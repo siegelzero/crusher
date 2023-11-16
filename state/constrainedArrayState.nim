@@ -1,6 +1,7 @@
 import std/[packedsets, random, sequtils, tables]
-import constraints/constraint
-import constrainedArray
+
+import ../constraints/constraint
+import ../constrainedArray
 
 ################################################################################
 # Type definitions
