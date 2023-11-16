@@ -1,7 +1,7 @@
-import std/[packedsets, random, strformat, tables]
-import times
-import constraint
-import expression
+import std/[packedsets, random, strformat, tables, times]
+
+import constraints/constraint
+import expressions/expression
 import constrainedArray
 import constrainedArrayState
 

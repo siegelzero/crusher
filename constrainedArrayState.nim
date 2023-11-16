@@ -1,5 +1,5 @@
 import std/[packedsets, random, sequtils, tables]
-import constraint
+import constraints/constraint
 import constrainedArray
 
 ################################################################################

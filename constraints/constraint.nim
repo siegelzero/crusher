@@ -1,8 +1,7 @@
 import std/packedsets
 
 import constraintNode
-import expression
-import expressionNode
+import ../expressions/[expression, expressionNode]
 
 ################################################################################
 # Type definitions

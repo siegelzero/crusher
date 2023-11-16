@@ -1,4 +1,4 @@
-import expressionNode
+import ../expressions/expressionNode
 
 ################################################################################
 # Type definitions

@@ -1,6 +1,7 @@
 import std/sequtils
-import constraint
-import expression
+
+import constraints/constraint
+import expressions/expression
 import constrainedArray
 
 
