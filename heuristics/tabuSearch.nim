@@ -1,9 +1,9 @@
 import std/[packedsets, random, strformat, tables, times]
 
-import constraints/constraint
-import expressions/expression
-import constrainedArray
-import state/tabuState
+import ../constraints/constraint
+import ../expressions/expression
+import ../constrainedArray
+import ../state/tabuState
 
 randomize()
 
@@ -49,13 +49,11 @@ proc applyBestMove[T](state: TabuState[T]) =
         if delta > 0:
             state.tenure += 1
             if state.tenure == state.maxTenure:
-                echo "Resetting max tenure"
+                echo "Resetting tenure"
                 state.tenure = state.minTenure
     else:
-        state.tenure += 1
-        if state.tenure == state.maxTenure:
-            echo "Resetting max tenure"
-            state.tenure = state.minTenure
+        echo "Resetting tenure"
+        state.tenure = state.minTenure
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int) =

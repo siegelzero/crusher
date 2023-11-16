@@ -1,7 +1,7 @@
 import std/[packedsets, strformat, times]
 
 import state/arrayState
-import heuristics
+import heuristics/tabuSearch
 import models
 
 
