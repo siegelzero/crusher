@@ -5,7 +5,7 @@ import models
 
 when isMainModule:
     let
-        trials = 100
+        trials = 10
         n = 30
         # x = magicSquare(n)
         x = latinSquares(n)

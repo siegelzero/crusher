@@ -6,7 +6,7 @@ import expressionTree
 ################################################################################
 
 type
-    Expression*[T] = ref object
+    Expression*[T] = object
         positions*: PackedSet[int]
         tree*: ExpressionNode[T]
 
@@ -65,4 +65,5 @@ ExpValOp(`-`, Subtraction)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](exp: Expression[T], assignment: seq[T]): T = exp.tree.evaluate(assignment)
+func evaluate*[T](exp: Expression[T], assignment: seq[T]): T {.inline.} =
+    exp.tree.evaluate(assignment)
