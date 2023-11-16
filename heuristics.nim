@@ -3,12 +3,12 @@ import std/[packedsets, random, strformat, tables, times]
 import constraints/constraint
 import expressions/expression
 import constrainedArray
-import state/constrainedArrayState
+import state/tabuState
 
 randomize()
 
 
-func bestMoves[T](state: ArrayState[T]): seq[(int, T, T, int)] =
+func bestMoves[T](state: TabuState[T]): seq[(int, T, T, int)] =
     var
         delta: int
         bestMoveCost = high(int)
@@ -35,7 +35,7 @@ func bestMoves[T](state: ArrayState[T]): seq[(int, T, T, int)] =
                     result.add((position, oldValue, newValue, delta))
 
 
-proc applyBestMove[T](state: var ArrayState[T]) =
+proc applyBestMove[T](state: TabuState[T]) =
     let moves = state.bestMoves()
 
     if moves.len > 0:
@@ -58,7 +58,7 @@ proc applyBestMove[T](state: var ArrayState[T]) =
             state.tenure = state.minTenure
 
 
-proc tabuImprove*[T](state: var ArrayState[T], threshold: int) =
+proc tabuImprove*[T](state: TabuState[T], threshold: int) =
     var lastImprovement = 0
 
     while state.iteration - lastImprovement < threshold:
@@ -77,7 +77,7 @@ proc tabuImprove*[T](state: var ArrayState[T], threshold: int) =
 
 
 proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000): seq[T] =
-    var state = initArrayState(carray)
+    var state = newTabuState(carray)
     state.tabuImprove(threshold)
     doAssert state.cost == 0
     return state.currentAssignment

@@ -8,7 +8,7 @@ import ../constrainedArray
 ################################################################################
 
 type
-    ArrayState*[T] = object
+    ArrayState*[T] = ref object of RootObj
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[Constraint[T]]]
 
@@ -22,16 +22,11 @@ type
         bestAssignment*: seq[T]
         bestCost*: int
 
-        iteration*: int
-        tabu*: seq[Table[T, int]]
-
-        maxTenure*, minTenure*, tenure*: int
-
 ################################################################################
 # ConstrainedArray Methods
 ################################################################################
 
-func updatePenaltyMap*[T](state: var ArrayState[T], position: int) =
+func updatePenaltyMap*[T](state: ArrayState[T], position: int) =
     var
         oldValue: T
         penalty: int
@@ -47,59 +42,54 @@ func updatePenaltyMap*[T](state: var ArrayState[T], position: int) =
         state.currentAssignment[nbr] = oldValue
 
 
-proc initArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
-    result.carray = carray
-    result.iteration = 0
-    result.minTenure = 5
-    result.maxTenure = 100
-    result.tenure = result.minTenure
-
-    result.constraintsAtPosition = newSeq[seq[Constraint[T]]](carray.len)
-    result.neighbors = newSeq[seq[int]](carray.len)
+proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
+    state.carray = carray
+    state.constraintsAtPosition = newSeq[seq[Constraint[T]]](carray.len)
+    state.neighbors = newSeq[seq[int]](carray.len)
 
     # Group constraints involving each position
-    for idx, constraint in carray.constraints:
+    for constraint in carray.constraints:
         for pos in constraint.positions:
-            result.constraintsAtPosition[pos].add(constraint)
+            state.constraintsAtPosition[pos].add(constraint)
     
-    # Build neighbors of each position
+    # Collect neighbors of each position
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
     for pos in carray.allPositions():
         neighborSet.clear()
-        for cons in result.constraintsAtPosition[pos]:
+        for cons in state.constraintsAtPosition[pos]:
             neighborSet.incl(cons.positions)
         neighborSet.excl(pos)
-        result.neighbors[pos] = toSeq(neighborSet)
+        state.neighbors[pos] = toSeq(neighborSet)
 
     # Random assignment
-    result.currentAssignment = newSeq[T](carray.len)
+    state.currentAssignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        result.currentAssignment[pos] = sample(carray.domain[pos])
+        state.currentAssignment[pos] = sample(carray.domain[pos])
 
+    # Compute cost
     for cons in carray.constraints:
-        result.cost += cons.penalty(result.currentAssignment)
+        state.cost += cons.penalty(state.currentAssignment)
 
-    result.bestCost = result.cost
-    result.bestAssignment = result.currentAssignment
+    state.bestCost = state.cost
+    state.bestAssignment = state.currentAssignment
 
-    result.penaltyMap = newSeq[Table[T, int]](result.carray.len)
+    state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
+
     var penalty: int
     var oldValue: T
 
     # Construct penalty map for each location and value
-    for pos in result.carray.allPositions():
-        oldValue = result.currentAssignment[pos]
-        for newValue in result.carray.domain[pos]:
+    for pos in state.carray.allPositions():
+        oldValue = state.currentAssignment[pos]
+        for newValue in state.carray.domain[pos]:
             penalty = 0
-            result.currentAssignment[pos] = newValue
-            for cons in result.constraintsAtPosition[pos]:
-                penalty += cons.penalty(result.currentAssignment)
-            result.penaltyMap[pos][newValue] = penalty
-        result.currentAssignment[pos] = oldValue
-    
-    result.tabu = newSeq[Table[T, int]](carray.len)
+            state.currentAssignment[pos] = newValue
+            for cons in state.constraintsAtPosition[pos]:
+                penalty += cons.penalty(state.currentAssignment)
+            state.penaltyMap[pos][newValue] = penalty
+        state.currentAssignment[pos] = oldValue
 
-    for i in 0..<carray.len:
-        result.tabu[i] = initTable[T, int]()
-        for d in carray.domain[i]:
-            result.tabu[i][d] = 0
+
+proc newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
+    new(result)
+    result.init(carray)

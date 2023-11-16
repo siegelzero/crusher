@@ -1,6 +1,6 @@
 import std/[packedsets, strformat, times]
 
-import state/constrainedArrayState
+import state/arrayState
 import heuristics
 import models
 
