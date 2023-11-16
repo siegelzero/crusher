@@ -14,7 +14,6 @@ type
         GreaterThanEq,
         LessThan,
         LessThanEq,
-        NotEqualTo
     
     NodeType* = enum
         UnaryRelNode,
@@ -36,42 +35,50 @@ type
 func evaluate*[T](tree: ConstraintNode[T], assignment: seq[T]): bool {.inline.} =
     case tree.kind:
         of UnaryRelNode:
+            let target = tree.target.evaluate(assignment)
+
             case tree.unaryRel:
                 of Not:
-                    return not (evaluate[T](tree.target, assignment))
+                    return not target
+
         of BinaryRelNode:
+            let left = tree.left.evaluate(assignment)
+            let right = tree.right.evaluate(assignment)
+
             case tree.binaryRel:
                 of EqualTo:
-                    return evaluate[T](tree.left, assignment) == evaluate[T](tree.right, assignment)
+                    return left == right
                 of GreaterThan:
-                    return evaluate[T](tree.left, assignment) > evaluate[T](tree.right, assignment)
+                    return left > right
                 of GreaterThanEq:
-                    return evaluate[T](tree.left, assignment) >= evaluate[T](tree.right, assignment)
+                    return left >= right
                 of LessThan:
-                    return evaluate[T](tree.left, assignment) < evaluate[T](tree.right, assignment)
+                    return left < right
                 of LessThanEq:
-                    return evaluate[T](tree.left, assignment) <= evaluate[T](tree.right, assignment)
-                of NotEqualTo:
-                    return evaluate[T](tree.left, assignment) != evaluate[T](tree.right, assignment)
+                    return left <= right
 
 
 func penalty*[T](tree: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
     case tree.kind:
         of UnaryRelNode:
+            let target = tree.target.evaluate(assignment)
+
             case tree.unaryRel:
                 of Not:
-                    return if evaluate[T](tree.target, assignment): 1 else: 0
+                    return if target: 1 else: 0
+
         of BinaryRelNode:
+            let left = tree.left.evaluate(assignment)
+            let right = tree.right.evaluate(assignment)
+
             case tree.binaryRel:
                 of EqualTo:
-                    return abs(evaluate[T](tree.left, assignment) - evaluate[T](tree.right, assignment))
+                    return abs(left - right)
                 of GreaterThan:
-                    return if evaluate[T](tree.left, assignment) > evaluate[T](tree.right, assignment): 0 else: 1
+                    return if left > right: 0 else: 1
                 of GreaterThanEq:
-                    return if evaluate[T](tree.left, assignment) >= evaluate[T](tree.right, assignment): 0 else: 1
+                    return if left >= right: 0 else: 1
                 of LessThan:
-                    return if evaluate[T](tree.left, assignment) < evaluate[T](tree.right, assignment): 0 else: 1
+                    return if left < right: 0 else: 1
                 of LessThanEq:
-                    return if evaluate[T](tree.left, assignment) <= evaluate[T](tree.right, assignment): 0 else: 1
-                of NotEqualTo:
-                    return if evaluate[T](tree.left, assignment) != evaluate[T](tree.right, assignment): 0 else: 1
+                    return if left <= right: 0 else: 1

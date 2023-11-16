@@ -42,16 +42,23 @@ func evaluate*[T](tree: ExpressionNode[T], assignment: seq[T]): T {.inline.} =
         of RefNode:
             return assignment[tree.position]
         of UnaryOpNode:
+            let target = tree.target.evaluate(assignment)
+
             case tree.unaryOp:
                 of AbsoluteValue:
-                    return abs(evaluate[T](tree.target, assignment))
+                    return abs(target)
                 of Negation:
-                    return -evaluate[T](tree.target, assignment)
+                    return -target
+
         of BinaryOpNode:
+            let
+                left = tree.left.evaluate(assignment)
+                right = tree.right.evaluate(assignment)
+
             case tree.binaryOp:
                 of Addition:
-                    return evaluate[T](tree.left, assignment) + evaluate[T](tree.right, assignment)
+                    return left + right
                 of Subtraction:
-                    return evaluate[T](tree.left, assignment) - evaluate[T](tree.right, assignment)
+                    return left - right
                 of Multiplication:
-                    return evaluate[T](tree.left, assignment) * evaluate[T](tree.right, assignment)
+                    return left * right

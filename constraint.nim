@@ -48,7 +48,6 @@ ExpExpRel(`>`, GreaterThan)
 ExpExpRel(`>=`, GreaterThanEq)
 ExpExpRel(`<`, LessThan)
 ExpExpRel(`<=`, LessThanEq)
-ExpExpRel(`!=`, NotEqualTo)
 
 ################################################################################
 # Binary (Expression, Value) Relations
@@ -81,7 +80,6 @@ ExpValRel(`>`, GreaterThan)
 ExpValRel(`>=`, GreaterThanEq)
 ExpValRel(`<`, LessThan)
 ExpValRel(`<=`, LessThanEq)
-ExpValRel(`!=`, NotEqualTo)
 
 ################################################################################
 # Evaluation
