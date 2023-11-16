@@ -23,26 +23,31 @@ type
         bestCost*: int
 
 ################################################################################
-# ConstrainedArray Methods
+# ArrayState methods
 ################################################################################
 
-func updatePenaltyMap*[T](state: ArrayState[T], position: int) =
-    var
-        oldValue: T
-        penalty: int
+func updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline.} =
+    # Computes penalties for all constraints involving the position, and updates penalty map
+    let oldValue = state.currentAssignment[position]
+    var penalty: int
 
+    for newValue in state.carray.domain[position]:
+        penalty = 0
+        state.currentAssignment[position] = newValue
+        for cons in state.constraintsAtPosition[position]:
+            penalty += cons.penalty(state.currentAssignment)
+        state.penaltyMap[position][newValue] = penalty
+
+    state.currentAssignment[position] = oldValue
+
+func updateNeighborPenalties*[T](state: ArrayState[T], position: int) {.inline.} =
+    # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
-        oldValue = state.currentAssignment[nbr]
-        for newValue in state.carray.domain[nbr]:
-            penalty = 0
-            state.currentAssignment[nbr] = newValue
-            for cons in state.constraintsAtPosition[nbr]:
-                penalty += cons.penalty(state.currentAssignment)
-            state.penaltyMap[nbr][newValue] = penalty
-        state.currentAssignment[nbr] = oldValue
+        state.updatePenaltiesForPosition(nbr)
 
 
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
+    # Initializes all structures and data for the state ArrayState[T]
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[Constraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
@@ -61,7 +66,7 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         neighborSet.excl(pos)
         state.neighbors[pos] = toSeq(neighborSet)
 
-    # Random assignment
+    # Initialize with random assignment
     state.currentAssignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
         state.currentAssignment[pos] = sample(carray.domain[pos])
@@ -73,23 +78,12 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     state.bestCost = state.cost
     state.bestAssignment = state.currentAssignment
 
-    state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
-
-    var penalty: int
-    var oldValue: T
-
     # Construct penalty map for each location and value
+    state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
     for pos in state.carray.allPositions():
-        oldValue = state.currentAssignment[pos]
-        for newValue in state.carray.domain[pos]:
-            penalty = 0
-            state.currentAssignment[pos] = newValue
-            for cons in state.constraintsAtPosition[pos]:
-                penalty += cons.penalty(state.currentAssignment)
-            state.penaltyMap[pos][newValue] = penalty
-        state.currentAssignment[pos] = oldValue
-
+        state.updatePenaltiesForPosition(pos)
 
 proc newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
+    # Allocates and initializes new ArrayState[T]
     new(result)
     result.init(carray)

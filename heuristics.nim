@@ -42,7 +42,7 @@ proc applyBestMove[T](state: TabuState[T]) =
         let (position, oldValue, newValue, delta) = sample(moves)
 
         state.currentAssignment[position] = newValue
-        state.updatePenaltyMap(position)
+        state.updateNeighborPenalties(position)
         state.cost += delta
         state.tabu[position][oldValue] = state.iteration + 1 + rand(state.tenure)
 
