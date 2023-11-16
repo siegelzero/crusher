@@ -1,5 +1,6 @@
 import std/packedsets
-import expressionTree
+
+import expressionNode
 
 ################################################################################
 # Type definitions

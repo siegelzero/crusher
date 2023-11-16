@@ -1,7 +1,9 @@
 import std/[packedsets, strformat, times]
-import heuristics
+
 import constrainedArrayState
+import heuristics
 import models
+
 
 when isMainModule:
     let
