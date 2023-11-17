@@ -33,7 +33,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], minTenure, maxTe
             state.tabu[i][d] = 0
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], minTenure=5, maxTenure=100): TabuState[T] =
+func newTabuState*[T](carray: ConstrainedArray[T], minTenure=5, maxTenure=100): TabuState[T] =
     # Allocates and initializes new TabuState[T]
     new(result)
     result.init(carray, minTenure, maxTenure)

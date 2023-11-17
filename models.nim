@@ -78,11 +78,11 @@ proc latinSquares*(n: int): ConstrainedArray[int] =
         
     # First row in order 0 1 2...
     for i in 0..<n:
-        x.constraints.add(x[i] == i)
+        x.addConstraint(x[i] == i)
 
     # First col in order 0 1 2...
     for i in 0..<n:
-        x.constraints.add(x[i*n] == i)
+        x.addConstraint(x[i*n] == i)
     
     return x
 

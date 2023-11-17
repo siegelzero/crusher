@@ -53,7 +53,7 @@ func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArra
     arr.domain[position] = toSeq[T](domain)
 
 func allDifferent*[T](arr: var ConstrainedArray[T]) =
-    # Adds all-different constraints for the given positions.
+    # Adds all-different constraints for the all positions in the array
     for i in 0..<arr.len:
         for j in 0..<i:
             arr.constraints.add(arr[i] != arr[j])

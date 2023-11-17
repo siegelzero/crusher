@@ -21,7 +21,7 @@ template ExpExpOp(op, opref: untyped) =
             positions: left.positions + right.positions,
             tree: ExpressionNode[T](
                 kind: BinaryOpNode,
-                binaryop: opref,
+                binaryOp: opref,
                 left: left.tree,
                 right: right.tree
             )
@@ -41,7 +41,7 @@ template ExpValOp(op, opref: untyped) =
             positions: left.positions,
             tree: ExpressionNode[T](
                 kind: BinaryOpNode,
-                binaryop: opref,
+                binaryOp: opref,
                 left: left.tree,
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
@@ -52,7 +52,7 @@ template ExpValOp(op, opref: untyped) =
             positions: right.positions,
             tree: ExpressionNode[T](
                 kind: BinaryOpNode,
-                binaryop: opref,
+                binaryOp: opref,
                 left: ExpressionNode[T](kind: LiteralNode, value: left),
                 right: right.tree
             )

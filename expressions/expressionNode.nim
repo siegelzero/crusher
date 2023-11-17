@@ -51,9 +51,8 @@ func evaluate*[T](tree: ExpressionNode[T], assignment: seq[T]): T {.inline.} =
                     return -target
 
         of BinaryOpNode:
-            let
-                left = tree.left.evaluate(assignment)
-                right = tree.right.evaluate(assignment)
+            let left = tree.left.evaluate(assignment)
+            let right = tree.right.evaluate(assignment)
 
             case tree.binaryOp:
                 of Addition:

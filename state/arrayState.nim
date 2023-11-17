@@ -83,7 +83,7 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for pos in state.carray.allPositions():
         state.updatePenaltiesForPosition(pos)
 
-proc newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
+func newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
     # Allocates and initializes new ArrayState[T]
     new(result)
     result.init(carray)
