@@ -21,7 +21,7 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T, T, int)] =
         if oldPenalty == 0:
             continue
 
-        for newValue in state.carray.domain[position]:
+        for newValue in state.reducedDomain[position]:
             if newValue == oldValue:
                 continue
 

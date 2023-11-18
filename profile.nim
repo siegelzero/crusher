@@ -1,6 +1,6 @@
 import std/[packedsets, strformat, times]
 
-import state/arrayState
+import state/[arrayState, domain]
 import heuristics/tabuSearch
 import models
 
@@ -11,7 +11,7 @@ when isMainModule:
         n = 30
         # x = magicSquare(n)
         x = latinSquares(n)
-
+    
     let then = cpuTime()
 
     for i in 0..<trials:
