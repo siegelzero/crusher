@@ -7,10 +7,10 @@ import models
 
 when isMainModule:
     let
-        trials = 10
-        n = 30
-        # x = magicSquare(n)
-        x = latinSquares(n)
+        trials = 1
+        n = 6
+        x = magicSquare(n)
+        # x = latinSquares(n)
     
     let then = cpuTime()
 

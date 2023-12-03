@@ -49,11 +49,7 @@ proc applyBestMove[T](state: TabuState[T]) =
         if delta > 0:
             state.tenure += 1
             if state.tenure == state.maxTenure:
-                echo "Resetting tenure"
                 state.tenure = state.minTenure
-    else:
-        echo "Resetting tenure"
-        state.tenure = state.minTenure
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int) =
