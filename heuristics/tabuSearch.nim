@@ -40,10 +40,7 @@ proc applyBestMove[T](state: TabuState[T]) =
 
     if moves.len > 0:
         let (position, oldValue, newValue, delta) = sample(moves)
-
-        state.currentAssignment[position] = newValue
-        state.updateNeighborPenalties(position)
-        state.cost += delta
+        state.assignValue(position, oldValue, newValue)
         state.tabu[position][oldValue] = state.iteration + 1 + rand(state.tenure)
 
         if delta > 0:
@@ -68,10 +65,28 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int) =
             break
 
         state.iteration += 1
+    
+    if state.cost != 0:
+        state.cost = state.bestCost
+        state.currentAssignment = state.bestAssignment
+        state.rebuildPenaltyMap()
 
 
-proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000): seq[T] =
+proc tabuRestarts*[T](state: var TabuState[T], threshold, restarts: int) =
+    var oldValue, newValue: T
+    var delta: int
+
+    for i in 0..<restarts:
+        state.tabuImprove(threshold)
+        if state.cost == 0:
+            break
+        echo "jiggling"
+        state = newTabuState(state.carray)
+
+
+
+proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000, restarts: int = 10): seq[T] =
     var state = newTabuState(carray)
-    state.tabuImprove(threshold)
+    state.tabuRestarts(threshold, restarts)
     doAssert state.cost == 0
     return state.currentAssignment

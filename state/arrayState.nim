@@ -47,6 +47,11 @@ func updateNeighborPenalties*[T](state: ArrayState[T], position: int) {.inline.}
         state.updatePenaltiesForPosition(nbr)
 
 
+func rebuildPenaltyMap*[T](state: ArrayState[T]) =
+    for position in state.carray.allPositions():
+        state.updatePenaltiesForPosition(position)
+
+
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state ArrayState[T]
     state.carray = carray
@@ -87,6 +92,14 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
 
     for pos in state.carray.allPositions():
         state.updatePenaltiesForPosition(pos)
+
+
+func assignValue*[T](state: ArrayState[T], position: int, oldValue, newValue: T) =
+    let oldPenalty = state.penaltyMap[position][oldValue]
+    let delta = state.penaltyMap[position][newValue] - oldPenalty
+    state.currentAssignment[position] = newValue
+    state.cost += delta
+    state.updateNeighborPenalties(position)
 
 
 func newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
