@@ -84,8 +84,5 @@ ExpValRel(`<=`, LessThanEq)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](cons: Constraint[T], assignment: seq[T]): bool {.inline.} =
-    cons.tree.evaluate(assignment)
-
 func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
     cons.tree.penalty(assignment)

@@ -43,11 +43,6 @@ proc applyBestMove[T](state: TabuState[T]) =
         state.assignValue(position, oldValue, newValue)
         state.tabu[position][oldValue] = state.iteration + 1 + rand(state.tenure)
 
-        if delta > 0:
-            state.tenure += 1
-            if state.tenure == state.maxTenure:
-                state.tenure = state.minTenure
-
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int) =
     var lastImprovement = 0
@@ -82,7 +77,6 @@ proc tabuRestarts*[T](state: var TabuState[T], threshold, restarts: int) =
             break
         echo "jiggling"
         state = newTabuState(state.carray)
-
 
 
 proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000, restarts: int = 10): seq[T] =
