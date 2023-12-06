@@ -67,20 +67,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int) =
         state.rebuildPenaltyMap()
 
 
-proc tabuRestarts*[T](state: var TabuState[T], threshold, restarts: int) =
-    var oldValue, newValue: T
-    var delta: int
-
-    for i in 0..<restarts:
-        state.tabuImprove(threshold)
-        if state.cost == 0:
-            break
-        echo "jiggling"
-        state = newTabuState(state.carray)
-
-
-proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000, restarts: int = 10): seq[T] =
+proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000): seq[T] =
     var state = newTabuState(carray)
-    state.tabuRestarts(threshold, restarts)
+    state.tabuImprove(threshold)
     doAssert state.cost == 0
     return state.currentAssignment
