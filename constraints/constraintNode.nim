@@ -10,6 +10,7 @@ type
 
     BinaryRelation* = enum
         EqualTo,
+        NotEqualTo,
         GreaterThan,
         GreaterThanEq,
         LessThan,
@@ -48,6 +49,8 @@ func evaluate*[T](tree: ConstraintNode[T], assignment: seq[T]): bool {.inline.} 
             case tree.binaryRel:
                 of EqualTo:
                     return left == right
+                of NotEqualTo:
+                    return left != right
                 of GreaterThan:
                     return left > right
                 of GreaterThanEq:
@@ -73,7 +76,10 @@ func penalty*[T](tree: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
 
             case tree.binaryRel:
                 of EqualTo:
-                    return abs(left - right)
+                    # return abs(left - right)
+                    return if left == right: 0 else: 1
+                of NotEqualTo:
+                    return if left != right: 0 else: 1
                 of GreaterThan:
                     return if left > right: 0 else: 1
                 of GreaterThanEq:

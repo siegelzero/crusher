@@ -17,14 +17,25 @@ type
 ################################################################################
 
 func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
-    Constraint[T](
-        positions: cons.positions,
-        tree: ConstraintNode[T](
-            kind: UnaryRelNode,
-            unaryRel: Not,
-            target: cons.tree
+    if cons.tree.kind == BinaryRelNode and cons.tree.binaryRel == EqualTo:
+        return Constraint[T](
+            positions: cons.positions,
+            tree: ConstraintNode[T](
+                kind: BinaryRelNode,
+                binaryRel: NotEqualTo,
+                left: cons.tree.left,
+                right: cons.tree.right
+            )
         )
-    )
+    else:
+        return Constraint[T](
+            positions: cons.positions,
+            tree: ConstraintNode[T](
+                kind: UnaryRelNode,
+                unaryRel: Not,
+                target: cons.tree
+            )
+        )
 
 ################################################################################
 # Binary (Expression, Expression) Relations

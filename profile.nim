@@ -8,7 +8,7 @@ import models
 when isMainModule:
     let
         trials = 1
-        n = 5
+        n = 6
         # x = ageProblem()
         # x = sendMoreMoney()
         # x = magicSquare(n)
@@ -18,7 +18,7 @@ when isMainModule:
     let then = cpuTime()
 
     for i in 0..<trials:
-        echo x.findAssignment(100000)
+        echo x.findAssignment(1000000)
         echo fmt"Found {i + 1} / {trials}"
 
     let now = cpuTime()
