@@ -35,26 +35,26 @@ type
 # Evaluation
 ################################################################################
 
-func evaluate*[T](tree: ExpressionNode[T], assignment: seq[T]): T {.inline.} =
-    case tree.kind:
+func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]): T {.inline.} =
+    case node.kind:
         of LiteralNode:
-            return tree.value
+            return node.value
         of RefNode:
-            return assignment[tree.position]
+            return assignment[node.position]
         of UnaryOpNode:
-            let target = tree.target.evaluate(assignment)
+            let target = node.target.evaluate(assignment)
 
-            case tree.unaryOp:
+            case node.unaryOp:
                 of AbsoluteValue:
                     return abs(target)
                 of Negation:
                     return -target
 
         of BinaryOpNode:
-            let left = tree.left.evaluate(assignment)
-            let right = tree.right.evaluate(assignment)
+            let left = node.left.evaluate(assignment)
+            let right = node.right.evaluate(assignment)
 
-            case tree.binaryOp:
+            case node.binaryOp:
                 of Addition:
                     return left + right
                 of Subtraction:

@@ -9,7 +9,7 @@ import expressionNode
 type
     Expression*[T] = object
         positions*: PackedSet[int]
-        tree*: ExpressionNode[T]
+        node*: ExpressionNode[T]
 
 ################################################################################
 # Binary (Expression, Expression) Operations
@@ -19,11 +19,11 @@ template ExpExpOp(op, opref: untyped) =
     func `op`*[T](left, right: Expression[T]): Expression[T] {.inline.} =
         Expression[T](
             positions: left.positions + right.positions,
-            tree: ExpressionNode[T](
+            node: ExpressionNode[T](
                 kind: BinaryOpNode,
                 binaryOp: opref,
-                left: left.tree,
-                right: right.tree
+                left: left.node,
+                right: right.node
             )
         )
 
@@ -39,10 +39,10 @@ template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: Expression[T], right: T): Expression[T] {.inline.} =
         Expression[T](
             positions: left.positions,
-            tree: ExpressionNode[T](
+            node: ExpressionNode[T](
                 kind: BinaryOpNode,
                 binaryOp: opref,
-                left: left.tree,
+                left: left.node,
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
         )
@@ -50,11 +50,11 @@ template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: T, right: Expression[T]): Expression[T] {.inline.} =
         Expression[T](
             positions: right.positions,
-            tree: ExpressionNode[T](
+            node: ExpressionNode[T](
                 kind: BinaryOpNode,
                 binaryOp: opref,
                 left: ExpressionNode[T](kind: LiteralNode, value: left),
-                right: right.tree
+                right: right.node
             )
         )
 
@@ -67,4 +67,4 @@ ExpValOp(`-`, Subtraction)
 ################################################################################
 
 func evaluate*[T](exp: Expression[T], assignment: seq[T]): T {.inline.} =
-    exp.tree.evaluate(assignment)
+    exp.node.evaluate(assignment)

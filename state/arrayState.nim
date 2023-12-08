@@ -23,7 +23,7 @@ type
         bestCost*: int
 
 ################################################################################
-# ArrayState methods
+# Penalty Map Routines
 ################################################################################
 
 func updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline.} =
@@ -51,6 +51,9 @@ func rebuildPenaltyMap*[T](state: ArrayState[T]) =
     for position in state.carray.allPositions():
         state.updatePenaltiesForPosition(position)
 
+################################################################################
+# ArrayState creation
+################################################################################
 
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state ArrayState[T]
@@ -94,15 +97,18 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         state.updatePenaltiesForPosition(pos)
 
 
-func assignValue*[T](state: ArrayState[T], position: int, oldValue, newValue: T) =
-    let oldPenalty = state.penaltyMap[position][oldValue]
-    let delta = state.penaltyMap[position][newValue] - oldPenalty
-    state.currentAssignment[position] = newValue
-    state.cost += delta
-    state.updateNeighborPenalties(position)
-
-
 func newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
     # Allocates and initializes new ArrayState[T]
     new(result)
     result.init(carray)
+
+################################################################################
+# Value Assignment
+################################################################################
+
+func assignValue*[T](state: ArrayState[T], position: int, value: T) =
+    let penalty = state.penaltyMap[position][state.currentAssignment[position]]
+    let delta = state.penaltyMap[position][value] - penalty
+    state.currentAssignment[position] = value
+    state.cost += delta
+    state.updateNeighborPenalties(position)

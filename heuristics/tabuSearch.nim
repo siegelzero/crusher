@@ -8,7 +8,7 @@ import ../state/tabuState
 randomize()
 
 
-func bestMoves[T](state: TabuState[T]): seq[(int, T, T, int)] =
+func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     var
         delta: int
         bestMoveCost = high(int)
@@ -29,18 +29,19 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T, T, int)] =
 
             if state.tabu[position][newValue] <= state.iteration or state.cost + delta < state.bestCost:
                 if state.cost + delta < bestMoveCost:
-                    result = @[(position, oldValue, newValue, delta)]
+                    result = @[(position, newValue)]
                     bestMoveCost = state.cost + delta
                 elif state.cost + delta == bestMoveCost:
-                    result.add((position, oldValue, newValue, delta))
+                    result.add((position, newValue))
 
 
 proc applyBestMove[T](state: TabuState[T]) =
     let moves = state.bestMoves()
 
     if moves.len > 0:
-        let (position, oldValue, newValue, delta) = sample(moves)
-        state.assignValue(position, oldValue, newValue)
+        let (position, newValue) = sample(moves)
+        let oldValue = state.currentAssignment[position]
+        state.assignValue(position, newValue)
         state.tabu[position][oldValue] = state.iteration + 1 + rand(state.tenure)
 
 

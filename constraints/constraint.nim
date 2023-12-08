@@ -10,30 +10,30 @@ import ../expressions/[expression, expressionNode]
 type
     Constraint*[T] = object
         positions*: PackedSet[int]
-        tree*: ConstraintNode[T]
+        node*: ConstraintNode[T]
 
 ################################################################################
 # Unary Constraint Relations
 ################################################################################
 
 func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
-    if cons.tree.kind == BinaryRelNode and cons.tree.binaryRel == EqualTo:
+    if cons.node.kind == BinaryRelNode and cons.node.binaryRel == EqualTo:
         return Constraint[T](
             positions: cons.positions,
-            tree: ConstraintNode[T](
+            node: ConstraintNode[T](
                 kind: BinaryRelNode,
                 binaryRel: NotEqualTo,
-                left: cons.tree.left,
-                right: cons.tree.right
+                left: cons.node.left,
+                right: cons.node.right
             )
         )
     else:
         return Constraint[T](
             positions: cons.positions,
-            tree: ConstraintNode[T](
+            node: ConstraintNode[T](
                 kind: UnaryRelNode,
                 unaryRel: Not,
-                target: cons.tree
+                target: cons.node
             )
         )
 
@@ -45,11 +45,11 @@ template ExpExpRel(rel, relEnum: untyped) =
     func `rel`*[T](left, right: Expression[T]): Constraint[T] {.inline.} =
         Constraint[T](
             positions: left.positions + right.positions,
-            tree: ConstraintNode[T](
+            node: ConstraintNode[T](
                 kind: BinaryRelNode,
                 binaryRel: relEnum,
-                left: left.tree,
-                right: right.tree
+                left: left.node,
+                right: right.node
             )
         )
 
@@ -67,21 +67,21 @@ template ExpValRel(rel, relEnum: untyped) =
     func `rel`*[T](left: Expression[T], right: T): Constraint[T] {.inline.} =
         Constraint[T](
             positions: left.positions,
-            tree: ConstraintNode[T](
+            node: ConstraintNode[T](
                 kind: BinaryRelNode,
                 binaryRel: relEnum,
-                left: left.tree,
+                left: left.node,
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
         )
     func `rel`*[T](left: T, right: Expression[T]): Constraint[T] {.inline.} =
         Constraint[T](
             positions: right.positions,
-            tree: ConstraintNode[T](
+            node: ConstraintNode[T](
                 kind: BinaryRelNode,
                 binaryRel: relEnum,
                 left: ExpressionNode[T](kind: LiteralNode, value: left),
-                right: right.tree
+                right: right.node
             )
         )
 
@@ -96,7 +96,8 @@ ExpValRel(`<=`, LessThanEq)
 ################################################################################
 
 func evaluate*[T](cons: Constraint[T], assignment: seq[T]): bool {.inline.} =
-    cons.tree.evaluate(assignment)
+    cons.node.evaluate(assignment)
 
 func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
-    cons.tree.penalty(assignment)
+    # cons.node.penalty(assignment)*cons.positions.len()
+    cons.node.penalty(assignment)

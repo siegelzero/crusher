@@ -33,20 +33,20 @@ type
 # Evaluation
 ################################################################################
 
-func evaluate*[T](tree: ConstraintNode[T], assignment: seq[T]): bool {.inline.} =
-    case tree.kind:
+func evaluate*[T](node: ConstraintNode[T], assignment: seq[T]): bool {.inline.} =
+    case node.kind:
         of UnaryRelNode:
-            let target = tree.target.evaluate(assignment)
+            let target = node.target.evaluate(assignment)
 
-            case tree.unaryRel:
+            case node.unaryRel:
                 of Not:
                     return not target
 
         of BinaryRelNode:
-            let left = tree.left.evaluate(assignment)
-            let right = tree.right.evaluate(assignment)
+            let left = node.left.evaluate(assignment)
+            let right = node.right.evaluate(assignment)
 
-            case tree.binaryRel:
+            case node.binaryRel:
                 of EqualTo:
                     return left == right
                 of NotEqualTo:
@@ -61,22 +61,21 @@ func evaluate*[T](tree: ConstraintNode[T], assignment: seq[T]): bool {.inline.} 
                     return left <= right
 
 
-func penalty*[T](tree: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
-    case tree.kind:
+func penalty*[T](node: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
+    case node.kind:
         of UnaryRelNode:
-            let target = tree.target.evaluate(assignment)
+            let target = node.target.evaluate(assignment)
 
-            case tree.unaryRel:
+            case node.unaryRel:
                 of Not:
                     return if target: 1 else: 0
 
         of BinaryRelNode:
-            let left = tree.left.evaluate(assignment)
-            let right = tree.right.evaluate(assignment)
+            let left = node.left.evaluate(assignment)
+            let right = node.right.evaluate(assignment)
 
-            case tree.binaryRel:
+            case node.binaryRel:
                 of EqualTo:
-                    # return abs(left - right)
                     return if left == right: 0 else: 1
                 of NotEqualTo:
                     return if left != right: 0 else: 1

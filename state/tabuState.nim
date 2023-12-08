@@ -11,10 +11,10 @@ type
     TabuState*[T] = ref object of ArrayState[T]
         iteration*: int
         tabu*: seq[seq[int]]
-        maxTenure*, minTenure*, tenure*: int
+        tenure*: int
 
 ################################################################################
-# TabuState methods
+# TabuState creation
 ################################################################################
 
 proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], tenure: int) =

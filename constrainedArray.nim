@@ -33,7 +33,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
         values.add(
             Expression[T](
                 positions: toPackedSet[int]([pos]),
-                tree: ExpressionNode[T](kind: RefNode, position: pos)
+                node: ExpressionNode[T](kind: RefNode, position: pos)
             )
         )
     return ConstrainedArray[T](
