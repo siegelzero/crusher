@@ -4,49 +4,6 @@ import ../constrainedArray
 import ../constraints/constraint
 
 
-# proc domainFiltering*[T](carray: ConstrainedArray[T]) =
-#     var cStamp = newSeq[int](carray.constraints.len)
-#     var vStamp = newSeq[int](carray.len)
-#     var inQ = newSeq[int](carray.len)
-#     var Q = newSeq[int]([])
-#     var t = 1
-#     var pos, cons: int
-
-#     var currentDomain: newSeq[PackedSet[T]](carray.len)
-#     for pos in carray.allPositions():
-#         currentDomain[pos] = toPackedSet[T](carray.domain[pos])
-
-    
-#     proc isSatisfiableWithFixed(cons: Constraint[T], fixed: int, value: T): bool =
-#         if cons.positions.len == 1:
-
-        
-
-
-#     for i in 0..<carray.constraints.len:
-#         cStamp[i] = 0
-
-#     # Treat all variables as active
-#     for pos in carray.allPositions():
-#         Q.add(pos)
-#         inQ[pos] = 1
-#         vStamp[pos] = 1
-
-#     while Q.len() > 0:
-#         pos = Q.pop()
-#         inQ[pos] = 0
-
-#         for idx in carray.constraintsAtPosition[pos]:
-#             if vStamp[pos] <= cStamp[idx]:
-#                 continue
-#             for w in in carray.constraints[idx].positions:
-
-
-
-
-
-
-
 proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     var
         ok: bool

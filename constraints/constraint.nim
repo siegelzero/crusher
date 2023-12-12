@@ -8,9 +8,22 @@ import ../expressions/[expression, expressionNode]
 ################################################################################
 
 type
+    ConstraintType* = enum
+        AlgebraicConstraint,
+        AllDifferentConstraint 
+    
+    AllDifferentState*[T] = object
+        counts*: seq[int]
+        cost: int
+
     Constraint*[T] = object
         positions*: PackedSet[int]
-        node*: ConstraintNode[T]
+
+        case scope*: ConstraintType
+            of AlgebraicConstraint:
+                node*: ConstraintNode[T]
+            of AllDifferentConstraint:
+                state*: AllDifferentState[T]
 
 ################################################################################
 # Unary Constraint Relations
@@ -19,6 +32,7 @@ type
 func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
     if cons.node.kind == BinaryRelNode and cons.node.binaryRel == EqualTo:
         return Constraint[T](
+            scope: AlgebraicConstraint,
             positions: cons.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
@@ -29,6 +43,7 @@ func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
         )
     else:
         return Constraint[T](
+            scope: AlgebraicConstraint,
             positions: cons.positions,
             node: ConstraintNode[T](
                 kind: UnaryRelNode,
@@ -44,6 +59,7 @@ func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
 template ExpExpRel(rel, relEnum: untyped) =
     func `rel`*[T](left, right: Expression[T]): Constraint[T] {.inline.} =
         Constraint[T](
+            scope: AlgebraicConstraint,
             positions: left.positions + right.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
@@ -66,6 +82,7 @@ ExpExpRel(`<=`, LessThanEq)
 template ExpValRel(rel, relEnum: untyped) =
     func `rel`*[T](left: Expression[T], right: T): Constraint[T] {.inline.} =
         Constraint[T](
+            scope: AlgebraicConstraint,
             positions: left.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
@@ -76,6 +93,7 @@ template ExpValRel(rel, relEnum: untyped) =
         )
     func `rel`*[T](left: T, right: Expression[T]): Constraint[T] {.inline.} =
         Constraint[T](
+            scope: AlgebraicConstraint,
             positions: right.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
@@ -99,5 +117,8 @@ func evaluate*[T](cons: Constraint[T], assignment: seq[T]): bool {.inline.} =
     cons.node.evaluate(assignment)
 
 func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
-    # cons.node.penalty(assignment)*cons.positions.len()
-    cons.node.penalty(assignment)
+    case cons.scope:
+        of AlgebraicConstraint:
+            return cons.node.penalty(assignment)
+        of AllDifferentConstraint:
+            return cons.state.cost

@@ -15,13 +15,14 @@ when isMainModule:
         # x = magicSquare2(n)
         x = latinSquares(30)
     
-    let then = cpuTime()
+    let then = epochTime()
 
     for i in 0..<trials:
-        echo x.findAssignment(1000000)
+        echo x.findAssignment(100000)
         echo fmt"Found {i + 1} / {trials}"
+    # let p = parallelSearch(x, 100000)
 
-    let now = cpuTime()
+    let now = epochTime()
     let diff = now - then
 
     echo fmt"Average: {diff / float(trials):.3f}"

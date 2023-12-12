@@ -29,7 +29,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], tenure: int) =
         state.tabu[pos] = newSeq[int](max(state.reducedDomain[pos]) + 1)
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], tenure=5): TabuState[T] =
+proc newTabuState*[T](carray: ConstrainedArray[T], tenure=6): TabuState[T] =
     # Allocates and initializes new TabuState[T]
     new(result)
     result.init(carray, tenure)
