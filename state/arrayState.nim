@@ -11,7 +11,7 @@ import domain
 type
     ArrayState*[T] = ref object of RootObj
         carray*: ConstrainedArray[T]
-        constraintsAtPosition*: seq[seq[int]]
+        constraintsAtPosition*: seq[seq[Constraint[T]]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
@@ -34,8 +34,8 @@ func updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline
     for newValue in state.reducedDomain[position]:
         penalty = 0
         state.currentAssignment[position] = newValue
-        for idx in state.constraintsAtPosition[position]:
-            penalty += state.carray.constraints[idx].penalty(state.currentAssignment)
+        for constraint in state.constraintsAtPosition[position]:
+            penalty += constraint.penalty(state.currentAssignment)
         state.penaltyMap[position][newValue] = penalty
 
     state.currentAssignment[position] = oldValue
@@ -58,21 +58,21 @@ func rebuildPenaltyMap*[T](state: ArrayState[T]) =
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state ArrayState[T]
     state.carray = carray
-    state.constraintsAtPosition = newSeq[seq[int]](carray.len)
+    state.constraintsAtPosition = newSeq[seq[Constraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 
     # Group constraints involving each position
-    for idx, constraint in carray.constraints:
+    for constraint in carray.constraints:
         for pos in constraint.positions:
-            state.constraintsAtPosition[pos].add(idx)
+            state.constraintsAtPosition[pos].add(constraint)
     
     # Collect neighbors of each position
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
     for pos in carray.allPositions():
         neighborSet.clear()
-        for idx in state.constraintsAtPosition[pos]:
-            neighborSet.incl(carray.constraints[idx].positions)
+        for constraint in state.constraintsAtPosition[pos]:
+            neighborSet.incl(constraint.positions)
         neighborSet.excl(pos)
         state.neighbors[pos] = toSeq(neighborSet)
 
