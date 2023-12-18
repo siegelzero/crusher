@@ -70,18 +70,6 @@ func allDifferent*[T](arr: var ConstrainedArray[T], expressions: seq[Expression[
         for j in 0..<i:
             arr.constraints.add(expressions[i] != expressions[j])
 
-func allDifferentCalculated*[T](arr: var ConstrainedArray[T], positions: seq[int]) =
-    var maxDomain = 0
-
-    for pos in positions:
-        maxDomain = max(maxDomain, arr.domain[pos])
-    
-    var count = newSeq[int](maxDomain + 1)
-
-
-    var state = AllDifferentState[T]
-
-
 func addConstraint*[T](arr: var ConstrainedArray[T], cons: Constraint[T]) {.inline.} =
     # Adds the constraint to the 
     arr.constraints.add(cons)

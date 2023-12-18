@@ -12,6 +12,7 @@ type
     ArrayState*[T] = ref object of RootObj
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[Constraint[T]]]
+        globalConstraints*: seq[Constraint[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
@@ -23,31 +24,45 @@ type
         bestCost*: int
 
 ################################################################################
+# Penalty Routines
+################################################################################
+
+proc penalty*[T](state: ArrayState[T], constraint: Constraint[T]): int {.inline.} =
+    return constraint.penalty(state.currentAssignment)
+
+
+proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: int, newValue: T): int {.inline.} =
+    let oldValue = state.currentAssignment[position]
+    case constraint.scope:
+        of AlgebraicConstraint:
+            state.currentAssignment[position] = newValue
+            result = state.penalty(constraint)
+            state.currentAssignment[position] = oldValue
+        of AllDifferentConstraint:
+            result = constraint.state.cost + constraint.state.moveDelta(position, oldValue, newValue)
+
+
+################################################################################
 # Penalty Map Routines
 ################################################################################
 
-func updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline.} =
+proc updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline.} =
     # Computes penalties for all constraints involving the position, and updates penalty map
-    let oldValue = state.currentAssignment[position]
     var penalty: int
-
     for newValue in state.reducedDomain[position]:
         penalty = 0
-        state.currentAssignment[position] = newValue
         for constraint in state.constraintsAtPosition[position]:
-            penalty += constraint.penalty(state.currentAssignment)
+            penalty += state.movePenalty(constraint, position, newValue)
         state.penaltyMap[position][newValue] = penalty
 
-    state.currentAssignment[position] = oldValue
 
-
-func updateNeighborPenalties*[T](state: ArrayState[T], position: int) {.inline.} =
+proc updateNeighborPenalties*[T](state: ArrayState[T], position: int) {.inline.} =
     # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
         state.updatePenaltiesForPosition(nbr)
 
 
-func rebuildPenaltyMap*[T](state: ArrayState[T]) =
+proc rebuildPenaltyMap*[T](state: ArrayState[T]) =
     for position in state.carray.allPositions():
         state.updatePenaltiesForPosition(position)
 
@@ -66,6 +81,8 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for constraint in carray.constraints:
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
+        if constraint.scope == AllDifferentConstraint:
+            state.globalConstraints.add(constraint)
     
     # Collect neighbors of each position
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
@@ -80,10 +97,14 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     state.currentAssignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
         state.currentAssignment[pos] = sample(state.reducedDomain[pos])
+    
+    # Initialize global constraint states
+    for cons in state.globalConstraints:
+        cons.state.initialize(state.currentAssignment)
 
     # Compute cost
     for cons in carray.constraints:
-        state.cost += cons.penalty(state.currentAssignment)
+        state.cost += state.penalty(cons)
 
     state.bestCost = state.cost
     state.bestAssignment = state.currentAssignment
@@ -106,9 +127,14 @@ func newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
 # Value Assignment
 ################################################################################
 
-func assignValue*[T](state: ArrayState[T], position: int, value: T) =
+proc assignValue*[T](state: ArrayState[T], position: int, value: T) =
     let penalty = state.penaltyMap[position][state.currentAssignment[position]]
     let delta = state.penaltyMap[position][value] - penalty
     state.currentAssignment[position] = value
+
+    for cons in state.globalConstraints:
+        if position in cons.positions:
+            cons.state.updatePosition(position, value)
+
     state.cost += delta
     state.updateNeighborPenalties(position)

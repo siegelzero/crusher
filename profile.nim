@@ -8,17 +8,19 @@ import models
 when isMainModule:
     let
         trials = 1
-        n = 6
+        n = 30
         # x = ageProblem()
         # x = sendMoreMoney()
         # x = magicSquare(n)
         # x = magicSquare2(n)
-        x = latinSquares(30)
+        x = latinSquares(n)
     
     let then = epochTime()
 
     for i in 0..<trials:
-        echo x.findAssignment(100000)
+        var sol = x.findAssignment(100000)
+        for j in 0..<n:
+            echo sol[j*n..<(j + 1)*n]
         echo fmt"Found {i + 1} / {trials}"
     # let p = parallelSearch(x, 100000)
 
