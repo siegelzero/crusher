@@ -13,7 +13,7 @@ type
         AllDifferentConstraint 
 
     AllDifferentState*[T] = ref object
-        positions: PackedSet[T]
+        positions: PackedSet[int]
         count*: Table[T, int]
         currentAssignment*: Table[int, T]
         cost*: int
