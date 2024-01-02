@@ -1,4 +1,4 @@
-import std/packedsets
+import std/[packedsets, tables]
 
 import expressionNode
 
@@ -66,5 +66,5 @@ ExpValOp(`-`, Subtraction)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](exp: Expression[T], assignment: seq[T]): T {.inline.} =
+func evaluate*[T](exp: Expression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     exp.node.evaluate(assignment)

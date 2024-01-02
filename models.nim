@@ -68,14 +68,12 @@ proc latinSquares*(n: int): ConstrainedArray[int] =
         locations = @[]
         for j in i*n..<(i + 1)*n:
             locations.add(j)
-        # x.allDifferent(locations)
         x.addConstraint(allDifferentConstraint(locations))
 
         # Set col i to be all distinct entries
         locations = @[]
         for j in countup(i, n*n - 1, n):
             locations.add(j)
-        # x.allDifferent(locations)
         x.addConstraint(allDifferentConstraint(locations))
         
     # First row in order 0 1 2...
@@ -98,6 +96,28 @@ proc nQueens*(n: int): ConstrainedArray[int] =
             x.addConstraint(x[i] != x[j])
             x.addConstraint(x[i] - x[j] != i - j)
             x.addConstraint(x[i] - x[j] != j - i)
+
+    return x
+
+
+proc nQueens2*(n: int): ConstrainedArray[int] =
+    var x = initConstrainedArray[int](n)
+    x.setDomain(toSeq 0..<n)
+
+    var terms: seq[Expression[int]] = @[]
+    for i in 0..<n:
+        terms.add(x[i])
+    x.addConstraint(allDifferentConstraint(terms))
+
+    terms.reset()
+    for i in 0..<n:
+        terms.add(x[i] - i)
+    x.addConstraint(allDifferentConstraint(terms))
+
+    terms.reset()
+    for i in 0..<n:
+        terms.add(x[i] + i)
+    x.addConstraint(allDifferentConstraint(terms))
 
     return x
 

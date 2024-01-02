@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/constraint
+import ../constraints/[constraint, allDifferentState]
 import ../constrainedArray
 import domain
 

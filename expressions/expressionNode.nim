@@ -1,3 +1,5 @@
+import std/tables
+
 ################################################################################
 # Type definitions
 ################################################################################
@@ -35,7 +37,7 @@ type
 # Evaluation
 ################################################################################
 
-func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]): T {.inline.} =
+func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     case node.kind:
         of LiteralNode:
             return node.value

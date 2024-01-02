@@ -12,13 +12,13 @@ type
         len*: int
         constraints*: seq[Constraint[T]]
         domain*: seq[seq[T]]
-        values*: seq[Expression[T]]
+        entries*: seq[Expression[T]]
 
 ################################################################################
 # Value Extraction
 ################################################################################
 
-func `[]`*[T](arr: ConstrainedArray[T], idx: int): Expression[T] {.inline.} = arr.values[idx]
+func `[]`*[T](arr: ConstrainedArray[T], idx: int): Expression[T] {.inline.} = arr.entries[idx]
 
 iterator allPositions*[T](arr: ConstrainedArray[T]): int =
     for i in 0..<arr.len: yield i
@@ -28,9 +28,9 @@ iterator allPositions*[T](arr: ConstrainedArray[T]): int =
 ################################################################################
 
 func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
-    var values: seq[Expression[T]] = @[]
+    var entries: seq[Expression[T]] = @[]
     for pos in 0..<n:
-        values.add(
+        entries.add(
             Expression[T](
                 positions: toPackedSet[int]([pos]),
                 node: ExpressionNode[T](kind: RefNode, position: pos)
@@ -40,8 +40,21 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
         len: n,
         constraints: newSeq[Constraint[T]](),
         domain: newSeq[seq[T]](n),
-        values: values
+        entries: entries
     )
+
+func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
+    let n = arr.entries.len()
+    for pos in n..<(n + m):
+        arr.entries.add(
+            Expression[T](
+                positions: toPackedSet[int]([pos]),
+                node: ExpressionNode[T](kind: RefNode, position: pos)
+            )
+        )
+        arr.domain.add(newSeq[T]())
+    arr.len += m
+
 
 func setDomain*[T](arr: var ConstrainedArray[T], domain: openArray[T]) =
     # Sets domain of all positions to the given values.
