@@ -1,4 +1,4 @@
-import std/[packedsets, tables]
+import std/[packedsets, sequtils, tables]
 
 import allDifferentState, constraintNode
 import ../expressions/[expression, expressionNode]
@@ -122,20 +122,27 @@ func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
 # AllDifferentState Methods
 ################################################################################
 
-func allDifferentConstraint*[T](positions: openArray[T]): Constraint[T] =
+func allDifferent[T](positions: openArray[T]): Constraint[T] =
     return Constraint[T](
         positions: toPackedSet[T](positions),
         scope: AllDifferentConstraint,
         state: newAllDifferentState[T](positions)
     )
 
-func allDifferentConstraint*[T](expressions: seq[Expression[T]]): Constraint[T] =
+proc allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
     var positions = toPackedSet[T]([])
+    var allRefs = true
     for exp in expressions:
+        if exp.node.kind != RefNode:
+            allRefs = false
         positions.incl(exp.positions)
-
-    return Constraint[T](
-        positions: positions,
-        scope: AllDifferentConstraint,
-        state: newAllDifferentState[T](expressions)
-    )
+    
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return allDifferent(toSeq[T](positions.items.toSeq))
+    else:
+        return Constraint[T](
+            positions: positions,
+            scope: AllDifferentConstraint,
+            state: newAllDifferentState[T](expressions)
+        )

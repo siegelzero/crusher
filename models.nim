@@ -3,6 +3,7 @@ import std/sequtils
 import constraints/constraint
 import expressions/expression
 import constrainedArray
+import constraintSystem
 
 
 proc sendMoreMoney*(): ConstrainedArray[int] =
@@ -56,35 +57,87 @@ proc ageProblem*(): ConstrainedArray[int] =
     return age
 
 
-proc latinSquares*(n: int): ConstrainedArray[int] =
+proc latinSquareSystem*(n: int): ConstraintSystem[int] =
     # Latin Squares
-    var x = initConstrainedArray[int](n*n)
-    x.setDomain(toSeq 0..<n)
+    var system = initConstraintSystem[int]()
+    var x = system.newConstrainedMatrix(n, n)
+    x.setDomain(toSeq(0..<n))
 
-    var locations: seq[int] = @[]
-        
+    var locations: seq[Expression[int]] = @[]
+    # Set rows to be distinct
     for i in 0..<n:
-        # Set row i to be all distinct entries
         locations = @[]
-        for j in i*n..<(i + 1)*n:
-            locations.add(j)
-        x.addConstraint(allDifferentConstraint(locations))
+        for j in 0..<n:
+            locations.add(x[i, j])
+        system.addConstraint(allDifferent(locations))
 
-        # Set col i to be all distinct entries
+    # Set all columns to be distinct
+    for j in 0..<n:
         locations = @[]
-        for j in countup(i, n*n - 1, n):
-            locations.add(j)
-        x.addConstraint(allDifferentConstraint(locations))
+        for i in 0..<n:
+            locations.add(x[i, j])
+        system.addConstraint(allDifferent(locations))
         
     # First row in order 0 1 2...
     for i in 0..<n:
-        x.addConstraint(x[i] == i)
+        system.addConstraint(x[0, i] == i)
 
     # First col in order 0 1 2...
     for i in 0..<n:
-        x.addConstraint(x[i*n] == i)
+        system.addConstraint(x[i, 0] == i)
+
+    return system
+
+
+proc MOLSSystem*(n: int): ConstraintSystem[int] =
+    # Latin Squares
+    var system = initConstraintSystem[int]()
+
+    var X = system.newConstrainedMatrix(n, n)
+    var Y = system.newConstrainedMatrix(n, n)
+
+    X.setDomain(toSeq(0..<n))
+    Y.setDomain(toSeq(0..<n))
+
+    # Set up each of x and y to be latin squares
+    var locationsX, locationsY: seq[Expression[int]]
+    # Set rows to be distinct
+    for i in 0..<n:
+        locationsX = @[]
+        locationsY = @[]
+        for j in 0..<n:
+            locationsX.add(X[i, j])
+            locationsY.add(Y[i, j])
+        system.addConstraint(allDifferent(locationsX))
+        system.addConstraint(allDifferent(locationsY))
+
+    # Set all columns to be distinct
+    for j in 0..<n:
+        locationsX = @[]
+        locationsY = @[]
+        for i in 0..<n:
+            locationsX.add(X[i, j])
+            locationsY.add(Y[i, j])
+        system.addConstraint(allDifferent(locationsX))
+        system.addConstraint(allDifferent(locationsY))
+        
+    # First row in order 0 1 2...
+    for i in 0..<n:
+        system.addConstraint(X[0, i] == i)
+
+    # First col in order 0 1 2...
+    for i in 0..<n:
+        system.addConstraint(X[i, 0] == i)
+        system.addConstraint(Y[i, 0] == i)
     
-    return x
+    # now mutual orthogonal condition
+    var pairs: seq[Expression[int]] = @[]
+    for i in 0..<n:
+        for j in 0..<n:
+            pairs.add(X[i, j] + n*Y[i, j])
+    system.addConstraint(allDifferent(pairs))
+
+    return system
 
 
 proc nQueens*(n: int): ConstrainedArray[int] =
@@ -107,17 +160,17 @@ proc nQueens2*(n: int): ConstrainedArray[int] =
     var terms: seq[Expression[int]] = @[]
     for i in 0..<n:
         terms.add(x[i])
-    x.addConstraint(allDifferentConstraint(terms))
+    x.addConstraint(allDifferent(terms))
 
     terms.reset()
     for i in 0..<n:
         terms.add(x[i] - i)
-    x.addConstraint(allDifferentConstraint(terms))
+    x.addConstraint(allDifferent(terms))
 
     terms.reset()
     for i in 0..<n:
         terms.add(x[i] + i)
-    x.addConstraint(allDifferentConstraint(terms))
+    x.addConstraint(allDifferent(terms))
 
     return x
 
@@ -161,3 +214,29 @@ proc magicSquare*(n: int): ConstrainedArray[int] =
 
     x.setDomain(toSeq(1..n*n))
     return x
+
+
+proc fooProblem*(): ConstraintSystem[int] =
+    var system = initConstraintSystem[int]()
+    var value = system.newConstrainedSequence(6)
+
+    value.setDomain(toSeq(0..<5))
+
+    system.addConstraint(value[0] + value[1] + value[2] == 3)
+    system.addConstraint(value[3] + value[4] + value[5] == 3)
+    system.addConstraint(value[2] + value[3] == 2)
+
+    return system
+
+
+proc fooGrid*(): ConstraintSystem[int] =
+    var system = initConstraintSystem[int]()
+    var value = system.newConstrainedMatrix(3, 3)
+
+    value.setDomain(toSeq(0..<3))
+
+    system.addConstraint(value[0, 0] + value[0, 1] + value[0, 2] == 2)
+    system.addConstraint(value[1, 0] + value[1, 1] + value[1, 2] == 2)
+    system.addConstraint(value[2, 0] + value[2, 1] + value[2, 2] == 2)
+
+    return system

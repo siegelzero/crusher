@@ -1,33 +1,25 @@
-import std/[packedsets, strformat, times]
+import std/[os, packedsets, strformat, strutils, times]
 
 import state/[arrayState, domain]
+import constraintSystem
 import heuristics/tabuSearch
 import models
 
 
 when isMainModule:
-    let
-        trials = 1
-        n = 200
-        # x = nQueens(n)
-        x = nQueens2(n)
-        # x = ageProblem()
-        # x = sendMoreMoney()
-        # x = magicSquare(n)
-        # x = magicSquare2(n)
-        # x = latinSquares(n)
+    let n = parseInt(paramStr(1))
+    let tenure = parseInt(paramStr(2))
+    let threshold = parseInt(paramStr(3))
+    let x = MOLSSystem(n)
     
     let then = epochTime()
 
-    for i in 0..<trials:
-        var sol = x.findAssignment(100000)
-        echo sol
-        # for j in 0..<n:
-        #     echo sol[j*n..<(j + 1)*n]
-        echo fmt"Found {i + 1} / {trials}"
-    # let p = parallelSearch(x, 100000)
+    x.findAssignment(tenure, threshold)
+
+    for v in x.variables:
+        display(v)
+        echo ""
 
     let now = epochTime()
     let diff = now - then
-
-    echo fmt"Average: {diff / float(trials):.3f}"
+    echo fmt"Elapsed Time: {diff:.3f}"

@@ -49,16 +49,24 @@ proc applyBestMove[T](state: TabuState[T]) =
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     var lastImprovement = 0
+    let blockSize = 10000
+    var now, rate: float
+    var then = epochTime()
+
+
     while state.iteration - lastImprovement < threshold:
         state.applyBestMove()
-        if state.iteration mod 500 == 0:
-            echo fmt"Have cost {state.bestCost} on iteration {state.iteration}"
+        if state.iteration > 0 and state.iteration mod blockSize == 0:
+            now = epochTime()
+            rate = float(blockSize) / (now - then)
+            then = now
+            echo fmt"Iteration: {state.iteration}  Current: {state.cost}  Best: {state.bestCost}  Rate: {rate:.3f} moves/sec"
         if state.cost < state.bestCost:
             lastImprovement = state.iteration
             state.bestCost = state.cost
             state.bestAssignment = state.currentAssignment
         if state.cost == 0:
-            echo "Solution found!"
+            echo fmt"Solution found on iteration {state.iteration}"
             return state
         state.iteration += 1
     if state.cost != 0:
@@ -99,8 +107,11 @@ proc parallelSearch*[T](carray: ConstrainedArray[T], threshold: int): TabuState[
     doAssert solutionFound
 
 
-proc findAssignment*[T](carray: ConstrainedArray[T], threshold: int = 10000): seq[T] =
-    var state = newTabuState(carray)
+proc findAssignment*[T](carray: ConstrainedArray[T], tenure = 6, threshold = 10000): seq[T] =
+    echo "Searching for Assignment:"
+    echo fmt"  tenure: {tenure}"
+    echo fmt"  tabuThreshold: {threshold}"
+    var state = newTabuState(carray, tenure)
     let improved = state.tabuImprove(threshold)
     doAssert improved.cost == 0
     return improved.currentAssignment
