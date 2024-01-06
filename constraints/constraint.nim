@@ -10,7 +10,7 @@ import ../expressions/[expression, expressionNode]
 type
     ConstraintType* = enum
         AlgebraicConstraint,
-        AllDifferentConstraint 
+        AllDifferentConstraint
 
     Constraint*[T] = object
         positions*: PackedSet[int]

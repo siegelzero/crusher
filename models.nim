@@ -90,54 +90,47 @@ proc latinSquareSystem*(n: int): ConstraintSystem[int] =
 
 
 proc MOLSSystem*(n: int): ConstraintSystem[int] =
-    # Latin Squares
-    var system = initConstraintSystem[int]()
+    # Mutually Orthogonal Latin Squares
+    var sys = initConstraintSystem[int]()
+    var X = sys.newConstrainedMatrix(n, n)
+    var Y = sys.newConstrainedMatrix(n, n)
 
-    var X = system.newConstrainedMatrix(n, n)
-    var Y = system.newConstrainedMatrix(n, n)
-
+    # Set up each of X and Y to be latin squares
+    # Set domain of each entry to 0..<n
     X.setDomain(toSeq(0..<n))
     Y.setDomain(toSeq(0..<n))
 
-    # Set up each of x and y to be latin squares
-    var locationsX, locationsY: seq[Expression[int]]
-    # Set rows to be distinct
-    for i in 0..<n:
-        locationsX = @[]
-        locationsY = @[]
-        for j in 0..<n:
-            locationsX.add(X[i, j])
-            locationsY.add(Y[i, j])
-        system.addConstraint(allDifferent(locationsX))
-        system.addConstraint(allDifferent(locationsY))
+    # Each row has to be a permutation of 0, 1, .., n
+    for row in X.rows():
+        sys.addConstraint(allDifferent(row))
 
-    # Set all columns to be distinct
-    for j in 0..<n:
-        locationsX = @[]
-        locationsY = @[]
-        for i in 0..<n:
-            locationsX.add(X[i, j])
-            locationsY.add(Y[i, j])
-        system.addConstraint(allDifferent(locationsX))
-        system.addConstraint(allDifferent(locationsY))
+    for row in Y.rows():
+        sys.addConstraint(allDifferent(row))
+
+    # Each col has to be a permutation of 0, 1, .., n
+    for col in X.columns():
+        sys.addConstraint(allDifferent(col))
+
+    for col in Y.columns():
+        sys.addConstraint(allDifferent(col))
         
-    # First row in order 0 1 2...
+    # First row in order 0 1 2... in first square
     for i in 0..<n:
-        system.addConstraint(X[0, i] == i)
+        sys.addConstraint(X[0, i] == i)
 
-    # First col in order 0 1 2...
+    # First col in order 0 1 2... in both squares
     for i in 0..<n:
-        system.addConstraint(X[i, 0] == i)
-        system.addConstraint(Y[i, 0] == i)
+        sys.addConstraint(X[i, 0] == i)
+        sys.addConstraint(Y[i, 0] == i)
     
-    # now mutual orthogonal condition
+    # Mutual orthogonality condition
     var pairs: seq[Expression[int]] = @[]
     for i in 0..<n:
         for j in 0..<n:
             pairs.add(X[i, j] + n*Y[i, j])
-    system.addConstraint(allDifferent(pairs))
+    sys.addConstraint(allDifferent(pairs))
 
-    return system
+    return sys
 
 
 proc nQueens*(n: int): ConstrainedArray[int] =

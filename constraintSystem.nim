@@ -78,6 +78,31 @@ func `[]`*[T](cvar: ConstrainedVariable[T], i, j: int): Expression[T] {.inline.}
     cvar.system.carray[cvar.offset + cvar.m*i + j]
 
 
+iterator columns*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
+    case cvar.shape:
+        of Matrix:
+            var col: seq[Expression[T]]
+            for i in 0..<cvar.n:
+                col = @[]
+                for j in 0..<cvar.m:
+                    col.add(cvar[j, i])
+                yield col
+        of Sequence:
+            discard
+
+iterator rows*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
+    case cvar.shape:
+        of Matrix:
+            var row: seq[Expression[T]]
+            for i in 0..<cvar.m:
+                row = @[]
+                for j in 0..<cvar.n:
+                    row.add(cvar[i, j])
+                yield row
+        of Sequence:
+            discard
+
+
 proc display*[T](cvar: ConstrainedVariable[T]) =
     case cvar.shape:
         of Sequence:
