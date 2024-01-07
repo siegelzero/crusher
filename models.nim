@@ -6,7 +6,7 @@ import constrainedArray
 import constraintSystem
 
 
-proc sendMoreMoney*(): ConstrainedArray[int] =
+proc sendMoreMoney*(): ConstraintSystem[int] =
     let
         S = 0
         E = 1
@@ -17,20 +17,21 @@ proc sendMoreMoney*(): ConstrainedArray[int] =
         R = 6
         Y = 7
     
-    var value = initConstrainedArray[int](8)
+    var sys = initConstraintSystem[int]()
+    var value = sys.newConstrainedSequence(8)
     value.setDomain(toSeq 0..9)
-    value.allDifferent()
+    sys.addConstraint(allDifferent(value))
 
     var 
         send = 1000*value[S] + 100*value[E] + 10*value[N] + value[D]
         more = 1000*value[M] + 100*value[O] + 10*value[R] + value[E]
         money = 10000*value[M] + 1000*value[O] + 100*value[N] + 10*value[E] + value[Y]
     
-    value.addConstraint(send + more == money)
-    value.addConstraint(value[S] > 0)
-    value.addConstraint(value[M] > 0)
+    sys.addConstraint(send + more == money)
+    sys.addConstraint(value[S] > 0)
+    sys.addConstraint(value[M] > 0)
 
-    return value
+    return sys
 
 
 proc ageProblem*(): ConstrainedArray[int] =
@@ -59,34 +60,25 @@ proc ageProblem*(): ConstrainedArray[int] =
 
 proc latinSquareSystem*(n: int): ConstraintSystem[int] =
     # Latin Squares
-    var system = initConstraintSystem[int]()
-    var x = system.newConstrainedMatrix(n, n)
-    x.setDomain(toSeq(0..<n))
+    var sys = initConstraintSystem[int]()
+    var X = sys.newConstrainedMatrix(n, n)
+    X.setDomain(toSeq(0..<n))
 
-    var locations: seq[Expression[int]] = @[]
-    # Set rows to be distinct
-    for i in 0..<n:
-        locations = @[]
-        for j in 0..<n:
-            locations.add(x[i, j])
-        system.addConstraint(allDifferent(locations))
-
-    # Set all columns to be distinct
-    for j in 0..<n:
-        locations = @[]
-        for i in 0..<n:
-            locations.add(x[i, j])
-        system.addConstraint(allDifferent(locations))
+    for row in X.rows():
+        sys.addConstraint(allDifferent(row))
+    
+    for col in X.columns():
+        sys.addConstraint(allDifferent(col))
         
     # First row in order 0 1 2...
     for i in 0..<n:
-        system.addConstraint(x[0, i] == i)
+        sys.addConstraint(X[0, i] == i)
 
     # First col in order 0 1 2...
     for i in 0..<n:
-        system.addConstraint(x[i, 0] == i)
+        sys.addConstraint(X[i, 0] == i)
 
-    return system
+    return sys
 
 
 proc MOLSSystem*(n: int): ConstraintSystem[int] =
@@ -168,45 +160,37 @@ proc nQueens2*(n: int): ConstrainedArray[int] =
     return x
 
 
-proc magicSquare*(n: int): ConstrainedArray[int] = 
+proc magicSquare*(n: int): ConstraintSystem[int] = 
     # Magic Squares
-
-    var
-        x = initConstrainedArray[int](n*n)
-        terms: seq[Expression[int]]
+    var sys = initConstraintSystem[int]()
+    var X = sys.newConstrainedMatrix(n, n)
 
     let target = n*(n*n + 1) div 2
 
     # Row sums == target
-    for p in 0..<n:
-        terms = @[]
-        for q in 0..<n:
-            terms.add(x[p*n + q])
-        x.addConstraint(terms.foldl(a + b) == target)
+    for row in X.rows():
+        sys.addConstraint(row.foldl(a + b) == target)
 
     # Col sums == target
-    for q in 0..<n:
-        terms = @[]
-        for p in 0..<n:
-            terms.add(x[p*n + q])
-        x.addConstraint(terms.foldl(a + b) == target)
+    for col in X.columns():
+        sys.addConstraint(col.foldl(a + b) == target)
         
     # Diagonals
-    terms = @[]
-    for p in countup(0, n*n, n + 1):
-        terms.add(x[p])
-    x.addConstraint(terms.foldl(a + b) == target)
+    var terms: seq[Expression[int]] = @[]
+    for i in 0..<n:
+        terms.add(X[i, i])
+    sys.addConstraint(terms.foldl(a + b) == target)
 
     terms = @[]
-    for p in countup(n - 1, n*(n - 1), n - 1):
-        terms.add(x[p])
-    x.addConstraint(terms.foldl(a + b) == target)
+    for i in 0..<n:
+        terms.add(X[i, n - i - 1])
+    sys.addConstraint(terms.foldl(a + b) == target)
 
     # All entries in square must be distinct
-    x.allDifferent()
+    sys.addConstraint(allDifferent(X))
+    X.setDomain(toSeq(1..n*n))
 
-    x.setDomain(toSeq(1..n*n))
-    return x
+    return sys
 
 
 proc fooProblem*(): ConstraintSystem[int] =

@@ -10,7 +10,8 @@ import ../expressions/[expression, expressionNode]
 type
     ConstraintType* = enum
         AlgebraicConstraint,
-        AllDifferentConstraint
+        AllDifferentConstraint,
+        # ElementConstraint
 
     Constraint*[T] = object
         positions*: PackedSet[int]
@@ -111,7 +112,7 @@ ExpValRel(`<=`, LessThanEq)
 func evaluate*[T](cons: Constraint[T], assignment: seq[T]): bool {.inline.} =
     cons.node.evaluate(assignment)
 
-func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
+proc penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
     case cons.scope:
         of AlgebraicConstraint:
             return cons.node.penalty(assignment)
@@ -122,7 +123,8 @@ func penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
 # AllDifferentState Methods
 ################################################################################
 
-func allDifferent[T](positions: openArray[T]): Constraint[T] =
+func allDifferent*[T](positions: openArray[T]): Constraint[T] =
+    # Returns allDifferent constraint for the given positions.
     return Constraint[T](
         positions: toPackedSet[T](positions),
         scope: AllDifferentConstraint,
@@ -130,6 +132,7 @@ func allDifferent[T](positions: openArray[T]): Constraint[T] =
     )
 
 proc allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
+    # Returns allDifferent constraint for the given expressions.
     var positions = toPackedSet[T]([])
     var allRefs = true
     for exp in expressions:

@@ -10,7 +10,11 @@ when isMainModule:
     let n = parseInt(paramStr(1))
     let tenure = parseInt(paramStr(2))
     let threshold = parseInt(paramStr(3))
-    let x = MOLSSystem(n)
+    # let x = MOLSSystem(n)
+    # let x = latinSquareSystem(n)
+    # let x = sendMoreMoney()
+    # let x = ageProblem()
+    let x = magicSquare(n)
     
     let then = epochTime()
 

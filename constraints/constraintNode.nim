@@ -61,7 +61,8 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T]): bool {.inline.} 
                     return left <= right
 
 
-func penalty*[T](node: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
+proc penalty*[T](node: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
+    # echo "node kind: ", node.kind
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)

@@ -24,7 +24,7 @@ iterator allPositions*[T](arr: ConstrainedArray[T]): int =
     for i in 0..<arr.len: yield i
 
 ################################################################################
-# ConstrainedArray Methods
+# ConstrainedArray Creation
 ################################################################################
 
 func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
@@ -32,7 +32,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
     for pos in 0..<n:
         entries.add(
             Expression[T](
-                positions: toPackedSet[int]([pos]),
+                positions: toPackedSet[int](@[pos]),
                 node: ExpressionNode[T](kind: RefNode, position: pos)
             )
         )
@@ -44,6 +44,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
     )
 
 func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
+    # Extends the array by m elements.
     let n = arr.entries.len()
     for pos in n..<(n + m):
         arr.entries.add(
@@ -55,6 +56,9 @@ func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
         arr.domain.add(newSeq[T]())
     arr.len += m
 
+################################################################################
+# ConstrainedArray domains
+################################################################################
 
 func setDomain*[T](arr: var ConstrainedArray[T], domain: openArray[T]) =
     # Sets domain of all positions to the given values.
@@ -65,23 +69,8 @@ func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArra
     # Sets domain of position to the given values.
     arr.domain[position] = toSeq[T](domain)
 
-func allDifferent*[T](arr: var ConstrainedArray[T]) =
-    # Adds all-different constraints for the all positions in the array
-    for i in 0..<arr.len:
-        for j in 0..<i:
-            arr.constraints.add(arr[i] != arr[j])
-
-func allDifferent*[T](arr: var ConstrainedArray[T], positions: seq[int]) =
-    # Adds all-different constraints for the given positions.
-    for i in 0..<positions.len:
-        for j in 0..<i:
-            arr.constraints.add(arr[positions[i]] != arr[positions[j]])
-
-func allDifferent*[T](arr: var ConstrainedArray[T], expressions: seq[Expression[T]]) =
-    # Adds all-different constraints for the given expressions.
-    for i in 0..<expressions.len:
-        for j in 0..<i:
-            arr.constraints.add(expressions[i] != expressions[j])
+func allDifferent*[T](arr: ConstrainedArray[T]): Constraint[T] {.inline.} =
+    allDifferent(toSeq arr.allPositions())
 
 func addConstraint*[T](arr: var ConstrainedArray[T], cons: Constraint[T]) {.inline.} =
     # Adds the constraint to the 
