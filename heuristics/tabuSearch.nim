@@ -16,6 +16,7 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         bestMoveCost = high(int)
         oldPenalty: int
         oldValue: T
+        firstImprovement = true
 
     for position in state.carray.allPositions():
         oldValue = state.currentAssignment[position]
@@ -28,6 +29,9 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                 continue
 
             delta = state.penaltyMap[position][newValue] - oldPenalty
+            # if delta < 0 and firstImprovement:
+            #     result = @[(position, newValue)]
+            #     return result
 
             if state.tabu[position][newValue] <= state.iteration or state.cost + delta < state.bestCost:
                 if state.cost + delta < bestMoveCost:
@@ -37,14 +41,14 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     result.add((position, newValue))
 
 
-proc applyBestMove[T](state: TabuState[T]) =
+proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     let moves = state.bestMoves()
 
     if moves.len > 0:
         let (position, newValue) = sample(moves)
         let oldValue = state.currentAssignment[position]
         state.assignValue(position, newValue)
-        state.tabu[position][oldValue] = state.iteration + 1 + rand(state.tenure)
+        state.tabu[position][oldValue] = state.iteration + state.cost + rand(state.tenure)
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
@@ -52,6 +56,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     let blockSize = 10000
     var now, rate: float
     var then = epochTime()
+    var beginning = then
 
 
     while state.iteration - lastImprovement < threshold:
@@ -66,7 +71,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
             state.bestCost = state.cost
             state.bestAssignment = state.currentAssignment
         if state.cost == 0:
-            echo fmt"Solution found on iteration {state.iteration}"
+            echo fmt"Solution found on iteration {state.iteration} after {epochTime() - beginning:.3f} sec"
             return state
         state.iteration += 1
     if state.cost != 0:
@@ -108,10 +113,11 @@ proc parallelSearch*[T](carray: ConstrainedArray[T], threshold: int): TabuState[
 
 
 proc findAssignment*[T](carray: ConstrainedArray[T], tenure = 6, threshold = 10000): seq[T] =
+    var state = newTabuState(carray, tenure)
     echo "Searching for Assignment:"
     echo fmt"  tenure: {tenure}"
     echo fmt"  tabuThreshold: {threshold}"
-    var state = newTabuState(carray, tenure)
+    echo fmt"  initial cost: {state.cost}"
     let improved = state.tabuImprove(threshold)
     doAssert improved.cost == 0
     return improved.currentAssignment

@@ -1,6 +1,6 @@
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, sequtils, strformat, tables]
 
-import allDifferentState, constraintNode
+import allDifferentState, constraintNode, linearCombinationState
 import ../expressions/[expression, expressionNode]
 
 ################################################################################
@@ -11,7 +11,7 @@ type
     ConstraintType* = enum
         AlgebraicConstraint,
         AllDifferentConstraint,
-        # ElementConstraint
+        LinearCombinationConstraint
 
     Constraint*[T] = object
         positions*: PackedSet[int]
@@ -20,6 +20,10 @@ type
                 node*: ConstraintNode[T]
             of AllDifferentConstraint:
                 state*: AllDifferentState[T]
+            of LinearCombinationConstraint:
+                lincomb*: LinearCombinationState[T]
+                linrel*: BinaryRelation
+                rhs*: T
 
 ################################################################################
 # Unary Constraint Relations
@@ -118,9 +122,27 @@ proc penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
             return cons.node.penalty(assignment)
         of AllDifferentConstraint:
             return cons.state.cost
+        of LinearCombinationConstraint:
+            var left = cons.lincomb.value
+            var right = cons.rhs
+            case cons.linrel:
+                of EqualTo:
+                    # return abs(left - right)
+                    return if left == right: 0 else: 1
+                    # return if left == right: 0 else: cons.positions.len
+                of NotEqualTo:
+                    return if left != right: 0 else: 1
+                of GreaterThan:
+                    return if left > right: 0 else: 1
+                of GreaterThanEq:
+                    return if left >= right: 0 else: 1
+                of LessThan:
+                    return if left < right: 0 else: 1
+                of LessThanEq:
+                    return if left <= right: 0 else: 1
 
 ################################################################################
-# AllDifferentState Methods
+# Computed Constraints
 ################################################################################
 
 func allDifferent*[T](positions: openArray[T]): Constraint[T] =
@@ -131,7 +153,7 @@ func allDifferent*[T](positions: openArray[T]): Constraint[T] =
         state: newAllDifferentState[T](positions)
     )
 
-proc allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
+func allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
     # Returns allDifferent constraint for the given expressions.
     var positions = toPackedSet[T]([])
     var allRefs = true
@@ -142,10 +164,66 @@ proc allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
     
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return allDifferent(toSeq[T](positions.items.toSeq))
+        return allDifferent(positions.items.toSeq)
     else:
         return Constraint[T](
             positions: positions,
             scope: AllDifferentConstraint,
             state: newAllDifferentState[T](expressions)
         )
+
+proc linearCombinationEq*[T](positions: seq[int], target: T): Constraint[T] =
+    return Constraint[T](
+        positions: toPackedSet[T](positions),
+        scope: LinearCombinationConstraint,
+        linrel: EqualTo,
+        rhs: target,
+        lincomb: newLinearCombinationState[T](positions)
+    )
+
+proc linearCombinationEq*[T](expressions: seq[Expression[T]], target: T): Constraint[T] =
+    # Returns allDifferent constraint for the given expressions.
+    var positions = toPackedSet[T]([])
+    var allRefs = true
+    for exp in expressions:
+        if exp.node.kind != RefNode:
+            allRefs = false
+        positions.incl(exp.positions)
+    
+    doAssert allRefs
+    # Use more efficient position based constraint if all expressions are refnodes
+    echo "fancypants"
+    return linearCombinationEq(positions.items.toSeq, target)
+
+################################################################################
+# Computed Constraint State interface
+################################################################################
+
+func initialize*[T](cons: Constraint[T], assignment: seq[T]) =
+    case cons.scope:
+        of AlgebraicConstraint:
+            return
+        of AllDifferentConstraint:
+            cons.state.initialize(assignment)
+        of LinearCombinationConstraint:
+            cons.lincomb.initialize(assignment)
+
+
+func moveDelta*[T](cons: Constraint[T], position: int, oldValue, newValue: T): int =
+    case cons.scope:
+        of AlgebraicConstraint:
+            return
+        of AllDifferentConstraint:
+            cons.state.moveDelta(position, oldValue, newValue)
+        of LinearCombinationConstraint:
+            cons.lincomb.moveDelta(position, oldValue, newValue)
+
+
+func updatePosition*[T](cons: Constraint[T], position: int, newValue: T) =
+    case cons.scope:
+        of AlgebraicConstraint:
+            return
+        of AllDifferentConstraint:
+            cons.state.updatePosition(position, newValue)
+        of LinearCombinationConstraint:
+            cons.lincomb.updatePosition(position, newValue)

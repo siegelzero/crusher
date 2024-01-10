@@ -10,7 +10,7 @@ type
     StateEvalMethod* = enum
         ExpressionBased,
         PositionBased
-    
+
     AllDifferentState*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int
@@ -30,7 +30,7 @@ type
 func init*[T](state: AllDifferentState[T], positions: openArray[T]) =
     state.cost = 0
     state.evalMethod = PositionBased
-    state.positions = toPackedSet[T](positions)
+    state.positions = toPackedSet[int](positions)
     state.count = newSeq[int]()
     state.currentAssignment = initTable[int, T]()
 
@@ -114,7 +114,7 @@ proc initialize*[T](state: AllDifferentState[T], assignment: seq[T]) =
 
             for count in state.count:
                 state.cost += max(0, count - 1)
-        
+
         of ExpressionBased:
             for pos in state.expressionsAtPosition.keys:
                 state.currentAssignment[pos] = assignment[pos]
@@ -134,7 +134,7 @@ proc adjustCounts*[T](state: AllDifferentState[T], oldValue, newValue: T) {.inli
     state.incrementCount(newValue)
     state.cost += state.contribution(oldValue)
     state.cost += state.contribution(newValue)
-                
+
 
 proc updatePosition*[T](state: AllDifferentState[T], position: int, newValue: T) =
     # State Update assigning newValue to position
@@ -181,7 +181,7 @@ proc moveDelta*[T](state: AllDifferentState[T], position: int, oldValue, newValu
                 result -= oldValueCount - 1
                 oldValueCount -= 1
                 result += max(0, oldValueCount - 1)
-            
+
                 state.currentAssignment[position] = newValue
                 newExpValue = exp.evaluate(state.currentAssignment)
                 state.currentAssignment[position] = oldValue

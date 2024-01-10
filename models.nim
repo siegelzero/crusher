@@ -1,4 +1,4 @@
-import std/sequtils
+import std/[sequtils, strformat]
 
 import constraints/constraint
 import expressions/expression
@@ -193,27 +193,45 @@ proc magicSquare*(n: int): ConstraintSystem[int] =
     return sys
 
 
-proc fooProblem*(): ConstraintSystem[int] =
-    var system = initConstraintSystem[int]()
-    var value = system.newConstrainedSequence(6)
+proc lcTest*(): ConstraintSystem[int] =
+    var sys = initConstraintSystem[int]()
+    var X = sys.newConstrainedSequence(3)
+    X.setDomain(toSeq 1..10)
 
-    value.setDomain(toSeq(0..<5))
+    sys.addConstraint(linearCombinationEq(@[X[0], X[1], X[2]], 5))
 
-    system.addConstraint(value[0] + value[1] + value[2] == 3)
-    system.addConstraint(value[3] + value[4] + value[5] == 3)
-    system.addConstraint(value[2] + value[3] == 2)
-
-    return system
+    return sys
 
 
-proc fooGrid*(): ConstraintSystem[int] =
-    var system = initConstraintSystem[int]()
-    var value = system.newConstrainedMatrix(3, 3)
+proc magicSquareLC*(n: int): ConstraintSystem[int] = 
+    # Magic Squares
+    var sys = initConstraintSystem[int]()
+    var X = sys.newConstrainedMatrix(n, n)
 
-    value.setDomain(toSeq(0..<3))
+    let target = n*(n*n + 1) div 2
+    echo fmt"Target: {target}"
 
-    system.addConstraint(value[0, 0] + value[0, 1] + value[0, 2] == 2)
-    system.addConstraint(value[1, 0] + value[1, 1] + value[1, 2] == 2)
-    system.addConstraint(value[2, 0] + value[2, 1] + value[2, 2] == 2)
+    # Row sums == target
+    for row in X.rows():
+        sys.addConstraint(linearCombinationEq(row, target))
 
-    return system
+    # Col sums == target
+    for col in X.columns():
+        sys.addConstraint(linearCombinationEq(col, target))
+        
+    # Diagonals
+    var terms: seq[Expression[int]] = @[]
+    for i in 0..<n:
+        terms.add(X[i, i])
+    sys.addConstraint(linearCombinationEq(terms, target))
+
+    terms = @[]
+    for i in 0..<n:
+        terms.add(X[i, n - i - 1])
+    sys.addConstraint(linearCombinationEq(terms, target))
+
+    # All entries in square must be distinct
+    sys.addConstraint(allDifferent(X))
+    X.setDomain(toSeq(1..n*n))
+
+    return sys

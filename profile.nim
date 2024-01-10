@@ -11,18 +11,21 @@ when isMainModule:
     let tenure = parseInt(paramStr(2))
     let threshold = parseInt(paramStr(3))
     # let x = MOLSSystem(n)
-    # let x = latinSquareSystem(n)
+   #  let x = latinSquareSystem(n)
     # let x = sendMoreMoney()
     # let x = ageProblem()
-    let x = magicSquare(n)
+   #  let x = magicSquare(n)
+   #  let x = magicSquareLC(n)
+    let x = nQueens2(n)
+   #  let x = lcTest()
     
     let then = epochTime()
 
-    x.findAssignment(tenure, threshold)
+    echo x.findAssignment(tenure, threshold)
 
-    for v in x.variables:
-        display(v)
-        echo ""
+   #  for v in x.variables:
+   #     display(v)
+   #     echo ""
 
     let now = epochTime()
     let diff = now - then
