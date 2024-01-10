@@ -31,6 +31,8 @@ type
 
 func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
     if cons.node.kind == BinaryRelNode and cons.node.binaryRel == EqualTo:
+        # If `not` is being called on an equality constraint, then use
+        # NotEqualTo constraint instead, since it is more efficient.
         return Constraint[T](
             scope: AlgebraicConstraint,
             positions: cons.positions,
