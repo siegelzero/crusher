@@ -54,7 +54,7 @@ proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: 
 # Penalty Map Routines
 ################################################################################
 
-proc updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline.} =
+proc updatePenaltiesForPosition[T](state: ArrayState[T], position: int) =
     # Computes penalties for all constraints involving the position, and updates penalty map
     var penalty: int
     for value in state.reducedDomain[position]:
@@ -64,7 +64,7 @@ proc updatePenaltiesForPosition[T](state: ArrayState[T], position: int) {.inline
         state.penaltyMap[position][value] = penalty
 
 
-proc updateNeighborPenalties*[T](state: ArrayState[T], position: int) {.inline.} =
+proc updateNeighborPenalties*[T](state: ArrayState[T], position: int) =
     # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
         state.updatePenaltiesForPosition(nbr)

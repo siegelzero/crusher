@@ -15,12 +15,12 @@ type
         GreaterThanEq,
         LessThan,
         LessThanEq,
-    
+
     NodeType* = enum
         UnaryRelNode,
         BinaryRelNode
-    
-    ConstraintNode*[T] = ref object
+
+    ConstraintNode*[T] {.acyclic.} = ref object
         case kind*: NodeType
             of UnaryRelNode:
                 unaryRel*: UnaryRelation

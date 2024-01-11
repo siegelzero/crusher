@@ -7,7 +7,7 @@ import expressionNode
 ################################################################################
 
 type
-    Expression*[T] = object
+    Expression*[T] {.acyclic.} = object
         positions*: PackedSet[int]
         node*: ExpressionNode[T]
 

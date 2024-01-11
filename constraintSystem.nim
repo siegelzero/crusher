@@ -27,7 +27,7 @@ type
     ConstraintSystem*[T] = ref object
         size*: int
         variables*: seq[ConstrainedVariable[T]]
-        carray*: ConstrainedArray[T]
+        baseArray*: ConstrainedArray[T]
         currentAssignment*: seq[T]
 
 
@@ -39,7 +39,7 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
     # Initializes empty ConstraintSystem
     return ConstraintSystem[T](
         size: 0,
-        carray: initConstrainedArray[T](0),
+        baseArray: initConstrainedArray[T](0),
         variables: newSeq[ConstrainedVariable[T]](),
         currentAssignment: newSeq[T]()
     )
@@ -52,10 +52,10 @@ func newConstrainedMatrix*[T](system: ConstraintSystem[T], m, n: int): Constrain
         m: m,
         n: n,
         system: system,
-        offset: system.carray.len,
+        offset: system.baseArray.len,
         size: m*n
     )
-    system.carray.extendArray(m*n)
+    system.baseArray.extendArray(m*n)
     system.variables.add(result)
 
 
@@ -65,10 +65,10 @@ proc newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): Constraine
         shape: Sequence,
         n: n,
         system: system,
-        offset: system.carray.len,
+        offset: system.baseArray.len,
         size: n
     )
-    system.carray.extendArray(n)
+    system.baseArray.extendArray(n)
     system.variables.add(result)
 
 ################################################################################
@@ -76,11 +76,11 @@ proc newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): Constraine
 ################################################################################
 
 func `[]`*[T](cvar: ConstrainedVariable[T], i: int): Expression[T] {.inline.} =
-    cvar.system.carray[cvar.offset + i]
+    cvar.system.baseArray[cvar.offset + i]
 
 
 func `[]`*[T](cvar: ConstrainedVariable[T], i, j: int): Expression[T] {.inline.} =
-    cvar.system.carray[cvar.offset + cvar.m*i + j]
+    cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
 
 func values*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
@@ -134,10 +134,10 @@ proc display*[T](cvar: ConstrainedVariable[T]) =
 ################################################################################
 
 func setDomain*[T](cvar: ConstrainedVariable[T], domain: openArray[T]) =
-    cvar.system.carray.setDomain(domain)
+    cvar.system.baseArray.setDomain(domain)
 
 func setDomain*[T](cvar: var ConstrainedArray[T], position: int, domain: openArray[T]) =
-    cvar.system.carray.setDomain(position, domain)
+    cvar.system.baseArray.setDomain(position, domain)
 
 ################################################################################
 # ConstrainedVariable constraints
@@ -148,7 +148,7 @@ proc allDifferent*[T](cvar: ConstrainedVariable[T]): Constraint[T] =
     allDifferent(cvar.basePositions())
 
 func addConstraint*[T](system: ConstraintSystem[T], constraint: Constraint[T]) =
-    system.carray.addConstraint(constraint)
+    system.baseArray.addConstraint(constraint)
 
 func basePositions*[T](cvar: ConstrainedVariable[T]): seq[int] =
     toSeq cvar.offset..<(cvar.offset + cvar.size)
@@ -157,4 +157,4 @@ func getAssignment*[T](cvar: ConstrainedVariable[T]): seq[T] =
     cvar.system.currentAssignment[cvar.offset..<(cvar.offset + cvar.size)]
 
 proc findAssignment*[T](system: ConstraintSystem[T], tenure, threshold: int) =
-    system.currentAssignment = system.carray.findAssignment(tenure, threshold)
+    system.currentAssignment = system.baseArray.findAssignment(tenure, threshold)

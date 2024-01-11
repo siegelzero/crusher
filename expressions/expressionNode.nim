@@ -8,19 +8,19 @@ type
     UnaryOperation = enum
         Negation,
         AbsoluteValue
-    
+
     BinaryOperation* = enum
         Addition,
         Subtraction,
         Multiplication
-    
+
     NodeType* = enum
         LiteralNode,
         RefNode,
         UnaryOpNode,
         BinaryOpNode
-    
-    ExpressionNode*[T] = ref object
+
+    ExpressionNode*[T] {.acyclic.} = ref object
         case kind*: NodeType
             of LiteralNode:
                 value*: T

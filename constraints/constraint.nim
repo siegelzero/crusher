@@ -13,7 +13,7 @@ type
         AllDifferentConstraint,
         LinearCombinationConstraint
 
-    Constraint*[T] = object
+    Constraint*[T] {.acyclic.} = object
         positions*: PackedSet[int]
         case scope*: ConstraintType
             of AlgebraicConstraint:
