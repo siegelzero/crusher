@@ -235,3 +235,16 @@ proc magicSquareLC*(n: int): ConstraintSystem[int] =
     X.setDomain(toSeq(1..n*n))
 
     return sys
+
+
+proc langford*(n: int): ConstraintSystem[int] =
+    var sys = initConstraintSystem[int]()
+    var position = sys.newConstrainedSequence(2*n)
+
+    for i in 0..<n:
+        sys.addConstraint(position[i + n] - position[i] == i + 2)
+
+    sys.addConstraint(allDifferent(position))
+    position.setDomain(toSeq 0..<(2*n))
+
+    return sys

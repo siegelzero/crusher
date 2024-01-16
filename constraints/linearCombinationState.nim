@@ -53,5 +53,5 @@ func updatePosition*[T](state: LinearCombinationState[T], position: int, newValu
 func moveDelta*[T](state: LinearCombinationState[T], position: int, oldValue, newValue: T): int {.inline.} =
     state.coefficient[position]*(newValue - oldValue)
 
-func evaluate*[T](state: LinearCombinationState[T]): T {.inline.} =
-    state.value
+# func evaluate*[T](state: LinearCombinationState[T]): T {.inline.} =
+#     state.value

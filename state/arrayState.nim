@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, strformat, tables]
+import std/[packedsets, random, sequtils, tables]
 
 import ../constraints/[constraint, allDifferentState, linearCombinationState]
 import ../constrainedArray
@@ -47,8 +47,6 @@ proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: 
                 result = 0
             else:
                 result = 1
-                # result = constraint.positions.len
-
 
 ################################################################################
 # Penalty Map Routines

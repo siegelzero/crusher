@@ -16,7 +16,6 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         bestMoveCost = high(int)
         oldPenalty: int
         oldValue: T
-        firstImprovement = true
 
     for position in state.carray.allPositions():
         oldValue = state.currentAssignment[position]
@@ -27,12 +26,7 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         for newValue in state.reducedDomain[position]:
             if newValue == oldValue:
                 continue
-
             delta = state.penaltyMap[position][newValue] - oldPenalty
-            # if delta < 0 and firstImprovement:
-            #     result = @[(position, newValue)]
-            #     return result
-
             if state.tabu[position][newValue] <= state.iteration or state.cost + delta < state.bestCost:
                 if state.cost + delta < bestMoveCost:
                     result = @[(position, newValue)]
@@ -51,13 +45,17 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.tabu[position][oldValue] = state.iteration + state.cost + rand(state.tenure)
 
 
-proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
+proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int): TabuState[T] =
+    var state = newTabuState[T](carray, tenure)
+    echo fmt"Searching for Assignment (thread {thread}):"
+    echo fmt"  tenure: {state.tenure}"
+    echo fmt"  tabuThreshold: {threshold}"
+    echo fmt"  initial cost: {state.cost}"
     var lastImprovement = 0
     let blockSize = 10000
     var now, rate: float
     var then = epochTime()
     var beginning = then
-
 
     while state.iteration - lastImprovement < threshold:
         state.applyBestMove()
@@ -71,7 +69,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
             state.bestCost = state.cost
             state.bestAssignment = state.currentAssignment
         if state.cost == 0:
-            echo fmt"Solution found on iteration {state.iteration} after {epochTime() - beginning:.3f} sec"
+            echo fmt"Solution found (thread {thread}) on iteration {state.iteration} after {epochTime() - beginning:.3f} sec"
             return state
         state.iteration += 1
     if state.cost != 0:
@@ -81,43 +79,26 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     return state
 
 
-proc batchImprove*[T](states: seq[TabuState[T]], tabuThreshold: int): seq[TabuState[T]] =
-    var
-        jobs: seq[FlowVarBase]
-        idx: int
-        res: TabuState[T]
-
-    for state in states:
-        jobs.add(spawn state.tabuImprove(tabuThreshold))
-
-    sync()
-
-    for job in jobs:
-        result.add(^FlowVar[TabuState[T]](job))
-
-
-proc parallelSearch*[T](carray: ConstrainedArray[T], threshold: int): TabuState[T] =
+iterator parallelSearch*[T](carray: ConstrainedArray[T], tenure, tabuThreshold: int): TabuState[T] =
     let N = countProcessors()
-    var initial: seq[TabuState[T]]
     var solutionFound = false
+    var jobs = newSeq[FlowVarBase](N)
+    var idx: int
+    var res: TabuState[T]
 
     for i in 0..<N:
-        initial.add(newTabuState[T](carray))
+        jobs[i] = (spawn carray.tabuImprove(tenure, tabuThreshold, i))
     
-    for improved in batchImprove(initial, threshold):
-        if improved.cost == 0:
-            solutionFound = true
-            return improved
-    
-    doAssert solutionFound
+    while jobs.len > 0:
+        idx = blockUntilAny(jobs)
+        echo fmt"blocked until thread {idx}"
+        res = ^FlowVar[TabuState[T]](jobs[idx])
+        yield res
+        jobs.del(idx)
+        if res.cost == 0:
+            break
 
-
-proc findAssignment*[T](carray: ConstrainedArray[T], tenure = 6, threshold = 10000): seq[T] =
-    var state = newTabuState(carray, tenure)
-    echo "Searching for Assignment:"
-    echo fmt"  tenure: {tenure}"
-    echo fmt"  tabuThreshold: {threshold}"
-    echo fmt"  initial cost: {state.cost}"
-    let improved = state.tabuImprove(threshold)
-    doAssert improved.cost == 0
-    return improved.currentAssignment
+proc resolve*[T](carray: ConstrainedArray[T], tenure = 6, tabuThreshold = 10000): TabuState[T] =
+    for imp in carray.parallelSearch(tenure, tabuThreshold):
+        if imp.cost == 0:
+            return imp

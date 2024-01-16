@@ -21,7 +21,7 @@ type
             of ExpressionBased:
                 countTable: Table[T, int]
                 expressions: seq[Expression[T]]
-                expressionsAtPosition: Table[int, seq[Expression[T]]]
+                expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################
 # AllDifferentState Creation
@@ -37,14 +37,14 @@ func init*[T](state: AllDifferentState[T], positions: openArray[T]) =
 func init*[T](state: AllDifferentState[T], expressions: seq[Expression[T]]) =
     state.cost = 0
     state.evalMethod = ExpressionBased
-    state.expressionsAtPosition = initTable[int, seq[Expression[T]]]()
+    state.expressionsAtPosition = initTable[int, seq[int]]()
 
-    for exp in expressions:
+    for i, exp in expressions:
         for pos in exp.positions.items:
             if pos in state.expressionsAtPosition:
-                state.expressionsAtPosition[pos].add(exp)
+                state.expressionsAtPosition[pos].add(i)
             else:
-                state.expressionsAtPosition[pos] = @[exp]
+                state.expressionsAtPosition[pos] = @[i]
 
     state.expressions = expressions
     state.countTable = initTable[T, int]()
@@ -68,6 +68,7 @@ func getCount[T](state: AllDifferentState[T], value: T): int {.inline.} =
     case state.evalMethod:
         of PositionBased:
             if value >= state.count.len:
+                # Extend count seq with 0s if necessary
                 state.count &= repeat(0, value - state.count.len + 1)
                 return 0
             return state.count[value]
@@ -87,6 +88,7 @@ func incrementCount[T](state: AllDifferentState[T], value: T) {.inline.} =
             if value < state.count.len:
                 state.count[value] += 1
             else:
+                # Extend count seq with 0s if needed
                 state.count &= repeat(0, value - state.count.len + 1)
                 state.count[value] = 1
         of ExpressionBased:
@@ -147,10 +149,10 @@ proc updatePosition*[T](state: AllDifferentState[T], position: int, newValue: T)
 
             of ExpressionBased:
                 var oldExpValue, newExpValue: T
-                for expression in state.expressionsAtPosition[position]:
-                    oldExpValue = expression.evaluate(state.currentAssignment)
+                for i in state.expressionsAtPosition[position]:
+                    oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
                     state.currentAssignment[position] = newValue
-                    newExpValue = expression.evaluate(state.currentAssignment)
+                    newExpValue = state.expressions[i].evaluate(state.currentAssignment)
                     state.adjustCounts(oldExpValue, newExpValue)
 
 
@@ -174,8 +176,8 @@ proc moveDelta*[T](state: AllDifferentState[T], position: int, oldValue, newValu
             result += newValueCount - 1
 
         of ExpressionBased:
-            for exp in state.expressionsAtPosition[position]:
-                oldExpValue = exp.evaluate(state.currentAssignment)
+            for i in state.expressionsAtPosition[position]:
+                oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
 
                 oldValueCount = state.getCount(oldExpValue)
                 result -= oldValueCount - 1
@@ -183,7 +185,7 @@ proc moveDelta*[T](state: AllDifferentState[T], position: int, oldValue, newValu
                 result += max(0, oldValueCount - 1)
 
                 state.currentAssignment[position] = newValue
-                newExpValue = exp.evaluate(state.currentAssignment)
+                newExpValue = state.expressions[i].evaluate(state.currentAssignment)
                 state.currentAssignment[position] = oldValue
 
                 newValueCount = state.getCount(newExpValue)
