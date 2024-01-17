@@ -1,8 +1,8 @@
 import std/packedsets
 
-import crusher/constraints/constraint
-import crusher/expressions/expression
-import crusher/constraintSystem
+import constraints/constraint
+import expressions/expression
+import constraintSystem
 
 export constraintSystem,
        constraint,
