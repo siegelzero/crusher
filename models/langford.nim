@@ -1,10 +1,7 @@
-import std/[os, packedsets, sequtils, strutils]
+import std/[os, sequtils, strutils]
 
-import ../expressions/expression
-import ../constraints/constraint
-import ../constraintSystem
-import ../constrainedArray
-import ../heuristics/tabuSearch
+import crusher
+
 
 
 proc langford*(n: int) =
