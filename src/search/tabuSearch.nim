@@ -1,7 +1,4 @@
 import std/[packedsets, random, strformat, tables, times]
-import cpuinfo
-import threadpool
-
 import ../constraints/constraint
 import ../expressions/expression
 import ../constrainedArray
@@ -18,7 +15,7 @@ func bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
         oldValue: T
 
     for position in state.carray.allPositions():
-        oldValue = state.currentAssignment[position]
+        oldValue = state.assignment[position]
         oldPenalty = state.penaltyMap[position][oldValue]
         if oldPenalty == 0:
             continue
@@ -40,17 +37,13 @@ proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
 
     if moves.len > 0:
         let (position, newValue) = sample(moves)
-        let oldValue = state.currentAssignment[position]
+        let oldValue = state.assignment[position]
         state.assignValue(position, newValue)
         state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
 
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
     var state = newArrayState[T](carray)
-    # echo fmt"Searching for Assignment (thread {thread}):"
-    # echo fmt"  tenure: {state.tenure}"
-    # echo fmt"  tabuThreshold: {threshold}"
-    # echo fmt"  initial cost: {state.cost}"
     var lastImprovement = 0
     let blockSize = 10000
     var now, rate: float
@@ -67,7 +60,7 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T]
         if state.cost < state.bestCost:
             lastImprovement = state.iteration
             state.bestCost = state.cost
-            state.bestAssignment = state.currentAssignment
+            state.bestAssignment = state.assignment
         if state.cost == 0:
             rate = float(state.iteration) / (now - beginning)
             echo fmt"Solution found on iteration {state.iteration} after {now - beginning:.3f} sec at {rate:.3f} moves/sec"
@@ -75,29 +68,6 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T]
         state.iteration += 1
     if state.cost != 0:
         state.cost = state.bestCost
-        state.currentAssignment = state.bestAssignment
+        state.assignment = state.bestAssignment
         state.rebuildPenaltyMap()
     return state
-
-
-iterator parallelSearch*[T](carray: ConstrainedArray[T], tabuThreshold: int): ArrayState[T] =
-    let N = countProcessors()
-    var jobs = newSeq[FlowVarBase](N)
-    var idx: int
-    var res: ArrayState[T]
-
-    for i in 0..<N:
-        jobs[i] = spawn carray.tabuImprove(tabuThreshold)
-    
-    while jobs.len > 0:
-        idx = blockUntilAny(jobs)
-        res = ^FlowVar[ArrayState[T]](jobs[idx])
-        yield res
-        jobs.del(idx)
-        if res.cost == 0:
-            break
-
-proc resolve*[T](carray: ConstrainedArray[T], tabuThreshold = 10000): ArrayState[T] =
-    for imp in carray.parallelSearch(tabuThreshold):
-        if imp.cost == 0:
-            return imp

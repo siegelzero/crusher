@@ -3,7 +3,7 @@ import std/[packedsets, sequtils]
 import constrainedArray
 import constraints/constraint
 import expressions/expression
-import heuristics/tabuSearch
+import search/[heuristics, tabuSearch]
 
 ################################################################################
 # Type definitions
@@ -28,7 +28,7 @@ type
         size*: int
         variables*: seq[ConstrainedVariable[T]]
         baseArray*: ConstrainedArray[T]
-        currentAssignment*: seq[T]
+        assignment*: seq[T]
 
 
 ################################################################################
@@ -41,7 +41,7 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
         size: 0,
         baseArray: initConstrainedArray[T](0),
         variables: newSeq[ConstrainedVariable[T]](),
-        currentAssignment: newSeq[T]()
+        assignment: newSeq[T]()
     )
 
 
@@ -154,12 +154,4 @@ func basePositions*[T](cvar: ConstrainedVariable[T]): seq[int] =
     toSeq cvar.offset..<(cvar.offset + cvar.size)
 
 func getAssignment*[T](cvar: ConstrainedVariable[T]): seq[T] =
-    cvar.system.currentAssignment[cvar.offset..<(cvar.offset + cvar.size)]
-
-proc findAssignment*[T](system: ConstraintSystem[T], tenure, threshold: int) =
-    system.currentAssignment = system.baseArray.findAssignment(tenure, threshold)
-
-proc resolve*[T](system: ConstraintSystem[T], threshold = 10000) =
-    for imp in system.baseArray.parallelSearch(threshold):
-        if imp.cost == 0:
-            system.currentAssignment = imp.currentAssignment
+    cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]

@@ -17,7 +17,7 @@ type
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
 
-        currentAssignment*: seq[T]
+        assignment*: seq[T]
         cost*: int
 
         bestAssignment*: seq[T]
@@ -33,16 +33,16 @@ type
 
 proc penalty*[T](state: ArrayState[T], constraint: Constraint[T]): int {.inline.} =
     # Computes the penalty of the constraint, using current assignment of state.
-    return constraint.penalty(state.currentAssignment)
+    return constraint.penalty(state.assignment)
 
 
 proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: int, newValue: T): int {.inline.} =
-    let oldValue = state.currentAssignment[position]
+    let oldValue = state.assignment[position]
     case constraint.scope:
         of AlgebraicConstraint:
-            state.currentAssignment[position] = newValue
+            state.assignment[position] = newValue
             result = state.penalty(constraint)
-            state.currentAssignment[position] = oldValue
+            state.assignment[position] = oldValue
         of AllDifferentConstraint:
             result = constraint.state.cost + constraint.state.moveDelta(position, oldValue, newValue)
         of LinearCombinationConstraint:
@@ -110,20 +110,20 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         state.neighbors[pos] = toSeq(neighborSet)
 
     # Initialize with random assignment
-    state.currentAssignment = newSeq[T](carray.len)
+    state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        state.currentAssignment[pos] = sample(state.reducedDomain[pos])
+        state.assignment[pos] = sample(state.reducedDomain[pos])
     
     # Initialize global constraint states
     for cons in state.computedConstraints:
-        cons.initialize(state.currentAssignment)
+        cons.initialize(state.assignment)
 
     # Compute cost
     for cons in carray.constraints:
         state.cost += state.penalty(cons)
 
     state.bestCost = state.cost
-    state.bestAssignment = state.currentAssignment
+    state.bestAssignment = state.assignment
 
     # Construct penalty map for each location and value
     state.penaltyMap = newSeq[seq[int]](state.carray.len)
@@ -145,10 +145,10 @@ proc newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
 
 proc assignValue*[T](state: ArrayState[T], position: int, value: T) =
     # Updates current assignment of state by setting value to the position
-    let penalty = state.penaltyMap[position][state.currentAssignment[position]]
+    let penalty = state.penaltyMap[position][state.assignment[position]]
     let delta = state.penaltyMap[position][value] - penalty
     # Update assignment
-    state.currentAssignment[position] = value
+    state.assignment[position] = value
 
     # Update all computed constraints that involve this position
     for cons in state.computedConstraints:
