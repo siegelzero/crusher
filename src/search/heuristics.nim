@@ -1,5 +1,4 @@
-import cpuinfo
-import threadpool
+import std/[cpuinfo, strformat, threadpool]
 
 import ../constrainedArray
 import ../state/arrayState
@@ -22,3 +21,23 @@ iterator parallelSearch*[T](carray: ConstrainedArray[T], tabuThreshold: int): Ar
         jobs.del(idx)
         if res.cost == 0:
             break
+
+
+proc hybrid*[T](carray: ConstrainedArray[T], tabuThreshold: int): ArrayState[T] =
+    var initial: seq[ArrayState[T]]
+
+    for improved in carray.parallelSearch(tabuThreshold):
+        if improved.cost == 0:
+            return improved
+        initial.add(improved)
+
+    doAssert initial.len >= 2
+    echo fmt"initial population: {initial.len}"
+
+    var A, B: ArrayState[T]
+    A = initial.pop()
+    B = initial.pop()
+
+    echo fmt"Found {A.cost} -- {B.cost}"
+
+    return A

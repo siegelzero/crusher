@@ -66,8 +66,4 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T]
             echo fmt"Solution found on iteration {state.iteration} after {now - beginning:.3f} sec at {rate:.3f} moves/sec"
             return state
         state.iteration += 1
-    if state.cost != 0:
-        state.cost = state.bestCost
-        state.assignment = state.bestAssignment
-        state.rebuildPenaltyMap()
     return state
