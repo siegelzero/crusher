@@ -159,7 +159,7 @@ func getAssignment*[T](cvar: ConstrainedVariable[T]): seq[T] =
 proc findAssignment*[T](system: ConstraintSystem[T], tenure, threshold: int) =
     system.currentAssignment = system.baseArray.findAssignment(tenure, threshold)
 
-proc resolve*[T](system: ConstraintSystem[T], tenure = 6, threshold = 10000) =
-    for imp in system.baseArray.parallelSearch(tenure, threshold):
+proc resolve*[T](system: ConstraintSystem[T], threshold = 10000) =
+    for imp in system.baseArray.parallelSearch(threshold):
         if imp.cost == 0:
             system.currentAssignment = imp.currentAssignment

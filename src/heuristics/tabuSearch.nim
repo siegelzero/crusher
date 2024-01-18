@@ -5,12 +5,12 @@ import threadpool
 import ../constraints/constraint
 import ../expressions/expression
 import ../constrainedArray
-import ../state/[arrayState, tabuState]
+import ../state/arrayState
 
 randomize()
 
 
-func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
+func bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
     var
         delta: int
         bestMoveCost = high(int)
@@ -35,18 +35,18 @@ func bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     result.add((position, newValue))
 
 
-proc applyBestMove[T](state: TabuState[T]) {.inline.} =
+proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
     let moves = state.bestMoves()
 
     if moves.len > 0:
         let (position, newValue) = sample(moves)
         let oldValue = state.currentAssignment[position]
         state.assignValue(position, newValue)
-        state.tabu[position][oldValue] = state.iteration + state.cost + rand(state.tenure)
+        state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
 
 
-proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int): TabuState[T] =
-    var state = newTabuState[T](carray, tenure)
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
+    var state = newArrayState[T](carray)
     # echo fmt"Searching for Assignment (thread {thread}):"
     # echo fmt"  tenure: {state.tenure}"
     # echo fmt"  tabuThreshold: {threshold}"
@@ -70,7 +70,7 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int
             state.bestAssignment = state.currentAssignment
         if state.cost == 0:
             rate = float(state.iteration) / (now - beginning)
-            echo fmt"Solution found (thread {thread}) on iteration {state.iteration} after {now - beginning:.3f} sec at {rate:.3f} moves/sec"
+            echo fmt"Solution found on iteration {state.iteration} after {now - beginning:.3f} sec at {rate:.3f} moves/sec"
             return state
         state.iteration += 1
     if state.cost != 0:
@@ -80,24 +80,24 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int
     return state
 
 
-iterator parallelSearch*[T](carray: ConstrainedArray[T], tenure, tabuThreshold: int): TabuState[T] =
+iterator parallelSearch*[T](carray: ConstrainedArray[T], tabuThreshold: int): ArrayState[T] =
     let N = countProcessors()
     var jobs = newSeq[FlowVarBase](N)
     var idx: int
-    var res: TabuState[T]
+    var res: ArrayState[T]
 
     for i in 0..<N:
-        jobs[i] = (spawn carray.tabuImprove(tenure, tabuThreshold, i))
+        jobs[i] = spawn carray.tabuImprove(tabuThreshold)
     
     while jobs.len > 0:
         idx = blockUntilAny(jobs)
-        res = ^FlowVar[TabuState[T]](jobs[idx])
+        res = ^FlowVar[ArrayState[T]](jobs[idx])
         yield res
         jobs.del(idx)
         if res.cost == 0:
             break
 
-proc resolve*[T](carray: ConstrainedArray[T], tenure = 6, tabuThreshold = 10000): TabuState[T] =
-    for imp in carray.parallelSearch(tenure, tabuThreshold):
+proc resolve*[T](carray: ConstrainedArray[T], tabuThreshold = 10000): ArrayState[T] =
+    for imp in carray.parallelSearch(tabuThreshold):
         if imp.cost == 0:
             return imp

@@ -23,6 +23,10 @@ type
         bestAssignment*: seq[T]
         bestCost*: int
 
+        iteration*: int
+        tabu*: seq[seq[int]]
+        tenure*: int
+
 ################################################################################
 # Penalty Routines
 ################################################################################
@@ -83,6 +87,12 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     state.neighbors = newSeq[seq[int]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 
+    state.iteration = 0
+    state.tabu = newSeq[seq[int]](carray.len)
+
+    for pos in carray.allPositions():
+        state.tabu[pos] = newSeq[int](max(state.reducedDomain[pos]) + 1)
+
     # Group constraints involving each position
     for constraint in carray.constraints:
         for pos in constraint.positions:
@@ -124,7 +134,7 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         state.updatePenaltiesForPosition(pos)
 
 
-func newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
+proc newArrayState*[T](carray: ConstrainedArray[T]): ArrayState[T] =
     # Allocates and initializes new ArrayState[T]
     new(result)
     result.init(carray)
