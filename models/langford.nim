@@ -3,11 +3,7 @@ import std/[os, sequtils, strutils]
 import crusher
 
 
-
 proc langford*(n: int) =
-    let tenure = 6
-    let threshold = 100000
-
     var sys = initConstraintSystem[int]()
     var position = sys.newConstrainedSequence(2*n)
     position.setDomain(toSeq 0..<(2*n))
@@ -16,7 +12,7 @@ proc langford*(n: int) =
         sys.addConstraint(position[i + n] - position[i] == i + 2)
 
     sys.addConstraint(allDifferent(position))
-    sys.resolve(tenure, threshold)
+    sys.resolve()
 
     var lseq = newSeq[int](2*n)
     var ass = position.getAssignment()

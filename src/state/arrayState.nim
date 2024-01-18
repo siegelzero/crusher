@@ -88,7 +88,6 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
         if constraint.scope == AllDifferentConstraint or constraint.scope == LinearCombinationConstraint:
-            echo "adding constraint to computedConstraints"
             state.computedConstraints.add(constraint)
     
     # Collect neighbors of each position

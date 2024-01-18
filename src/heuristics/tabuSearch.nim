@@ -47,10 +47,10 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int): TabuState[T] =
     var state = newTabuState[T](carray, tenure)
-    echo fmt"Searching for Assignment (thread {thread}):"
-    echo fmt"  tenure: {state.tenure}"
-    echo fmt"  tabuThreshold: {threshold}"
-    echo fmt"  initial cost: {state.cost}"
+    # echo fmt"Searching for Assignment (thread {thread}):"
+    # echo fmt"  tenure: {state.tenure}"
+    # echo fmt"  tabuThreshold: {threshold}"
+    # echo fmt"  initial cost: {state.cost}"
     var lastImprovement = 0
     let blockSize = 10000
     var now, rate: float
@@ -63,7 +63,7 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], tenure, threshold, thread: int
         if state.iteration > 0 and state.iteration mod blockSize == 0:
             rate = float(blockSize) / (now - then)
             then = now
-            echo fmt"Iteration: {state.iteration}  Current: {state.cost}  Best: {state.bestCost}  Rate: {rate:.3f} moves/sec"
+            # echo fmt"Iteration: {state.iteration}  Current: {state.cost}  Best: {state.bestCost}  Rate: {rate:.3f} moves/sec"
         if state.cost < state.bestCost:
             lastImprovement = state.iteration
             state.bestCost = state.cost
@@ -91,7 +91,6 @@ iterator parallelSearch*[T](carray: ConstrainedArray[T], tenure, tabuThreshold: 
     
     while jobs.len > 0:
         idx = blockUntilAny(jobs)
-        echo fmt"blocked until thread {idx}"
         res = ^FlowVar[TabuState[T]](jobs[idx])
         yield res
         jobs.del(idx)
