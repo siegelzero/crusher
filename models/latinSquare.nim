@@ -25,7 +25,7 @@ proc latinSquare*(n: int) =
 
     sys.resolve()
 
-    X.display()
+    echo X
 
 
 when isMainModule:

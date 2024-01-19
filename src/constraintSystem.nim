@@ -10,26 +10,22 @@ import search/[heuristics, tabuSearch]
 ################################################################################
 
 type
-    VariableShape = enum
-        Sequence, Matrix
+    VariableContainer[T] = ref object of RootObj
+        system: ConstraintSystem[T]
+        offset: int
+        size: int
 
-    ConstrainedVariable*[T] = object
-        system*: ConstraintSystem[T]
-        offset*: int
-        size*: int
-        n*: int
-        case shape*: VariableShape
-            of Matrix:
-                m*: int
-            of Sequence:
-                discard
+    ConstrainedSequence*[T] = ref object of VariableContainer[T]
+        n: int
+
+    ConstrainedMatrix*[T] = ref object of VariableContainer[T]
+        m, n: int
 
     ConstraintSystem*[T] = ref object
         size*: int
-        variables*: seq[ConstrainedVariable[T]]
+        variables*: seq[VariableContainer[T]]
         baseArray*: ConstrainedArray[T]
         assignment*: seq[T]
-
 
 ################################################################################
 # ConstraintSystem creation
@@ -40,118 +36,107 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
     return ConstraintSystem[T](
         size: 0,
         baseArray: initConstrainedArray[T](0),
-        variables: newSeq[ConstrainedVariable[T]](),
+        variables: newSeq[VariableContainer[T]](),
         assignment: newSeq[T]()
     )
 
+################################################################################
+# Constrained Variable creation
+################################################################################
 
-func newConstrainedMatrix*[T](system: ConstraintSystem[T], m, n: int): ConstrainedVariable[T] =
-    # Creates new ConstrainedVariable in the form of an mxn matrix, adding the variable to the system.
-    result = ConstrainedVariable[T](
-        shape: Matrix,
-        m: m,
-        n: n,
-        system: system,
-        offset: system.baseArray.len,
-        size: m*n
-    )
-    system.baseArray.extendArray(m*n)
+func init*[T](cvar: VariableContainer[T], system: ConstraintSystem[T]) =
+    cvar.system = system
+    cvar.offset = system.baseArray.len
+
+func init*[T](cvar: ConstrainedSequence[T], system: ConstraintSystem[T], n: int) =
+    cvar.init(system)
+    cvar.size = n
+    cvar.n = n
+
+func init*[T](cvar: ConstrainedMatrix[T], system: ConstraintSystem[T], m, n: int) =
+    cvar.init(system)
+    cvar.size = m*n
+    cvar.m = m
+    cvar.n = n
+
+# system.newConstrainedSequence(n)
+func newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): ConstrainedSequence[T] =
+    new(result)
+    result.init(system, n)
+    system.baseArray.extendArray(n)
     system.variables.add(result)
 
-
-proc newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): ConstrainedVariable[T] =
-    # Creates new ConstrainedVariable in the form of a length n seq, adding the variable to the system.
-    result = ConstrainedVariable[T](
-        shape: Sequence,
-        n: n,
-        system: system,
-        offset: system.baseArray.len,
-        size: n
-    )
-    system.baseArray.extendArray(n)
+func newConstrainedMatrix*[T](system: ConstraintSystem[T], m, n: int): ConstrainedMatrix[T] =
+    new(result)
+    result.init(system, m, n)
+    system.baseArray.extendArray(m*n)
     system.variables.add(result)
 
 ################################################################################
 # ConstrainedVariable access
 ################################################################################
 
-func `[]`*[T](cvar: ConstrainedVariable[T], i: int): Expression[T] {.inline.} =
+func `[]`*[T](cvar: ConstrainedSequence[T], i: int): Expression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + i]
 
-
-func `[]`*[T](cvar: ConstrainedVariable[T], i, j: int): Expression[T] {.inline.} =
+func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): Expression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
+func basePositions*[T](cvar: VariableContainer[T]): seq[int] =
+    toSeq cvar.offset..<(cvar.offset + cvar.size)
 
-func values*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
-    case cvar.shape:
-        of Matrix:
-            for i in 0..<cvar.m:
-                for j in 0..<cvar.n:
-                    result.add(cvar[i, j])
-        of Sequence:
-            for i in 0..<cvar.n:
-                result.add(cvar[i])
+func getAssignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
+    cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
 
+func getAssignment*[T](cvar: ConstrainedMatrix[T]): seq[seq[T]] =
+    let values = cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
+    for i in 0..<cvar.m:
+        result.add(values[cvar.m*i..<(cvar.m*i + cvar.n)])
 
-iterator columns*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
-    case cvar.shape:
-        of Matrix:
-            var col: seq[Expression[T]]
-            for i in 0..<cvar.n:
-                col = @[]
-                for j in 0..<cvar.m:
-                    col.add(cvar[j, i])
-                yield col
-        of Sequence:
-            discard
+################################################################################
+# Useful Iterators
+################################################################################
 
+iterator columns*[T](cvar: ConstrainedMatrix[T]): seq[Expression[T]] =
+    var col: seq[Expression[T]]
+    for i in 0..<cvar.n:
+        col = @[]
+        for j in 0..<cvar.m:
+            col.add(cvar[j, i])
+        yield col
 
-iterator rows*[T](cvar: ConstrainedVariable[T]): seq[Expression[T]] =
-    case cvar.shape:
-        of Matrix:
-            var row: seq[Expression[T]]
-            for i in 0..<cvar.m:
-                row = @[]
-                for j in 0..<cvar.n:
-                    row.add(cvar[i, j])
-                yield row
-        of Sequence:
-            discard
+iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[Expression[T]] =
+    var row: seq[Expression[T]]
+    for i in 0..<cvar.m:
+        row = @[]
+        for j in 0..<cvar.n:
+            row.add(cvar[i, j])
+        yield row
 
+################################################################################
+# Displaying
+################################################################################
 
-proc display*[T](cvar: ConstrainedVariable[T]) =
-    case cvar.shape:
-        of Sequence:
-            echo cvar.getAssignment()
-        of Matrix:
-            let assignment = cvar.getAssignment()
-            for i in 0..<cvar.m:
-                echo assignment[cvar.m*i..<(cvar.m*i + cvar.n)]
+func `$`*[T](cvar: ConstrainedSequence[T]): string = $(cvar.getAssignment())
+func `$`*[T](cvar: ConstrainedMatrix[T]): string = $(cvar.getAssignment())
 
 ################################################################################
 # ConstrainedVariable domains
 ################################################################################
 
-func setDomain*[T](cvar: ConstrainedVariable[T], domain: openArray[T]) =
+func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
+    # sets the domain of the constrained variable
     cvar.system.baseArray.setDomain(domain)
-
-func setDomain*[T](cvar: var ConstrainedArray[T], position: int, domain: openArray[T]) =
-    cvar.system.baseArray.setDomain(position, domain)
 
 ################################################################################
 # ConstrainedVariable constraints
 ################################################################################
 
-proc allDifferent*[T](cvar: ConstrainedVariable[T]): Constraint[T] =
-    # allDifferent on constrained variable
+proc allDifferent*[T](cvar: VariableContainer[T]): Constraint[T] =
+    # all-different constraint for the variable
+    # Returns constraint requiring that all values in the container be distinct.
     allDifferent(cvar.basePositions())
 
 func addConstraint*[T](system: ConstraintSystem[T], constraint: Constraint[T]) =
+    # adds constraint to the system
     system.baseArray.addConstraint(constraint)
-
-func basePositions*[T](cvar: ConstrainedVariable[T]): seq[int] =
-    toSeq cvar.offset..<(cvar.offset + cvar.size)
-
-func getAssignment*[T](cvar: ConstrainedVariable[T]): seq[T] =
-    cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
