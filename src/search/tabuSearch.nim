@@ -46,8 +46,7 @@ proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
         state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
 
 
-proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
-    var state = newArrayState[T](carray)
+proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =
     var lastImprovement = 0
 
     while state.iteration - lastImprovement < threshold:
@@ -60,3 +59,8 @@ proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T]
             return state
         state.iteration += 1
     return state
+
+
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
+    var state = newArrayState[T](carray)
+    return state.tabuImprove(threshold)
