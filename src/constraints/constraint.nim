@@ -194,7 +194,6 @@ proc linearCombinationEq*[T](expressions: seq[Expression[T]], target: T): Constr
     
     doAssert allRefs
     # Use more efficient position based constraint if all expressions are refnodes
-    echo "fancypants"
     return linearCombinationEq(positions.items.toSeq, target)
 
 ################################################################################

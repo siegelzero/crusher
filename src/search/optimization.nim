@@ -6,21 +6,17 @@ import ../expressions/expression
 import ../constraintSystem
 
 
-proc minimize*[T](system: ConstraintSystem[T], objective: Expression[T]): seq[T] =
+proc minimize*[T](system: ConstraintSystem[T], objective: Expression[T]) =
     # Find initial solution
     system.resolve()
     var currentCost = objective.evaluate(system.assignment)
-    var bestAssignment = system.assignment
-    echo fmt"Found solution {currentCost} with assignment {bestAssignment}"
+    echo fmt"Found solution with cost {currentCost}"
 
     while true:
         system.addConstraint(objective < currentCost)
         try:
             system.resolve()
             currentCost = objective.evaluate(system.assignment)
-            bestAssignment = system.assignment
-            echo fmt"Found solution {currentCost} with assignment {system.assignment}"
+            echo fmt"Found solution with cost {currentCost}"
         except NoSolutionFoundError:
-            break
-    
-    return bestAssignment
+            return

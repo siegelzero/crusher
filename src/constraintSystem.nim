@@ -3,7 +3,6 @@ import std/[packedsets, sequtils]
 import constrainedArray
 import constraints/constraint
 import expressions/expression
-import search/[heuristics, tabuSearch]
 
 ################################################################################
 # Type definitions
@@ -140,3 +139,8 @@ proc allDifferent*[T](cvar: VariableContainer[T]): Constraint[T] =
 func addConstraint*[T](system: ConstraintSystem[T], constraint: Constraint[T]) =
     # adds constraint to the system
     system.baseArray.addConstraint(constraint)
+
+func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[Constraint[T]]) =
+    # adds constraints to the system
+    for constraint in constraints:
+        system.baseArray.addConstraint(constraint)
