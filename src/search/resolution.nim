@@ -1,12 +1,16 @@
+import os
+
 import heuristics
 import ../constraintSystem
 
 
-proc resolve*[T](system: ConstraintSystem[T], threshold = 1000) =
-    # for improved in system.baseArray.parallelSearch(threshold):
-    #     doAssert improved.cost == 0
-    #     system.assignment = improved.assignment
+type NoSolutionFoundError* = object of CatchableError
 
-    var improved = system.baseArray.hybrid(threshold, 8, 1)
-    doAssert improved.cost == 0
-    system.assignment = improved.assignment
+
+proc resolve*[T](system: ConstraintSystem[T], threshold = 1000, attempts=10) = 
+    for improved in system.baseArray.parallelSearch(threshold, attempts):
+        if improved.cost == 0:
+            system.assignment = improved.assignment
+            return
+
+    raise newException(NoSolutionFoundError, "Couldn't find satisfying solution")

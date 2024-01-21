@@ -85,10 +85,10 @@ func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): Expression[T] {.inline.} =
 func basePositions*[T](cvar: VariableContainer[T]): seq[int] =
     toSeq cvar.offset..<(cvar.offset + cvar.size)
 
-func getAssignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
+func assignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
     cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
 
-func getAssignment*[T](cvar: ConstrainedMatrix[T]): seq[seq[T]] =
+func assignment*[T](cvar: ConstrainedMatrix[T]): seq[seq[T]] =
     let values = cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
     for i in 0..<cvar.m:
         result.add(values[cvar.m*i..<(cvar.m*i + cvar.n)])
@@ -117,8 +117,8 @@ iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[Expression[T]] =
 # Displaying
 ################################################################################
 
-func `$`*[T](cvar: ConstrainedSequence[T]): string = $(cvar.getAssignment())
-func `$`*[T](cvar: ConstrainedMatrix[T]): string = $(cvar.getAssignment())
+func `$`*[T](cvar: ConstrainedSequence[T]): string = $(cvar.assignment)
+func `$`*[T](cvar: ConstrainedMatrix[T]): string = $(cvar.assignment)
 
 ################################################################################
 # ConstrainedVariable domains

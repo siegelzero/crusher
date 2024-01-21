@@ -2,11 +2,12 @@ import std/packedsets
 
 import constraints/constraint
 import expressions/expression
-import search/resolution
+import search/[optimization, resolution]
 import constraintSystem
 
 export constraintSystem,
        constraint,
        expression,
+       optimization,
        resolution,
        packedsets

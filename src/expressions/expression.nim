@@ -12,6 +12,12 @@ type
         node*: ExpressionNode[T]
 
 ################################################################################
+# Unary Expression Operations
+################################################################################
+
+func `-`*[T](exp: Expression[T]): Expression[T] {.inline.} = -1*exp
+
+################################################################################
 # Binary (Expression, Expression) Operations
 ################################################################################
 
@@ -68,3 +74,4 @@ ExpValOp(`-`, Subtraction)
 
 func evaluate*[T](exp: Expression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     exp.node.evaluate(assignment)
+
