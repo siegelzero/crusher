@@ -7,7 +7,7 @@ import ../expressions/[expression, expressionNode]
 ################################################################################
 
 type
-    StateEvalMethod* = enum
+    StateEvalMethod = enum
         ExpressionBased,
         PositionBased
 

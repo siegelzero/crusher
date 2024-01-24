@@ -29,28 +29,36 @@ type
 # Unary Constraint Relations
 ################################################################################
 
-func `not`*[T](cons: Constraint[T]): Constraint[T] {.inline.} =
-    if cons.node.kind == BinaryRelNode and cons.node.binaryRel == EqualTo:
+func `not`*[T](constraint: Constraint[T]): Constraint[T] {.inline.} =
+    let complementaryRel: Table[BinaryRelation, BinaryRelation] = {
+        EqualTo: NotEqualTo,
+        NotEqualTo, EqualTo,
+        GreaterThan, LessThanEq,
+        GreaterThanEq, LessThan,
+        LessThan: GreaterThanEq,
+        LessThanEq, GreaterThan
+    }
+    if constraint.node.kind == BinaryRelNode:
         # If `not` is being called on an equality constraint, then use
         # NotEqualTo constraint instead, since it is more efficient.
         return Constraint[T](
             scope: AlgebraicConstraint,
-            positions: cons.positions,
+            positions: constraint.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
-                binaryRel: NotEqualTo,
-                left: cons.node.left,
-                right: cons.node.right
+                binaryRel: complementaryRel[constraint.node.binaryRel],
+                left: constraint.node.left,
+                right: constraint.node.right
             )
         )
     else:
         return Constraint[T](
             scope: AlgebraicConstraint,
-            positions: cons.positions,
+            positions: constraint.positions,
             node: ConstraintNode[T](
                 kind: UnaryRelNode,
                 unaryRel: Not,
-                target: cons.node
+                target: constraint.node
             )
         )
 
@@ -115,19 +123,19 @@ ExpValRel(`<=`, LessThanEq)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](cons: Constraint[T], assignment: seq[T]): bool {.inline.} =
-    cons.node.evaluate(assignment)
+func evaluate*[T](constraint: Constraint[T], assignment: seq[T]): bool {.inline.} =
+    constraint.node.evaluate(assignment)
 
-proc penalty*[T](cons: Constraint[T], assignment: seq[T]): T {.inline.} =
-    case cons.scope:
+proc penalty*[T](constraint: Constraint[T], assignment: seq[T]): T {.inline.} =
+    case constraint.scope:
         of AlgebraicConstraint:
-            return cons.node.penalty(assignment)
+            return constraint.node.penalty(assignment)
         of AllDifferentConstraint:
-            return cons.state.cost
+            return constraint.state.cost
         of LinearCombinationConstraint:
-            var left = cons.lincomb.value
-            var right = cons.rhs
-            case cons.linrel:
+            var left = constraint.lincomb.value
+            var right = constraint.rhs
+            case constraint.linrel:
                 of EqualTo:
                     # return abs(left - right)
                     return if left == right: 0 else: 1
@@ -184,7 +192,6 @@ proc linearCombinationEq*[T](positions: seq[int], target: T): Constraint[T] =
     )
 
 proc linearCombinationEq*[T](expressions: seq[Expression[T]], target: T): Constraint[T] =
-    # Returns allDifferent constraint for the given expressions.
     var positions = toPackedSet[T]([])
     var allRefs = true
     for exp in expressions:
@@ -193,38 +200,38 @@ proc linearCombinationEq*[T](expressions: seq[Expression[T]], target: T): Constr
         positions.incl(exp.positions)
     
     doAssert allRefs
-    # Use more efficient position based constraint if all expressions are refnodes
+    # Use more efficient position based constraint since all expressions are refnodes
     return linearCombinationEq(positions.items.toSeq, target)
 
 ################################################################################
 # Computed Constraint State interface
 ################################################################################
 
-func initialize*[T](cons: Constraint[T], assignment: seq[T]) =
-    case cons.scope:
+func initialize*[T](constraint: Constraint[T], assignment: seq[T]) =
+    case constraint.scope:
         of AlgebraicConstraint:
             return
         of AllDifferentConstraint:
-            cons.state.initialize(assignment)
+            constraint.state.initialize(assignment)
         of LinearCombinationConstraint:
-            cons.lincomb.initialize(assignment)
+            constraint.lincomb.initialize(assignment)
 
 
-func moveDelta*[T](cons: Constraint[T], position: int, oldValue, newValue: T): int =
-    case cons.scope:
+func moveDelta*[T](constraint: Constraint[T], position: int, oldValue, newValue: T): int =
+    case constraint.scope:
         of AlgebraicConstraint:
             return
         of AllDifferentConstraint:
-            cons.state.moveDelta(position, oldValue, newValue)
+            constraint.state.moveDelta(position, oldValue, newValue)
         of LinearCombinationConstraint:
-            cons.lincomb.moveDelta(position, oldValue, newValue)
+            constraint.lincomb.moveDelta(position, oldValue, newValue)
 
 
-func updatePosition*[T](cons: Constraint[T], position: int, newValue: T) =
-    case cons.scope:
+func updatePosition*[T](constraint: Constraint[T], position: int, newValue: T) =
+    case constraint.scope:
         of AlgebraicConstraint:
             return
         of AllDifferentConstraint:
-            cons.state.updatePosition(position, newValue)
+            constraint.state.updatePosition(position, newValue)
         of LinearCombinationConstraint:
-            cons.lincomb.updatePosition(position, newValue)
+            constraint.lincomb.updatePosition(position, newValue)

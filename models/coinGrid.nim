@@ -7,7 +7,6 @@ proc coingrid*(n, c: int) =
     var X = sys.newConstrainedMatrix(n, n)
     X.setDomain(toSeq 0..1)
 
-
     for column in X.columns():
         sys.addConstraint(linearCombinationEq(column, c))
     

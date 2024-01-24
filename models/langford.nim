@@ -12,10 +12,10 @@ proc langford*(n: int) =
         sys.addConstraint(position[i + n] - position[i] == i + 2)
 
     sys.addConstraint(allDifferent(position))
-    sys.resolve(1000, 100)
+    sys.resolve(10, 10000)
 
     var lseq = newSeq[int](2*n)
-    var ass = position.getAssignment()
+    var ass = position.assignment
 
     for i in 0..<n:
         lseq[ass[i]] = i + 1

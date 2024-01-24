@@ -13,4 +13,4 @@ proc resolve*[T](system: ConstraintSystem[T], threshold = 10000, attempts=10) =
             system.assignment = improved.assignment
             return
 
-    raise newException(NoSolutionFoundError, "Couldn't find satisfying solution")
+    raise newException(NoSolutionFoundError, "Can't find satisfying solution")

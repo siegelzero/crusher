@@ -33,6 +33,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
         entries.add(
             Expression[T](
                 positions: toPackedSet[int](@[pos]),
+                linear: true,
                 node: ExpressionNode[T](kind: RefNode, position: pos)
             )
         )
@@ -50,6 +51,7 @@ func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
         arr.entries.add(
             Expression[T](
                 positions: toPackedSet[int]([pos]),
+                linear: true,
                 node: ExpressionNode[T](kind: RefNode, position: pos)
             )
         )
