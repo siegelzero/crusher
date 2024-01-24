@@ -29,5 +29,5 @@ proc latinSquare*(n: int) =
 
 
 when isMainModule:
-   let n = parseInt(paramStr(1))
-   latinSquare(n)
+    let n = parseInt(paramStr(1))
+    latinSquare(n)

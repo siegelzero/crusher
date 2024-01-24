@@ -24,5 +24,5 @@ proc langford*(n: int) =
 
 
 when isMainModule:
-   let n = parseInt(paramStr(1))
-   langford(n)
+    let n = parseInt(paramStr(1))
+    langford(n)

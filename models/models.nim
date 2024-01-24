@@ -102,41 +102,6 @@ proc MOLSSystem*(n: int): ConstraintSystem[int] =
     return sys
 
 
-proc nQueens*(n: int): ConstrainedArray[int] =
-    var x = initConstrainedArray[int](n)
-    x.setDomain(toSeq 0..<n)
-
-    for i in 0..<n:
-        for j in (i + 1)..<n:
-            x.addConstraint(x[i] != x[j])
-            x.addConstraint(x[i] - x[j] != i - j)
-            x.addConstraint(x[i] - x[j] != j - i)
-
-    return x
-
-
-proc nQueens2*(n: int): ConstrainedArray[int] =
-    var x = initConstrainedArray[int](n)
-    x.setDomain(toSeq 0..<n)
-
-    var terms: seq[Expression[int]] = @[]
-    for i in 0..<n:
-        terms.add(x[i])
-    x.addConstraint(allDifferent(terms))
-
-    terms.reset()
-    for i in 0..<n:
-        terms.add(x[i] - i)
-    x.addConstraint(allDifferent(terms))
-
-    terms.reset()
-    for i in 0..<n:
-        terms.add(x[i] + i)
-    x.addConstraint(allDifferent(terms))
-
-    return x
-
-
 proc magicSquare*(n: int): ConstraintSystem[int] = 
     # Magic Squares
     var sys = initConstraintSystem[int]()
@@ -166,16 +131,6 @@ proc magicSquare*(n: int): ConstraintSystem[int] =
     # All entries in square must be distinct
     sys.addConstraint(allDifferent(X))
     X.setDomain(toSeq(1..n*n))
-
-    return sys
-
-
-proc lcTest*(): ConstraintSystem[int] =
-    var sys = initConstraintSystem[int]()
-    var X = sys.newConstrainedSequence(3)
-    X.setDomain(toSeq 1..10)
-
-    sys.addConstraint(linearCombinationEq(@[X[0], X[1], X[2]], 5))
 
     return sys
 
