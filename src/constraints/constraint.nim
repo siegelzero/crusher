@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, strformat, tables]
+import std/[packedsets, sequtils, tables]
 
 import allDifferentState, constraintNode, linearCombinationState
 import ../expressions/[expression, expressionNode]
