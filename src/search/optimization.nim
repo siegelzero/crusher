@@ -6,7 +6,7 @@ import ../expressions/expression
 import ../constraintSystem
 
 
-proc minimize*[T](system: ConstraintSystem[T], objective: Expression[T]) =
+proc minimize*[T](system: ConstraintSystem[T], objective: AlgebraicExpression[T]) =
     # Find initial solution
     system.resolve()
     var currentCost = objective.evaluate(system.assignment)

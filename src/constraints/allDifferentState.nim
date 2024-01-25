@@ -20,7 +20,7 @@ type
                 positions: PackedSet[int]
             of ExpressionBased:
                 countTable: Table[T, int]
-                expressions: seq[Expression[T]]
+                expressions: seq[AlgebraicExpression[T]]
                 expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################
@@ -34,7 +34,7 @@ func init*[T](state: AllDifferentState[T], positions: openArray[T]) =
     state.count = newSeq[int]()
     state.currentAssignment = initTable[int, T]()
 
-func init*[T](state: AllDifferentState[T], expressions: seq[Expression[T]]) =
+func init*[T](state: AllDifferentState[T], expressions: seq[AlgebraicExpression[T]]) =
     state.cost = 0
     state.evalMethod = ExpressionBased
     state.expressionsAtPosition = initTable[int, seq[int]]()
@@ -55,7 +55,7 @@ func newAllDifferentState*[T](positions: openArray[T] ): AllDifferentState[T] =
     new(result)
     result.init(positions)
 
-func newAllDifferentState*[T](expressions: seq[Expression[T]]): AllDifferentState[T] =
+func newAllDifferentState*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentState[T] =
     # Allocates and initializes new AllDifferentState[T]
     new(result)
     result.init(expressions)

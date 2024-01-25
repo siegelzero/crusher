@@ -75,10 +75,10 @@ func newConstrainedMatrix*[T](system: ConstraintSystem[T], m, n: int): Constrain
 # ConstrainedVariable access
 ################################################################################
 
-func `[]`*[T](cvar: ConstrainedSequence[T], i: int): Expression[T] {.inline.} =
+func `[]`*[T](cvar: ConstrainedSequence[T], i: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + i]
 
-func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): Expression[T] {.inline.} =
+func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
 func basePositions*[T](cvar: VariableContainer[T]): seq[int] =

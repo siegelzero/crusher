@@ -63,11 +63,11 @@ func `not`*[T](constraint: Constraint[T]): Constraint[T] {.inline.} =
         )
 
 ################################################################################
-# Binary (Expression, Expression) Relations
+# Binary (AlgebraicExpression, AlgebraicExpression) Relations
 ################################################################################
 
 template ExpExpRel(rel, relEnum: untyped) =
-    func `rel`*[T](left, right: Expression[T]): Constraint[T] {.inline.} =
+    func `rel`*[T](left, right: AlgebraicExpression[T]): Constraint[T] {.inline.} =
         Constraint[T](
             scope: AlgebraicConstraint,
             positions: left.positions + right.positions,
@@ -86,11 +86,11 @@ ExpExpRel(`<`, LessThan)
 ExpExpRel(`<=`, LessThanEq)
 
 ################################################################################
-# Binary (Expression, Value) Relations
+# Binary (AlgebraicExpression, Value) Relations
 ################################################################################
 
 template ExpValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: Expression[T], right: T): Constraint[T] {.inline.} =
+    func `rel`*[T](left: AlgebraicExpression[T], right: T): Constraint[T] {.inline.} =
         Constraint[T](
             scope: AlgebraicConstraint,
             positions: left.positions,
@@ -101,7 +101,7 @@ template ExpValRel(rel, relEnum: untyped) =
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
         )
-    func `rel`*[T](left: T, right: Expression[T]): Constraint[T] {.inline.} =
+    func `rel`*[T](left: T, right: AlgebraicExpression[T]): Constraint[T] {.inline.} =
         Constraint[T](
             scope: AlgebraicConstraint,
             positions: right.positions,
@@ -163,7 +163,7 @@ func allDifferent*[T](positions: openArray[T]): Constraint[T] =
         state: newAllDifferentState[T](positions)
     )
 
-func allDifferent*[T](expressions: seq[Expression[T]]): Constraint[T] =
+func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
     # Returns allDifferent constraint for the given expressions.
     var positions = toPackedSet[T]([])
     var allRefs = true
@@ -191,7 +191,7 @@ proc linearCombinationEq*[T](positions: seq[int], target: T): Constraint[T] =
         lincomb: newLinearCombinationState[T](positions)
     )
 
-proc linearCombinationEq*[T](expressions: seq[Expression[T]], target: T): Constraint[T] =
+proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): Constraint[T] =
     var positions = toPackedSet[T]([])
     var allRefs = true
     for exp in expressions:
