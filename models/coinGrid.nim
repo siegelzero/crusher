@@ -13,7 +13,7 @@ proc coingrid*(n, c: int) =
     for row in X.rows():
         sys.addConstraint(linearCombinationEq(row, c))
     
-    var objectiveTerms: seq[Expression[int]]
+    var objectiveTerms: seq[AlgebraicExpression[int]]
     for i in 0..<n:
         for j in 0..<n:
             if i != j:
