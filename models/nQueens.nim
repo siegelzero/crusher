@@ -8,7 +8,7 @@ proc nQueens*(n: int) =
     var x = sys.newConstrainedSequence(n)
     x.setDomain(toSeq 0..<n)
 
-    var terms: seq[Expression[int]] = @[]
+    var terms: seq[AlgebraicExpression[int]] = @[]
     for i in 0..<n:
         terms.add(x[i])
     sys.addConstraint(allDifferent(terms))

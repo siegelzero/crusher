@@ -96,16 +96,16 @@ func assignment*[T](cvar: ConstrainedMatrix[T]): seq[seq[T]] =
 # Useful Iterators
 ################################################################################
 
-iterator columns*[T](cvar: ConstrainedMatrix[T]): seq[Expression[T]] =
-    var col: seq[Expression[T]]
+iterator columns*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
+    var col: seq[AlgebraicExpression[T]]
     for i in 0..<cvar.n:
         col = @[]
         for j in 0..<cvar.m:
             col.add(cvar[j, i])
         yield col
 
-iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[Expression[T]] =
-    var row: seq[Expression[T]]
+iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
+    var row: seq[AlgebraicExpression[T]]
     for i in 0..<cvar.m:
         row = @[]
         for j in 0..<cvar.n:

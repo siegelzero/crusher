@@ -38,7 +38,7 @@ proc MOLSSystem*(n: int) =
         sys.addConstraint(Y[i, 0] == i)
     
     # Mutual orthogonality condition
-    var pairs: seq[Expression[int]] = @[]
+    var pairs: seq[AlgebraicExpression[int]] = @[]
     for i in 0..<n:
         for j in 0..<n:
             pairs.add(X[i, j] + n*Y[i, j])

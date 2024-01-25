@@ -75,14 +75,14 @@ ExpExpOp(`-`, Subtraction)
 template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: AlgebraicExpression[T], right: T): AlgebraicExpression[T] {.inline.} =
         newAlgebraicExpression[T](
-            positions: left.positions,
-            node: ExpressionNode[T](
+            positions=left.positions,
+            node=ExpressionNode[T](
                 kind: BinaryOpNode,
                 binaryOp: opref,
                 left: left.node,
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             ),
-            linear: left.linear
+            linear=left.linear
         )
 
     func `op`*[T](left: T, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
