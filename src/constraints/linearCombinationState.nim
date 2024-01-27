@@ -20,7 +20,7 @@ type
 # LinearCombinationState Creation
 ################################################################################
 
-func init*[T](state: LinearCombinationState[T], positions: seq[T]) =
+func init*[T](state: LinearCombinationState[T], positions: openArray[T]) =
     state.value = 0
     state.constant = 0
     state.positions = toPackedSet[int](positions)
@@ -41,7 +41,7 @@ func init*[T](state: LinearCombinationState[T], coefficients: Table[int, T], con
         state.positions.incl(pos)
         state.coefficient[pos] = coeff
 
-func newLinearCombinationState*[T](positions: seq[T]): LinearCombinationState[T] =
+func newLinearCombinationState*[T](positions: openArray[T]): LinearCombinationState[T] =
     new(result)
     result.init(positions)
 

@@ -155,17 +155,17 @@ proc penalty*[T](constraint: Constraint[T], assignment: seq[T]): T {.inline.} =
 # Computed Constraints
 ################################################################################
 
-func allDifferent*[T](positions: openArray[T]): Constraint[T] =
+func allDifferent*[T](positions: openArray[int]): Constraint[T] =
     # Returns allDifferent constraint for the given positions.
     return Constraint[T](
-        positions: toPackedSet[T](positions),
+        positions: toPackedSet[int](positions),
         scope: AllDifferentConstraint,
         state: newAllDifferentState[T](positions)
     )
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
     # Returns allDifferent constraint for the given expressions.
-    var positions = toPackedSet[T]([])
+    var positions = toPackedSet[int]([])
     var allRefs = true
     for exp in expressions:
         if exp.node.kind != RefNode:
@@ -174,7 +174,7 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
     
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return allDifferent(positions.items.toSeq)
+        return allDifferent[T](toSeq[int](positions))
     else:
         return Constraint[T](
             positions: positions,
@@ -182,9 +182,9 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
             state: newAllDifferentState[T](expressions)
         )
 
-proc linearCombinationEq*[T](positions: seq[int], target: T): Constraint[T] =
+proc linearCombinationEq*[T](positions: openArray[int], target: T): Constraint[T] =
     return Constraint[T](
-        positions: toPackedSet[T](positions),
+        positions: toPackedSet[int](positions),
         scope: LinearCombinationConstraint,
         linrel: EqualTo,
         rhs: target,
@@ -192,7 +192,7 @@ proc linearCombinationEq*[T](positions: seq[int], target: T): Constraint[T] =
     )
 
 proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): Constraint[T] =
-    var positions = toPackedSet[T]([])
+    var positions = toPackedSet[int]([])
     var allRefs = true
     for exp in expressions:
         if exp.node.kind != RefNode:
@@ -201,7 +201,7 @@ proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T
     
     doAssert allRefs
     # Use more efficient position based constraint since all expressions are refnodes
-    return linearCombinationEq(positions.items.toSeq, target)
+    return linearCombinationEq(toSeq[int](positions), target)
 
 ################################################################################
 # Computed Constraint State interface
