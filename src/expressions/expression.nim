@@ -27,9 +27,7 @@ func init*[T](expression: AlgebraicExpression[T], positions: PackedSet[T], node:
     expression.node = node
     expression.linear = linear
 
-func newAlgebraicExpression*[T](positions: PackedSet[T],
-                                node: ExpressionNode[T],
-                                linear: bool): AlgebraicExpression[T] =
+func newAlgebraicExpression*[T](positions: PackedSet[T], node: ExpressionNode[T], linear: bool): AlgebraicExpression[T] =
     new(result)
     result.init(positions, node, linear)
 

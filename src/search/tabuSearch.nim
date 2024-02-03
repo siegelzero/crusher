@@ -43,7 +43,8 @@ proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
         let (position, newValue) = sample(moves)
         let oldValue = state.assignment[position]
         state.assignValue(position, newValue)
-        state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
+        # state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
+        state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
 
 
 proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =

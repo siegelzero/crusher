@@ -134,7 +134,7 @@ func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
 proc allDifferent*[T](cvar: VariableContainer[T]): Constraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
-    allDifferent(cvar.basePositions())
+    allDifferent[T](cvar.basePositions())
 
 func addConstraint*[T](system: ConstraintSystem[T], constraint: Constraint[T]) =
     # adds constraint to the system

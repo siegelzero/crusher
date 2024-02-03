@@ -31,11 +31,15 @@ proc MOLSSystem*(n: int) =
     # First row in order 0 1 2... in first square
     for i in 0..<n:
         sys.addConstraint(X[0, i] == i)
+        sys.addConstraint(X[i, 0] == i)
 
     # First col in order 0 1 2... in both squares
     for i in 0..<n:
-        sys.addConstraint(X[i, 0] == i)
-        sys.addConstraint(Y[i, 0] == i)
+        sys.addConstraint(Y[0, i] == i)
+    
+    for i in 1..<n:
+        sys.addConstraint(Y[i, 0] <= i + 1)
+        sys.addConstraint(Y[i, 0] != i)
     
     # Mutual orthogonality condition
     var pairs: seq[AlgebraicExpression[int]] = @[]
@@ -44,7 +48,7 @@ proc MOLSSystem*(n: int) =
             pairs.add(X[i, j] + n*Y[i, j])
     sys.addConstraint(allDifferent(pairs))
 
-    sys.resolve(100000, 10)
+    sys.resolve(10000, 1000)
 
     for row in X.assignment():
         echo row

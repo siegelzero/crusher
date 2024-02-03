@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import allDifferentState, constraintNode, linearCombinationState
+import allDifferentState, constraintNode, elementState, linearCombinationState
 import ../expressions/[expression, expressionNode]
 
 ################################################################################
@@ -10,35 +10,36 @@ import ../expressions/[expression, expressionNode]
 type
     ConstraintType* = enum
         AlgebraicConstraint,
+        StatefulConstraint
+    
+    StatefulConstraintType* = enum
         AllDifferentConstraint,
+        ElementConstraint,
         LinearCombinationConstraint
 
-    Constraint*[T] {.acyclic.} = object
+    Constraint*[T] = object
         positions*: PackedSet[int]
         case scope*: ConstraintType
             of AlgebraicConstraint:
                 node*: ConstraintNode[T]
-            of AllDifferentConstraint:
-                state*: AllDifferentState[T]
-            of LinearCombinationConstraint:
-                lincomb*: LinearCombinationState[T]
-                linrel*: BinaryRelation
-                rhs*: T
+            of StatefulConstraint:
+                case stateType*: StatefulConstraintType
+                    of AllDifferentConstraint:
+                        allDifferentState*: AllDifferentState[T]
+                    of ElementConstraint:
+                        elementState: ElementState[T]
+                    of LinearCombinationConstraint:
+                        linearCombinationState*: LinearCombinationState[T]
+                        relation*: BinaryRelation
+                        rhs*: T
 
 ################################################################################
 # Unary Constraint Relations
 ################################################################################
 
 func `not`*[T](constraint: Constraint[T]): Constraint[T] {.inline.} =
-    let complementaryRel: Table[BinaryRelation, BinaryRelation] = {
-        EqualTo: NotEqualTo,
-        NotEqualTo, EqualTo,
-        GreaterThan, LessThanEq,
-        GreaterThanEq, LessThan,
-        LessThan: GreaterThanEq,
-        LessThanEq, GreaterThan
-    }
-    if constraint.node.kind == BinaryRelNode:
+    doAssert constraint.scope == AlgebraicConstraint
+    if constraint.node.kind == BinaryRelNode and constraint.node.binaryRel == EqualTo:
         # If `not` is being called on an equality constraint, then use
         # NotEqualTo constraint instead, since it is more efficient.
         return Constraint[T](
@@ -46,7 +47,7 @@ func `not`*[T](constraint: Constraint[T]): Constraint[T] {.inline.} =
             positions: constraint.positions,
             node: ConstraintNode[T](
                 kind: BinaryRelNode,
-                binaryRel: complementaryRel[constraint.node.binaryRel],
+                binaryRel: NotEqualTo,
                 left: constraint.node.left,
                 right: constraint.node.right
             )
@@ -130,26 +131,29 @@ proc penalty*[T](constraint: Constraint[T], assignment: seq[T]): T {.inline.} =
     case constraint.scope:
         of AlgebraicConstraint:
             return constraint.node.penalty(assignment)
-        of AllDifferentConstraint:
-            return constraint.state.cost
-        of LinearCombinationConstraint:
-            var left = constraint.lincomb.value
-            var right = constraint.rhs
-            case constraint.linrel:
-                of EqualTo:
-                    # return abs(left - right)
-                    return if left == right: 0 else: 1
-                    # return if left == right: 0 else: cons.positions.len
-                of NotEqualTo:
-                    return if left != right: 0 else: 1
-                of GreaterThan:
-                    return if left > right: 0 else: 1
-                of GreaterThanEq:
-                    return if left >= right: 0 else: 1
-                of LessThan:
-                    return if left < right: 0 else: 1
-                of LessThanEq:
-                    return if left <= right: 0 else: 1
+        of StatefulConstraint:
+            case constraint.stateType:
+                of AllDifferentConstraint:
+                    return constraint.allDifferentState.cost
+                of ElementConstraint:
+                    return constraint.elementState.cost
+                of LinearCombinationConstraint:
+                    let left = constraint.linearCombinationState.value
+                    let right = constraint.rhs
+
+                    case constraint.relation:
+                        of EqualTo:
+                            return if left == right: 0 else: 1
+                        of NotEqualTo:
+                            return if left != right: 0 else: 1
+                        of GreaterThan:
+                            return if left > right: 0 else: 1
+                        of GreaterThanEq:
+                            return if left >= right: 0 else: 1
+                        of LessThan:
+                            return if left < right: 0 else: 1
+                        of LessThanEq:
+                            return if left <= right: 0 else: 1
 
 ################################################################################
 # Computed Constraints
@@ -159,8 +163,9 @@ func allDifferent*[T](positions: openArray[int]): Constraint[T] =
     # Returns allDifferent constraint for the given positions.
     return Constraint[T](
         positions: toPackedSet[int](positions),
-        scope: AllDifferentConstraint,
-        state: newAllDifferentState[T](positions)
+        scope: StatefulConstraint,
+        stateType: AllDifferentConstraint,
+        allDifferentState: newAllDifferentState[T](positions)
     )
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
@@ -178,17 +183,19 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): Constraint[T] =
     else:
         return Constraint[T](
             positions: positions,
-            scope: AllDifferentConstraint,
-            state: newAllDifferentState[T](expressions)
+            scope: StatefulConstraint,
+            stateType: AllDifferentConstraint,
+            allDifferentState: newAllDifferentState[T](expressions)
         )
 
 proc linearCombinationEq*[T](positions: openArray[int], target: T): Constraint[T] =
     return Constraint[T](
         positions: toPackedSet[int](positions),
-        scope: LinearCombinationConstraint,
-        linrel: EqualTo,
+        scope: StatefulConstraint,
+        stateType: LinearCombinationConstraint,
+        relation: EqualTo,
         rhs: target,
-        lincomb: newLinearCombinationState[T](positions)
+        linearCombinationState: newLinearCombinationState[T](positions)
     )
 
 proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): Constraint[T] =
@@ -211,27 +218,39 @@ func initialize*[T](constraint: Constraint[T], assignment: seq[T]) =
     case constraint.scope:
         of AlgebraicConstraint:
             return
-        of AllDifferentConstraint:
-            constraint.state.initialize(assignment)
-        of LinearCombinationConstraint:
-            constraint.lincomb.initialize(assignment)
+        of StatefulConstraint:
+            case constraint.stateType:
+                of AllDifferentConstraint:
+                    constraint.allDifferentState.initialize(assignment)
+                of ElementConstraint:
+                    constraint.elementState.initialize(assignment)
+                of LinearCombinationConstraint:
+                    constraint.linearCombinationState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: Constraint[T], position: int, oldValue, newValue: T): int =
     case constraint.scope:
         of AlgebraicConstraint:
             return
-        of AllDifferentConstraint:
-            constraint.state.moveDelta(position, oldValue, newValue)
-        of LinearCombinationConstraint:
-            constraint.lincomb.moveDelta(position, oldValue, newValue)
+        of StatefulConstraint:
+            case constraint.stateType:
+                of AllDifferentConstraint:
+                    constraint.allDifferentState.moveDelta(position, oldValue, newValue)
+                of ElementConstraint:
+                    constraint.elementState.moveDelta(position, oldValue, newValue)
+                of LinearCombinationConstraint:
+                    constraint.linearCombinationState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: Constraint[T], position: int, newValue: T) =
     case constraint.scope:
         of AlgebraicConstraint:
             return
-        of AllDifferentConstraint:
-            constraint.state.updatePosition(position, newValue)
-        of LinearCombinationConstraint:
-            constraint.lincomb.updatePosition(position, newValue)
+        of StatefulConstraint:
+            case constraint.stateType:
+                of AllDifferentConstraint:
+                    constraint.allDifferentState.updatePosition(position, newValue)
+                of ElementConstraint:
+                    constraint.elementState.updatePosition(position, newValue)
+                of LinearCombinationConstraint:
+                    constraint.linearCombinationState.updatePosition(position, newValue)

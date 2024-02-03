@@ -43,14 +43,17 @@ proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: 
             state.assignment[position] = newValue
             result = state.penalty(constraint)
             state.assignment[position] = oldValue
-        of AllDifferentConstraint:
-            result = constraint.state.cost + constraint.state.moveDelta(position, oldValue, newValue)
-        of LinearCombinationConstraint:
-            # result = abs(constraint.rhs - (constraint.lincomb.value + constraint.lincomb.moveDelta(position, oldValue, newValue)))
-            if constraint.rhs == (constraint.lincomb.value + constraint.lincomb.moveDelta(position, oldValue, newValue)):
-                result = 0
-            else:
-                result = 1
+        of StatefulConstraint:
+            case constraint.stateType:
+                of AllDifferentConstraint:
+                    result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
+                of ElementConstraint:
+                    result = 0
+                of LinearCombinationConstraint:
+                    if constraint.rhs == (constraint.linearCombinationState.value + constraint.linearCombinationState.moveDelta(position, oldValue, newValue)):
+                        result = 0
+                    else:
+                        result = 1
 
 ################################################################################
 # Penalty Map Routines
@@ -97,7 +100,7 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for constraint in carray.constraints:
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
-        if constraint.scope == AllDifferentConstraint or constraint.scope == LinearCombinationConstraint:
+        if constraint.scope == StatefulConstraint:
             state.computedConstraints.add(constraint)
     
     # Collect neighbors of each position
@@ -115,8 +118,8 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
         state.assignment[pos] = sample(state.reducedDomain[pos])
     
     # Initialize global constraint states
-    for cons in state.computedConstraints:
-        cons.initialize(state.assignment)
+    for constraint in state.computedConstraints:
+        constraint.initialize(state.assignment)
 
     # Compute cost
     for cons in carray.constraints:
