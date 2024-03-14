@@ -21,8 +21,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             continue
         var pos = toSeq(cons.positions)[0]
         for d in carray.domain[pos]:
-            assignment[pos] = d
-            if not cons.evaluate(assignment):
+            cons.updatePosition(pos, d)
+            if cons.penalty() > 0:
                 # echo "Excluding ", d, " from ", pos
                 currentDomain[pos].excl(d)
     
@@ -36,11 +36,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         for val1 in toSeq(currentDomain[pos1]):
             ok = false
-            assignment[pos1] = val1
+            cons.updatePosition(pos1, val1)
 
             for val2 in currentDomain[pos2]:
-                assignment[pos2] = val2
-                if cons.evaluate(assignment):
+                cons.updatePosition(pos2, val2)
+                if cons.penalty() > 0:
                     ok = true
                     break
 
@@ -52,11 +52,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         for val2 in toSeq(currentDomain[pos2]):
             ok = false
-            assignment[pos2] = val2
+            cons.updatePosition(pos2, val2)
 
             for val1 in currentDomain[pos1]:
-                assignment[pos1] = val1
-                if cons.evaluate(assignment):
+                cons.updatePosition(pos1, val1)
+                if cons.penalty() > 0:
                     ok = true
                     break
 

@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/[constraint, allDifferentState, linearCombinationState]
+import ../constraints/[constraint, algebraicConstraint, allDifferentState, linearCombinationState]
 import ../constrainedArray
 import domain
 
@@ -11,8 +11,8 @@ import domain
 type
     ArrayState*[T] = ref object of RootObj
         carray*: ConstrainedArray[T]
-        constraintsAtPosition*: seq[seq[Constraint[T]]]
-        computedConstraints*: seq[Constraint[T]]
+        constraintsAtPosition*: seq[seq[ConstraintState[T]]]
+        constraints*: seq[ConstraintState[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
@@ -31,29 +31,25 @@ type
 # Penalty Routines
 ################################################################################
 
-proc penalty*[T](state: ArrayState[T], constraint: Constraint[T]): int {.inline.} =
-    # Computes the penalty of the constraint, using current assignment of state.
-    return constraint.penalty(state.assignment)
+# proc penalty*[T](state: ArrayState[T], constraint: Constraint[T]): int {.inline.} =
+#     # Computes the penalty of the constraint, using current assignment of state.
+#     return constraint.penalty(state.assignment)
 
 
-proc movePenalty*[T](state: ArrayState[T], constraint: Constraint[T], position: int, newValue: T): int {.inline.} =
+proc movePenalty*[T](state: ArrayState[T], constraint: ConstraintState[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
-    case constraint.scope:
-        of AlgebraicConstraint:
-            state.assignment[position] = newValue
-            result = state.penalty(constraint)
-            state.assignment[position] = oldValue
-        of StatefulConstraint:
-            case constraint.stateType:
-                of AllDifferentConstraint:
-                    result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
-                of ElementConstraint:
-                    result = 0
-                of LinearCombinationConstraint:
-                    if constraint.rhs == (constraint.linearCombinationState.value + constraint.linearCombinationState.moveDelta(position, oldValue, newValue)):
-                        result = 0
-                    else:
-                        result = 1
+    case constraint.stateType:
+        of AllDifferentConstraint:
+            result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
+        of ElementConstraint:
+            result = 0
+        of LinearCombinationConstraint:
+            if constraint.rhs == (constraint.linearCombinationState.value + constraint.linearCombinationState.moveDelta(position, oldValue, newValue)):
+                result = 0
+            else:
+                result = 1
+        of StatefulAlgebraicConstraint:
+            result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines
@@ -86,7 +82,7 @@ proc rebuildPenaltyMap*[T](state: ArrayState[T]) =
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state ArrayState[T]
     state.carray = carray
-    state.constraintsAtPosition = newSeq[seq[Constraint[T]]](carray.len)
+    state.constraintsAtPosition = newSeq[seq[ConstraintState[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 
@@ -98,10 +94,9 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
 
     # Group constraints involving each position
     for constraint in carray.constraints:
+        state.constraints.add(constraint)
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
-        if constraint.scope == StatefulConstraint:
-            state.computedConstraints.add(constraint)
     
     # Collect neighbors of each position
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
@@ -117,13 +112,13 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for pos in carray.allPositions():
         state.assignment[pos] = sample(state.reducedDomain[pos])
     
-    # Initialize global constraint states
-    for constraint in state.computedConstraints:
+    # Initialize constraint states with current assignment
+    for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
     # Compute cost
     for cons in carray.constraints:
-        state.cost += state.penalty(cons)
+        state.cost += cons.penalty()
 
     state.bestCost = state.cost
     state.bestAssignment = state.assignment
@@ -154,9 +149,8 @@ proc assignValue*[T](state: ArrayState[T], position: int, value: T) =
     state.assignment[position] = value
 
     # Update all computed constraints that involve this position
-    for cons in state.computedConstraints:
-        if position in cons.positions:
-            cons.updatePosition(position, value)
+    for constraint in state.constraintsAtPosition[position]:
+        constraint.updatePosition(position, value)
 
     # Update cost of state for the given move
     state.cost += delta

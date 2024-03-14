@@ -1,3 +1,5 @@
+import std/tables
+
 import ../expressions/expressionNode
 
 ################################################################################
@@ -33,7 +35,7 @@ type
 # Evaluation
 ################################################################################
 
-func evaluate*[T](node: ConstraintNode[T], assignment: seq[T]): bool {.inline.} =
+func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): bool {.inline.} =
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)
@@ -61,7 +63,7 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T]): bool {.inline.} 
                     return left <= right
 
 
-proc penalty*[T](node: ConstraintNode[T], assignment: seq[T]): T {.inline.} =
+proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
     # echo "node kind: ", node.kind
     case node.kind:
         of UnaryRelNode:
