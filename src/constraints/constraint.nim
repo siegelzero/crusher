@@ -12,7 +12,7 @@ type
         AllDifferentConstraint,
         ElementConstraint,
         LinearCombinationConstraint,
-        StatefulAlgebraicConstraint
+        AlgebraicType
 
     ConstraintState*[T] = object
         positions*: PackedSet[int]
@@ -25,8 +25,8 @@ type
                 linearCombinationState*: LinearCombinationState[T]
                 relation*: BinaryRelation
                 rhs*: T
-            of StatefulAlgebraicConstraint:
-                algebraicConstraintState*: AlgebraicConstraintState[T]
+            of AlgebraicType:
+                algebraicConstraintState*: StatefulAlgebraicConstraint[T]
 
 ################################################################################
 # Evaluation
@@ -56,7 +56,7 @@ proc penalty*[T](constraint: ConstraintState[T]): T {.inline.} =
                 of LessThanEq:
                     return if left <= right: 0 else: 1
         
-        of StatefulAlgebraicConstraint:
+        of AlgebraicType:
             return constraint.algebraicConstraintState.cost
 
 ################################################################################
@@ -123,7 +123,7 @@ func initialize*[T](constraint: ConstraintState[T], assignment: seq[T]) =
             constraint.elementState.initialize(assignment)
         of LinearCombinationConstraint:
             constraint.linearCombinationState.initialize(assignment)
-        of StatefulAlgebraicConstraint:
+        of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
 
 
@@ -147,5 +147,5 @@ func updatePosition*[T](constraint: ConstraintState[T], position: int, newValue:
             constraint.elementState.updatePosition(position, newValue)
         of LinearCombinationConstraint:
             constraint.linearCombinationState.updatePosition(position, newValue)
-        of StatefulAlgebraicConstraint:
+        of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)

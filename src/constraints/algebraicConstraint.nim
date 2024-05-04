@@ -12,11 +12,19 @@ type
         positions*: PackedSet[int]
         node*: ConstraintNode[T]
 
+    StatefulAlgebraicConstraint*[T] = ref object
+        currentAssignment*: Table[int, T]
+        cost*: int
+        constraint*: AlgebraicConstraint[T]
+        positions: PackedSet[int]
+
+
 ################################################################################
 # Unary Constraint Relations
 ################################################################################
 
 func `not`*[T](constraint: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
+    # Returns the negation of the constraint.
     if constraint.node.kind == BinaryRelNode and constraint.node.binaryRel == EqualTo:
         # If `not` is being called on an equality constraint, then use
         # NotEqualTo constraint instead, since it is more efficient.
@@ -44,6 +52,7 @@ func `not`*[T](constraint: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inl
 ################################################################################
 
 template ExpExpRel(rel, relEnum: untyped) =
+    # Template for xRy for x, y Algebraic Expressions and R a binary relation
     func `rel`*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
         AlgebraicConstraint[T](
             positions: left.positions + right.positions,
@@ -103,24 +112,18 @@ func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table
 proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
     return constraint.node.penalty(assignment)
 
-type
-    AlgebraicConstraintState*[T] = ref object
-        currentAssignment*: Table[int, T]
-        cost*: int
-        constraint*: AlgebraicConstraint[T]
-        positions: PackedSet[int]
-
 ################################################################################
 # AlgebraicConstraintState Creation
 ################################################################################
 
-func init*[T](state: AlgebraicConstraintState[T], constraint: AlgebraicConstraint[T]) =
+func init*[T](state: StatefulAlgebraicConstraint[T], constraint: AlgebraicConstraint[T]) =
+    # Initializes StatsfulAlgebraicConstraint version of the given constraint
     state.cost = 0
     state.positions = constraint.positions
     state.constraint = constraint
     state.currentAssignment = initTable[int, T]()
 
-func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): AlgebraicConstraintState[T] =
+func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): StatefulAlgebraicConstraint[T] =
     new(result)
     result.init(constraint)
 
@@ -128,7 +131,8 @@ func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): Algebr
 # AlgebraicConstraintState Initialization
 ################################################################################
 
-func initialize*[T](state: AlgebraicConstraintState[T], assignment: seq[T]) =
+func initialize*[T](state: StatefulAlgebraicConstraint[T], assignment: seq[T]) =
+    # Initializes the state with the given assignment.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
     state.cost = state.constraint.penalty(assignment)
@@ -137,11 +141,13 @@ func initialize*[T](state: AlgebraicConstraintState[T], assignment: seq[T]) =
 # AlgebraicConstraintState Updates
 ################################################################################
 
-func updatePosition*[T](state: AlgebraicConstraintState[T], position: int, newValue: T) {.inline.} =
+func updatePosition*[T](state: StatefulAlgebraicConstraint[T], position: int, newValue: T) {.inline.} =
+    # Sets position=newValue in the given state and updates cost.
     state.currentAssignment[position] = newValue
     state.cost = state.constraint.penalty(state.currentAssignment)
 
-func moveDelta*[T](state: AlgebraicConstraintState[T], position: int, oldValue, newValue: T): int {.inline.} =
+func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
+    # Returns cost delta for changing position from oldValue to newValue.
     let oldCost = state.cost
     state.currentAssignment[position] = newValue
     let newCost = state.constraint.penalty(state.currentAssignment)

@@ -48,7 +48,7 @@ proc movePenalty*[T](state: ArrayState[T], constraint: ConstraintState[T], posit
                 result = 0
             else:
                 result = 1
-        of StatefulAlgebraicConstraint:
+        of AlgebraicType:
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
 ################################################################################

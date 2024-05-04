@@ -145,7 +145,7 @@ func addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstra
     system.baseArray.addConstraint(
         ConstraintState[T](
             positions: constraint.positions,
-            stateType: StatefulAlgebraicConstraint,
+            stateType: AlgebraicType,
             algebraicConstraintState: newAlgebraicConstraintState[T](constraint))
         )
 
