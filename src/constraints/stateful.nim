@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferentState, constraintNode, elementState, linearCombinationState
+import algebraic, allDifferent, constraintNode, elementState, linearCombinationState
 import ../expressions/[expression, expressionNode]
 
 ################################################################################
@@ -9,7 +9,7 @@ import ../expressions/[expression, expressionNode]
 
 type
     StatefulConstraintType* = enum
-        AllDifferentConstraint,
+        AllDifferentType,
         ElementConstraint,
         LinearCombinationConstraint,
         AlgebraicType
@@ -17,8 +17,8 @@ type
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
         case stateType*: StatefulConstraintType
-            of AllDifferentConstraint:
-                allDifferentState*: AllDifferentState[T]
+            of AllDifferentType:
+                allDifferentState*: AllDifferentConstraint[T]
             of ElementConstraint:
                 elementState: ElementState[T]
             of LinearCombinationConstraint:
@@ -34,7 +34,7 @@ type
 
 proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
     case constraint.stateType:
-        of AllDifferentConstraint:
+        of AllDifferentType:
             return constraint.allDifferentState.cost
         of ElementConstraint:
             return constraint.elementState.cost
@@ -67,8 +67,8 @@ func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given positions.
     return StatefulConstraint[T](
         positions: toPackedSet[int](positions),
-        stateType: AllDifferentConstraint,
-        allDifferentState: newAllDifferentState[T](positions)
+        stateType: AllDifferentType,
+        allDifferentState: newAllDifferentConstraint[T](positions)
     )
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
@@ -86,8 +86,8 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
     else:
         return StatefulConstraint[T](
             positions: positions,
-            stateType: AllDifferentConstraint,
-            allDifferentState: newAllDifferentState[T](expressions)
+            stateType: AllDifferentType,
+            allDifferentState: newAllDifferentConstraint[T](expressions)
         )
 
 proc linearCombinationEq*[T](positions: openArray[int], target: T): StatefulConstraint[T] =
@@ -117,7 +117,7 @@ proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T
 
 func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
     case constraint.stateType:
-        of AllDifferentConstraint:
+        of AllDifferentType:
             constraint.allDifferentState.initialize(assignment)
         of ElementConstraint:
             constraint.elementState.initialize(assignment)
@@ -141,7 +141,7 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
     case constraint.stateType:
-        of AllDifferentConstraint:
+        of AllDifferentType:
             constraint.allDifferentState.updatePosition(position, newValue)
         of ElementConstraint:
             constraint.elementState.updatePosition(position, newValue)

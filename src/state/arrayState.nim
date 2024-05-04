@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/[algebraic, stateful, allDifferentState, linearCombinationState]
+import ../constraints/[algebraic, stateful, allDifferent, linearCombinationState]
 import ../constrainedArray
 import domain
 
@@ -39,7 +39,7 @@ type
 proc movePenalty*[T](state: ArrayState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
     case constraint.stateType:
-        of AllDifferentConstraint:
+        of AllDifferentType:
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             result = 0

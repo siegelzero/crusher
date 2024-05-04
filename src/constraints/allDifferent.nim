@@ -11,7 +11,7 @@ type
         ExpressionBased,
         PositionBased
 
-    AllDifferentState*[T] = ref object
+    AllDifferentConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int
         case evalMethod*: StateEvalMethod
@@ -24,17 +24,17 @@ type
                 expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################
-# AllDifferentState Creation
+# AllDifferentConstraint Creation
 ################################################################################
 
-func init*[T](state: AllDifferentState[T], positions: openArray[T]) =
+func init*[T](state: AllDifferentConstraint[T], positions: openArray[T]) =
     state.cost = 0
     state.evalMethod = PositionBased
     state.positions = toPackedSet[int](positions)
     state.count = newSeq[int]()
     state.currentAssignment = initTable[int, T]()
 
-func init*[T](state: AllDifferentState[T], expressions: seq[AlgebraicExpression[T]]) =
+func init*[T](state: AllDifferentConstraint[T], expressions: seq[AlgebraicExpression[T]]) =
     state.cost = 0
     state.evalMethod = ExpressionBased
     state.expressionsAtPosition = initTable[int, seq[int]]()
@@ -50,21 +50,21 @@ func init*[T](state: AllDifferentState[T], expressions: seq[AlgebraicExpression[
     state.countTable = initTable[T, int]()
     state.currentAssignment = initTable[int, T]()
 
-func newAllDifferentState*[T](positions: openArray[T] ): AllDifferentState[T] =
-    # Allocates and initializes new AllDifferentState[T]
+func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstraint[T] =
+    # Allocates and initializes new AllDifferentConstraint[T]
     new(result)
     result.init(positions)
 
-func newAllDifferentState*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentState[T] =
-    # Allocates and initializes new AllDifferentState[T]
+func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentConstraint[T] =
+    # Allocates and initializes new AllDifferentConstraint[T]
     new(result)
     result.init(expressions)
 
 ################################################################################
-# AllDifferentState utility functions
+# AllDifferentConstraint utility functions
 ################################################################################
 
-func getCount[T](state: AllDifferentState[T], value: T): int {.inline.} =
+func getCount[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
     case state.evalMethod:
         of PositionBased:
             if value >= state.count.len:
@@ -75,14 +75,14 @@ func getCount[T](state: AllDifferentState[T], value: T): int {.inline.} =
         of ExpressionBased:
             return state.countTable.getOrDefault(value)
 
-func decrementCount[T](state: AllDifferentState[T], value: T) {.inline.} =
+func decrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     case state.evalMethod:
         of PositionBased:
             state.count[value] -= 1
         of ExpressionBased:
             state.countTable[value] -= 1
 
-func incrementCount[T](state: AllDifferentState[T], value: T) {.inline.} =
+func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     case state.evalMethod:
         of PositionBased:
             if value < state.count.len:
@@ -98,14 +98,14 @@ func incrementCount[T](state: AllDifferentState[T], value: T) {.inline.} =
                 state.countTable[value] = 1
 
 
-func contribution*[T](state: AllDifferentState[T], value: T): int {.inline.} =
+func contribution*[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
     max(0, state.getCount(value) - 1)
 
 ################################################################################
-# AllDifferentState initialization and updates
+# AllDifferentConstraint initialization and updates
 ################################################################################
 
-proc initialize*[T](state: AllDifferentState[T], assignment: seq[T]) =
+proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
     var value: T
     case state.evalMethod:
         of PositionBased:
@@ -128,7 +128,7 @@ proc initialize*[T](state: AllDifferentState[T], assignment: seq[T]) =
             for value, count in state.countTable.pairs:
                 state.cost += max(0, count - 1)
 
-proc adjustCounts*[T](state: AllDifferentState[T], oldValue, newValue: T) {.inline.} =
+proc adjustCounts*[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
     state.cost -= state.contribution(oldValue)
     state.cost -= state.contribution(newValue)
@@ -138,7 +138,7 @@ proc adjustCounts*[T](state: AllDifferentState[T], oldValue, newValue: T) {.inli
     state.cost += state.contribution(newValue)
 
 
-proc updatePosition*[T](state: AllDifferentState[T], position: int, newValue: T) =
+proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
     if oldValue != newValue:
@@ -156,7 +156,7 @@ proc updatePosition*[T](state: AllDifferentState[T], position: int, newValue: T)
                     state.adjustCounts(oldExpValue, newExpValue)
 
 
-proc moveDelta*[T](state: AllDifferentState[T], position: int, oldValue, newValue: T): int =
+proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, newValue: T): int =
     if oldvalue == newValue:
         return 0
 
