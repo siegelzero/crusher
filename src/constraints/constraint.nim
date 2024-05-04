@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraicConstraint, allDifferentState, constraintNode, elementState, linearCombinationState
+import algebraic, allDifferentState, constraintNode, elementState, linearCombinationState
 import ../expressions/[expression, expressionNode]
 
 ################################################################################

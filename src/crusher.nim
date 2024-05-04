@@ -1,13 +1,13 @@
 import std/packedsets
 
-import constraints/[constraint, algebraicConstraint]
+import constraints/[constraint, algebraic]
 import expressions/expression
 import search/[optimization, resolution]
 import constraintSystem
 
 export constraintSystem,
        constraint,
-       algebraicConstraint,
+       algebraic,
        expression,
        optimization,
        resolution,
