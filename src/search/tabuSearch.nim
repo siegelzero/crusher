@@ -1,6 +1,5 @@
 import std/[packedsets, random, tables]
 
-import ../constraints/constraint
 import ../expressions/expression
 import ../constrainedArray
 import ../state/arrayState

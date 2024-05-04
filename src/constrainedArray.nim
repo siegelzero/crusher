@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils]
 
-import constraints/constraint
+import constraints/stateful
 import expressions/[expression, expressionNode]
 
 ################################################################################

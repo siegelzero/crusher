@@ -1,7 +1,7 @@
 import std/[packedsets, sequtils]
 
 import ../constrainedArray
-import ../constraints/constraint
+import ../constraints/stateful
 
 
 proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =

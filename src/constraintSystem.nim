@@ -1,7 +1,7 @@
 import std/[packedsets, sequtils]
 
 import constrainedArray
-import constraints/[algebraic, constraint]
+import constraints/[algebraic, stateful]
 import expressions/expression
 
 ################################################################################

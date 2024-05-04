@@ -1,12 +1,12 @@
 import std/packedsets
 
-import constraints/[constraint, algebraic]
+import constraints/[algebraic, stateful]
 import expressions/expression
 import search/[optimization, resolution]
 import constraintSystem
 
 export constraintSystem,
-       constraint,
+       stateful,
        algebraic,
        expression,
        optimization,

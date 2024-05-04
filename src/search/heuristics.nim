@@ -1,6 +1,6 @@
 import std/[cpuinfo, random, strformat, threadpool]
 
-import ../constraints/constraint
+import ../constraints/stateful
 import ../constrainedArray
 import ../state/arrayState
 import tabuSearch
