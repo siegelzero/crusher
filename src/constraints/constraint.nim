@@ -14,7 +14,7 @@ type
         LinearCombinationConstraint,
         AlgebraicType
 
-    ConstraintState*[T] = object
+    StatefulConstraint*[T] = object
         positions*: PackedSet[int]
         case stateType*: StatefulConstraintType
             of AllDifferentConstraint:
@@ -32,7 +32,7 @@ type
 # Evaluation
 ################################################################################
 
-proc penalty*[T](constraint: ConstraintState[T]): T {.inline.} =
+proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
     case constraint.stateType:
         of AllDifferentConstraint:
             return constraint.allDifferentState.cost
@@ -63,15 +63,15 @@ proc penalty*[T](constraint: ConstraintState[T]): T {.inline.} =
 # Computed Constraints
 ################################################################################
 
-func allDifferent*[T](positions: openArray[int]): ConstraintState[T] =
+func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given positions.
-    return ConstraintState[T](
+    return StatefulConstraint[T](
         positions: toPackedSet[int](positions),
         stateType: AllDifferentConstraint,
         allDifferentState: newAllDifferentState[T](positions)
     )
 
-func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): ConstraintState[T] =
+func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given expressions.
     var positions = toPackedSet[int]([])
     var allRefs = true
@@ -84,14 +84,14 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): ConstraintState
         # Use more efficient position based constraint if all expressions are refnodes
         return allDifferent[T](toSeq[int](positions))
     else:
-        return ConstraintState[T](
+        return StatefulConstraint[T](
             positions: positions,
             stateType: AllDifferentConstraint,
             allDifferentState: newAllDifferentState[T](expressions)
         )
 
-proc linearCombinationEq*[T](positions: openArray[int], target: T): ConstraintState[T] =
-    return ConstraintState[T](
+proc linearCombinationEq*[T](positions: openArray[int], target: T): StatefulConstraint[T] =
+    return StatefulConstraint[T](
         positions: toPackedSet[int](positions),
         stateType: LinearCombinationConstraint,
         relation: EqualTo,
@@ -99,7 +99,7 @@ proc linearCombinationEq*[T](positions: openArray[int], target: T): ConstraintSt
         linearCombinationState: newLinearCombinationState[T](positions)
     )
 
-proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): ConstraintState[T] =
+proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): StatefulConstraint[T] =
     var positions = toPackedSet[int]([])
     var allRefs = true
     for exp in expressions:
@@ -115,7 +115,7 @@ proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T
 # Computed Constraint State interface
 ################################################################################
 
-func initialize*[T](constraint: ConstraintState[T], assignment: seq[T]) =
+func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
     case constraint.stateType:
         of AllDifferentConstraint:
             constraint.allDifferentState.initialize(assignment)
@@ -127,7 +127,7 @@ func initialize*[T](constraint: ConstraintState[T], assignment: seq[T]) =
             constraint.algebraicConstraintState.initialize(assignment)
 
 
-func moveDelta*[T](constraint: ConstraintState[T], position: int, oldValue, newValue: T): int =
+func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
     case constraint.stateType:
         of AllDifferentConstraint:
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
@@ -139,7 +139,7 @@ func moveDelta*[T](constraint: ConstraintState[T], position: int, oldValue, newV
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
 
-func updatePosition*[T](constraint: ConstraintState[T], position: int, newValue: T) =
+func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
     case constraint.stateType:
         of AllDifferentConstraint:
             constraint.allDifferentState.updatePosition(position, newValue)

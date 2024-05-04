@@ -11,8 +11,8 @@ import domain
 type
     ArrayState*[T] = ref object of RootObj
         carray*: ConstrainedArray[T]
-        constraintsAtPosition*: seq[seq[ConstraintState[T]]]
-        constraints*: seq[ConstraintState[T]]
+        constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
+        constraints*: seq[StatefulConstraint[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
@@ -36,7 +36,7 @@ type
 #     return constraint.penalty(state.assignment)
 
 
-proc movePenalty*[T](state: ArrayState[T], constraint: ConstraintState[T], position: int, newValue: T): int {.inline.} =
+proc movePenalty*[T](state: ArrayState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
     case constraint.stateType:
         of AllDifferentConstraint:
@@ -82,7 +82,7 @@ proc rebuildPenaltyMap*[T](state: ArrayState[T]) =
 proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state ArrayState[T]
     state.carray = carray
-    state.constraintsAtPosition = newSeq[seq[ConstraintState[T]]](carray.len)
+    state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 

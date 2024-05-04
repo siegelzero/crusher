@@ -10,7 +10,7 @@ import expressions/[expression, expressionNode]
 type
     ConstrainedArray*[T] = object
         len*: int
-        constraints*: seq[ConstraintState[T]]
+        constraints*: seq[StatefulConstraint[T]]
         domain*: seq[seq[T]]
         entries*: seq[AlgebraicExpression[T]]
 
@@ -39,7 +39,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
         )
     return ConstrainedArray[T](
         len: n,
-        constraints: newSeq[ConstraintState[T]](),
+        constraints: newSeq[StatefulConstraint[T]](),
         domain: newSeq[seq[T]](n),
         entries: entries
     )
@@ -71,9 +71,9 @@ func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArra
     # Sets domain of position to the given values.
     arr.domain[position] = toSeq[T](domain)
 
-func allDifferent*[T](arr: ConstrainedArray[T]): ConstraintState[T] {.inline.} =
+func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.} =
     allDifferent(toSeq arr.allPositions())
 
-func addConstraint*[T](arr: var ConstrainedArray[T], cons: ConstraintState[T]) {.inline.} =
+func addConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstraint[T]) {.inline.} =
     # Adds the constraint to the 
     arr.constraints.add(cons)

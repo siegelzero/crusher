@@ -131,25 +131,25 @@ func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
 # ConstrainedVariable constraints
 ################################################################################
 
-proc allDifferent*[T](cvar: VariableContainer[T]): ConstraintState[T] =
+proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.basePositions())
 
-func addConstraint*[T](system: ConstraintSystem[T], constraint: ConstraintState[T]) =
+func addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
     # adds constraint to the system
     system.baseArray.addConstraint(constraint)
 
 func addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstraint[T]) =
     # adds constraint to the system
     system.baseArray.addConstraint(
-        ConstraintState[T](
+        StatefulConstraint[T](
             positions: constraint.positions,
             stateType: AlgebraicType,
             algebraicConstraintState: newAlgebraicConstraintState[T](constraint))
         )
 
-func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[ConstraintState[T]]) =
+func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[StatefulConstraint[T]]) =
     # adds constraints to the system
     for constraint in constraints:
         system.baseArray.addConstraint(constraint)
