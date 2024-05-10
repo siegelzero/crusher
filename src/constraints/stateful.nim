@@ -1,6 +1,7 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, constraintNode, elementState, linearCombinationState
+import algebraic, allDifferent, elementState, linear
+import constraintNode
 import ../expressions/[expression, expressionNode]
 
 ################################################################################
@@ -11,7 +12,7 @@ type
     StatefulConstraintType* = enum
         AllDifferentType,
         ElementConstraint,
-        LinearCombinationConstraint,
+        LinearType,
         AlgebraicType
 
     StatefulConstraint*[T] = object
@@ -21,10 +22,8 @@ type
                 allDifferentState*: AllDifferentConstraint[T]
             of ElementConstraint:
                 elementState: ElementState[T]
-            of LinearCombinationConstraint:
-                linearCombinationState*: LinearCombinationState[T]
-                relation*: BinaryRelation
-                rhs*: T
+            of LinearType:
+                linearCombinationState*: LinearConstraint[T]
             of AlgebraicType:
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
 
@@ -38,30 +37,30 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.allDifferentState.cost
         of ElementConstraint:
             return constraint.elementState.cost
-        of LinearCombinationConstraint:
-            let left = constraint.linearCombinationState.value
-            let right = constraint.rhs
-
-            case constraint.relation:
-                of EqualTo:
-                    return if left == right: 0 else: 1
-                of NotEqualTo:
-                    return if left != right: 0 else: 1
-                of GreaterThan:
-                    return if left > right: 0 else: 1
-                of GreaterThanEq:
-                    return if left >= right: 0 else: 1
-                of LessThan:
-                    return if left < right: 0 else: 1
-                of LessThanEq:
-                    return if left <= right: 0 else: 1
-        
+        of LinearType:
+            return constraint.linearCombinationState.cost
         of AlgebraicType:
             return constraint.algebraicConstraintState.cost
 
 ################################################################################
 # Computed Constraints
 ################################################################################
+
+template LCValRel(rel, relEnum: untyped) =
+    func `rel`*[T](left: LinearCombination[T], right: T): StatefulConstraint[T] {.inline.} =
+        var vLeft = left
+        return StatefulConstraint[T](
+            positions: vLeft.positions,
+            stateType: LinearType,
+            linearCombinationState: newLinearConstraint[T](vLeft, relEnum, right)
+        )
+
+LCValRel(`==`, EqualTo)
+LCValRel(`>`, GreaterThan)
+LCValRel(`>=`, GreaterThanEq)
+LCValRel(`<`, LessThan)
+LCValRel(`<=`, LessThanEq)
+
 
 func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given positions.
@@ -90,27 +89,6 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
             allDifferentState: newAllDifferentConstraint[T](expressions)
         )
 
-proc linearCombinationEq*[T](positions: openArray[int], target: T): StatefulConstraint[T] =
-    return StatefulConstraint[T](
-        positions: toPackedSet[int](positions),
-        stateType: LinearCombinationConstraint,
-        relation: EqualTo,
-        rhs: target,
-        linearCombinationState: newLinearCombinationState[T](positions)
-    )
-
-proc linearCombinationEq*[T](expressions: seq[AlgebraicExpression[T]], target: T): StatefulConstraint[T] =
-    var positions = toPackedSet[int]([])
-    var allRefs = true
-    for exp in expressions:
-        if exp.node.kind != RefNode:
-            allRefs = false
-        positions.incl(exp.positions)
-    
-    doAssert allRefs
-    # Use more efficient position based constraint since all expressions are refnodes
-    return linearCombinationEq(toSeq[int](positions), target)
-
 ################################################################################
 # Computed Constraint State interface
 ################################################################################
@@ -121,7 +99,7 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.allDifferentState.initialize(assignment)
         of ElementConstraint:
             constraint.elementState.initialize(assignment)
-        of LinearCombinationConstraint:
+        of LinearType:
             constraint.linearCombinationState.initialize(assignment)
         of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
@@ -133,7 +111,7 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             constraint.elementState.moveDelta(position, oldValue, newValue)
-        of LinearCombinationConstraint:
+        of LinearType:
             constraint.linearCombinationState.moveDelta(position, oldValue, newValue)
         of StatefulAlgebraicConstraint:
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
@@ -145,7 +123,7 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.allDifferentState.updatePosition(position, newValue)
         of ElementConstraint:
             constraint.elementState.updatePosition(position, newValue)
-        of LinearCombinationConstraint:
+        of LinearType:
             constraint.linearCombinationState.updatePosition(position, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)

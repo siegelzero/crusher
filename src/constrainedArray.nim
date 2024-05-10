@@ -74,6 +74,7 @@ func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArra
 func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.} =
     allDifferent(toSeq arr.allPositions())
 
-func addConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstraint[T]) {.inline.} =
+proc addBaseConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstraint[T]) {.inline.} =
     # Adds the constraint to the 
+    echo cons
     arr.constraints.add(cons)

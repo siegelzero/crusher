@@ -8,10 +8,10 @@ proc coingrid*(n, c: int) =
     X.setDomain(toSeq 0..1)
 
     for column in X.columns():
-        sys.addConstraint(linearCombinationEq(column, c))
+        sys.addConstraint(sum(column) == c)
     
     for row in X.rows():
-        sys.addConstraint(linearCombinationEq(row, c))
+        sys.addConstraint(sum(row) == c)
     
     var objectiveTerms: seq[AlgebraicExpression[int]]
     for i in 0..<n:
@@ -20,10 +20,9 @@ proc coingrid*(n, c: int) =
                 objectiveTerms.add(X[i, j]*(i - j)*(i - j))
 
     let objective = foldl(objectiveTerms, a + b)
-    sys.minimize(objective)
-
-    # doAssert assignment == @[0, 1, 1, 0, 0]
-    # doAssert objective.evaluate(assignment) == 17
+    # sys.minimize(objective)
+    let linear = linearize(objective)
+    sys.minimize(linear)
 
 
 when isMainModule:

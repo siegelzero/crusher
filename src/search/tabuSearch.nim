@@ -6,7 +6,7 @@ import ../state/arrayState
 
 randomize()
 
-func bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
+proc bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
     # Returns the best valid next moves for the state.
     # Evaluates the entire neighborhood to find best non-tabu or improving moves.
     var
@@ -63,4 +63,5 @@ proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
     var state = newArrayState[T](carray)
+    # echo "State: ", state
     return state.tabuImprove(threshold)

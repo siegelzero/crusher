@@ -1,33 +1,32 @@
-import std/[packedsets, tables]
+import std/[packedsets, sequtils, tables]
 
 import expressionNode
 
 ################################################################################
-# Type definitions
+# Type definitions for AlgebraicExpression
 ################################################################################
 
 type
-    Expression*[T] = ref object of RootObj
+    AlgebraicExpression*[T] = ref object
         positions*: PackedSet[int]
-    
-    AlgebraicExpression*[T] = ref object of Expression[T]
         node*: ExpressionNode[T]
         linear*: bool
 
 ################################################################################
-# Expression Creation
+# AlgebraicExpression Creation
 ################################################################################
 
-func init*[T](expression: Expression[T], positions: PackedSet[T]) =
-    # initalize base Expression
+func init*[T](expression: AlgebraicExpression[T],
+              positions: PackedSet[T],
+              node: ExpressionNode[T],
+              linear: bool) =
     expression.positions = positions
-
-func init*[T](expression: AlgebraicExpression[T], positions: PackedSet[T], node: ExpressionNode[T], linear: bool) =
-    expression.init(positions)
     expression.node = node
     expression.linear = linear
 
-func newAlgebraicExpression*[T](positions: PackedSet[T], node: ExpressionNode[T], linear: bool): AlgebraicExpression[T] =
+func newAlgebraicExpression*[T](positions: PackedSet[T],
+                                node: ExpressionNode[T],
+                                linear: bool): AlgebraicExpression[T] =
     new(result)
     result.init(positions, node, linear)
 
@@ -100,8 +99,142 @@ ExpValOp(`*`, Multiplication)
 ExpValOp(`-`, Subtraction)
 
 ################################################################################
-# Evaluation
+# AlgebraicExpression Evaluation
 ################################################################################
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     expression.node.evaluate(assignment)
+
+################################################################################
+# Type definitions for LinearCombination
+################################################################################
+
+type
+    LinearCombination*[T] = object
+        value*: T
+        constant*: T
+        positions*: PackedSet[int]
+        coefficient*: Table[int, T]
+        currentAssignment*: Table[int, T]
+
+################################################################################
+# LinearCombinationState Creation
+################################################################################
+
+# func init*[T](state: LinearCombination[T], positions: openArray[T]) =
+#     state.value = 0
+#     state.constant = 0
+#     state.positions = toPackedSet[int](positions)
+#     state.coefficient = initTable[int, T]()
+#     state.currentAssignment = initTable[int, T]()
+
+#     for pos in positions:
+#         state.coefficient[pos] = 1
+
+# func init*[T](state: LinearCombination[T], coefficients: Table[int, T], constant: T) =
+#     state.value = constant
+#     state.constant = constant
+#     state.positions = initPackedSet[int]()
+#     state.coefficient = initTable[int, T]()
+#     state.currentAssignment = initTable[int, T]()
+
+#     for pos, coeff in coefficients.pairs:
+#         state.positions.incl(pos)
+#         state.coefficient[pos] = coeff
+
+# func newLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
+#     new(result)
+#     result.init(positions)
+
+# func newLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): LinearCombination[T] =
+#     new(result)
+#     result.init(coefficients, constant)
+
+func initLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): LinearCombination[T] =
+    var
+        coefficient = initTable[int, T]()
+        positions = initPackedSet[int]()
+
+    for pos, coeff in coefficients.pairs:
+        positions.incl(pos)
+        coefficient[pos] = coeff
+
+    return LinearCombination[T](
+        value: 0,
+        constant: 0,
+        positions: positions,
+        currentAssignment: initTable[int, T](),
+        coefficient: coefficient
+    )
+
+func initLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
+    var coefficient = initTable[int, T]()
+
+    for pos in positions:
+        coefficient[pos] = 1
+    
+    return LinearCombination[T](
+        value: 0,
+        constant: 0,
+        positions: toPackedSet[int](positions),
+        currentAssignment: initTable[int, T](),
+        coefficient: coefficient
+    )
+
+
+################################################################################
+# LinearCombinationState Initialization
+################################################################################
+
+func initialize*[T](state: var LinearCombination[T], assignment: seq[T]) =
+    var value: T = state.constant
+    for pos in state.positions:
+        value = assignment[pos]
+        state.value += state.coefficient[pos]*value
+        state.currentAssignment[pos] = value
+
+################################################################################
+# LinearCombinationState Updates
+################################################################################
+
+func updatePosition*[T](state: var LinearCombination[T], position: int, newValue: T) {.inline.} =
+    let oldValue = state.currentAssignment[position]
+    state.value += state.coefficient[position]*(newValue - oldValue)
+    state.currentAssignment[position] = newValue
+
+func moveDelta*[T](state: LinearCombination[T], position: int, oldValue, newValue: T): int {.inline.} =
+    state.coefficient[position]*(newValue - oldValue)
+
+
+func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
+    # Converts linear expression to a LinearCombination
+    var constant: T
+    var coefficients, assignment: Table[int, T]
+
+    # evaluate with all variables zero to get constant coefficient
+    for pos in expression.positions:
+        assignment[pos] = 0
+
+    constant = expression.evaluate(assignment)
+
+    # extract each coefficient
+    for pos in expression.positions:
+        assignment[pos] = 1
+        coefficients[pos] = expression.evaluate(assignment) - constant
+        assignment[pos] = 0
+
+    # return newLinearCombination[T](coefficients, constant)
+    return initLinearCombination[T](coefficients, constant)
+
+
+func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
+    var positions = toPackedSet[int]([])
+    var allRefs = true
+    for exp in expressions:
+        if exp.node.kind != RefNode:
+            allRefs = false
+        positions.incl(exp.positions)
+    
+    doAssert allRefs
+    # return newLinearCombination[T](toSeq[int](positions))
+    return initLinearCombination[T](toSeq[int](positions))

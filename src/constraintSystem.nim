@@ -136,13 +136,13 @@ proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.basePositions())
 
-func addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
+proc addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
     # adds constraint to the system
-    system.baseArray.addConstraint(constraint)
+    system.baseArray.addBaseConstraint(constraint)
 
-func addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstraint[T]) =
+proc addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstraint[T]) =
     # adds constraint to the system
-    system.baseArray.addConstraint(
+    system.baseArray.addBaseConstraint(
         StatefulConstraint[T](
             positions: constraint.positions,
             stateType: AlgebraicType,
@@ -152,4 +152,4 @@ func addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstra
 func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[StatefulConstraint[T]]) =
     # adds constraints to the system
     for constraint in constraints:
-        system.baseArray.addConstraint(constraint)
+        system.baseArray.addBaseConstraint(constraint)
