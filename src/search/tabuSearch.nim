@@ -63,5 +63,4 @@ proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
     var state = newArrayState[T](carray)
-    # echo "State: ", state
     return state.tabuImprove(threshold)

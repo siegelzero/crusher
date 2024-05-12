@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, tables]
+import std/[packedsets, random, sequtils, tables, strformat]
 
 import ../constraints/[algebraic, stateful, allDifferent, linear]
 import ../constrainedArray
@@ -31,11 +31,6 @@ type
 # Penalty Routines
 ################################################################################
 
-# proc penalty*[T](state: ArrayState[T], constraint: Constraint[T]): int {.inline.} =
-#     # Computes the penalty of the constraint, using current assignment of state.
-#     return constraint.penalty(state.assignment)
-
-
 proc movePenalty*[T](state: ArrayState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
     case constraint.stateType:
@@ -44,7 +39,7 @@ proc movePenalty*[T](state: ArrayState[T], constraint: StatefulConstraint[T], po
         of ElementConstraint:
             result = 0
         of LinearType:
-            result = constraint.linearCombinationState.cost + constraint.linearCombinationState.moveDelta(position, oldValue, newValue)
+            result = constraint.linearConstraintState.cost + constraint.linearConstraintState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
@@ -109,9 +104,12 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for pos in carray.allPositions():
         state.assignment[pos] = sample(state.reducedDomain[pos])
     
+    echo fmt"Initial assignment: {state.assignment}"
+    
     # Initialize constraint states with current assignment
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
+        echo fmt"Initialized constraint with cost {constraint.penalty()}"
 
     # Compute cost
     for cons in carray.constraints:

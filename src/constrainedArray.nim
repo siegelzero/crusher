@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils]
+import std/[packedsets, sequtils, strformat]
 
 import constraints/stateful
 import expressions/[expression, expressionNode]
@@ -22,6 +22,10 @@ func `[]`*[T](arr: ConstrainedArray[T], idx: int): AlgebraicExpression[T] {.inli
 
 iterator allPositions*[T](arr: ConstrainedArray[T]): int =
     for i in 0..<arr.len: yield i
+
+func `$`*[T](arr: ConstrainedArray[T]): string =
+    return fmt"ConstrainedArray of size {arr.len}"
+
 
 ################################################################################
 # ConstrainedArray Creation
@@ -76,5 +80,4 @@ func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.
 
 proc addBaseConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstraint[T]) {.inline.} =
     # Adds the constraint to the 
-    echo cons
     arr.constraints.add(cons)

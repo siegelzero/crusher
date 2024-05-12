@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, sequtils, strformat, tables]
 
 import algebraic, allDifferent, elementState, linear
 import constraintNode
@@ -23,9 +23,25 @@ type
             of ElementConstraint:
                 elementState: ElementState[T]
             of LinearType:
-                linearCombinationState*: LinearConstraint[T]
+                linearConstraintState*: LinearConstraint[T]
             of AlgebraicType:
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
+
+
+func `$`*[T](constraint: StatefulConstraint[T]): string =
+    case constraint.stateType:
+        of AllDifferentType:
+            return "AllDifferent Constraint"
+        of ElementConstraint:
+            return "Element Constraint"
+        of LinearType:
+            # return $(constraint.linearConsraintState.lincomb.coefficients)
+            # return fmt"Linear Constraint {constraint.linearConsraintState.lincomb.coefficients}"
+            return constraint.linearConstraintState.cost
+            # return fmt"Linear Constraint {constraint.linearConstraintState.lincomb} {constraint.linearConstraintState.relation} {constraint.linearConstraintState.target}"
+        of AlgebraicType:
+            return "Algebraic Constraint"
+    # return $(constraint.lincomb.coefficient)
 
 ################################################################################
 # Evaluation
@@ -38,7 +54,7 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
         of ElementConstraint:
             return constraint.elementState.cost
         of LinearType:
-            return constraint.linearCombinationState.cost
+            return constraint.linearConstraintState.cost
         of AlgebraicType:
             return constraint.algebraicConstraintState.cost
 
@@ -52,7 +68,7 @@ template LCValRel(rel, relEnum: untyped) =
         return StatefulConstraint[T](
             positions: vLeft.positions,
             stateType: LinearType,
-            linearCombinationState: newLinearConstraint[T](vLeft, relEnum, right)
+            linearConstraintState: newLinearConstraint[T](vLeft, relEnum, right)
         )
 
 LCValRel(`==`, EqualTo)
@@ -100,7 +116,7 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
         of ElementConstraint:
             constraint.elementState.initialize(assignment)
         of LinearType:
-            constraint.linearCombinationState.initialize(assignment)
+            constraint.linearConstraintState.initialize(assignment)
         of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
 
@@ -112,7 +128,7 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
         of ElementConstraint:
             constraint.elementState.moveDelta(position, oldValue, newValue)
         of LinearType:
-            constraint.linearCombinationState.moveDelta(position, oldValue, newValue)
+            constraint.linearConstraintState.moveDelta(position, oldValue, newValue)
         of StatefulAlgebraicConstraint:
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
@@ -124,6 +140,6 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
         of ElementConstraint:
             constraint.elementState.updatePosition(position, newValue)
         of LinearType:
-            constraint.linearCombinationState.updatePosition(position, newValue)
+            constraint.linearConstraintState.updatePosition(position, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)

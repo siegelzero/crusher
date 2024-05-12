@@ -1,4 +1,4 @@
-import std/sequtils
+import std/[sequtils, strformat]
 import crusher
 
 
@@ -14,12 +14,10 @@ proc mip*() =
     sys.addConstraint(linearize(x[1] - 2*x[2] + x[3] + x[4]) <= -1)
 
     let objective = linearize(5*x[0] + 7*x[1] + 10*x[2] + 3*x[3] + x[4])
-    # sys.addConstraint(objective < 20)
-    # sys.addConstraint(objective < 19)
-    sys.minimize(objective)
-
+    sys.minimize(objective, parallel=false)
+    echo fmt"Found assignment: {sys.assignment}"
+    
     doAssert x.assignment == @[0, 1, 1, 0, 0]
-    # doAssert objective.evaluate(x.assignment) == 17
 
 
 when isMainModule:

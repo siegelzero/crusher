@@ -14,6 +14,9 @@ type
         target*: T
         cost*: int
 
+# func `$`*[T](constraint: LinearConstraint[T]): string =
+#     return $(constraint.lincomb.coefficient)
+
 ################################################################################
 # LinearConstraint Creation
 ################################################################################

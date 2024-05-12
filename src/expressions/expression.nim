@@ -188,6 +188,7 @@ func initLinearCombination*[T](positions: openArray[int]): LinearCombination[T] 
 
 func initialize*[T](state: var LinearCombination[T], assignment: seq[T]) =
     var value: T = state.constant
+    state.value = 0
     for pos in state.positions:
         value = assignment[pos]
         state.value += state.coefficient[pos]*value
