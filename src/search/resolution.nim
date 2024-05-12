@@ -9,18 +9,32 @@ type NoSolutionFoundError* = object of CatchableError
 
 proc resolve*[T](system: ConstraintSystem[T],
                  parallel=true,
-                 threshold=10000,
-                 attempts=10) = 
+                 tabuThreshold=10000,
+                 maxAttempts=1000,
+                 attemptThreshold=100) = 
     
     if not parallel:
-        var improved = system.baseArray.tabuImprove(threshold)
+        var improved = system.baseArray.tabuImprove(tabuThreshold)
         if improved.cost == 0:
             system.assignment = improved.assignment
             return
     else:
-        for improved in system.baseArray.parallelSearch(threshold, attempts):
+        var lastImprovement = 0
+        var bestAttempt = 1000000000
+        var attempt = 0
+
+        for improved in system.baseArray.parallelSearch(tabuThreshold, maxAttempts):
+            attempt += 1
+
+            if improved.cost < bestAttempt:
+                bestAttempt = improved.cost
+                lastImprovement = attempt
+
             if improved.cost == 0:
                 system.assignment = improved.assignment
                 return
+            
+            if attempt - lastImprovement > attemptThreshold:
+                break
 
     raise newException(NoSolutionFoundError, "Can't find satisfying solution")

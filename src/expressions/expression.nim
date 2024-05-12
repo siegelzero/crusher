@@ -110,7 +110,7 @@ func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[i
 ################################################################################
 
 type
-    LinearCombination*[T] = object
+    LinearCombination*[T] = ref object
         value*: T
         constant*: T
         positions*: PackedSet[int]
@@ -121,72 +121,41 @@ type
 # LinearCombinationState Creation
 ################################################################################
 
-# func init*[T](state: LinearCombination[T], positions: openArray[T]) =
-#     state.value = 0
-#     state.constant = 0
-#     state.positions = toPackedSet[int](positions)
-#     state.coefficient = initTable[int, T]()
-#     state.currentAssignment = initTable[int, T]()
-
-#     for pos in positions:
-#         state.coefficient[pos] = 1
-
-# func init*[T](state: LinearCombination[T], coefficients: Table[int, T], constant: T) =
-#     state.value = constant
-#     state.constant = constant
-#     state.positions = initPackedSet[int]()
-#     state.coefficient = initTable[int, T]()
-#     state.currentAssignment = initTable[int, T]()
-
-#     for pos, coeff in coefficients.pairs:
-#         state.positions.incl(pos)
-#         state.coefficient[pos] = coeff
-
-# func newLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
-#     new(result)
-#     result.init(positions)
-
-# func newLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): LinearCombination[T] =
-#     new(result)
-#     result.init(coefficients, constant)
-
-func initLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): LinearCombination[T] =
-    var
-        coefficient = initTable[int, T]()
-        positions = initPackedSet[int]()
-
-    for pos, coeff in coefficients.pairs:
-        positions.incl(pos)
-        coefficient[pos] = coeff
-
-    return LinearCombination[T](
-        value: 0,
-        constant: 0,
-        positions: positions,
-        currentAssignment: initTable[int, T](),
-        coefficient: coefficient
-    )
-
-func initLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
-    var coefficient = initTable[int, T]()
+func init*[T](state: LinearCombination[T], positions: openArray[T]) =
+    state.value = 0
+    state.constant = 0
+    state.positions = toPackedSet[int](positions)
+    state.coefficient = initTable[int, T]()
+    state.currentAssignment = initTable[int, T]()
 
     for pos in positions:
-        coefficient[pos] = 1
-    
-    return LinearCombination[T](
-        value: 0,
-        constant: 0,
-        positions: toPackedSet[int](positions),
-        currentAssignment: initTable[int, T](),
-        coefficient: coefficient
-    )
+        state.coefficient[pos] = 1
+
+func init*[T](state: LinearCombination[T], coefficients: Table[int, T], constant: T) =
+    state.value = constant
+    state.constant = constant
+    state.positions = initPackedSet[int]()
+    state.coefficient = initTable[int, T]()
+    state.currentAssignment = initTable[int, T]()
+
+    for pos, coeff in coefficients.pairs:
+        state.positions.incl(pos)
+        state.coefficient[pos] = coeff
+
+func newLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
+    new(result)
+    result.init(positions)
+
+func newLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): LinearCombination[T] =
+    new(result)
+    result.init(coefficients, constant)
 
 
 ################################################################################
 # LinearCombinationState Initialization
 ################################################################################
 
-func initialize*[T](state: var LinearCombination[T], assignment: seq[T]) =
+func initialize*[T](state: LinearCombination[T], assignment: seq[T]) =
     var value: T = state.constant
     state.value = 0
     for pos in state.positions:
@@ -198,7 +167,7 @@ func initialize*[T](state: var LinearCombination[T], assignment: seq[T]) =
 # LinearCombinationState Updates
 ################################################################################
 
-func updatePosition*[T](state: var LinearCombination[T], position: int, newValue: T) {.inline.} =
+func updatePosition*[T](state: LinearCombination[T], position: int, newValue: T) {.inline.} =
     let oldValue = state.currentAssignment[position]
     state.value += state.coefficient[position]*(newValue - oldValue)
     state.currentAssignment[position] = newValue
@@ -224,8 +193,7 @@ func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
         coefficients[pos] = expression.evaluate(assignment) - constant
         assignment[pos] = 0
 
-    # return newLinearCombination[T](coefficients, constant)
-    return initLinearCombination[T](coefficients, constant)
+    return newLinearCombination[T](coefficients, constant)
 
 
 func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
@@ -237,5 +205,4 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
         positions.incl(exp.positions)
     
     doAssert allRefs
-    # return newLinearCombination[T](toSeq[int](positions))
-    return initLinearCombination[T](toSeq[int](positions))
+    return newLinearCombination[T](toSeq[int](positions))

@@ -104,12 +104,9 @@ proc init*[T](state: ArrayState[T], carray: ConstrainedArray[T]) =
     for pos in carray.allPositions():
         state.assignment[pos] = sample(state.reducedDomain[pos])
     
-    echo fmt"Initial assignment: {state.assignment}"
-    
     # Initialize constraint states with current assignment
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
-        echo fmt"Initialized constraint with cost {constraint.penalty()}"
 
     # Compute cost
     for cons in carray.constraints:

@@ -64,11 +64,10 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
 
 template LCValRel(rel, relEnum: untyped) =
     func `rel`*[T](left: LinearCombination[T], right: T): StatefulConstraint[T] {.inline.} =
-        var vLeft = left
         return StatefulConstraint[T](
-            positions: vLeft.positions,
+            positions: left.positions,
             stateType: LinearType,
-            linearConstraintState: newLinearConstraint[T](vLeft, relEnum, right)
+            linearConstraintState: newLinearConstraint[T](left, relEnum, right)
         )
 
 LCValRel(`==`, EqualTo)

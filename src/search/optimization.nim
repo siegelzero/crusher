@@ -23,20 +23,17 @@ proc minimize*[T](system: ConstraintSystem[T], objective: AlgebraicExpression[T]
 
 proc minimize*[T](system: ConstraintSystem[T], objective: LinearCombination[T], parallel=true) =
     # Find initial solution
-    var vObjective = objective
-    echo "Hello"
     system.resolve(parallel=parallel)
-    vObjective.initialize(system.assignment)
-    var currentCost = vObjective.value
-    echo fmt"Found solution with cost {currentCost}"
+    objective.initialize(system.assignment)
+    var currentCost = objective.value
 
     while true:
-        system.addConstraint(vObjective < currentCost)
+        system.addConstraint(objective < currentCost)
 
         try:
             system.resolve(parallel=parallel)
-            vObjective.initialize(system.assignment)
-            currentCost = vObjective.value
+            objective.initialize(system.assignment)
+            currentCost = objective.value
             echo fmt"Found solution with cost {currentCost}"
         except NoSolutionFoundError:
             return
