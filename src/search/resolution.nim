@@ -20,7 +20,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             return
     else:
         var lastImprovement = 0
-        var bestAttempt = 1000000000
+        var bestAttempt = high(int)
         var attempt = 0
 
         for improved in system.baseArray.parallelSearch(tabuThreshold, maxAttempts):
