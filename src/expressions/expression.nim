@@ -172,6 +172,7 @@ func updatePosition*[T](state: LinearCombination[T], position: int, newValue: T)
     state.value += state.coefficient[position]*(newValue - oldValue)
     state.currentAssignment[position] = newValue
 
+
 func moveDelta*[T](state: LinearCombination[T], position: int, oldValue, newValue: T): int {.inline.} =
     state.coefficient[position]*(newValue - oldValue)
 

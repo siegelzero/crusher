@@ -21,7 +21,7 @@ type
             of AllDifferentType:
                 allDifferentState*: AllDifferentConstraint[T]
             of ElementConstraint:
-                elementState: ElementState[T]
+                elementState*: ElementState[T]
             of LinearType:
                 linearConstraintState*: LinearConstraint[T]
             of AlgebraicType:
