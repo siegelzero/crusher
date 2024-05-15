@@ -58,40 +58,6 @@ proc ageProblem*(): ConstrainedArray[int] =
     return age
 
 
-
-proc magicSquare*(n: int): ConstraintSystem[int] = 
-    # Magic Squares
-    var sys = initConstraintSystem[int]()
-    var X = sys.newConstrainedMatrix(n, n)
-
-    let target = n*(n*n + 1) div 2
-
-    # Row sums == target
-    for row in X.rows():
-        sys.addConstraint(row.foldl(a + b) == target)
-
-    # Col sums == target
-    for col in X.columns():
-        sys.addConstraint(col.foldl(a + b) == target)
-        
-    # Diagonals
-    var terms: seq[Expression[int]] = @[]
-    for i in 0..<n:
-        terms.add(X[i, i])
-    sys.addConstraint(terms.foldl(a + b) == target)
-
-    terms = @[]
-    for i in 0..<n:
-        terms.add(X[i, n - i - 1])
-    sys.addConstraint(terms.foldl(a + b) == target)
-
-    # All entries in square must be distinct
-    sys.addConstraint(allDifferent(X))
-    X.setDomain(toSeq(1..n*n))
-
-    return sys
-
-
 proc magicSquareLC*(n: int): ConstraintSystem[int] = 
     # Magic Squares
     var sys = initConstraintSystem[int]()
