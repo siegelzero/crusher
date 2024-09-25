@@ -2,11 +2,11 @@ import std/[packedsets, random, tables]
 
 import ../expressions
 import ../constrainedArray
-import ../state/arrayState
+import tabuState
 
 randomize()
 
-proc bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
+proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     # Returns the best valid next moves for the state.
     # Evaluates the entire neighborhood to find best non-tabu or improving moves.
     var
@@ -35,7 +35,7 @@ proc bestMoves[T](state: ArrayState[T]): seq[(int, T)] =
                     result.add((position, newValue))
 
 
-proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
+proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     let moves = state.bestMoves()
 
     if moves.len > 0:
@@ -46,7 +46,7 @@ proc applyBestMove[T](state: ArrayState[T]) {.inline.} =
         state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
 
 
-proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =
+proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     var lastImprovement = 0
 
     while state.iteration - lastImprovement < threshold:
@@ -61,6 +61,6 @@ proc tabuImprove*[T](state: ArrayState[T], threshold: int): ArrayState[T] =
     return state
 
 
-proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): ArrayState[T] =
-    var state = newArrayState[T](carray)
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): TabuState[T] =
+    var state = newTabuState[T](carray)
     return state.tabuImprove(threshold)

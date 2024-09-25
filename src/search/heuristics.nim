@@ -2,13 +2,12 @@ import std/[cpuinfo, random, strformat, threadpool]
 
 import ../constraints/stateful
 import ../constrainedArray
-import ../state/arrayState
-import tabuSearch
+import tabuSearch, tabuState
 
 randomize()
 
 
-iterator parallelSearch*[T](carray: ConstrainedArray[T], threshold: int, maxJobs=0): ArrayState[T] =
+iterator parallelSearch*[T](carray: ConstrainedArray[T], threshold: int, maxJobs=0): TabuState[T] =
     # Spawns N independent search threads, yielding results in order of completion.
     # Iteration stops if a solution is found.
     let N = countProcessors()
@@ -21,11 +20,11 @@ iterator parallelSearch*[T](carray: ConstrainedArray[T], threshold: int, maxJobs
         jobCount += 1
     
     # Yield each as it completes
-    var result: ArrayState[T]
+    var result: TabuState[T]
     var idx: int
     while jobs.len > 0:
         idx = blockUntilAny(jobs)
-        result = ^FlowVar[ArrayState[T]](jobs[idx])
+        result = ^FlowVar[TabuState[T]](jobs[idx])
 
         yield result
         if result.cost == 0:
@@ -38,8 +37,8 @@ iterator parallelSearch*[T](carray: ConstrainedArray[T], threshold: int, maxJobs
             jobs.del(idx)
 
 
-proc crossover*[T](carray: ConstrainedArray[T], A, B: ArrayState[T]): ArrayState[T] =
-    result = newArrayState[T](carray)
+proc crossover*[T](carray: ConstrainedArray[T], A, B: TabuState[T]): TabuState[T] =
+    result = newTabuState[T](carray)
     var penaltyA, penaltyB: int
 
     for constraint in carray.constraints:
@@ -59,16 +58,16 @@ proc crossover*[T](carray: ConstrainedArray[T], A, B: ArrayState[T]): ArrayState
                 result.assignValue(position, sample(A.reducedDomain[position]))
 
 
-proc hybrid*[T](carray: ConstrainedArray[T], threshold, popSize, generations: int): ArrayState[T] =
-    var population: seq[ArrayState[T]]
+proc hybrid*[T](carray: ConstrainedArray[T], threshold, popSize, generations: int): TabuState[T] =
+    var population: seq[TabuState[T]]
     for improved in carray.parallelSearch(threshold, popSize):
         if improved.cost == 0:
             return improved
         population.add(improved)
     
     echo fmt"Have population {population.len}"
-    var nextGeneration: seq[ArrayState[T]]
-    var improved, offspring: ArrayState[T]
+    var nextGeneration: seq[TabuState[T]]
+    var improved, offspring: TabuState[T]
 
     for i in 0..<population.len:
         for j in 0..<i:
