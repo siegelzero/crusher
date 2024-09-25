@@ -1,6 +1,6 @@
 import std/tables
 
-import ../expressions/expression
+import ../expressions
 import ../utils
 import constraintNode
 

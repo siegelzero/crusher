@@ -2,7 +2,7 @@ import std/[packedsets, sequtils]
 
 import constrainedArray
 import constraints/[algebraic, stateful]
-import expressions/expression
+import expressions
 
 ################################################################################
 # Type definitions

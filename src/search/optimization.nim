@@ -1,7 +1,7 @@
 import std/[strformat]
 
 import resolution
-import ../expressions/expression
+import ../expressions
 import ../constraintSystem
 
 

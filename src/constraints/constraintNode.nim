@@ -1,6 +1,6 @@
 import std/tables
 
-import ../expressions/expressionNode
+import ../expressions
 import ../utils
 
 ################################################################################
@@ -65,7 +65,6 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
                     return left <= right
                 of CommonFactor:
                     return gcd(left, right) > 1
-
 
 
 proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T {.inline.} =

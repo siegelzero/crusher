@@ -1,7 +1,7 @@
 import std/packedsets
 
 import constraints/[algebraic, stateful, linear]
-import expressions/expression
+import expressions
 import search/[optimization, resolution]
 import constraintSystem
 
@@ -9,7 +9,7 @@ export constraintSystem,
        stateful,
        algebraic,
        linear,
-       expression,
+       expressions,
        optimization,
        resolution,
        packedsets

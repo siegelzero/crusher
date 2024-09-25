@@ -1,7 +1,7 @@
 import std/[packedsets, sequtils, strformat]
 
 import constraints/stateful
-import expressions/[expression, expressionNode]
+import expressions
 
 ################################################################################
 # Type definitions

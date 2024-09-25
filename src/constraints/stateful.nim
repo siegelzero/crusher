@@ -1,8 +1,8 @@
-import std/[packedsets, sequtils, strformat, tables]
+import std/[packedsets, sequtils, tables]
 
 import algebraic, allDifferent, elementState, linear
 import constraintNode
-import ../expressions/[expression, expressionNode]
+import ../expressions
 
 ################################################################################
 # Type definitions

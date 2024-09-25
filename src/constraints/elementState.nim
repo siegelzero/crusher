@@ -1,6 +1,4 @@
-import std/[packedsets, sequtils, tables]
-
-import ../expressions/[expression, expressionNode]
+import std/[packedsets, tables]
 
 ################################################################################
 # Type definitions
