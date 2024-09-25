@@ -1,6 +1,7 @@
 import std/tables
 
 import ../expressions/expression
+import ../utils
 import constraintNode
 
 ################################################################################
@@ -52,6 +53,8 @@ func computeCost(left, right: int, relation: BinaryRelation): int =
             return if left < right: 0 else: 1
         of LessThanEq:
             return if left <= right: 0 else: 1
+        of CommonFactor:
+            return if gcd(left, right) > 1: 0 else: 1
 
 
 func initialize*[T](state: LinearConstraint[T], assignment: seq[T]) =

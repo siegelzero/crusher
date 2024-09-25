@@ -154,3 +154,18 @@ func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValu
     let delta = newCost - oldCost
     state.currentAssignment[position] = oldValue
     return delta
+
+################################################################################
+# Arithmetical Constraints
+################################################################################
+
+func commonFactor*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: left.positions + right.positions,
+        node: ConstraintNode[T](
+            kind: BinaryRelNode,
+            binaryRel: CommonFactor,
+            left: left.node,
+            right: right.node
+        )
+    )

@@ -27,38 +27,34 @@ type
 # AllDifferentConstraint Creation
 ################################################################################
 
-func init*[T](state: AllDifferentConstraint[T], positions: openArray[T]) =
-    state.cost = 0
-    state.evalMethod = PositionBased
-    state.positions = toPackedSet[int](positions)
-    state.count = newSeq[int]()
-    state.currentAssignment = initTable[int, T]()
-
-func init*[T](state: AllDifferentConstraint[T], expressions: seq[AlgebraicExpression[T]]) =
-    state.cost = 0
-    state.evalMethod = ExpressionBased
-    state.expressionsAtPosition = initTable[int, seq[int]]()
-
-    for i, exp in expressions:
-        for pos in exp.positions.items:
-            if pos in state.expressionsAtPosition:
-                state.expressionsAtPosition[pos].add(i)
-            else:
-                state.expressionsAtPosition[pos] = @[i]
-
-    state.expressions = expressions
-    state.countTable = initTable[T, int]()
-    state.currentAssignment = initTable[int, T]()
-
 func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
-    new(result)
-    result.init(positions)
+    AllDifferentConstraint[T](
+        cost: 0,
+        evalMethod: PositionBased,
+        positions: toPackedSet[int](positions),
+        count: newSeq[int](),
+        currentAssignment: initTable[int, T](),
+    )
 
 func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
-    new(result)
-    result.init(expressions)
+    result = AllDifferentConstraint[T](
+        cost: 0,
+        evalMethod: ExpressionBased,
+        expressionsAtPosition: initTable[int, seq[int]](),
+        expressions: expressions,
+        countTable: initTable[T, int](),
+        currentAssignment: initTable[int, T](),
+    )
+
+    for i, exp in expressions:
+        for pos in exp.positions.items:
+            if pos in result.expressionsAtPosition:
+                result.expressionsAtPosition[pos].add(i)
+            else:
+                result.expressionsAtPosition[pos] = @[i]
+
 
 ################################################################################
 # AllDifferentConstraint utility functions

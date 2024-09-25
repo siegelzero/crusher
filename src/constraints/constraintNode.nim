@@ -1,6 +1,7 @@
 import std/tables
 
 import ../expressions/expressionNode
+import ../utils
 
 ################################################################################
 # Type definitions
@@ -17,6 +18,7 @@ type
         GreaterThanEq,
         LessThan,
         LessThanEq,
+        CommonFactor,
 
     NodeType* = enum
         UnaryRelNode,
@@ -61,6 +63,9 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
                     return left < right
                 of LessThanEq:
                     return left <= right
+                of CommonFactor:
+                    return gcd(left, right) > 1
+
 
 
 proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
@@ -90,3 +95,5 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
                     return if left < right: 0 else: 1
                 of LessThanEq:
                     return if left <= right: 0 else: 1
+                of CommonFactor:
+                    return if gcd(left, right) > 1: 0 else: 1
