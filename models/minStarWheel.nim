@@ -1,4 +1,4 @@
-import std/[os, sequtils, strformat, strutils]
+import std/[os, sequtils, strutils]
 
 import crusher
 
