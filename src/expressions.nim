@@ -225,6 +225,10 @@ func initialize*[T](state: LinearCombination[T], assignment: seq[T]) =
         state.value += state.coefficient[pos]*value
         state.currentAssignment[pos] = value
 
+func evaluate*[T](expression: LinearCombination[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    for pos in expression.positions:
+        result += expression.coefficient[pos]*assignment[pos]
+
 ################################################################################
 # LinearCombinationState Updates
 ################################################################################

@@ -112,6 +112,10 @@ iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
             row.add(cvar[i, j])
         yield row
 
+
+func sum*[T](cvar: ConstrainedSequence[T]): LinearCombination[T] =
+    return newLinearCombination[T](cvar.basePositions)
+
 ################################################################################
 # Displaying
 ################################################################################

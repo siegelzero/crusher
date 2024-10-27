@@ -19,6 +19,7 @@ type
         LessThan,
         LessThanEq,
         CommonFactor,
+        CoPrime,
 
     NodeType* = enum
         UnaryRelNode,
@@ -65,6 +66,8 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
                     return left <= right
                 of CommonFactor:
                     return gcd(left, right) > 1
+                of CoPrime:
+                    return gcd(left, right) == 1
 
 
 proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
@@ -96,3 +99,5 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
                     return if left <= right: 0 else: 1
                 of CommonFactor:
                     return if gcd(left, right) > 1: 0 else: 1
+                of CoPrime:
+                    return if gcd(left, right) == 1: 0 else: 1

@@ -169,3 +169,14 @@ func commonFactor*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[
             right: right.node
         )
     )
+
+func coPrime*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: left.positions + right.positions,
+        node: ConstraintNode[T](
+            kind: BinaryRelNode,
+            binaryRel: CoPrime,
+            left: left.node,
+            right: right.node
+        )
+    )

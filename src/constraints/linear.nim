@@ -55,6 +55,8 @@ func computeCost(left, right: int, relation: BinaryRelation): int =
             return if left <= right: 0 else: 1
         of CommonFactor:
             return if gcd(left, right) > 1: 0 else: 1
+        of CoPrime:
+            return if gcd(left, right) == 1: 0 else: 1
 
 
 func initialize*[T](state: LinearConstraint[T], assignment: seq[T]) =
