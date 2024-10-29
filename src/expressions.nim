@@ -20,7 +20,7 @@ type
         UnaryOpNode,
         BinaryOpNode
 
-    ExpressionNode*[T] {.acyclic.} = ref object
+    ExpressionNode*[T] = ref object
         case kind*: NodeType
             of LiteralNode:
                 value*: T
@@ -32,6 +32,11 @@ type
             of BinaryOpNode:
                 binaryOp*: BinaryOperation
                 left*, right*: ExpressionNode[T]
+
+    AlgebraicExpression*[T] = ref object
+        positions*: PackedSet[int]
+        node*: ExpressionNode[T]
+        linear*: bool
 
 ################################################################################
 # Evaluation
@@ -63,16 +68,6 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                     return left - right
                 of Multiplication:
                     return left * right
-
-################################################################################
-# Type definitions for AlgebraicExpression
-################################################################################
-
-type
-    AlgebraicExpression*[T] = ref object
-        positions*: PackedSet[int]
-        node*: ExpressionNode[T]
-        linear*: bool
 
 ################################################################################
 # AlgebraicExpression Creation

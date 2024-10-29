@@ -35,13 +35,9 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
         of ElementConstraint:
             return "Element Constraint"
         of LinearType:
-            # return $(constraint.linearConsraintState.lincomb.coefficients)
-            # return fmt"Linear Constraint {constraint.linearConsraintState.lincomb.coefficients}"
             return constraint.linearConstraintState.cost
-            # return fmt"Linear Constraint {constraint.linearConstraintState.lincomb} {constraint.linearConstraintState.relation} {constraint.linearConstraintState.target}"
         of AlgebraicType:
             return "Algebraic Constraint"
-    # return $(constraint.lincomb.coefficient)
 
 ################################################################################
 # Evaluation

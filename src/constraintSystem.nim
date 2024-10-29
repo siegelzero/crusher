@@ -58,7 +58,6 @@ func init*[T](cvar: ConstrainedMatrix[T], system: ConstraintSystem[T], m, n: int
     cvar.m = m
     cvar.n = n
 
-# system.newConstrainedSequence(n)
 func newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): ConstrainedSequence[T] =
     new(result)
     result.init(system, n)
@@ -81,7 +80,7 @@ func `[]`*[T](cvar: ConstrainedSequence[T], i: int): AlgebraicExpression[T] {.in
 func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
-func basePositions*[T](cvar: VariableContainer[T]): seq[int] =
+func positions[T](cvar: VariableContainer[T]): seq[int] =
     toSeq cvar.offset..<(cvar.offset + cvar.size)
 
 func assignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
@@ -97,6 +96,7 @@ func assignment*[T](cvar: ConstrainedMatrix[T]): seq[seq[T]] =
 ################################################################################
 
 iterator columns*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
+    # Yields the columns of the ConstrainedMatrix
     var col: seq[AlgebraicExpression[T]]
     for i in 0..<cvar.n:
         col = @[]
@@ -105,6 +105,7 @@ iterator columns*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
         yield col
 
 iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
+    # Yields the rows of the ConstrainedMatrix
     var row: seq[AlgebraicExpression[T]]
     for i in 0..<cvar.m:
         row = @[]
@@ -112,9 +113,6 @@ iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
             row.add(cvar[i, j])
         yield row
 
-
-func sum*[T](cvar: ConstrainedSequence[T]): LinearCombination[T] =
-    return newLinearCombination[T](cvar.basePositions)
 
 ################################################################################
 # Displaying
@@ -132,13 +130,22 @@ func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
     cvar.system.baseArray.setDomain(domain)
 
 ################################################################################
+# ConstrainedVariable methods
+################################################################################
+
+func sum*[T](cvar: ConstrainedSequence[T]): LinearCombination[T] =
+    # Returns LinearCombination object representing the sum of the
+    # Constrained Sequence
+    return newLinearCombination[T](cvar.positions)
+
+################################################################################
 # ConstrainedVariable constraints
 ################################################################################
 
 proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
-    allDifferent[T](cvar.basePositions())
+    allDifferent[T](cvar.positions)
 
 proc addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
     # adds constraint to the system

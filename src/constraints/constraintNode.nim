@@ -25,7 +25,7 @@ type
         UnaryRelNode,
         BinaryRelNode
 
-    ConstraintNode*[T] {.acyclic.} = ref object
+    ConstraintNode*[T] = ref object
         case kind*: NodeType
             of UnaryRelNode:
                 unaryRel*: UnaryRelation
@@ -38,11 +38,31 @@ type
 # Evaluation
 ################################################################################
 
-func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): bool {.inline.} =
+func evaluate*[T](relation: BinaryRelation, left, right: T): bool =
+    # Evaluates the binary relation with inputs left, right
+    case relation:
+        of EqualTo:
+            return left == right
+        of NotEqualTo:
+            return left != right
+        of GreaterThan:
+            return left > right
+        of GreaterThanEq:
+            return left >= right
+        of LessThan:
+            return left < right
+        of LessThanEq:
+            return left <= right
+        of CommonFactor:
+            return gcd(left, right) > 1
+        of CoPrime:
+            return gcd(left, right) == 1
+
+
+func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): bool =
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)
-
             case node.unaryRel:
                 of Not:
                     return not target
@@ -50,32 +70,17 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
         of BinaryRelNode:
             let left = node.left.evaluate(assignment)
             let right = node.right.evaluate(assignment)
-
-            case node.binaryRel:
-                of EqualTo:
-                    return left == right
-                of NotEqualTo:
-                    return left != right
-                of GreaterThan:
-                    return left > right
-                of GreaterThanEq:
-                    return left >= right
-                of LessThan:
-                    return left < right
-                of LessThanEq:
-                    return left <= right
-                of CommonFactor:
-                    return gcd(left, right) > 1
-                of CoPrime:
-                    return gcd(left, right) == 1
+            return node.binaryRel.evaluate(left, right)
 
 
-proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
-    # echo "node kind: ", node.kind
+func penalty*[T](relation: BinaryRelation, left, right: T): T =
+    return if relation.evaluate(left, right): return 0 else: 1
+
+
+proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T =
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)
-
             case node.unaryRel:
                 of Not:
                     return if target: 1 else: 0
@@ -83,21 +88,4 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
         of BinaryRelNode:
             let left = node.left.evaluate(assignment)
             let right = node.right.evaluate(assignment)
-
-            case node.binaryRel:
-                of EqualTo:
-                    return if left == right: 0 else: 1
-                of NotEqualTo:
-                    return if left != right: 0 else: 1
-                of GreaterThan:
-                    return if left > right: 0 else: 1
-                of GreaterThanEq:
-                    return if left >= right: 0 else: 1
-                of LessThan:
-                    return if left < right: 0 else: 1
-                of LessThanEq:
-                    return if left <= right: 0 else: 1
-                of CommonFactor:
-                    return if gcd(left, right) > 1: 0 else: 1
-                of CoPrime:
-                    return if gcd(left, right) == 1: 0 else: 1
+            return node.binaryRel.penalty(left, right)

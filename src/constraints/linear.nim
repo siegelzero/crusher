@@ -1,7 +1,4 @@
-import std/tables
-
 import ../expressions
-import ../utils
 import constraintNode
 
 ################################################################################
@@ -16,7 +13,7 @@ type
         cost*: int
 
 ################################################################################
-# LinearConstraint Creation
+# LinearConstraint creation
 ################################################################################
 
 func init*[T](state: LinearConstraint[T],
@@ -36,43 +33,20 @@ func newLinearConstraint*[T](lincomb: LinearCombination[T],
     result.init(lincomb, relation, target)
 
 ################################################################################
-# LinearCombinationState Initialization
+# LinearCombinationState initialization and updates
 ################################################################################
-
-func computeCost(left, right: int, relation: BinaryRelation): int =
-    case relation:
-        of EqualTo:
-            return if left == right: 0 else: 1
-        of NotEqualTo:
-            return if left != right: 0 else: 1
-        of GreaterThan:
-            return if left > right: 0 else: 1
-        of GreaterThanEq:
-            return if left >= right: 0 else: 1
-        of LessThan:
-            return if left < right: 0 else: 1
-        of LessThanEq:
-            return if left <= right: 0 else: 1
-        of CommonFactor:
-            return if gcd(left, right) > 1: 0 else: 1
-        of CoPrime:
-            return if gcd(left, right) == 1: 0 else: 1
-
 
 func initialize*[T](state: LinearConstraint[T], assignment: seq[T]) =
     state.lincomb.initialize(assignment)
-    state.cost = computeCost(state.lincomb.value, state.target, state.relation)
+    state.cost = state.relation.penalty(state.lincomb.value, state.target)
 
-################################################################################
-# LinearCombinationState Updates
-################################################################################
 
 func updatePosition*[T](state: LinearConstraint[T], position: int, newValue: T) {.inline.} =
     state.lincomb.updatePosition(position, newValue)
-    state.cost = computeCost(state.lincomb.value, state.target, state.relation)
+    state.cost = state.relation.penalty(state.lincomb.value, state.target)
 
 
 proc moveDelta*[T](state: LinearConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
     # Returns cost delta for changing position from oldValue to newValue.
-    let delta = state.lincomb.coefficient[position]*(newValue - oldValue)
-    return computeCost(state.lincomb.value + delta, state.target, state.relation)
+    let delta = state.lincomb.moveDelta(position, oldValue, newValue)
+    return state.relation.penalty(state.lincomb.value + delta, state.target)

@@ -24,7 +24,7 @@ type
                 expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################
-# AllDifferentConstraint Creation
+# AllDifferentConstraint creation
 ################################################################################
 
 func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstraint[T] =
@@ -55,7 +55,6 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
             else:
                 result.expressionsAtPosition[pos] = @[i]
 
-
 ################################################################################
 # AllDifferentConstraint utility functions
 ################################################################################
@@ -71,12 +70,18 @@ func getCount[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
         of ExpressionBased:
             return state.countTable.getOrDefault(value)
 
+
+func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
+    max(0, state.getCount(value) - 1)
+
+
 func decrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     case state.evalMethod:
         of PositionBased:
             state.count[value] -= 1
         of ExpressionBased:
             state.countTable[value] -= 1
+
 
 func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     case state.evalMethod:
@@ -94,8 +99,14 @@ func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
                 state.countTable[value] = 1
 
 
-func contribution*[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
-    max(0, state.getCount(value) - 1)
+proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
+    # Adjust value counts and state cost for the removal of oldValue and addition of newValue
+    state.cost -= state.contribution(oldValue)
+    state.cost -= state.contribution(newValue)
+    state.decrementCount(oldvalue)
+    state.incrementCount(newValue)
+    state.cost += state.contribution(oldValue)
+    state.cost += state.contribution(newValue)
 
 ################################################################################
 # AllDifferentConstraint initialization and updates
@@ -123,15 +134,6 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
 
             for value, count in state.countTable.pairs:
                 state.cost += max(0, count - 1)
-
-proc adjustCounts*[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
-    # Adjust value counts and state cost for the removal of oldValue and addition of newValue
-    state.cost -= state.contribution(oldValue)
-    state.cost -= state.contribution(newValue)
-    state.decrementCount(oldvalue)
-    state.incrementCount(newValue)
-    state.cost += state.contribution(oldValue)
-    state.cost += state.contribution(newValue)
 
 
 proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
