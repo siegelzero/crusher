@@ -38,9 +38,7 @@ type
         node*: ExpressionNode[T]
         linear*: bool
 
-################################################################################
 # Evaluation
-################################################################################
 
 func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     case node.kind:
@@ -69,9 +67,7 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                 of Multiplication:
                     return left * right
 
-################################################################################
 # AlgebraicExpression Creation
-################################################################################
 
 func init*[T](expression: AlgebraicExpression[T],
               positions: PackedSet[T],
@@ -87,15 +83,11 @@ func newAlgebraicExpression*[T](positions: PackedSet[T],
     new(result)
     result.init(positions, node, linear)
 
-################################################################################
 # Unary Expression Operations
-################################################################################
 
 func `-`*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} = -1*expression
 
-################################################################################
 # Binary (Expression, Expression) Operations
-################################################################################
 
 template ExpExpOp(op, opref: untyped) =
     func `op`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
@@ -122,9 +114,7 @@ ExpExpOp(`+`, Addition)
 ExpExpOp(`*`, Multiplication)
 ExpExpOp(`-`, Subtraction)
 
-################################################################################
 # Binary (Expression, Value) Operations
-################################################################################
 
 template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: AlgebraicExpression[T], right: T): AlgebraicExpression[T] {.inline.} =
@@ -155,9 +145,7 @@ ExpValOp(`+`, Addition)
 ExpValOp(`*`, Multiplication)
 ExpValOp(`-`, Subtraction)
 
-################################################################################
 # AlgebraicExpression Evaluation
-################################################################################
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     expression.node.evaluate(assignment)
@@ -174,9 +162,7 @@ type
         coefficient*: Table[int, T]
         currentAssignment*: Table[int, T]
 
-################################################################################
 # LinearCombinationState Creation
-################################################################################
 
 func init*[T](state: LinearCombination[T], positions: openArray[T]) =
     state.value = 0
@@ -207,12 +193,10 @@ func newLinearCombination*[T](coefficients: Table[int, T], constant: T = 0): Lin
     new(result)
     result.init(coefficients, constant)
 
-
-################################################################################
 # LinearCombinationState Initialization
-################################################################################
 
 func initialize*[T](state: LinearCombination[T], assignment: seq[T]) =
+    # Initizialize the Linear Combination with the given assignment, and updates the value.
     var value: T = state.constant
     state.value = 0
     for pos in state.positions:
@@ -221,34 +205,33 @@ func initialize*[T](state: LinearCombination[T], assignment: seq[T]) =
         state.currentAssignment[pos] = value
 
 func evaluate*[T](expression: LinearCombination[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    # Computes the value of the Linear Combination given the variable assignment.
     for pos in expression.positions:
         result += expression.coefficient[pos]*assignment[pos]
 
-################################################################################
+func `$`*[T](state: LinearCombination[T]): string = $(state.value)
+
 # LinearCombinationState Updates
-################################################################################
 
 func updatePosition*[T](state: LinearCombination[T], position: int, newValue: T) {.inline.} =
+    # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.value += state.coefficient[position]*(newValue - oldValue)
     state.currentAssignment[position] = newValue
 
-
 func moveDelta*[T](state: LinearCombination[T], position: int, oldValue, newValue: T): int {.inline.} =
+    # Returns the change in value obtained by reassigning position from oldValue to newValue.
     state.coefficient[position]*(newValue - oldValue)
-
 
 func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
     # Converts linear expression to a LinearCombination
     var constant: T
     var coefficients, assignment: Table[int, T]
-
     # evaluate with all variables zero to get constant coefficient
     for pos in expression.positions:
         assignment[pos] = 0
 
     constant = expression.evaluate(assignment)
-
     # extract each coefficient
     for pos in expression.positions:
         assignment[pos] = 1
@@ -256,7 +239,6 @@ func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
         assignment[pos] = 0
 
     return newLinearCombination[T](coefficients, constant)
-
 
 func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
     var positions = toPackedSet[int]([])
@@ -268,3 +250,56 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
     
     doAssert allRefs
     return newLinearCombination[T](toSeq[int](positions))
+
+################################################################################
+# Type definitions for MinExpression
+################################################################################
+
+type
+    MinExpression*[T] = ref object
+        value*: T
+        positions*: PackedSet[int]
+        currentAssignment*: Table[int, T]
+
+# MinExpression creation
+
+func init*[T](state: MinExpression[T], positions: openArray[T]) =
+    state.minValue = 0
+    state.positions = toPackedSet[int](positions)
+    state.currentAssignment = initTable[int, T]()
+
+func newMinExpression*[T](positions: openArray[int]): MinExpression[T] =
+    new(result)
+    result.init(positions)
+
+# MinExpression initialization
+
+func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
+    # Initizialize the MinExpression with the given assignment, and updates the value.
+    var minValue: T = high(T)
+    for pos in state.positions:
+        state.currentAssignment[pos] = assignment[pos]
+        minValue = min(minValue, assignment[pos])
+    state.value = minValue
+
+func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    var minValue: T = high(T)
+    for pos in state.positions:
+        minValue = min(minValue, assignment[pos])
+    return minValue
+
+func `$`*[T](state: MinExpression[T]): string = $(state.minValue)
+
+# MinExpression updates
+
+func updatePosition*[T](state: MinExpression[T], position: int, newValue: T) {.inline.} =
+    # Assigns the value newValue to the variable in the given position, updating state.
+    state.currentAssignment[position] = newValue
+    state.value = state.currentAssignment.values.min()
+
+func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
+    # Returns the change in value obtained by reassigning position from oldValue to newValue.
+    if newValue >= state.value:
+        return 0
+    else:
+        return state.value - newValue

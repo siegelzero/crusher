@@ -18,10 +18,11 @@ proc cycleGraph(n: int): seq[seq[int]] =
     return graph
 
 
-proc inducedDollhouse*(n: int) =
+proc inducedDollhouse*(n, b: int) =
     var sys = initConstraintSystem[int]()
-    var label = sys.newConstrainedSequence(n)
-    label.setDomain(toSeq 2..1000)
+    var label: ConstrainedSequence[int] = sys.newConstrainedSequence(n)
+
+    label.setDomain(toSeq 2..b)
 
     sys.addConstraint(allDifferent(label))
 
@@ -34,13 +35,14 @@ proc inducedDollhouse*(n: int) =
             else:
                 sys.addConstraint(coPrime(label[i], label[j]))
     
-    var labelSum = sum(label)
-    sys.minimize(labelSum)
+    var labelSum: LinearCombination[int] = sum(label)
+    sys.minimize(labelSum, tabuThreshold=10000)
 
     echo fmt"Found labeling: {label}"
-    echo fmt"cost: {labelSum.value}"
+    echo fmt"sum: {labelSum}"
 
 
 when isMainModule:
     let n = parseInt(paramStr(1))
-    inducedDollhouse(n)
+    let b = parseInt(paramStr(2))
+    inducedDollhouse(n, b)

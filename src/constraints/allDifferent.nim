@@ -29,7 +29,8 @@ type
 
 func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
-    AllDifferentConstraint[T](
+    new(result)
+    result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: PositionBased,
         positions: toPackedSet[int](positions),
@@ -39,6 +40,7 @@ func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstr
 
 func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
+    new(result)
     result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: ExpressionBased,
