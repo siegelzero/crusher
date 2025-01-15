@@ -9,15 +9,20 @@ import ../expressions
 
 type
     AlgebraicConstraint*[T] = object
+        # Constraint stored as an expression tree on the given positions.
+        # Evaluation of the constraint requires evaluating the tree.
+        # This constraint form has no state; i.e. no assignment to the variables.
         positions*: PackedSet[int]
         node*: ConstraintNode[T]
 
     StatefulAlgebraicConstraint*[T] = ref object
+        # Stateful Constraint backed by an Algebraic Constraint, where the current
+        # assignment is saved, along with the cost.
+        # This constraint form has state which is updated as the assignment changes.
         currentAssignment*: Table[int, T]
         cost*: int
         constraint*: AlgebraicConstraint[T]
         positions: PackedSet[int]
-
 
 ################################################################################
 # Unary Constraint Relations

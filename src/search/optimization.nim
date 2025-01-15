@@ -33,6 +33,8 @@ proc minimize*[T](system: ConstraintSystem[T],
     objective.initialize(system.assignment)
     var currentCost = objective.value
 
+    echo fmt"Found initial solution with value {currentCost}"
+
     while true:
         system.addConstraint(objective < currentCost)
 
