@@ -1,0 +1,16 @@
+predicate all_different_int(array [int] of var int: x);
+array [1..16] of var 1..4: a :: output_array([1..4, 1..4]);
+
+% Row constraints: each row contains all different values
+constraint all_different_int([a[1], a[2], a[3], a[4]]);
+constraint all_different_int([a[5], a[6], a[7], a[8]]);
+constraint all_different_int([a[9], a[10], a[11], a[12]]);
+constraint all_different_int([a[13], a[14], a[15], a[16]]);
+
+% Column constraints: each column contains all different values
+constraint all_different_int([a[1], a[5], a[9], a[13]]);
+constraint all_different_int([a[2], a[6], a[10], a[14]]);
+constraint all_different_int([a[3], a[7], a[11], a[15]]);
+constraint all_different_int([a[4], a[8], a[12], a[16]]);
+
+solve satisfy;

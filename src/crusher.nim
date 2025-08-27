@@ -1,14 +1,16 @@
 import std/packedsets
 
-import constraints/[algebraic, stateful, linear]
-import expressions
-import search/[optimization, resolution]
-import constraintSystem
+import crusher/constraints/[algebraic, stateful, linear, minConstraint, maxConstraint, sumConstraint]
+import crusher/[expressions, constraintSystem]
+import crusher/search/[optimization, resolution]
 
 export constraintSystem,
        stateful,
        algebraic,
        linear,
+       minConstraint,
+       maxConstraint,
+       sumConstraint,
        expressions,
        optimization,
        resolution,

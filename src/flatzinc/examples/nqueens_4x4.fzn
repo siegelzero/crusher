@@ -1,0 +1,32 @@
+predicate all_different_int(array [int] of var int: x);
+predicate int_lin_eq(array [int] of int: coeffs, array [int] of var int: vars, int: rhs);
+
+% 4 Queens Problem - Full Implementation with Diagonal Constraints
+% x[i] represents the column position of the queen in row i (1-based for FlatZinc)
+array [1..4] of var 1..4: x :: output_array([1..4]);
+
+% Auxiliary variables for diagonal constraints (using positive domains)
+array [1..4] of var 1..7: diag1 :: output_array([1..4]); % x[i] - i + 4 (shifted to be positive)
+array [1..4] of var 2..8: diag2 :: output_array([1..4]); % x[i] + i
+
+% Column constraint: no two queens in the same column
+constraint all_different_int([x[1], x[2], x[3], x[4]]);
+
+% Define diagonal auxiliary variables
+% diag1[i] = x[i] - i + 4 (range: 1-1+4=4 to 4-4+4=4, so 1..7)
+constraint int_lin_eq([1, -1], [x[1], diag1[1]], -3);  % x[1] - diag1[1] = -3, so diag1[1] = x[1] + 3
+constraint int_lin_eq([1, -1], [x[2], diag1[2]], -2);  % x[2] - diag1[2] = -2, so diag1[2] = x[2] + 2
+constraint int_lin_eq([1, -1], [x[3], diag1[3]], -1);  % x[3] - diag1[3] = -1, so diag1[3] = x[3] + 1
+constraint int_lin_eq([1, -1], [x[4], diag1[4]], 0);   % x[4] - diag1[4] = 0, so diag1[4] = x[4]
+
+% diag2[i] = x[i] + i (range: 1+1=2 to 4+4=8)
+constraint int_lin_eq([1, -1], [x[1], diag2[1]], -1);  % x[1] - diag2[1] = -1, so diag2[1] = x[1] + 1
+constraint int_lin_eq([1, -1], [x[2], diag2[2]], -2);  % x[2] - diag2[2] = -2, so diag2[2] = x[2] + 2
+constraint int_lin_eq([1, -1], [x[3], diag2[3]], -3);  % x[3] - diag2[3] = -3, so diag2[3] = x[3] + 3
+constraint int_lin_eq([1, -1], [x[4], diag2[4]], -4);  % x[4] - diag2[4] = -4, so diag2[4] = x[4] + 4
+
+% Diagonal constraints: all different
+constraint all_different_int([diag1[1], diag1[2], diag1[3], diag1[4]]);
+constraint all_different_int([diag2[1], diag2[2], diag2[3], diag2[4]]);
+
+solve satisfy;

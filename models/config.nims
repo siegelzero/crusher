@@ -1,1 +1,1 @@
-switch("path", "$projectDir/../src")
+switch("path", "/Users/ken/dev_old/crusher/src")

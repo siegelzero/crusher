@@ -1,0 +1,4 @@
+output [show(s),"\n"];
+int: n = 20;
+array [1..20] of int: X_INTRODUCED_0_;
+array [0..n-1] of int: s = array1d(0..19,X_INTRODUCED_0_);
