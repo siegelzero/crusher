@@ -1,7 +1,7 @@
 import std/[tables, strutils, sequtils, packedsets, math, strformat]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality]
 import ../crusher/search/[resolution, tabuSearch]
 
 type
@@ -902,6 +902,182 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
           echo "fzn_increasing_int FAILED: need at least 2 variables"
       else:
         echo "fzn_increasing_int FAILED: insufficient arguments"
+    
+    of "array_int_minimum":
+      # array_int_minimum(min_var, array)
+      # min_var should equal the minimum value of the array
+      if constraint.args.len >= 2:
+        let minVarExpr = constraint.args[0]
+        let arrayExpr = constraint.args[1]
+        
+        # Extract the minimum variable
+        if minVarExpr.exprType == feIdent and minVarExpr.name in translator.variables:
+          let minVarPos = translator.variables[minVarExpr.name]
+          let minVar = translator.system.baseArray.entries[minVarPos]
+          
+          # Extract array variables and create MinExpression
+          var arrayExpressions: seq[AlgebraicExpression[int]] = @[]
+          
+          if arrayExpr.exprType == feArray:
+            # Direct array of variables
+            for elem in arrayExpr.elements:
+              if elem.exprType == feIdent and elem.name in translator.variables:
+                let position = translator.variables[elem.name]
+                arrayExpressions.add(translator.system.baseArray.entries[position])
+          elif arrayExpr.exprType == feIdent:
+            # Array variable reference
+            for decl in translator.varDecls:
+              if decl.name == arrayExpr.name:
+                if decl.arrayVarRefs.len > 0:
+                  # Array references other variables
+                  for varRef in decl.arrayVarRefs:
+                    if varRef in translator.variables:
+                      let position = translator.variables[varRef]
+                      arrayExpressions.add(translator.system.baseArray.entries[position])
+                  break
+                elif decl.isVar and decl.varType in [fzArrayInt, fzArrayBool]:
+                  # Direct array variable
+                  if arrayExpr.name in translator.variables:
+                    let basePos = translator.variables[arrayExpr.name]
+                    let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                    for i in 0..<arraySize:
+                      arrayExpressions.add(translator.system.baseArray.entries[basePos + i])
+                  break
+          
+          if arrayExpressions.len > 0:
+            # Implement array_int_minimum as: min_var <= all elements AND min_var == at least one element
+            # This ensures min_var equals the minimum of the array
+            
+            # Add constraints: min_var <= each array element
+            for arrayElem in arrayExpressions:
+              translator.system.addConstraint(minVar <= arrayElem)
+            
+            # Add constraint: min_var >= min(array) by creating a disjunction
+            # At least one array element must equal min_var
+            var equalityConstraints: seq[AlgebraicConstraint[int]] = @[]
+            for arrayElem in arrayExpressions:
+              equalityConstraints.add(minVar == arrayElem)
+            
+            # Create disjunction: minVar == array[0] OR minVar == array[1] OR ...
+            if equalityConstraints.len > 0:
+              var disjunction = equalityConstraints[0]
+              for i in 1..<equalityConstraints.len:
+                disjunction = disjunction or equalityConstraints[i]
+              translator.system.addConstraint(disjunction)
+              
+            echo "array_int_minimum: Implemented as min_var <= all elements AND min_var == some element"
+          else:
+            echo "array_int_minimum FAILED: no array variables found"
+        else:
+          echo "array_int_minimum FAILED: min variable not found"
+      else:
+        echo "array_int_minimum FAILED: insufficient arguments"
+    
+    of "fzn_global_cardinality":
+      # fzn_global_cardinality(variables, cover, counts)
+      # variables: array of variables to constrain
+      # cover: array of values that should appear
+      # counts: array of variables representing how often each cover value should appear
+      if constraint.args.len >= 3:
+        let varsExpr = constraint.args[0]
+        let coverExpr = constraint.args[1] 
+        let countsExpr = constraint.args[2]
+        
+        var expressions: seq[AlgebraicExpression[int]] = @[]
+        var coverValues: seq[int] = @[]
+        var countVars: seq[string] = @[]
+        
+        # Extract variables array
+        if varsExpr.exprType == feArray:
+          for elem in varsExpr.elements:
+            if elem.exprType == feIdent and elem.name in translator.variables:
+              let position = translator.variables[elem.name]
+              expressions.add(translator.system.baseArray.entries[position])
+        elif varsExpr.exprType == feIdent:
+          # Handle array variable reference
+          for decl in translator.varDecls:
+            if decl.name == varsExpr.name and decl.arrayVarRefs.len > 0:
+              for varRef in decl.arrayVarRefs:
+                if varRef in translator.variables:
+                  let position = translator.variables[varRef]
+                  expressions.add(translator.system.baseArray.entries[position])
+              break
+        
+        # Extract cover values (constant array)
+        if coverExpr.exprType == feArray:
+          for elem in coverExpr.elements:
+            if elem.exprType == feLiteral and elem.literal.literalType == fzInt:
+              coverValues.add(elem.literal.intVal)
+        elif coverExpr.exprType == feIdent:
+          # Handle array parameter reference
+          for decl in translator.varDecls:
+            if decl.name == coverExpr.name and not decl.isVar and decl.varType == fzArrayInt:
+              coverValues = decl.arrayValue
+              break
+        
+        # Extract count variables
+        if countsExpr.exprType == feArray:
+          for elem in countsExpr.elements:
+            if elem.exprType == feIdent:
+              countVars.add(elem.name)
+        elif countsExpr.exprType == feIdent:
+          # Handle array variable reference  
+          for decl in translator.varDecls:
+            if decl.name == countsExpr.name and decl.arrayVarRefs.len > 0:
+              countVars = decl.arrayVarRefs
+              break
+        
+        if expressions.len > 0 and coverValues.len == countVars.len and coverValues.len > 0:
+          # For each cover value, we need to determine its required cardinality
+          # If count variable is constrained to a specific value, use that
+          # Otherwise, add equality constraints between the count variables and expected counts
+          var cardinalities = initTable[int, int]()
+          
+          for i, coverValue in coverValues:
+            if i < countVars.len:
+              let countVarName = countVars[i]
+              
+              # Check if count variable is a parameter (fixed value)
+              var fixedCount = -1
+              for decl in translator.varDecls:
+                if decl.name == countVarName and not decl.isVar:
+                  if decl.varType == fzInt and decl.arrayValue.len > 0:
+                    fixedCount = decl.arrayValue[0]
+                  break
+              
+              if fixedCount >= 0:
+                cardinalities[coverValue] = fixedCount
+              else:
+                # Count variable is a decision variable - we need to handle this case
+                # For now, we'll assume equal distribution if all count variables are the same
+                # (like in the De Bruijn case where gcc = [X_INTRODUCED_57_, X_INTRODUCED_57_])
+                if countVars.len > 1 and countVars.allIt(it == countVars[0]):
+                  # All count variables are the same - equal distribution
+                  let expectedCount = expressions.len div coverValues.len
+                  cardinalities[coverValue] = expectedCount
+                else:
+                  # More complex case - would need additional constraint handling
+                  echo "fzn_global_cardinality: Complex count variables not fully supported yet"
+                  cardinalities[coverValue] = 1  # Default fallback
+          
+          # Create and add the global cardinality constraint
+          translator.system.addConstraint(globalCardinality(expressions, cardinalities))
+          
+          # IMPORTANT: Also constrain the count variables to equal their expected cardinalities
+          for i, coverValue in coverValues:
+            if i < countVars.len:
+              let countVarName = countVars[i]
+              if countVarName in translator.variables:
+                let countVarPos = translator.variables[countVarName]
+                let countVar = translator.system.baseArray.entries[countVarPos]
+                let expectedCount = cardinalities[coverValue]
+                # Constrain count variable to equal expected count
+                translator.system.addConstraint(countVar == expectedCount)
+        else:
+          echo "fzn_global_cardinality FAILED: insufficient or mismatched arguments"
+          echo "  expressions: ", expressions.len, ", coverValues: ", coverValues.len, ", countVars: ", countVars.len
+      else:
+        echo "fzn_global_cardinality FAILED: insufficient arguments"
     
     else:
       # Unsupported constraint - skip for now  

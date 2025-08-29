@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils]
+import std/[packedsets, sequtils, tables]
 
 import constrainedArray
 import constraints/[algebraic, stateful, minConstraint, maxConstraint]
@@ -158,6 +158,11 @@ proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.positions)
+
+proc globalCardinality*[T](cvar: VariableContainer[T], cardinalities: Table[T, int]): StatefulConstraint[T] =
+    # global cardinality constraint for the variable container
+    # Returns constraint requiring specific cardinalities for each value.
+    globalCardinality[T](cvar.positions, cardinalities)
 
 proc min*[T](cvar: VariableContainer[T]): MinExpression[T] =
     # min expression for the variable container

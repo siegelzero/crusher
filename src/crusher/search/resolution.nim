@@ -8,8 +8,8 @@ type NoSolutionFoundError* = object of CatchableError
 
 
 proc resolve*[T](system: ConstraintSystem[T],
-                 initialTabuThreshold=1024,
-                 maxAttempts=100,
+                 initialTabuThreshold=32,
+                 maxAttempts=10,
                  attemptThreshold=10) = 
 
     var lastImprovement = 0

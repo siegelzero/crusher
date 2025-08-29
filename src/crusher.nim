@@ -1,6 +1,6 @@
 import std/packedsets
 
-import crusher/constraints/[algebraic, stateful, linear, minConstraint, maxConstraint, sumConstraint]
+import crusher/constraints/[algebraic, stateful, linear, minConstraint, maxConstraint, sumConstraint, globalCardinality]
 import crusher/[expressions, constraintSystem]
 import crusher/search/[optimization, resolution]
 
@@ -11,6 +11,7 @@ export constraintSystem,
        minConstraint,
        maxConstraint,
        sumConstraint,
+       globalCardinality,
        expressions,
        optimization,
        resolution,

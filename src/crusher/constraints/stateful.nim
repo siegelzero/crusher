@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
+import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint, globalCardinality
 import constraintNode
 import ../expressions
 
@@ -30,7 +30,8 @@ type
         ReifiedLinearType,
         MinType,
         MaxType,
-        SumType
+        SumType,
+        GlobalCardinalityType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -51,6 +52,8 @@ type
                 maxConstraintState*: MaxConstraint[T]
             of SumType:
                 sumConstraintState*: SumConstraint[T]
+            of GlobalCardinalityType:
+                globalCardinalityState*: GlobalCardinalityConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -71,6 +74,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Max Constraint"
         of SumType:
             return "Sum Constraint"
+        of GlobalCardinalityType:
+            return "GlobalCardinality Constraint"
 
 ################################################################################
 # Evaluation
@@ -94,6 +99,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.maxConstraintState.cost
         of SumType:
             return constraint.sumConstraintState.cost
+        of GlobalCardinalityType:
+            return constraint.globalCardinalityState.cost
 
 ################################################################################
 # Computed Constraints
@@ -140,6 +147,33 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
             positions: positions,
             stateType: AllDifferentType,
             allDifferentState: newAllDifferentConstraint[T](expressions)
+        )
+
+func globalCardinality*[T](positions: openArray[int], cardinalities: Table[T, int]): StatefulConstraint[T] =
+    # Returns globalCardinality constraint for the given positions.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: GlobalCardinalityType,
+        globalCardinalityState: newGlobalCardinalityConstraint[T](positions, cardinalities)
+    )
+
+func globalCardinality*[T](expressions: seq[AlgebraicExpression[T]], cardinalities: Table[T, int]): StatefulConstraint[T] =
+    # Returns globalCardinality constraint for the given expressions.
+    var positions = toPackedSet[int]([])
+    var allRefs = true
+    for exp in expressions:
+        if exp.node.kind != RefNode:
+            allRefs = false
+        positions.incl(exp.positions)
+    
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return globalCardinality[T](toSeq(positions), cardinalities)
+    else:
+        return StatefulConstraint[T](
+            positions: positions,
+            stateType: GlobalCardinalityType,
+            globalCardinalityState: newGlobalCardinalityConstraint[T](expressions, cardinalities)
         )
 
 
@@ -260,6 +294,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.maxConstraintState.initialize(assignment)
         of SumType:
             constraint.sumConstraintState.initialize(assignment)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -280,6 +316,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.maxConstraintState.moveDelta(position, oldValue, newValue)
         of SumType:
             constraint.sumConstraintState.moveDelta(position, oldValue, newValue)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -300,6 +338,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.maxConstraintState.updatePosition(position, newValue)
         of SumType:
             constraint.sumConstraintState.updatePosition(position, newValue)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.updatePosition(position, newValue)
 
 
 ################################################################################
