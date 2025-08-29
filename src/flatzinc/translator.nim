@@ -152,24 +152,9 @@ proc translateLinearConstraint(translator: var FlatZincTranslator,
           let index = parseInt(indexStr)
           if arrayName in translator.variables:
             let basePos = translator.variables[arrayName]
-            # Find the array declaration to get its size
-            var n = 0
-            var found = false
-            for decl in translator.varDecls:
-              if decl.name == arrayName and decl.varType in [fzArrayInt, fzArrayBool, fzArrayFloat]:
-                let arraySize = if decl.arraySize.len > 0:
-                  decl.arraySize[0]
-                else:
-                  raise newException(FlatZincError, "Array variable '" & arrayName & "' has no size information in linear constraint translation")
-                n = int(sqrt(float(arraySize)))
-                found = true
-                break
-            if not found:
-              raise newException(FlatZincError, "Array variable '" & arrayName & "' not found in linear constraint translation")
-            let linearIndex = index - 1  # Convert to 0-based
-            let row = linearIndex div n
-            let col = linearIndex mod n
-            basePos + row * n + col
+            # Simple linear array indexing - don't assume 2D matrix structure
+            let linearIndex = index - 1  # Convert to 0-based indexing
+            basePos + linearIndex
           else:
             -1  # Invalid
         except:
@@ -280,14 +265,20 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
           for elem in varsExpr.elements:
             if elem.exprType == feIdent:
               varNames.add(elem.name)
+        elif varsExpr.exprType == feIdent:
+          # Handle array parameter reference for variables
+          for decl in translator.varDecls:
+            if decl.name == varsExpr.name and decl.varType == fzArrayInt:
+              # This is an array - get variable references
+              if decl.arrayVarRefs.len > 0:
+                varNames = decl.arrayVarRefs
+              break
         
         if rhsExpr.exprType == feLiteral and rhsExpr.literal.literalType == fzInt:
           rhs = rhsExpr.literal.intVal
         
         if coeffs.len == varNames.len:
           translator.translateLinearConstraint(coeffs, varNames, rhs, "le")
-        else:
-          echo "int_lin_le FAILED: coeffs.len=", coeffs.len, ", varNames.len=", varNames.len
     
     of "int_lin_ge":
       # Similar to int_lin_eq but with >=
@@ -1129,19 +1120,48 @@ proc translateModel*(model: FlatZincModel): FlatZincTranslator =
 proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
   case model.solve.solveType:
     of fsSatisfy:
-      resolve(translator.system)
-      # resolve() already sets the assignment if a solution is found
-      return translator.system.assignment.len > 0
+      resolve(translator.system, useParallel=true)
+      
+      # Verify we actually found a valid solution (cost = 0)
+      if translator.system.assignment.len == 0:
+        return false  # No assignment found
+        
+      # Check that the solution actually satisfies all constraints
+      var totalCost = 0
+      for constraint in translator.system.baseArray.constraints:
+        totalCost += constraint.penalty()
+      
+      if totalCost == 0:
+        echo fmt"Valid solution found with cost {totalCost}"
+        return true
+      else:
+        echo fmt"ERROR: Solution has cost {totalCost}, not valid!"
+        return false
     of fsMinimize:
       # For now, just find a satisfying solution
       # TODO: Implement actual minimization
-      resolve(translator.system)
-      return translator.system.assignment.len > 0
+      resolve(translator.system, useParallel=true)
+      
+      # Verify we found a valid solution
+      if translator.system.assignment.len == 0:
+        return false
+      var totalCost = 0
+      for constraint in translator.system.baseArray.constraints:
+        totalCost += constraint.penalty()
+      return totalCost == 0
+      
     of fsMaximize:
       # For now, just find a satisfying solution  
       # TODO: Implement actual maximization
-      resolve(translator.system)
-      return translator.system.assignment.len > 0
+      resolve(translator.system, useParallel=true)
+      
+      # Verify we found a valid solution
+      if translator.system.assignment.len == 0:
+        return false
+      var totalCost = 0
+      for constraint in translator.system.baseArray.constraints:
+        totalCost += constraint.penalty()
+      return totalCost == 0
 
 proc getSolution*(translator: FlatZincTranslator): Table[string, string] =
   result = initTable[string, string]()

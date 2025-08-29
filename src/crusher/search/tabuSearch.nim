@@ -54,7 +54,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     while state.iteration - lastImprovement < threshold:
         state.applyBestMove()
         if state.cost < state.bestCost:
-            echo "Found better solution with cost ", state.cost
+            # echo "Found better solution with cost ", state.cost
             lastImprovement = state.iteration
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
@@ -67,3 +67,25 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): TabuState[T] =
     var state = newTabuState[T](carray)
     return state.tabuImprove(threshold)
+
+proc tabuImproveWithTermination*[T](state: TabuState[T], threshold: int, shouldTerminate: proc(): bool {.gcsafe.}): TabuState[T] {.gcsafe.} =
+    var lastImprovement = 0
+    
+    while state.iteration - lastImprovement < threshold:
+        # Check if we should terminate early
+        if shouldTerminate():
+            break
+            
+        state.applyBestMove()
+        if state.cost < state.bestCost:
+            lastImprovement = state.iteration
+            state.bestCost = state.cost
+            state.bestAssignment = state.assignment
+        if state.cost == 0:
+            return state
+        state.iteration += 1
+    return state
+
+proc tabuImproveWithTermination*[T](carray: ConstrainedArray[T], threshold: int, shouldTerminate: proc(): bool {.gcsafe.}): TabuState[T] {.gcsafe.} =
+    var state = newTabuState[T](carray)
+    return state.tabuImproveWithTermination(threshold, shouldTerminate)

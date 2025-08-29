@@ -8,7 +8,7 @@ type
     ElementState*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int
-        positions: PackedSet[int]
+        positions*: PackedSet[int]
 
 
 proc initialize*[T](state: ElementState[T], assignment: seq[T]) =

@@ -7,7 +7,7 @@ import ../expressions
 ################################################################################
 
 type
-    StateEvalMethod = enum
+    StateEvalMethod* = enum
         ExpressionBased,
         PositionBased
 
@@ -18,10 +18,10 @@ type
         currentCounts*: Table[T, int]         # Current count of each value
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[int]
+                positions*: PackedSet[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # GlobalCardinalityConstraint creation

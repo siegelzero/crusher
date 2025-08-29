@@ -74,7 +74,7 @@ func setDomain*[T](arr: var ConstrainedArray[T], domain: openArray[T]) =
 
 func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArray[T]) =
     # Sets domain of position to the given values.
-    arr.domain[position] = toSeq(domain)
+    arr.domain[position] = @domain
 
 func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.} =
     allDifferent(toSeq arr.allPositions())
@@ -138,4 +138,19 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         reduced[pos] = toSeq(currentDomain[pos])
     
     return reduced
+
+################################################################################
+# Deep Copy for ConstrainedArray (for parallel processing)
+################################################################################
+
+proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
+  ## Creates a deep copy of a ConstrainedArray for thread-safe parallel processing
+  result.len = arr.len
+  result.domain = arr.domain  # seq[seq[T]] - deep copy by assignment
+  result.entries = arr.entries  # seq[AlgebraicExpression[T]] - should be immutable
+  
+  # Deep copy all stateful constraints
+  result.constraints = newSeq[StatefulConstraint[T]](arr.constraints.len)
+  for i, constraint in arr.constraints:
+    result.constraints[i] = constraint.deepCopy()
 

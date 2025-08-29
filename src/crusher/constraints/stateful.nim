@@ -1,6 +1,7 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint, globalCardinality
+import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
+import globalCardinality
 import constraintNode
 import ../expressions
 
@@ -398,3 +399,120 @@ SumExpRel(`>`, GreaterThan)
 SumExpRel(`>=`, GreaterThanEq)
 SumExpRel(`<`, LessThan)
 SumExpRel(`<=`, LessThanEq)
+
+################################################################################
+# Deep Copy for StatefulConstraint (for parallel processing)
+################################################################################
+
+proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
+  ## Creates a deep copy of a stateful constraint for thread-safe parallel processing
+  ## Since workers start with random states, we only need to copy structure, not values
+  
+  case constraint.stateType:
+    of AllDifferentType:
+      # Create a new StatefulConstraint with fresh AllDifferent state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: AllDifferentType,
+        allDifferentState: newAllDifferentConstraint[T](toSeq(constraint.positions))
+      )
+    of ElementConstraint:
+      # Create a new ElementState with fresh state - ElementState is mostly a stub
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: ElementConstraint,
+        elementState: ElementState[T](
+          currentAssignment: initTable[int, T](),
+          cost: 0,
+          positions: constraint.positions
+        )
+      )  
+    of LinearType:
+      # Create a new LinearConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: LinearType,
+        linearConstraintState: newLinearConstraint[T](
+          constraint.linearConstraintState.lincomb.deepCopy(),
+          constraint.linearConstraintState.relation, 
+          constraint.linearConstraintState.target
+        )
+      )
+    of AlgebraicType:
+      # Create a new AlgebraicConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: AlgebraicType,
+        algebraicConstraintState: newAlgebraicConstraintState[T](
+          constraint.algebraicConstraintState.constraint
+        )
+      )
+    of ReifiedLinearType:
+      # Create a new ReifiedLinearConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: ReifiedLinearType,
+        reifiedLinearState: ReifiedLinearConstraint[T](
+          linearComb: constraint.reifiedLinearState.linearComb.deepCopy(),
+          relation: constraint.reifiedLinearState.relation,
+          rhs: constraint.reifiedLinearState.rhs,
+          boolPosition: constraint.reifiedLinearState.boolPosition,
+          boolValue: T(0),  # Fresh state - will be initialized by worker
+          cost: 0  # Fresh state
+        )
+      )
+    of MinType:
+      # Create a new MinConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: MinType,
+        minConstraintState: newMinConstraint[T](
+          constraint.minConstraintState.minExpr.deepCopy(),
+          constraint.minConstraintState.relation,
+          constraint.minConstraintState.target
+        )
+      )
+    of MaxType:
+      # Create a new MaxConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: MaxType,
+        maxConstraintState: newMaxConstraint[T](
+          constraint.maxConstraintState.maxExpr.deepCopy(),
+          constraint.maxConstraintState.relation,
+          constraint.maxConstraintState.target
+        )
+      )
+    of SumType:
+      # Create a new SumConstraint with same parameters but fresh state
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SumType,
+        sumConstraintState: newSumConstraint[T](
+          constraint.sumConstraintState.sumExpr.deepCopy(),
+          constraint.sumConstraintState.relation,
+          constraint.sumConstraintState.target
+        )
+      )
+    of GlobalCardinalityType:
+      # Create a new GlobalCardinalityConstraint with same parameters but fresh state
+      let origConstraint = constraint.globalCardinalityState
+      case origConstraint.evalMethod:
+        of globalCardinality.PositionBased:
+          result = StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: GlobalCardinalityType,
+            globalCardinalityState: newGlobalCardinalityConstraint[T](
+              toSeq(constraint.positions), 
+              origConstraint.valueCardinalities
+            )
+          )
+        of globalCardinality.ExpressionBased:
+          result = StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: GlobalCardinalityType,
+            globalCardinalityState: newGlobalCardinalityConstraint[T](
+              origConstraint.expressions,
+              origConstraint.valueCardinalities
+            )
+          )

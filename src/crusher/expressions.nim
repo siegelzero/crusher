@@ -223,6 +223,15 @@ func moveDelta*[T](state: LinearCombination[T], position: int, oldValue, newValu
     # Returns the change in value obtained by reassigning position from oldValue to newValue.
     state.coefficient[position]*(newValue - oldValue)
 
+proc deepCopy*[T](state: LinearCombination[T]): LinearCombination[T] =
+    # Creates a deep copy of a LinearCombination for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.constant = state.constant
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.coefficient = state.coefficient  # Table is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+
 func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
     # Converts linear expression to a LinearCombination
     var constant: T
@@ -551,6 +560,38 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
             
             return newMax - currentMax
 
+proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
+    # Creates a deep copy of a MinExpression for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.evalMethod = state.evalMethod
+    
+    case state.evalMethod:
+        of PositionBased:
+            # All fields already copied - no additional mutable state
+            discard
+        of ExpressionBased:
+            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
+            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+
+proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
+    # Creates a deep copy of a MaxExpression for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.evalMethod = state.evalMethod
+    
+    case state.evalMethod:
+        of PositionBased:
+            # All fields already copied - no additional mutable state
+            discard
+        of ExpressionBased:
+            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
+            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+
 ################################################################################
 # Type definitions for SumExpression
 ################################################################################
@@ -712,3 +753,18 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
     else:
         # Use general expression-based approach for complex expressions
         return newSumExpression[T](expressions)
+
+proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
+    # Creates a deep copy of a SumExpression for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.evalMethod = state.evalMethod
+    
+    case state.evalMethod:
+        of PositionBased:
+            result.linearComb = state.linearComb.deepCopy()
+        of ExpressionBased:
+            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
+            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy

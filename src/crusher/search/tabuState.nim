@@ -1,6 +1,6 @@
-import std/[packedsets, random, sequtils, tables]
+import std/[packedsets, random, sequtils, tables, strformat]
 
-import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint]
+import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint, elementState, globalCardinality]
 import ../constrainedArray
 
 ################################################################################
@@ -116,7 +116,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     # Initialize with random assignment
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        state.assignment[pos] = sample(state.reducedDomain[pos])
+        if state.reducedDomain[pos].len > 0:
+            state.assignment[pos] = sample(state.reducedDomain[pos])
+        else:
+            # Handle empty domain - use original domain as fallback
+            # This shouldn't happen with well-formed problems, but provides robustness
+            if carray.domain[pos].len > 0:
+                state.assignment[pos] = sample(carray.domain[pos])
+            else:
+                # Last resort: use default value
+                state.assignment[pos] = T(0)
     
     # Initialize constraint states with current assignment
     for constraint in state.constraints:
@@ -149,15 +158,48 @@ proc newTabuState*[T](carray: ConstrainedArray[T]): TabuState[T] =
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Updates current assignment of state by setting value to the position
-    let penalty = state.penaltyMap[position][state.assignment[position]]
-    let delta = state.penaltyMap[position][value] - penalty
+    let oldValue = state.assignment[position]
+    
+    # Calculate cost delta BEFORE updating constraint states using moveDelta
+    var delta = 0
+    for constraint in state.constraintsAtPosition[position]:
+        case constraint.stateType:
+            of AllDifferentType:
+                delta += constraint.allDifferentState.moveDelta(position, oldValue, value)
+            of ElementConstraint:
+                delta += constraint.elementState.moveDelta(position, oldValue, value)
+            of LinearType:
+                delta += constraint.linearConstraintState.moveDelta(position, oldValue, value)
+            of AlgebraicType:
+                delta += constraint.algebraicConstraintState.moveDelta(position, oldValue, value)
+            of ReifiedLinearType:
+                delta += constraint.reifiedLinearState.moveDelta(position, oldValue, value)
+            of MinType:
+                delta += constraint.minConstraintState.moveDelta(position, oldValue, value)
+            of MaxType:
+                delta += constraint.maxConstraintState.moveDelta(position, oldValue, value)
+            of SumType:
+                delta += constraint.sumConstraintState.moveDelta(position, oldValue, value)
+            of GlobalCardinalityType:
+                delta += constraint.globalCardinalityState.moveDelta(position, oldValue, value)
+    
     # Update assignment
     state.assignment[position] = value
 
-    # Update all computed constraints that involve this position
+    # Update all constraint states that involve this position  
     for constraint in state.constraintsAtPosition[position]:
         constraint.updatePosition(position, value)
-
-    # Update cost of state for the given move
+        
+    # Apply the pre-calculated cost delta
     state.cost += delta
+        
+    # Rebuild penalty maps for this position and neighbors (since constraint states changed)
     state.updateNeighborPenalties(position)
+    
+    # DEBUGGING: Verify incremental calculation matches actual cost
+    when defined(debugCostCalculation):
+        var actualCost = 0
+        for constraint in state.carray.constraints:
+            actualCost += constraint.penalty()
+        if actualCost != state.cost:
+            echo fmt"COST MISMATCH at position {position}: tracked={state.cost}, actual={actualCost}, delta={delta}"
