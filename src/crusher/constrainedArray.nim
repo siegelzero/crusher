@@ -1,7 +1,9 @@
-import std/[packedsets, sequtils, strformat]
+import std/[algorithm, packedsets, sequtils, strformat, strutils, tables]
 
 import constraints/stateful
-import constraints/algebraic
+import constraints/algebraic  
+import constraints/allDifferent
+import constraints/common
 import expressions
 
 ################################################################################
@@ -103,7 +105,272 @@ proc addBaseConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstrain
 # ConstrainedArray domain reduction
 ################################################################################
 
-proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
+proc reduceAllDifferentDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq[PackedSet[T]], constraint: StatefulConstraint[T]): bool =
+    ## Reduces domains for AllDifferent constraints using arc consistency
+    ## Returns true if any domain was reduced
+    if constraint.stateType != AllDifferentType:
+        return false
+    
+    var changed = false
+    let allDiffState = constraint.allDifferentState
+    
+    case allDiffState.evalMethod:
+        of PositionBased:
+            # Handle position-based AllDifferent (simple variables)
+            let positions = toSeq(constraint.positions)
+            
+            # Step 1: Singleton propagation - if any variable has domain size 1, 
+            # remove that value from all other variables in the constraint
+            for pos in positions:
+                if currentDomain[pos].card == 1:
+                    let singletonValue = toSeq(currentDomain[pos])[0]
+                    for otherPos in positions:
+                        if otherPos != pos and singletonValue in currentDomain[otherPos]:
+                            currentDomain[otherPos].excl(singletonValue)
+                            changed = true
+            
+            # Step 2: Hall's Marriage Theorem - if k variables have exactly k values
+            # between them, those values are reserved for those variables
+            # Smart heuristic approach: focus on promising subsets instead of exhaustive search
+            
+            # First, identify variables with small domains (most likely to form Hall sets)
+            var smallDomainPositions: seq[(int, int)] = @[]  # (position, domain_size)
+            for pos in positions:
+                smallDomainPositions.add((pos, currentDomain[pos].card))
+            smallDomainPositions.sort(proc(a, b: (int, int)): int = a[1] - b[1])  # Sort by domain size
+            
+            # Smart Hall's theorem checking with early termination
+            let maxChecks = min(10000, positions.len * positions.len)  # Reasonable computational budget
+            var checksPerformed = 0
+            var reductionsMade = 0
+            
+            # Check pairs first (size 2) - most common and efficient
+            for i in 0..<min(20, smallDomainPositions.len):
+                for j in i+1..<min(20, smallDomainPositions.len):
+                    if checksPerformed >= maxChecks: break
+                    checksPerformed += 1
+                    
+                    let pos1 = smallDomainPositions[i][0]
+                    let pos2 = smallDomainPositions[j][0]
+                    
+                    # Compute union of domains
+                    var unionValues: PackedSet[T]
+                    for value in currentDomain[pos1]:
+                        unionValues.incl(value)
+                    for value in currentDomain[pos2]:
+                        unionValues.incl(value)
+                    
+                    # Hall condition: exactly 2 values for 2 variables
+                    if unionValues.card == 2:
+                        # Remove these values from all other positions
+                        for value in unionValues:
+                            for pos in positions:
+                                if pos != pos1 and pos != pos2 and value in currentDomain[pos]:
+                                    currentDomain[pos].excl(value)
+                                    changed = true
+                                    reductionsMade += 1
+            
+            # Check triples (size 3) only if we're making good progress and have small domains
+            if reductionsMade > 0 and positions.len <= 100:
+                for i in 0..<min(10, smallDomainPositions.len):
+                    for j in i+1..<min(10, smallDomainPositions.len):
+                        for k in j+1..<min(10, smallDomainPositions.len):
+                            if checksPerformed >= maxChecks: break
+                            checksPerformed += 1
+                            
+                            let pos1 = smallDomainPositions[i][0]
+                            let pos2 = smallDomainPositions[j][0]
+                            let pos3 = smallDomainPositions[k][0]
+                            
+                            # Quick pruning: if any domain is too large, skip
+                            if currentDomain[pos1].card > 5 or currentDomain[pos2].card > 5 or currentDomain[pos3].card > 5:
+                                continue
+                            
+                            # Compute union of domains
+                            var unionValues: PackedSet[T]
+                            for value in currentDomain[pos1]:
+                                unionValues.incl(value)
+                            for value in currentDomain[pos2]:
+                                unionValues.incl(value)
+                            for value in currentDomain[pos3]:
+                                unionValues.incl(value)
+                            
+                            # Hall condition: exactly 3 values for 3 variables
+                            if unionValues.card == 3:
+                                # Remove these values from all other positions
+                                for value in unionValues:
+                                    for pos in positions:
+                                        if pos != pos1 and pos != pos2 and pos != pos3 and value in currentDomain[pos]:
+                                            currentDomain[pos].excl(value)
+                                            changed = true
+                                            reductionsMade += 1
+        
+        of ExpressionBased:
+            # Handle expression-based AllDifferent (e.g., x[i] + i, x[i] - i in N-Queens)
+            let expressions = allDiffState.expressions
+            
+            # Step 1: Compute possible expression values for each expression
+            var expressionValues: seq[PackedSet[T]] = @[]
+            for exp in expressions:
+                var possibleValues: PackedSet[T]
+                let expPositions = toSeq(exp.positions)
+                
+                # For simple expressions with single variable, evaluate all possibilities
+                if expPositions.len == 1:
+                    let pos = expPositions[0]
+                    for domainValue in currentDomain[pos]:
+                        # Create temporary assignment to evaluate expression
+                        var tempAssignment = newSeq[T](carray.len)
+                        tempAssignment[pos] = domainValue
+                        let expValue = exp.evaluate(tempAssignment)
+                        possibleValues.incl(expValue)
+                else:
+                    # For more complex expressions with multiple variables
+                    # This is less common but we handle it for completeness
+                    for pos in expPositions:
+                        if pos < currentDomain.len:
+                            for domainValue in currentDomain[pos]:
+                                var tempAssignment = newSeq[T](carray.len)
+                                tempAssignment[pos] = domainValue
+                                let expValue = exp.evaluate(tempAssignment)
+                                possibleValues.incl(expValue)
+                
+                expressionValues.add(possibleValues)
+            
+            # Step 2: Apply singleton propagation for expression values
+            for i, expValues in expressionValues:
+                if expValues.card == 1:
+                    let singletonValue = toSeq(expValues)[0]
+                    # This expression can only evaluate to one value
+                    # Remove this value from all other expressions
+                    for j in 0..<expressions.len:
+                        if i != j and singletonValue in expressionValues[j]:
+                            # Need to remove domain values that would make expression j equal singletonValue
+                            let exp = expressions[j]
+                            let expPositions = toSeq(exp.positions)
+                            
+                            if expPositions.len == 1:
+                                let pos = expPositions[0]
+                                var toRemove: seq[T] = @[]
+                                
+                                for domainValue in currentDomain[pos]:
+                                    var tempAssignment = newSeq[T](carray.len)
+                                    tempAssignment[pos] = domainValue
+                                    if exp.evaluate(tempAssignment) == singletonValue:
+                                        toRemove.add(domainValue)
+                                
+                                for value in toRemove:
+                                    currentDomain[pos].excl(value)
+                                    changed = true
+            
+            # Step 3: Hall's Marriage Theorem for expression values
+            # Smart heuristic approach: focus on expressions with small value sets
+            
+            # Sort expressions by their value set size (smallest first)
+            var sortedExpressions: seq[(int, int)] = @[]  # (expr_index, value_count)
+            for i, expValues in expressionValues:
+                sortedExpressions.add((i, expValues.card))
+            sortedExpressions.sort(proc(a, b: (int, int)): int = a[1] - b[1])
+            
+            # Smart Hall's checking with computational budget
+            let maxExpChecks = min(5000, expressions.len * expressions.len)
+            var expChecksPerformed = 0
+            var expReductionsMade = 0
+            
+            # Check pairs of expressions (size 2)
+            for i in 0..<min(15, sortedExpressions.len):
+                for j in i+1..<min(15, sortedExpressions.len):
+                    if expChecksPerformed >= maxExpChecks: break
+                    expChecksPerformed += 1
+                    
+                    let expr1Idx = sortedExpressions[i][0]
+                    let expr2Idx = sortedExpressions[j][0]
+                    
+                    # Compute union of expression values
+                    var unionExpValues: PackedSet[T]
+                    for value in expressionValues[expr1Idx]:
+                        unionExpValues.incl(value)
+                    for value in expressionValues[expr2Idx]:
+                        unionExpValues.incl(value)
+                    
+                    # Hall condition: exactly 2 values for 2 expressions
+                    if unionExpValues.card == 2:
+                        # These values are reserved for these expressions
+                        for value in unionExpValues:
+                            for k in 0..<expressions.len:
+                                if k != expr1Idx and k != expr2Idx and value in expressionValues[k]:
+                                    # Remove domain values that would make expression k equal this value
+                                    let exp = expressions[k]
+                                    let expPositions = toSeq(exp.positions)
+                                    
+                                    if expPositions.len == 1:
+                                        let pos = expPositions[0]
+                                        var toRemove: seq[T] = @[]
+                                        
+                                        for domainValue in currentDomain[pos]:
+                                            var tempAssignment = newSeq[T](carray.len)
+                                            tempAssignment[pos] = domainValue
+                                            if exp.evaluate(tempAssignment) == value:
+                                                toRemove.add(domainValue)
+                                        
+                                        for removeValue in toRemove:
+                                            currentDomain[pos].excl(removeValue)
+                                            changed = true
+                                            expReductionsMade += 1
+            
+            # Check triples (size 3) only if making progress and small problem
+            if expReductionsMade > 0 and expressions.len <= 50:
+                for i in 0..<min(8, sortedExpressions.len):
+                    for j in i+1..<min(8, sortedExpressions.len):
+                        for k in j+1..<min(8, sortedExpressions.len):
+                            if expChecksPerformed >= maxExpChecks: break
+                            expChecksPerformed += 1
+                            
+                            let expr1Idx = sortedExpressions[i][0]
+                            let expr2Idx = sortedExpressions[j][0]
+                            let expr3Idx = sortedExpressions[k][0]
+                            
+                            # Quick pruning: skip if any expression has too many values
+                            if expressionValues[expr1Idx].card > 4 or expressionValues[expr2Idx].card > 4 or expressionValues[expr3Idx].card > 4:
+                                continue
+                            
+                            # Compute union of expression values
+                            var unionExpValues: PackedSet[T]
+                            for value in expressionValues[expr1Idx]:
+                                unionExpValues.incl(value)
+                            for value in expressionValues[expr2Idx]:
+                                unionExpValues.incl(value)
+                            for value in expressionValues[expr3Idx]:
+                                unionExpValues.incl(value)
+                            
+                            # Hall condition: exactly 3 values for 3 expressions
+                            if unionExpValues.card == 3:
+                                # These values are reserved for these expressions
+                                for value in unionExpValues:
+                                    for l in 0..<expressions.len:
+                                        if l != expr1Idx and l != expr2Idx and l != expr3Idx and value in expressionValues[l]:
+                                            # Remove domain values that would make expression l equal this value
+                                            let exp = expressions[l]
+                                            let expPositions = toSeq(exp.positions)
+                                            
+                                            if expPositions.len == 1:
+                                                let pos = expPositions[0]
+                                                var toRemove: seq[T] = @[]
+                                                
+                                                for domainValue in currentDomain[pos]:
+                                                    var tempAssignment = newSeq[T](carray.len)
+                                                    tempAssignment[pos] = domainValue
+                                                    if exp.evaluate(tempAssignment) == value:
+                                                        toRemove.add(domainValue)
+                                                
+                                                for removeValue in toRemove:
+                                                    currentDomain[pos].excl(removeValue)
+                                                    changed = true
+                                                    expReductionsMade += 1
+    
+    return changed
+
+proc reduceDomain*[T](carray: ConstrainedArray[T], verbose: bool = true): seq[seq[T]] =
     var
         reduced = newSeq[seq[T]](carray.len)
         currentDomain = newSeq[PackedSet[T]](carray.len)
@@ -111,31 +378,108 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     for pos in carray.allPositions():
         currentDomain[pos] = toPackedSet[T](carray.domain[pos])
 
-    # First examine any single-variable constraints to reduce domains
-    for cons in carray.constraints:
-        if cons.positions.len != 1:
-            continue
-        var pos = toSeq(cons.positions)[0]
-        
-        # Initialize constraint with a dummy assignment
-        var dummyAssignment = newSeq[T](carray.len)
-        for i in 0..<carray.len:
-            if carray.domain[i].len > 0:
-                dummyAssignment[i] = carray.domain[i][0]
-            else:
-                # If domain is empty, use default value (this shouldn't happen in normal cases)
-                dummyAssignment[i] = T.default
-        
-        # Only initialize and test single-position constraints to avoid interference
-        cons.initialize(dummyAssignment)
-        
-        for d in carray.domain[pos]:
-            cons.updatePosition(pos, d)
-            if cons.penalty() > 0:
-                currentDomain[pos].excl(d)
-    
+    # Log initial domain sizes
+    var totalDomainSize = 0
     for pos in carray.allPositions():
+        totalDomainSize += currentDomain[pos].card
+    
+    if verbose:
+        echo "Domain Reduction Starting:"
+        echo "  Initial total domain size: ", totalDomainSize
+        echo "  Initial domain sizes: [", 
+            carray.allPositions().toSeq().mapIt(currentDomain[it].card).join(", "), "]"
+
+    # Iterative domain reduction until fixpoint
+    var changed = true
+    var iterations = 0
+    const maxIterations = 10  # Prevent infinite loops
+    
+    
+    while changed and iterations < maxIterations:
+        changed = false
+        iterations += 1
+        
+        if verbose: echo "\n--- Iteration ", iterations, " ---"
+        
+        # Process AllDifferent constraints first (most impactful)
+        var allDifferentChanged = false
+        var allDifferentCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == AllDifferentType:
+                allDifferentCount += 1
+                if carray.reduceAllDifferentDomains(currentDomain, cons):
+                    allDifferentChanged = true
+                    changed = true
+        
+        if verbose and allDifferentCount > 0:
+            var totalAfterAllDiff = 0
+            for pos in carray.allPositions():
+                totalAfterAllDiff += currentDomain[pos].card
+            echo "  After ", allDifferentCount, " AllDifferent constraint(s):"
+            echo "    Total domain size: ", totalAfterAllDiff
+            if allDifferentChanged:
+                echo "    Updated domain sizes: [", 
+                    carray.allPositions().toSeq().mapIt(currentDomain[it].card).join(", "), "]"
+            else:
+                echo "    No changes made"
+        
+        # Then examine single-variable constraints to reduce domains
+        var singleVarChanged = false
+        var singleVarCount = 0
+        for cons in carray.constraints:
+            if cons.positions.len != 1:
+                continue
+            singleVarCount += 1
+            var pos = toSeq(cons.positions)[0]
+            
+            # Initialize constraint with a dummy assignment using CURRENT reduced domains
+            var dummyAssignment = newSeq[T](carray.len)
+            for i in 0..<carray.len:
+                if currentDomain[i].card > 0:
+                    dummyAssignment[i] = toSeq(currentDomain[i])[0]
+                else:
+                    # If current domain is empty, use default value
+                    dummyAssignment[i] = T.default
+            
+            # Only initialize and test single-position constraints to avoid interference
+            cons.initialize(dummyAssignment)
+            
+            var originalSize = currentDomain[pos].card
+            for d in toSeq(currentDomain[pos]):  # Need to convert to seq to avoid modification during iteration
+                cons.updatePosition(pos, d)
+                if cons.penalty() > 0:
+                    currentDomain[pos].excl(d)
+            
+            if currentDomain[pos].card < originalSize:
+                singleVarChanged = true
+                changed = true
+        
+        if verbose and singleVarCount > 0:
+            var totalAfterSingleVar = 0
+            for pos in carray.allPositions():
+                totalAfterSingleVar += currentDomain[pos].card
+            echo "  After ", singleVarCount, " single-variable constraint(s):"
+            echo "    Total domain size: ", totalAfterSingleVar
+            if singleVarChanged:
+                echo "    Updated domain sizes: [", 
+                    carray.allPositions().toSeq().mapIt(currentDomain[it].card).join(", "), "]"
+            else:
+                echo "    No changes made"
+    
+    # Final logging
+    var finalTotalDomainSize = 0
+    for pos in carray.allPositions():
+        finalTotalDomainSize += currentDomain[pos].card
         reduced[pos] = toSeq(currentDomain[pos])
+    
+    if verbose:
+        echo "\nDomain Reduction Complete:"
+        echo "  Total iterations: ", iterations
+        echo "  Final total domain size: ", finalTotalDomainSize
+        echo "  Domain size reduction: ", (totalDomainSize - finalTotalDomainSize), " (", 
+             if totalDomainSize > 0: (100 * (totalDomainSize - finalTotalDomainSize) div totalDomainSize) else: 0, "%)"
+        echo "  Final domain sizes: [", 
+            carray.allPositions().toSeq().mapIt(reduced[it].len).join(", "), "]"
     
     return reduced
 

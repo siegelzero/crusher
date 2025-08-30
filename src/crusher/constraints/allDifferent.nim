@@ -1,27 +1,24 @@
 import std/[packedsets, sequtils, tables]
 
 import ../expressions
+import common
 
 ################################################################################
 # Type definitions
 ################################################################################
 
 type
-    StateEvalMethod = enum
-        ExpressionBased,
-        PositionBased
-
     AllDifferentConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 count: seq[int]
-                positions: PackedSet[int]
+                positions*: PackedSet[int]
             of ExpressionBased:
                 countTable: Table[T, int]
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # AllDifferentConstraint creation
@@ -56,6 +53,13 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
                 result.expressionsAtPosition[pos].add(i)
             else:
                 result.expressionsAtPosition[pos] = @[i]
+
+func getExpressions*[T](state: AllDifferentConstraint[T]): seq[AlgebraicExpression[T]] =
+    ## Safely get expressions from AllDifferentConstraint if it's expression-based
+    if state.evalMethod == ExpressionBased:
+        return state.expressions
+    else:
+        return @[]
 
 ################################################################################
 # AllDifferentConstraint utility functions
@@ -203,3 +207,49 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
                 result -= max(0, newValueCount - 1)
                 newValueCount += 1
                 result += newValueCount - 1
+
+################################################################################
+# Deep Copy for AllDifferentConstraint (for parallel processing)
+################################################################################
+
+proc deepCopy*[T](constraint: AllDifferentConstraint[T]): AllDifferentConstraint[T] =
+  ## Creates a deep copy of an AllDifferentConstraint for thread-safe parallel processing
+  case constraint.evalMethod:
+    of PositionBased:
+      result = AllDifferentConstraint[T](
+        evalMethod: PositionBased,
+        count: @[],
+        positions: initPackedSet[int]()
+      )
+      # Manual field copying
+      result.currentAssignment = initTable[int, T]()
+      for k, v in constraint.currentAssignment.pairs:
+        result.currentAssignment[k] = v
+      result.cost = constraint.cost
+      result.count = @[]
+      for item in constraint.count:
+        result.count.add(item)
+      for item in constraint.positions:
+        result.positions.incl(item)
+        
+    of ExpressionBased:
+      result = AllDifferentConstraint[T](
+        evalMethod: ExpressionBased,
+        countTable: initTable[T, int](),
+        expressions: @[],
+        expressionsAtPosition: initTable[int, seq[int]]()
+      )
+      # Manual field copying
+      result.currentAssignment = initTable[int, T]()
+      for k, v in constraint.currentAssignment.pairs:
+        result.currentAssignment[k] = v
+      result.cost = constraint.cost
+      for k, v in constraint.countTable.pairs:
+        result.countTable[k] = v
+      result.expressions = newSeq[AlgebraicExpression[T]](constraint.expressions.len)
+      for i, expr in constraint.expressions:
+        result.expressions[i] = expr  # AlgebraicExpression should be immutable, so reference copy is fine
+      for k, v in constraint.expressionsAtPosition.pairs:
+        result.expressionsAtPosition[k] = @[]
+        for item in v:
+          result.expressionsAtPosition[k].add(item)

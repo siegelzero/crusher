@@ -1,16 +1,13 @@
 import std/[packedsets, sequtils, tables]
 
 import ../expressions
+import common
 
 ################################################################################
 # Type definitions
 ################################################################################
 
 type
-    StateEvalMethod* = enum
-        ExpressionBased,
-        PositionBased
-
     GlobalCardinalityConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int

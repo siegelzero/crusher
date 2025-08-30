@@ -1,6 +1,4 @@
-import std/[packedsets, random, sequtils, tables, atomics, strformat, os, times, cpuinfo, algorithm]
-import std/typedthreads
-
+import std/[packedsets, random, sequtils, tables, atomics, strformat, os, times, algorithm]
 import ../expressions
 import ../constrainedArray
 import ../constraintSystem
@@ -35,7 +33,7 @@ type
         iteration*: int
         tabu*: seq[seq[int]]
         tenure*: int
-        
+
         # Timing statistics for profiling
         constraintTimings*: Table[string, ConstraintTiming]
         enableTiming*: bool
@@ -44,26 +42,14 @@ type
 # Penalty Routines
 ################################################################################
 
-proc getConstraintTypeName[T](constraint: StatefulConstraint[T]): string {.inline.} =
-    case constraint.stateType:
-        of AllDifferentType: "AllDifferent"
-        of ElementConstraint: "Element"
-        of LinearType: "Linear"
-        of AlgebraicType: "Algebraic"
-        of ReifiedLinearType: "ReifiedLinear"
-        of MinType: "Min"
-        of MaxType: "Max"
-        of SumType: "Sum"
-        of GlobalCardinalityType: "GlobalCardinality"
-
 proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
-    
+
     # Time the operation if timing is enabled
     var startTime: float
     if state.enableTiming:
         startTime = epochTime()
-    
+
     case constraint.stateType:
         of AllDifferentType:
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
@@ -83,7 +69,7 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.sumConstraintState.cost + constraint.sumConstraintState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
             result = constraint.globalCardinalityState.cost + constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
-    
+
     # Record timing if enabled
     if state.enableTiming:
         let elapsed = epochTime() - startTime
@@ -131,11 +117,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], enableTiming: bo
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
-    state.reducedDomain = reduceDomain(state.carray)
+    # Use the current domain as the reduced domain (should already be pre-computed)
+    state.reducedDomain = newSeq[seq[T]](carray.len)
+    for pos in carray.allPositions():
+        state.reducedDomain[pos] = carray.domain[pos]
 
     state.iteration = 0
     state.tabu = newSeq[seq[int]](carray.len)
-    
+
     # Initialize timing
     state.enableTiming = enableTiming
     state.constraintTimings = initTable[string, ConstraintTiming]()
@@ -163,7 +152,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], enableTiming: bo
         neighborSet.excl(pos)
         state.neighbors[pos] = toSeq(neighborSet)
 
-    # Initialize with random assignment
+    # Initialize with random assignment  
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
         if state.reducedDomain[pos].len > 0:
@@ -314,8 +303,6 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let (position, newValue) = sample(moves)
         let oldValue = state.assignment[position]
         state.assignValue(position, newValue)
-        # state.tabu[position][oldValue] = state.iteration + 1 + rand(3)
-        # state.tabu[position][oldValue] = state.iteration + state.cost + rand(11)
         state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
 
 ################################################################################
@@ -338,8 +325,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
     return state
 
 
-proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): TabuState[T] =
-    var state = newTabuState[T](carray)
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int, enableTiming: bool = false): TabuState[T] =
+    var state = newTabuState[T](carray, enableTiming)
     return state.tabuImprove(threshold)
 
 ################################################################################
@@ -360,7 +347,7 @@ proc tabuImproveWithTermination*[T](state: TabuState[T], threshold: int, shouldT
         if state.cost == 0:
             return state
         state.iteration += 1
-    
+
     return state
 
 proc tabuImproveWithTermination*[T](carray: ConstrainedArray[T], threshold: int, shouldTerminate: proc(): bool {.gcsafe.}, enableTiming: bool = false): TabuState[T] {.gcsafe.} =
@@ -384,17 +371,53 @@ type
         threshold*: int
         result*: ptr SharedResult[T]
         workerId*: int
+        verbose*: bool
 
 proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
     ## Worker thread that performs tabu search and updates shared result
     # Create termination check function
     proc shouldTerminate(): bool {.gcsafe.} = params.result.solutionFound.load()
+    
+    # Set different random seeds for each worker
+    randomize(params.workerId * 1000 + int(epochTime()))
 
     let startTime = epochTime()
-    let startIteration = 0  # Workers always start from iteration 0
-    # Enable timing only for worker 0 to avoid too much overhead
-    let enableTiming = params.workerId == 0
-    let improved = params.systemCopy.baseArray.tabuImproveWithTermination(params.threshold, shouldTerminate, enableTiming)
+    # Enable timing only for worker 0 and only in verbose mode to avoid too much overhead
+    let enableTiming = params.verbose and params.workerId == 0
+    
+    # Domains are already set by the main thread - no need for domain reduction
+    echo "Worker ", params.workerId, " starting search with pre-computed domains"
+    
+    # Use the same multi-restart logic as sequentialSearch iterator
+    var bestResult: TabuState[T]
+    var found = false
+    var currentThreshold = params.threshold
+    
+    for attempt in 0..<10:  # Same as sequentialSearch maxAttempts
+        # Check if another worker found a solution
+        if shouldTerminate():
+            echo "DEBUG: Worker ", params.workerId, " terminating early - solution found by another worker"
+            return
+            
+        randomize(attempt * 1000 + int(epochTime()))  # Same seed pattern as sequentialSearch
+        let improved = params.systemCopy.baseArray.tabuImproveWithTermination(currentThreshold, shouldTerminate)
+        echo "DEBUG: Worker ", params.workerId, " attempt ", attempt, " cost: ", improved.cost
+        
+        # DEBUG: Show the first few assignment values for worker 0
+        if params.workerId == 0 and attempt == 0:
+            echo "DEBUG: Worker 0 initial assignment (first 10): ", improved.assignment[0..<min(10, improved.assignment.len)]
+        
+        if not found or improved.cost < bestResult.cost:
+            bestResult = improved
+            found = true
+            
+        if improved.cost == 0:
+            bestResult = improved
+            break
+            
+        currentThreshold = currentThreshold * 2  # Same threshold doubling as sequentialSearch
+    
+    let improved = if found: bestResult else: params.systemCopy.baseArray.tabuImproveWithTermination(params.threshold, shouldTerminate)
     let elapsed = epochTime() - startTime
     
     # Log profiling info for this worker

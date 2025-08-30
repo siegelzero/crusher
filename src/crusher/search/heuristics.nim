@@ -7,11 +7,14 @@ import tabu
 randomize()
 
 # Sequential search iterator that performs multiple restarts
-iterator sequentialSearch*[T](carray: ConstrainedArray[T], initialTabuThreshold: int, maxAttempts: int = 10): TabuState[T] =
+iterator sequentialSearch*[T](carray: ConstrainedArray[T], initialTabuThreshold: int, maxAttempts: int = 10, enableTiming: bool = false): TabuState[T] =
     var currentThreshold = initialTabuThreshold
     for attempt in 0..<maxAttempts:
         randomize(attempt * 1000 + int(epochTime()))
-        let improved = carray.tabuImprove(currentThreshold)
+        let improved = carray.tabuImprove(currentThreshold, enableTiming)
+        echo "DEBUG: Serial attempt ", attempt, " initial cost: ", improved.cost
+        if attempt == 0:
+            echo "DEBUG: Serial attempt 0 initial assignment (first 10): ", improved.assignment[0..<min(10, improved.assignment.len)]
         yield improved
         if improved.cost == 0:
             break

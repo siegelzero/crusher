@@ -1,5 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
+import common
 import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
 import globalCardinality
 import constraintNode
@@ -77,6 +78,19 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Sum Constraint"
         of GlobalCardinalityType:
             return "GlobalCardinality Constraint"
+
+proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
+    ## Returns a human-readable name for the constraint type
+    case constraint.stateType:
+        of AllDifferentType: "AllDifferent"
+        of ElementConstraint: "Element"
+        of LinearType: "Linear"
+        of AlgebraicType: "Algebraic"
+        of ReifiedLinearType: "ReifiedLinear"
+        of MinType: "Min"
+        of MaxType: "Max"
+        of SumType: "Sum"
+        of GlobalCardinalityType: "GlobalCardinality"
 
 ################################################################################
 # Evaluation
@@ -420,15 +434,15 @@ SumExpRel(`<=`, LessThanEq)
 
 proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
   ## Creates a deep copy of a stateful constraint for thread-safe parallel processing
-  ## Since workers start with random states, we only need to copy structure, not values
+  ## FIXED: Now properly copies the current constraint state instead of creating fresh state
   
   case constraint.stateType:
     of AllDifferentType:
-      # Create a new StatefulConstraint with fresh AllDifferent state
+      # FIXED: Deep copy the actual constraint state instead of creating fresh state
       result = StatefulConstraint[T](
         positions: constraint.positions,
         stateType: AllDifferentType,
-        allDifferentState: newAllDifferentConstraint[T](toSeq(constraint.positions))
+        allDifferentState: constraint.allDifferentState.deepCopy()
       )
     of ElementConstraint:
       # Create a new ElementState with fresh state - ElementState is mostly a stub
@@ -521,7 +535,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
       # Create a new GlobalCardinalityConstraint with same parameters but fresh state
       let origConstraint = constraint.globalCardinalityState
       case origConstraint.evalMethod:
-        of globalCardinality.PositionBased:
+        of PositionBased:
           result = StatefulConstraint[T](
             positions: constraint.positions,
             stateType: GlobalCardinalityType,
@@ -530,7 +544,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
               origConstraint.valueCardinalities
             )
           )
-        of globalCardinality.ExpressionBased:
+        of ExpressionBased:
           result = StatefulConstraint[T](
             positions: constraint.positions,
             stateType: GlobalCardinalityType,

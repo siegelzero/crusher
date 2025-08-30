@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, tables, algorithm]
+import std/[packedsets, tables, algorithm]
 
 ################################################################################
 # Type definitions for ExpressionNode
