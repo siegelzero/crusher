@@ -38,7 +38,9 @@ type
         node*: ExpressionNode[T]
         linear*: bool
 
+################################################################################
 # Evaluation
+################################################################################
 
 func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     case node.kind:
@@ -67,7 +69,13 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                 of Multiplication:
                     return left * right
 
+
+func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    expression.node.evaluate(assignment)
+
+################################################################################
 # AlgebraicExpression Creation
+################################################################################
 
 func init*[T](expression: AlgebraicExpression[T],
               positions: PackedSet[T],
@@ -87,7 +95,9 @@ func newAlgebraicExpression*[T](positions: PackedSet[T],
 
 func `-`*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} = -1*expression
 
+################################################################################
 # Binary (Expression, Expression) Operations
+################################################################################
 
 template ExpExpOp(op, opref: untyped) =
     func `op`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
@@ -114,7 +124,9 @@ ExpExpOp(`+`, Addition)
 ExpExpOp(`*`, Multiplication)
 ExpExpOp(`-`, Subtraction)
 
+################################################################################
 # Binary (Expression, Value) Operations
+################################################################################
 
 template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: AlgebraicExpression[T], right: T): AlgebraicExpression[T] {.inline.} =
@@ -144,11 +156,6 @@ template ExpValOp(op, opref: untyped) =
 ExpValOp(`+`, Addition)
 ExpValOp(`*`, Multiplication)
 ExpValOp(`-`, Subtraction)
-
-# AlgebraicExpression Evaluation
-
-func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
-    expression.node.evaluate(assignment)
 
 ################################################################################
 # Type definitions for LinearCombination
@@ -249,7 +256,6 @@ func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
 
     return newLinearCombination[T](coefficients, constant)
 
-
 ################################################################################
 # Type definitions for MinExpression
 ################################################################################
@@ -272,8 +278,6 @@ type
 
 # MinExpression creation
 
-# Init functions removed - construction is now handled directly in newMinExpression
-
 func newMinExpression*[T](positions: openArray[int]): MinExpression[T] =
     result = MinExpression[T](
         evalMethod: PositionBased,
@@ -282,10 +286,10 @@ func newMinExpression*[T](positions: openArray[int]): MinExpression[T] =
         currentAssignment: initTable[int, T]()
     )
 
-func newMinExpression*[T](expressions: seq[AlgebraicExpression[T]]): MinExpression[T] =  
+func newMinExpression*[T](expressions: seq[AlgebraicExpression[T]]): MinExpression[T] =
     var expressionsAtPos = initTable[int, seq[int]]()
     var allPositions = initPackedSet[int]()
-    
+
     # Collect all positions involved in the expressions
     for i, exp in expressions:
         allPositions.incl(exp.positions)
@@ -294,7 +298,7 @@ func newMinExpression*[T](expressions: seq[AlgebraicExpression[T]]): MinExpressi
             if pos notin expressionsAtPos:
                 expressionsAtPos[pos] = @[]
             expressionsAtPos[pos].add(i)
-    
+
     result = MinExpression[T](
         evalMethod: ExpressionBased,
         value: 0,
@@ -310,7 +314,7 @@ func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
     # Initialize the MinExpression with the given assignment, and updates the value.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-    
+
     var minValue: T = high(T)
     case state.evalMethod:
         of PositionBased:
@@ -322,7 +326,7 @@ func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
             for exp in state.expressions:
                 let expValue = exp.evaluate(assignment)
                 minValue = min(minValue, expValue)
-    
+
     state.value = minValue
 
 func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
@@ -345,7 +349,7 @@ func updatePosition*[T](state: MinExpression[T], position: int, newValue: T) {.i
     # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
-    
+
     case state.evalMethod:
         of PositionBased:
             # For position-based: use smart updating logic
@@ -361,7 +365,7 @@ func updatePosition*[T](state: MinExpression[T], position: int, newValue: T) {.i
                         minValue = val
                 state.value = minValue
             # Otherwise, the minimum doesn't change
-            
+
         of ExpressionBased:
             # For expression-based: need to recalculate affected expressions
             # This is less efficient but more general
@@ -374,7 +378,7 @@ func updatePosition*[T](state: MinExpression[T], position: int, newValue: T) {.i
 func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in minimum value obtained by reassigning position from oldValue to newValue.
     let currentMin = state.value
-    
+
     case state.evalMethod:
         of PositionBased:
             # Use optimized logic for position-based
@@ -393,18 +397,34 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
             else:
                 # Minimum doesn't change
                 return 0
-        
+
         of ExpressionBased:
             # For expression-based: compute new minimum by evaluating all expressions
             var tempAssignment = state.currentAssignment
             tempAssignment[position] = newValue
-            
+
             var newMin: T = high(T)
             for exp in state.expressions:
                 let expValue = exp.evaluate(tempAssignment)
                 newMin = min(newMin, expValue)
-            
+
             return newMin - currentMin
+
+proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
+    # Creates a deep copy of a MinExpression for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.evalMethod = state.evalMethod
+
+    case state.evalMethod:
+        of PositionBased:
+            # All fields already copied - no additional mutable state
+            discard
+        of ExpressionBased:
+            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
+            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
 
 ################################################################################
 # Type definitions for MaxExpression
@@ -439,7 +459,7 @@ func newMaxExpression*[T](positions: openArray[int]): MaxExpression[T] =
 func newMaxExpression*[T](expressions: seq[AlgebraicExpression[T]]): MaxExpression[T] =  
     var expressionsAtPos = initTable[int, seq[int]]()
     var allPositions = initPackedSet[int]()
-    
+
     # Collect all positions involved in the expressions
     for i, exp in expressions:
         allPositions.incl(exp.positions)
@@ -448,7 +468,7 @@ func newMaxExpression*[T](expressions: seq[AlgebraicExpression[T]]): MaxExpressi
             if pos notin expressionsAtPos:
                 expressionsAtPos[pos] = @[]
             expressionsAtPos[pos].add(i)
-    
+
     result = MaxExpression[T](
         evalMethod: ExpressionBased,
         value: 0,
@@ -464,7 +484,7 @@ func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
     # Initialize the MaxExpression with the given assignment, and updates the value.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-    
+
     var maxValue: T = low(T)
     case state.evalMethod:
         of PositionBased:
@@ -476,7 +496,7 @@ func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
             for exp in state.expressions:
                 let expValue = exp.evaluate(assignment)
                 maxValue = max(maxValue, expValue)
-    
+
     state.value = maxValue
 
 func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
@@ -499,7 +519,7 @@ func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.i
     # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
-    
+
     case state.evalMethod:
         of PositionBased:
             # For position-based: use smart updating logic
@@ -515,7 +535,7 @@ func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.i
                         maxValue = val
                 state.value = maxValue
             # Otherwise, the maximum doesn't change
-            
+
         of ExpressionBased:
             # For expression-based: need to recalculate affected expressions
             # This is less efficient but more general
@@ -528,7 +548,7 @@ func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.i
 func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in maximum value obtained by reassigning position from oldValue to newValue.
     let currentMax = state.value
-    
+
     case state.evalMethod:
         of PositionBased:
             # Use optimized logic for position-based
@@ -547,34 +567,18 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
             else:
                 # Maximum doesn't change
                 return 0
-        
+
         of ExpressionBased:
             # For expression-based: compute new maximum by evaluating all expressions
             var tempAssignment = state.currentAssignment
             tempAssignment[position] = newValue
-            
+
             var newMax: T = low(T)
             for exp in state.expressions:
                 let expValue = exp.evaluate(tempAssignment)
                 newMax = max(newMax, expValue)
-            
-            return newMax - currentMax
 
-proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
-    # Creates a deep copy of a MinExpression for thread-safe parallel processing
-    new(result)
-    result.value = state.value
-    result.positions = state.positions  # PackedSet is a value type, safe to copy
-    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
-    result.evalMethod = state.evalMethod
-    
-    case state.evalMethod:
-        of PositionBased:
-            # All fields already copied - no additional mutable state
-            discard
-        of ExpressionBased:
-            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
-            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+            return newMax - currentMax
 
 proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
     # Creates a deep copy of a MaxExpression for thread-safe parallel processing
@@ -583,7 +587,7 @@ proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
     result.positions = state.positions  # PackedSet is a value type, safe to copy
     result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
     result.evalMethod = state.evalMethod
-    
+
     case state.evalMethod:
         of PositionBased:
             # All fields already copied - no additional mutable state
@@ -626,7 +630,7 @@ func newSumExpression*[T](positions: openArray[int]): SumExpression[T] =
 func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =  
     var expressionsAtPos = initTable[int, seq[int]]()
     var allPositions = initPackedSet[int]()
-    
+
     # Collect all positions involved in the expressions
     for i, exp in expressions:
         allPositions.incl(exp.positions)
@@ -635,7 +639,7 @@ func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpressi
             if pos notin expressionsAtPos:
                 expressionsAtPos[pos] = @[]
             expressionsAtPos[pos].add(i)
-    
+
     result = SumExpression[T](
         evalMethod: ExpressionBased,
         value: 0,
@@ -651,7 +655,7 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
     # Initialize the SumExpression with the given assignment, and updates the value.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-    
+
     case state.evalMethod:
         of PositionBased:
             # Use efficient LinearCombination
@@ -686,13 +690,13 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
             # Use efficient LinearCombination update
             state.linearComb.updatePosition(position, newValue)
             state.value = state.linearComb.value
-            
+
         of ExpressionBased:
             # Only update expressions affected by the changed position
             if position in state.expressionsAtPosition:
                 let oldValue = state.currentAssignment[position]
                 state.currentAssignment[position] = newValue
-                
+
                 # Calculate delta for each affected expression and apply to sum
                 for expIndex in state.expressionsAtPosition[position]:
                     let exp = state.expressions[expIndex]
@@ -702,7 +706,7 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
                     let oldExpValueActual = exp.evaluate(state.currentAssignment)
                     # Set back to new value
                     state.currentAssignment[position] = newValue
-                    
+
                     state.value += (oldExpValue - oldExpValueActual)
             else:
                 # Position doesn't affect any expressions, just update assignment
@@ -714,22 +718,22 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
         of PositionBased:
             # Use efficient LinearCombination delta calculation
             return state.linearComb.moveDelta(position, oldValue, newValue)
-        
+
         of ExpressionBased:
             # Only recalculate expressions that depend on the changed position
             var totalDelta: T = 0
-            
+
             if position in state.expressionsAtPosition:
                 var tempAssignment = state.currentAssignment
                 tempAssignment[position] = newValue
-                
+
                 # Calculate delta for each affected expression
                 for expIndex in state.expressionsAtPosition[position]:
                     let exp = state.expressions[expIndex]
                     let oldExpValue = exp.evaluate(state.currentAssignment)
                     let newExpValue = exp.evaluate(tempAssignment)
                     totalDelta += (newExpValue - oldExpValue)
-            
+
             return totalDelta
 
 ################################################################################
@@ -740,13 +744,13 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
     # Check if all expressions are simple variable references (RefNodes)
     var allRefs = true
     var positions: seq[int] = @[]
-    
+
     for exp in expressions:
         if exp.node.kind == RefNode:
             positions.add(exp.node.position)
         else:
             allRefs = false
-    
+
     if allRefs:
         # Use efficient position-based approach if all expressions are simple variables
         return newSumExpression[T](positions)
@@ -761,7 +765,7 @@ proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
     result.positions = state.positions  # PackedSet is a value type, safe to copy
     result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
     result.evalMethod = state.evalMethod
-    
+
     case state.evalMethod:
         of PositionBased:
             result.linearComb = state.linearComb.deepCopy()
