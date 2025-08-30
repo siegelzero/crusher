@@ -1,3 +1,0 @@
-output ["queens: "++show(queens)]++["\n"];
-int: n = 8;
-array [1..n] of int: queens;

@@ -17,7 +17,7 @@ proc magicSquare*(n: int) =
     # Col sums == target
     for col in X.columns():
         sys.addConstraint(sum(col) == target)
-        
+
     # Diagonals
     var terms: seq[AlgebraicExpression[int]] = @[]
     for i in 0..<n:

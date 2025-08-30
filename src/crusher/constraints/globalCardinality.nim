@@ -80,22 +80,22 @@ func adjustCounts[T](state: GlobalCardinalityConstraint[T], oldValue, newValue: 
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
     if oldValue == newValue:
         return
-    
+
     # Remove old penalty contributions
     state.cost -= state.penaltyContribution(oldValue)
     state.cost -= state.penaltyContribution(newValue)
-    
+
     # Update counts
     let oldCount = state.getCurrentCount(oldValue)
     let newCount = state.getCurrentCount(newValue)
-    
+
     if oldCount > 1:
         state.currentCounts[oldValue] = oldCount - 1
     else:
         state.currentCounts.del(oldValue)
-    
+
     state.currentCounts[newValue] = newCount + 1
-    
+
     # Add new penalty contributions
     state.cost += state.penaltyContribution(oldValue)
     state.cost += state.penaltyContribution(newValue)
@@ -109,7 +109,7 @@ proc initialize*[T](state: GlobalCardinalityConstraint[T], assignment: seq[T]) =
     state.cost = 0
     state.currentAssignment.clear()
     state.currentCounts.clear()
-    
+
     var value: T
     case state.evalMethod:
         of PositionBased:
@@ -124,13 +124,13 @@ proc initialize*[T](state: GlobalCardinalityConstraint[T], assignment: seq[T]) =
             # Store assignment for all relevant positions
             for pos in state.expressionsAtPosition.keys:
                 state.currentAssignment[pos] = assignment[pos]
-            
+
             # Evaluate expressions and count their values
             for exp in state.expressions:
                 value = exp.evaluate(state.currentAssignment)
                 let currentCount = state.getCurrentCount(value)
                 state.currentCounts[value] = currentCount + 1
-    
+
     # Compute total penalty based on cardinality violations
     for requiredValue, requiredCount in state.valueCardinalities.pairs:
         state.cost += abs(state.getCurrentCount(requiredValue) - requiredCount)
@@ -163,13 +163,13 @@ proc moveDelta*[T](state: GlobalCardinalityConstraint[T], position: int, oldValu
             let oldCount_new = state.getCurrentCount(newValue) 
             let req_old = state.getRequiredCardinality(oldValue)
             let req_new = state.getRequiredCardinality(newValue)
-            
+
             # Current penalty contribution from these two values
             let currentPenalty = abs(oldCount_old - req_old) + abs(oldCount_new - req_new)
-            
-            # Penalty after hypothetical move  
+
+            # Penalty after hypothetical move
             let newPenalty = abs(oldCount_old - 1 - req_old) + abs(oldCount_new + 1 - req_new)
-            
+
             return newPenalty - currentPenalty
 
         of ExpressionBased:
@@ -177,19 +177,19 @@ proc moveDelta*[T](state: GlobalCardinalityConstraint[T], position: int, oldValu
             for i in state.expressionsAtPosition[position]:
                 # Get current expression value
                 let oldExprValue = state.expressions[i].evaluate(state.currentAssignment)
-                
-                # Temporarily change position and evaluate  
+
+                # Temporarily change position and evaluate
                 state.currentAssignment[position] = newValue
                 let newExprValue = state.expressions[i].evaluate(state.currentAssignment)
                 state.currentAssignment[position] = oldValue  # Restore
-                
+
                 if oldExprValue != newExprValue:
                     # Compute penalty delta for this value change
                     let oldCount_old = state.getCurrentCount(oldExprValue)
                     let oldCount_new = state.getCurrentCount(newExprValue)
                     let req_old = state.getRequiredCardinality(oldExprValue)
                     let req_new = state.getRequiredCardinality(newExprValue)
-                    
+
                     result -= abs(oldCount_old - req_old)
                     result -= abs(oldCount_new - req_new)
                     result += abs(oldCount_old - 1 - req_old) 

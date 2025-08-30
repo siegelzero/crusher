@@ -354,6 +354,20 @@ template MinExpRel(rel, relEnum: untyped) =
             stateType: MinType,
             minConstraintState: newMinConstraint[T](left, relEnum, right)
         )
+    
+    proc `rel`*[T](left: MinExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        # MinExpression == Variable constraint
+        # Check if right is a simple variable reference
+        if right.node.kind == RefNode:
+            let rightPos = right.node.position
+            return StatefulConstraint[T](
+                positions: left.positions + toPackedSet([rightPos]),
+                stateType: MinType,
+                minConstraintState: newMinConstraintWithVariableTarget[T](left, relEnum, rightPos)
+            )
+        else:
+            # This operator only supports simple variable references on the right side
+            raise newException(ValueError, "MinExpression == AlgebraicExpression requires right side to be a simple variable reference")
 
 MinExpRel(`==`, EqualTo)
 MinExpRel(`!=`, NotEqualTo)
@@ -466,11 +480,20 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
       result = StatefulConstraint[T](
         positions: constraint.positions,
         stateType: MinType,
-        minConstraintState: newMinConstraint[T](
-          constraint.minConstraintState.minExpr.deepCopy(),
-          constraint.minConstraintState.relation,
-          constraint.minConstraintState.target
-        )
+        minConstraintState: 
+          case constraint.minConstraintState.constraintType:
+          of ConstantTarget:
+            newMinConstraint[T](
+              constraint.minConstraintState.minExpr.deepCopy(),
+              constraint.minConstraintState.relation,
+              constraint.minConstraintState.target
+            )
+          of VariableTarget:
+            newMinConstraintWithVariableTarget[T](
+              constraint.minConstraintState.minExpr.deepCopy(),
+              constraint.minConstraintState.relation,
+              constraint.minConstraintState.targetPosition
+            )
       )
     of MaxType:
       # Create a new MaxConstraint with same parameters but fresh state

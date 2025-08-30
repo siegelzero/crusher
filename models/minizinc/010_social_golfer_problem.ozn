@@ -1,5 +1,0 @@
-output [if j==1 then "\n" else " " endif++show(assign[i,j]) | i in Golfer, j in Week]++["\n"];
-set of int: Week = 1..4;
-set of int: Golfer = 1..9;
-array [1..36] of int: X_INTRODUCED_0_;
-array [Golfer,Week] of int: assign = array2d(1..9,1..4,X_INTRODUCED_0_);

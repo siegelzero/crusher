@@ -1,23 +1,53 @@
 import std/[tables, strutils, sequtils, packedsets, math, strformat]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality]
-import ../crusher/search/[resolution, tabuSearch]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint]
+import ../crusher/search/[resolution, tabu]
 
 type
   FlatZincError* = object of CatchableError
   
+  AlgebraicConstraintStats* = object
+    inequalities*: int  # <=, >=, <, >
+    equalities*: int    # ==
+    inequalities_linear*: int  # LinearCombination <= value
+    inequalities_variable*: int # Variable <= Variable  
+    
   FlatZincTranslator* = object
     system*: ConstraintSystem[int]
     variables*: Table[string, int] # Maps FZ variable names to Crusher indices
     varDecls*: seq[FlatZincVarDecl]
+    algebraicStats*: AlgebraicConstraintStats
 
 proc initTranslator*(): FlatZincTranslator =
   result = FlatZincTranslator(
     system: initConstraintSystem[int](),
     variables: initTable[string, int](),
-    varDecls: @[]
+    varDecls: @[],
+    algebraicStats: AlgebraicConstraintStats(inequalities: 0, equalities: 0, inequalities_linear: 0, inequalities_variable: 0)
   )
+
+# Wrapper to track algebraic constraint types
+proc addConstraintWithTracking(translator: var FlatZincTranslator, constraint: AlgebraicConstraint[int], constraintType: string) =
+  # Track the type of algebraic constraint
+  if "==" in constraintType:
+    translator.algebraicStats.equalities += 1
+  elif "<=" in constraintType or ">=" in constraintType or "<" in constraintType or ">" in constraintType:
+    translator.algebraicStats.inequalities += 1
+    if "LinearCombination" in constraintType:
+      translator.algebraicStats.inequalities_linear += 1  
+    elif "Variable" in constraintType:
+      translator.algebraicStats.inequalities_variable += 1
+  
+  translator.system.addConstraint(constraint)
+
+proc printAlgebraicStats(translator: FlatZincTranslator) =
+  echo "\n=== ALGEBRAIC CONSTRAINT ANALYSIS ==="
+  echo fmt"Total equalities (==): {translator.algebraicStats.equalities}"
+  echo fmt"Total inequalities (<=,>=,<,>): {translator.algebraicStats.inequalities}"
+  echo fmt"  - LinearCombination inequalities: {translator.algebraicStats.inequalities_linear}"
+  echo fmt"  - Variable-to-Variable inequalities: {translator.algebraicStats.inequalities_variable}"
+  echo "======================================"
 
 
 proc translateDomain(domain: FlatZincDomain): seq[int] =
@@ -180,16 +210,22 @@ proc translateLinearConstraint(translator: var FlatZincTranslator,
   # Add constraint using LinearCombination operators
   case op:
     of "eq", "=": 
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint
       translator.system.addConstraint(linearComb == rhs)
     of "le", "<=": 
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint  
       translator.system.addConstraint(linearComb <= rhs)
     of "ge", ">=": 
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint
       translator.system.addConstraint(linearComb >= rhs)
     of "lt", "<": 
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint
       translator.system.addConstraint(linearComb < rhs)
     of "gt", ">": 
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint
       translator.system.addConstraint(linearComb > rhs)
     of "ne", "!=":
+      # This creates a LinearType StatefulConstraint, not AlgebraicConstraint
       translator.system.addConstraint(linearComb != rhs)
     else: 
       translator.system.addConstraint(linearComb == rhs)
@@ -936,27 +972,11 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
                   break
           
           if arrayExpressions.len > 0:
-            # Implement array_int_minimum as: min_var <= all elements AND min_var == at least one element
-            # This ensures min_var equals the minimum of the array
+            # Create MinExpression and constraint: minVar == min(array)
+            let minExpr = min(arrayExpressions)
+            translator.system.addConstraint(minExpr == minVar)
             
-            # Add constraints: min_var <= each array element
-            for arrayElem in arrayExpressions:
-              translator.system.addConstraint(minVar <= arrayElem)
-            
-            # Add constraint: min_var >= min(array) by creating a disjunction
-            # At least one array element must equal min_var
-            var equalityConstraints: seq[AlgebraicConstraint[int]] = @[]
-            for arrayElem in arrayExpressions:
-              equalityConstraints.add(minVar == arrayElem)
-            
-            # Create disjunction: minVar == array[0] OR minVar == array[1] OR ...
-            if equalityConstraints.len > 0:
-              var disjunction = equalityConstraints[0]
-              for i in 1..<equalityConstraints.len:
-                disjunction = disjunction or equalityConstraints[i]
-              translator.system.addConstraint(disjunction)
-              
-            echo "array_int_minimum: Implemented as min_var <= all elements AND min_var == some element"
+            echo "array_int_minimum: Implemented with MinConstraint (stateful approach)"
           else:
             echo "array_int_minimum FAILED: no array variables found"
         else:
@@ -1116,11 +1136,14 @@ proc translateModel*(model: FlatZincModel): FlatZincTranslator =
     echo constraintType, ": ", translated, "/", totalCount, " translated"
   echo "======================================"
   
+  # Print algebraic constraint analysis
+  result.printAlgebraicStats()
+  
 
 proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
   case model.solve.solveType:
     of fsSatisfy:
-      resolve(translator.system, useParallel=true)
+      resolve(translator.system)
       
       # Verify we actually found a valid solution (cost = 0)
       if translator.system.assignment.len == 0:
@@ -1140,7 +1163,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
     of fsMinimize:
       # For now, just find a satisfying solution
       # TODO: Implement actual minimization
-      resolve(translator.system, useParallel=true)
+      resolve(translator.system)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:
@@ -1153,7 +1176,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
     of fsMaximize:
       # For now, just find a satisfying solution  
       # TODO: Implement actual maximization
-      resolve(translator.system, useParallel=true)
+      resolve(translator.system)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:

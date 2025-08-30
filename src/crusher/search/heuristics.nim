@@ -2,7 +2,7 @@ import std/[random, os, times]
 
 import ../constraints/stateful
 import ../constrainedArray
-import tabuSearch, tabuState
+import tabu
 
 randomize()
 

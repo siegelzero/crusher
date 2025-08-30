@@ -113,7 +113,7 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
 
 
 func penalty*[T](relation: BinaryRelation, left, right: T): T =
-    return if relation.evaluate(left, right): return 0 else: 1
+    return if relation.evaluate(left, right): 0 else: 1
 
 
 func penalty*[T](relation: TernaryRelation, first, second, third: T): T =

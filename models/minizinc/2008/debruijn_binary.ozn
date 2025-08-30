@@ -1,9 +1,0 @@
-output ((((([(if i==1 then ((((((((("\n% n: "++show(n))++" m: ")++show(m))++" base: ")++show(base))++"\n% bin_code: ")++show(bin_code))++"\n% gcc: ")++show(gcc))++"\n% binary code: " else "" endif++show(bin_code[i]))++"" | i in 1..m]++["\n% x (decimal representation): "++show(x)])++["\n%\n"])++["x = ",show(x),";\n"])++["binary = array2d(1..",show(m),", 1..",show(n),", ",show(binary),");\n"])++["bin_code = ",show(bin_code),";\n"])++["gcc = array1d(1..",show(base),", ",show(gcc),");\n"];
-int: n = 9;
-int: m = 512;
-int: base = 2;
-array [1..m] of int: bin_code;
-array [1..base] of int: gcc;
-array [1..m] of int: x;
-array [1..4608] of int: X_INTRODUCED_528_;
-array [1..m,1..n] of int: binary = array2d(1..512,1..9,X_INTRODUCED_528_);

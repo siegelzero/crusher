@@ -1,2 +1,0 @@
-output [show(x)];
-array [1..5] of int: x;

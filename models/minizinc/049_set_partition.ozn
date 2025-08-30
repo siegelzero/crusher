@@ -1,5 +1,0 @@
-output [((((((("a: "++show(a))++"\n")++"sums: ")++show(sums))++"\n")++"sum_squared: ")++show(sum_squared))++"\n"];
-int: num_sets = 2;
-array [1..num_sets] of set of int: a;
-array [1..num_sets] of int: sums;
-array [1..num_sets] of int: sum_squared;
