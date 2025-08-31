@@ -19,11 +19,13 @@ proc resolve*[T](system: ConstraintSystem[T],
     if parallel:
         let cpuCount = countProcessors()
         let numWorkers = max(1, min(cpuCount - 1, 16))
-        echo fmt"Using parallel resolution with {numWorkers} workers"
+        if verbose:
+            echo fmt"Using parallel resolution with {numWorkers} workers"
         # Work directly on the original system for parallel search  
         system.resolveParallel(initialTabuThreshold, numWorkers, verbose)
     else:
-        echo "Using serial resolution"
+        if verbose:
+            echo "Using serial resolution"
         system.resolveSerial(initialTabuThreshold, maxAttempts, attemptThreshold, verbose)
 
 proc resolveSerial*[T](system: ConstraintSystem[T],
@@ -35,9 +37,11 @@ proc resolveSerial*[T](system: ConstraintSystem[T],
     ## Continues searching until a valid solution (cost = 0) is found
 
     # Compute domain reduction once before search (same as parallel)
-    echo "Computing domain reduction..."
-    let preComputedDomains = system.baseArray.reduceDomain(verbose = false)
-    echo "Domain reduction complete"
+    if verbose:
+        echo "Computing domain reduction..."
+    let preComputedDomains = system.baseArray.reduceDomain(verbose = verbose)
+    if verbose:
+        echo "Domain reduction complete"
     
     # Check for empty domains before starting search
     for i, domain in preComputedDomains:
@@ -129,9 +133,11 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
         echo "=================================="
 
     # Compute domain reduction once and share results with all workers
-    echo "Computing domain reduction for parallel workers..."
-    let preComputedDomains = system.baseArray.reduceDomain(verbose = false)
-    echo "Domain reduction complete, sharing with all workers"
+    if verbose:
+        echo "Computing domain reduction for parallel workers..."
+    let preComputedDomains = system.baseArray.reduceDomain(verbose = verbose)
+    if verbose:
+        echo "Domain reduction complete, sharing with all workers"
     
     # Check for empty domains before starting search
     for i, domain in preComputedDomains:
@@ -163,11 +169,6 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
             var systemCopy = system.deepCopy()
             
             # Domains should already be set correctly since we set them before deep copying
-            if i == 0:
-                echo "DEBUG: Worker 0 domains should now match original system"
-                echo "DEBUG: Worker 0 first 10 domain sizes: "
-                for j in 0..<min(10, systemCopy.baseArray.len):
-                    echo "  Var ", j, ": ", systemCopy.baseArray.domain[j].len
 
             let params = WorkerParams[T](
                 systemCopy: systemCopy,

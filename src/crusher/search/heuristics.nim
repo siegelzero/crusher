@@ -11,8 +11,16 @@ iterator sequentialSearch*[T](carray: ConstrainedArray[T], initialTabuThreshold:
     var currentThreshold = initialTabuThreshold
     for attempt in 0..<maxAttempts:
         randomize(attempt * 1000 + int(epochTime()))
+        let attemptStartTime = epochTime()
         let improved = carray.tabuImprove(currentThreshold, enableTiming)
-        echo "DEBUG: Serial attempt ", attempt, " initial cost: ", improved.cost
+        let attemptEndTime = epochTime()
+        let attemptDuration = attemptEndTime - attemptStartTime
+        let iterationsPerSec = if attemptDuration > 0:
+            improved.iteration.float / attemptDuration
+        else:
+            0.0
+        echo "DEBUG: Serial attempt ", attempt, " cost: ", improved.cost,
+             " (", improved.iteration, " iters @ ", int(iterationsPerSec), " iters/sec)"
         if attempt == 0:
             echo "DEBUG: Serial attempt 0 initial assignment (first 10): ", improved.assignment[0..<min(10, improved.assignment.len)]
         yield improved

@@ -58,8 +58,8 @@ proc translateDomain(domain: FlatZincDomain): seq[int] =
       elif domain.hasSet:
         result = domain.intSet
       else:
-        # Unbounded integer - use reasonable default
-        result = toSeq(0 .. 100)
+        # Unbounded integer - will be refined later based on constraint analysis
+        result = @[]  # Empty domain signals need for inference
     of fzBool:
       result = @[0, 1] # false=0, true=1
     of fzArrayInt, fzArrayBool, fzArrayFloat:
@@ -96,7 +96,11 @@ proc addVariable(translator: var FlatZincTranslator, decl: FlatZincVarDecl) =
           # Create array as a sequence, not a matrix
           let baseVarIndex = translator.system.baseArray.len
           let sequence = newConstrainedSequence(translator.system, arraySize)
-          sequence.setDomain(domain)
+          if domain.len == 0:
+            # Unbounded array elements - use temporary large domain
+            sequence.setDomain(toSeq(0 .. 10000))
+          else:
+            sequence.setDomain(domain)
           
           # Map the array variable to the base index
           translator.variables[decl.name] = baseVarIndex
@@ -106,7 +110,11 @@ proc addVariable(translator: var FlatZincTranslator, decl: FlatZincVarDecl) =
         let varIndex = translator.system.baseArray.len
         let varSeq = newConstrainedSequence(translator.system, 1)
         # Set domain using the correct API pattern
-        varSeq.setDomain(domain)
+        if domain.len == 0:
+          # Unbounded variable - use temporary large domain, will be refined later
+          varSeq.setDomain(toSeq(0 .. 10000))
+        else:
+          varSeq.setDomain(domain)
         translator.variables[decl.name] = varIndex
 
 proc translateExpr(translator: FlatZincTranslator, expr: FlatZincExpr): ExpressionNode[int] =
@@ -230,7 +238,7 @@ proc translateLinearConstraint(translator: var FlatZincTranslator,
     else: 
       translator.system.addConstraint(linearComb == rhs)
 
-proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZincConstraint) =
+proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZincConstraint, verbose: bool = false) =
   case constraint.name:
     of "int_lin_eq":
       # int_lin_eq([c1,c2,...], [x1,x2,...], rhs)
@@ -720,18 +728,19 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
           let reified = (boolTrue and equalityConstraint) or (boolFalse and not equalityConstraint)
           translator.system.addConstraint(reified)
         else:
-          echo "int_eq_reif FAILED:"
-          if boolResultExpr.exprType != feIdent:
-            echo "  boolResult not an identifier"
-          elif boolResultExpr.name notin translator.variables:
-            echo "  boolResult variable not found: ", boolResultExpr.name
-          elif var1Position < 0:
-            echo "  var1 position failed: ", var1Position
-            echo "  var1 exprType: ", var1Expr.exprType
-            if var1Expr.exprType == feIdent:
-              echo "  var1 name: ", var1Expr.name, " (in vars: ", (var1Expr.name in translator.variables), ")"
-          else:
-            echo "  unknown failure condition"
+          if verbose:
+            echo "int_eq_reif FAILED:"
+            if boolResultExpr.exprType != feIdent:
+              echo "  boolResult not an identifier"
+            elif boolResultExpr.name notin translator.variables:
+              echo "  boolResult variable not found: ", boolResultExpr.name
+            elif var1Position < 0:
+              echo "  var1 position failed: ", var1Position
+              echo "  var1 exprType: ", var1Expr.exprType
+              if var1Expr.exprType == feIdent:
+                echo "  var1 name: ", var1Expr.name, " (in vars: ", (var1Expr.name in translator.variables), ")"
+            else:
+              echo "  unknown failure condition"
     
     of "int_lin_le_reif", "int_lin_eq_reif", "int_lin_ge_reif", "int_lin_lt_reif", "int_lin_gt_reif", "int_lin_ne_reif":
       # int_lin_<OP>_reif(coeffs, vars, rhs, bool_result)
@@ -826,7 +835,8 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
           let intVar = translator.system.baseArray.entries[intPosition]
           translator.system.addConstraint(intVar == boolVar)
         else:
-          echo "bool2int FAILED: boolPos=", boolPosition, ", intPos=", intPosition
+          if verbose:
+            echo "bool2int FAILED: boolPos=", boolPosition, ", intPos=", intPosition
     
     of "int_mod":
       # int_mod(dividend, divisor, remainder)
@@ -880,9 +890,11 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
             let moduloConstraint = modulo(dividendVar, divisorLit, remainderVar)
             translator.system.addConstraint(moduloConstraint)
         else:
-          echo "int_mod FAILED: unsupported argument types"
+          if verbose:
+            echo "int_mod FAILED: unsupported argument types"
       else:
-        echo "int_mod FAILED: insufficient arguments"
+        if verbose:
+          echo "int_mod FAILED: insufficient arguments"
     
     of "fzn_increasing_int":
       # fzn_increasing_int([x1, x2, x3, ...]) 
@@ -926,9 +938,11 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
           for constraint in increasingConstraints:
             translator.system.addConstraint(constraint)
         else:
-          echo "fzn_increasing_int FAILED: need at least 2 variables"
+          if verbose:
+            echo "fzn_increasing_int FAILED: need at least 2 variables"
       else:
-        echo "fzn_increasing_int FAILED: insufficient arguments"
+        if verbose:
+          echo "fzn_increasing_int FAILED: insufficient arguments"
     
     of "array_int_minimum":
       # array_int_minimum(min_var, array)
@@ -976,13 +990,17 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
             let minExpr = min(arrayExpressions)
             translator.system.addConstraint(minExpr == minVar)
             
-            echo "array_int_minimum: Implemented with MinConstraint (stateful approach)"
+            if verbose:
+              echo "array_int_minimum: Implemented with MinConstraint (stateful approach)"
           else:
-            echo "array_int_minimum FAILED: no array variables found"
+            if verbose:
+              echo "array_int_minimum FAILED: no array variables found"
         else:
-          echo "array_int_minimum FAILED: min variable not found"
+          if verbose:
+            echo "array_int_minimum FAILED: min variable not found"
       else:
-        echo "array_int_minimum FAILED: insufficient arguments"
+        if verbose:
+          echo "array_int_minimum FAILED: insufficient arguments"
     
     of "fzn_global_cardinality":
       # fzn_global_cardinality(variables, cover, counts)
@@ -1068,7 +1086,8 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
                   cardinalities[coverValue] = expectedCount
                 else:
                   # More complex case - would need additional constraint handling
-                  echo "fzn_global_cardinality: Complex count variables not fully supported yet"
+                  if verbose:
+                    echo "fzn_global_cardinality: Complex count variables not fully supported yet"
                   cardinalities[coverValue] = 1  # Default fallback
           
           # Create and add the global cardinality constraint
@@ -1085,19 +1104,22 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
                 # Constrain count variable to equal expected count
                 translator.system.addConstraint(countVar == expectedCount)
         else:
-          echo "fzn_global_cardinality FAILED: insufficient or mismatched arguments"
-          echo "  expressions: ", expressions.len, ", coverValues: ", coverValues.len, ", countVars: ", countVars.len
+          if verbose:
+            echo "fzn_global_cardinality FAILED: insufficient or mismatched arguments"
+            echo "  expressions: ", expressions.len, ", coverValues: ", coverValues.len, ", countVars: ", countVars.len
       else:
-        echo "fzn_global_cardinality FAILED: insufficient arguments"
+        if verbose:
+          echo "fzn_global_cardinality FAILED: insufficient arguments"
     
     else:
       # Unsupported constraint - skip for now  
-      echo "UNSUPPORTED CONSTRAINT: ", constraint.name, " with ", constraint.args.len, " args"
-      if constraint.args.len > 0:
-        echo "  First arg type: ", constraint.args[0].exprType
+      if verbose:
+        echo "UNSUPPORTED CONSTRAINT: ", constraint.name, " with ", constraint.args.len, " args"
+        if constraint.args.len > 0:
+          echo "  First arg type: ", constraint.args[0].exprType
       discard
 
-proc translateModel*(model: FlatZincModel): FlatZincTranslator =
+proc translateModel*(model: FlatZincModel, verbose: bool = false): FlatZincTranslator =
   result = initTranslator()
   
   # Count constraint types for debugging
@@ -1125,25 +1147,26 @@ proc translateModel*(model: FlatZincModel): FlatZincTranslator =
   let initialConstraints = result.system.baseArray.constraints.len
   for constraint in model.constraints:
     let beforeCount = result.system.baseArray.constraints.len
-    result.translateConstraint(constraint)
+    result.translateConstraint(constraint, verbose)
     let afterCount = result.system.baseArray.constraints.len
     if afterCount > beforeCount:
       translatedCounts[constraint.name] = translatedCounts.getOrDefault(constraint.name, 0) + 1
   
-  echo "=== CONSTRAINT TRANSLATION SUMMARY ==="
-  for constraintType, totalCount in constraintCounts:
-    let translated = translatedCounts.getOrDefault(constraintType, 0)
-    echo constraintType, ": ", translated, "/", totalCount, " translated"
-  echo "======================================"
-  
-  # Print algebraic constraint analysis
-  result.printAlgebraicStats()
+  if verbose:
+    echo "=== CONSTRAINT TRANSLATION SUMMARY ==="
+    for constraintType, totalCount in constraintCounts:
+      let translated = translatedCounts.getOrDefault(constraintType, 0)
+      echo constraintType, ": ", translated, "/", totalCount, " translated"
+    echo "======================================"
+    
+    # Print algebraic constraint analysis
+    result.printAlgebraicStats()
   
 
-proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
+proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: bool = true, verbose: bool = false): bool =
   case model.solve.solveType:
     of fsSatisfy:
-      resolve(translator.system)
+      resolve(translator.system, parallel=parallel, verbose=verbose)
       
       # Verify we actually found a valid solution (cost = 0)
       if translator.system.assignment.len == 0:
@@ -1155,7 +1178,8 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
         totalCost += constraint.penalty()
       
       if totalCost == 0:
-        echo fmt"Valid solution found with cost {totalCost}"
+        if verbose:
+          echo fmt"Valid solution found with cost {totalCost}"
         return true
       else:
         echo fmt"ERROR: Solution has cost {totalCost}, not valid!"
@@ -1163,7 +1187,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
     of fsMinimize:
       # For now, just find a satisfying solution
       # TODO: Implement actual minimization
-      resolve(translator.system)
+      resolve(translator.system, parallel=parallel, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:
@@ -1176,7 +1200,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel): bool =
     of fsMaximize:
       # For now, just find a satisfying solution  
       # TODO: Implement actual maximization
-      resolve(translator.system)
+      resolve(translator.system, parallel=parallel, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:

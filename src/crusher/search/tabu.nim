@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, tables, atomics, strformat, os, times, algorithm]
+import std/[packedsets, random, sequtils, tables, atomics, strformat, strutils, os, times, algorithm]
 import ../expressions
 import ../constrainedArray
 import ../constraintSystem
@@ -310,6 +310,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
 ################################################################################
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
+    let startTime = epochTime()
     var lastImprovement = 0
 
     while state.iteration - lastImprovement < threshold:
@@ -320,8 +321,11 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
         if state.cost == 0:
-            return state
+            break
         state.iteration += 1
+    
+    # Don't report timing here - let the caller handle it
+    
     return state
 
 
@@ -386,7 +390,6 @@ proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
     let enableTiming = params.verbose and params.workerId == 0
     
     # Domains are already set by the main thread - no need for domain reduction
-    echo "Worker ", params.workerId, " starting search with pre-computed domains"
     
     # Use the same multi-restart logic as sequentialSearch iterator
     var bestResult: TabuState[T]
@@ -396,15 +399,25 @@ proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
     for attempt in 0..<10:  # Same as sequentialSearch maxAttempts
         # Check if another worker found a solution
         if shouldTerminate():
-            echo "DEBUG: Worker ", params.workerId, " terminating early - solution found by another worker"
+            if params.verbose:
+                echo "DEBUG: Worker ", params.workerId, " terminating early - solution found by another worker"
             return
             
         randomize(attempt * 1000 + int(epochTime()))  # Same seed pattern as sequentialSearch
+        let attemptStartTime = epochTime()
         let improved = params.systemCopy.baseArray.tabuImproveWithTermination(currentThreshold, shouldTerminate)
-        echo "DEBUG: Worker ", params.workerId, " attempt ", attempt, " cost: ", improved.cost
+        let attemptEndTime = epochTime()
+        let attemptDuration = attemptEndTime - attemptStartTime
+        let iterationsPerSec = if attemptDuration > 0: 
+            improved.iteration.float / attemptDuration 
+        else: 
+            0.0
+        if params.verbose:
+            echo "DEBUG: Worker ", params.workerId, " attempt ", attempt, " cost: ", improved.cost, 
+                 " (", improved.iteration, " iters @ ", int(iterationsPerSec), " iters/sec)"
         
         # DEBUG: Show the first few assignment values for worker 0
-        if params.workerId == 0 and attempt == 0:
+        if params.workerId == 0 and attempt == 0 and params.verbose:
             echo "DEBUG: Worker 0 initial assignment (first 10): ", improved.assignment[0..<min(10, improved.assignment.len)]
         
         if not found or improved.cost < bestResult.cost:
@@ -424,7 +437,8 @@ proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
     if elapsed > 0:
         let totalIterations = improved.iteration
         let iterationsPerSecond = totalIterations.float / elapsed
-        echo fmt"  Worker {params.workerId}: {totalIterations} iterations in {elapsed:.2f}s ({iterationsPerSecond:.0f} iter/s)"
+        if params.verbose:
+            echo fmt"  Worker {params.workerId}: {totalIterations} iterations in {elapsed:.2f}s ({iterationsPerSecond:.0f} iter/s)"
         
         # Print constraint timing statistics for worker 0
         if enableTiming:
@@ -435,7 +449,8 @@ proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
         # Try to claim the solution using solutionFound flag
         let wasAlreadyFound = params.result.solutionFound.exchange(true)
         if not wasAlreadyFound:  # We're the first to find a perfect solution
-            echo fmt"Worker {params.workerId} found solution!"
+            if params.verbose:
+                echo fmt"Worker {params.workerId} found solution!"
 
             # Atomically update the assignment
             params.result.assignment = improved.assignment
