@@ -5,6 +5,8 @@ import constraints/algebraic
 import constraints/allDifferent
 import constraints/common
 import constraints/constraintNode
+import constraints/minConstraint
+import constraints/globalCardinality
 import expressions
 
 ################################################################################
@@ -400,6 +402,7 @@ proc reduceAllDifferentDomains*[T](carray: ConstrainedArray[T], currentDomain: v
 proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq[PackedSet[T]], constraint: StatefulConstraint[T]): bool =
     ## Reduces domains for Linear constraints using bounds propagation
     ## For constraint: Σ(aᵢ·xᵢ) ≤ b, compute bounds for each variable
+    ## Properly handles both positive and negative coefficients
     ## Returns true if any domain was reduced
     if constraint.stateType != LinearType:
         return false
@@ -408,8 +411,12 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
     let linState = constraint.linearConstraintState
     let positions = toSeq(constraint.positions)
     
-    # Only handle simple inequality constraints for now
-    if linState.relation notin [LessThan, LessThanEq, GreaterThan, GreaterThanEq, EqualTo]:
+    # Handle different constraint types
+    if linState.relation notin [LessThan, LessThanEq, GreaterThan, GreaterThanEq, EqualTo, NotEqualTo]:
+        return false
+    
+    # Skip single-variable constraints as they don't benefit from bounds propagation
+    if positions.len <= 1:
         return false
     
     # For each variable in the constraint, compute tighter bounds
@@ -417,6 +424,16 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
         let coeff = linState.lincomb.coefficient[targetPos]
         if coeff == 0:
             continue  # Skip variables with zero coefficient
+        
+        # Skip if any other variable has empty domain (can't compute meaningful bounds)
+        var skipThisVariable = false
+        for pos in positions:
+            if pos != targetPos and currentDomain[pos].card == 0:
+                skipThisVariable = true
+                break
+        
+        if skipThisVariable:
+            continue
         
         # Compute bounds for other variables
         var minOthers: T = linState.lincomb.constant
@@ -427,7 +444,7 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
                 continue
             let c = linState.lincomb.coefficient[pos]
             if currentDomain[pos].card == 0:
-                continue  # Skip empty domains
+                continue  # Skip empty domains (shouldn't happen due to check above)
             
             let domainVals = toSeq(currentDomain[pos])
             let minVal = min(domainVals)
@@ -441,29 +458,31 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
                 maxOthers += c * minVal
         
         # Now compute bounds for targetPos based on constraint type
-        var newMin, newMax: T
         
         case linState.relation:
             of LessThanEq, LessThan:
                 # Σ(aᵢ·xᵢ) ≤ b  =>  aⱼ·xⱼ ≤ b - Σᵢ≠ⱼ(aᵢ·xᵢ)
+                let targetValue = linState.target - minOthers
+                
                 if coeff > 0:
                     # xⱼ ≤ (b - minOthers) / aⱼ
-                    newMax = (linState.target - minOthers) div coeff
-                    if linState.relation == LessThan:
-                        newMax -= 1  # Strict inequality
+                    let newMax = if linState.relation == LessThan:
+                        divFloor(targetValue - 1, coeff)  # Strict: x < (target/coeff)
+                    else:
+                        divFloor(targetValue, coeff)  # Non-strict: x ≤ (target/coeff)
                     
-                    # Remove values greater than newMax
                     for val in toSeq(currentDomain[targetPos]):
                         if val > newMax:
                             currentDomain[targetPos].excl(val)
                             changed = true
+                            
                 else:  # coeff < 0
-                    # xⱼ ≥ (b - maxOthers) / aⱼ  (note: division by negative flips inequality)
-                    newMin = (linState.target - maxOthers) div coeff + 1
-                    if linState.relation == LessThan:
-                        newMin += 1  # Strict inequality
+                    # When coefficient is negative, inequality flips: xⱼ ≥ (b - minOthers) / aⱼ
+                    let newMin = if linState.relation == LessThan:
+                        divCeil(targetValue - 1, coeff)  # Strict: x > (target/coeff)
+                    else:
+                        divCeil(targetValue, coeff)  # Non-strict: x ≥ (target/coeff)
                     
-                    # Remove values less than newMin
                     for val in toSeq(currentDomain[targetPos]):
                         if val < newMin:
                             currentDomain[targetPos].excl(val)
@@ -471,24 +490,27 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
             
             of GreaterThanEq, GreaterThan:
                 # Σ(aᵢ·xᵢ) ≥ b  =>  aⱼ·xⱼ ≥ b - Σᵢ≠ⱼ(aᵢ·xᵢ)
+                let targetValue = linState.target - maxOthers
+                
                 if coeff > 0:
                     # xⱼ ≥ (b - maxOthers) / aⱼ
-                    newMin = (linState.target - maxOthers + coeff - 1) div coeff  # Ceiling division
-                    if linState.relation == GreaterThan:
-                        newMin += 1  # Strict inequality
+                    let newMin = if linState.relation == GreaterThan:
+                        divCeil(targetValue + 1, coeff)  # Strict: x > (target/coeff)
+                    else:
+                        divCeil(targetValue, coeff)  # Non-strict: x ≥ (target/coeff)
                     
-                    # Remove values less than newMin
                     for val in toSeq(currentDomain[targetPos]):
                         if val < newMin:
                             currentDomain[targetPos].excl(val)
                             changed = true
+                            
                 else:  # coeff < 0
-                    # xⱼ ≤ (b - minOthers) / aⱼ  (note: division by negative flips inequality)
-                    newMax = (linState.target - minOthers) div coeff
-                    if linState.relation == GreaterThan:
-                        newMax -= 1  # Strict inequality
+                    # When coefficient is negative, inequality flips: xⱼ ≤ (b - maxOthers) / aⱼ
+                    let newMax = if linState.relation == GreaterThan:
+                        divFloor(targetValue + 1, coeff)  # Strict: x < (target/coeff)
+                    else:
+                        divFloor(targetValue, coeff)  # Non-strict: x ≤ (target/coeff)
                     
-                    # Remove values greater than newMax
                     for val in toSeq(currentDomain[targetPos]):
                         if val > newMax:
                             currentDomain[targetPos].excl(val)
@@ -496,32 +518,373 @@ proc reduceLinearDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq
             
             of EqualTo:
                 # For equality: aⱼ·xⱼ = b - Σᵢ≠ⱼ(aᵢ·xᵢ)
-                # So xⱼ = (b - Σᵢ≠ⱼ(aᵢ·xᵢ)) / aⱼ
                 # The range of Σᵢ≠ⱼ(aᵢ·xᵢ) is [minOthers, maxOthers]
                 # So xⱼ must satisfy: (b - maxOthers) / aⱼ ≤ xⱼ ≤ (b - minOthers) / aⱼ (if aⱼ > 0)
                 # Or: (b - minOthers) / aⱼ ≤ xⱼ ≤ (b - maxOthers) / aⱼ (if aⱼ < 0)
-                
                 let targetMin = linState.target - maxOthers
                 let targetMax = linState.target - minOthers
                 
                 if coeff > 0:
                     # For positive coefficient: xⱼ ∈ [⌈targetMin/coeff⌉, ⌊targetMax/coeff⌋]
-                    newMin = divCeil(targetMin, coeff)
-                    newMax = divFloor(targetMax, coeff)
+                    let computedMin = divCeil(targetMin, coeff)
+                    let computedMax = divFloor(targetMax, coeff)
+                    
+                    for val in toSeq(currentDomain[targetPos]):
+                        if val < computedMin or val > computedMax:
+                            currentDomain[targetPos].excl(val)
+                            changed = true
+                            
                 else:  # coeff < 0
                     # For negative coefficient: division flips the inequality
                     # xⱼ ∈ [⌈targetMax/coeff⌉, ⌊targetMin/coeff⌋]
-                    newMin = divCeil(targetMax, coeff)
-                    newMax = divFloor(targetMin, coeff)
-                
-                # Remove values outside [newMin, newMax]
-                for val in toSeq(currentDomain[targetPos]):
-                    if val < newMin or val > newMax:
-                        currentDomain[targetPos].excl(val)
-                        changed = true
+                    let computedMin = divCeil(targetMax, coeff)
+                    let computedMax = divFloor(targetMin, coeff)
+                    
+                    for val in toSeq(currentDomain[targetPos]):
+                        if val < computedMin or val > computedMax:
+                            currentDomain[targetPos].excl(val)
+                            changed = true
+            
+            of NotEqualTo:
+                # For Σ(aᵢ·xᵢ) ≠ b, we can only remove values when all but one variable have singleton domains
+                # Skip this variable in the outer loop - we'll handle it separately after
+                discard
             
             else:
                 discard  # Other relations not handled yet
+    
+    # Special handling for NotEqualTo constraints
+    if linState.relation == NotEqualTo:
+        # Count variables with non-singleton domains
+        var multiValueVars: seq[int] = @[]
+        for pos in positions:
+            if currentDomain[pos].card > 1:
+                multiValueVars.add(pos)
+        
+        # If exactly one variable has multiple values, we can remove the forbidden value
+        if multiValueVars.len == 1:
+            let targetPos = multiValueVars[0]
+            let coeff = linState.lincomb.coefficient[targetPos]
+            
+            if coeff != 0:  # Ensure non-zero coefficient
+                # Compute the sum of all other (singleton) variables
+                var fixedSum: T = linState.lincomb.constant
+                for pos in positions:
+                    if pos != targetPos:
+                        if currentDomain[pos].card == 1:
+                            let fixedValue = toSeq(currentDomain[pos])[0]
+                            fixedSum += linState.lincomb.coefficient[pos] * fixedValue
+                        else:
+                            # Should not happen if multiValueVars.len == 1
+                            break
+                
+                # The forbidden value for targetPos is: (target - fixedSum) / coeff
+                let remainder = linState.target - fixedSum
+                if remainder mod coeff == 0:  # Check if division is exact
+                    let forbiddenValue = remainder div coeff
+                    
+                    # Remove the forbidden value if it's in the domain
+                    if forbiddenValue in currentDomain[targetPos]:
+                        currentDomain[targetPos].excl(forbiddenValue)
+                        changed = true
+    
+    return changed
+
+proc reduceMinDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq[PackedSet[T]], constraint: StatefulConstraint[T]): bool =
+    ## Reduces domains for Min constraints using bounds propagation
+    ## Returns true if any domain was reduced
+    if constraint.stateType != MinType:
+        return false
+    
+    var changed = false
+    let minState = constraint.minConstraintState
+    let positions = toSeq(constraint.positions)
+    
+    # Get target value based on constraint type
+    var target: T
+    case minState.constraintType:
+    of ConstantTarget:
+        target = minState.target
+    of VariableTarget:
+        # Variable targets require bidirectional domain propagation which is complex
+        # For now, skip domain reduction for variable targets to avoid over-pruning
+        return false
+    
+    case minState.relation:
+        of EqualTo:
+            # min(variables) = target
+            # 1. At least one variable must contain target
+            # 2. All variables can have values > target removed
+            # 3. If no variable can achieve target, constraint is unsatisfiable
+            
+            var canAchieveTarget = false
+            for pos in positions:
+                if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                    continue  # Skip target variable itself
+                if target in currentDomain[pos]:
+                    canAchieveTarget = true
+            
+            if not canAchieveTarget:
+                # Constraint unsatisfiable - make all domains empty (signals failure)
+                for pos in positions:
+                    if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                        continue
+                    currentDomain[pos] = initPackedSet[T]()
+                    changed = true
+            else:
+                # Remove values > target from all variables
+                for pos in positions:
+                    if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                        continue  # Skip target variable
+                    for val in toSeq(currentDomain[pos]):
+                        if val > target:
+                            currentDomain[pos].excl(val)
+                            changed = true
+        
+        of LessThanEq, LessThan:
+            # min(variables) ≤ target (or <)
+            # All variables can have upper bound set to target (or target-1)
+            let upperBound = if minState.relation == LessThan: target - 1 else: target
+            
+            for pos in positions:
+                if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                    continue  # Skip target variable
+                for val in toSeq(currentDomain[pos]):
+                    if val > upperBound:
+                        currentDomain[pos].excl(val)
+                        changed = true
+        
+        of GreaterThanEq, GreaterThan:
+            # min(variables) ≥ target (or >)
+            # At least one variable must have a value ≥ target (or > target)
+            let lowerBound = if minState.relation == GreaterThan: target + 1 else: target
+            
+            var canSatisfy = false
+            for pos in positions:
+                if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                    continue  # Skip target variable
+                let domainVals = toSeq(currentDomain[pos])
+                if domainVals.len > 0 and max(domainVals) >= lowerBound:
+                    canSatisfy = true
+                    break
+            
+            if not canSatisfy:
+                # Constraint unsatisfiable - make all domains empty
+                for pos in positions:
+                    if minState.constraintType == VariableTarget and pos == minState.targetPosition:
+                        continue
+                    currentDomain[pos] = initPackedSet[T]()
+                    changed = true
+        
+        else:
+            discard  # Other relations not handled
+    
+    return changed
+
+proc reduceMaxDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq[PackedSet[T]], constraint: StatefulConstraint[T]): bool =
+    ## Reduces domains for Max constraints using bounds propagation  
+    ## Returns true if any domain was reduced
+    if constraint.stateType != MaxType:
+        return false
+    
+    var changed = false
+    let maxState = constraint.maxConstraintState
+    let positions = toSeq(constraint.positions)
+    let target = maxState.target
+    
+    case maxState.relation:
+        of EqualTo:
+            # max(variables) = target
+            # 1. At least one variable must contain target
+            # 2. All variables can have values < target removed
+            # 3. If no variable can achieve target, constraint is unsatisfiable
+            
+            var canAchieveTarget = false
+            for pos in positions:
+                if target in currentDomain[pos]:
+                    canAchieveTarget = true
+            
+            if not canAchieveTarget:
+                # Constraint unsatisfiable - make all domains empty
+                for pos in positions:
+                    currentDomain[pos] = initPackedSet[T]()
+                    changed = true
+            else:
+                # Remove values < target from all variables
+                for pos in positions:
+                    for val in toSeq(currentDomain[pos]):
+                        if val < target:
+                            currentDomain[pos].excl(val)
+                            changed = true
+        
+        of GreaterThanEq, GreaterThan:
+            # max(variables) ≥ target (or >)
+            # All variables can have lower bound set to target (or target+1)
+            let lowerBound = if maxState.relation == GreaterThan: target + 1 else: target
+            
+            for pos in positions:
+                for val in toSeq(currentDomain[pos]):
+                    if val < lowerBound:
+                        currentDomain[pos].excl(val)
+                        changed = true
+        
+        of LessThanEq, LessThan:
+            # max(variables) ≤ target (or <)
+            # At least one variable must have a value ≤ target (or < target)
+            let upperBound = if maxState.relation == LessThan: target - 1 else: target
+            
+            var canSatisfy = false
+            for pos in positions:
+                let domainVals = toSeq(currentDomain[pos])
+                if domainVals.len > 0 and min(domainVals) <= upperBound:
+                    canSatisfy = true
+                    break
+            
+            if not canSatisfy:
+                # Constraint unsatisfiable - make all domains empty
+                for pos in positions:
+                    currentDomain[pos] = initPackedSet[T]()
+                    changed = true
+        
+        else:
+            discard  # Other relations not handled
+    
+    return changed
+
+proc reduceGlobalCardinalityDomains*[T](carray: ConstrainedArray[T], currentDomain: var seq[PackedSet[T]], constraint: StatefulConstraint[T]): bool =
+    ## Reduces domains for GlobalCardinality constraints
+    ## Returns true if any domain was reduced
+    if constraint.stateType != GlobalCardinalityType:
+        return false
+    
+    var changed = false
+    let gcState = constraint.globalCardinalityState
+    let positions = toSeq(constraint.positions)
+    let cardinalities = gcState.valueCardinalities
+    
+    # Only handle position-based constraints for now (not expression-based)
+    if gcState.evalMethod != PositionBased:
+        return false
+    
+    # Step 1: Remove values with cardinality 0
+    for value, requiredCount in cardinalities.pairs:
+        if requiredCount == 0:
+            # This value should not appear at all
+            for pos in positions:
+                if value in currentDomain[pos]:
+                    currentDomain[pos].excl(value)
+                    changed = true
+    
+    # Step 2: Count current assignments and possibilities for each value
+    var minCount = initTable[T, int]()  # Minimum occurrences (singleton domains)
+    var maxCount = initTable[T, int]()  # Maximum possible occurrences
+    var forcedPositions = initTable[T, seq[int]]()  # Positions forced to a value
+    var possiblePositions = initTable[T, seq[int]]()  # Positions that could take a value
+    
+    # Analyze current domains
+    for pos in positions:
+        let domainVals = toSeq(currentDomain[pos])
+        if domainVals.len == 0:
+            continue  # Skip empty domains
+        
+        if domainVals.len == 1:
+            # Singleton domain - this position is forced
+            let value = domainVals[0]
+            minCount[value] = minCount.getOrDefault(value, 0) + 1
+            maxCount[value] = maxCount.getOrDefault(value, 0) + 1
+            if value notin forcedPositions:
+                forcedPositions[value] = @[]
+            forcedPositions[value].add(pos)
+        else:
+            # Multiple values possible
+            for value in domainVals:
+                maxCount[value] = maxCount.getOrDefault(value, 0) + 1
+                if value notin possiblePositions:
+                    possiblePositions[value] = @[]
+                possiblePositions[value].add(pos)
+    
+    # Step 3: Check feasibility and remove values
+    for value, requiredCount in cardinalities.pairs:
+        let currentMin = minCount.getOrDefault(value, 0)
+        let currentMax = maxCount.getOrDefault(value, 0)
+        
+        # Check if constraint is satisfiable
+        if currentMax < requiredCount:
+            # Not enough positions can take this value - constraint unsatisfiable
+            # Make all domains empty to signal failure
+            for pos in positions:
+                currentDomain[pos] = initPackedSet[T]()
+                changed = true
+            return changed
+        
+        if currentMin > requiredCount:
+            # Too many positions forced to this value - constraint unsatisfiable
+            for pos in positions:
+                currentDomain[pos] = initPackedSet[T]()
+                changed = true
+            return changed
+        
+        # If we've reached the required count, remove this value from other positions
+        if currentMin == requiredCount:
+            # We have exactly the required number of forced positions
+            # Remove this value from all other positions
+            if value in possiblePositions:
+                for pos in possiblePositions[value]:
+                    if value in currentDomain[pos]:
+                        currentDomain[pos].excl(value)
+                        changed = true
+        
+        # If exactly requiredCount positions can take this value, force them all
+        if currentMax == requiredCount and requiredCount > 0:
+            # These positions must take this value
+            let allPositions = forcedPositions.getOrDefault(value, @[]) & possiblePositions.getOrDefault(value, @[])
+            for pos in allPositions:
+                if currentDomain[pos].card > 1:
+                    # Force to singleton domain
+                    currentDomain[pos] = toPackedSet[T]([value])
+                    changed = true
+    
+    # Step 4: Hall's theorem-like reasoning for sets of values
+    # For simplicity, we'll check pairs of values
+    if positions.len <= 20:  # Only for small problems to avoid exponential blowup
+        var valuesToCheck = newSeq[T]()
+        for value, _ in cardinalities.pairs:
+            valuesToCheck.add(value)
+        
+        # Check pairs of values
+        for i in 0..<valuesToCheck.len:
+            for j in i+1..<valuesToCheck.len:
+                let v1 = valuesToCheck[i]
+                let v2 = valuesToCheck[j]
+                let totalRequired = cardinalities[v1] + cardinalities[v2]
+                
+                # Find positions that can only take v1 or v2
+                var restrictedPositions = newSeq[int]()
+                for pos in positions:
+                    let domainVals = toSeq(currentDomain[pos])
+                    var canTakeOther = false
+                    for val in domainVals:
+                        if val != v1 and val != v2 and val in cardinalities:
+                            canTakeOther = true
+                            break
+                    if not canTakeOther and domainVals.len > 0:
+                        # This position can only take v1 or v2 (or values not in cardinalities)
+                        var hasV1orV2 = false
+                        for val in domainVals:
+                            if val == v1 or val == v2:
+                                hasV1orV2 = true
+                                break
+                        if hasV1orV2:
+                            restrictedPositions.add(pos)
+                
+                # If exactly totalRequired positions can only take v1 or v2
+                if restrictedPositions.len == totalRequired:
+                    # Remove all other values from these positions
+                    for pos in restrictedPositions:
+                        for val in toSeq(currentDomain[pos]):
+                            if val != v1 and val != v2:
+                                currentDomain[pos].excl(val)
+                                changed = true
     
     return changed
 
@@ -573,25 +936,81 @@ proc reduceDomain*[T](carray: ConstrainedArray[T], verbose: bool = true): seq[se
             if not allDifferentChanged:
                 echo "    No changes made"
         
-        # Process Linear constraints with bounds propagation (only in first iteration to avoid over-pruning)
-        if iterations == 1:
-            var linearChanged = false
-            var linearCount = 0
-            for cons in carray.constraints:
-                if cons.stateType == LinearType:
-                    linearCount += 1
-                    if carray.reduceLinearDomains(currentDomain, cons):
-                        linearChanged = true
-                        changed = true
-            
-            if verbose and linearCount > 0:
-                var totalAfterLinear = 0
-                for pos in carray.allPositions():
-                    totalAfterLinear += currentDomain[pos].card
-                echo "  After ", linearCount, " Linear constraint(s):"
-                echo "    Total domain size: ", totalAfterLinear
-                if not linearChanged:
-                    echo "    No changes made"
+        # Process Linear constraints with bounds propagation
+        var linearChanged = false
+        var linearCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == LinearType:
+                linearCount += 1
+                if carray.reduceLinearDomains(currentDomain, cons):
+                    linearChanged = true
+                    changed = true
+        
+        if verbose and linearCount > 0:
+            var totalAfterLinear = 0
+            for pos in carray.allPositions():
+                totalAfterLinear += currentDomain[pos].card
+            echo "  After ", linearCount, " Linear constraint(s):"
+            echo "    Total domain size: ", totalAfterLinear
+            if not linearChanged:
+                echo "    No changes made"
+        
+        # Process Min constraints with bounds propagation
+        var minChanged = false
+        var minCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == MinType:
+                minCount += 1
+                if carray.reduceMinDomains(currentDomain, cons):
+                    minChanged = true
+                    changed = true
+        
+        if verbose and minCount > 0:
+            var totalAfterMin = 0
+            for pos in carray.allPositions():
+                totalAfterMin += currentDomain[pos].card
+            echo "  After ", minCount, " Min constraint(s):"
+            echo "    Total domain size: ", totalAfterMin
+            if not minChanged:
+                echo "    No changes made"
+        
+        # Process Max constraints with bounds propagation
+        var maxChanged = false
+        var maxCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == MaxType:
+                maxCount += 1
+                if carray.reduceMaxDomains(currentDomain, cons):
+                    maxChanged = true
+                    changed = true
+        
+        if verbose and maxCount > 0:
+            var totalAfterMax = 0
+            for pos in carray.allPositions():
+                totalAfterMax += currentDomain[pos].card
+            echo "  After ", maxCount, " Max constraint(s):"
+            echo "    Total domain size: ", totalAfterMax
+            if not maxChanged:
+                echo "    No changes made"
+        
+        # Process GlobalCardinality constraints
+        var globalCardChanged = false
+        var globalCardCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == GlobalCardinalityType:
+                globalCardCount += 1
+                if carray.reduceGlobalCardinalityDomains(currentDomain, cons):
+                    globalCardChanged = true
+                    changed = true
+        
+        if verbose and globalCardCount > 0:
+            var totalAfterGlobalCard = 0
+            for pos in carray.allPositions():
+                totalAfterGlobalCard += currentDomain[pos].card
+            echo "  After ", globalCardCount, " GlobalCardinality constraint(s):"
+            echo "    Total domain size: ", totalAfterGlobalCard
+            if not globalCardChanged:
+                echo "    No changes made"
         
         # Then examine single-variable constraints to reduce domains
         var singleVarChanged = false
