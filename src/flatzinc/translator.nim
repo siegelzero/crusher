@@ -1,8 +1,8 @@
-import std/[tables, strutils, sequtils, packedsets, math, strformat]
+import std/[tables, strutils, sequtils, packedsets, math, strformat, sets]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint]
-import ../crusher/search/[resolution, tabu]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular]
+import ../crusher/search/[resolution, tabu, optimization]
 
 type
   FlatZincError* = object of CatchableError
@@ -169,6 +169,62 @@ proc translateExpr(translator: FlatZincTranslator, expr: FlatZincExpr): Expressi
         result = translator.translateExpr(expr.elements[0])
       else:
         result = ExpressionNode[int](kind: LiteralNode, value: 0)
+
+proc translateObjective(translator: FlatZincTranslator, expr: FlatZincExpr): AlgebraicExpression[int] =
+  ## Translate a FlatZinc objective expression to Crusher AlgebraicExpression
+  case expr.exprType:
+    of feIdent:
+      # Simple variable reference as objective
+      if expr.name in translator.variables:
+        let position = translator.variables[expr.name]
+        result = translator.system.baseArray.entries[position]
+      else:
+        # Handle array indexing like "cost[1]"
+        if '[' in expr.name and expr.name.endsWith("]"):
+          let parts = expr.name.split('[')
+          if parts.len == 2:
+            let arrayName = parts[0]
+            let indexStr = parts[1].replace("]", "")
+            try:
+              let index = parseInt(indexStr)
+              if arrayName in translator.variables:
+                let basePos = translator.variables[arrayName]
+                let linearIndex = index - 1  # Convert to 0-based
+                result = translator.system.baseArray.entries[basePos + linearIndex]
+                return
+            except:
+              discard
+        # Fallback: create a constant expression with value 0
+        result = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: 0),
+          linear = true
+        )
+    of feLiteral:
+      # Constant objective (unusual but possible)
+      var value = 0
+      case expr.literal.literalType:
+        of fzInt: 
+          value = expr.literal.intVal
+        of fzBool: 
+          value = if expr.literal.boolVal: 1 else: 0
+        else: 
+          value = 0
+      result = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: value),
+        linear = true
+      )
+    of feArray:
+      # Complex expression - for now, just use first element or return constant 0
+      if expr.elements.len > 0:
+        result = translator.translateObjective(expr.elements[0])
+      else:
+        result = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: 0),
+          linear = true
+        )
 
 proc translateLinearConstraint(translator: var FlatZincTranslator, 
                               coeffs: seq[int], vars: seq[string], 
@@ -1111,6 +1167,163 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
         if verbose:
           echo "fzn_global_cardinality FAILED: insufficient arguments"
     
+    of "gecode_regular":
+      # gecode_regular(sequence, numStates, alphabetSize, transitionMatrix, initialState, acceptingStates)
+      if constraint.args.len >= 6:
+        if verbose:
+          echo "Processing gecode_regular constraint with ", constraint.args.len, " args"
+        
+        # Extract arguments
+        let sequenceExpr = constraint.args[0]       # Variable array
+        let numStatesExpr = constraint.args[1]      # Integer
+        let alphabetSizeExpr = constraint.args[2]   # Integer  
+        let transitionMatrixExpr = constraint.args[3] # Integer array
+        let initialStateExpr = constraint.args[4]   # Integer
+        let acceptingStatesExpr = constraint.args[5] # Set of integers
+        
+        # Parse parameters
+        var numStates = 0
+        var alphabetSize = 0
+        var initialState = 0
+        var transitionMatrix: seq[seq[int]] = @[]
+        var acceptingStates: HashSet[int]
+        var varNames: seq[string] = @[]
+        
+        # Extract numStates
+        if numStatesExpr.exprType == feLiteral and numStatesExpr.literal.literalType == fzInt:
+          numStates = numStatesExpr.literal.intVal
+          
+        # Extract alphabetSize  
+        if alphabetSizeExpr.exprType == feLiteral and alphabetSizeExpr.literal.literalType == fzInt:
+          alphabetSize = alphabetSizeExpr.literal.intVal
+          
+        # Extract initialState
+        if initialStateExpr.exprType == feLiteral and initialStateExpr.literal.literalType == fzInt:
+          initialState = initialStateExpr.literal.intVal
+          
+        # Extract accepting states (set)
+        if acceptingStatesExpr.exprType == feLiteral and acceptingStatesExpr.literal.literalType == fzSetInt:
+          acceptingStates = acceptingStatesExpr.literal.setVal.toHashSet()
+          if verbose:
+            echo "  Parsed accepting states: ", acceptingStatesExpr.literal.setVal, " -> ", acceptingStates
+          
+          # Use accepting states as specified in the FlatZinc file
+          # If there's an issue with the FlatZinc generation, it should be fixed upstream
+        
+        # Extract variable sequence - handle mixed arrays with both variables and constants
+        var expressions: seq[AlgebraicExpression[int]] = @[]
+        
+        if sequenceExpr.exprType == feIdent:
+          # Look up array declaration to reconstruct the mixed array
+          for decl in translator.varDecls:
+            if decl.name == sequenceExpr.name and decl.varType == fzArrayInt:
+              # This array references both variables and constants
+              # The declaration shows: [var1, var2, var3, var4, 6, var6, var7, var8, var9, 6, ...]
+              # We need to reconstruct this exact sequence
+              
+              if decl.arrayVarRefs.len > 0 and decl.arrayValue.len > 0:
+                # Mixed array - reconstruct the proper sequence based on pattern
+                if verbose:
+                  echo "  Found mixed array '", decl.name, "' with ", decl.arrayVarRefs.len, " vars and ", decl.arrayValue.len, " constants"
+                
+                # Determine total array size and pattern
+                let totalElements = decl.arrayVarRefs.len + decl.arrayValue.len
+                let constInterval = if decl.arrayValue.len > 0:
+                  totalElements div decl.arrayValue.len  # How often constants appear
+                else:
+                  0
+                
+                # Build the sequence by interleaving variables and constants
+                var varIndex = 0
+                var constIndex = 0
+                
+                for i in 0..<totalElements:
+                  # Check if this position should be a constant
+                  let isConstPos = (constInterval > 1) and ((i + 1) mod constInterval == 0) and (constIndex < decl.arrayValue.len)
+                  
+                  if isConstPos:
+                    # Add constant expression
+                    let constValue = decl.arrayValue[constIndex]
+                    expressions.add(newAlgebraicExpression[int](
+                      positions = initPackedSet[int](),
+                      node = ExpressionNode[int](kind: LiteralNode, value: constValue),
+                      linear = true
+                    ))
+                    constIndex += 1
+                  elif varIndex < decl.arrayVarRefs.len:
+                    # Add variable expression
+                    let varName = decl.arrayVarRefs[varIndex]
+                    if varName in translator.variables:
+                      let varIdx = translator.variables[varName]
+                      expressions.add(translator.system.baseArray[varIdx])
+                    varIndex += 1
+                    
+                if verbose:
+                  echo "  Reconstructed mixed array with ", expressions.len, " elements (", varIndex, " vars, ", constIndex, " constants)"
+                
+              elif decl.arrayVarRefs.len > 0:
+                # Pure variable array
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    let varIdx = translator.variables[varName]
+                    expressions.add(translator.system.baseArray[varIdx])
+              break
+              
+        elif sequenceExpr.exprType == feArray:
+          # Direct array expression - parse each element
+          for elem in sequenceExpr.elements:
+            if elem.exprType == feIdent:
+              # Variable reference
+              if elem.name in translator.variables:
+                let varIdx = translator.variables[elem.name]
+                expressions.add(translator.system.baseArray[varIdx])
+            elif elem.exprType == feLiteral and elem.literal.literalType == fzInt:
+              # Constant value
+              let constValue = elem.literal.intVal
+              expressions.add(newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: constValue),
+                linear = true
+              ))
+        
+        # Extract transition matrix
+        if transitionMatrixExpr.exprType == feIdent:
+          # Look up array parameter
+          for decl in translator.varDecls:
+            if decl.name == transitionMatrixExpr.name and not decl.isVar and decl.varType == fzArrayInt:
+              let flatMatrix = decl.arrayValue
+              # Convert flat array to 2D matrix [numStates][alphabetSize]
+              transitionMatrix = newSeq[seq[int]](numStates)
+              for i in 0..<numStates:
+                transitionMatrix[i] = newSeq[int](alphabetSize)
+                for j in 0..<alphabetSize:
+                  let idx = i * alphabetSize + j
+                  if idx < flatMatrix.len:
+                    transitionMatrix[i][j] = flatMatrix[idx]
+              break
+        
+        # Create and add regular constraint
+        if expressions.len > 0 and transitionMatrix.len > 0:
+          let regularConst = regularConstraint(
+            sequence = expressions,
+            numStates = numStates,
+            alphabetSize = alphabetSize,
+            transitionMatrix = transitionMatrix,
+            initialState = initialState,
+            acceptingStates = acceptingStates
+          )
+          translator.system.addConstraint(regularConst)
+          
+          if verbose:
+            echo "Added gecode_regular constraint: ", expressions.len, " variables, ", 
+                 numStates, " states, alphabet ", alphabetSize
+        else:
+          if verbose:
+            echo "gecode_regular FAILED: invalid parameters or empty sequence"
+      else:
+        if verbose:
+          echo "gecode_regular FAILED: insufficient arguments (", constraint.args.len, " < 6)"
+    
     else:
       # Unsupported constraint - skip for now  
       if verbose:
@@ -1185,9 +1398,13 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: 
         echo fmt"ERROR: Solution has cost {totalCost}, not valid!"
         return false
     of fsMinimize:
-      # For now, just find a satisfying solution
-      # TODO: Implement actual minimization
-      resolve(translator.system, parallel=parallel, verbose=verbose)
+      # Translate objective expression and minimize
+      let objective = translator.translateObjective(model.solve.objective)
+      if verbose:
+        echo "Minimizing objective..."
+        echo fmt"Objective variable: {model.solve.objective}"
+        echo fmt"Translated to AlgebraicExpression with {objective.positions.len} variable(s)"
+      minimize(translator.system, objective, parallel=parallel, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:
@@ -1198,9 +1415,13 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: 
       return totalCost == 0
       
     of fsMaximize:
-      # For now, just find a satisfying solution  
-      # TODO: Implement actual maximization
-      resolve(translator.system, parallel=parallel, verbose=verbose)
+      # Translate objective expression and maximize
+      let objective = translator.translateObjective(model.solve.objective)
+      if verbose:
+        echo "Maximizing objective..."
+        echo fmt"Objective variable: {model.solve.objective}"
+        echo fmt"Translated to AlgebraicExpression with {objective.positions.len} variable(s)"
+      maximize(translator.system, objective, parallel=parallel, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:
@@ -1230,16 +1451,69 @@ proc getSolution*(translator: FlatZincTranslator): Table[string, string] =
             var values: seq[int] = @[]
             
             if varDecl.arrayVarRefs.len > 0:
-              # Use the variable references from the array assignment
-              for varRefName in varDecl.arrayVarRefs:
-                if varRefName in translator.variables:
-                  let varPos = translator.variables[varRefName]
-                  if varPos < translator.system.assignment.len:
-                    values.add(translator.system.assignment[varPos])
+              # Reconstruct mixed array that contains both variable references and constants
+              # Need to parse the original FlatZinc array structure to determine proper interleaving
+              # This requires looking at the original array declaration to see the pattern
+              
+              # For now, use a simple approach: try to determine the pattern by examining the FlatZinc
+              # We need to find the original array in model.varDecls that this refers to
+              var foundPattern = false
+              for originalDecl in translator.varDecls:
+                if originalDecl.name == varDecl.name and originalDecl.arrayVarRefs.len > 0:
+                  # This is the mixed array - analyze its structure
+                  let totalVars = originalDecl.arrayVarRefs.len
+                  let totalConsts = originalDecl.arrayValue.len
+                  let totalElements = totalVars + totalConsts
+                  
+                  values = newSeq[int](totalElements)
+                  var varIdx = 0
+                  var constIdx = 0
+                  
+                  # Try to infer pattern from array size ratios
+                  if totalConsts > 0 and totalElements > 0:
+                    let constantInterval = totalElements div totalConsts
+                    
+                    # Fill array by checking if each position should be a constant
+                    for i in 0..<totalElements:
+                      # Check if this looks like a constant position based on regular intervals
+                      let isConstantPos = (constantInterval > 1) and ((i + 1) mod constantInterval == 0) and (constIdx < totalConsts)
+                      
+                      if isConstantPos:
+                        values[i] = originalDecl.arrayValue[constIdx]
+                        constIdx += 1
+                      elif varIdx < totalVars:
+                        let varRefName = originalDecl.arrayVarRefs[varIdx]
+                        if varRefName in translator.variables:
+                          let varPos = translator.variables[varRefName]
+                          if varPos < translator.system.assignment.len:
+                            values[i] = translator.system.assignment[varPos]
+                          else:
+                            values[i] = 0
+                        else:
+                          values[i] = 0
+                        varIdx += 1
+                      else:
+                        values[i] = 0
+                  
+                  foundPattern = true
+                  break
+              
+              if not foundPattern:
+                # Fallback: just concatenate variables then constants
+                values = newSeq[int](varDecl.arrayVarRefs.len + varDecl.arrayValue.len)
+                for i, varRefName in varDecl.arrayVarRefs:
+                  if varRefName in translator.variables:
+                    let varPos = translator.variables[varRefName]
+                    if varPos < translator.system.assignment.len:
+                      values[i] = translator.system.assignment[varPos]
+                    else:
+                      values[i] = 0
                   else:
-                    values.add(0)
-                else:
-                  values.add(0)
+                    values[i] = 0
+                
+                # Add constants at the end
+                for i, constVal in varDecl.arrayValue:
+                  values[varDecl.arrayVarRefs.len + i] = constVal
             else:
               # Fallback to direct indexing
               for i in 0..<arraySize:

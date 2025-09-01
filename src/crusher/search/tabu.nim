@@ -69,6 +69,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.sumConstraintState.cost + constraint.sumConstraintState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
             result = constraint.globalCardinalityState.cost + constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
+        of RegularType:
+            result = constraint.regularState.cost + constraint.moveDelta(position, oldValue, newValue)
 
     # Record timing if enabled
     if state.enableTiming:
@@ -249,6 +251,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 delta += constraint.sumConstraintState.moveDelta(position, oldValue, value)
             of GlobalCardinalityType:
                 delta += constraint.globalCardinalityState.moveDelta(position, oldValue, value)
+            of RegularType:
+                delta += constraint.moveDelta(position, oldValue, value)
 
     # Update assignment
     state.assignment[position] = value

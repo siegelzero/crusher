@@ -22,7 +22,7 @@ proc resolve*[T](system: ConstraintSystem[T],
         if verbose:
             echo fmt"Using parallel resolution with {numWorkers} workers"
         # Work directly on the original system for parallel search  
-        system.resolveParallel(initialTabuThreshold, numWorkers, verbose)
+        system.resolveParallel(initialTabuThreshold, numWorkers, maxAttempts, attemptThreshold, verbose)
     else:
         if verbose:
             echo "Using serial resolution"
@@ -52,11 +52,6 @@ proc resolveSerial*[T](system: ConstraintSystem[T],
     # Set the pre-computed reduced domains on the system for serial search
     for pos in 0..<system.baseArray.len:
         system.baseArray.domain[pos] = preComputedDomains[pos]
-    
-    # DEBUG: Show first 10 domain sizes in serial path
-    echo "DEBUG: Serial path domain sizes:"
-    for i in 0..<min(10, preComputedDomains.len):
-        echo "  Var ", i, ": ", preComputedDomains[i].len
 
     var lastImprovement = 0
     var bestAttempt = high(int)
@@ -109,6 +104,8 @@ proc resolveSerial*[T](system: ConstraintSystem[T],
 proc resolveParallel*[T](system: ConstraintSystem[T],
                         tabuThreshold=1000,
                         numWorkers=4,
+                        maxAttempts=10,
+                        attemptThreshold=10,
                         verbose=false) =
     ## Parallel version that runs multiple batches until solution found
 
@@ -124,7 +121,7 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
         for constraint in system.baseArray.constraints:
             let typeName = constraint.getConstraintTypeName()
             constraintTypeCounts[typeName] = constraintTypeCounts.getOrDefault(typeName, 0) + 1
-        
+
         echo fmt"Total constraints: {system.baseArray.constraints.len}"
         echo fmt"Total variables: {system.baseArray.len}"
         echo "Constraint types:"
@@ -138,14 +135,14 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
     let preComputedDomains = system.baseArray.reduceDomain(verbose = verbose)
     if verbose:
         echo "Domain reduction complete, sharing with all workers"
-    
+
     # Check for empty domains before starting search
     for i, domain in preComputedDomains:
         if domain.len == 0:
             echo "Error: Variable at position ", i, " has empty reduced domain - problem is unsatisfiable"
             raise newException(NoSolutionFoundError, "Problem is unsatisfiable due to empty domains")
-    
-    # CRITICAL FIX: Set the reduced domains on the original system BEFORE deep copying
+
+    # Set the reduced domains on the original system BEFORE deep copying
     # This ensures deep copies get the correct domains from the start
     for pos in 0..<system.baseArray.len:
         system.baseArray.domain[pos] = preComputedDomains[pos]
@@ -167,7 +164,7 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
 
         for i in 0..<numWorkers:
             var systemCopy = system.deepCopy()
-            
+
             # Domains should already be set correctly since we set them before deep copying
 
             let params = WorkerParams[T](
@@ -208,7 +205,13 @@ proc resolveParallel*[T](system: ConstraintSystem[T],
             echo fmt"Batch {attempt} found better solution with cost {batchBestCost}"
 
         # Adaptive tabu threshold - increase if no improvement
-        if attempt - lastImprovement > 2:
+        if attempt - lastImprovement > attemptThreshold:
             currentTabuThreshold += currentTabuThreshold div 2
-            echo fmt"No improvement for 5 batches, increasing threshold to {currentTabuThreshold}"
+            echo fmt"No improvement for {attemptThreshold} batches, increasing threshold to {currentTabuThreshold}"
             lastImprovement = attempt
+
+        # Check if we should terminate search due to maxAttempts limit
+        if attempt >= maxAttempts:
+            if verbose:
+                echo fmt"Reached maximum attempts ({maxAttempts}), terminating parallel search"
+            raise newException(NoSolutionFoundError, "Maximum attempts reached in parallel search")

@@ -228,10 +228,26 @@ proc parseExpr(p: var Parser): FlatZincExpr =
                 result = FlatZincExpr(exprType: feIdent, name: identName)
         of tkInt:
             let val = parseInt(p.advance().value)
-            result = FlatZincExpr(
-                exprType: feLiteral,
-                literal: FlatZincLiteral(literalType: fzInt, intVal: val)
-            )
+            # Check if this is range notation like "1..2"
+            if p.match(tkDotDot):
+                discard p.advance() # Skip ".."
+                if p.match(tkInt):
+                    let endVal = parseInt(p.advance().value)
+                    # Convert range to set
+                    var setVals: seq[int] = @[]
+                    for i in val..endVal:
+                        setVals.add(i)
+                    result = FlatZincExpr(
+                        exprType: feLiteral,
+                        literal: FlatZincLiteral(literalType: fzSetInt, setVal: setVals)
+                    )
+                else:
+                    raise newException(ParseError, "Expected integer after '..' at line " & $p.current.line)
+            else:
+                result = FlatZincExpr(
+                    exprType: feLiteral,
+                    literal: FlatZincLiteral(literalType: fzInt, intVal: val)
+                )
         of tkBool:
             let val = p.advance().value == "true"
             result = FlatZincExpr(

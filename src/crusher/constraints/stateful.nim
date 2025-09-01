@@ -1,8 +1,8 @@
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, sequtils, tables, sets]
 
 import common
 import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
-import globalCardinality
+import globalCardinality, regular
 import constraintNode
 import ../expressions
 
@@ -33,7 +33,8 @@ type
         MinType,
         MaxType,
         SumType,
-        GlobalCardinalityType
+        GlobalCardinalityType,
+        RegularType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -56,6 +57,8 @@ type
                 sumConstraintState*: SumConstraint[T]
             of GlobalCardinalityType:
                 globalCardinalityState*: GlobalCardinalityConstraint[T]
+            of RegularType:
+                regularState*: RegularConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -78,6 +81,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Sum Constraint"
         of GlobalCardinalityType:
             return "GlobalCardinality Constraint"
+        of RegularType:
+            return "Regular Constraint"
 
 proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
     ## Returns a human-readable name for the constraint type
@@ -91,6 +96,7 @@ proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inli
         of MaxType: "Max"
         of SumType: "Sum"
         of GlobalCardinalityType: "GlobalCardinality"
+        of RegularType: "Regular"
 
 ################################################################################
 # Evaluation
@@ -116,6 +122,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.sumConstraintState.cost
         of GlobalCardinalityType:
             return constraint.globalCardinalityState.cost
+        of RegularType:
+            return constraint.regularState.getCost()
 
 ################################################################################
 # Computed Constraints
@@ -311,6 +319,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.sumConstraintState.initialize(assignment)
         of GlobalCardinalityType:
             constraint.globalCardinalityState.initialize(assignment)
+        of RegularType:
+            constraint.regularState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -333,6 +343,14 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.sumConstraintState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
             constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
+        of RegularType:
+            # Compute delta without modifying state by using pure evaluation
+            let oldCost = constraint.regularState.cost
+            # Create temporary assignment with new value
+            var tempAssignment = constraint.regularState.currentAssignment
+            tempAssignment[position] = newValue
+            let (newViolations, _) = constraint.regularState.evaluateSequencePure(tempAssignment)
+            return newViolations - oldCost
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -355,6 +373,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.sumConstraintState.updatePosition(position, newValue)
         of GlobalCardinalityType:
             constraint.globalCardinalityState.updatePosition(position, newValue)
+        of RegularType:
+            constraint.regularState.updatePosition(position, newValue)
 
 
 ################################################################################
@@ -553,3 +573,50 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
               origConstraint.valueCardinalities
             )
           )
+    of RegularType:
+      # Deep copy the regular constraint
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: RegularType,
+        regularState: constraint.regularState.deepCopy()
+      )
+
+################################################################################
+# Regular constraint StatefulConstraint constructors
+################################################################################
+
+func regularConstraint*[T](
+    sequence: seq[AlgebraicExpression[T]], 
+    numStates: int,
+    alphabetSize: int, 
+    transitionMatrix: seq[seq[int]],
+    initialState: int,
+    acceptingStates: HashSet[int]
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a RegularConstraint from expressions
+    let regularConst = newRegularConstraint(sequence, numStates, alphabetSize, 
+                                          transitionMatrix, initialState, acceptingStates)
+    
+    result = StatefulConstraint[T](
+        positions: regularConst.positions,
+        stateType: RegularType,
+        regularState: regularConst
+    )
+
+func regularConstraint*[T](
+    positions: openArray[int],
+    numStates: int,
+    alphabetSize: int, 
+    transitionMatrix: seq[seq[int]],
+    initialState: int,
+    acceptingStates: HashSet[int]
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a RegularConstraint from positions
+    let regularConst = newRegularConstraint(positions, numStates, alphabetSize, 
+                                          transitionMatrix, initialState, acceptingStates)
+    
+    result = StatefulConstraint[T](
+        positions: regularConst.positions,
+        stateType: RegularType,
+        regularState: regularConst
+    )
