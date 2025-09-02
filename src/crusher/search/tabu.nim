@@ -374,6 +374,14 @@ type
         solutionWorkerId*: Atomic[int]
         assignment*: seq[T]  # Protected by solved flag
 
+    BatchSharedResult*[T] = object
+        solutionFound*: Atomic[bool]
+        bestCost*: Atomic[int]
+        solutionWorkerId*: Atomic[int]
+        solutionAssignment*: seq[T]
+        # Storage for all improved states
+        improvedStates*: seq[TabuState[T]]
+
     WorkerParams*[T] = object
         systemCopy*: ConstraintSystem[T]
         threshold*: int
@@ -471,3 +479,146 @@ proc tabuSearchWorker*[T](params: WorkerParams[T]) {.thread.} =
             echo fmt"Worker {params.workerId} found new best cost: {improved.cost}"
             break
         currentBest = params.result.bestCost.load()
+
+################################################################################
+# Batch improvement methods
+################################################################################
+
+type
+    BatchWorkerParams*[T] = object
+        systemCopy*: ConstraintSystem[T]
+        threshold*: int
+        result*: ptr BatchSharedResult[T]
+        workerId*: int
+        verbose*: bool
+
+proc batchImproveWorker*[T](params: BatchWorkerParams[T]) {.thread.} =
+    ## Worker thread that improves a single ConstraintSystem in a batch
+    # Create termination check function
+    proc shouldTerminate(): bool {.gcsafe.} = params.result.solutionFound.load()
+    
+    # Set different random seeds for each worker to ensure diversity
+    randomize(params.workerId * 1000 + int(epochTime()))
+
+    let startTime = epochTime()
+    let enableTiming = params.verbose and params.workerId == 0
+    
+    # Improve using the system's baseArray (same pattern as existing parallel search)
+    let improved = params.systemCopy.baseArray.tabuImproveWithTermination(params.threshold, shouldTerminate, enableTiming)
+    let elapsed = epochTime() - startTime
+    
+    # Log profiling info for this worker
+    if elapsed > 0:
+        let totalIterations = improved.iteration
+        let iterationsPerSecond = totalIterations.float / elapsed
+        if params.verbose:
+            echo fmt"  Batch Worker {params.workerId}: {totalIterations} iterations in {elapsed:.2f}s ({iterationsPerSecond:.0f} iter/s), final cost: {improved.cost}"
+        
+        # Print constraint timing statistics for worker 0
+        if enableTiming:
+            improved.printTimingStats()
+
+    # Store the improved state in the shared result (always, regardless of solution status)
+    # Note: This is not thread-safe for concurrent writes, but since each worker writes to its own index, it should be fine
+    if params.workerId < params.result.improvedStates.len:
+        params.result.improvedStates[params.workerId] = improved
+
+    # Check if we found a perfect solution
+    if improved.cost == 0:
+        # Try to claim the solution using solutionFound flag
+        let wasAlreadyFound = params.result.solutionFound.exchange(true)
+        if not wasAlreadyFound:  # We're the first to find a perfect solution
+            if params.verbose:
+                echo fmt"Batch Worker {params.workerId} found solution!"
+
+            # Atomically update the solution
+            params.result.solutionAssignment = improved.assignment
+            params.result.bestCost.store(0)
+            params.result.solutionWorkerId.store(params.workerId)
+            return
+
+    # Update best cost if we found an improvement
+    var currentBest = params.result.bestCost.load()
+    while improved.cost < currentBest:
+        let swapped = params.result.bestCost.compareExchange(currentBest, improved.cost)
+        if swapped:
+            if params.verbose:
+                echo fmt"Batch Worker {params.workerId} found new best cost: {improved.cost}"
+            break
+        currentBest = params.result.bestCost.load()
+
+proc batchImprove*[T](systems: seq[ConstraintSystem[T]], threshold: int, verbose: bool = false): seq[TabuState[T]] =
+    ## Improves a batch of ConstraintSystems in parallel using tabu search
+    ## Returns improved TabuStates, terminating early if any solution found (cost == 0)
+    
+    if systems.len == 0:
+        return @[]
+    
+    let numWorkers = systems.len
+    if verbose:
+        echo fmt"Starting batch improvement with {numWorkers} systems"
+    
+    # Create batch shared result structure
+    var batchResult = BatchSharedResult[T]()
+    batchResult.solutionFound.store(false)
+    batchResult.bestCost.store(high(int))
+    batchResult.solutionWorkerId.store(-1)
+    batchResult.solutionAssignment = @[]
+    batchResult.improvedStates = newSeq[TabuState[T]](numWorkers)
+    
+    # Launch worker threads - each gets a deep copy of a system
+    var threads: seq[Thread[BatchWorkerParams[T]]]
+    threads.setLen(numWorkers)
+    
+    for i in 0..<numWorkers:
+        var systemCopy = systems[i].deepCopy()
+        
+        let params = BatchWorkerParams[T](
+            systemCopy: systemCopy,
+            threshold: threshold,
+            result: batchResult.addr,
+            workerId: i,
+            verbose: verbose
+        )
+        createThread(threads[i], batchImproveWorker, params)
+    
+    # Wait for solution or all workers to complete
+    while not batchResult.solutionFound.load():
+        var allDone = true
+        for thread in threads:
+            if running(thread):
+                allDone = false
+                break
+        
+        if allDone:
+            break
+        sleep(50)
+    
+    # Clean up threads
+    for i in 0..<threads.len:
+        joinThread(threads[i])
+    
+    # Report results and return improved states
+    if batchResult.solutionFound.load():
+        let solutionWorkerId = batchResult.solutionWorkerId.load()
+        if verbose:
+            echo fmt"Batch improvement found solution via worker {solutionWorkerId}"
+    else:
+        let bestCost = batchResult.bestCost.load()
+        if verbose and bestCost < high(int):
+            echo fmt"Batch improvement completed, best cost: {bestCost}"
+    
+    # Return all improved states (whether solution found or not)
+    return batchResult.improvedStates
+
+proc batchImprove*[T](carrays: seq[ConstrainedArray[T]], threshold: int, verbose: bool = false): seq[TabuState[T]] =
+    ## Convenience overload that creates ConstraintSystems from ConstrainedArrays
+    var systems: seq[ConstraintSystem[T]] = @[]
+    
+    for carray in carrays:
+        # Create a constraint system from the constrained array
+        var system = initConstraintSystem[T]()
+        system.baseArray = carray
+        systems.add(system)
+    
+    return batchImprove(systems, threshold, verbose)
