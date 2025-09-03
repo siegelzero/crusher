@@ -1,7 +1,7 @@
 import std/[tables, strutils, sequtils, packedsets, math, strformat, sets]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular, elementState]
 import ../crusher/search/[resolution, tabu, optimization]
 
 type
@@ -1324,6 +1324,64 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
         if verbose:
           echo "gecode_regular FAILED: insufficient arguments (", constraint.args.len, " < 6)"
     
+    of "array_var_int_element":
+      # array_var_int_element(index, array, value)
+      if constraint.args.len >= 3:
+        let indexExpr = constraint.args[0]    # Index variable
+        let arrayExpr = constraint.args[1]    # Array (constants and/or variables)
+        let valueExpr = constraint.args[2]    # Value variable
+        
+        if verbose:
+          echo "Processing array_var_int_element constraint"
+        
+        # Get index variable position
+        var indexPos = -1
+        if indexExpr.exprType == feIdent and indexExpr.name in translator.variables:
+          indexPos = translator.variables[indexExpr.name]
+        
+        # Get value variable position
+        var valuePos = -1
+        if valueExpr.exprType == feIdent and valueExpr.name in translator.variables:
+          valuePos = translator.variables[valueExpr.name]
+        
+        if indexPos >= 0 and valuePos >= 0 and arrayExpr.exprType == feArray:
+          # Build array elements (mix of constants and variables)
+          var arrayElements: seq[ArrayElement[int]] = @[]
+          
+          for elem in arrayExpr.elements:
+            if elem.exprType == feLiteral and elem.literal.literalType == fzInt:
+              # Constant element
+              arrayElements.add(ArrayElement[int](
+                isConstant: true,
+                constantValue: elem.literal.intVal
+              ))
+            elif elem.exprType == feIdent and elem.name in translator.variables:
+              # Variable element
+              arrayElements.add(ArrayElement[int](
+                isConstant: false,
+                variablePosition: translator.variables[elem.name]
+              ))
+            else:
+              # Unsupported element type - create placeholder constant
+              arrayElements.add(ArrayElement[int](
+                isConstant: true,
+                constantValue: 0
+              ))
+          
+          # Create element constraint
+          let elementConstraint = element(indexPos, arrayElements, valuePos)
+          translator.system.addConstraint(elementConstraint)
+          
+          if verbose:
+            echo "Added array_var_int_element constraint: index=", indexPos, 
+                 ", array_size=", arrayElements.len, ", value=", valuePos
+        else:
+          if verbose:
+            echo "array_var_int_element FAILED: invalid variable references or array format"
+      else:
+        if verbose:
+          echo "array_var_int_element FAILED: insufficient arguments (", constraint.args.len, " < 3)"
+
     else:
       # Unsupported constraint - skip for now  
       if verbose:

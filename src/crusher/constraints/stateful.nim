@@ -180,6 +180,19 @@ func element*[T](indexPos: int, constantArray: seq[T], valuePos: int): StatefulC
         elementState: newElementConstraint[T](indexPos, constantArray, valuePos)
     )
 
+func element*[T](indexPos: int, arrayElements: seq[ArrayElement[T]], valuePos: int): StatefulConstraint[T] =
+    # Returns element constraint for the given index position, variable array elements, and value position.
+    var allPositions: seq[int] = @[indexPos, valuePos]
+    for element in arrayElements:
+        if not element.isConstant:
+            allPositions.add(element.variablePosition)
+    
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](allPositions),
+        stateType: ElementConstraint,
+        elementState: newElementConstraint[T](indexPos, arrayElements, valuePos)
+    )
+
 func globalCardinality*[T](positions: openArray[int], cardinalities: Table[T, int]): StatefulConstraint[T] =
     # Returns globalCardinality constraint for the given positions.
     return StatefulConstraint[T](
