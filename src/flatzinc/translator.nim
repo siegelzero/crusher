@@ -1302,7 +1302,7 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
                     transitionMatrix[i][j] = flatMatrix[idx]
               break
         
-        # Create and add regular constraint
+        # Create and add regular constraint (using high-performance YuckRegular implementation)
         if expressions.len > 0 and transitionMatrix.len > 0:
           let regularConst = regularConstraint(
             sequence = expressions,

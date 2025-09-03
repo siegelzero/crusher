@@ -11,7 +11,7 @@ type NoSolutionFoundError* = object of CatchableError
 
 
 proc resolve*[T](system: ConstraintSystem[T],
-                 initialTabuThreshold=1000,
+                 tabuThreshold=10000,
                  maxAttempts=10,
                  attemptThreshold=10,
                  parallel=true,
@@ -21,42 +21,42 @@ proc resolve*[T](system: ConstraintSystem[T],
         let numWorkers = max(1, min(cpuCount - 1, 16))
         if verbose:
             echo fmt"Using parallel resolution with {numWorkers} workers"
-        # Work directly on the original system for parallel search  
-        system.resolveParallel(initialTabuThreshold, numWorkers, maxAttempts, attemptThreshold, verbose)
+        # Work directly on the original system for parallel search
+        system.resolveParallel(tabuThreshold, numWorkers, maxAttempts, attemptThreshold, verbose)
     else:
         if verbose:
             echo "Using serial resolution"
-        system.resolveSerial(initialTabuThreshold, maxAttempts, attemptThreshold, verbose)
+        system.resolveSerial(tabuThreshold, maxAttempts, attemptThreshold, verbose)
 
 proc resolveSerial*[T](system: ConstraintSystem[T],
-                      initialTabuThreshold=10000,
-                      maxAttempts=10,
-                      attemptThreshold=10,
-                      verbose=false) = 
+                       tabuThreshold=10000,
+                       maxAttempts=10,
+                       attemptThreshold=10,
+                       verbose=false) =
     ## Serial resolution implementation for constraint satisfaction
     ## Continues searching until a valid solution (cost = 0) is found
 
     # Compute domain reduction once before search (same as parallel)
     if verbose:
-        echo "Computing domain reduction..."
-    let preComputedDomains = system.baseArray.reduceDomain(verbose = verbose)
+        echo "Reducing domains..."
+    let reducedDomains = system.baseArray.reduceDomain(verbose = verbose)
     if verbose:
         echo "Domain reduction complete"
-    
+
     # Check for empty domains before starting search
-    for i, domain in preComputedDomains:
+    for i, domain in reducedDomains:
         if domain.len == 0:
             echo "Error: Variable at position ", i, " has empty reduced domain - problem is unsatisfiable"
             raise newException(NoSolutionFoundError, "Problem is unsatisfiable due to empty domains")
-    
+
     # Set the pre-computed reduced domains on the system for serial search
     for pos in 0..<system.baseArray.len:
-        system.baseArray.domain[pos] = preComputedDomains[pos]
+        system.baseArray.domain[pos] = reducedDomains[pos]
 
     var lastImprovement = 0
     var bestAttempt = high(int)
     var attempt = 0
-    var currentTabuThreshold = initialTabuThreshold
+    var currentTabuThreshold = tabuThreshold
     var totalIterations = 0
 
     # Display constraint type information in verbose mode
@@ -66,7 +66,7 @@ proc resolveSerial*[T](system: ConstraintSystem[T],
         for constraint in system.baseArray.constraints:
             let typeName = constraint.getConstraintTypeName()
             constraintTypeCounts[typeName] = constraintTypeCounts.getOrDefault(typeName, 0) + 1
-        
+
         echo fmt"Total constraints: {system.baseArray.constraints.len}"
         echo fmt"Total variables: {system.baseArray.len}"
         echo "Constraint types:"
@@ -83,10 +83,10 @@ proc resolveSerial*[T](system: ConstraintSystem[T],
             if improved.cost < bestAttempt:
                 bestAttempt = improved.cost
                 lastImprovement = attempt
-                echo fmt"Found better solution with cost {improved.cost} (iteration {totalIterations})"
+                echo fmt"Found candidate with cost {improved.cost} (iteration {totalIterations})"
 
             if improved.cost == 0:
-                echo fmt"Perfect solution found after {totalIterations} iterations"
+                echo fmt"Solution found after {totalIterations} iterations"
                 system.assignment = improved.assignment
                 # Display timing statistics in verbose mode
                 if verbose:

@@ -7,6 +7,7 @@ import constraints/common
 import constraints/constraintNode
 import constraints/minConstraint
 import constraints/globalCardinality
+import constraints/regularDomainFiltering
 import expressions
 
 ################################################################################
@@ -1012,6 +1013,25 @@ proc reduceDomain*[T](carray: ConstrainedArray[T], verbose: bool = true): seq[se
             if not globalCardChanged:
                 echo "    No changes made"
         
+        # Process Regular constraints with arc consistency
+        var regularChanged = false
+        var regularCount = 0
+        for cons in carray.constraints:
+            if cons.stateType == RegularType:
+                regularCount += 1
+                if carray.reduceRegularDomains(currentDomain, cons):
+                    regularChanged = true
+                    changed = true
+        
+        if verbose and regularCount > 0:
+            var totalAfterRegular = 0
+            for pos in carray.allPositions():
+                totalAfterRegular += currentDomain[pos].card
+            echo "  After ", regularCount, " Regular constraint(s):"
+            echo "    Total domain size: ", totalAfterRegular
+            if not regularChanged:
+                echo "    No changes made"
+        
         # Then examine single-variable constraints to reduce domains
         var singleVarChanged = false
         var singleVarCount = 0
@@ -1066,6 +1086,25 @@ proc reduceDomain*[T](carray: ConstrainedArray[T], verbose: bool = true): seq[se
              if totalDomainSize > 0: (100 * (totalDomainSize - finalTotalDomainSize) div totalDomainSize) else: 0, "%)"
     
     return reduced
+
+################################################################################
+# Regular constraint domain reduction integration
+################################################################################
+
+proc reduceRegularDomains*[T](carray: ConstrainedArray[T], 
+                             currentDomains: var seq[PackedSet[T]], 
+                             constraint: StatefulConstraint[T]): bool =
+    ## Integration function for regular constraint domain reduction
+    ## Returns true if any domain was reduced
+    when T is int:
+        if constraint.stateType == RegularType:
+            # Create domain filterer for this regular constraint
+            var filterer = newRegularDomainFilterer(constraint.regularState)
+            
+            # Apply arc consistency filtering
+            return filterer.filterDomainsArcConsistent(currentDomains)
+    
+    return false
 
 ################################################################################
 # Deep Copy for ConstrainedArray (for parallel processing)

@@ -7,10 +7,9 @@ import tabu
 randomize()
 
 # Sequential search iterator that performs multiple restarts
-iterator sequentialSearch*[T](carray: ConstrainedArray[T], initialTabuThreshold: int, maxAttempts: int = 10, enableTiming: bool = false): TabuState[T] =
-    var currentThreshold = initialTabuThreshold
+iterator sequentialSearch*[T](carray: ConstrainedArray[T], tabuThreshold: int, maxAttempts: int = 10, enableTiming: bool = false): TabuState[T] =
+    var currentThreshold = tabuThreshold
     for attempt in 0..<maxAttempts:
-        randomize(attempt * 1000 + int(epochTime()))
         let attemptStartTime = epochTime()
         let improved = carray.tabuImprove(currentThreshold, enableTiming)
         let attemptEndTime = epochTime()
@@ -47,7 +46,7 @@ proc crossover*[T](carray: ConstrainedArray[T], A, B: TabuState[T]): TabuState[T
                 result.assignValue(position, B.assignment[position])
         else:
             for position in constraint.positions:
-                result.assignValue(position, sample(A.reducedDomain[position]))
+                result.assignValue(position, sample(A.domain[position]))
 
 
 proc hybrid*[T](carray: ConstrainedArray[T], threshold, popSize, generations: int): TabuState[T] =

@@ -344,13 +344,7 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
         of GlobalCardinalityType:
             constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
         of RegularType:
-            # Compute delta without modifying state by using pure evaluation
-            let oldCost = constraint.regularState.cost
-            # Create temporary assignment with new value
-            var tempAssignment = constraint.regularState.currentAssignment
-            tempAssignment[position] = newValue
-            let (newViolations, _) = constraint.regularState.evaluateSequencePure(tempAssignment)
-            return newViolations - oldCost
+            constraint.regularState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -620,3 +614,4 @@ func regularConstraint*[T](
         stateType: RegularType,
         regularState: regularConst
     )
+

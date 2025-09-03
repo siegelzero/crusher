@@ -7,14 +7,14 @@ import ../constraintSystem
 
 proc minimize*[T](system: ConstraintSystem[T], 
                   objective: AlgebraicExpression[T],
-                  initialTabuThreshold=1000,
+                  tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
                   parallel=true,
                   verbose=false) =
     # Find initial solution
     system.resolve(
-        initialTabuThreshold=initialTabuThreshold,
+        tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
         parallel=parallel,
@@ -30,7 +30,7 @@ proc minimize*[T](system: ConstraintSystem[T],
         system.addConstraint(objective < currentCost)
         try:
             system.resolve(
-                initialTabuThreshold=initialTabuThreshold,
+                tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
                 parallel=parallel,
@@ -45,14 +45,14 @@ proc minimize*[T](system: ConstraintSystem[T],
 
 proc minimize*[T](system: ConstraintSystem[T],
                   objective: LinearCombination[T],
-                  initialTabuThreshold=1000,
+                  tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
                   parallel=true,
                   verbose=false) =
     # Find initial solution
     system.resolve(
-        initialTabuThreshold=initialTabuThreshold,
+        tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
         parallel=parallel,
@@ -62,16 +62,16 @@ proc minimize*[T](system: ConstraintSystem[T],
     var currentCost = objective.value
 
     if verbose:
-        echo fmt"Found initial solution with LinearCombination objective value: {currentCost}"
+        echo fmt"Found initial solution with objective value: {currentCost}"
 
     while true:
         if verbose:
-            echo fmt"Adding constraint: LinearCombination < {currentCost}"
+            echo fmt"Adding constraint: objective < {currentCost}"
         system.addConstraint(objective < currentCost)
 
         try:
             system.resolve(
-                initialTabuThreshold=initialTabuThreshold,
+                tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
                 parallel=parallel,
@@ -80,21 +80,21 @@ proc minimize*[T](system: ConstraintSystem[T],
             objective.initialize(system.assignment)
             currentCost = objective.value
             if verbose:
-                echo fmt"Found better solution with LinearCombination objective value: {objective.value}"
+                echo fmt"Found better solution with objective value: {currentCost}"
         except NoSolutionFoundError:
             return
 
 
 proc maximize*[T](system: ConstraintSystem[T], 
                   objective: AlgebraicExpression[T],
-                  initialTabuThreshold=1000,
+                  tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
                   parallel=true,
                   verbose=false) =
     # Find initial solution
     system.resolve(
-        initialTabuThreshold=initialTabuThreshold,
+        tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
         parallel=parallel,
@@ -110,7 +110,7 @@ proc maximize*[T](system: ConstraintSystem[T],
         system.addConstraint(objective > currentCost)
         try:
             system.resolve(
-                initialTabuThreshold=initialTabuThreshold,
+                tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
                 parallel=parallel,
@@ -125,14 +125,14 @@ proc maximize*[T](system: ConstraintSystem[T],
 
 proc maximize*[T](system: ConstraintSystem[T],
                   objective: LinearCombination[T],
-                  initialTabuThreshold=1000,
+                  tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
                   parallel=true,
                   verbose=false) =
     # Find initial solution
     system.resolve(
-        initialTabuThreshold=initialTabuThreshold,
+        tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
         parallel=parallel,
@@ -142,16 +142,16 @@ proc maximize*[T](system: ConstraintSystem[T],
     var currentCost = objective.value
 
     if verbose:
-        echo fmt"Found initial solution with LinearCombination objective value: {currentCost}"
+        echo fmt"Found initial solution with objective value: {currentCost}"
 
     while true:
         if verbose:
-            echo fmt"Adding constraint: LinearCombination > {currentCost}"
+            echo fmt"Adding constraint: objective > {currentCost}"
         system.addConstraint(objective > currentCost)
 
         try:
             system.resolve(
-                initialTabuThreshold=initialTabuThreshold,
+                tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
                 parallel=parallel,
@@ -160,6 +160,6 @@ proc maximize*[T](system: ConstraintSystem[T],
             objective.initialize(system.assignment)
             currentCost = objective.value
             if verbose:
-                echo fmt"Found better solution with LinearCombination objective value: {objective.value}"
+                echo fmt"Found better solution with objective value: {currentCost}"
         except NoSolutionFoundError:
             return

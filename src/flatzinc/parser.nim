@@ -103,7 +103,7 @@ proc parseTypeWithDimensions(p: var Parser): (FlatZincType, seq[int]) =
         of tkFloat1:
             discard p.advance()
             result = (fzFloat, dimensions)
-        of tkInt, tkLBrace:
+        of tkInt, tkLBrace, tkSet:
             # This is a domain specification like "1..25" or "{1,2,3}", assume int type
             result = (fzInt, dimensions)
         of tkArray:
@@ -160,7 +160,24 @@ proc parseDomain(p: var Parser, varType: FlatZincType): FlatZincDomain =
     
     case varType:
         of fzInt:
-            if p.match(tkLBrace):
+            if p.match(tkSet):
+                # Pre-parsed set of integers like "{0,2,3,4}"
+                let setStr = p.advance().value
+                result.intSet = @[]
+                # Parse the set string manually
+                var numStr = ""
+                for i, ch in setStr:
+                    if ch.isDigit or ch == '-':
+                        numStr.add(ch)
+                    elif ch == ',' or ch == '}' or i == setStr.len - 1:
+                        if numStr.len > 0:
+                            try:
+                                result.intSet.add(parseInt(numStr))
+                            except ValueError:
+                                discard # Skip invalid numbers
+                            numStr = ""
+                result.hasSet = true
+            elif p.match(tkLBrace):
                 # Set of integers
                 discard p.advance() # Skip {
                 result.intSet = @[]
@@ -302,7 +319,11 @@ proc parseVarDecl(p: var Parser): FlatZincVarDecl =
     var domain: FlatZincDomain
     var arrayDimensions: seq[int] = @[]
     
-    if p.matchAny(tkInt, tkLBrace):
+    # Debug output
+    # echo "DEBUG: parseVarDecl - current token: ", p.current.kind, " value: ", p.current.value, " at line ", p.current.line
+    
+    # Check if we have a domain constraint (either with or without var keyword)
+    if p.matchAny(tkInt, tkLBrace, tkSet):
         # This is a domain constraint like "1..10" or "{1,2,3}"
         varType = fzInt
         domain = p.parseDomain(varType)
@@ -323,7 +344,7 @@ proc parseVarDecl(p: var Parser): FlatZincVarDecl =
         domain = FlatZincDomain(domainType: varType)
         
         # Parse optional domain constraint
-        if p.matchAny(tkInt, tkFloat, tkLBrace) or (varType == fzInt and p.match(tkInt)):
+        if p.matchAny(tkInt, tkFloat, tkLBrace, tkSet) or (varType == fzInt and p.match(tkInt)):
             # For array types, domain applies to elements
             let domainType = case varType:
                 of fzArrayInt: fzInt
