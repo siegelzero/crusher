@@ -1,7 +1,7 @@
 import std/[tables, strutils, sequtils, packedsets, math, strformat, sets]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular, elementState]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular, elementState, cumulative]
 import ../crusher/search/[resolution, tabu, optimization]
 
 type
@@ -1432,6 +1432,155 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
       else:
         if verbose:
           echo "array_int_element FAILED: insufficient arguments (", constraint.args.len, " < 3)"
+
+    of "gecode_cumulatives":
+      # gecode_cumulatives(starts, durations, demands, capacity)
+      if constraint.args.len >= 4:
+        let startsExpr = constraint.args[0]
+        let durationsExpr = constraint.args[1] 
+        let demandsExpr = constraint.args[2]
+        let capacityExpr = constraint.args[3]
+        
+        # Parse start times array
+        var startPositions: seq[int] = @[]
+        if startsExpr.exprType == feIdent:
+          # Array variable reference
+          for decl in translator.varDecls:
+            if decl.name == startsExpr.name and decl.varType == fzArrayInt:
+              if decl.arrayVarRefs.len > 0:
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    startPositions.add(translator.variables[varName])
+              elif decl.name in translator.variables:
+                # This is a direct array variable
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  startPositions.add(basePos + i)
+              break
+        
+        # Parse durations array (mixed constants and variables)
+        var durationParams: seq[TaskParam[int]] = @[]
+        if durationsExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == durationsExpr.name and decl.varType == fzArrayInt:
+              
+              # Handle mixed arrays with both constants and variables
+              if decl.arrayVarRefs.len > 0 and decl.arrayValue.len > 0:
+                let totalSize = if decl.arraySize.len > 0: decl.arraySize[0] else: 0
+                # We need to reconstruct the original order
+                # For now, assume variables come first, then constants 
+                # TODO: Need more sophisticated parsing to get exact positions
+                var paramIndex = 0
+                
+                # Add variable parameters first
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables and paramIndex < totalSize:
+                    durationParams.add(TaskParam[int](isConstant: false, 
+                                                     variablePosition: translator.variables[varName]))
+                    paramIndex += 1
+                
+                # Add constant parameters 
+                for constVal in decl.arrayValue:
+                  if paramIndex < totalSize:
+                    durationParams.add(TaskParam[int](isConstant: true, 
+                                                     constantValue: constVal))
+                    paramIndex += 1
+              elif decl.arrayVarRefs.len > 0:
+                # All variables
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    durationParams.add(TaskParam[int](isConstant: false, 
+                                                     variablePosition: translator.variables[varName]))
+              elif decl.arrayValue.len > 0:
+                # All constants
+                for constVal in decl.arrayValue:
+                  durationParams.add(TaskParam[int](isConstant: true, constantValue: constVal))
+              elif decl.name in translator.variables:
+                # Array of variables
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  durationParams.add(TaskParam[int](isConstant: false, 
+                                                   variablePosition: basePos + i))
+              break
+        
+        # Parse demands array (mixed constants and variables) 
+        var demandParams: seq[TaskParam[int]] = @[]
+        if demandsExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == demandsExpr.name and decl.varType == fzArrayInt:
+              
+              # Handle mixed arrays with both constants and variables
+              if decl.arrayVarRefs.len > 0 and decl.arrayValue.len > 0:
+                let totalSize = if decl.arraySize.len > 0: decl.arraySize[0] else: 0
+                var paramIndex = 0
+                
+                # Add variable parameters first
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables and paramIndex < totalSize:
+                    demandParams.add(TaskParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+                    paramIndex += 1
+                
+                # Add constant parameters 
+                for constVal in decl.arrayValue:
+                  if paramIndex < totalSize:
+                    demandParams.add(TaskParam[int](isConstant: true, 
+                                                   constantValue: constVal))
+                    paramIndex += 1
+              elif decl.arrayVarRefs.len > 0:
+                # All variables
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    demandParams.add(TaskParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+              elif decl.arrayValue.len > 0:
+                # All constants
+                for constVal in decl.arrayValue:
+                  demandParams.add(TaskParam[int](isConstant: true, constantValue: constVal))
+              elif decl.name in translator.variables:
+                # Array of variables
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  demandParams.add(TaskParam[int](isConstant: false, 
+                                                 variablePosition: basePos + i))
+              break
+        
+        # Parse capacity (can be variable or constant)
+        var capacity: int = 0
+        if capacityExpr.exprType == feLiteral and capacityExpr.literal.literalType == fzInt:
+          capacity = capacityExpr.literal.intVal
+        elif capacityExpr.exprType == feIdent and capacityExpr.name in translator.variables:
+          # Variable capacity - for now, treat as constant 100 (could be improved)
+          capacity = 100  # Placeholder - would need more complex handling for variable capacity
+        
+        # Convert start positions to TaskParam objects
+        var startParams: seq[TaskParam[int]] = @[]
+        for pos in startPositions:
+          startParams.add(TaskParam[int](isConstant: false, variablePosition: pos))
+        
+        # Create capacity parameter
+        let capacityParam = TaskParam[int](isConstant: true, constantValue: capacity)
+        
+        if startParams.len == durationParams.len and 
+           durationParams.len == demandParams.len and
+           startParams.len > 0:
+          let cumulativeConstraint = stateful.cumulativeConstraintMixed[int](
+            startParams, durationParams, demandParams, capacityParam
+          )
+          translator.system.addConstraint(cumulativeConstraint)
+          
+          if verbose:
+            echo "Added gecode_cumulatives constraint: ", startParams.len, " tasks, capacity=", capacity
+        else:
+          if verbose:
+            echo "gecode_cumulatives FAILED: mismatched array sizes - starts:", startParams.len, 
+                 " durations:", durationParams.len, " demands:", demandParams.len
+      else:
+        if verbose:
+          echo "gecode_cumulatives FAILED: insufficient arguments (", constraint.args.len, " < 4)"
 
     else:
       # Unsupported constraint - skip for now  

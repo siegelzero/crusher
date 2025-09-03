@@ -2,7 +2,7 @@ import std/[packedsets, sequtils, tables, sets]
 
 import common
 import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
-import globalCardinality, regular
+import globalCardinality, regular, cumulative
 import constraintNode
 import ../expressions
 
@@ -34,7 +34,8 @@ type
         MaxType,
         SumType,
         GlobalCardinalityType,
-        RegularType
+        RegularType,
+        CumulativeType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -59,6 +60,8 @@ type
                 globalCardinalityState*: GlobalCardinalityConstraint[T]
             of RegularType:
                 regularState*: RegularConstraint[T]
+            of CumulativeType:
+                cumulativeState*: CumulativeConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -83,6 +86,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "GlobalCardinality Constraint"
         of RegularType:
             return "Regular Constraint"
+        of CumulativeType:
+            return "Cumulative Constraint"
 
 proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
     ## Returns a human-readable name for the constraint type
@@ -97,6 +102,7 @@ proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inli
         of SumType: "Sum"
         of GlobalCardinalityType: "GlobalCardinality"
         of RegularType: "Regular"
+        of CumulativeType: "Cumulative"
 
 ################################################################################
 # Evaluation
@@ -124,6 +130,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.globalCardinalityState.cost
         of RegularType:
             return constraint.regularState.getCost()
+        of CumulativeType:
+            return constraint.cumulativeState.cost
 
 ################################################################################
 # Computed Constraints
@@ -342,6 +350,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.globalCardinalityState.initialize(assignment)
         of RegularType:
             constraint.regularState.initialize(assignment)
+        of CumulativeType:
+            constraint.cumulativeState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -366,6 +376,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
         of RegularType:
             constraint.regularState.moveDelta(position, oldValue, newValue)
+        of CumulativeType:
+            constraint.cumulativeState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -390,6 +402,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.globalCardinalityState.updatePosition(position, newValue)
         of RegularType:
             constraint.regularState.updatePosition(position, newValue)
+        of CumulativeType:
+            constraint.cumulativeState.updatePosition(position, newValue)
 
 
 ################################################################################
@@ -591,6 +605,17 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
         stateType: RegularType,
         regularState: constraint.regularState.deepCopy()
       )
+    of CumulativeType:
+      # Deep copy the cumulative constraint
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: CumulativeType,
+        cumulativeState: newCumulativeConstraint[T](
+          constraint.cumulativeState.cumulativeExpr.deepCopy(),
+          constraint.cumulativeState.relation,
+          constraint.cumulativeState.target
+        )
+      )
 
 ################################################################################
 # Regular constraint StatefulConstraint constructors
@@ -630,5 +655,35 @@ func regularConstraint*[T](
         positions: regularConst.positions,
         stateType: RegularType,
         regularState: regularConst
+    )
+
+################################################################################
+# Cumulative constraint StatefulConstraint constructors
+################################################################################
+
+func cumulativeConstraint*[T](
+    startPositions, durationPositions, demandPositions: seq[int], 
+    capacity: T
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a CumulativeConstraint from positions
+    let cumulConst = cumulative.cumulativeConstraint[T](startPositions, durationPositions, demandPositions, capacity)
+    
+    result = StatefulConstraint[T](
+        positions: cumulConst.cumulativeExpr.positions,
+        stateType: CumulativeType,
+        cumulativeState: cumulConst
+    )
+
+func cumulativeConstraintMixed*[T](
+    startParams, durationParams, demandParams: seq[TaskParam[T]], 
+    capacityParam: TaskParam[T]
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a CumulativeConstraint from mixed params
+    let cumulConst = cumulativeConstraintFromParams[T](startParams, durationParams, demandParams, capacityParam)
+    
+    result = StatefulConstraint[T](
+        positions: cumulConst.cumulativeExpr.positions,
+        stateType: CumulativeType,
+        cumulativeState: cumulConst
     )
 

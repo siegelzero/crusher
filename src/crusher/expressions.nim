@@ -737,6 +737,222 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
             return totalDelta
 
 ################################################################################
+# Type definitions for CumulativeExpression
+################################################################################
+
+type
+    TaskParam*[T] = object
+        case isConstant*: bool
+        of true:
+            constantValue*: T
+        of false:
+            variablePosition*: int
+
+    TimePoint[T] = object
+        time*: T
+        deltaChange*: T  # Net resource change at this time (+demand at start, -demand at end)
+
+    CumulativeExpression*[T] = ref object
+        # Task parameters (positions or constants)
+        startTimes*: seq[TaskParam[T]]
+        durations*: seq[TaskParam[T]]
+        demands*: seq[TaskParam[T]]
+        capacity*: TaskParam[T]  # Can be variable or constant
+        
+        # Efficient state tracking
+        timePoints*: seq[TimePoint[T]]  # Sorted time points with resource changes
+        currentMaxUsage*: T             # Current peak resource usage
+        violatingTimePoint*: int        # Index of first time point exceeding capacity, -1 if none
+        currentAssignment*: Table[int, T]
+        positions*: PackedSet[int]      # All variable positions involved
+
+# CumulativeExpression creation
+
+func newTaskParam*[T](constantValue: T): TaskParam[T] =
+    TaskParam[T](isConstant: true, constantValue: constantValue)
+
+func newTaskParam*[T](variablePosition: int): TaskParam[T] =
+    TaskParam[T](isConstant: false, variablePosition: variablePosition)
+
+func newCumulativeExpression*[T](startTimes, durations, demands: seq[TaskParam[T]], capacity: TaskParam[T]): CumulativeExpression[T] =
+    new(result)
+    result.startTimes = startTimes
+    result.durations = durations
+    result.demands = demands
+    result.capacity = capacity
+    result.timePoints = @[]
+    result.currentMaxUsage = T(0)
+    result.violatingTimePoint = -1
+    result.currentAssignment = initTable[int, T]()
+    result.positions = initPackedSet[int]()
+    
+    # Collect all variable positions
+    for param in startTimes:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+    for param in durations:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+    for param in demands:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+    if not capacity.isConstant:
+        result.positions.incl(capacity.variablePosition)
+
+# CumulativeExpression utility functions
+
+func getTaskParam*[T](param: TaskParam[T], assignment: Table[int, T]): T {.inline.} =
+    if param.isConstant:
+        param.constantValue
+    else:
+        assignment[param.variablePosition]
+
+func getTaskParam*[T](param: TaskParam[T], assignment: seq[T]): T {.inline.} =
+    if param.isConstant:
+        param.constantValue
+    else:
+        assignment[param.variablePosition]
+
+# CumulativeExpression initialization
+
+func initialize*[T](state: CumulativeExpression[T], assignment: seq[T]) =
+    # Initialize assignments
+    for pos in state.positions:
+        state.currentAssignment[pos] = assignment[pos]
+    
+    # Build time points from current assignment
+    state.timePoints.setLen(0)
+    
+    for i in 0..<state.startTimes.len:
+        let startTime = getTaskParam(state.startTimes[i], assignment)
+        let duration = getTaskParam(state.durations[i], assignment)
+        let demand = getTaskParam(state.demands[i], assignment)
+        let endTime = startTime + duration
+        
+        # Add resource demand at start time
+        var foundStart = false
+        for tp in state.timePoints.mitems:
+            if tp.time == startTime:
+                tp.deltaChange += demand
+                foundStart = true
+                break
+        if not foundStart:
+            state.timePoints.add(TimePoint[T](time: startTime, deltaChange: demand))
+        
+        # Remove resource demand at end time
+        var foundEnd = false
+        for tp in state.timePoints.mitems:
+            if tp.time == endTime:
+                tp.deltaChange -= demand
+                foundEnd = true
+                break
+        if not foundEnd:
+            state.timePoints.add(TimePoint[T](time: endTime, deltaChange: -demand))
+    
+    # Sort time points by time
+    state.timePoints.sort(proc(a, b: TimePoint[T]): int = cmp(a.time, b.time))
+    
+    # Calculate current max usage and find violations
+    var currentUsage: T = T(0)
+    state.currentMaxUsage = T(0)
+    state.violatingTimePoint = -1
+    let capacityValue = getTaskParam(state.capacity, assignment)
+    
+    for i, tp in state.timePoints:
+        currentUsage += tp.deltaChange
+        if currentUsage > state.currentMaxUsage:
+            state.currentMaxUsage = currentUsage
+        if state.violatingTimePoint == -1 and currentUsage > capacityValue:
+            state.violatingTimePoint = i
+
+func evaluate*[T](state: CumulativeExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    # Returns maximum resource usage across all time points
+    var currentUsage: T = T(0)
+    var maxUsage: T = T(0)
+    
+    # Rebuild time points for this assignment
+    var tempTimePoints: seq[TimePoint[T]] = @[]
+    
+    for i in 0..<state.startTimes.len:
+        let startTime = getTaskParam(state.startTimes[i], assignment)
+        let duration = getTaskParam(state.durations[i], assignment)
+        let demand = getTaskParam(state.demands[i], assignment)
+        let endTime = startTime + duration
+        
+        # Add resource demand at start time
+        var foundStart = false
+        for tp in tempTimePoints.mitems:
+            if tp.time == startTime:
+                tp.deltaChange += demand
+                foundStart = true
+                break
+        if not foundStart:
+            tempTimePoints.add(TimePoint[T](time: startTime, deltaChange: demand))
+        
+        # Remove resource demand at end time
+        var foundEnd = false
+        for tp in tempTimePoints.mitems:
+            if tp.time == endTime:
+                tp.deltaChange -= demand
+                foundEnd = true
+                break
+        if not foundEnd:
+            tempTimePoints.add(TimePoint[T](time: endTime, deltaChange: -demand))
+    
+    # Sort time points by time
+    tempTimePoints.sort(proc(a, b: TimePoint[T]): int = cmp(a.time, b.time))
+    
+    # Calculate max usage
+    for tp in tempTimePoints:
+        currentUsage += tp.deltaChange
+        if currentUsage > maxUsage:
+            maxUsage = currentUsage
+    
+    return maxUsage
+
+func `$`*[T](state: CumulativeExpression[T]): string = "CumulativeExpr(maxUsage=" & $(state.currentMaxUsage) & ")"
+
+# CumulativeExpression updates
+
+func updatePosition*[T](state: CumulativeExpression[T], position: int, newValue: T) {.inline.} =
+    # Update assignment and recalculate time points
+    let oldValue = state.currentAssignment[position]
+    state.currentAssignment[position] = newValue
+    
+    # For now, full recalculation (can be optimized later)
+    state.initialize(state.currentAssignment.values.toSeq)
+
+func moveDelta*[T](state: CumulativeExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
+    # Returns the change in maximum resource usage
+    let oldMaxUsage = state.currentMaxUsage
+    
+    # Temporarily apply change
+    let originalValue = state.currentAssignment[position]
+    state.currentAssignment[position] = newValue
+    
+    # Recalculate (this is the part that can be heavily optimized)
+    let newMaxUsage = state.evaluate(state.currentAssignment)
+    
+    # Restore original value
+    state.currentAssignment[position] = originalValue
+    
+    return newMaxUsage - oldMaxUsage
+
+proc deepCopy*[T](state: CumulativeExpression[T]): CumulativeExpression[T] =
+    new(result)
+    result.startTimes = state.startTimes  # TaskParam is a value type, safe to copy
+    result.durations = state.durations
+    result.demands = state.demands
+    result.capacity = state.capacity
+    result.timePoints = @[]
+    for tp in state.timePoints:
+        result.timePoints.add(tp)  # TimePoint is a value type, safe to copy
+    result.currentMaxUsage = state.currentMaxUsage
+    result.violatingTimePoint = state.violatingTimePoint
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+
+################################################################################
 # SumExpression creation helpers for constraint syntax
 ################################################################################
 
