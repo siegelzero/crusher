@@ -172,6 +172,14 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
             allDifferentState: newAllDifferentConstraint[T](expressions)
         )
 
+func element*[T](indexPos: int, constantArray: seq[T], valuePos: int): StatefulConstraint[T] =
+    # Returns element constraint for the given index position, constant array, and value position.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int]([indexPos, valuePos]),
+        stateType: ElementConstraint,
+        elementState: newElementConstraint[T](indexPos, constantArray, valuePos)
+    )
+
 func globalCardinality*[T](positions: openArray[int], cardinalities: Table[T, int]): StatefulConstraint[T] =
     # Returns globalCardinality constraint for the given positions.
     return StatefulConstraint[T](
@@ -459,15 +467,11 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
         allDifferentState: constraint.allDifferentState.deepCopy()
       )
     of ElementConstraint:
-      # Create a new ElementState with fresh state - ElementState is mostly a stub
+      # Deep copy the ElementConstraint state
       result = StatefulConstraint[T](
         positions: constraint.positions,
         stateType: ElementConstraint,
-        elementState: ElementState[T](
-          currentAssignment: initTable[int, T](),
-          cost: 0,
-          positions: constraint.positions
-        )
+        elementState: constraint.elementState.deepCopy()
       )  
     of LinearType:
       # Create a new LinearConstraint with same parameters but fresh state
