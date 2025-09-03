@@ -306,7 +306,8 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let (position, newValue) = sample(moves)
         let oldValue = state.assignment[position]
         state.assignValue(position, newValue)
-        state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
+        #state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
+        state.tabu[position][oldValue] = state.iteration + 1 + rand(5)
 
 ################################################################################
 # Normal tabu search
