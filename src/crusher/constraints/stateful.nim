@@ -2,7 +2,7 @@ import std/[packedsets, sequtils, tables, sets]
 
 import common
 import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
-import globalCardinality, regular, cumulative, diffn
+import globalCardinality, regular, cumulative, diffn, setConstraints
 import constraintNode
 import ../expressions
 
@@ -36,7 +36,11 @@ type
         GlobalCardinalityType,
         RegularType,
         CumulativeType,
-        DiffnType
+        DiffnType,
+        SetMembershipType,
+        SetCardinalityType,
+        SetEqualityType,
+        SetSubsetType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -65,6 +69,14 @@ type
                 cumulativeState*: CumulativeConstraint[T]
             of DiffnType:
                 diffnState*: DiffnConstraint[T]
+            of SetMembershipType:
+                setMembershipState*: SetMembershipConstraint[T]
+            of SetCardinalityType:
+                setCardinalityState*: SetCardinalityConstraint[T]
+            of SetEqualityType:
+                setEqualityState*: SetEqualityConstraint[T]
+            of SetSubsetType:
+                setSubsetState*: SetSubsetConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -93,6 +105,14 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Cumulative Constraint"
         of DiffnType:
             return "Diffn Constraint"
+        of SetMembershipType:
+            return "SetMembership Constraint"
+        of SetCardinalityType:
+            return "SetCardinality Constraint"
+        of SetEqualityType:
+            return "SetEquality Constraint"
+        of SetSubsetType:
+            return "SetSubset Constraint"
 
 proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
     ## Returns a human-readable name for the constraint type
@@ -109,6 +129,10 @@ proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inli
         of RegularType: "Regular"
         of CumulativeType: "Cumulative"
         of DiffnType: "Diffn"
+        of SetMembershipType: "SetMembership"
+        of SetCardinalityType: "SetCardinality"
+        of SetEqualityType: "SetEquality"
+        of SetSubsetType: "SetSubset"
 
 ################################################################################
 # Evaluation
@@ -140,6 +164,14 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.cumulativeState.cost
         of DiffnType:
             return constraint.diffnState.cost
+        of SetMembershipType:
+            return constraint.setMembershipState.cost
+        of SetCardinalityType:
+            return constraint.setCardinalityState.cost
+        of SetEqualityType:
+            return constraint.setEqualityState.cost
+        of SetSubsetType:
+            return constraint.setSubsetState.cost
 
 ################################################################################
 # Computed Constraints
@@ -362,6 +394,14 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.cumulativeState.initialize(assignment)
         of DiffnType:
             constraint.diffnState.initialize(assignment)
+        of SetMembershipType:
+            constraint.setMembershipState.initialize(assignment)
+        of SetCardinalityType:
+            constraint.setCardinalityState.initialize(assignment)
+        of SetEqualityType:
+            constraint.setEqualityState.initialize(assignment)
+        of SetSubsetType:
+            constraint.setSubsetState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -390,6 +430,14 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.cumulativeState.moveDelta(position, oldValue, newValue)
         of DiffnType:
             constraint.diffnState.moveDelta(position, oldValue, newValue)
+        of SetMembershipType:
+            constraint.setMembershipState.moveDelta(position, oldValue, newValue)
+        of SetCardinalityType:
+            constraint.setCardinalityState.moveDelta(position, oldValue, newValue)
+        of SetEqualityType:
+            constraint.setEqualityState.moveDelta(position, oldValue, newValue)
+        of SetSubsetType:
+            constraint.setSubsetState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -418,6 +466,14 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.cumulativeState.updatePosition(position, newValue)
         of DiffnType:
             constraint.diffnState.updatePosition(position, newValue)
+        of SetMembershipType:
+            constraint.setMembershipState.updatePosition(position, newValue)
+        of SetCardinalityType:
+            constraint.setCardinalityState.updatePosition(position, newValue)
+        of SetEqualityType:
+            constraint.setEqualityState.updatePosition(position, newValue)
+        of SetSubsetType:
+            constraint.setSubsetState.updatePosition(position, newValue)
 
 
 ################################################################################
@@ -637,6 +693,47 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
         stateType: DiffnType,
         diffnState: newDiffnConstraint[T](
           constraint.diffnState.diffnExpr.deepCopy()
+        )
+      )
+    of SetMembershipType:
+      # Create a new constraint with same parameters
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SetMembershipType,
+        setMembershipState: newSetMembershipConstraint[T](
+          constraint.setMembershipState.elementPosition,
+          constraint.setMembershipState.setPositions,
+          constraint.setMembershipState.universe
+        )
+      )
+    of SetCardinalityType:
+      # Create a new constraint with same parameters
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SetCardinalityType,
+        setCardinalityState: newSetCardinalityConstraint[T](
+          constraint.setCardinalityState.setPositions,
+          constraint.setCardinalityState.cardinalityPosition
+        )
+      )
+    of SetEqualityType:
+      # Create a new constraint with same parameters
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SetEqualityType,
+        setEqualityState: newSetEqualityConstraint[T](
+          constraint.setEqualityState.setAPositions,
+          constraint.setEqualityState.setBPositions
+        )
+      )
+    of SetSubsetType:
+      # Create a new constraint with same parameters
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SetSubsetType,
+        setSubsetState: newSetSubsetConstraint[T](
+          constraint.setSubsetState.subsetPositions,
+          constraint.setSubsetState.supersetPositions
         )
       )
 

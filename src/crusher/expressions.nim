@@ -1110,7 +1110,7 @@ func updateOverlapsForRectangle*[T](state: DiffnExpression[T], rectIndex: int) =
     # Update overlaps for a specific rectangle with all others
     # Remove old overlaps involving this rectangle
     var toRemove: seq[(int, int)] = @[]
-    for pair in state.overlappingPairs:
+    for pair in state.overlappingPairs.items:
         if pair[0] == rectIndex or pair[1] == rectIndex:
             toRemove.add(pair)
     
@@ -1229,3 +1229,111 @@ proc deepCopy*[T](state: DiffnExpression[T]): DiffnExpression[T] =
     result.positions = state.positions  # PackedSet is a value type, safe to copy
     result.overlappingPairs = state.overlappingPairs  # HashSet is a value type, safe to copy
     result.positionToRectangles = state.positionToRectangles  # Table is a value type, safe to copy
+
+################################################################################
+# Type definitions for SetExpression
+################################################################################
+
+type
+    SetExpression*[T] = ref object
+        universe*: PackedSet[int]        # Domain of possible elements (e.g., 1..10)
+        currentSet*: PackedSet[int]      # Current set contents
+        cardinality*: int                # Cached |currentSet| for efficiency
+        positions*: PackedSet[int]       # Variable positions this set depends on
+        currentAssignment*: Table[int, T] # Current variable assignments
+        dependentElements*: Table[int, seq[int]]  # position -> elements it can affect
+
+# SetExpression creation
+
+func newSetExpression*[T](universe: PackedSet[int]): SetExpression[T] =
+    result = SetExpression[T](
+        universe: universe,
+        currentSet: initPackedSet[int](),
+        cardinality: 0,
+        positions: initPackedSet[int](),
+        currentAssignment: initTable[int, T](),
+        dependentElements: initTable[int, seq[int]]()
+    )
+
+func newSetExpression*[T](universe: seq[int]): SetExpression[T] =
+    newSetExpression[T](toPackedSet(universe))
+
+# SetExpression initialization
+
+func initialize*[T](state: SetExpression[T], assignment: seq[T]) =
+    # Initialize the SetExpression with the given assignment
+    for pos in state.positions:
+        state.currentAssignment[pos] = assignment[pos]
+    
+    # Rebuild current set based on assignment
+    # For now, assume set membership is determined by specific logic
+    # This will be refined when we implement the actual constraints
+    state.currentSet = initPackedSet[int]()
+    state.cardinality = 0
+
+func evaluate*[T](state: SetExpression[T], assignment: seq[T]|Table[int, T]): PackedSet[int] {.inline.} =
+    # Returns current set contents
+    state.currentSet
+
+func evaluateCardinality*[T](state: SetExpression[T], assignment: seq[T]|Table[int, T]): int {.inline.} =
+    # Returns current set cardinality
+    state.cardinality
+
+func `$`*[T](state: SetExpression[T]): string = 
+    "SetExpr(" & $state.currentSet & ", |S|=" & $state.cardinality & ")"
+
+# SetExpression updates
+
+func addElement*[T](state: SetExpression[T], element: int) {.inline.} =
+    # Add element to the set if it's in the universe
+    if element in state.universe and element notin state.currentSet:
+        state.currentSet.incl(element)
+        state.cardinality += 1
+
+func removeElement*[T](state: SetExpression[T], element: int) {.inline.} =
+    # Remove element from the set
+    if element in state.currentSet:
+        state.currentSet.excl(element)
+        state.cardinality -= 1
+
+func updatePosition*[T](state: SetExpression[T], position: int, newValue: T) {.inline.} =
+    # Update assignment for a position that affects this set
+    let oldValue = state.currentAssignment.getOrDefault(position)
+    state.currentAssignment[position] = newValue
+    
+    # The specific logic for how position changes affect set membership
+    # will be implemented in the individual set constraints
+    
+func contains*[T](state: SetExpression[T], element: int): bool {.inline.} =
+    # Check if element is in the current set
+    element in state.currentSet
+
+func isSubsetOf*[T](setA: SetExpression[T], setB: SetExpression[T]): bool {.inline.} =
+    # Check if setA ⊆ setB
+    setA.currentSet <= setB.currentSet
+
+func setsEqual*[T](setA: SetExpression[T], setB: SetExpression[T]): bool {.inline.} =
+    # Check if setA = setB
+    setA.currentSet == setB.currentSet
+
+func setUnion*[T](setA: SetExpression[T], setB: SetExpression[T]): PackedSet[int] {.inline.} =
+    # Compute A ∪ B
+    setA.currentSet + setB.currentSet
+
+func setIntersection*[T](setA: SetExpression[T], setB: SetExpression[T]): PackedSet[int] {.inline.} =
+    # Compute A ∩ B
+    setA.currentSet * setB.currentSet
+
+func setDifference*[T](setA: SetExpression[T], setB: SetExpression[T]): PackedSet[int] {.inline.} =
+    # Compute A \ B
+    setA.currentSet - setB.currentSet
+
+proc deepCopy*[T](state: SetExpression[T]): SetExpression[T] =
+    # Creates a deep copy of a SetExpression for thread-safe parallel processing
+    new(result)
+    result.universe = state.universe                    # PackedSet is a value type, safe to copy
+    result.currentSet = state.currentSet                # PackedSet is a value type, safe to copy
+    result.cardinality = state.cardinality
+    result.positions = state.positions                  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.dependentElements = state.dependentElements  # Table is a value type, safe to copy

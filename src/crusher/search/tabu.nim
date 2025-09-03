@@ -2,7 +2,7 @@ import std/[packedsets, random, sequtils, tables, atomics, strformat, strutils, 
 import ../expressions
 import ../constrainedArray
 import ../constraintSystem
-import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint, elementState, globalCardinality, cumulative, diffn]
+import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint, elementState, globalCardinality, cumulative, diffn, setConstraints]
 
 randomize()
 
@@ -74,6 +74,14 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.cumulativeState.cost + constraint.cumulativeState.moveDelta(position, oldValue, newValue)
         of DiffnType:
             result = constraint.diffnState.cost + constraint.diffnState.moveDelta(position, oldValue, newValue)
+        of SetMembershipType:
+            result = constraint.setMembershipState.cost + constraint.setMembershipState.moveDelta(position, oldValue, newValue)
+        of SetCardinalityType:
+            result = constraint.setCardinalityState.cost + constraint.setCardinalityState.moveDelta(position, oldValue, newValue)
+        of SetEqualityType:
+            result = constraint.setEqualityState.cost + constraint.setEqualityState.moveDelta(position, oldValue, newValue)
+        of SetSubsetType:
+            result = constraint.setSubsetState.cost + constraint.setSubsetState.moveDelta(position, oldValue, newValue)
 
     # Record timing if enabled
     if state.enableTiming:
@@ -260,6 +268,14 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 delta += constraint.cumulativeState.moveDelta(position, oldValue, value)
             of DiffnType:
                 delta += constraint.diffnState.moveDelta(position, oldValue, value)
+            of SetMembershipType:
+                delta += constraint.setMembershipState.moveDelta(position, oldValue, value)
+            of SetCardinalityType:
+                delta += constraint.setCardinalityState.moveDelta(position, oldValue, value)
+            of SetEqualityType:
+                delta += constraint.setEqualityState.moveDelta(position, oldValue, value)
+            of SetSubsetType:
+                delta += constraint.setSubsetState.moveDelta(position, oldValue, value)
 
     # Update assignment
     state.assignment[position] = value

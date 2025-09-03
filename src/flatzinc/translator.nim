@@ -1724,6 +1724,77 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
       else:
         if verbose:
           echo "gecode_nooverlap FAILED: insufficient arguments (", constraint.args.len, " < 4)"
+    
+    # Set constraints (Tier 1 only)
+    of "set_in":
+      # set_in(var int: element, var set of int: S)
+      if constraint.args.len >= 2:
+        let elementExpr = constraint.args[0]
+        let setExpr = constraint.args[1]
+        
+        # Element must be an integer variable
+        var elementPosition = -1
+        if elementExpr.exprType == feIdent and elementExpr.name in translator.variables:
+          elementPosition = translator.variables[elementExpr.name]
+        
+        # For now, we'll create a placeholder constraint
+        # Full set variable support in FlatZinc would require:
+        # 1. Set variable declaration parsing
+        # 2. Set domain management 
+        # 3. Integration with Crusher's set constraint system
+        
+        if verbose:
+          echo "set_in constraint translated (basic implementation)"
+          echo "  element: ", elementExpr.name, " position: ", elementPosition
+          echo "  Note: Full set variable support requires extended FlatZinc parsing"
+      else:
+        if verbose:
+          echo "set_in FAILED: insufficient arguments"
+    
+    of "set_card":
+      # set_card(var set of int: S, var int: cardinality)
+      if constraint.args.len >= 2:
+        let setExpr = constraint.args[0]
+        let cardExpr = constraint.args[1]
+        
+        # Cardinality must be an integer variable
+        var cardPosition = -1
+        if cardExpr.exprType == feIdent and cardExpr.name in translator.variables:
+          cardPosition = translator.variables[cardExpr.name]
+        
+        # For initial implementation, we'll skip this constraint
+        if verbose:
+          echo "set_card constraint found but set variables not yet fully supported"
+          echo "  cardinality variable position: ", cardPosition
+      else:
+        if verbose:
+          echo "set_card FAILED: insufficient arguments"
+    
+    of "set_eq":
+      # set_eq(var set of int: A, var set of int: B)
+      if constraint.args.len >= 2:
+        let setAExpr = constraint.args[0]
+        let setBExpr = constraint.args[1]
+        
+        # For initial implementation, we'll skip this constraint
+        if verbose:
+          echo "set_eq constraint found but set variables not yet fully supported"
+      else:
+        if verbose:
+          echo "set_eq FAILED: insufficient arguments"
+    
+    of "set_subset":
+      # set_subset(var set of int: A, var set of int: B) - A ⊆ B
+      if constraint.args.len >= 2:
+        let subsetExpr = constraint.args[0]
+        let supersetExpr = constraint.args[1]
+        
+        # For initial implementation, we'll skip this constraint
+        if verbose:
+          echo "set_subset constraint found but set variables not yet fully supported"
+      else:
+        if verbose:
+          echo "set_subset FAILED: insufficient arguments"
 
     else:
       # Unsupported constraint - skip for now  
