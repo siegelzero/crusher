@@ -1,7 +1,7 @@
 import std/[tables, strutils, sequtils, packedsets, math, strformat, sets]
 import ast
 import ../crusher/[constraintSystem, constrainedArray, expressions]
-import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular, elementState, cumulative]
+import ../crusher/constraints/[algebraic, stateful, constraintNode, globalCardinality, minConstraint, regular, elementState, cumulative, diffn]
 import ../crusher/search/[resolution, tabu, optimization]
 
 type
@@ -1581,6 +1581,149 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
       else:
         if verbose:
           echo "gecode_cumulatives FAILED: insufficient arguments (", constraint.args.len, " < 4)"
+
+    of "gecode_nooverlap":
+      # gecode_nooverlap(x, widths, y, heights)
+      if constraint.args.len >= 4:
+        let xExpr = constraint.args[0]
+        let widthsExpr = constraint.args[1]
+        let yExpr = constraint.args[2] 
+        let heightsExpr = constraint.args[3]
+        
+        # Parse x-coordinates array
+        var xParams: seq[RectangleParam[int]] = @[]
+        if xExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == xExpr.name and decl.varType == fzArrayInt:
+              if decl.arrayVarRefs.len > 0:
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    xParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+              elif decl.name in translator.variables:
+                # This is a direct array variable
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  xParams.add(RectangleParam[int](isConstant: false, 
+                                                 variablePosition: basePos + i))
+              break
+        
+        # Parse widths array (mixed constants and variables)
+        var wParams: seq[RectangleParam[int]] = @[]
+        if widthsExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == widthsExpr.name and decl.varType == fzArrayInt:
+              # Handle mixed arrays with both constants and variables
+              if decl.arrayVarRefs.len > 0 and decl.arrayValue.len > 0:
+                let totalSize = if decl.arraySize.len > 0: decl.arraySize[0] else: 0
+                var paramIndex = 0
+                
+                # Add variable parameters first
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables and paramIndex < totalSize:
+                    wParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+                    paramIndex += 1
+                
+                # Add constant parameters 
+                for constVal in decl.arrayValue:
+                  if paramIndex < totalSize:
+                    wParams.add(RectangleParam[int](isConstant: true, constantValue: constVal))
+                    paramIndex += 1
+              elif decl.arrayVarRefs.len > 0:
+                # All variables
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    wParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+              elif decl.arrayValue.len > 0:
+                # All constants
+                for constVal in decl.arrayValue:
+                  wParams.add(RectangleParam[int](isConstant: true, constantValue: constVal))
+              elif decl.name in translator.variables:
+                # Array of variables
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  wParams.add(RectangleParam[int](isConstant: false, 
+                                                 variablePosition: basePos + i))
+              break
+        
+        # Parse y-coordinates array
+        var yParams: seq[RectangleParam[int]] = @[]
+        if yExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == yExpr.name and decl.varType == fzArrayInt:
+              if decl.arrayVarRefs.len > 0:
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    yParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+              elif decl.name in translator.variables:
+                # This is a direct array variable
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  yParams.add(RectangleParam[int](isConstant: false, 
+                                                 variablePosition: basePos + i))
+              break
+        
+        # Parse heights array (mixed constants and variables) 
+        var hParams: seq[RectangleParam[int]] = @[]
+        if heightsExpr.exprType == feIdent:
+          for decl in translator.varDecls:
+            if decl.name == heightsExpr.name and decl.varType == fzArrayInt:
+              # Handle mixed arrays with both constants and variables
+              if decl.arrayVarRefs.len > 0 and decl.arrayValue.len > 0:
+                let totalSize = if decl.arraySize.len > 0: decl.arraySize[0] else: 0
+                var paramIndex = 0
+                
+                # Add variable parameters first
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables and paramIndex < totalSize:
+                    hParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+                    paramIndex += 1
+                
+                # Add constant parameters 
+                for constVal in decl.arrayValue:
+                  if paramIndex < totalSize:
+                    hParams.add(RectangleParam[int](isConstant: true, constantValue: constVal))
+                    paramIndex += 1
+              elif decl.arrayVarRefs.len > 0:
+                # All variables
+                for varName in decl.arrayVarRefs:
+                  if varName in translator.variables:
+                    hParams.add(RectangleParam[int](isConstant: false, 
+                                                   variablePosition: translator.variables[varName]))
+              elif decl.arrayValue.len > 0:
+                # All constants
+                for constVal in decl.arrayValue:
+                  hParams.add(RectangleParam[int](isConstant: true, constantValue: constVal))
+              elif decl.name in translator.variables:
+                # Array of variables
+                let basePos = translator.variables[decl.name]
+                let arraySize = if decl.arraySize.len > 0: decl.arraySize[0] else: 1
+                for i in 0..<arraySize:
+                  hParams.add(RectangleParam[int](isConstant: false, 
+                                                 variablePosition: basePos + i))
+              break
+        
+        if xParams.len == wParams.len and wParams.len == yParams.len and 
+           yParams.len == hParams.len and xParams.len > 0:
+          let diffnConstraint = diffnConstraintFromParams[int](xParams, wParams, yParams, hParams)
+          translator.system.addConstraint(diffnConstraint)
+          
+          if verbose:
+            echo "Added gecode_nooverlap constraint: ", xParams.len, " rectangles"
+        else:
+          if verbose:
+            echo "gecode_nooverlap FAILED: mismatched array sizes - x:", xParams.len, 
+                 " w:", wParams.len, " y:", yParams.len, " h:", hParams.len
+      else:
+        if verbose:
+          echo "gecode_nooverlap FAILED: insufficient arguments (", constraint.args.len, " < 4)"
 
     else:
       # Unsupported constraint - skip for now  

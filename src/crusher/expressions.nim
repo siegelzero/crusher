@@ -1,4 +1,4 @@
-import std/[packedsets, tables, algorithm]
+import std/[packedsets, tables, algorithm, sets]
 
 ################################################################################
 # Type definitions for ExpressionNode
@@ -988,3 +988,244 @@ proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
         of ExpressionBased:
             result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
             result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+################################################################################
+# Type definitions for DiffnExpression
+################################################################################
+
+type
+    RectangleParam*[T] = object
+        # Represents a rectangle parameter that can be either constant or variable
+        case isConstant*: bool
+        of true:
+            constantValue*: T
+        of false:
+            variablePosition*: int
+
+    Rectangle[T] = object
+        x*, y*, width*, height*: T
+
+    DiffnExpression*[T] = ref object
+        # Rectangle parameters (positions or constants)
+        xParams*: seq[RectangleParam[T]]
+        wParams*: seq[RectangleParam[T]]  # widths
+        yParams*: seq[RectangleParam[T]]
+        hParams*: seq[RectangleParam[T]]  # heights
+        
+        # Efficient state tracking
+        rectangles*: seq[Rectangle[T]]  # Current rectangle positions/sizes
+        overlapCount*: int              # Number of overlapping rectangle pairs
+        currentAssignment*: Table[int, T]
+        positions*: PackedSet[int]      # All variable positions involved
+        
+        # Optimization: incremental overlap tracking
+        overlappingPairs*: HashSet[(int, int)]  # Currently overlapping rectangle pairs
+        positionToRectangles*: Table[int, seq[int]]  # Position -> list of rectangle indices using it
+
+# DiffnExpression creation
+
+func newRectangleParam*[T](constantValue: T): RectangleParam[T] =
+    RectangleParam[T](isConstant: true, constantValue: constantValue)
+
+func newRectangleParam*[T](variablePosition: int): RectangleParam[T] =
+    RectangleParam[T](isConstant: false, variablePosition: variablePosition)
+
+func newDiffnExpression*[T](xParams, wParams, yParams, hParams: seq[RectangleParam[T]]): DiffnExpression[T] =
+    new(result)
+    result.xParams = xParams
+    result.wParams = wParams
+    result.yParams = yParams
+    result.hParams = hParams
+    result.rectangles = newSeq[Rectangle[T]](xParams.len)
+    result.overlapCount = 0
+    result.currentAssignment = initTable[int, T]()
+    result.positions = initPackedSet[int]()
+    result.overlappingPairs = initHashSet[(int, int)]()
+    result.positionToRectangles = initTable[int, seq[int]]()
+    
+    # Collect all variable positions and build position-to-rectangle mapping
+    for i, param in xParams:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+            if param.variablePosition notin result.positionToRectangles:
+                result.positionToRectangles[param.variablePosition] = @[]
+            result.positionToRectangles[param.variablePosition].add(i)
+    for i, param in wParams:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+            if param.variablePosition notin result.positionToRectangles:
+                result.positionToRectangles[param.variablePosition] = @[]
+            result.positionToRectangles[param.variablePosition].add(i)
+    for i, param in yParams:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+            if param.variablePosition notin result.positionToRectangles:
+                result.positionToRectangles[param.variablePosition] = @[]
+            result.positionToRectangles[param.variablePosition].add(i)
+    for i, param in hParams:
+        if not param.isConstant:
+            result.positions.incl(param.variablePosition)
+            if param.variablePosition notin result.positionToRectangles:
+                result.positionToRectangles[param.variablePosition] = @[]
+            result.positionToRectangles[param.variablePosition].add(i)
+
+# DiffnExpression utility functions
+
+func getRectangleParam*[T](param: RectangleParam[T], assignment: Table[int, T]): T {.inline.} =
+    if param.isConstant:
+        param.constantValue
+    else:
+        assignment[param.variablePosition]
+
+func getRectangleParam*[T](param: RectangleParam[T], assignment: seq[T]): T {.inline.} =
+    if param.isConstant:
+        param.constantValue
+    else:
+        assignment[param.variablePosition]
+
+func rectanglesOverlap*[T](rect1, rect2: Rectangle[T]): bool {.inline.} =
+    # Two rectangles don't overlap if one is completely to the left, right, above, or below the other
+    not (rect1.x + rect1.width <= rect2.x or   # rect1 is to the left of rect2
+         rect2.x + rect2.width <= rect1.x or   # rect2 is to the left of rect1
+         rect1.y + rect1.height <= rect2.y or  # rect1 is below rect2
+         rect2.y + rect2.height <= rect1.y)    # rect2 is below rect1
+
+func countOverlaps*[T](rectangles: seq[Rectangle[T]]): int =
+    # Count total number of overlapping pairs
+    result = 0
+    for i in 0..<rectangles.len:
+        for j in (i+1)..<rectangles.len:
+            if rectanglesOverlap(rectangles[i], rectangles[j]):
+                result += 1
+
+func buildOverlappingPairs*[T](state: DiffnExpression[T]) =
+    # Build initial set of overlapping pairs
+    state.overlappingPairs.clear()
+    for i in 0..<state.rectangles.len:
+        for j in (i+1)..<state.rectangles.len:
+            if rectanglesOverlap(state.rectangles[i], state.rectangles[j]):
+                state.overlappingPairs.incl((i, j))
+    state.overlapCount = state.overlappingPairs.len
+
+func updateOverlapsForRectangle*[T](state: DiffnExpression[T], rectIndex: int) =
+    # Update overlaps for a specific rectangle with all others
+    # Remove old overlaps involving this rectangle
+    var toRemove: seq[(int, int)] = @[]
+    for pair in state.overlappingPairs:
+        if pair[0] == rectIndex or pair[1] == rectIndex:
+            toRemove.add(pair)
+    
+    for pair in toRemove:
+        state.overlappingPairs.excl(pair)
+    
+    # Add new overlaps involving this rectangle
+    for i in 0..<state.rectangles.len:
+        if i != rectIndex:
+            if rectanglesOverlap(state.rectangles[rectIndex], state.rectangles[i]):
+                let pair = if rectIndex < i: (rectIndex, i) else: (i, rectIndex)
+                state.overlappingPairs.incl(pair)
+    
+    state.overlapCount = state.overlappingPairs.len
+
+# DiffnExpression initialization
+
+func initialize*[T](state: DiffnExpression[T], assignment: seq[T]) =
+    # Initialize assignments
+    for pos in state.positions.items:
+        state.currentAssignment[pos] = assignment[pos]
+    
+    # Build rectangle array from current assignment
+    for i in 0..<state.xParams.len:
+        state.rectangles[i] = Rectangle[T](
+            x: getRectangleParam(state.xParams[i], assignment),
+            y: getRectangleParam(state.yParams[i], assignment),
+            width: getRectangleParam(state.wParams[i], assignment),
+            height: getRectangleParam(state.hParams[i], assignment)
+        )
+    
+    # Build overlapping pairs set for incremental tracking
+    buildOverlappingPairs(state)
+
+func evaluate*[T](state: DiffnExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    # Evaluate to the number of overlapping rectangle pairs
+    T(state.overlapCount)
+
+func `$`*[T](state: DiffnExpression[T]): string = 
+    "DiffnExpr(overlaps=" & $state.overlapCount & ")"
+
+# DiffnExpression updates
+
+func updatePosition*[T](state: DiffnExpression[T], position: int, newValue: T) {.inline.} =
+    # Update assignment and rebuild affected rectangles
+    state.currentAssignment[position] = newValue
+    
+    if position notin state.positionToRectangles:
+        return  # Position doesn't affect any rectangles
+    
+    let affectedRectIndices = state.positionToRectangles[position]
+    
+    # Update affected rectangles and their overlaps
+    for rectIndex in affectedRectIndices:
+        # Update rectangle parameters
+        if not state.xParams[rectIndex].isConstant and state.xParams[rectIndex].variablePosition == position:
+            state.rectangles[rectIndex].x = newValue
+        if not state.wParams[rectIndex].isConstant and state.wParams[rectIndex].variablePosition == position:
+            state.rectangles[rectIndex].width = newValue
+        if not state.yParams[rectIndex].isConstant and state.yParams[rectIndex].variablePosition == position:
+            state.rectangles[rectIndex].y = newValue
+        if not state.hParams[rectIndex].isConstant and state.hParams[rectIndex].variablePosition == position:
+            state.rectangles[rectIndex].height = newValue
+        
+        # Update overlaps for this specific rectangle
+        updateOverlapsForRectangle(state, rectIndex)
+
+func moveDelta*[T](state: DiffnExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
+    # Calculate the change in overlap count for this position change
+    # Only check overlaps for rectangles that are affected by this position change
+    
+    if position notin state.positionToRectangles:
+        return 0  # Position doesn't affect any rectangles
+    
+    let affectedRectIndices = state.positionToRectangles[position]
+    var overlapDelta = 0
+    
+    # For each affected rectangle, calculate change in overlaps
+    for rectIndex in affectedRectIndices:
+        # Create temporary rectangle with new value
+        var tempRect = state.rectangles[rectIndex]
+        
+        # Update appropriate parameter based on which one uses this position
+        if not state.xParams[rectIndex].isConstant and state.xParams[rectIndex].variablePosition == position:
+            tempRect.x = newValue
+        if not state.wParams[rectIndex].isConstant and state.wParams[rectIndex].variablePosition == position:
+            tempRect.width = newValue
+        if not state.yParams[rectIndex].isConstant and state.yParams[rectIndex].variablePosition == position:
+            tempRect.y = newValue
+        if not state.hParams[rectIndex].isConstant and state.hParams[rectIndex].variablePosition == position:
+            tempRect.height = newValue
+        
+        # Check overlap changes with all other rectangles
+        for i in 0..<state.rectangles.len:
+            if i != rectIndex:
+                let oldOverlap = rectanglesOverlap(state.rectangles[rectIndex], state.rectangles[i])
+                let newOverlap = rectanglesOverlap(tempRect, state.rectangles[i])
+                
+                if oldOverlap and not newOverlap:
+                    overlapDelta -= 1  # Lost an overlap
+                elif not oldOverlap and newOverlap:
+                    overlapDelta += 1  # Gained an overlap
+    
+    return overlapDelta
+
+proc deepCopy*[T](state: DiffnExpression[T]): DiffnExpression[T] =
+    # Creates a deep copy of a DiffnExpression for thread-safe parallel processing
+    new(result)
+    result.xParams = state.xParams  # seq of value types, safe to copy
+    result.wParams = state.wParams
+    result.yParams = state.yParams
+    result.hParams = state.hParams
+    result.rectangles = state.rectangles  # seq of value types, safe to copy
+    result.overlapCount = state.overlapCount
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.overlappingPairs = state.overlappingPairs  # HashSet is a value type, safe to copy
+    result.positionToRectangles = state.positionToRectangles  # Table is a value type, safe to copy

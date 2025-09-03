@@ -2,7 +2,7 @@ import std/[packedsets, sequtils, tables, sets]
 
 import common
 import algebraic, allDifferent, elementState, linear, minConstraint, maxConstraint, sumConstraint
-import globalCardinality, regular, cumulative
+import globalCardinality, regular, cumulative, diffn
 import constraintNode
 import ../expressions
 
@@ -35,7 +35,8 @@ type
         SumType,
         GlobalCardinalityType,
         RegularType,
-        CumulativeType
+        CumulativeType,
+        DiffnType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -62,6 +63,8 @@ type
                 regularState*: RegularConstraint[T]
             of CumulativeType:
                 cumulativeState*: CumulativeConstraint[T]
+            of DiffnType:
+                diffnState*: DiffnConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -88,6 +91,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Regular Constraint"
         of CumulativeType:
             return "Cumulative Constraint"
+        of DiffnType:
+            return "Diffn Constraint"
 
 proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
     ## Returns a human-readable name for the constraint type
@@ -103,6 +108,7 @@ proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inli
         of GlobalCardinalityType: "GlobalCardinality"
         of RegularType: "Regular"
         of CumulativeType: "Cumulative"
+        of DiffnType: "Diffn"
 
 ################################################################################
 # Evaluation
@@ -132,6 +138,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.regularState.getCost()
         of CumulativeType:
             return constraint.cumulativeState.cost
+        of DiffnType:
+            return constraint.diffnState.cost
 
 ################################################################################
 # Computed Constraints
@@ -352,6 +360,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.regularState.initialize(assignment)
         of CumulativeType:
             constraint.cumulativeState.initialize(assignment)
+        of DiffnType:
+            constraint.diffnState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -378,6 +388,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.regularState.moveDelta(position, oldValue, newValue)
         of CumulativeType:
             constraint.cumulativeState.moveDelta(position, oldValue, newValue)
+        of DiffnType:
+            constraint.diffnState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -404,6 +416,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.regularState.updatePosition(position, newValue)
         of CumulativeType:
             constraint.cumulativeState.updatePosition(position, newValue)
+        of DiffnType:
+            constraint.diffnState.updatePosition(position, newValue)
 
 
 ################################################################################
@@ -616,6 +630,15 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
           constraint.cumulativeState.target
         )
       )
+    of DiffnType:
+      # Deep copy the diffn constraint
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: DiffnType,
+        diffnState: newDiffnConstraint[T](
+          constraint.diffnState.diffnExpr.deepCopy()
+        )
+      )
 
 ################################################################################
 # Regular constraint StatefulConstraint constructors
@@ -685,5 +708,33 @@ func cumulativeConstraintMixed*[T](
         positions: cumulConst.cumulativeExpr.positions,
         stateType: CumulativeType,
         cumulativeState: cumulConst
+    )
+
+################################################################################
+# Diffn constraint StatefulConstraint constructors
+################################################################################
+
+func diffnConstraint*[T](
+    xPositions, widthPositions, yPositions, heightPositions: seq[int]
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a DiffnConstraint from positions
+    let diffnConst = diffn.diffnConstraint[T](xPositions, widthPositions, yPositions, heightPositions)
+    
+    result = StatefulConstraint[T](
+        positions: diffnConst.diffnExpr.positions,
+        stateType: DiffnType,
+        diffnState: diffnConst
+    )
+
+func diffnConstraintFromParams*[T](
+    xParams, wParams, yParams, hParams: seq[RectangleParam[T]]
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a DiffnConstraint from mixed params
+    let diffnConst = diffnConstraintMixed[T](xParams, wParams, yParams, hParams)
+    
+    result = StatefulConstraint[T](
+        positions: diffnConst.diffnExpr.positions,
+        stateType: DiffnType,
+        diffnState: diffnConst
     )
 

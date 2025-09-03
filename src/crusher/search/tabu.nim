@@ -2,7 +2,7 @@ import std/[packedsets, random, sequtils, tables, atomics, strformat, strutils, 
 import ../expressions
 import ../constrainedArray
 import ../constraintSystem
-import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint, elementState, globalCardinality, cumulative]
+import ../constraints/[algebraic, stateful, allDifferent, linear, minConstraint, maxConstraint, sumConstraint, elementState, globalCardinality, cumulative, diffn]
 
 randomize()
 
@@ -72,6 +72,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.regularState.cost + constraint.moveDelta(position, oldValue, newValue)
         of CumulativeType:
             result = constraint.cumulativeState.cost + constraint.cumulativeState.moveDelta(position, oldValue, newValue)
+        of DiffnType:
+            result = constraint.diffnState.cost + constraint.diffnState.moveDelta(position, oldValue, newValue)
 
     # Record timing if enabled
     if state.enableTiming:
@@ -256,6 +258,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 delta += constraint.moveDelta(position, oldValue, value)
             of CumulativeType:
                 delta += constraint.cumulativeState.moveDelta(position, oldValue, value)
+            of DiffnType:
+                delta += constraint.diffnState.moveDelta(position, oldValue, value)
 
     # Update assignment
     state.assignment[position] = value
