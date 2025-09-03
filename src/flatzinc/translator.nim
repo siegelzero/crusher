@@ -1382,6 +1382,57 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
         if verbose:
           echo "array_var_int_element FAILED: insufficient arguments (", constraint.args.len, " < 3)"
 
+    of "array_int_element":
+      # array_int_element(index, constant_array_param, value)
+      if constraint.args.len >= 3:
+        let indexExpr = constraint.args[0]    # Index variable
+        let arrayExpr = constraint.args[1]    # Constant array parameter
+        let valueExpr = constraint.args[2]    # Value variable
+        
+        if verbose:
+          echo "Processing array_int_element constraint"
+        
+        # Get index variable position
+        var indexPos = -1
+        if indexExpr.exprType == feIdent and indexExpr.name in translator.variables:
+          indexPos = translator.variables[indexExpr.name]
+        
+        # Get value variable position
+        var valuePos = -1
+        if valueExpr.exprType == feIdent and valueExpr.name in translator.variables:
+          valuePos = translator.variables[valueExpr.name]
+        
+        # Get constant array from parameter declarations
+        var constantArray: seq[int] = @[]
+        if arrayExpr.exprType == feIdent:
+          # Find the constant array parameter in variable declarations
+          for decl in translator.varDecls:
+            if decl.name == arrayExpr.name and not decl.isVar and decl.varType == fzArrayInt:
+              constantArray = decl.arrayValue
+              break
+        
+        if indexPos >= 0 and valuePos >= 0 and constantArray.len > 0:
+          # Create element constraint with constant array
+          let elementConstraint = element(indexPos, constantArray, valuePos)
+          translator.system.addConstraint(elementConstraint)
+          
+          if verbose:
+            echo "Added array_int_element constraint: index=", indexPos, 
+                 ", array_size=", constantArray.len, ", value=", valuePos,
+                 ", array=", constantArray
+        else:
+          if verbose:
+            echo "array_int_element FAILED: invalid variable references or constant array not found"
+            if indexPos < 0:
+              echo "  indexPos=", indexPos, " (should be >= 0)"
+            if valuePos < 0:
+              echo "  valuePos=", valuePos, " (should be >= 0)"
+            if constantArray.len == 0:
+              echo "  constantArray.len=0 (array parameter '", arrayExpr.name, "' not found)"
+      else:
+        if verbose:
+          echo "array_int_element FAILED: insufficient arguments (", constraint.args.len, " < 3)"
+
     else:
       # Unsupported constraint - skip for now  
       if verbose:
@@ -1434,10 +1485,10 @@ proc translateModel*(model: FlatZincModel, verbose: bool = false): FlatZincTrans
     result.printAlgebraicStats()
   
 
-proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: bool = true, verbose: bool = false): bool =
+proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, strategy: SearchStrategy = TabuParallel, verbose: bool = false): bool =
   case model.solve.solveType:
     of fsSatisfy:
-      resolve(translator.system, parallel=parallel, verbose=verbose)
+      resolve(translator.system, strategy=strategy, verbose=verbose)
       
       # Verify we actually found a valid solution (cost = 0)
       if translator.system.assignment.len == 0:
@@ -1462,7 +1513,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: 
         echo "Minimizing objective..."
         echo fmt"Objective variable: {model.solve.objective}"
         echo fmt"Translated to AlgebraicExpression with {objective.positions.len} variable(s)"
-      minimize(translator.system, objective, parallel=parallel, verbose=verbose)
+      minimize(translator.system, objective, strategy=strategy, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:
@@ -1479,7 +1530,7 @@ proc solve*(translator: var FlatZincTranslator, model: FlatZincModel, parallel: 
         echo "Maximizing objective..."
         echo fmt"Objective variable: {model.solve.objective}"
         echo fmt"Translated to AlgebraicExpression with {objective.positions.len} variable(s)"
-      maximize(translator.system, objective, parallel=parallel, verbose=verbose)
+      maximize(translator.system, objective, strategy=strategy, verbose=verbose)
       
       # Verify we found a valid solution
       if translator.system.assignment.len == 0:

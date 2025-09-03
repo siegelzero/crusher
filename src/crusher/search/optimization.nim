@@ -10,14 +10,14 @@ proc minimize*[T](system: ConstraintSystem[T],
                   tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
-                  parallel=true,
+                  strategy: SearchStrategy = TabuParallel,
                   verbose=false) =
     # Find initial solution
     system.resolve(
         tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
-        parallel=parallel,
+        strategy=strategy,
         verbose=verbose
     )
     var currentCost = objective.evaluate(system.assignment)
@@ -33,7 +33,7 @@ proc minimize*[T](system: ConstraintSystem[T],
                 tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
-                parallel=parallel,
+                strategy=strategy,
                 verbose=verbose
             )
             currentCost = objective.evaluate(system.assignment)
@@ -48,14 +48,14 @@ proc minimize*[T](system: ConstraintSystem[T],
                   tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
-                  parallel=true,
+                  strategy: SearchStrategy = TabuParallel,
                   verbose=false) =
     # Find initial solution
     system.resolve(
         tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
-        parallel=parallel,
+        strategy=strategy,
         verbose=verbose
     )
     objective.initialize(system.assignment)
@@ -74,7 +74,7 @@ proc minimize*[T](system: ConstraintSystem[T],
                 tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
-                parallel=parallel,
+                strategy=strategy,
                 verbose=verbose
             )
             objective.initialize(system.assignment)
@@ -90,14 +90,14 @@ proc maximize*[T](system: ConstraintSystem[T],
                   tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
-                  parallel=true,
+                  strategy: SearchStrategy = TabuParallel,
                   verbose=false) =
     # Find initial solution
     system.resolve(
         tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
-        parallel=parallel,
+        strategy=strategy,
         verbose=verbose
     )
     var currentCost = objective.evaluate(system.assignment)
@@ -113,7 +113,7 @@ proc maximize*[T](system: ConstraintSystem[T],
                 tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
-                parallel=parallel,
+                strategy=strategy,
                 verbose=verbose
             )
             currentCost = objective.evaluate(system.assignment)
@@ -128,14 +128,14 @@ proc maximize*[T](system: ConstraintSystem[T],
                   tabuThreshold=1000,
                   maxAttempts=5,
                   attemptThreshold=3,
-                  parallel=true,
+                  strategy: SearchStrategy = TabuParallel,
                   verbose=false) =
     # Find initial solution
     system.resolve(
         tabuThreshold=tabuThreshold,
         maxAttempts=maxAttempts,
         attemptThreshold=attemptThreshold,
-        parallel=parallel,
+        strategy=strategy,
         verbose=verbose
     )
     objective.initialize(system.assignment)
@@ -154,7 +154,7 @@ proc maximize*[T](system: ConstraintSystem[T],
                 tabuThreshold=tabuThreshold,
                 maxAttempts=maxAttempts,
                 attemptThreshold=attemptThreshold,
-                parallel=parallel,
+                strategy=strategy,
                 verbose=verbose
             )
             objective.initialize(system.assignment)

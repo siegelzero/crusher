@@ -1,7 +1,7 @@
 import std/[os, strformat, cpuinfo, atomics, tables]
 import std/typedthreads
 
-import heuristics, tabu
+import heuristics, tabu, populationSearch
 import ../constraintSystem
 import ../constrainedArray
 import ../constraints/stateful
@@ -10,23 +10,44 @@ import ../constraints/stateful
 type NoSolutionFoundError* = object of CatchableError
 
 
+type SearchStrategy* = enum
+    TabuSerial, TabuParallel, PopulationBased
+
 proc resolve*[T](system: ConstraintSystem[T],
                  tabuThreshold=10000,
                  maxAttempts=10,
                  attemptThreshold=10,
-                 parallel=true,
-                 verbose=false) =
-    if parallel:
-        let cpuCount = countProcessors()
-        let numWorkers = max(1, min(cpuCount - 1, 16))
-        if verbose:
-            echo fmt"Using parallel resolution with {numWorkers} workers"
-        # Work directly on the original system for parallel search
-        system.resolveParallel(tabuThreshold, numWorkers, maxAttempts, attemptThreshold, verbose)
-    else:
-        if verbose:
-            echo "Using serial resolution"
-        system.resolveSerial(tabuThreshold, maxAttempts, attemptThreshold, verbose)
+                 verbose=false,
+                 strategy: SearchStrategy = TabuParallel) =
+    case strategy:
+        of PopulationBased:
+            if verbose:
+                echo "Using population-based path relinking search"
+            system.resolvePopulationBased(
+                populationSize = 20,
+                maxGenerations = 100,
+                tabuThreshold = tabuThreshold,
+                verbose = verbose
+            )
+        of TabuParallel:
+            let cpuCount = countProcessors()
+            let numWorkers = max(1, min(cpuCount - 1, 16))
+            if verbose:
+                echo fmt"Using parallel resolution with {numWorkers} workers"
+            # Work directly on the original system for parallel search
+            system.resolveParallel(tabuThreshold, numWorkers, maxAttempts, attemptThreshold, verbose)
+        of TabuSerial:
+            if verbose:
+                echo "Using serial resolution"
+            system.resolveSerial(tabuThreshold, maxAttempts, attemptThreshold, verbose)
+
+# Convenience function for population-based search
+proc resolveWithPopulation*[T](system: ConstraintSystem[T],
+                              populationSize: int = 20,
+                              maxGenerations: int = 100,
+                              tabuThreshold: int = 1000,
+                              verbose: bool = false) =
+    system.resolvePopulationBased(populationSize, maxGenerations, tabuThreshold, verbose)
 
 proc resolveSerial*[T](system: ConstraintSystem[T],
                        tabuThreshold=10000,

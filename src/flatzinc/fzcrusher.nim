@@ -5,14 +5,15 @@
 # This module provides functionality to parse FlatZinc files and translate
 # them into Crusher constraint systems for solving.
 
-import std/[os, strformat, tables]
+import std/[os, strformat, tables, strutils]
 import parser, ast, translator
+import ../crusher/search/resolution
 
 ################################################################################
 # Main solving function
 ################################################################################
 
-proc solveFlatZincFile*(filename: string, parallel: bool = true, verbose: bool = false): bool =
+proc solveFlatZincFile*(filename: string, strategy: SearchStrategy = TabuParallel, verbose: bool = false): bool =
     ## Parse and solve a FlatZinc file
     ## Returns true if a solution was found
     
@@ -34,7 +35,7 @@ proc solveFlatZincFile*(filename: string, parallel: bool = true, verbose: bool =
             echo fmt"Translated to Crusher system with {translator.system.baseArray.len} variables and {translator.system.baseArray.constraints.len} constraints"
         
         # Solve the constraint system
-        let solved = translator.solve(model, parallel, verbose)
+        let solved = translator.solve(model, strategy, verbose)
         
         if solved:
             if not verbose:
@@ -71,7 +72,7 @@ when isMainModule:
     import std/parseopt
     
     var filename = ""
-    var useParallel = true  # Default to parallel search
+    var strategy = TabuParallel  # Default to parallel tabu search
     var useVerbose = false  # Default to non-verbose
     
     for kind, key, val in getopt():
@@ -85,12 +86,28 @@ when isMainModule:
                         echo "Parse and solve FlatZinc constraint problems"
                         echo ""
                         echo "Options:"
-                        echo "  -s, --sequential    Use sequential search (default: parallel)"
-                        echo "  -v, --verbose       Enable verbose output (default: non-verbose)"
-                        echo "  -h, --help          Show this help message"
+                        echo "  -s, --strategy=STRATEGY  Choose search strategy:"
+                        echo "                             parallel (default) - Parallel tabu search"
+                        echo "                             sequential          - Sequential tabu search" 
+                        echo "                             population          - Population-based path relinking"
+                        echo "  --sequential             Use sequential search (deprecated, use --strategy=sequential)"
+                        echo "  -v, --verbose            Enable verbose output (default: non-verbose)"
+                        echo "  -h, --help               Show this help message"
                         quit(0)
-                    of "s", "sequential":
-                        useParallel = false
+                    of "s", "strategy":
+                        case val.toLowerAscii():
+                            of "parallel":
+                                strategy = TabuParallel
+                            of "sequential":
+                                strategy = TabuSerial
+                            of "population":
+                                strategy = PopulationBased
+                            else:
+                                echo fmt"Error: Unknown strategy '{val}'. Valid options: parallel, sequential, population"
+                                quit(1)
+                    of "sequential":
+                        echo "Warning: --sequential is deprecated. Use --strategy=sequential instead."
+                        strategy = TabuSerial
                     of "v", "verbose":
                         useVerbose = true
             of cmdEnd:
@@ -101,4 +118,4 @@ when isMainModule:
         echo "Use --help for more information"
         quit(1)
     
-    discard solveFlatZincFile(filename, useParallel, useVerbose)
+    discard solveFlatZincFile(filename, strategy, useVerbose)
