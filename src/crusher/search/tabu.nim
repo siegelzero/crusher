@@ -82,6 +82,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.setEqualityState.cost + constraint.setEqualityState.moveDelta(position, oldValue, newValue)
         of SetSubsetType:
             result = constraint.setSubsetState.cost + constraint.setSubsetState.moveDelta(position, oldValue, newValue)
+        of SetMembershipReifType:
+            result = constraint.setMembershipReifState.cost + constraint.setMembershipReifState.moveDelta(position, oldValue, newValue)
 
     # Record timing if enabled
     if state.enableTiming:
@@ -276,6 +278,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 delta += constraint.setEqualityState.moveDelta(position, oldValue, value)
             of SetSubsetType:
                 delta += constraint.setSubsetState.moveDelta(position, oldValue, value)
+            of SetMembershipReifType:
+                delta += constraint.setMembershipReifState.moveDelta(position, oldValue, value)
 
     # Update assignment
     state.assignment[position] = value

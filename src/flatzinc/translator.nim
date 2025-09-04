@@ -1795,6 +1795,59 @@ proc translateConstraint(translator: var FlatZincTranslator, constraint: FlatZin
       else:
         if verbose:
           echo "set_subset FAILED: insufficient arguments"
+    
+    of "set_in_reif":
+      # set_in_reif(var int: element, set of int: S, var bool: result)
+      # Means: result ↔ (element ∈ S)
+      if constraint.args.len >= 3:
+        let elementExpr = constraint.args[0]
+        let setExpr = constraint.args[1]
+        let boolExpr = constraint.args[2]
+        
+        # Element must be an integer variable
+        var elementPosition = -1
+        if elementExpr.exprType == feIdent and elementExpr.name in translator.variables:
+          elementPosition = translator.variables[elementExpr.name]
+        
+        # Boolean result must be a boolean variable
+        var boolPosition = -1
+        if boolExpr.exprType == feIdent and boolExpr.name in translator.variables:
+          boolPosition = translator.variables[boolExpr.name]
+        
+        # Parse set expression - handle constant sets like {1,3}
+        if setExpr.exprType == feLiteral and setExpr.literal.literalType == fzSetInt and elementPosition >= 0 and boolPosition >= 0:
+          # Convert set elements to seq[int]
+          let universe = setExpr.literal.setVal
+          
+          if universe.len > 0:
+            # Create dummy set positions for constant set - not used but required by interface
+            # For constant sets, we don't need actual boolean variables for set membership
+            let setPositions = toPackedSet[int]([])
+            
+            # Create the reified constraint  
+            let constraint = setMembershipReifConstraint[int](
+              elementPosition, setPositions, universe, boolPosition
+            )
+            translator.system.addConstraint(constraint)
+            
+            if verbose:
+              echo "Added set_in_reif constraint: element=", elementExpr.name, 
+                   " ∈ {", universe, "} ↔ bool=", boolExpr.name
+          else:
+            if verbose:
+              echo "set_in_reif FAILED: empty universe"
+        else:
+          if verbose:
+            echo "set_in_reif FAILED:"
+            if elementPosition < 0:
+              echo "  element variable not found: ", elementExpr.name
+            if boolPosition < 0:  
+              echo "  boolean variable not found: ", boolExpr.name
+            if setExpr.exprType != feLiteral or setExpr.literal.literalType != fzSetInt:
+              echo "  set expression not a constant set"
+      else:
+        if verbose:
+          echo "set_in_reif FAILED: insufficient arguments (", constraint.args.len, " < 3)"
 
     else:
       # Unsupported constraint - skip for now  

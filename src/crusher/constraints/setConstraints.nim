@@ -16,10 +16,12 @@ type
         elementPosition*: int        # Variable position for element
         setPositions*: PackedSet[int] # Variable positions for the set (boolean variables)
         universe*: seq[int]         # Ordered elements that could be in the set (matches setPositions order)
+        universeSet*: PackedSet[int] # O(1) universe membership testing
         currentAssignment*: Table[int, T] # Current variable assignments
         elementValue*: T            # Cached current element value
         isMember*: bool             # Cached membership status
         cost*: int                  # Violation cost (0 = satisfied, 1 = violated)
+        setPositionsSeq*: seq[int]  # Cached conversion of setPositions to seq for performance
         
     SetCardinalityConstraint*[T] = ref object
         setPositions*: PackedSet[int] # Variable positions for the set (boolean variables)
@@ -43,6 +45,19 @@ type
         violationCount*: int        # Number of elements in subset but not superset
         cost*: int                  # Violation cost
 
+    SetMembershipReifConstraint*[T] = ref object
+        elementPosition*: int        # Variable position for element
+        setPositions*: PackedSet[int] # Variable positions for the set (boolean variables)
+        universe*: seq[int]         # Ordered elements that could be in the set (matches setPositions order)
+        universeSet*: PackedSet[int] # O(1) universe membership testing
+        boolPosition*: int          # Variable position for boolean result
+        currentAssignment*: Table[int, T] # Current variable assignments
+        elementValue*: T            # Cached current element value
+        boolValue*: T               # Cached current boolean value
+        isMember*: bool             # Cached membership status  
+        cost*: int                  # Violation cost (0 = satisfied, 1 = violated)
+        setPositionsSeq*: seq[int]  # Cached conversion of setPositions to seq for performance
+
 ################################################################################  
 # SetMembershipConstraint (set_in) implementation
 ################################################################################
@@ -52,11 +67,25 @@ func newSetMembershipConstraint*[T](elementPosition: int, setPositions: PackedSe
         elementPosition: elementPosition,
         setPositions: setPositions,
         universe: universe,
+        universeSet: universe.toPackedSet(),  # O(1) universe membership testing
         currentAssignment: initTable[int, T](),
         elementValue: default(T),
         isMember: false,
-        cost: 1  # Initially violated until initialized
+        cost: 1,  # Initially violated until initialized
+        setPositionsSeq: toSeq(setPositions)  # Cache the conversion
     )
+
+proc checkMembership[T](state: SetMembershipConstraint[T], elementValue: int): bool {.inline.} =
+    ## Helper to check if an element value is in the current set
+    if state.setPositions.len == 0:
+        # Constant set case - O(1) lookup
+        return elementValue in state.universeSet
+    else:
+        # Variable set case - single pass through universe
+        for i, universeElement in state.universe:
+            if universeElement == elementValue:
+                return int(state.currentAssignment[state.setPositionsSeq[i]]) == 1
+        return false  # Element not in universe
 
 proc initialize*[T](state: SetMembershipConstraint[T], assignment: seq[T]) =
     # Store all relevant assignments
@@ -70,14 +99,7 @@ proc initialize*[T](state: SetMembershipConstraint[T], assignment: seq[T]) =
     let elementValue = int(state.elementValue)
     
     # Check if element is in the current set
-    state.isMember = false
-    if elementValue in state.universe:
-        # Find which position in setPositions corresponds to this element
-        for i, universeElement in state.universe:
-            if universeElement == elementValue:
-                let setPos = toSeq(state.setPositions)[i]
-                state.isMember = int(assignment[setPos]) == 1
-                break
+    state.isMember = state.checkMembership(elementValue)
     
     state.cost = if state.isMember: 0 else: 1
 
@@ -89,24 +111,15 @@ proc updatePosition*[T](state: SetMembershipConstraint[T], position: int, newVal
         # Element changed - recalculate membership
         state.elementValue = newValue
         let elementValue = int(newValue)
-        
-        state.isMember = false
-        if elementValue in state.universe:
-            # Find which position corresponds to this element
-            for i, universeElement in state.universe:
-                if universeElement == elementValue:
-                    let setPos = toSeq(state.setPositions)[i]
-                    state.isMember = int(state.currentAssignment[setPos]) == 1
-                    break
+        state.isMember = state.checkMembership(elementValue)
                     
     elif position in state.setPositions:
-        # Set membership changed - recalculate if this affects current element
+        # Set membership changed - only update if this affects current element
         let currentElementValue = int(state.elementValue)
         if currentElementValue in state.universe:
             for i, universeElement in state.universe:
                 if universeElement == currentElementValue:
-                    let setPos = toSeq(state.setPositions)[i]
-                    if setPos == position:
+                    if state.setPositionsSeq[i] == position:
                         # This position change affects our element
                         state.isMember = int(newValue) == 1
                         break
@@ -115,30 +128,18 @@ proc updatePosition*[T](state: SetMembershipConstraint[T], position: int, newVal
 
 proc moveDelta*[T](state: SetMembershipConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
     if position == state.elementPosition:
-        # Element variable changed
+        # Element variable changed - use cached membership for old value
         let oldElementValue = int(oldValue)
         let newElementValue = int(newValue)
         
         if oldElementValue == newElementValue:
             return 0  # No change
         
-        # Check old membership status
-        var oldMember = false
-        if oldElementValue in state.universe:
-            for i, universeElement in state.universe:
-                if universeElement == oldElementValue:
-                    let setPos = toSeq(state.setPositions)[i]
-                    oldMember = int(state.currentAssignment[setPos]) == 1
-                    break
+        # OLD: Use cached membership status (optimization!)
+        let oldMember = state.isMember
         
-        # Check new membership status
-        var newMember = false
-        if newElementValue in state.universe:
-            for i, universeElement in state.universe:
-                if universeElement == newElementValue:
-                    let setPos = toSeq(state.setPositions)[i]
-                    newMember = int(state.currentAssignment[setPos]) == 1
-                    break
+        # NEW: Only calculate new membership  
+        let newMember = state.checkMembership(newElementValue)
         
         # Return cost delta
         let oldCost = if oldMember: 0 else: 1
@@ -158,8 +159,7 @@ proc moveDelta*[T](state: SetMembershipConstraint[T], position: int, oldValue, n
         if currentElementValue in state.universe:
             for i, universeElement in state.universe:
                 if universeElement == currentElementValue:
-                    let setPos = toSeq(state.setPositions)[i]
-                    if setPos == position:
+                    if state.setPositionsSeq[i] == position:
                         # This change affects our element's membership
                         let oldCost = if oldInSet: 0 else: 1
                         let newCost = if newInSet: 0 else: 1
@@ -463,17 +463,157 @@ proc moveDelta*[T](state: SetSubsetConstraint[T], position: int, oldValue, newVa
     return 0
 
 ################################################################################
+# SetMembershipReifConstraint (set_in_reif) implementation
+################################################################################
+
+func newSetMembershipReifConstraint*[T](elementPosition: int, setPositions: PackedSet[int], universe: seq[int], boolPosition: int): SetMembershipReifConstraint[T] =
+    result = SetMembershipReifConstraint[T](
+        elementPosition: elementPosition,
+        setPositions: setPositions,
+        universe: universe,
+        universeSet: universe.toPackedSet(),  # O(1) universe membership testing
+        boolPosition: boolPosition,
+        currentAssignment: initTable[int, T](),
+        elementValue: default(T),
+        boolValue: default(T),
+        isMember: false,
+        cost: 1,  # Initially violated until initialized
+        setPositionsSeq: toSeq(setPositions)  # Cache the conversion
+    )
+
+proc checkElementMembership[T](state: SetMembershipReifConstraint[T], elementValue: int): bool {.inline.} =
+    ## Helper to check if an element value is in the current set
+    if state.setPositions.len == 0:
+        # Constant set case - O(1) lookup
+        return elementValue in state.universeSet
+    else:
+        # Variable set case - single pass through universe
+        for i, universeElement in state.universe:
+            if universeElement == elementValue:
+                return int(state.currentAssignment[state.setPositionsSeq[i]]) == 1
+        return false  # Element not in universe
+
+proc initialize*[T](state: SetMembershipReifConstraint[T], assignment: seq[T]) =
+    # Store all relevant assignments
+    state.currentAssignment.clear()
+    state.currentAssignment[state.elementPosition] = assignment[state.elementPosition]
+    state.currentAssignment[state.boolPosition] = assignment[state.boolPosition]
+    for pos in state.setPositions:
+        state.currentAssignment[pos] = assignment[pos]
+    
+    # Get current values
+    state.elementValue = assignment[state.elementPosition]
+    state.boolValue = assignment[state.boolPosition]
+    let elementValue = int(state.elementValue)
+    
+    # Check if element is in the current set
+    state.isMember = state.checkElementMembership(elementValue)
+    
+    # Calculate cost: boolean should match membership
+    let boolSaysTrue = int(state.boolValue) == 1
+    state.cost = if boolSaysTrue == state.isMember: 0 else: 1
+
+proc updatePosition*[T](state: SetMembershipReifConstraint[T], position: int, newValue: T) {.inline.} =
+    # Update our local assignment tracking
+    state.currentAssignment[position] = newValue
+    
+    if position == state.elementPosition:
+        # Element changed - recalculate membership
+        state.elementValue = newValue
+        let elementValue = int(newValue)
+        state.isMember = state.checkElementMembership(elementValue)
+                    
+    elif position == state.boolPosition:
+        # Boolean result changed
+        state.boolValue = newValue
+        
+    elif position in state.setPositions:
+        # Set membership changed - only update if this affects current element
+        let currentElementValue = int(state.elementValue)
+        if currentElementValue in state.universe:
+            for i, universeElement in state.universe:
+                if universeElement == currentElementValue:
+                    if state.setPositionsSeq[i] == position:
+                        # This position change affects our element
+                        state.isMember = int(newValue) == 1
+                        break
+    
+    # Recalculate cost: boolean should match membership
+    let boolSaysTrue = int(state.boolValue) == 1
+    state.cost = if boolSaysTrue == state.isMember: 0 else: 1
+
+proc moveDelta*[T](state: SetMembershipReifConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
+    if position == state.elementPosition:
+        # Element variable changed - use cached membership for old value
+        let oldElementValue = int(oldValue)
+        let newElementValue = int(newValue)
+        
+        if oldElementValue == newElementValue:
+            return 0  # No change
+        
+        # OLD: Use cached membership status (this is the key optimization!)
+        let oldMember = state.isMember
+        
+        # NEW: Only calculate new membership
+        let newMember = state.checkElementMembership(newElementValue)
+        
+        # Calculate cost delta
+        let boolSaysTrue = int(state.boolValue) == 1
+        let oldCost = if boolSaysTrue == oldMember: 0 else: 1
+        let newCost = if boolSaysTrue == newMember: 0 else: 1
+        return newCost - oldCost
+        
+    elif position == state.boolPosition:
+        # Boolean result variable changed
+        let oldBoolSaysTrue = int(oldValue) == 1
+        let newBoolSaysTrue = int(newValue) == 1
+        
+        if oldBoolSaysTrue == newBoolSaysTrue:
+            return 0  # No change in boolean value
+        
+        # Cost delta based on whether new/old boolean matches membership (use cached membership)
+        let oldCost = if oldBoolSaysTrue == state.isMember: 0 else: 1
+        let newCost = if newBoolSaysTrue == state.isMember: 0 else: 1
+        return newCost - oldCost
+        
+    elif position in state.setPositions:
+        # Set membership position changed
+        let oldInSet = int(oldValue) == 1
+        let newInSet = int(newValue) == 1
+        
+        if oldInSet == newInSet:
+            return 0  # No change in membership
+        
+        # Check if this position affects current element
+        let currentElementValue = int(state.elementValue)
+        if currentElementValue in state.universe:
+            for i, universeElement in state.universe:
+                if universeElement == currentElementValue:
+                    if state.setPositionsSeq[i] == position:
+                        # This change affects our element's membership
+                        let boolSaysTrue = int(state.boolValue) == 1
+                        let oldCost = if boolSaysTrue == oldInSet: 0 else: 1
+                        let newCost = if boolSaysTrue == newInSet: 0 else: 1
+                        return newCost - oldCost
+                    break
+    
+    return 0  # No change
+
+################################################################################
 # String representations
 ################################################################################
 
 func `$`*[T](constraint: SetMembershipConstraint[T]): string =
-    "SetMembership(elem@pos:" & $constraint.elementPosition & " ∈ set:" & $constraint.setIndex & ", cost:" & $constraint.cost & ")"
+    "SetMembership(elem@pos:" & $constraint.elementPosition & " ∈ set, cost:" & $constraint.cost & ")"
 
 func `$`*[T](constraint: SetCardinalityConstraint[T]): string =
-    "SetCardinality(|set:" & $constraint.setIndex & "| = var@pos:" & $constraint.cardinalityPosition & ", cost:" & $constraint.cost & ")"
+    "SetCardinality(|set| = var@pos:" & $constraint.cardinalityPosition & ", cost:" & $constraint.cost & ")"
 
 func `$`*[T](constraint: SetEqualityConstraint[T]): string =
-    "SetEquality(set:" & $constraint.setAIndex & " = set:" & $constraint.setBIndex & ", cost:" & $constraint.cost & ")"
+    "SetEquality(setA = setB, cost:" & $constraint.cost & ")"
 
 func `$`*[T](constraint: SetSubsetConstraint[T]): string =
-    "SetSubset(set:" & $constraint.subsetIndex & " ⊆ set:" & $constraint.supersetIndex & ", cost:" & $constraint.cost & ")"
+    "SetSubset(subset ⊆ superset, cost:" & $constraint.cost & ")"
+
+func `$`*[T](constraint: SetMembershipReifConstraint[T]): string =
+    "SetMembershipReif(elem@pos:" & $constraint.elementPosition & " ∈ set ↔ bool@pos:" & $constraint.boolPosition & ", cost:" & $constraint.cost & ")"

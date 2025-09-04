@@ -40,7 +40,8 @@ type
         SetMembershipType,
         SetCardinalityType,
         SetEqualityType,
-        SetSubsetType
+        SetSubsetType,
+        SetMembershipReifType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -77,6 +78,8 @@ type
                 setEqualityState*: SetEqualityConstraint[T]
             of SetSubsetType:
                 setSubsetState*: SetSubsetConstraint[T]
+            of SetMembershipReifType:
+                setMembershipReifState*: SetMembershipReifConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -113,6 +116,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "SetEquality Constraint"
         of SetSubsetType:
             return "SetSubset Constraint"
+        of SetMembershipReifType:
+            return "SetMembershipReif Constraint"
 
 proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inline.} =
     ## Returns a human-readable name for the constraint type
@@ -133,6 +138,7 @@ proc getConstraintTypeName*[T](constraint: StatefulConstraint[T]): string {.inli
         of SetCardinalityType: "SetCardinality"
         of SetEqualityType: "SetEquality"
         of SetSubsetType: "SetSubset"
+        of SetMembershipReifType: "SetMembershipReif"
 
 ################################################################################
 # Evaluation
@@ -172,6 +178,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.setEqualityState.cost
         of SetSubsetType:
             return constraint.setSubsetState.cost
+        of SetMembershipReifType:
+            return constraint.setMembershipReifState.cost
 
 ################################################################################
 # Computed Constraints
@@ -402,6 +410,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.setEqualityState.initialize(assignment)
         of SetSubsetType:
             constraint.setSubsetState.initialize(assignment)
+        of SetMembershipReifType:
+            constraint.setMembershipReifState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -438,6 +448,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.setEqualityState.moveDelta(position, oldValue, newValue)
         of SetSubsetType:
             constraint.setSubsetState.moveDelta(position, oldValue, newValue)
+        of SetMembershipReifType:
+            constraint.setMembershipReifState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -474,6 +486,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.setEqualityState.updatePosition(position, newValue)
         of SetSubsetType:
             constraint.setSubsetState.updatePosition(position, newValue)
+        of SetMembershipReifType:
+            constraint.setMembershipReifState.updatePosition(position, newValue)
 
 
 ################################################################################
@@ -736,6 +750,18 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
           constraint.setSubsetState.supersetPositions
         )
       )
+    of SetMembershipReifType:
+      # Create a new constraint with same parameters
+      result = StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: SetMembershipReifType,
+        setMembershipReifState: newSetMembershipReifConstraint[T](
+          constraint.setMembershipReifState.elementPosition,
+          constraint.setMembershipReifState.setPositions,
+          constraint.setMembershipReifState.universe,
+          constraint.setMembershipReifState.boolPosition
+        )
+      )
 
 ################################################################################
 # Regular constraint StatefulConstraint constructors
@@ -833,5 +859,26 @@ func diffnConstraintFromParams*[T](
         positions: diffnConst.diffnExpr.positions,
         stateType: DiffnType,
         diffnState: diffnConst
+    )
+
+################################################################################
+# Set constraint StatefulConstraint constructors
+################################################################################
+
+func setMembershipReifConstraint*[T](
+    elementPosition: int,
+    setPositions: PackedSet[int], 
+    universe: seq[int],
+    boolPosition: int
+): StatefulConstraint[T] =
+    ## Create a StatefulConstraint wrapping a SetMembershipReifConstraint
+    let allPositions = setPositions + toPackedSet([elementPosition, boolPosition])
+    
+    result = StatefulConstraint[T](
+        positions: allPositions,
+        stateType: SetMembershipReifType,
+        setMembershipReifState: newSetMembershipReifConstraint[T](
+            elementPosition, setPositions, universe, boolPosition
+        )
     )
 
