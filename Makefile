@@ -28,7 +28,7 @@ test:
 # Clean all compiled executables
 clean:
 	@echo "🧹 Cleaning all compiled executables..."
-	find . -type f -perm +111 -not -path "./.git/*" -delete 2>/dev/null || true
+	@find . -type f -perm +111 -not -path "./.git/*" -delete 2>/dev/null || true
 	@echo "✅ Cleanup complete"
 
 # Run all targets

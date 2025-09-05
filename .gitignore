@@ -1,3 +1,10 @@
+# Ignore compiled executables but keep important files
+*
+!*/
+!*.*
+!Makefile
+
+# Nim-specific ignores
 *~
 *.out
 nimcache/
