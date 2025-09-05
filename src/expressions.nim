@@ -34,7 +34,7 @@ type
                 left*, right*: ExpressionNode[T]
 
     AlgebraicExpression*[T] = ref object
-        positions*: PackedSet[int]
+        positions*: PackedSet[Natural]
         node*: ExpressionNode[T]
         linear*: bool
 
@@ -70,14 +70,14 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
 # AlgebraicExpression Creation
 
 func init*[T](expression: AlgebraicExpression[T],
-              positions: PackedSet[T],
+              positions: PackedSet[Natural],
               node: ExpressionNode[T],
               linear: bool) =
     expression.positions = positions
     expression.node = node
     expression.linear = linear
 
-func newAlgebraicExpression*[T](positions: PackedSet[T],
+func newAlgebraicExpression*[T](positions: PackedSet[Natural],
                                 node: ExpressionNode[T],
                                 linear: bool): AlgebraicExpression[T] =
     new(result)
@@ -158,16 +158,16 @@ type
     LinearCombination*[T] = ref object
         value*: T
         constant*: T
-        positions*: PackedSet[int]
+        positions*: PackedSet[Natural]
         coefficient*: Table[int, T]
         currentAssignment*: Table[int, T]
 
 # LinearCombinationState Creation
 
-func init*[T](state: LinearCombination[T], positions: openArray[T]) =
+func init*[T](state: LinearCombination[T], positions: openArray[Natural]) =
     state.value = 0
     state.constant = 0
-    state.positions = toPackedSet[int](positions)
+    state.positions = toPackedSet[Natural](positions)
     state.coefficient = initTable[int, T]()
     state.currentAssignment = initTable[int, T]()
 
@@ -177,7 +177,7 @@ func init*[T](state: LinearCombination[T], positions: openArray[T]) =
 func init*[T](state: LinearCombination[T], coefficients: Table[int, T], constant: T) =
     state.value = constant
     state.constant = constant
-    state.positions = initPackedSet[int]()
+    state.positions = initPackedSet[Natural]()
     state.coefficient = initTable[int, T]()
     state.currentAssignment = initTable[int, T]()
 
@@ -185,7 +185,7 @@ func init*[T](state: LinearCombination[T], coefficients: Table[int, T], constant
         state.positions.incl(pos)
         state.coefficient[pos] = coeff
 
-func newLinearCombination*[T](positions: openArray[int]): LinearCombination[T] =
+func newLinearCombination*[T](positions: openArray[Natural]): LinearCombination[T] =
     new(result)
     result.init(positions)
 
@@ -241,7 +241,7 @@ func linearize*[T](expression: AlgebraicExpression[T]): LinearCombination[T] =
     return newLinearCombination[T](coefficients, constant)
 
 func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
-    var positions = toPackedSet[int]([])
+    var positions = toPackedSet[Natural]([])
     var allRefs = true
     for exp in expressions:
         if exp.node.kind != RefNode:
@@ -258,17 +258,17 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
 type
     MinExpression*[T] = ref object
         value*: T
-        positions*: PackedSet[int]
+        positions*: PackedSet[Natural]
         currentAssignment*: Table[int, T]
 
 # MinExpression creation
 
-func init*[T](state: MinExpression[T], positions: openArray[T]) =
+func init*[T](state: MinExpression[T], positions: openArray[Natural]) =
     state.minValue = 0
-    state.positions = toPackedSet[int](positions)
+    state.positions = toPackedSet[Natural](positions)
     state.currentAssignment = initTable[int, T]()
 
-func newMinExpression*[T](positions: openArray[int]): MinExpression[T] =
+func newMinExpression*[T](positions: openArray[Natural]): MinExpression[T] =
     new(result)
     result.init(positions)
 
