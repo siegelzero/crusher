@@ -1,11 +1,10 @@
-import std/[sequtils, strutils, sets]
+import std/[sequtils, strutils, sets, unittest]
 import crusher
 
 proc validateMagicSquare(matrix: seq[seq[int]], n: int): bool =
     ## Validates that the given matrix is a valid n×n magic square
 
     let target = n * (n * n + 1) div 2
-    echo "🎯 Expected magic sum: ", target
 
     # Check dimensions
     if matrix.len != n:
@@ -64,136 +63,81 @@ proc validateMagicSquare(matrix: seq[seq[int]], n: int): bool =
         echo "❌ Anti-diagonal sum is ", diag2Sum, ", expected ", target
         return false
 
-    echo "✅ All magic square properties verified"
     return true
 
-proc testMagicSquareFoldl4x4(): bool =
-    ## Test solving a 4×4 magic square using foldl constraints and validate the solution
-    echo "🧪 Testing 4×4 Magic Square generation (foldl constraints)..."
+suite "Magic Square Tests":
+    test "4x4 Magic Square (foldl constraints)":
+        # Create constraint system (based on models/magicSquare.nim)
+        var sys = initConstraintSystem[int]()
+        var X = sys.newConstrainedMatrix(4, 4)
 
-    # Create constraint system (based on models/magicSquare.nim)
-    var sys = initConstraintSystem[int]()
-    var X = sys.newConstrainedMatrix(4, 4)
+        let target = 4 * (4 * 4 + 1) div 2  # = 34
 
-    let target = 4 * (4 * 4 + 1) div 2  # = 34
+        # Row sums == target (using foldl)
+        for row in X.rows():
+            sys.addConstraint(row.foldl(a + b) == target)
 
-    # Row sums == target (using foldl)
-    for row in X.rows():
-        sys.addConstraint(row.foldl(a + b) == target)
+        # Col sums == target (using foldl)
+        for col in X.columns():
+            sys.addConstraint(col.foldl(a + b) == target)
 
-    # Col sums == target (using foldl)
-    for col in X.columns():
-        sys.addConstraint(col.foldl(a + b) == target)
+        # Main diagonal
+        var terms: seq[AlgebraicExpression[int]] = @[]
+        for i in 0..<4:
+            terms.add(X[i, i])
+        sys.addConstraint(terms.foldl(a + b) == target)
 
-    # Main diagonal
-    var terms: seq[AlgebraicExpression[int]] = @[]
-    for i in 0..<4:
-        terms.add(X[i, i])
-    sys.addConstraint(terms.foldl(a + b) == target)
+        # Anti-diagonal
+        terms = @[]
+        for i in 0..<4:
+            terms.add(X[i, 4 - i - 1])
+        sys.addConstraint(terms.foldl(a + b) == target)
 
-    # Anti-diagonal
-    terms = @[]
-    for i in 0..<4:
-        terms.add(X[i, 4 - i - 1])
-    sys.addConstraint(terms.foldl(a + b) == target)
+        # All entries must be distinct
+        sys.addConstraint(allDifferent(X))
+        X.setDomain(toSeq(1..16))
 
-    # All entries must be distinct
-    sys.addConstraint(allDifferent(X))
-    X.setDomain(toSeq(1..16))
+        # Solve the constraint system
+        sys.resolve()
 
-    # Solve the constraint system
-    echo "⚡ Solving constraint system..."
-    sys.resolve()
+        # Extract solution matrix and validate
+        let solution = X.assignment
+        check validateMagicSquare(solution, 4)
 
-    # Extract solution matrix
-    let solution = X.assignment
+    test "4x4 Magic Square (Linear Combination constraints)":
+        # Create constraint system (based on models/magicSquareLC.nim)
+        var sys = initConstraintSystem[int]()
+        var X = sys.newConstrainedMatrix(4, 4)
 
-    # Display solution
-    echo "📋 Solution found:"
-    for i, row in solution:
-        echo "   ", row.mapIt($it).join("  ")
+        let target = 4 * (4 * 4 + 1) div 2  # = 34
 
-    # Validate the solution
-    echo "✅ Validating solution..."
-    return validateMagicSquare(solution, 4)
+        # Row sums == target (using sum - Linear Combination)
+        for row in X.rows():
+            sys.addConstraint(sum(row) == target)
 
-proc testMagicSquareLC4x4(): bool =
-    ## Test solving a 4×4 magic square using linear combination constraints and validate the solution
-    echo "🧪 Testing 4×4 Magic Square generation (Linear Combination constraints)..."
+        # Col sums == target (using sum - Linear Combination)
+        for col in X.columns():
+            sys.addConstraint(sum(col) == target)
 
-    # Create constraint system (based on models/magicSquareLC.nim)
-    var sys = initConstraintSystem[int]()
-    var X = sys.newConstrainedMatrix(4, 4)
+        # Main diagonal
+        var terms: seq[AlgebraicExpression[int]] = @[]
+        for i in 0..<4:
+            terms.add(X[i, i])
+        sys.addConstraint(sum(terms) == target)
 
-    let target = 4 * (4 * 4 + 1) div 2  # = 34
+        # Anti-diagonal
+        terms = @[]
+        for i in 0..<4:
+            terms.add(X[i, 4 - i - 1])
+        sys.addConstraint(sum(terms) == target)
 
-    # Row sums == target (using sum - Linear Combination)
-    for row in X.rows():
-        sys.addConstraint(sum(row) == target)
+        # All entries must be distinct
+        sys.addConstraint(allDifferent(X))
+        X.setDomain(toSeq(1..16))
 
-    # Col sums == target (using sum - Linear Combination)
-    for col in X.columns():
-        sys.addConstraint(sum(col) == target)
+        # Solve the constraint system
+        sys.resolve()
 
-    # Main diagonal
-    var terms: seq[AlgebraicExpression[int]] = @[]
-    for i in 0..<4:
-        terms.add(X[i, i])
-    sys.addConstraint(sum(terms) == target)
-
-    # Anti-diagonal
-    terms = @[]
-    for i in 0..<4:
-        terms.add(X[i, 4 - i - 1])
-    sys.addConstraint(sum(terms) == target)
-
-    # All entries must be distinct
-    sys.addConstraint(allDifferent(X))
-    X.setDomain(toSeq(1..16))
-
-    # Solve the constraint system
-    echo "⚡ Solving constraint system..."
-    sys.resolve()
-
-    # Extract solution matrix
-    let solution = X.assignment
-
-    # Display solution
-    echo "📋 Solution found:"
-    for i, row in solution:
-        echo "   ", row.mapIt($it).join("  ")
-
-    # Validate the solution
-    echo "✅ Validating solution..."
-    return validateMagicSquare(solution, 4)
-
-proc main() =
-    echo "🚀 Starting Magic Square Tests"
-    echo "==============================="
-
-    var allSuccess = true
-
-    echo ""
-    echo "📋 Test 1/2: Magic Square (foldl constraints)"
-    echo "=============================================="
-    let foldlSuccess = testMagicSquareFoldl4x4()
-    if not foldlSuccess:
-        allSuccess = false
-
-    echo ""
-    echo "📋 Test 2/2: Magic Square (Linear Combination constraints)"
-    echo "=========================================================="
-    let lcSuccess = testMagicSquareLC4x4()
-    if not lcSuccess:
-        allSuccess = false
-
-    echo ""
-    if allSuccess:
-        echo "✅ All magic square tests passed!"
-        quit(0)
-    else:
-        echo "❌ Some magic square tests failed!"
-        quit(1)
-
-when isMainModule:
-    main()
+        # Extract solution matrix and validate
+        let solution = X.assignment
+        check validateMagicSquare(solution, 4)

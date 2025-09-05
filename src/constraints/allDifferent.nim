@@ -13,13 +13,12 @@ type
 
     AllDifferentConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
+        countTable: Table[T, int]
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                count: seq[int]
                 positions: PackedSet[Natural]
             of ExpressionBased:
-                countTable: Table[T, int]
                 expressions: seq[AlgebraicExpression[T]]
                 expressionsAtPosition: Table[int, seq[int]]
 
@@ -34,7 +33,7 @@ func newAllDifferentConstraint*[T](positions: openArray[Natural] ): AllDifferent
         cost: 0,
         evalMethod: PositionBased,
         positions: toPackedSet[Natural](positions),
-        count: newSeq[int](),
+        countTable: initTable[T, int](),
         currentAssignment: initTable[int, T](),
     )
 
@@ -62,15 +61,7 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
 ################################################################################
 
 func getCount[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
-    case state.evalMethod:
-        of PositionBased:
-            if value >= state.count.len:
-                # Extend count seq with 0s if necessary
-                state.count &= repeat(0, value - state.count.len + 1)
-                return 0
-            return state.count[value]
-        of ExpressionBased:
-            return state.countTable.getOrDefault(value)
+    return state.countTable.getOrDefault(value, 0)
 
 
 func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
@@ -78,27 +69,15 @@ func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.}
 
 
 func decrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
-    case state.evalMethod:
-        of PositionBased:
-            state.count[value] -= 1
-        of ExpressionBased:
-            state.countTable[value] -= 1
+    if value in state.countTable:
+        state.countTable[value] -= 1
 
 
 func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
-    case state.evalMethod:
-        of PositionBased:
-            if value < state.count.len:
-                state.count[value] += 1
-            else:
-                # Extend count seq with 0s if needed
-                state.count &= repeat(0, value - state.count.len + 1)
-                state.count[value] = 1
-        of ExpressionBased:
-            if value in state.countTable:
-                state.countTable[value] += 1
-            else:
-                state.countTable[value] = 1
+    if value in state.countTable:
+        state.countTable[value] += 1
+    else:
+        state.countTable[value] = 1
 
 
 proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
@@ -123,9 +102,6 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
                 state.currentAssignment[pos] = value
                 state.incrementCount(value)
 
-            for count in state.count:
-                state.cost += max(0, count - 1)
-
         of ExpressionBased:
             for pos in state.expressionsAtPosition.keys:
                 state.currentAssignment[pos] = assignment[pos]
@@ -134,8 +110,9 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
                 value = exp.evaluate(state.currentAssignment)
                 state.incrementCount(value)
 
-            for value, count in state.countTable.pairs:
-                state.cost += max(0, count - 1)
+    # Calculate cost from count table for both methods
+    for value, count in state.countTable.pairs:
+        state.cost += max(0, count - 1)
 
 
 proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =

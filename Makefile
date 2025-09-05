@@ -10,25 +10,20 @@ help:
 	@echo ""
 	@echo "Available targets:"
 	@echo "  help     - Show this help message"
-	@echo "  test     - Compile and run all tests"
+	@echo "  test     - Auto-discover and run all test_*.nim files in tests/"
 	@echo "  clean    - Clean all compiled executables"
 	@echo "  all      - Run all targets (currently just test)"
 	@echo ""
 
-# Main test target - runs all tests
 test:
-	@echo "🚀 Compiling and running all Crusher tests..."
-	@echo "=============================================="
-	@echo ""
-	@echo "📋 Test 1/2: Latin Square (4x4)"
-	nim c --path:./src tests/test_latin_square.nim
-	./tests/test_latin_square
-	@echo ""
-	@echo "📋 Test 2/2: Magic Square (both constraint types)"
-	nim c --path:./src tests/test_magic_square.nim
-	./tests/test_magic_square
-	@echo ""
-	@echo "🎉 All tests completed successfully!"
+	@echo "🚀 Auto-discovering and running all test files..."
+	@echo "================================================"
+	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
+		echo "Running $$test_file..."; \
+		nim c -r --path:./src $$test_file || exit 1; \
+		echo ""; \
+	done
+	@echo "✅ All tests completed successfully!"
 
 # Clean all compiled executables
 clean:

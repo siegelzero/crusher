@@ -13,7 +13,7 @@ type
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
         constraints*: seq[StatefulConstraint[T]]
         neighbors*: seq[seq[Natural]]
-        penaltyMap*: seq[seq[int]]
+        penaltyMap*: seq[Table[T, int]]
         reducedDomain*: seq[seq[T]]
 
         assignment*: seq[T]
@@ -23,7 +23,7 @@ type
         bestCost*: int
 
         iteration*: int
-        tabu*: seq[seq[int]]
+        tabu*: seq[Table[T, int]]
         tenure*: int
 
 ################################################################################
@@ -78,10 +78,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     state.reducedDomain = reduceDomain(state.carray)
 
     state.iteration = 0
-    state.tabu = newSeq[seq[int]](carray.len)
+    state.tabu = newSeq[Table[T, int]](carray.len)
 
     for pos in carray.allPositions():
-        state.tabu[pos] = newSeq[int](max(state.reducedDomain[pos]) + 1)
+        state.tabu[pos] = initTable[T, int]()
 
     # Group constraints involving each position
     for constraint in carray.constraints:
@@ -115,9 +115,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     state.bestAssignment = state.assignment
 
     # Construct penalty map for each location and value
-    state.penaltyMap = newSeq[seq[int]](state.carray.len)
+    state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
     for pos in state.carray.allPositions():
-        state.penaltyMap[pos] = newSeq[int](max(state.reducedDomain[pos]) + 1)
+        state.penaltyMap[pos] = initTable[T, int]()
 
     for pos in state.carray.allPositions():
         state.updatePenaltiesForPosition(pos)
@@ -134,8 +134,8 @@ proc newTabuState*[T](carray: ConstrainedArray[T]): TabuState[T] =
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Updates current assignment of state by setting value to the position
-    let penalty = state.penaltyMap[position][state.assignment[position]]
-    let delta = state.penaltyMap[position][value] - penalty
+    let penalty = state.penaltyMap[position].getOrDefault(state.assignment[position], 0)
+    let delta = state.penaltyMap[position].getOrDefault(value, 0) - penalty
     # Update assignment
     state.assignment[position] = value
 

@@ -17,17 +17,17 @@ proc bestMoves[T](state: TabuState[T]): seq[(Natural, T)] =
 
     for position in state.carray.allPositions():
         oldValue = state.assignment[position]
-        oldPenalty = state.penaltyMap[position][oldValue]
+        oldPenalty = state.penaltyMap[position].getOrDefault(oldValue, 0)
         if oldPenalty == 0:
             continue
 
         for newValue in state.reducedDomain[position]:
             if newValue == oldValue:
                 continue
-            delta = state.penaltyMap[position][newValue] - oldPenalty
+            delta = state.penaltyMap[position].getOrDefault(newValue, 0) - oldPenalty
             # Allow the move if the new value is not tabu for the position
             # or if the new improved cost is better than the best seen so far (aspiration criterion)
-            if state.tabu[position][newValue] <= state.iteration or state.cost + delta < state.bestCost:
+            if state.tabu[position].getOrDefault(newValue, 0) <= state.iteration or state.cost + delta < state.bestCost:
                 if state.cost + delta < bestMoveCost:
                     result = @[(position, newValue)]
                     bestMoveCost = state.cost + delta

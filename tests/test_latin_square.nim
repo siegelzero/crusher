@@ -1,4 +1,4 @@
-import std/[sequtils, strutils, sets]
+import std/[sequtils, strutils, sets, unittest]
 import crusher
 
 proc validateLatinSquare(matrix: seq[seq[int]], n: int): bool =
@@ -45,58 +45,33 @@ proc validateLatinSquare(matrix: seq[seq[int]], n: int): bool =
     
     return true
 
-proc testLatinSquare4x4(): bool =
-    ## Test solving a 4×4 latin square and validate the solution
-    echo "🧪 Testing 4×4 Latin Square generation..."
+suite "Latin Square Tests":
+    test "4x4 Latin Square generation":
+        # Create constraint system (based on models/latinSquare.nim)
+        var sys = initConstraintSystem[int]()
+        var X = sys.newConstrainedMatrix(4, 4)
+        X.setDomain(toSeq(0..<4))
 
-    # Create constraint system (based on models/latinSquare.nim)
-    var sys = initConstraintSystem[int]()
-    var X = sys.newConstrainedMatrix(4, 4)
-    X.setDomain(toSeq(0..<4))
+        # Add constraints
+        for row in X.rows():
+            sys.addConstraint(allDifferent(row))
 
-    # Add constraints
-    for row in X.rows():
-        sys.addConstraint(allDifferent(row))
+        for col in X.columns():
+            sys.addConstraint(allDifferent(col))
 
-    for col in X.columns():
-        sys.addConstraint(allDifferent(col))
+        # First row in order 0 1 2 3
+        for i in 0..<4:
+            sys.addConstraint(X[0, i] == i)
 
-    # First row in order 0 1 2 3
-    for i in 0..<4:
-        sys.addConstraint(X[0, i] == i)
+        # First col in order 0 1 2 3
+        for i in 0..<4:
+            sys.addConstraint(X[i, 0] == i)
 
-    # First col in order 0 1 2 3
-    for i in 0..<4:
-        sys.addConstraint(X[i, 0] == i)
+        # Solve the constraint system
+        sys.resolve()
 
-    # Solve the constraint system
-    echo "⚡ Solving constraint system..."
-    sys.resolve()
+        # Extract solution matrix using the assignment method on ConstrainedMatrix
+        let solution = X.assignment
 
-    # Extract solution matrix using the assignment method on ConstrainedMatrix
-    let solution = X.assignment
-
-    # Display solution
-    echo "📋 Solution found:"
-    for i, row in solution:
-        echo "   ", row.join(" ")
-
-    # Validate the solution
-    echo "✅ Validating solution..."
-    return validateLatinSquare(solution, 4)
-
-proc main() =
-    echo "🚀 Starting Latin Square Tests"
-    echo "================================"
-
-    let success = testLatinSquare4x4()
-
-    if success:
-        echo "✅ All tests passed!"
-        quit(0)
-    else:
-        echo "❌ Tests failed!"
-        quit(1)
-
-when isMainModule:
-    main()
+        # Validate the solution
+        check validateLatinSquare(solution, 4)
