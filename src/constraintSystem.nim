@@ -80,8 +80,10 @@ func `[]`*[T](cvar: ConstrainedSequence[T], i: int): AlgebraicExpression[T] {.in
 func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
-func positions[T](cvar: VariableContainer[T]): seq[int] =
-    toSeq cvar.offset..<(cvar.offset + cvar.size)
+func positions[T](cvar: VariableContainer[T]): seq[Natural] =
+    result = newSeq[Natural](cvar.size)
+    for i in 0..<cvar.size:
+        result[i] = Natural(cvar.offset + i)
 
 func assignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
     cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]

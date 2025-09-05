@@ -16,7 +16,7 @@ type
         AlgebraicType
 
     StatefulConstraint*[T] = object
-        positions*: PackedSet[int]
+        positions*: PackedSet[Natural]
         case stateType*: StatefulConstraintType
             of AllDifferentType:
                 allDifferentState*: AllDifferentConstraint[T]
@@ -73,17 +73,17 @@ LCValRel(`<`, LessThan)
 LCValRel(`<=`, LessThanEq)
 
 
-func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
+func allDifferent*[T](positions: openArray[Natural]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given positions.
     return StatefulConstraint[T](
-        positions: toPackedSet[int](positions),
+        positions: toPackedSet[Natural](positions),
         stateType: AllDifferentType,
         allDifferentState: newAllDifferentConstraint[T](positions)
     )
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given expressions.
-    var positions = toPackedSet[int]([])
+    var positions = toPackedSet[Natural]([])
     var allRefs = true
     for exp in expressions:
         if exp.node.kind != RefNode:

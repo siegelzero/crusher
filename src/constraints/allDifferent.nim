@@ -17,7 +17,7 @@ type
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 count: seq[int]
-                positions: PackedSet[int]
+                positions: PackedSet[Natural]
             of ExpressionBased:
                 countTable: Table[T, int]
                 expressions: seq[AlgebraicExpression[T]]
@@ -27,13 +27,13 @@ type
 # AllDifferentConstraint creation
 ################################################################################
 
-func newAllDifferentConstraint*[T](positions: openArray[T] ): AllDifferentConstraint[T] =
+func newAllDifferentConstraint*[T](positions: openArray[Natural] ): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
     new(result)
     result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: PositionBased,
-        positions: toPackedSet[int](positions),
+        positions: toPackedSet[Natural](positions),
         count: newSeq[int](),
         currentAssignment: initTable[int, T](),
     )

@@ -12,7 +12,7 @@ type
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
         constraints*: seq[StatefulConstraint[T]]
-        neighbors*: seq[seq[int]]
+        neighbors*: seq[seq[Natural]]
         penaltyMap*: seq[seq[int]]
         reducedDomain*: seq[seq[T]]
 
@@ -46,7 +46,7 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 # Penalty Map Routines
 ################################################################################
 
-proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
+proc updatePenaltiesForPosition[T](state: TabuState[T], position: Natural) =
     # Computes penalties for all constraints involving the position, and updates penalty map
     var penalty: int
     for value in state.reducedDomain[position]:
@@ -56,7 +56,7 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
         state.penaltyMap[position][value] = penalty
 
 
-proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
+proc updateNeighborPenalties*[T](state: TabuState[T], position: Natural) =
     # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
         state.updatePenaltiesForPosition(nbr)
@@ -74,7 +74,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state TabuState[T]
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
-    state.neighbors = newSeq[seq[int]](carray.len)
+    state.neighbors = newSeq[seq[Natural]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 
     state.iteration = 0
@@ -90,7 +90,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
             state.constraintsAtPosition[pos].add(constraint)
     
     # Collect neighbors of each position
-    var neighborSet: PackedSet[int] = toPackedSet[int]([])
+    var neighborSet: PackedSet[Natural] = toPackedSet[Natural]([])
     for pos in carray.allPositions():
         neighborSet.clear()
         for constraint in state.constraintsAtPosition[pos]:

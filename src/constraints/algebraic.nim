@@ -12,7 +12,7 @@ type
         # Constraint stored as an expression tree on the given positions.
         # Evaluation of the constraint requires evaluating the tree.
         # This constraint form has no state; i.e. no assignment to the variables.
-        positions*: PackedSet[int]
+        positions*: PackedSet[Natural]
         node*: ConstraintNode[T]
 
     StatefulAlgebraicConstraint*[T] = ref object
@@ -22,7 +22,7 @@ type
         currentAssignment*: Table[int, T]
         cost*: int
         constraint*: AlgebraicConstraint[T]
-        positions: PackedSet[int]
+        positions: PackedSet[Natural]
 
 ################################################################################
 # Unary Constraint Relations
