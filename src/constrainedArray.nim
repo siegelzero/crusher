@@ -69,11 +69,11 @@ func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
 func setDomain*[T](arr: var ConstrainedArray[T], domain: openArray[T]) =
     # Sets domain of all positions to the given values.
     for position in arr.allPositions():
-        arr.domain[position] = toSeq[T](domain)
+        arr.domain[position] = toSeq(domain)
 
 func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArray[T]) =
     # Sets domain of position to the given values.
-    arr.domain[position] = toSeq[T](domain)
+    arr.domain[position] = toSeq(domain)
 
 func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.} =
     allDifferent(toSeq arr.allPositions())

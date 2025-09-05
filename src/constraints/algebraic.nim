@@ -90,7 +90,7 @@ template ExpValRel(rel, relEnum: untyped) =
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
         )
-    func `rel`*[T](left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    func `rel`*[T: not ref](left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
         AlgebraicConstraint[T](
             positions: right.positions,
             node: ConstraintNode[T](

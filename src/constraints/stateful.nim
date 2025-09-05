@@ -92,7 +92,7 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
     
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return allDifferent[T](toSeq[int](positions))
+        return allDifferent[T](toSeq(positions))
     else:
         return StatefulConstraint[T](
             positions: positions,

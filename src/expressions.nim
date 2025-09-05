@@ -249,7 +249,7 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): LinearCombination[T] =
         positions.incl(exp.positions)
     
     doAssert allRefs
-    return newLinearCombination[T](toSeq[int](positions))
+    return newLinearCombination[T](toSeq(positions))
 
 ################################################################################
 # Type definitions for MinExpression

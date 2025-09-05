@@ -8,10 +8,10 @@ type NoSolutionFoundError* = object of CatchableError
 
 
 proc resolve*[T](system: ConstraintSystem[T],
-                 parallel=true,
+                 parallel=false,
                  tabuThreshold=10000,
                  maxAttempts=1000,
-                 attemptThreshold=100) = 
+                 attemptThreshold=100) =
     
     if not parallel:
         var improved = system.baseArray.tabuImprove(tabuThreshold)
