@@ -1,9 +1,6 @@
 import std/[sequtils, strformat]
 
-import constraints/constraint
-import expressions/expression
-import constrainedArray
-import constraintSystem
+import crusher
 
 
 proc sendMoreMoney*(): ConstraintSystem[int] =

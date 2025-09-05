@@ -7,7 +7,7 @@ import constraintNode
 
 type
     LinearConstraint*[T] = ref object
-        lincomb: LinearCombination[T]
+        lincomb*: LinearCombination[T]
         relation*: BinaryRelation
         target*: T
         cost*: int
@@ -48,5 +48,7 @@ func updatePosition*[T](state: LinearConstraint[T], position: int, newValue: T) 
 
 proc moveDelta*[T](state: LinearConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
     # Returns cost delta for changing position from oldValue to newValue.
+    let oldCost = state.relation.penalty(state.lincomb.value, state.target)
     let delta = state.lincomb.moveDelta(position, oldValue, newValue)
-    return state.relation.penalty(state.lincomb.value + delta, state.target)
+    let newCost = state.relation.penalty(state.lincomb.value + delta, state.target)
+    return newCost - oldCost

@@ -22,7 +22,7 @@ type
         currentAssignment*: Table[int, T]
         cost*: int
         constraint*: AlgebraicConstraint[T]
-        positions: PackedSet[int]
+        positions*: PackedSet[int]
 
 ################################################################################
 # Unary Constraint Relations
@@ -70,6 +70,7 @@ template ExpExpRel(rel, relEnum: untyped) =
         )
 
 ExpExpRel(`==`, EqualTo)
+ExpExpRel(`!=`, NotEqualTo)
 ExpExpRel(`>`, GreaterThan)
 ExpExpRel(`>=`, GreaterThanEq)
 ExpExpRel(`<`, LessThan)
@@ -90,7 +91,7 @@ template ExpValRel(rel, relEnum: untyped) =
                 right: ExpressionNode[T](kind: LiteralNode, value: right)
             )
         )
-    func `rel`*[T](left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    func `rel`*[T: not ref](left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
         AlgebraicConstraint[T](
             positions: right.positions,
             node: ConstraintNode[T](
@@ -102,6 +103,7 @@ template ExpValRel(rel, relEnum: untyped) =
         )
 
 ExpValRel(`==`, EqualTo)
+ExpValRel(`!=`, NotEqualTo)
 ExpValRel(`>`, GreaterThan)
 ExpValRel(`>=`, GreaterThanEq)
 ExpValRel(`<`, LessThan)
@@ -185,3 +187,134 @@ func coPrime*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.
             right: right.node
         )
     )
+
+################################################################################
+# Logical Binary Constraint Relations
+################################################################################
+
+func `and`*[T](left, right: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: left.positions + right.positions,
+        node: ConstraintNode[T](
+            kind: LogicalBinaryRelNode,
+            logicalBinaryRel: And,
+            leftConstraint: left.node,
+            rightConstraint: right.node
+        )
+    )
+
+func `or`*[T](left, right: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: left.positions + right.positions,
+        node: ConstraintNode[T](
+            kind: LogicalBinaryRelNode,
+            logicalBinaryRel: Or,
+            leftConstraint: left.node,
+            rightConstraint: right.node
+        )
+    )
+
+################################################################################
+# Reified Constraints
+################################################################################
+
+func reify*[T](boolVar: AlgebraicExpression[T], constraint: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
+    # Returns reified constraint: boolVar ↔ constraint
+    # Implemented as: (boolVar == 1 AND constraint) OR (boolVar == 0 AND NOT constraint)
+    let boolTrue = boolVar == 1
+    let boolFalse = boolVar == 0
+    return (boolTrue and constraint) or (boolFalse and not constraint)
+
+template ReifyExpExpRel(reifyFunc, rel, relEnum: untyped) =
+    # Template for reified xRy for x, y Algebraic Expressions and R a binary relation
+    func `reifyFunc`*[T](boolVar: AlgebraicExpression[T], left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+        let constraint = `rel`(left, right)
+        return reify(boolVar, constraint)
+
+template ReifyExpValRel(reifyFunc, rel, relEnum: untyped) =
+    # Template for reified xRy for x Algebraic Expression, y value and R a binary relation
+    func `reifyFunc`*[T](boolVar: AlgebraicExpression[T], left: AlgebraicExpression[T], right: T): AlgebraicConstraint[T] {.inline.} =
+        let constraint = `rel`(left, right)
+        return reify(boolVar, constraint)
+    func `reifyFunc`*[T: not ref](boolVar: AlgebraicExpression[T], left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+        let constraint = `rel`(left, right)
+        return reify(boolVar, constraint)
+
+ReifyExpExpRel(reifyEq, `==`, EqualTo)
+ReifyExpExpRel(reifyNe, `!=`, NotEqualTo)
+ReifyExpExpRel(reifyGt, `>`, GreaterThan)
+ReifyExpExpRel(reifyGe, `>=`, GreaterThanEq)
+ReifyExpExpRel(reifyLt, `<`, LessThan)
+ReifyExpExpRel(reifyLe, `<=`, LessThanEq)
+
+ReifyExpValRel(reifyEq, `==`, EqualTo)
+ReifyExpValRel(reifyNe, `!=`, NotEqualTo)
+ReifyExpValRel(reifyGt, `>`, GreaterThan)
+ReifyExpValRel(reifyGe, `>=`, GreaterThanEq)
+ReifyExpValRel(reifyLt, `<`, LessThan)
+ReifyExpValRel(reifyLe, `<=`, LessThanEq)
+
+func divisibleBy*[T](dividend, divisor: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: dividend.positions + divisor.positions,
+        node: ConstraintNode[T](
+            kind: BinaryRelNode,
+            binaryRel: DivisibleBy,
+            left: dividend.node,
+            right: divisor.node
+        )
+    )
+
+func divisibleBy*[T](dividend: AlgebraicExpression[T], divisor: T): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: dividend.positions,
+        node: ConstraintNode[T](
+            kind: BinaryRelNode,
+            binaryRel: DivisibleBy,
+            left: dividend.node,
+            right: ExpressionNode[T](kind: LiteralNode, value: divisor)
+        )
+    )
+
+func commonFactor*[T](left: AlgebraicExpression[T], right: T): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: left.positions,
+        node: ConstraintNode[T](
+            kind: BinaryRelNode,
+            binaryRel: CommonFactor,
+            left: left.node,
+            right: ExpressionNode[T](kind: LiteralNode, value: right)
+        )
+    )
+
+func modulo*[T](dividend, divisor, remainder: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
+    AlgebraicConstraint[T](
+        positions: dividend.positions + divisor.positions + remainder.positions,
+        node: ConstraintNode[T](
+            kind: TernaryRelNode,
+            ternaryRel: Modulo,
+            first: dividend.node,
+            second: divisor.node,
+            third: remainder.node
+        )
+    )
+
+template OrderingRel(relName, relEnum: untyped) =
+    ## Template for ordering relations on sequences of expressions
+    func `relName`*[T](expressions: seq[AlgebraicExpression[T]]): seq[AlgebraicConstraint[T]] =
+        result = @[]
+        for i in 0..<expressions.len-1:
+            result.add(AlgebraicConstraint[T](
+                positions: expressions[i].positions + expressions[i+1].positions,
+                node: ConstraintNode[T](
+                    kind: BinaryRelNode,
+                    binaryRel: relEnum,
+                    left: expressions[i].node,
+                    right: expressions[i+1].node
+                )
+            ))
+
+OrderingRel(increasing, LessThanEq)
+OrderingRel(strictlyIncreasing, LessThan)
+OrderingRel(decreasing, GreaterThanEq)
+OrderingRel(strictlyDecreasing, GreaterThan)
