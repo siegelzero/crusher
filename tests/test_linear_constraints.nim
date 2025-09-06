@@ -15,7 +15,7 @@ suite "Linear Constraint Tests":
             simpleTerms.add(x[i])  # RefNodes only -> position-based optimization
         sys.addConstraint(sum(simpleTerms) == 9)
 
-        # Expression-based constraint: multi-variable summands  
+        # Expression-based constraint: multi-variable summands
         # This should trigger expression-based mode due to complex terms
         var complexTerms: seq[AlgebraicExpression[int]] = @[]
         complexTerms.add(x[0] + x[1])    # Multi-variable term: positions {0,1}
@@ -28,11 +28,11 @@ suite "Linear Constraint Tests":
 
         # Extract and validate solution
         let solution = x.assignment
-        
+
         # Validate position-based constraint: x[0] + x[1] + x[2] == 9
         let sumCheck = solution[0] + solution[1] + solution[2]
         check sumCheck == 9
-        
+
         # Validate expression-based constraint: (x[0] + x[1]) + (x[1] - x[2]) + (2*x[0]) <= 12
         let complexSum = (solution[0] + solution[1]) + (solution[1] - solution[2]) + (2 * solution[0])
         check complexSum <= 12
@@ -40,7 +40,7 @@ suite "Linear Constraint Tests":
     test "Direct SumExpression Constructor Tests":
         # Test the direct SumExpression constructors
         var sys = initConstraintSystem[int]()
-        var x = sys.newConstrainedSequence(3) 
+        var x = sys.newConstrainedSequence(3)
         x.setDomain(toSeq(0..5))
 
         # Position-based: unit coefficients using position array
@@ -50,7 +50,7 @@ suite "Linear Constraint Tests":
         # Expression-based: custom coefficients using coefficient table
         var coeffs = initTable[int, int]()
         coeffs[0] = 3   # 3*x[0]
-        coeffs[1] = 1   # 1*x[1] 
+        coeffs[1] = 1   # 1*x[1]
         coeffs[2] = -1  # -1*x[2]
         let coefficientBased = newSumExpression[int](coeffs, 0)  # No constant term
         sys.addConstraint(coefficientBased <= 12)
@@ -60,7 +60,7 @@ suite "Linear Constraint Tests":
 
         # Extract and validate solution
         let solution = x.assignment
-        
+
         # Validate constraints
         check solution[0] + solution[1] + solution[2] == 9
         check 3 * solution[0] + solution[1] - solution[2] <= 12

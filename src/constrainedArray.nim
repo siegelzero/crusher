@@ -79,7 +79,7 @@ func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.
     allDifferent(toSeq arr.allPositions())
 
 proc addBaseConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstraint[T]) {.inline.} =
-    # Adds the constraint to the 
+    # Adds the constraint to the
     arr.constraints.add(cons)
 
 ################################################################################
@@ -104,9 +104,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if cons.penalty() > 0:
                 # echo "Excluding ", d, " from ", pos
                 currentDomain[pos].excl(d)
-    
+
     for pos in carray.allPositions():
         reduced[pos] = toSeq(currentDomain[pos])
-    
+
     return reduced
 

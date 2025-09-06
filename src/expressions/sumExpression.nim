@@ -29,7 +29,7 @@ func newSumExpression*[T](positions: openArray[Natural]): SumExpression[T] =
         evalMethod: PositionBased,
         coefficient: initTable[int, T]()
     )
-    
+
     for pos in positions:
         result.coefficient[pos] = 1
 
@@ -38,14 +38,14 @@ func newSumExpression*[T](positions: openArray[int]): SumExpression[T] =
     var naturalPositions = newSeq[Natural](positions.len)
     for i, pos in positions:
         naturalPositions[i] = Natural(pos)
-    
+
     return newSumExpression[T](naturalPositions)
 
 func newSumExpression*[T](coefficients: Table[int, T], constant: T = 0): SumExpression[T] =
     var positions = initPackedSet[Natural]()
     for pos in coefficients.keys:
         positions.incl(pos)
-    
+
     result = SumExpression[T](
         value: constant,
         constant: constant,
@@ -58,7 +58,7 @@ func newSumExpression*[T](coefficients: Table[int, T], constant: T = 0): SumExpr
 func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
     var positions = initPackedSet[Natural]()
     var expressionsAtPosition = initTable[int, seq[int]]()
-    
+
     # Build position to expression mapping
     for i, exp in expressions:
         for pos in exp.positions:
@@ -67,7 +67,7 @@ func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpressi
                 expressionsAtPosition[pos].add(i)
             else:
                 expressionsAtPosition[pos] = @[i]
-    
+
     result = SumExpression[T](
         value: 0,
         constant: 0,
@@ -83,17 +83,17 @@ func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpressi
 func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
     # Initialize the Sum Expression with the given assignment, and updates the value.
     state.value = state.constant
-    
+
     # Store current assignment for all positions
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-    
+
     case state.evalMethod:
         of PositionBased:
             # For position-based: sum coefficient[pos] * assignment[pos]
             for pos in state.positions:
                 state.value += state.coefficient[pos] * assignment[pos]
-        
+
         of ExpressionBased:
             # For expression-based: evaluate and sum all expressions
             for exp in state.expressions:
@@ -103,13 +103,13 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
 func evaluate*[T](expression: SumExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     # Computes the value of the Sum Expression given the variable assignment.
     result = expression.constant
-    
+
     case expression.evalMethod:
         of PositionBased:
             # For position-based: sum coefficient[pos] * assignment[pos]
             for pos in expression.positions:
                 result += expression.coefficient[pos] * assignment[pos]
-        
+
         of ExpressionBased:
             # For expression-based: evaluate and sum all expressions
             for exp in expression.expressions:
@@ -124,23 +124,23 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
     # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
-    
+
     case state.evalMethod:
         of PositionBased:
             # For position-based: simple coefficient-based update
             state.value += state.coefficient[position] * (newValue - oldValue)
-        
+
         of ExpressionBased:
             # For expression-based: re-evaluate affected expressions
             for i in state.expressionsAtPosition[position]:
                 # Subtract old expression value
                 state.currentAssignment[position] = oldValue
                 let oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
-                
+
                 # Add new expression value
                 state.currentAssignment[position] = newValue
                 let newExpValue = state.expressions[i].evaluate(state.currentAssignment)
-                
+
                 state.value += (newExpValue - oldExpValue)
 
 func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
@@ -149,21 +149,21 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
         of PositionBased:
             # For position-based: simple coefficient calculation
             return state.coefficient[position] * (newValue - oldValue)
-        
+
         of ExpressionBased:
             # For expression-based: calculate delta from affected expressions
             result = 0
             var tempAssignment = state.currentAssignment
-            
+
             for i in state.expressionsAtPosition[position]:
                 # Calculate old expression value
                 tempAssignment[position] = oldValue
                 let oldExpValue = state.expressions[i].evaluate(tempAssignment)
-                
-                # Calculate new expression value  
+
+                # Calculate new expression value
                 tempAssignment[position] = newValue
                 let newExpValue = state.expressions[i].evaluate(tempAssignment)
-                
+
                 result += (newExpValue - oldExpValue)
 
 func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
@@ -190,7 +190,7 @@ func sum*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
         if exp.node.kind != RefNode:
             allRefs = false
         positions.incl(exp.positions)
-    
+
     if allRefs:
         # Use more efficient position-based constraint if all expressions are RefNodes
         return newSumExpression[T](toSeq(positions))

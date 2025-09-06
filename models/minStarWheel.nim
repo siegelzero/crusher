@@ -16,7 +16,7 @@ proc star(n: int): seq[int] =
             break
         for pk in countup(p, bound, p):
             bits[pk] = true
-        
+
         bits[pn] = false
         var count = 0
         var psum = 0
@@ -32,7 +32,7 @@ proc star(n: int): seq[int] =
                         best = pn + psum
                         result = terms
                     break
-        
+
         bits[pn] = true
 
 

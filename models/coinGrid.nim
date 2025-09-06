@@ -14,13 +14,13 @@ proc coingrid*(n, c: int) =
         for e in column:
             terms.add(e)
         sys.addConstraint(foldl(terms, a + b) == c)
-    
+
     for row in X.rows():
         terms = @[]
         for e in row:
             terms.add(e)
         sys.addConstraint(foldl(terms, a + b) == c)
-    
+
     var objectiveTerms: seq[AlgebraicExpression[int]]
     for i in 0..<n:
         for j in 0..<n:

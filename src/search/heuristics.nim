@@ -18,7 +18,7 @@ iterator parallelSearch*[T](carray: ConstrainedArray[T], threshold: int, maxJobs
     for i in 0..<N:
         jobs[i] = spawn carray.tabuImprove(threshold)
         jobCount += 1
-    
+
     # Yield each as it completes
     var result: TabuState[T]
     var idx: int
@@ -64,7 +64,7 @@ proc hybrid*[T](carray: ConstrainedArray[T], threshold, popSize, generations: in
         if improved.cost == 0:
             return improved
         population.add(improved)
-    
+
     echo fmt"Have population {population.len}"
     var nextGeneration: seq[TabuState[T]]
     var improved, offspring: TabuState[T]

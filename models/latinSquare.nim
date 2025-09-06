@@ -11,10 +11,10 @@ proc latinSquare*(n: int) =
 
     for row in X.rows():
         sys.addConstraint(allDifferent(row))
-    
+
     for col in X.columns():
         sys.addConstraint(allDifferent(col))
-        
+
     # First row in order 0 1 2...
     for i in 0..<n:
         sys.addConstraint(X[0, i] == i)

@@ -16,7 +16,7 @@ proc mip*() =
     let objective = linearize(5*x[0] + 7*x[1] + 10*x[2] + 3*x[3] + x[4])
     sys.minimize(objective, parallel=false)
     echo fmt"Found assignment: {sys.assignment}"
-    
+
     doAssert x.assignment == @[0, 1, 1, 0, 0]
     doAssert objective.evaluate(x.assignment) == 17
 

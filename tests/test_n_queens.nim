@@ -34,7 +34,7 @@ proc validateNQueensSolution(solution: seq[int], n: int): bool =
             return false
         usedMainDiagonals.incl(diagonalId)
 
-    # Check anti-diagonal conflicts: no two queens on same anti-diagonal  
+    # Check anti-diagonal conflicts: no two queens on same anti-diagonal
     # Two queens are on same anti-diagonal if solution[i] + i == solution[j] + j
     var usedAntiDiagonals = initHashSet[int]()
     for i, col in solution:
@@ -68,7 +68,7 @@ suite "N-Queens Tests":
         sys.addConstraint(allDifferent(terms))
 
         # Anti-diagonal constraint: no two queens on same anti-diagonal
-        # Uses expression-based constraints with x[i] + i  
+        # Uses expression-based constraints with x[i] + i
         terms.reset()
         for i in 0..<4:
             terms.add(x[i] + i)

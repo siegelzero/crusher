@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test clean all
+.PHONY: help test clean all format
 
 # Default target
 help:
@@ -12,6 +12,7 @@ help:
 	@echo "  help     - Show this help message"
 	@echo "  test     - Auto-discover and run all test_*.nim files in tests/"
 	@echo "  clean    - Clean all compiled executables"
+	@echo "  format   - Strip trailing whitespace from all *.nim files"
 	@echo "  all      - Run all targets (currently just test)"
 	@echo ""
 
@@ -31,6 +32,12 @@ clean:
 	@find . -type f -perm +111 -not -path "./.git/*" -delete 2>/dev/null || true
 	@find . -name "*~" -type f -delete 2>/dev/null || true
 	@echo "✅ Cleanup complete"
+
+# Format code by stripping trailing whitespace
+format:
+	@echo "🎨 Stripping trailing whitespace from *.nim files..."
+	@find . -name "*.nim" -type f -exec sed -i '' 's/[[:space:]]*$$//' {} \;
+	@echo "✅ Formatting complete"
 
 # Run all targets
 all: test

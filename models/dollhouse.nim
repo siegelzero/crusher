@@ -7,14 +7,14 @@ proc squareFree(n: int): seq[int] =
     var B = newSeq[int](n + 1)
     for i in 2..n:
         B[i] = 1
-    
+
     for i in 2..n:
         if i*i > n:
             break
         if B[i] == 1:
             for mult in countup(i*i, n, i*i):
                 B[mult] = 0
-    
+
     for i in 2..n:
         if B[i] == 1:
             result.add(i)
@@ -24,11 +24,11 @@ proc cycleGraph(n: int): seq[seq[int]] =
     var graph = newSeq[seq[int]](n)
     for i in 0..<n:
         graph[i] = newSeq[int](n)
-    
+
     for i in 0..<n-1:
         graph[i][i + 1] = 1
         graph[i + 1][i] = 1
-    
+
     graph[0][n - 1] = 1
     graph[n - 1][0] = 1
 
@@ -39,7 +39,7 @@ proc gridGraph*(n: int): seq[seq[int]] =
     var graph = newSeq[seq[int]](n*n)
     for i in 0..<n*n:
         graph[i] = newSeq[int](n*n)
-    
+
     if n == 2:
         # 0 -- 1
         # |    |
@@ -57,7 +57,7 @@ proc gridGraph*(n: int): seq[seq[int]] =
         graph[2][3] = 1
         graph[3][1] = 1
         graph[3][2] = 1
-    
+
     elif n == 3:
         # 0 -- 1 -- 2
         # |    |    |
@@ -117,7 +117,7 @@ proc inducedDollhouse*(n, b: int) =
                 sys.addConstraint(commonFactor(label[i], label[j]))
             else:
                 sys.addConstraint(coPrime(label[i], label[j]))
-    
+
     var labelSum: SumExpression[int] = sum(label)
     sys.minimize(labelSum, tabuThreshold=100000, maxAttempts=10, attemptThreshold=10)
 

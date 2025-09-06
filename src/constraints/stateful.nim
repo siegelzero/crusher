@@ -89,7 +89,7 @@ func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstra
         if exp.node.kind != RefNode:
             allRefs = false
         positions.incl(exp.positions)
-    
+
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
         return allDifferent[T](toSeq(positions))

@@ -12,7 +12,7 @@ proc resolve*[T](system: ConstraintSystem[T],
                  tabuThreshold=10000,
                  maxAttempts=1000,
                  attemptThreshold=100) =
-    
+
     if not parallel:
         var improved = system.baseArray.tabuImprove(tabuThreshold)
         if improved.cost == 0:
@@ -33,7 +33,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             if improved.cost == 0:
                 system.assignment = improved.assignment
                 return
-            
+
             if attempt - lastImprovement > attemptThreshold:
                 break
 

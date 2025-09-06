@@ -16,17 +16,17 @@ proc sendMoreMoney*(): ConstraintSystem[int] =
         O = 5
         R = 6
         Y = 7
-    
+
     var sys = initConstraintSystem[int]()
     var value = sys.newConstrainedSequence(8)
     value.setDomain(toSeq 0..9)
     sys.addConstraint(allDifferent(value))
 
-    var 
+    var
         send = 1000*value[S] + 100*value[E] + 10*value[N] + value[D]
         more = 1000*value[M] + 100*value[O] + 10*value[R] + value[E]
         money = 10000*value[M] + 1000*value[O] + 100*value[N] + 10*value[E] + value[Y]
-    
+
     sys.addConstraint(send + more == money)
     sys.addConstraint(value[S] > 0)
     sys.addConstraint(value[M] > 0)
@@ -58,7 +58,7 @@ proc ageProblem*(): ConstrainedArray[int] =
     return age
 
 
-proc magicSquareLC*(n: int): ConstraintSystem[int] = 
+proc magicSquareLC*(n: int): ConstraintSystem[int] =
     # Magic Squares
     var sys = initConstraintSystem[int]()
     var X = sys.newConstrainedMatrix(n, n)
@@ -73,7 +73,7 @@ proc magicSquareLC*(n: int): ConstraintSystem[int] =
     # Col sums == target
     for col in X.columns():
         sys.addConstraint(linearCombinationEq(col, target))
-        
+
     # Diagonals
     var terms: seq[Expression[int]] = @[]
     for i in 0..<n:

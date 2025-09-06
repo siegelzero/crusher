@@ -9,10 +9,10 @@ proc coingrid*(n, c: int) =
 
     for column in X.columns():
         sys.addConstraint(sum(column) == c)
-    
+
     for row in X.rows():
         sys.addConstraint(sum(row) == c)
-    
+
     var objectiveTerms: seq[AlgebraicExpression[int]]
     for i in 0..<n:
         for j in 0..<n:

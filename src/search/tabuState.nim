@@ -88,7 +88,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
         state.constraints.add(constraint)
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
-    
+
     # Collect neighbors of each position
     var neighborSet: PackedSet[Natural] = toPackedSet[Natural]([])
     for pos in carray.allPositions():
@@ -102,7 +102,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
         state.assignment[pos] = sample(state.reducedDomain[pos])
-    
+
     # Initialize constraint states with current assignment
     for constraint in state.constraints:
         constraint.initialize(state.assignment)

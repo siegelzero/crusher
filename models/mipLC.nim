@@ -18,7 +18,7 @@ proc mip*() =
     echo fmt"Found assignment: {sys.assignment}"
     echo objective.value
     echo x.assignment
-    
+
     doAssert x.assignment == @[0, 1, 1, 0, 0]
     doAssert objective.value == 17
     doAssert objective.evaluate(x.assignment) == 17
