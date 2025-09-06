@@ -1,8 +1,8 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, sumConstraint
+import algebraic, allDifferent, elementState, sumConstraint, minConstraint, maxConstraint
 import constraintNode
-import ../expressions/algebraic
+import ../expressions/[algebraic, maxExpression, minExpression]
 
 ################################################################################
 # StatefulAlgebraicConstraint - moved from algebraic.nim
@@ -13,7 +13,7 @@ type
         # Stateful Constraint backed by an Algebraic Constraint, where the current
         # assignment is saved, along with the cost.
         # This constraint form has state which is updated as the assignment changes.
-        currentAssignment*: Table[int, T]
+        currentAssignment*: Table[Natural, T]
         cost*: int
         constraint*: AlgebraicConstraint[T]
         positions: PackedSet[Natural]
@@ -25,7 +25,7 @@ func init*[T](state: StatefulAlgebraicConstraint[T], constraint: AlgebraicConstr
     state.cost = 0
     state.positions = constraint.positions
     state.constraint = constraint
-    state.currentAssignment = initTable[int, T]()
+    state.currentAssignment = initTable[Natural, T]()
 
 func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): StatefulAlgebraicConstraint[T] =
     new(result)
@@ -46,7 +46,7 @@ func updatePosition*[T](state: StatefulAlgebraicConstraint[T], position: int, ne
     state.currentAssignment[position] = newValue
     state.cost = state.constraint.penalty(state.currentAssignment)
 
-func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
+func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: Natural, oldValue, newValue: T): int {.inline.} =
     # Returns cost delta for changing position from oldValue to newValue.
     let oldCost = state.cost
     state.currentAssignment[position] = newValue
@@ -64,7 +64,9 @@ type
         AllDifferentType,
         ElementConstraint,
         SumExpressionType,
-        AlgebraicType
+        AlgebraicType,
+        MinConstraintType,
+        MaxConstraintType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[Natural]
@@ -77,6 +79,10 @@ type
                 sumExpressionConstraintState*: SumExpressionConstraint[T]
             of AlgebraicType:
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
+            of MinConstraintType:
+                minConstraintState*: MinConstraint[T]
+            of MaxConstraintType:
+                maxConstraintState*: MaxConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -89,6 +95,10 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return "Algebraic Constraint"
+        of MinConstraintType:
+            return "Min Constraint"
+        of MaxConstraintType:
+            return "Max Constraint"
 
 ################################################################################
 # Evaluation
@@ -104,6 +114,10 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return constraint.algebraicConstraintState.cost
+        of MinConstraintType:
+            return constraint.minConstraintState.cost
+        of MaxConstraintType:
+            return constraint.maxConstraintState.cost
 
 ################################################################################
 # Computed Constraints
@@ -122,6 +136,72 @@ LCValRel(`>`, GreaterThan)
 LCValRel(`>=`, GreaterThanEq)
 LCValRel(`<`, LessThan)
 LCValRel(`<=`, LessThanEq)
+
+template MinValRel(rel, relEnum: untyped) =
+    func `rel`*[T](left: MinExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        return StatefulConstraint[T](
+            positions: left.positions,
+            stateType: MinConstraintType,
+            minConstraintState: newMinConstraint[T](left, relEnum, right)
+        )
+
+MinValRel(`==`, EqualTo)
+MinValRel(`>`, GreaterThan)
+MinValRel(`>=`, GreaterThanEq)
+MinValRel(`<`, LessThan)
+MinValRel(`<=`, LessThanEq)
+
+template MaxValRel(rel, relEnum: untyped) =
+    func `rel`*[T](left: MaxExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        return StatefulConstraint[T](
+            positions: left.positions,
+            stateType: MaxConstraintType,
+            maxConstraintState: newMaxConstraint[T](left, relEnum, right)
+        )
+
+MaxValRel(`==`, EqualTo)
+MaxValRel(`>`, GreaterThan)
+MaxValRel(`>=`, GreaterThanEq)
+MaxValRel(`<`, LessThan)
+MaxValRel(`<=`, LessThanEq)
+
+# Variable target operators for MinExpression (RefNode only)
+template MinVarRel(rel, relEnum: untyped) =
+    func `rel`*[T](left: MinExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        if right.node.kind != RefNode:
+            raise newException(ValueError, "Variable target constraints require right side to be a simple variable reference")
+        var positions = left.positions
+        positions.incl(right.positions)
+        return StatefulConstraint[T](
+            positions: positions,
+            stateType: MinConstraintType,
+            minConstraintState: newMinConstraintWithVariableTarget[T](left, relEnum, right.node.position)
+        )
+
+MinVarRel(`==`, EqualTo)
+MinVarRel(`>`, GreaterThan)
+MinVarRel(`>=`, GreaterThanEq)
+MinVarRel(`<`, LessThan)
+MinVarRel(`<=`, LessThanEq)
+
+# Variable target operators for MaxExpression (RefNode only)
+template MaxVarRel(rel, relEnum: untyped) =
+    func `rel`*[T](left: MaxExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        if right.node.kind != RefNode:
+            raise newException(ValueError, "Variable target constraints require right side to be a simple variable reference")
+        var positions = left.positions
+        positions.incl(right.positions)
+        return StatefulConstraint[T](
+            positions: positions,
+            stateType: MaxConstraintType,
+            maxConstraintState: newMaxConstraintWithVariableTarget[T](left, relEnum, right.node.position)
+        )
+
+MaxVarRel(`==`, EqualTo)
+MaxVarRel(`>`, GreaterThan)
+MaxVarRel(`>=`, GreaterThanEq)
+MaxVarRel(`<`, LessThan)
+MaxVarRel(`<=`, LessThanEq)
 
 
 func allDifferent*[T](positions: openArray[Natural]): StatefulConstraint[T] =
@@ -165,21 +245,29 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.sumExpressionConstraintState.initialize(assignment)
         of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
+        of MinConstraintType:
+            constraint.minConstraintState.initialize(assignment)
+        of MaxConstraintType:
+            constraint.maxConstraintState.initialize(assignment)
 
 
-func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
+func moveDelta*[T](constraint: StatefulConstraint[T], position: Natural, oldValue, newValue: T): int =
     case constraint.stateType:
-        of AllDifferentConstraint:
+        of AllDifferentType:
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             constraint.elementState.moveDelta(position, oldValue, newValue)
         of SumExpressionType:
             constraint.sumExpressionConstraintState.moveDelta(position, oldValue, newValue)
-        of StatefulAlgebraicConstraint:
+        of AlgebraicType:
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
+        of MinConstraintType:
+            constraint.minConstraintState.moveDelta(position, oldValue, newValue)
+        of MaxConstraintType:
+            constraint.maxConstraintState.moveDelta(position, oldValue, newValue)
 
 
-func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
+func updatePosition*[T](constraint: StatefulConstraint[T], position: Natural, newValue: T) =
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.updatePosition(position, newValue)
@@ -189,3 +277,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.sumExpressionConstraintState.updatePosition(position, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)
+        of MinConstraintType:
+            constraint.minConstraintState.updatePosition(position, newValue)
+        of MaxConstraintType:
+            constraint.maxConstraintState.updatePosition(position, newValue)
+

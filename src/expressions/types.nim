@@ -44,7 +44,7 @@ type
 
 # Evaluation
 
-func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
     case node.kind:
         of LiteralNode:
             return node.value
@@ -71,5 +71,5 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                 of Multiplication:
                     return left * right
 
-func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
     expression.node.evaluate(assignment)

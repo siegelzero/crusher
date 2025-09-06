@@ -59,7 +59,7 @@ func evaluate*[T](relation: BinaryRelation, left, right: T): bool =
             return gcd(left, right) == 1
 
 
-func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): bool =
+func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[Natural, T]): bool =
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)
@@ -77,7 +77,7 @@ func penalty*[T](relation: BinaryRelation, left, right: T): T =
     return if relation.evaluate(left, right): return 0 else: 1
 
 
-proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T =
+proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[Natural, T]): T =
     case node.kind:
         of UnaryRelNode:
             let target = node.target.evaluate(assignment)

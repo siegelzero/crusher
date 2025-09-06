@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/[algebraic, stateful, allDifferent, sumConstraint]
+import ../constraints/[algebraic, stateful, allDifferent, sumConstraint, minConstraint, maxConstraint]
 import ../constrainedArray
 
 ################################################################################
@@ -30,7 +30,7 @@ type
 # Penalty Routines
 ################################################################################
 
-proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
+proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: Natural, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
     case constraint.stateType:
         of AllDifferentType:
@@ -41,6 +41,10 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.sumExpressionConstraintState.cost + constraint.sumExpressionConstraintState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
+        of MinConstraintType:
+            result = constraint.minConstraintState.cost + constraint.minConstraintState.moveDelta(position, oldValue, newValue)
+        of MaxConstraintType:
+            result = constraint.maxConstraintState.cost + constraint.maxConstraintState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines

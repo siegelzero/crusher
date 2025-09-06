@@ -10,10 +10,10 @@ type
         value*: T
         constant*: T
         positions*: PackedSet[Natural]
-        currentAssignment*: Table[int, T]
+        currentAssignment*: Table[Natural, T]
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                coefficient*: Table[int, T]
+                coefficient*: Table[Natural, T]
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition*: Table[int, seq[int]]
@@ -25,9 +25,9 @@ func newSumExpression*[T](positions: openArray[Natural]): SumExpression[T] =
         value: 0,
         constant: 0,
         positions: toPackedSet[Natural](positions),
-        currentAssignment: initTable[int, T](),
+        currentAssignment: initTable[Natural, T](),
         evalMethod: PositionBased,
-        coefficient: initTable[int, T]()
+        coefficient: initTable[Natural, T]()
     )
 
     for pos in positions:
@@ -41,7 +41,7 @@ func newSumExpression*[T](positions: openArray[int]): SumExpression[T] =
 
     return newSumExpression[T](naturalPositions)
 
-func newSumExpression*[T](coefficients: Table[int, T], constant: T = 0): SumExpression[T] =
+func newSumExpression*[T](coefficients: Table[Natural, T], constant: T = 0): SumExpression[T] =
     var positions = initPackedSet[Natural]()
     for pos in coefficients.keys:
         positions.incl(pos)
@@ -50,7 +50,7 @@ func newSumExpression*[T](coefficients: Table[int, T], constant: T = 0): SumExpr
         value: constant,
         constant: constant,
         positions: positions,
-        currentAssignment: initTable[int, T](),
+        currentAssignment: initTable[Natural, T](),
         evalMethod: PositionBased,
         coefficient: coefficients
     )
@@ -72,7 +72,7 @@ func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpressi
         value: 0,
         constant: 0,
         positions: positions,
-        currentAssignment: initTable[int, T](),
+        currentAssignment: initTable[Natural, T](),
         evalMethod: ExpressionBased,
         expressions: expressions,
         expressionsAtPosition: expressionsAtPosition
@@ -100,7 +100,7 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
                 let expValue = exp.evaluate(assignment)
                 state.value += expValue
 
-func evaluate*[T](expression: SumExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+func evaluate*[T](expression: SumExpression[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
     # Computes the value of the Sum Expression given the variable assignment.
     result = expression.constant
 
@@ -169,7 +169,7 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
 func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
     # Converts linear expression to a SumExpression
     var constant: T
-    var coefficients, assignment: Table[int, T]
+    var coefficients, assignment: Table[Natural, T]
     # evaluate with all variables zero to get constant coefficient
     for pos in expression.positions:
         assignment[pos] = 0

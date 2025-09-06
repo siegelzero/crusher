@@ -102,10 +102,10 @@ ExpValRel(`<=`, LessThanEq)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[int, T]): bool {.inline.} =
+func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[Natural, T]): bool {.inline.} =
     constraint.node.evaluate(assignment)
 
-proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
+proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[Natural, T]): T {.inline.} =
     return constraint.node.penalty(assignment)
 
 

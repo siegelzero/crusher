@@ -8,7 +8,7 @@ import ../expressions/expressions
 
 type
     AllDifferentConstraint*[T] = ref object
-        currentAssignment*: Table[int, T]
+        currentAssignment*: Table[Natural, T]
         countTable: Table[T, int]
         cost*: int
         case evalMethod*: StateEvalMethod
@@ -16,7 +16,7 @@ type
                 positions: PackedSet[Natural]
             of ExpressionBased:
                 expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressionsAtPosition: Table[Natural, seq[int]]
 
 ################################################################################
 # AllDifferentConstraint creation
@@ -30,7 +30,7 @@ func newAllDifferentConstraint*[T](positions: openArray[Natural] ): AllDifferent
         evalMethod: PositionBased,
         positions: toPackedSet[Natural](positions),
         countTable: initTable[T, int](),
-        currentAssignment: initTable[int, T](),
+        currentAssignment: initTable[Natural, T](),
     )
 
 func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentConstraint[T] =
@@ -42,7 +42,7 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
         expressionsAtPosition: initTable[int, seq[int]](),
         expressions: expressions,
         countTable: initTable[T, int](),
-        currentAssignment: initTable[int, T](),
+        currentAssignment: initTable[Natural, T](),
     )
 
     for i, exp in expressions:

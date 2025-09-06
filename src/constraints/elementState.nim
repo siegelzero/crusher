@@ -6,7 +6,7 @@ import std/[packedsets, tables]
 
 type
     ElementState*[T] = ref object
-        currentAssignment*: Table[int, T]
+        currentAssignment*: Table[Natural, T]
         cost*: int
         positions: PackedSet[int]
 

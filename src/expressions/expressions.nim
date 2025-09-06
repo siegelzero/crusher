@@ -1,3 +1,5 @@
 import algebraic
 import stateful
-export algebraic, stateful
+import minExpression
+import maxExpression
+export algebraic, stateful, minExpression, maxExpression
