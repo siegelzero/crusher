@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/[algebraic, stateful, allDifferent, linear]
+import ../constraints/[algebraic, stateful, allDifferent, sumConstraint]
 import ../constrainedArray
 
 ################################################################################
@@ -37,8 +37,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             result = 0
-        of LinearType:
-            result = constraint.linearConstraintState.cost + constraint.linearConstraintState.moveDelta(position, oldValue, newValue)
+        of SumExpressionType:
+            result = constraint.sumExpressionConstraintState.cost + constraint.sumExpressionConstraintState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 

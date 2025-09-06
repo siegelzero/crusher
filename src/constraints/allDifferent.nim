@@ -1,16 +1,12 @@
 import std/[packedsets, sequtils, tables]
 
-import ../expressions
+import ../expressions/expressions
 
 ################################################################################
 # Type definitions
 ################################################################################
 
 type
-    StateEvalMethod = enum
-        ExpressionBased,
-        PositionBased
-
     AllDifferentConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
         countTable: Table[T, int]
@@ -84,7 +80,7 @@ proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
     state.cost -= state.contribution(oldValue)
     state.cost -= state.contribution(newValue)
-    state.decrementCount(oldvalue)
+    state.decrementCount(oldValue)
     state.incrementCount(newValue)
     state.cost += state.contribution(oldValue)
     state.cost += state.contribution(newValue)
@@ -134,7 +130,7 @@ proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValu
 
 
 proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, newValue: T): int =
-    if oldvalue == newValue:
+    if oldValue == newValue:
         return 0
 
     var oldExpValue, newExpValue, oldValueCount, newValueCount: int

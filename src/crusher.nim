@@ -1,14 +1,14 @@
 import std/packedsets
 
-import constraints/[algebraic, stateful, linear]
-import expressions
+import constraints/[algebraic, stateful, sumConstraint]
+import expressions/expressions
 import search/[optimization, resolution]
 import constraintSystem
 
 export constraintSystem,
        stateful,
        algebraic,
-       linear,
+       sumConstraint,
        expressions,
        optimization,
        resolution,

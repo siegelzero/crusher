@@ -1,6 +1,6 @@
 import std/tables
 
-import ../expressions
+import ../expressions/expressions
 import ../utils
 
 ################################################################################

@@ -118,7 +118,7 @@ proc inducedDollhouse*(n, b: int) =
             else:
                 sys.addConstraint(coPrime(label[i], label[j]))
     
-    var labelSum: LinearCombination[int] = sum(label)
+    var labelSum: SumExpression[int] = sum(label)
     sys.minimize(labelSum, tabuThreshold=100000, maxAttempts=10, attemptThreshold=10)
 
     echo fmt"Found labeling: {label}"

@@ -2,7 +2,7 @@ import std/[packedsets, sequtils]
 
 import constrainedArray
 import constraints/[algebraic, stateful]
-import expressions
+import expressions/expressions
 
 ################################################################################
 # Type definitions
@@ -135,10 +135,10 @@ func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
 # ConstrainedVariable methods
 ################################################################################
 
-func sum*[T](cvar: ConstrainedSequence[T]): LinearCombination[T] =
-    # Returns LinearCombination object representing the sum of the
+func sum*[T](cvar: ConstrainedSequence[T]): SumExpression[T] =
+    # Returns SumExpression object representing the sum of the
     # Constrained Sequence
-    return newLinearCombination[T](cvar.positions)
+    return newSumExpression[T](cvar.positions)
 
 ################################################################################
 # ConstrainedVariable constraints

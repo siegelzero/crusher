@@ -1,7 +1,7 @@
 import std/[strformat]
 
 import resolution
-import ../expressions
+import ../expressions/expressions
 import ../constraintSystem
 
 
@@ -22,7 +22,7 @@ proc minimize*[T](system: ConstraintSystem[T], objective: AlgebraicExpression[T]
 
 
 proc minimize*[T](system: ConstraintSystem[T],
-                  objective: LinearCombination[T],
+                  objective: SumExpression[T],
                   parallel=true,
                   tabuThreshold=1000,
                   maxAttempts=10,
@@ -49,4 +49,6 @@ proc minimize*[T](system: ConstraintSystem[T],
             currentCost = objective.value
             echo fmt"Found solution with objective {objective.value}"
         except NoSolutionFoundError:
+            # Ensure objective state reflects the final best solution
+            objective.initialize(system.assignment)
             return

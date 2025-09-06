@@ -1,8 +1,8 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, linear
+import algebraic, allDifferent, elementState, sumConstraint
 import constraintNode
-import ../expressions
+import ../expressions/expressions
 
 ################################################################################
 # Type definitions
@@ -12,7 +12,7 @@ type
     StatefulConstraintType* = enum
         AllDifferentType,
         ElementConstraint,
-        LinearType,
+        SumExpressionType,
         AlgebraicType
 
     StatefulConstraint*[T] = object
@@ -22,8 +22,8 @@ type
                 allDifferentState*: AllDifferentConstraint[T]
             of ElementConstraint:
                 elementState*: ElementState[T]
-            of LinearType:
-                linearConstraintState*: LinearConstraint[T]
+            of SumExpressionType:
+                sumExpressionConstraintState*: SumExpressionConstraint[T]
             of AlgebraicType:
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
 
@@ -34,8 +34,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "AllDifferent Constraint"
         of ElementConstraint:
             return "Element Constraint"
-        of LinearType:
-            return constraint.linearConstraintState.cost
+        of SumExpressionType:
+            return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return "Algebraic Constraint"
 
@@ -49,8 +49,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.allDifferentState.cost
         of ElementConstraint:
             return constraint.elementState.cost
-        of LinearType:
-            return constraint.linearConstraintState.cost
+        of SumExpressionType:
+            return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return constraint.algebraicConstraintState.cost
 
@@ -59,11 +59,11 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
 ################################################################################
 
 template LCValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: LinearCombination[T], right: T): StatefulConstraint[T] {.inline.} =
+    func `rel`*[T](left: SumExpression[T], right: T): StatefulConstraint[T] {.inline.} =
         return StatefulConstraint[T](
             positions: left.positions,
-            stateType: LinearType,
-            linearConstraintState: newLinearConstraint[T](left, relEnum, right)
+            stateType: SumExpressionType,
+            sumExpressionConstraintState: newSumExpressionConstraint[T](left, relEnum, right)
         )
 
 LCValRel(`==`, EqualTo)
@@ -110,8 +110,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.allDifferentState.initialize(assignment)
         of ElementConstraint:
             constraint.elementState.initialize(assignment)
-        of LinearType:
-            constraint.linearConstraintState.initialize(assignment)
+        of SumExpressionType:
+            constraint.sumExpressionConstraintState.initialize(assignment)
         of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
 
@@ -122,8 +122,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             constraint.elementState.moveDelta(position, oldValue, newValue)
-        of LinearType:
-            constraint.linearConstraintState.moveDelta(position, oldValue, newValue)
+        of SumExpressionType:
+            constraint.sumExpressionConstraintState.moveDelta(position, oldValue, newValue)
         of StatefulAlgebraicConstraint:
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
 
@@ -134,7 +134,7 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.allDifferentState.updatePosition(position, newValue)
         of ElementConstraint:
             constraint.elementState.updatePosition(position, newValue)
-        of LinearType:
-            constraint.linearConstraintState.updatePosition(position, newValue)
+        of SumExpressionType:
+            constraint.sumExpressionConstraintState.updatePosition(position, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)

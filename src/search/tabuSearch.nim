@@ -1,6 +1,6 @@
 import std/[packedsets, random, tables]
 
-import ../expressions
+import ../expressions/expressions
 import ../constrainedArray
 import tabuState
 
