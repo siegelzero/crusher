@@ -27,8 +27,8 @@ func init*[T](state: SumExpressionConstraint[T],
 
 
 func newSumExpressionConstraint*[T](sumExpr: SumExpression[T],
-                             relation: BinaryRelation,
-                             target: T): SumExpressionConstraint[T] =
+                                    relation: BinaryRelation,
+                                    target: T): SumExpressionConstraint[T] =
     new(result)
     result.init(sumExpr, relation, target)
 

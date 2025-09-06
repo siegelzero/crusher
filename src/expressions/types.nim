@@ -5,7 +5,7 @@ import std/[packedsets, tables]
 ################################################################################
 
 type
-    UnaryOperation = enum
+    UnaryOperation* = enum
         Negation,
         AbsoluteValue
 
