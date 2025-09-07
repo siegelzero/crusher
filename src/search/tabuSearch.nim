@@ -31,6 +31,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(Natural, T)] =
                 if state.cost + delta < bestMoveCost:
                     result = @[(position, newValue)]
                     bestMoveCost = state.cost + delta
+                    echo "found candidate with ", bestMoveCost
                 elif state.cost + delta == bestMoveCost:
                     result.add((position, newValue))
 
