@@ -1,6 +1,7 @@
 import std/[packedsets, sequtils, strformat]
 
 import constraints/stateful
+import constraints/algebraic
 import expressions/expressions
 
 ################################################################################
@@ -99,9 +100,29 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if cons.positions.len != 1:
             continue
         var pos = toSeq(cons.positions)[0]
+        # Create a temporary assignment for testing this constraint
+        var tempAssignment = newSeq[T](carray.len)
+        # Initialize with first values from domains (doesn't matter, we only care about position pos)
+        for i in 0..<carray.len:
+            if carray.domain[i].len > 0:
+                tempAssignment[i] = carray.domain[i][0]
+
         for d in carray.domain[pos]:
-            cons.updatePosition(pos, d)
-            if cons.penalty() > 0:
+            tempAssignment[pos] = d
+            # Test the constraint without requiring it to be initialized
+            var tempPenalty = 0
+            case cons.stateType:
+                of AlgebraicType:
+                    tempPenalty = penalty(cons.algebraicConstraintState.constraint, tempAssignment)
+                of RelationalConstraintType:
+                    # RelationalConstraint needs to be evaluated differently
+                    # Skip for now - these are typically multi-variable anyway
+                    continue
+                of AllDifferentType, ElementConstraint:
+                    # Skip these constraint types for domain reduction
+                    continue
+
+            if tempPenalty > 0:
                 # echo "Excluding ", d, " from ", pos
                 currentDomain[pos].excl(d)
 

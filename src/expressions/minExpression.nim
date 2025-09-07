@@ -29,7 +29,7 @@ func newMinExpression*[T](positions: openArray[Natural]): MinExpression[T] =
         currentAssignment: initTable[Natural, T]()
     )
 
-func newMinExpression*[T](expressions: seq[AlgebraicExpression[T]]): MinExpression[T] =
+func newMinExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MinExpression[T] =
     var expressionsAtPos = initTable[Natural, seq[int]]()
     var allPositions = initPackedSet[Natural]()
 
@@ -47,7 +47,7 @@ func newMinExpression*[T](expressions: seq[AlgebraicExpression[T]]): MinExpressi
         value: 0,
         positions: allPositions,
         currentAssignment: initTable[Natural, T](),
-        expressions: expressions,
+        expressions: @expressions,
         expressionsAtPosition: expressionsAtPos
     )
 
@@ -181,7 +181,7 @@ proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
 # MinExpression creation helpers for constraint syntax
 ################################################################################
 
-func min*[T](expressions: seq[AlgebraicExpression[T]]): MinExpression[T] =
+func min*[T](expressions: openArray[AlgebraicExpression[T]]): MinExpression[T] =
     # Check if all expressions are simple variable references (RefNodes)
     var allRefs = true
     var positions: seq[Natural] = @[]

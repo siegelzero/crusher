@@ -1,8 +1,8 @@
 import std/[packedsets, sequtils]
 
 import constrainedArray
-import constraints/[algebraic, stateful]
-import expressions/[algebraic, stateful]
+import constraints/[algebraic, stateful, constraintNode]
+import expressions/[algebraic, stateful, sumExpression]
 
 ################################################################################
 # Type definitions

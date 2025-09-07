@@ -70,33 +70,6 @@ ExpExpRel(`<=`, LessThanEq)
 # Binary (AlgebraicExpression, Value) Relations
 ################################################################################
 
-template ExpValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: AlgebraicExpression[T], right: T): AlgebraicConstraint[T] {.inline.} =
-        AlgebraicConstraint[T](
-            positions: left.positions,
-            node: ConstraintNode[T](
-                kind: BinaryRelNode,
-                binaryRel: relEnum,
-                left: left.node,
-                right: ExpressionNode[T](kind: LiteralNode, value: right)
-            )
-        )
-    func `rel`*[T: not ref](left: T, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
-        AlgebraicConstraint[T](
-            positions: right.positions,
-            node: ConstraintNode[T](
-                kind: BinaryRelNode,
-                binaryRel: relEnum,
-                left: ExpressionNode[T](kind: LiteralNode, value: left),
-                right: right.node
-            )
-        )
-
-ExpValRel(`==`, EqualTo)
-ExpValRel(`>`, GreaterThan)
-ExpValRel(`>=`, GreaterThanEq)
-ExpValRel(`<`, LessThan)
-ExpValRel(`<=`, LessThanEq)
 
 ################################################################################
 # Evaluation

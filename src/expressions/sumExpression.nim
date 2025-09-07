@@ -55,7 +55,7 @@ func newSumExpression*[T](coefficients: Table[Natural, T], constant: T = 0): Sum
         coefficient: coefficients
     )
 
-func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
+func newSumExpression*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     var positions = initPackedSet[Natural]()
     var expressionsAtPosition = initTable[int, seq[int]]()
 
@@ -74,7 +74,7 @@ func newSumExpression*[T](expressions: seq[AlgebraicExpression[T]]): SumExpressi
         positions: positions,
         currentAssignment: initTable[Natural, T](),
         evalMethod: ExpressionBased,
-        expressions: expressions,
+        expressions: @expressions,
         expressionsAtPosition: expressionsAtPosition
     )
 
@@ -120,7 +120,7 @@ func `$`*[T](state: SumExpression[T]): string = $(state.value)
 
 # SumExpression Updates
 
-func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.inline.} =
+func updatePosition*[T](state: SumExpression[T], position: Natural, newValue: T) {.inline.} =
     # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
@@ -143,7 +143,7 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
 
                 state.value += (newExpValue - oldExpValue)
 
-func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
+func moveDelta*[T](state: SumExpression[T], position: Natural, oldValue, newValue: T): int {.inline.} =
     # Returns the change in value obtained by reassigning position from oldValue to newValue.
     case state.evalMethod:
         of PositionBased:
@@ -183,7 +183,7 @@ func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
 
     return newSumExpression[T](coefficients, constant)
 
-func sum*[T](expressions: seq[AlgebraicExpression[T]]): SumExpression[T] =
+func sum*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     var positions = toPackedSet[Natural]([])
     var allRefs = true
     for exp in expressions:

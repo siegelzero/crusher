@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, sumConstraint, minConstraint, maxConstraint
+import algebraic, allDifferent, elementState, relationalConstraint
 import constraintNode
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -63,10 +63,8 @@ type
     StatefulConstraintType* = enum
         AllDifferentType,
         ElementConstraint,
-        SumExpressionType,
         AlgebraicType,
-        MinConstraintType,
-        MaxConstraintType
+        RelationalConstraintType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[Natural]
@@ -75,14 +73,10 @@ type
                 allDifferentState*: AllDifferentConstraint[T]
             of ElementConstraint:
                 elementState*: ElementState[T]
-            of SumExpressionType:
-                sumExpressionConstraintState*: SumExpressionConstraint[T]
             of AlgebraicType:
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
-            of MinConstraintType:
-                minConstraintState*: MinConstraint[T]
-            of MaxConstraintType:
-                maxConstraintState*: MaxConstraint[T]
+            of RelationalConstraintType:
+                relationalConstraintState*: RelationalConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -91,14 +85,10 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "AllDifferent Constraint"
         of ElementConstraint:
             return "Element Constraint"
-        of SumExpressionType:
-            return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return "Algebraic Constraint"
-        of MinConstraintType:
-            return "Min Constraint"
-        of MaxConstraintType:
-            return "Max Constraint"
+        of RelationalConstraintType:
+            return "Relational Constraint"
 
 ################################################################################
 # Evaluation
@@ -110,98 +100,197 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.allDifferentState.cost
         of ElementConstraint:
             return constraint.elementState.cost
-        of SumExpressionType:
-            return constraint.sumExpressionConstraintState.cost
         of AlgebraicType:
             return constraint.algebraicConstraintState.cost
-        of MinConstraintType:
-            return constraint.minConstraintState.cost
-        of MaxConstraintType:
-            return constraint.maxConstraintState.cost
+        of RelationalConstraintType:
+            return constraint.relationalConstraintState.cost
 
 ################################################################################
 # Computed Constraints
 ################################################################################
 
-template LCValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: SumExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+
+################################################################################
+# Expression-to-Expression Relational Operators (using RelationalConstraint)
+################################################################################
+
+import ../expressions/stateful
+
+# Template for expression-to-expression relations
+template ExprExprRel(rel, relEnum: untyped) =
+    # Sum-to-Sum relations
+    func `rel`*[T](left: SumExpression[T], right: SumExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
-            positions: left.positions,
-            stateType: SumExpressionType,
-            sumExpressionConstraintState: newSumExpressionConstraint[T](left, relEnum, right)
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
         )
 
-LCValRel(`==`, EqualTo)
-LCValRel(`>`, GreaterThan)
-LCValRel(`>=`, GreaterThanEq)
-LCValRel(`<`, LessThan)
-LCValRel(`<=`, LessThanEq)
-
-template MinValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: MinExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+    # Min-to-Min relations
+    func `rel`*[T](left: MinExpression[T], right: MinExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
-            positions: left.positions,
-            stateType: MinConstraintType,
-            minConstraintState: newMinConstraint[T](left, relEnum, right)
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
         )
 
-MinValRel(`==`, EqualTo)
-MinValRel(`>`, GreaterThan)
-MinValRel(`>=`, GreaterThanEq)
-MinValRel(`<`, LessThan)
-MinValRel(`<=`, LessThanEq)
-
-template MaxValRel(rel, relEnum: untyped) =
-    func `rel`*[T](left: MaxExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+    # Max-to-Max relations
+    func `rel`*[T](left: MaxExpression[T], right: MaxExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
-            positions: left.positions,
-            stateType: MaxConstraintType,
-            maxConstraintState: newMaxConstraint[T](left, relEnum, right)
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
         )
 
-MaxValRel(`==`, EqualTo)
-MaxValRel(`>`, GreaterThan)
-MaxValRel(`>=`, GreaterThanEq)
-MaxValRel(`<`, LessThan)
-MaxValRel(`<=`, LessThanEq)
+    # Min-to-Max relations
+    func `rel`*[T](left: MinExpression[T], right: MaxExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
 
-# Variable target operators for MinExpression (RefNode only)
-template MinVarRel(rel, relEnum: untyped) =
+    # Max-to-Min relations
+    func `rel`*[T](left: MaxExpression[T], right: MinExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # Sum-to-Min relations
+    func `rel`*[T](left: SumExpression[T], right: MinExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # Sum-to-Max relations
+    func `rel`*[T](left: SumExpression[T], right: MaxExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # AlgebraicExpression-to-any relations
+    func `rel`*[T](left: AlgebraicExpression[T], right: SumExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    func `rel`*[T](left: SumExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    func `rel`*[T](left: AlgebraicExpression[T], right: MinExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
     func `rel`*[T](left: MinExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
-        if right.node.kind != RefNode:
-            raise newException(ValueError, "Variable target constraints require right side to be a simple variable reference")
-        var positions = left.positions
-        positions.incl(right.positions)
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
-            positions: positions,
-            stateType: MinConstraintType,
-            minConstraintState: newMinConstraintWithVariableTarget[T](left, relEnum, right.node.position)
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
         )
 
-MinVarRel(`==`, EqualTo)
-MinVarRel(`>`, GreaterThan)
-MinVarRel(`>=`, GreaterThanEq)
-MinVarRel(`<`, LessThan)
-MinVarRel(`<=`, LessThanEq)
+    func `rel`*[T](left: AlgebraicExpression[T], right: MaxExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
 
-# Variable target operators for MaxExpression (RefNode only)
-template MaxVarRel(rel, relEnum: untyped) =
     func `rel`*[T](left: MaxExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
-        if right.node.kind != RefNode:
-            raise newException(ValueError, "Variable target constraints require right side to be a simple variable reference")
-        var positions = left.positions
-        positions.incl(right.positions)
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
-            positions: positions,
-            stateType: MaxConstraintType,
-            maxConstraintState: newMaxConstraintWithVariableTarget[T](left, relEnum, right.node.position)
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
         )
 
-MaxVarRel(`==`, EqualTo)
-MaxVarRel(`>`, GreaterThan)
-MaxVarRel(`>=`, GreaterThanEq)
-MaxVarRel(`<`, LessThan)
-MaxVarRel(`<=`, LessThanEq)
+    func `rel`*[T](left: AlgebraicExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+# Generate all relational operators for expression-to-expression
+ExprExprRel(`==`, EqualTo)
+ExprExprRel(`!=`, NotEqualTo)
+ExprExprRel(`>`, GreaterThan)
+ExprExprRel(`>=`, GreaterThanEq)
+ExprExprRel(`<`, LessThan)
+ExprExprRel(`<=`, LessThanEq)
+
+# Template for expression-to-constant relations (replaces old LCValRel, MinValRel, MaxValRel)
+template ExprConstRel(rel, relEnum: untyped) =
+    # Sum-to-constant relations
+    func `rel`*[T](left: SumExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # Min-to-constant relations
+    func `rel`*[T](left: MinExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # Max-to-constant relations
+    func `rel`*[T](left: MaxExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+    # Algebraic-to-constant relations
+    func `rel`*[T](left: AlgebraicExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalConstraintType,
+            relationalConstraintState: constraint
+        )
+
+# Generate expression-to-constant operators
+ExprConstRel(`==`, EqualTo)
+ExprConstRel(`!=`, NotEqualTo)
+ExprConstRel(`>`, GreaterThan)
+ExprConstRel(`>=`, GreaterThanEq)
+ExprConstRel(`<`, LessThan)
+ExprConstRel(`<=`, LessThanEq)
 
 
 func allDifferent*[T](positions: openArray[Natural]): StatefulConstraint[T] =
@@ -211,6 +300,13 @@ func allDifferent*[T](positions: openArray[Natural]): StatefulConstraint[T] =
         stateType: AllDifferentType,
         allDifferentState: newAllDifferentConstraint[T](positions)
     )
+
+func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
+    # Returns allDifferent constraint for the given positions (int overload).
+    var naturalPositions = newSeq[Natural](positions.len)
+    for i, pos in positions:
+        naturalPositions[i] = Natural(pos)
+    return allDifferent[T](naturalPositions)
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given expressions.
@@ -241,14 +337,10 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.allDifferentState.initialize(assignment)
         of ElementConstraint:
             constraint.elementState.initialize(assignment)
-        of SumExpressionType:
-            constraint.sumExpressionConstraintState.initialize(assignment)
         of AlgebraicType:
             constraint.algebraicConstraintState.initialize(assignment)
-        of MinConstraintType:
-            constraint.minConstraintState.initialize(assignment)
-        of MaxConstraintType:
-            constraint.maxConstraintState.initialize(assignment)
+        of RelationalConstraintType:
+            constraint.relationalConstraintState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: Natural, oldValue, newValue: T): int =
@@ -257,14 +349,10 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: Natural, oldValu
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
             constraint.elementState.moveDelta(position, oldValue, newValue)
-        of SumExpressionType:
-            constraint.sumExpressionConstraintState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
-        of MinConstraintType:
-            constraint.minConstraintState.moveDelta(position, oldValue, newValue)
-        of MaxConstraintType:
-            constraint.maxConstraintState.moveDelta(position, oldValue, newValue)
+        of RelationalConstraintType:
+            constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: Natural, newValue: T) =
@@ -273,12 +361,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: Natural, ne
             constraint.allDifferentState.updatePosition(position, newValue)
         of ElementConstraint:
             constraint.elementState.updatePosition(position, newValue)
-        of SumExpressionType:
-            constraint.sumExpressionConstraintState.updatePosition(position, newValue)
         of AlgebraicType:
             constraint.algebraicConstraintState.updatePosition(position, newValue)
-        of MinConstraintType:
-            constraint.minConstraintState.updatePosition(position, newValue)
-        of MaxConstraintType:
-            constraint.maxConstraintState.updatePosition(position, newValue)
+        of RelationalConstraintType:
+            constraint.relationalConstraintState.updatePosition(position, newValue)
 

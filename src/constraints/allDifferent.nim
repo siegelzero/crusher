@@ -39,7 +39,7 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
     result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: ExpressionBased,
-        expressionsAtPosition: initTable[int, seq[int]](),
+        expressionsAtPosition: initTable[Natural, seq[int]](),
         expressions: expressions,
         countTable: initTable[T, int](),
         currentAssignment: initTable[Natural, T](),

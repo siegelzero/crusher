@@ -29,7 +29,7 @@ func newMaxExpression*[T](positions: openArray[Natural]): MaxExpression[T] =
         currentAssignment: initTable[Natural, T]()
     )
 
-func newMaxExpression*[T](expressions: seq[AlgebraicExpression[T]]): MaxExpression[T] =
+func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxExpression[T] =
     var expressionsAtPos = initTable[Natural, seq[int]]()
     var allPositions = initPackedSet[Natural]()
 
@@ -47,7 +47,7 @@ func newMaxExpression*[T](expressions: seq[AlgebraicExpression[T]]): MaxExpressi
         value: 0,
         positions: allPositions,
         currentAssignment: initTable[Natural, T](),
-        expressions: expressions,
+        expressions: @expressions,
         expressionsAtPosition: expressionsAtPos
     )
 
@@ -181,7 +181,7 @@ proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
 # MaxExpression creation helpers for constraint syntax
 ################################################################################
 
-func max*[T](expressions: seq[AlgebraicExpression[T]]): MaxExpression[T] =
+func max*[T](expressions: openArray[AlgebraicExpression[T]]): MaxExpression[T] =
     # Check if all expressions are simple variable references (RefNodes)
     var allRefs = true
     var positions: seq[Natural] = @[]
