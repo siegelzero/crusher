@@ -107,7 +107,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
         state.cost += max(0, count - 1)
 
 
-proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
+proc updatePosition*[T](state: AllDifferentConstraint[T], position: Natural, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
     if oldValue != newValue:
@@ -125,7 +125,7 @@ proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValu
                     state.adjustCounts(oldExpValue, newExpValue)
 
 
-proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, newValue: T): int =
+proc moveDelta*[T](state: AllDifferentConstraint[T], position: Natural, oldValue, newValue: T): int =
     if oldValue == newValue:
         return 0
 
