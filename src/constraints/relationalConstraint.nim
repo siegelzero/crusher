@@ -32,7 +32,7 @@ func newRelationalConstraint*[T](leftExpr, rightExpr: Expression[T],
 # Template-based constructor that accepts any expression types
 template newRelationalConstraint*[T](leftExpr, rightExpr: typed,
                                      relation: BinaryRelation): RelationalConstraint[T] =
-    newRelationalConstraint(wrap[T](leftExpr), wrap[T](rightExpr), relation)
+    newRelationalConstraint(newExpression[T](leftExpr), newExpression[T](rightExpr), relation)
 
 # Initialize the constraint with an assignment
 func initialize*[T](constraint: RelationalConstraint[T], assignment: seq[T]) =

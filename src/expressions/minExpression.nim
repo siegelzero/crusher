@@ -12,10 +12,10 @@ type
         currentAssignment*: Table[Natural, T]
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                discard  # positions and currentAssignment are sufficient
+                discard
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
-                expressionsAtPosition*: Table[Natural, seq[int]]  # position -> list of expression indices
+                expressionsAtPosition*: Table[Natural, seq[int]]
 
 ################################################################################
 # MinExpression creation
@@ -59,20 +59,7 @@ func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
     # Initialize the MinExpression with the given assignment, and updates the value.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-
-    var minValue: T = high(T)
-    case state.evalMethod:
-        of PositionBased:
-            # For position-based: minimum of variable values directly
-            for pos in state.positions:
-                minValue = min(minValue, assignment[pos])
-        of ExpressionBased:
-            # For expression-based: minimum of expression evaluations
-            for exp in state.expressions:
-                let expValue = exp.evaluate(assignment)
-                minValue = min(minValue, expValue)
-
-    state.value = minValue
+    state.value = state.evaluate(assignment)
 
 func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
     var minValue: T = high(T)
@@ -82,8 +69,7 @@ func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[Natural, T])
                 minValue = min(minValue, assignment[pos])
         of ExpressionBased:
             for exp in state.expressions:
-                let expValue = exp.evaluate(assignment)
-                minValue = min(minValue, expValue)
+                minValue = min(minValue, exp.evaluate(assignment))
     return minValue
 
 func `$`*[T](state: MinExpression[T]): string = $(state.value)
@@ -106,28 +92,21 @@ func updatePosition*[T](state: MinExpression[T], position: Natural, newValue: T)
             elif oldValue == state.value and newValue > oldValue:
                 # We're replacing the current minimum with a larger value
                 # Need to find the new minimum among all values
-                var minValue: T = high(T)
-                for val in state.currentAssignment.values:
-                    if val < minValue:
-                        minValue = val
-                state.value = minValue
+                state.value = min(state.currentAssignment.values.toSeq)
             # Otherwise, the minimum doesn't change
 
         of ExpressionBased:
-            # For expression-based: need to recalculate affected expressions
-            # This is less efficient but more general
-            var minValue: T = high(T)
-            for exp in state.expressions:
-                let expValue = exp.evaluate(state.currentAssignment)
-                minValue = min(minValue, expValue)
-            state.value = minValue
+            # Only evaluate expressions that depend on the changed position
+            for idx in state.expressionsAtPosition[position]:
+                let expValue = state.expressions[idx].evaluate(state.currentAssignment)
+                if expValue < state.value:
+                    state.value = expValue
+                elif expValue == state.value and newValue > oldValue:
+                    state.value = state.evaluate(state.currentAssignment)
+                    break
 
 func moveDelta*[T](state: MinExpression[T], position: Natural, oldValue, newValue: T): T {.inline.} =
     # Returns the change in minimum value obtained by reassigning position from oldValue to newValue.
-    # If position is not part of this expression, return 0 (no change)
-    if position notin state.positions:
-        return 0
-
     let currentMin = state.value
 
     case state.evalMethod:
@@ -154,11 +133,7 @@ func moveDelta*[T](state: MinExpression[T], position: Natural, oldValue, newValu
             var tempAssignment = state.currentAssignment
             tempAssignment[position] = newValue
 
-            var newMin: T = high(T)
-            for exp in state.expressions:
-                let expValue = exp.evaluate(tempAssignment)
-                newMin = min(newMin, expValue)
-
+            let newMin = state.evaluate(tempAssignment)
             return newMin - currentMin
 
 proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =

@@ -17,48 +17,44 @@ type
         value*: T
         currentAssignment*: Table[Natural, T]
 
-func newStatefulAlgebraicExpression*[T](expr: AlgebraicExpression[T]): StatefulAlgebraicExpression[T] =
+func newStatefulAlgebraicExpression*[T](expression: AlgebraicExpression[T]): StatefulAlgebraicExpression[T] =
     result = StatefulAlgebraicExpression[T](
-        algebraicExpr: expr,
-        positions: expr.positions,
-        value: 0,
+        algebraicExpr: expression,
+        positions: expression.positions,
+        value: default(T),
         currentAssignment: initTable[Natural, T]()
     )
 
-func initialize*[T](expr: StatefulAlgebraicExpression[T], assignment: seq[T]) =
+func initialize*[T](expression: StatefulAlgebraicExpression[T], assignment: seq[T]) =
     # Initialize with the given assignment
-    expr.currentAssignment.clear()
-    for position in expr.positions:
-        expr.currentAssignment[position] = assignment[position]
-    expr.value = expr.algebraicExpr.evaluate(assignment)
+    expression.currentAssignment.clear()
+    for position in expression.positions:
+        expression.currentAssignment[position] = assignment[position]
+    expression.value = expression.algebraicExpr.evaluate(assignment)
 
-func updatePosition*[T](expr: StatefulAlgebraicExpression[T], position: Natural, newValue: T) =
+func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: Natural, newValue: T) =
     # Update a single position incrementally
-    if position in expr.positions:
+    if position in expression.positions:
         # Calculate the delta first for incremental update
-        let oldValue = expr.currentAssignment[position]
-        let delta = expr.moveDelta(position, oldValue, newValue)
+        let oldValue = expression.currentAssignment[position]
+        let delta = expression.moveDelta(position, oldValue, newValue)
 
         # Update assignment and value incrementally
-        expr.currentAssignment[position] = newValue
-        expr.value += delta
+        expression.currentAssignment[position] = newValue
+        expression.value += delta
 
-func moveDelta*[T](expr: StatefulAlgebraicExpression[T], position: Natural,
+# Calculate the change in cost
+func moveDelta*[T](expression: StatefulAlgebraicExpression[T],
+                   position: Natural,
                    oldValue, newValue: T): T =
-    # Calculate the change in value
-    if position notin expr.positions:
-        return 0
-
-    # Store current value
-    let currentValue = expr.value
-
+    let currentValue = expression.value
     # Temporarily update and evaluate using table-based evaluation
-    let savedValue = expr.currentAssignment[position]
-    expr.currentAssignment[position] = newValue
-    let newTotalValue = expr.algebraicExpr.evaluate(expr.currentAssignment)
+    let savedValue = expression.currentAssignment[position]
+    expression.currentAssignment[position] = newValue
+    let newTotalValue = expression.algebraicExpr.evaluate(expression.currentAssignment)
 
     # Restore original value
-    expr.currentAssignment[position] = savedValue
+    expression.currentAssignment[position] = savedValue
 
     return newTotalValue - currentValue
 
@@ -88,106 +84,77 @@ type
         of ConstantExpr:
             constantValue*: T
 
-# Generic template to wrap any expression type into Expression wrapper
-template wrap*[T](expr: typed): Expression[T] =
-    when expr is StatefulAlgebraicExpression[T]:
-        Expression[T](
-            kind: StatefulAlgebraicExpr,
-            algebraicExpr: expr,
-            positions: expr.positions
-        )
-    elif expr is AlgebraicExpression[T]:
-        # Convert AlgebraicExpression to StatefulAlgebraicExpression
-        let statefulExpr = newStatefulAlgebraicExpression(expr)
-        Expression[T](
-            kind: StatefulAlgebraicExpr,
-            algebraicExpr: statefulExpr,
-            positions: expr.positions
-        )
-    elif expr is SumExpression[T]:
-        Expression[T](
-            kind: SumExpr,
-            sumExpr: expr,
-            positions: expr.positions
-        )
-    elif expr is MinExpression[T]:
-        Expression[T](
-            kind: MinExpr,
-            minExpr: expr,
-            positions: expr.positions
-        )
-    elif expr is MaxExpression[T]:
-        Expression[T](
-            kind: MaxExpr,
-            maxExpr: expr,
-            positions: expr.positions
-        )
-    elif expr is T:
-        # Handle constant values
-        Expression[T](
-            kind: ConstantExpr,
-            constantValue: expr,
-            positions: toPackedSet[Natural]([])
-        )
-    else:
-        {.error: "Unsupported expression type for wrap".}
+# Overloaded procs to create Expression wrapper from various expression types
+proc newExpression*[T](expression: StatefulAlgebraicExpression[T]): Expression[T] =
+    Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: expression, positions: expression.positions)
+
+proc newExpression*[T](expression: AlgebraicExpression[T]): Expression[T] =
+    # Convert AlgebraicExpression to StatefulAlgebraicExpression
+    let statefulExpression = newStatefulAlgebraicExpression(expression)
+    Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: statefulExpression, positions: expression.positions)
+
+proc newExpression*[T](expression: SumExpression[T]): Expression[T] =
+    Expression[T](kind: SumExpr, sumExpr: expression, positions: expression.positions)
+
+proc newExpression*[T](expression: MinExpression[T]): Expression[T] =
+    Expression[T](kind: MinExpr, minExpr: expression, positions: expression.positions)
+
+proc newExpression*[T](expression: MaxExpression[T]): Expression[T] =
+    Expression[T](kind: MaxExpr, maxExpr: expression, positions: expression.positions)
+
+proc newExpression*[T](value: T): Expression[T] =
+    Expression[T](kind: ConstantExpr, constantValue: value, positions: initPackedSet[Natural]())
 
 # Helper functions for Expression operations
-func initialize*[T](expr: Expression[T], assignment: seq[T]) =
-    case expr.kind
+func initialize*[T](expression: Expression[T], assignment: seq[T]) =
+    case expression.kind
     of StatefulAlgebraicExpr:
-        expr.algebraicExpr.initialize(assignment)
+        expression.algebraicExpr.initialize(assignment)
     of SumExpr:
-        expr.sumExpr.initialize(assignment)
+        expression.sumExpr.initialize(assignment)
     of MinExpr:
-        expr.minExpr.initialize(assignment)
+        expression.minExpr.initialize(assignment)
     of MaxExpr:
-        expr.maxExpr.initialize(assignment)
+        expression.maxExpr.initialize(assignment)
     of ConstantExpr:
         discard  # Constants don't need initialization
 
-func getValue*[T](expr: Expression[T]): T =
-    case expr.kind
+func getValue*[T](expression: Expression[T]): T =
+    case expression.kind
     of StatefulAlgebraicExpr:
-        return expr.algebraicExpr.value
+        return expression.algebraicExpr.value
     of SumExpr:
-        return expr.sumExpr.value
+        return expression.sumExpr.value
     of MinExpr:
-        return expr.minExpr.value
+        return expression.minExpr.value
     of MaxExpr:
-        return expr.maxExpr.value
+        return expression.maxExpr.value
     of ConstantExpr:
-        return expr.constantValue
+        return expression.constantValue
 
-func updatePosition*[T](expr: Expression[T], position: Natural, newValue: T) =
-    if position notin expr.positions:
-        return
-
-    case expr.kind
+func updatePosition*[T](expression: Expression[T], position: Natural, newValue: T) =
+    case expression.kind
     of StatefulAlgebraicExpr:
-        expr.algebraicExpr.updatePosition(position, newValue)
+        expression.algebraicExpr.updatePosition(position, newValue)
     of SumExpr:
-        expr.sumExpr.updatePosition(position, newValue)
+        expression.sumExpr.updatePosition(position, newValue)
     of MinExpr:
-        expr.minExpr.updatePosition(position, newValue)
+        expression.minExpr.updatePosition(position, newValue)
     of MaxExpr:
-        expr.maxExpr.updatePosition(position, newValue)
+        expression.maxExpr.updatePosition(position, newValue)
     of ConstantExpr:
         discard  # Constants don't change
 
-func moveDelta*[T](expr: Expression[T], position: Natural,
+func moveDelta*[T](expression: Expression[T], position: Natural,
                    oldValue, newValue: T): T =
-    if position notin expr.positions:
-        return 0
-
-    case expr.kind
+    case expression.kind
     of StatefulAlgebraicExpr:
-        return expr.algebraicExpr.moveDelta(position, oldValue, newValue)
+        return expression.algebraicExpr.moveDelta(position, oldValue, newValue)
     of SumExpr:
-        return expr.sumExpr.moveDelta(position, oldValue, newValue)
+        return expression.sumExpr.moveDelta(position, oldValue, newValue)
     of MinExpr:
-        return expr.minExpr.moveDelta(position, oldValue, newValue)
+        return expression.minExpr.moveDelta(position, oldValue, newValue)
     of MaxExpr:
-        return expr.maxExpr.moveDelta(position, oldValue, newValue)
+        return expression.maxExpr.moveDelta(position, oldValue, newValue)
     of ConstantExpr:
         return 0  # Constants don't change

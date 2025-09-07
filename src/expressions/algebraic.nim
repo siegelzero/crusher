@@ -5,27 +5,18 @@ export types, sumExpression
 
 
 # AlgebraicExpression Creation
-
-func init*[T](expression: AlgebraicExpression[T],
-              positions: PackedSet[Natural],
-              node: ExpressionNode[T],
-              linear: bool) =
-    expression.positions = positions
-    expression.node = node
-    expression.linear = linear
-
 func newAlgebraicExpression*[T](positions: PackedSet[Natural],
                                 node: ExpressionNode[T],
                                 linear: bool): AlgebraicExpression[T] =
     new(result)
-    result.init(positions, node, linear)
+    result.positions = positions
+    result.node = node
+    result.linear = linear
 
 # Unary Expression Operations
-
 func `-`*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} = -1*expression
 
 # Binary (Expression, Expression) Operations
-
 template ExpExpOp(op, opref: untyped) =
     func `op`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
         let linear = case opref:
@@ -52,7 +43,6 @@ ExpExpOp(`*`, Multiplication)
 ExpExpOp(`-`, Subtraction)
 
 # Binary (Expression, Value) Operations
-
 template ExpValOp(op, opref: untyped) =
     func `op`*[T](left: AlgebraicExpression[T], right: T): AlgebraicExpression[T] {.inline.} =
         newAlgebraicExpression[T](

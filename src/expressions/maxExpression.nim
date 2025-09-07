@@ -12,10 +12,10 @@ type
         currentAssignment*: Table[Natural, T]
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                discard  # positions and currentAssignment are sufficient
+                discard
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
-                expressionsAtPosition*: Table[Natural, seq[int]]  # position -> list of expression indices
+                expressionsAtPosition*: Table[Natural, seq[int]]
 
 ################################################################################
 # MaxExpression creation
@@ -59,20 +59,7 @@ func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
     # Initialize the MaxExpression with the given assignment, and updates the value.
     for pos in state.positions:
         state.currentAssignment[pos] = assignment[pos]
-
-    var maxValue: T = low(T)
-    case state.evalMethod:
-        of PositionBased:
-            # For position-based: maximum of variable values directly
-            for pos in state.positions:
-                maxValue = max(maxValue, assignment[pos])
-        of ExpressionBased:
-            # For expression-based: maximum of expression evaluations
-            for exp in state.expressions:
-                let expValue = exp.evaluate(assignment)
-                maxValue = max(maxValue, expValue)
-
-    state.value = maxValue
+    state.value = state.evaluate(assignment)
 
 func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
     var maxValue: T = low(T)
@@ -82,8 +69,7 @@ func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[Natural, T])
                 maxValue = max(maxValue, assignment[pos])
         of ExpressionBased:
             for exp in state.expressions:
-                let expValue = exp.evaluate(assignment)
-                maxValue = max(maxValue, expValue)
+                maxValue = max(maxValue, exp.evaluate(assignment))
     return maxValue
 
 func `$`*[T](state: MaxExpression[T]): string = $(state.value)
@@ -106,28 +92,21 @@ func updatePosition*[T](state: MaxExpression[T], position: Natural, newValue: T)
             elif oldValue == state.value and newValue < oldValue:
                 # We're replacing the current maximum with a smaller value
                 # Need to find the new maximum among all values
-                var maxValue: T = low(T)
-                for val in state.currentAssignment.values:
-                    if val > maxValue:
-                        maxValue = val
-                state.value = maxValue
+                state.value = max(state.currentAssignment.values.toSeq)
             # Otherwise, the maximum doesn't change
 
         of ExpressionBased:
-            # For expression-based: need to recalculate affected expressions
-            # This is less efficient but more general
-            var maxValue: T = low(T)
-            for exp in state.expressions:
-                let expValue = exp.evaluate(state.currentAssignment)
-                maxValue = max(maxValue, expValue)
-            state.value = maxValue
+            # Only evaluate expressions that depend on the changed position
+            for idx in state.expressionsAtPosition[position]:
+                let expValue = state.expressions[idx].evaluate(state.currentAssignment)
+                if expValue > state.value:
+                    state.value = expValue
+                elif expValue == state.value and newValue < oldValue:
+                    state.value = state.evaluate(state.currentAssignment)
+                    break
 
 func moveDelta*[T](state: MaxExpression[T], position: Natural, oldValue, newValue: T): T {.inline.} =
     # Returns the change in maximum value obtained by reassigning position from oldValue to newValue.
-    # If position is not part of this expression, return 0 (no change)
-    if position notin state.positions:
-        return 0
-
     let currentMax = state.value
 
     case state.evalMethod:
@@ -154,11 +133,7 @@ func moveDelta*[T](state: MaxExpression[T], position: Natural, oldValue, newValu
             var tempAssignment = state.currentAssignment
             tempAssignment[position] = newValue
 
-            var newMax: T = low(T)
-            for exp in state.expressions:
-                let expValue = exp.evaluate(tempAssignment)
-                newMax = max(newMax, expValue)
-
+            let newMax = state.evaluate(tempAssignment)
             return newMax - currentMax
 
 proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
