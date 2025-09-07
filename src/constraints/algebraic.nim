@@ -1,3 +1,15 @@
+## Algebraic constraint definitions and operations
+##
+## This module provides the core `AlgebraicConstraint` type for representing
+## constraints as expression trees, along with operations for creating constraints
+## from algebraic expressions and evaluating them against variable assignments.
+##
+## Key features:
+## - Constraint creation from algebraic expressions using standard operators
+## - Optimized constraint negation (converts `not(a == b)` to `a != b`)
+## - Support for arithmetic constraints (common factors, coprimality)
+## - Efficient evaluation using expression trees
+
 import std/[packedsets, tables]
 
 import constraintNode
@@ -67,11 +79,6 @@ ExpExpRel(`<`, LessThan)
 ExpExpRel(`<=`, LessThanEq)
 
 ################################################################################
-# Binary (AlgebraicExpression, Value) Relations
-################################################################################
-
-
-################################################################################
 # Evaluation
 ################################################################################
 
@@ -79,8 +86,7 @@ func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table
     constraint.node.evaluate(assignment)
 
 proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[Natural, T]): T {.inline.} =
-    return constraint.node.penalty(assignment)
-
+    constraint.node.penalty(assignment)
 
 ################################################################################
 # Arithmetical Constraints

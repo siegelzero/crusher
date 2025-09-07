@@ -59,22 +59,18 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
 func getCount[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
     return state.countTable.getOrDefault(value, 0)
 
-
 func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
     max(0, state.getCount(value) - 1)
-
 
 func decrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     if value in state.countTable:
         state.countTable[value] -= 1
-
 
 func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
     if value in state.countTable:
         state.countTable[value] += 1
     else:
         state.countTable[value] = 1
-
 
 proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
@@ -133,12 +129,13 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
     if oldValue == newValue:
         return 0
 
-    var oldExpValue, newExpValue, oldValueCount, newValueCount: int
+    var oldExpValue, newExpValue: T
+    var oldValueCount, newValueCount: int
 
     case state.evalMethod:
         of PositionBased:
             oldValueCount = state.getCount(oldValue)
-            doAssert oldValueCount >= 1
+            doAssert oldValueCount >= 1, "oldValue should exist in count table"
             result -= oldValueCount - 1
             oldValueCount -= 1
             result += max(0, oldValueCount - 1)
