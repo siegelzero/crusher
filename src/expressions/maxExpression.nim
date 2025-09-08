@@ -1,4 +1,4 @@
-import std/[packedsets, tables]
+import std/[packedsets, tables, sequtils]
 import algebraic, types
 
 ################################################################################
@@ -8,30 +8,30 @@ import algebraic, types
 type
     MaxExpression*[T] = ref object
         value*: T
-        positions*: PackedSet[Natural]
-        currentAssignment*: Table[Natural, T]
+        positions*: PackedSet[int]
+        currentAssignment*: Table[int, T]
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 discard
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
-                expressionsAtPosition*: Table[Natural, seq[int]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # MaxExpression creation
 ################################################################################
 
-func newMaxExpression*[T](positions: openArray[Natural]): MaxExpression[T] =
+func newMaxExpression*[T](positions: openArray[int]): MaxExpression[T] =
     result = MaxExpression[T](
         evalMethod: PositionBased,
         value: 0,
-        positions: toPackedSet[Natural](positions),
-        currentAssignment: initTable[Natural, T]()
+        positions: toPackedSet[int](positions),
+        currentAssignment: initTable[int, T]()
     )
 
 func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxExpression[T] =
-    var expressionsAtPos = initTable[Natural, seq[int]]()
-    var allPositions = initPackedSet[Natural]()
+    var expressionsAtPos = initTable[int, seq[int]]()
+    var allPositions = initPackedSet[int]()
 
     # Collect all positions involved in the expressions
     for i, exp in expressions:
@@ -46,7 +46,7 @@ func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxEx
         evalMethod: ExpressionBased,
         value: 0,
         positions: allPositions,
-        currentAssignment: initTable[Natural, T](),
+        currentAssignment: initTable[int, T](),
         expressions: @expressions,
         expressionsAtPosition: expressionsAtPos
     )
@@ -61,7 +61,7 @@ func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
         state.currentAssignment[pos] = assignment[pos]
     state.value = state.evaluate(assignment)
 
-func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[Natural, T]): T {.inline.} =
+func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     var maxValue: T = low(T)
     case state.evalMethod:
         of PositionBased:
@@ -78,7 +78,7 @@ func `$`*[T](state: MaxExpression[T]): string = $(state.value)
 # MaxExpression updates
 ################################################################################
 
-func updatePosition*[T](state: MaxExpression[T], position: Natural, newValue: T) {.inline.} =
+func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.inline.} =
     # Assigns the value newValue to the variable in the given position, updating state.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
@@ -105,7 +105,7 @@ func updatePosition*[T](state: MaxExpression[T], position: Natural, newValue: T)
                     state.value = state.evaluate(state.currentAssignment)
                     break
 
-func moveDelta*[T](state: MaxExpression[T], position: Natural, oldValue, newValue: T): T {.inline.} =
+func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in maximum value obtained by reassigning position from oldValue to newValue.
     let currentMax = state.value
 
@@ -159,7 +159,7 @@ proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
 func max*[T](expressions: openArray[AlgebraicExpression[T]]): MaxExpression[T] =
     # Check if all expressions are simple variable references (RefNodes)
     var allRefs = true
-    var positions: seq[Natural] = @[]
+    var positions: seq[int] = @[]
 
     for exp in expressions:
         if exp.node.kind == RefNode:

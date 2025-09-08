@@ -5,7 +5,7 @@ export types, sumExpression
 
 
 # AlgebraicExpression Creation
-func newAlgebraicExpression*[T](positions: PackedSet[Natural],
+func newAlgebraicExpression*[T](positions: PackedSet[int],
                                 node: ExpressionNode[T],
                                 linear: bool): AlgebraicExpression[T] =
     new(result)

@@ -21,8 +21,8 @@ type
 
 func `[]`*[T](arr: ConstrainedArray[T], idx: int): AlgebraicExpression[T] {.inline.} = arr.entries[idx]
 
-iterator allPositions*[T](arr: ConstrainedArray[T]): Natural =
-    for i in 0..<arr.len: yield Natural(i)
+iterator allPositions*[T](arr: ConstrainedArray[T]): int =
+    for i in 0..<arr.len: yield int(i)
 
 func `$`*[T](arr: ConstrainedArray[T]): string =
     return fmt"ConstrainedArray of size {arr.len}"
@@ -37,7 +37,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
     for pos in 0..<n:
         entries.add(
             newAlgebraicExpression[T](
-                positions=toPackedSet[Natural](@[Natural(pos)]),
+                positions=toPackedSet[int](@[int(pos)]),
                 node=ExpressionNode[T](kind: RefNode, position: pos),
                 linear=true
             )
@@ -55,7 +55,7 @@ func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
     for pos in n..<(n + m):
         arr.entries.add(
             newAlgebraicExpression[T](
-                positions=toPackedSet[Natural](@[Natural(pos)]),
+                positions=toPackedSet[int](@[int(pos)]),
                 node=ExpressionNode[T](kind: RefNode, position: pos),
                 linear=true
             )

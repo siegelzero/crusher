@@ -48,7 +48,7 @@ suite "Linear Constraint Tests":
         sys.addConstraint(positionBased == 9)
 
         # Expression-based: custom coefficients using coefficient table
-        var coeffs = initTable[Natural, int]()
+        var coeffs = initTable[int, int]()
         coeffs[0] = 3   # 3*x[0]
         coeffs[1] = 1   # 1*x[1]
         coeffs[2] = -1  # -1*x[2]

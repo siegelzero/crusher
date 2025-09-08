@@ -6,7 +6,7 @@ import tabuState
 
 randomize()
 
-proc bestMoves[T](state: TabuState[T]): seq[(Natural, T)] =
+proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     # Returns the best valid next moves for the state.
     # Evaluates the entire neighborhood to find best non-tabu or improving moves.
     var

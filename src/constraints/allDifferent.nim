@@ -8,29 +8,29 @@ import ../expressions/expressions
 
 type
     AllDifferentConstraint*[T] = ref object
-        currentAssignment*: Table[Natural, T]
+        currentAssignment*: Table[int, T]
         countTable: Table[T, int]
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[Natural]
+                positions: PackedSet[int]
             of ExpressionBased:
                 expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[Natural, seq[int]]
+                expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################
 # AllDifferentConstraint creation
 ################################################################################
 
-func newAllDifferentConstraint*[T](positions: openArray[Natural] ): AllDifferentConstraint[T] =
+func newAllDifferentConstraint*[T](positions: openArray[int] ): AllDifferentConstraint[T] =
     # Allocates and initializes new AllDifferentConstraint[T]
     new(result)
     result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: PositionBased,
-        positions: toPackedSet[Natural](positions),
+        positions: toPackedSet[int](positions),
         countTable: initTable[T, int](),
-        currentAssignment: initTable[Natural, T](),
+        currentAssignment: initTable[int, T](),
     )
 
 func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): AllDifferentConstraint[T] =
@@ -39,10 +39,10 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
     result = AllDifferentConstraint[T](
         cost: 0,
         evalMethod: ExpressionBased,
-        expressionsAtPosition: initTable[Natural, seq[int]](),
+        expressionsAtPosition: initTable[int, seq[int]](),
         expressions: expressions,
         countTable: initTable[T, int](),
-        currentAssignment: initTable[Natural, T](),
+        currentAssignment: initTable[int, T](),
     )
 
     for i, exp in expressions:
@@ -107,7 +107,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
         state.cost += max(0, count - 1)
 
 
-proc updatePosition*[T](state: AllDifferentConstraint[T], position: Natural, newValue: T) =
+proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
     if oldValue != newValue:
@@ -125,7 +125,7 @@ proc updatePosition*[T](state: AllDifferentConstraint[T], position: Natural, new
                     state.adjustCounts(oldExpValue, newExpValue)
 
 
-proc moveDelta*[T](state: AllDifferentConstraint[T], position: Natural, oldValue, newValue: T): int =
+proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, newValue: T): int =
     if oldValue == newValue:
         return 0
 

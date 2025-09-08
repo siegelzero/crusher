@@ -24,7 +24,7 @@ type
         # Constraint stored as an expression tree on the given positions.
         # Evaluation of the constraint requires evaluating the tree.
         # This constraint form has no state; i.e. no assignment to the variables.
-        positions*: PackedSet[Natural]
+        positions*: PackedSet[int]
         node*: ConstraintNode[T]
 
 ################################################################################
@@ -82,10 +82,10 @@ ExpExpRel(`<=`, LessThanEq)
 # Evaluation
 ################################################################################
 
-func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[Natural, T]): bool {.inline.} =
+func evaluate*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[int, T]): bool {.inline.} =
     constraint.node.evaluate(assignment)
 
-proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[Natural, T]): T {.inline.} =
+proc penalty*[T](constraint: AlgebraicConstraint[T], assignment: seq[T] | Table[int, T]): T {.inline.} =
     constraint.node.penalty(assignment)
 
 ################################################################################

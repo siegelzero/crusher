@@ -13,10 +13,10 @@ type
         # Stateful Constraint backed by an Algebraic Constraint, where the current
         # assignment is saved, along with the cost.
         # This constraint form has state which is updated as the assignment changes.
-        currentAssignment*: Table[Natural, T]
+        currentAssignment*: Table[int, T]
         cost*: int
         constraint*: AlgebraicConstraint[T]
-        positions: PackedSet[Natural]
+        positions: PackedSet[int]
 
 # StatefulAlgebraicConstraint Creation
 
@@ -25,7 +25,7 @@ func init*[T](state: StatefulAlgebraicConstraint[T], constraint: AlgebraicConstr
     state.cost = 0
     state.positions = constraint.positions
     state.constraint = constraint
-    state.currentAssignment = initTable[Natural, T]()
+    state.currentAssignment = initTable[int, T]()
 
 func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): StatefulAlgebraicConstraint[T] =
     new(result)
@@ -46,7 +46,7 @@ func updatePosition*[T](state: StatefulAlgebraicConstraint[T], position: int, ne
     state.currentAssignment[position] = newValue
     state.cost = state.constraint.penalty(state.currentAssignment)
 
-func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: Natural, oldValue, newValue: T): int {.inline.} =
+func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValue, newValue: T): int {.inline.} =
     # Returns cost delta for changing position from oldValue to newValue.
     let oldCost = state.cost
     state.currentAssignment[position] = newValue
@@ -67,7 +67,7 @@ type
         RelationalConstraintType
 
     StatefulConstraint*[T] = object
-        positions*: PackedSet[Natural]
+        positions*: PackedSet[int]
         case stateType*: StatefulConstraintType
             of AllDifferentType:
                 allDifferentState*: AllDifferentConstraint[T]
@@ -293,24 +293,18 @@ ExprConstRel(`<`, LessThan)
 ExprConstRel(`<=`, LessThanEq)
 
 
-func allDifferent*[T](positions: openArray[Natural]): StatefulConstraint[T] =
+func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given positions.
     return StatefulConstraint[T](
-        positions: toPackedSet[Natural](positions),
+        positions: toPackedSet[int](positions),
         stateType: AllDifferentType,
         allDifferentState: newAllDifferentConstraint[T](positions)
     )
 
-func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
-    # Returns allDifferent constraint for the given positions (int overload).
-    var naturalPositions = newSeq[Natural](positions.len)
-    for i, pos in positions:
-        naturalPositions[i] = Natural(pos)
-    return allDifferent[T](naturalPositions)
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given expressions.
-    var positions = toPackedSet[Natural]([])
+    var positions = toPackedSet[int]([])
     var allRefs = true
     for exp in expressions:
         if exp.node.kind != RefNode:
@@ -343,7 +337,7 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.relationalConstraintState.initialize(assignment)
 
 
-func moveDelta*[T](constraint: StatefulConstraint[T], position: Natural, oldValue, newValue: T): int =
+func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
@@ -355,7 +349,7 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: Natural, oldValu
             constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
 
 
-func updatePosition*[T](constraint: StatefulConstraint[T], position: Natural, newValue: T) =
+func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.updatePosition(position, newValue)

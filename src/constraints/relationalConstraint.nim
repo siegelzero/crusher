@@ -13,7 +13,7 @@ type
         rightExpr*: Expression[T]              # Any expression type
         relation*: BinaryRelation              # Reuse existing ==, !=, <, <=, >, >=
         cost*: int                             # Cache current penalty
-        positions*: PackedSet[Natural]         # Union of left + right positions
+        positions*: PackedSet[int]         # Union of left + right positions
         # Cache for expression values
         leftValue*: T
         rightValue*: T
@@ -49,7 +49,7 @@ func initialize*[T](constraint: RelationalConstraint[T], assignment: seq[T]) =
 
 # Calculate the change in penalty for a position change
 func moveDelta*[T](constraint: RelationalConstraint[T],
-                   position: Natural, oldValue, newValue: T): int =
+                   position: int, oldValue, newValue: T): int =
     # Early exit if position doesn't affect this constraint
     if position notin constraint.positions:
         return 0
@@ -72,7 +72,7 @@ func moveDelta*[T](constraint: RelationalConstraint[T],
 
 # Update a position with a new value
 func updatePosition*[T](constraint: RelationalConstraint[T],
-                        position: Natural, newValue: T) =
+                        position: int, newValue: T) =
     # Update expressions incrementally and get their new values directly
     # The expressions maintain their own values, so we don't need getValue()
 

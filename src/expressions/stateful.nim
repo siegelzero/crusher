@@ -13,16 +13,16 @@ type
         # Stateful wrapper for AlgebraicExpression
         # Maintains current value and assignment like Sum/Min/MaxExpression
         algebraicExpr*: AlgebraicExpression[T]
-        positions*: PackedSet[Natural]
+        positions*: PackedSet[int]
         value*: T
-        currentAssignment*: Table[Natural, T]
+        currentAssignment*: Table[int, T]
 
 func newStatefulAlgebraicExpression*[T](expression: AlgebraicExpression[T]): StatefulAlgebraicExpression[T] =
     result = StatefulAlgebraicExpression[T](
         algebraicExpr: expression,
         positions: expression.positions,
         value: default(T),
-        currentAssignment: initTable[Natural, T]()
+        currentAssignment: initTable[int, T]()
     )
 
 func initialize*[T](expression: StatefulAlgebraicExpression[T], assignment: seq[T]) =
@@ -32,7 +32,7 @@ func initialize*[T](expression: StatefulAlgebraicExpression[T], assignment: seq[
         expression.currentAssignment[position] = assignment[position]
     expression.value = expression.algebraicExpr.evaluate(assignment)
 
-func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: Natural, newValue: T) =
+func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: int, newValue: T) =
     # Update a single position incrementally
     if position in expression.positions:
         # Calculate the delta first for incremental update
@@ -45,7 +45,7 @@ func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: Na
 
 # Calculate the change in cost
 func moveDelta*[T](expression: StatefulAlgebraicExpression[T],
-                   position: Natural,
+                   position: int,
                    oldValue, newValue: T): T =
     let currentValue = expression.value
     # Temporarily update and evaluate using table-based evaluation
@@ -71,7 +71,7 @@ type
         ConstantExpr
 
     Expression*[T] = object
-        positions*: PackedSet[Natural]
+        positions*: PackedSet[int]
         case kind*: ExpressionKind
         of StatefulAlgebraicExpr:
             algebraicExpr*: StatefulAlgebraicExpression[T]
@@ -103,7 +103,7 @@ proc newExpression*[T](expression: MaxExpression[T]): Expression[T] =
     Expression[T](kind: MaxExpr, maxExpr: expression, positions: expression.positions)
 
 proc newExpression*[T](value: T): Expression[T] =
-    Expression[T](kind: ConstantExpr, constantValue: value, positions: initPackedSet[Natural]())
+    Expression[T](kind: ConstantExpr, constantValue: value, positions: initPackedSet[int]())
 
 # Helper functions for Expression operations
 func initialize*[T](expression: Expression[T], assignment: seq[T]) =
@@ -132,7 +132,7 @@ func getValue*[T](expression: Expression[T]): T =
     of ConstantExpr:
         return expression.constantValue
 
-func updatePosition*[T](expression: Expression[T], position: Natural, newValue: T) =
+func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
     case expression.kind
     of StatefulAlgebraicExpr:
         expression.algebraicExpr.updatePosition(position, newValue)
@@ -145,7 +145,7 @@ func updatePosition*[T](expression: Expression[T], position: Natural, newValue: 
     of ConstantExpr:
         discard  # Constants don't change
 
-func moveDelta*[T](expression: Expression[T], position: Natural,
+func moveDelta*[T](expression: Expression[T], position: int,
                    oldValue, newValue: T): T =
     case expression.kind
     of StatefulAlgebraicExpr:

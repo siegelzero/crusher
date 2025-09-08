@@ -1,7 +1,8 @@
 import std/[packedsets, sequtils]
 
 import constrainedArray
-import constraints/[algebraic, stateful, constraintNode]
+import constraints/[algebraic, stateful, constraintNode, elementState]
+export elementState.ArrayElement
 import expressions/[algebraic, stateful, sumExpression]
 
 ################################################################################
@@ -80,10 +81,10 @@ func `[]`*[T](cvar: ConstrainedSequence[T], i: int): AlgebraicExpression[T] {.in
 func `[]`*[T](cvar: ConstrainedMatrix[T], i, j: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + cvar.m*i + j]
 
-func positions[T](cvar: VariableContainer[T]): seq[Natural] =
-    result = newSeq[Natural](cvar.size)
+func positions[T](cvar: VariableContainer[T]): seq[int] =
+    result = newSeq[int](cvar.size)
     for i in 0..<cvar.size:
-        result[i] = Natural(cvar.offset + i)
+        result[i] = cvar.offset + i
 
 func assignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
     cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
@@ -166,3 +167,49 @@ func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[Stat
     # adds constraints to the system
     for constraint in constraints:
         system.baseArray.addBaseConstraint(constraint)
+
+################################################################################
+# Element constraint functions
+################################################################################
+
+proc element*[T](indexExpr: AlgebraicExpression[T], constantArray: seq[T], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    # Creates element constraint: constantArray[indexExpr] = valueExpr
+    let indexPos = indexExpr.node.position
+    let valuePos = valueExpr.node.position
+    let elementState = newElementState[T](indexPos, constantArray, valuePos)
+
+    return StatefulConstraint[T](
+        positions: elementState.positions,
+        stateType: ElementConstraint,
+        elementState: elementState
+    )
+
+proc element*[T](indexExpr: AlgebraicExpression[T], variableArray: seq[AlgebraicExpression[T]], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    # Creates element constraint: variableArray[indexExpr] = valueExpr
+    let indexPos = indexExpr.node.position
+    let valuePos = valueExpr.node.position
+
+    # Convert AlgebraicExpressions to ArrayElements
+    var arrayElements: seq[ArrayElement[T]] = @[]
+    for expr in variableArray:
+        arrayElements.add(ArrayElement[T](isConstant: false, variablePosition: expr.node.position))
+
+    let elementState = newElementState[T](indexPos, arrayElements, valuePos)
+
+    return StatefulConstraint[T](
+        positions: elementState.positions,
+        stateType: ElementConstraint,
+        elementState: elementState
+    )
+
+proc element*[T](indexExpr: AlgebraicExpression[T], mixedArray: seq[ArrayElement[T]], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    # Creates element constraint: mixedArray[indexExpr] = valueExpr (mixed constant/variable array)
+    let indexPos = indexExpr.node.position
+    let valuePos = valueExpr.node.position
+    let elementState = newElementState[T](indexPos, mixedArray, valuePos)
+
+    return StatefulConstraint[T](
+        positions: elementState.positions,
+        stateType: ElementConstraint,
+        elementState: elementState
+    )

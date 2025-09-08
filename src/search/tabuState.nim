@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables]
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState]
 import ../constrainedArray
 
 ################################################################################
@@ -12,7 +12,7 @@ type
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
         constraints*: seq[StatefulConstraint[T]]
-        neighbors*: seq[seq[Natural]]
+        neighbors*: seq[seq[int]]
         penaltyMap*: seq[Table[T, int]]
         reducedDomain*: seq[seq[T]]
 
@@ -30,13 +30,13 @@ type
 # Penalty Routines
 ################################################################################
 
-proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: Natural, newValue: T): int {.inline.} =
+proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
     let oldValue = state.assignment[position]
     case constraint.stateType:
         of AllDifferentType:
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of ElementConstraint:
-            result = 0
+            result = constraint.elementState.cost + constraint.elementState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
         of RelationalConstraintType:
@@ -46,7 +46,7 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 # Penalty Map Routines
 ################################################################################
 
-proc updatePenaltiesForPosition[T](state: TabuState[T], position: Natural) =
+proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
     # Computes penalties for all constraints involving the position, and updates penalty map
     var penalty: int
     for value in state.reducedDomain[position]:
@@ -56,7 +56,7 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: Natural) =
         state.penaltyMap[position][value] = penalty
 
 
-proc updateNeighborPenalties*[T](state: TabuState[T], position: Natural) =
+proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
         state.updatePenaltiesForPosition(nbr)
@@ -74,7 +74,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     # Initializes all structures and data for the state TabuState[T]
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
-    state.neighbors = newSeq[seq[Natural]](carray.len)
+    state.neighbors = newSeq[seq[int]](carray.len)
     state.reducedDomain = reduceDomain(state.carray)
 
     state.iteration = 0
@@ -90,7 +90,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
             state.constraintsAtPosition[pos].add(constraint)
 
     # Collect neighbors of each position
-    var neighborSet: PackedSet[Natural] = toPackedSet[Natural]([])
+    var neighborSet: PackedSet[int] = toPackedSet[int]([])
     for pos in carray.allPositions():
         neighborSet.clear()
         for constraint in state.constraintsAtPosition[pos]:
