@@ -1,6 +1,6 @@
 import std/packedsets
 
-import constraints/[algebraic, stateful, ordering, globalCardinality]
+import constraints/[algebraic, stateful, ordering, globalCardinality, atleast, atmost, multiknapsack, sequence]
 import expressions/expressions
 import search/[optimization, resolution]
 import constraintSystem
@@ -13,4 +13,8 @@ export constraintSystem,
        resolution,
        packedsets,
        ordering,
-       globalCardinality
+       globalCardinality,
+       atleast,
+       atmost,
+       multiknapsack,
+       sequence

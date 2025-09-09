@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, tables]
 import types
 
 ################################################################################

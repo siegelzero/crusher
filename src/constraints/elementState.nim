@@ -1,3 +1,37 @@
+## Element Constraint Implementation
+## =================================
+##
+## This module implements the Element constraint, which enforces the indexing relationship
+## `array[indexExpr] = valueExpr`, where the array can contain constants, variables, or mixed elements.
+##
+## **Constraint Definition**:
+## `array[index] = value`
+##
+## **Key Features**:
+## - Support for constant arrays, variable arrays, and mixed arrays
+## - Automatic bounds checking for array indices
+## - Binary violation cost (0 if satisfied, 1 if violated)
+## - Efficient caching of array element values
+## - Handles out-of-bounds indices gracefully
+##
+## **Array Types**:
+## - **Constant Array**: Fixed lookup table with predetermined values
+## - **Variable Array**: Array elements are variables that can change
+## - **Mixed Array**: Combination of constants and variables
+##
+## **Applications**:
+## - Lookup tables: Implementing function mappings y = f(x)
+## - Configuration selection: Choose settings based on mode
+## - Data structure modeling: Array/list access patterns
+## - Routing problems: Path selection from alternatives
+## - Resource mapping: Dynamic resource assignment based on conditions
+## - State machines: State transition tables
+##
+## **Violation Cost**: Binary constraint (0 = satisfied, 1 = violated)
+## - Checks exact equality after bounds validation
+##
+## **Performance**: O(1) evaluation with cached array access, efficient bound checking
+
 import std/[packedsets, tables]
 
 ################################################################################

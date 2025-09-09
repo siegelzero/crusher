@@ -1,7 +1,7 @@
-import std/[packedsets, sequtils]
+import std/packedsets
 
 import constrainedArray
-import constraints/[algebraic, stateful, constraintNode, elementState]
+import constraints/[algebraic, stateful, elementState]
 export elementState.ArrayElement
 import expressions/[algebraic, stateful, sumExpression, maxExpression, minExpression]
 

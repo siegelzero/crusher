@@ -1,3 +1,33 @@
+## Ordering Constraint Implementation
+## ==================================
+##
+## This module implements ordering constraints that enforce monotonic relationships
+## between variables: increasing, decreasing, strictly increasing, and strictly decreasing.
+##
+## **Constraint Definitions**:
+## - **Increasing**: `∀i ∈ [0, n-2] : x[positions[i]] ≤ x[positions[i+1]]`
+## - **Decreasing**: `∀i ∈ [0, n-2] : x[positions[i]] ≥ x[positions[i+1]]`
+## - **Strictly Increasing**: `∀i ∈ [0, n-2] : x[positions[i]] < x[positions[i+1]]`
+## - **Strictly Decreasing**: `∀i ∈ [0, n-2] : x[positions[i]] > x[positions[i+1]]`
+##
+## **Key Features**:
+## - Position-based and expression-based evaluation modes
+## - Efficient adjacent-pair violation checking
+## - Support for all four ordering relationship types
+## - Incremental move evaluation with minimal recomputation
+##
+## **Applications**:
+## - Scheduling: Temporal ordering constraints (start ≤ finish)
+## - Resource management: Capacity/priority ordering
+## - Data processing: Sorted sequence requirements
+## - Quality control: Monotonic trend enforcement
+## - Performance optimization: Ensuring improvement over time
+##
+## **Violation Cost**: Sum of ordering violations between adjacent pairs
+## - Each violated constraint contributes 1 to total cost
+##
+## **Performance**: O(k) incremental move evaluation where k = number of affected adjacent pairs
+
 import std/[packedsets, sequtils, tables, algorithm]
 
 import ../expressions/[expressions, types]

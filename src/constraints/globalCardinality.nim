@@ -1,4 +1,29 @@
-import std/[packedsets, sequtils, tables]
+## Global Cardinality Constraint Implementation
+## ============================================
+##
+## This module implements the Global Cardinality constraint, which ensures specific
+## occurrence counts for multiple values simultaneously. Supports both exact counts
+## and bounded counts (lower/upper bounds).
+##
+## **Constraint Definitions**:
+## - **Exact**: `∀v ∈ cover : |{i ∈ positions : x[i] = v}| = targetCounts[v]`
+## - **Bounded**: `∀v ∈ cover : lowerBounds[v] ≤ |{i ∈ positions : x[i] = v}| ≤ upperBounds[v]`
+##
+## **Key Features**:
+## - Position-based and expression-based evaluation modes
+## - Efficient incremental updates using value frequency tracking
+## - Handles both exact count requirements and bounded count ranges
+## - Penalty for values outside the cover set
+##
+## **Applications**:
+## - Workforce scheduling: Exact staff requirements per role
+## - Resource allocation: Bounded resource usage per category
+## - Load balancing: Balanced distribution across servers
+## - Quality control: Target occurrence rates
+##
+## **Performance**: O(1) incremental move evaluation, O(n) initialization where n = number of positions/expressions
+
+import std/[packedsets, tables]
 
 import ../expressions/expressions
 import common

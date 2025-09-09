@@ -35,6 +35,10 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
     case constraint.stateType:
         of AllDifferentType:
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
+        of AtLeastType:
+            result = constraint.atLeastState.cost + constraint.atLeastState.moveDelta(position, oldValue, newValue)
+        of AtMostType:
+            result = constraint.atMostState.cost + constraint.atMostState.moveDelta(position, oldValue, newValue)
         of ElementType:
             result = constraint.elementState.cost + constraint.elementState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
@@ -45,6 +49,10 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.orderingState.cost + constraint.orderingState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
             result = constraint.globalCardinalityState.cost + constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
+        of MultiknapsackType:
+            result = constraint.multiknapsackState.cost + constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
+        of SequenceType:
+            result = constraint.sequenceState.cost + constraint.sequenceState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines

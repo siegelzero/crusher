@@ -1,4 +1,32 @@
-import std/[packedsets, sequtils, tables]
+## AllDifferent Constraint Implementation
+## =====================================
+##
+## This module implements the AllDifferent constraint, which ensures all variables
+## in the specified positions take different values (no duplicates).
+##
+## **Constraint Definition**:
+## `∀i,j ∈ positions, i ≠ j : x[i] ≠ x[j]`
+##
+## **Key Features**:
+## - Position-based and expression-based evaluation modes
+## - Efficient incremental updates using value frequency counting
+## - Linear violation cost based on number of duplicate pairs
+## - Hash table-based O(1) value lookup and counting
+##
+## **Applications**:
+## - N-Queens problem: Ensuring no conflicts between queens
+## - Resource assignment: Unique resource allocation per task
+## - Scheduling: Non-overlapping activities in time slots
+## - Permutation problems: Generating unique arrangements
+## - Graph coloring: Adjacent nodes get different colors
+## - Sudoku puzzles: Row/column/box uniqueness constraints
+##
+## **Violation Cost**: Sum of conflicts between duplicate values
+## - For each value v: `max(0, count(v) - 1)` duplicates contribute to cost
+##
+## **Performance**: O(1) incremental move evaluation, O(n) initialization where n = number of positions/expressions
+
+import std/[packedsets, tables]
 
 import ../expressions/expressions
 import common
