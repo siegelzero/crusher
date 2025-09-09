@@ -62,9 +62,9 @@ func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValu
 type
     StatefulConstraintType* = enum
         AllDifferentType,
-        ElementConstraint,
+        ElementType,
         AlgebraicType,
-        RelationalConstraintType,
+        RelationalType,
         OrderingType,
         GlobalCardinalityType
 
@@ -73,12 +73,12 @@ type
         case stateType*: StatefulConstraintType
             of AllDifferentType:
                 allDifferentState*: AllDifferentConstraint[T]
-            of ElementConstraint:
+            of ElementType:
                 elementState*: ElementState[T]
             of AlgebraicType:
-                algebraicConstraintState*: StatefulAlgebraicConstraint[T]
-            of RelationalConstraintType:
-                relationalConstraintState*: RelationalConstraint[T]
+                algebraicState*: StatefulAlgebraicConstraint[T]
+            of RelationalType:
+                relationalState*: RelationalConstraint[T]
             of OrderingType:
                 orderingState*: OrderingConstraint[T]
             of GlobalCardinalityType:
@@ -89,11 +89,11 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
     case constraint.stateType:
         of AllDifferentType:
             return "AllDifferent Constraint"
-        of ElementConstraint:
+        of ElementType:
             return "Element Constraint"
         of AlgebraicType:
             return "Algebraic Constraint"
-        of RelationalConstraintType:
+        of RelationalType:
             return "Relational Constraint"
         of OrderingType:
             return "Ordering Constraint"
@@ -108,12 +108,12 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
     case constraint.stateType:
         of AllDifferentType:
             return constraint.allDifferentState.cost
-        of ElementConstraint:
+        of ElementType:
             return constraint.elementState.cost
         of AlgebraicType:
-            return constraint.algebraicConstraintState.cost
-        of RelationalConstraintType:
-            return constraint.relationalConstraintState.cost
+            return constraint.algebraicState.cost
+        of RelationalType:
+            return constraint.relationalState.cost
         of OrderingType:
             return constraint.orderingState.cost
         of GlobalCardinalityType:
@@ -137,8 +137,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Min-to-Min relations
@@ -146,8 +146,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Max-to-Max relations
@@ -155,8 +155,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Min-to-Max relations
@@ -164,8 +164,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Max-to-Min relations
@@ -173,8 +173,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Sum-to-Min relations
@@ -182,8 +182,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Sum-to-Max relations
@@ -191,8 +191,8 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # AlgebraicExpression-to-any relations
@@ -200,56 +200,56 @@ template ExprExprRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: SumExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: AlgebraicExpression[T], right: MinExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: MinExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: AlgebraicExpression[T], right: MaxExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: MaxExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     func `rel`*[T](left: AlgebraicExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
 # Generate all relational operators for expression-to-expression
@@ -267,8 +267,8 @@ template ExprConstRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Min-to-constant relations
@@ -276,8 +276,8 @@ template ExprConstRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Max-to-constant relations
@@ -285,8 +285,8 @@ template ExprConstRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
     # Algebraic-to-constant relations
@@ -294,8 +294,8 @@ template ExprConstRel(rel, relEnum: untyped) =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
-            stateType: RelationalConstraintType,
-            relationalConstraintState: constraint
+            stateType: RelationalType,
+            relationalState: constraint
         )
 
 # Generate expression-to-constant operators
@@ -510,12 +510,12 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.initialize(assignment)
-        of ElementConstraint:
+        of ElementType:
             constraint.elementState.initialize(assignment)
         of AlgebraicType:
-            constraint.algebraicConstraintState.initialize(assignment)
-        of RelationalConstraintType:
-            constraint.relationalConstraintState.initialize(assignment)
+            constraint.algebraicState.initialize(assignment)
+        of RelationalType:
+            constraint.relationalState.initialize(assignment)
         of OrderingType:
             constraint.orderingState.initialize(assignment)
         of GlobalCardinalityType:
@@ -526,12 +526,12 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.moveDelta(position, oldValue, newValue)
-        of ElementConstraint:
+        of ElementType:
             constraint.elementState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
-            constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
-        of RelationalConstraintType:
-            constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
+            constraint.algebraicState.moveDelta(position, oldValue, newValue)
+        of RelationalType:
+            constraint.relationalState.moveDelta(position, oldValue, newValue)
         of OrderingType:
             constraint.orderingState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
@@ -542,12 +542,12 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
     case constraint.stateType:
         of AllDifferentType:
             constraint.allDifferentState.updatePosition(position, newValue)
-        of ElementConstraint:
+        of ElementType:
             constraint.elementState.updatePosition(position, newValue)
         of AlgebraicType:
-            constraint.algebraicConstraintState.updatePosition(position, newValue)
-        of RelationalConstraintType:
-            constraint.relationalConstraintState.updatePosition(position, newValue)
+            constraint.algebraicState.updatePosition(position, newValue)
+        of RelationalType:
+            constraint.relationalState.updatePosition(position, newValue)
         of OrderingType:
             constraint.orderingState.updatePosition(position, newValue)
         of GlobalCardinalityType:

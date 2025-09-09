@@ -35,12 +35,12 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
     case constraint.stateType:
         of AllDifferentType:
             result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
-        of ElementConstraint:
+        of ElementType:
             result = constraint.elementState.cost + constraint.elementState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
-            result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
-        of RelationalConstraintType:
-            result = constraint.relationalConstraintState.cost + constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
+            result = constraint.algebraicState.cost + constraint.algebraicState.moveDelta(position, oldValue, newValue)
+        of RelationalType:
+            result = constraint.relationalState.cost + constraint.relationalState.moveDelta(position, oldValue, newValue)
         of OrderingType:
             result = constraint.orderingState.cost + constraint.orderingState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:

@@ -210,7 +210,7 @@ proc element*[T](indexExpr: AlgebraicExpression[T], constantArray: seq[T], value
 
     return StatefulConstraint[T](
         positions: elementState.positions,
-        stateType: ElementConstraint,
+        stateType: ElementType,
         elementState: elementState
     )
 
@@ -228,7 +228,7 @@ proc element*[T](indexExpr: AlgebraicExpression[T], variableArray: seq[Algebraic
 
     return StatefulConstraint[T](
         positions: elementState.positions,
-        stateType: ElementConstraint,
+        stateType: ElementType,
         elementState: elementState
     )
 
@@ -240,6 +240,6 @@ proc element*[T](indexExpr: AlgebraicExpression[T], mixedArray: seq[ArrayElement
 
     return StatefulConstraint[T](
         positions: elementState.positions,
-        stateType: ElementConstraint,
+        stateType: ElementType,
         elementState: elementState
     )

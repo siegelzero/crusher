@@ -113,12 +113,12 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             var tempPenalty = 0
             case cons.stateType:
                 of AlgebraicType:
-                    tempPenalty = penalty(cons.algebraicConstraintState.constraint, tempAssignment)
-                of RelationalConstraintType:
+                    tempPenalty = penalty(cons.algebraicState.constraint, tempAssignment)
+                of RelationalType:
                     # RelationalConstraint needs to be evaluated differently
                     # Skip for now - these are typically multi-variable anyway
                     continue
-                of AllDifferentType, ElementConstraint, OrderingType, GlobalCardinalityType:
+                of AllDifferentType, ElementType, OrderingType, GlobalCardinalityType:
                     # Skip these constraint types for domain reduction
                     continue
 
