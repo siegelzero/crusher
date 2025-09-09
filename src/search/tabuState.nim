@@ -41,6 +41,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.algebraicConstraintState.cost + constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
         of RelationalConstraintType:
             result = constraint.relationalConstraintState.cost + constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
+        of OrderingType:
+            result = constraint.orderingState.cost + constraint.orderingState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines

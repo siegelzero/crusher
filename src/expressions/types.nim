@@ -73,3 +73,17 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     expression.node.evaluate(assignment)
+
+################################################################################
+# Helper Functions for Expression Analysis
+################################################################################
+
+func isAllRefs*[T](expressions: openArray[AlgebraicExpression[T]]): (bool, seq[int]) =
+    ## Check if all expressions are simple reference nodes and return positions in order (preserves duplicates)
+    var positions: seq[int] = @[]
+    for exp in expressions:
+        if exp.node.kind != RefNode:
+            # Early return if we find a non-RefNode - no need to collect positions
+            return (false, positions)
+        positions.add(exp.node.position)
+    return (true, positions)

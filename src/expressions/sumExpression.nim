@@ -168,16 +168,11 @@ func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
     return newSumExpression[T](coefficients, constant)
 
 func sum*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
-    var positions = toPackedSet[int]([])
-    var allRefs = true
-    for exp in expressions:
-        if exp.node.kind != RefNode:
-            allRefs = false
-        positions.incl(exp.positions)
+    let (allRefs, positions) = isAllRefs(expressions)
 
     if allRefs:
         # Use more efficient position-based constraint if all expressions are RefNodes
-        return newSumExpression[T](toSeq(positions))
+        return newSumExpression[T](positions)
     else:
         # Use expression-based constraint for complex expressions
         return newSumExpression[T](expressions)

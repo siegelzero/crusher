@@ -157,15 +157,7 @@ proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
 ################################################################################
 
 func min*[T](expressions: openArray[AlgebraicExpression[T]]): MinExpression[T] =
-    # Check if all expressions are simple variable references (RefNodes)
-    var allRefs = true
-    var positions: seq[int] = @[]
-
-    for exp in expressions:
-        if exp.node.kind == RefNode:
-            positions.add(exp.node.position)
-        else:
-            allRefs = false
+    let (allRefs, positions) = isAllRefs(expressions)
 
     if allRefs:
         # Use efficient position-based approach if all expressions are simple variables

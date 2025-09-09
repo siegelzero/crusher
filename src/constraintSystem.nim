@@ -3,7 +3,7 @@ import std/[packedsets, sequtils]
 import constrainedArray
 import constraints/[algebraic, stateful, constraintNode, elementState]
 export elementState.ArrayElement
-import expressions/[algebraic, stateful, sumExpression]
+import expressions/[algebraic, stateful, sumExpression, maxExpression, minExpression]
 
 ################################################################################
 # Type definitions
@@ -141,6 +141,16 @@ func sum*[T](cvar: ConstrainedSequence[T]): SumExpression[T] =
     # Constrained Sequence
     return newSumExpression[T](cvar.positions)
 
+func max*[T](cvar: ConstrainedSequence[T]): MaxExpression[T] =
+    # Returns MaxExpression object representing the max of the
+    # Constrained Sequence
+    return newMaxExpression[T](cvar.positions)
+
+func min*[T](cvar: ConstrainedSequence[T]): MinExpression[T] =
+    # Returns MinExpression object representing the min of the
+    # Constrained Sequence
+    return newMinExpression[T](cvar.positions)
+
 ################################################################################
 # ConstrainedVariable constraints
 ################################################################################
@@ -149,6 +159,26 @@ proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.positions)
+
+proc increasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # increasing constraint for the variable
+    # Returns constraint requiring that all values in the container be in non-decreasing order.
+    increasing[T](cvar.positions)
+
+proc strictlyIncreasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # strictly increasing constraint for the variable
+    # Returns constraint requiring that all values in the container be in strictly increasing order.
+    strictlyIncreasing[T](cvar.positions)
+
+proc decreasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # decreasing constraint for the variable
+    # Returns constraint requiring that all values in the container be in non-increasing order.
+    decreasing[T](cvar.positions)
+
+proc strictlyDecreasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # strictly decreasing constraint for the variable
+    # Returns constraint requiring that all values in the container be in strictly decreasing order.
+    strictlyDecreasing[T](cvar.positions)
 
 proc addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
     # adds constraint to the system

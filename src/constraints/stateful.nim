@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, relationalConstraint
+import algebraic, allDifferent, elementState, relationalConstraint, ordering
 import constraintNode
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -64,7 +64,8 @@ type
         AllDifferentType,
         ElementConstraint,
         AlgebraicType,
-        RelationalConstraintType
+        RelationalConstraintType,
+        OrderingType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -77,6 +78,8 @@ type
                 algebraicConstraintState*: StatefulAlgebraicConstraint[T]
             of RelationalConstraintType:
                 relationalConstraintState*: RelationalConstraint[T]
+            of OrderingType:
+                orderingState*: OrderingConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -89,6 +92,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Algebraic Constraint"
         of RelationalConstraintType:
             return "Relational Constraint"
+        of OrderingType:
+            return "Ordering Constraint"
 
 ################################################################################
 # Evaluation
@@ -104,6 +109,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.algebraicConstraintState.cost
         of RelationalConstraintType:
             return constraint.relationalConstraintState.cost
+        of OrderingType:
+            return constraint.orderingState.cost
 
 ################################################################################
 # Computed Constraints
@@ -304,21 +311,132 @@ func allDifferent*[T](positions: openArray[int]): StatefulConstraint[T] =
 
 func allDifferent*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
     # Returns allDifferent constraint for the given expressions.
-    var positions = toPackedSet[int]([])
-    var allRefs = true
-    for exp in expressions:
-        if exp.node.kind != RefNode:
-            allRefs = false
-        positions.incl(exp.positions)
+    let (allRefs, positions) = isAllRefs(expressions)
 
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return allDifferent[T](toSeq(positions))
+        return allDifferent[T](positions)
     else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
         return StatefulConstraint[T](
-            positions: positions,
+            positions: allPositions,
             stateType: AllDifferentType,
             allDifferentState: newAllDifferentConstraint[T](expressions)
+        )
+
+
+func increasing*[T](positions: openArray[int]): StatefulConstraint[T] =
+    # Returns increasing constraint for the given positions.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: OrderingType,
+        orderingState: newIncreasingConstraint[T](positions)
+    )
+
+
+func increasing*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    # Returns increasing constraint for the given expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return increasing[T](positions)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: OrderingType,
+            orderingState: newIncreasingConstraint[T](expressions)
+        )
+
+
+func strictlyIncreasing*[T](positions: openArray[int]): StatefulConstraint[T] =
+    # Returns strictly increasing constraint for the given positions.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: OrderingType,
+        orderingState: newStrictlyIncreasingConstraint[T](positions)
+    )
+
+
+func strictlyIncreasing*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    # Returns strictly increasing constraint for the given expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return strictlyIncreasing[T](positions)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: OrderingType,
+            orderingState: newStrictlyIncreasingConstraint[T](expressions)
+        )
+
+
+func decreasing*[T](positions: openArray[int]): StatefulConstraint[T] =
+    # Returns decreasing constraint for the given positions.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: OrderingType,
+        orderingState: newDecreasingConstraint[T](positions)
+    )
+
+
+func decreasing*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    # Returns decreasing constraint for the given expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return decreasing[T](positions)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: OrderingType,
+            orderingState: newDecreasingConstraint[T](expressions)
+        )
+
+
+func strictlyDecreasing*[T](positions: openArray[int]): StatefulConstraint[T] =
+    # Returns strictly decreasing constraint for the given positions.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: OrderingType,
+        orderingState: newStrictlyDecreasingConstraint[T](positions)
+    )
+
+
+func strictlyDecreasing*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    # Returns strictly decreasing constraint for the given expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return strictlyDecreasing[T](positions)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: OrderingType,
+            orderingState: newStrictlyDecreasingConstraint[T](expressions)
         )
 
 ################################################################################
@@ -335,6 +453,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.algebraicConstraintState.initialize(assignment)
         of RelationalConstraintType:
             constraint.relationalConstraintState.initialize(assignment)
+        of OrderingType:
+            constraint.orderingState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -347,6 +467,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.algebraicConstraintState.moveDelta(position, oldValue, newValue)
         of RelationalConstraintType:
             constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
+        of OrderingType:
+            constraint.orderingState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -359,4 +481,6 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.algebraicConstraintState.updatePosition(position, newValue)
         of RelationalConstraintType:
             constraint.relationalConstraintState.updatePosition(position, newValue)
+        of OrderingType:
+            constraint.orderingState.updatePosition(position, newValue)
 
