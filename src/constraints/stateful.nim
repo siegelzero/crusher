@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, elementState, relationalConstraint, ordering
+import algebraic, allDifferent, elementState, relationalConstraint, ordering, globalCardinality
 import constraintNode
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -65,7 +65,8 @@ type
         ElementConstraint,
         AlgebraicType,
         RelationalConstraintType,
-        OrderingType
+        OrderingType,
+        GlobalCardinalityType
 
     StatefulConstraint*[T] = object
         positions*: PackedSet[int]
@@ -80,6 +81,8 @@ type
                 relationalConstraintState*: RelationalConstraint[T]
             of OrderingType:
                 orderingState*: OrderingConstraint[T]
+            of GlobalCardinalityType:
+                globalCardinalityState*: GlobalCardinalityConstraint[T]
 
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
@@ -94,6 +97,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Relational Constraint"
         of OrderingType:
             return "Ordering Constraint"
+        of GlobalCardinalityType:
+            return "Global Cardinality Constraint"
 
 ################################################################################
 # Evaluation
@@ -111,6 +116,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.relationalConstraintState.cost
         of OrderingType:
             return constraint.orderingState.cost
+        of GlobalCardinalityType:
+            return constraint.globalCardinalityState.cost
 
 ################################################################################
 # Computed Constraints
@@ -439,6 +446,62 @@ func strictlyDecreasing*[T](expressions: seq[AlgebraicExpression[T]]): StatefulC
             orderingState: newStrictlyDecreasingConstraint[T](expressions)
         )
 
+
+func globalCardinality*[T](positions: openArray[int], cover: openArray[T], counts: openArray[int]): StatefulConstraint[T] =
+    # Returns global cardinality constraint for the given positions with exact counts.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: GlobalCardinalityType,
+        globalCardinalityState: newExactGlobalCardinality[T](positions, cover, counts)
+    )
+
+
+func globalCardinality*[T](expressions: seq[AlgebraicExpression[T]], cover: openArray[T], counts: openArray[int]): StatefulConstraint[T] =
+    # Returns global cardinality constraint for the given expressions with exact counts.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return globalCardinality[T](positions, cover, counts)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: GlobalCardinalityType,
+            globalCardinalityState: newExactGlobalCardinality[T](expressions, cover, counts)
+        )
+
+
+func globalCardinalityBounded*[T](positions: openArray[int], cover: openArray[T], lbound: openArray[int], ubound: openArray[int]): StatefulConstraint[T] =
+    # Returns global cardinality constraint for the given positions with lower/upper bounds.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: GlobalCardinalityType,
+        globalCardinalityState: newBoundedGlobalCardinality[T](positions, cover, lbound, ubound)
+    )
+
+
+func globalCardinalityBounded*[T](expressions: seq[AlgebraicExpression[T]], cover: openArray[T], lbound: openArray[int], ubound: openArray[int]): StatefulConstraint[T] =
+    # Returns global cardinality constraint for the given expressions with lower/upper bounds.
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return globalCardinalityBounded[T](positions, cover, lbound, ubound)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: GlobalCardinalityType,
+            globalCardinalityState: newBoundedGlobalCardinality[T](expressions, cover, lbound, ubound)
+        )
+
 ################################################################################
 # Computed Constraint State interface
 ################################################################################
@@ -455,6 +518,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.relationalConstraintState.initialize(assignment)
         of OrderingType:
             constraint.orderingState.initialize(assignment)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -469,6 +534,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.relationalConstraintState.moveDelta(position, oldValue, newValue)
         of OrderingType:
             constraint.orderingState.moveDelta(position, oldValue, newValue)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -483,4 +550,6 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.relationalConstraintState.updatePosition(position, newValue)
         of OrderingType:
             constraint.orderingState.updatePosition(position, newValue)
+        of GlobalCardinalityType:
+            constraint.globalCardinalityState.updatePosition(position, newValue)
 

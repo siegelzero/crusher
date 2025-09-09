@@ -87,3 +87,13 @@ func isAllRefs*[T](expressions: openArray[AlgebraicExpression[T]]): (bool, seq[i
             return (false, positions)
         positions.add(exp.node.position)
     return (true, positions)
+
+proc buildExpressionPositionMap*[T](expressions: openArray[AlgebraicExpression[T]]): Table[int, seq[int]] =
+    ## Builds a mapping from positions to expression indices that depend on them
+    result = initTable[int, seq[int]]()
+    for i, exp in expressions:
+        for pos in exp.positions.items:
+            if pos in result:
+                result[pos].add(i)
+            else:
+                result[pos] = @[i]

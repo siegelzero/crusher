@@ -52,16 +52,10 @@ func newSumExpression*[T](coefficients: Table[int, T], constant: T = 0): SumExpr
 
 func newSumExpression*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     var positions = initPackedSet[int]()
-    var expressionsAtPosition = initTable[int, seq[int]]()
-
     # Build position to expression mapping
-    for i, exp in expressions:
-        for pos in exp.positions:
-            positions.incl(pos)
-            if pos in expressionsAtPosition:
-                expressionsAtPosition[pos].add(i)
-            else:
-                expressionsAtPosition[pos] = @[i]
+    let expressionsAtPosition = buildExpressionPositionMap(expressions)
+    for exp in expressions:
+        positions.incl(exp.positions)
 
     result = SumExpression[T](
         value: 0,

@@ -30,17 +30,12 @@ func newMaxExpression*[T](positions: openArray[int]): MaxExpression[T] =
     )
 
 func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxExpression[T] =
-    var expressionsAtPos = initTable[int, seq[int]]()
     var allPositions = initPackedSet[int]()
 
     # Collect all positions involved in the expressions
-    for i, exp in expressions:
+    let expressionsAtPos = buildExpressionPositionMap(expressions)
+    for exp in expressions:
         allPositions.incl(exp.positions)
-        # Map each position to which expressions depend on it
-        for pos in exp.positions:
-            if pos notin expressionsAtPos:
-                expressionsAtPos[pos] = @[]
-            expressionsAtPos[pos].add(i)
 
     result = MaxExpression[T](
         evalMethod: ExpressionBased,

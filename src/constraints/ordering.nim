@@ -66,12 +66,7 @@ func newOrderingConstraint*[T](expressions: seq[AlgebraicExpression[T]], orderin
         currentAssignment: initTable[int, T](),
     )
 
-    for i, exp in expressions:
-        for pos in exp.positions.items:
-            if pos in result.expressionsAtPosition:
-                result.expressionsAtPosition[pos].add(i)
-            else:
-                result.expressionsAtPosition[pos] = @[i]
+    result.expressionsAtPosition = buildExpressionPositionMap(expressions)
 
 ################################################################################
 # Convenience constructors for specific ordering types

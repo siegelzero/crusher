@@ -1,6 +1,7 @@
 import std/[packedsets, sequtils, tables]
 
 import ../expressions/expressions
+import common
 
 ################################################################################
 # Type definitions
@@ -45,39 +46,23 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
         currentAssignment: initTable[int, T](),
     )
 
-    for i, exp in expressions:
-        for pos in exp.positions.items:
-            if pos in result.expressionsAtPosition:
-                result.expressionsAtPosition[pos].add(i)
-            else:
-                result.expressionsAtPosition[pos] = @[i]
+    result.expressionsAtPosition = buildExpressionPositionMap(expressions)
 
 ################################################################################
 # AllDifferentConstraint utility functions
 ################################################################################
 
-func getCount[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
-    return state.countTable.getOrDefault(value, 0)
 
 func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
-    max(0, state.getCount(value) - 1)
+    max(0, getCount(state.countTable, value) - 1)
 
-func decrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
-    if value in state.countTable:
-        state.countTable[value] -= 1
-
-func incrementCount[T](state: AllDifferentConstraint[T], value: T) {.inline.} =
-    if value in state.countTable:
-        state.countTable[value] += 1
-    else:
-        state.countTable[value] = 1
 
 proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
     state.cost -= state.contribution(oldValue)
     state.cost -= state.contribution(newValue)
-    state.decrementCount(oldValue)
-    state.incrementCount(newValue)
+    decrementCount(state.countTable, oldValue)
+    incrementCount(state.countTable, newValue)
     state.cost += state.contribution(oldValue)
     state.cost += state.contribution(newValue)
 
@@ -92,7 +77,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
             for pos in state.positions:
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
-                state.incrementCount(value)
+                incrementCount(state.countTable, value)
 
         of ExpressionBased:
             for pos in state.expressionsAtPosition.keys:
@@ -100,7 +85,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
 
             for exp in state.expressions:
                 value = exp.evaluate(state.currentAssignment)
-                state.incrementCount(value)
+                incrementCount(state.countTable, value)
 
     # Calculate cost from count table for both methods
     for value, count in state.countTable.pairs:
@@ -134,13 +119,13 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
 
     case state.evalMethod:
         of PositionBased:
-            oldValueCount = state.getCount(oldValue)
+            oldValueCount = getCount(state.countTable, oldValue)
             doAssert oldValueCount >= 1, "oldValue should exist in count table"
             result -= oldValueCount - 1
             oldValueCount -= 1
             result += max(0, oldValueCount - 1)
 
-            newValueCount = state.getCount(newValue)
+            newValueCount = getCount(state.countTable, newValue)
             result -= max(0, newValueCount - 1)
             newValueCount += 1
             result += newValueCount - 1
@@ -149,7 +134,7 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
             for i in state.expressionsAtPosition[position]:
                 oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
 
-                oldValueCount = state.getCount(oldExpValue)
+                oldValueCount = getCount(state.countTable, oldExpValue)
                 result -= oldValueCount - 1
                 oldValueCount -= 1
                 result += max(0, oldValueCount - 1)
@@ -158,7 +143,7 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
                 newExpValue = state.expressions[i].evaluate(state.currentAssignment)
                 state.currentAssignment[position] = oldValue
 
-                newValueCount = state.getCount(newExpValue)
+                newValueCount = getCount(state.countTable, newExpValue)
                 result -= max(0, newValueCount - 1)
                 newValueCount += 1
                 result += newValueCount - 1

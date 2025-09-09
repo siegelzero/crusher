@@ -18,6 +18,7 @@ proc resolve*[T](system: ConstraintSystem[T],
         if improved.cost == 0:
             system.assignment = improved.assignment
             return
+        raise newException(NoSolutionFoundError, "Can't find satisfying solution")
     else:
         var lastImprovement = 0
         var bestAttempt = high(int)
