@@ -33,7 +33,7 @@ func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxEx
     var allPositions = initPackedSet[int]()
 
     # Collect all positions involved in the expressions
-    let expressionsAtPos = buildExpressionPositionMap(expressions)
+    let expressionsAtPosition = buildExpressionPositionMap(expressions)
     for exp in expressions:
         allPositions.incl(exp.positions)
 
@@ -43,7 +43,7 @@ func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxEx
         positions: allPositions,
         currentAssignment: initTable[int, T](),
         expressions: @expressions,
-        expressionsAtPosition: expressionsAtPos
+        expressionsAtPosition: expressionsAtPosition
     )
 
 ################################################################################

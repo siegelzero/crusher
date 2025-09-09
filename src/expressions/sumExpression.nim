@@ -161,6 +161,22 @@ func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
 
     return newSumExpression[T](coefficients, constant)
 
+proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
+    # Creates a deep copy of a SumExpression for thread-safe parallel processing
+    new(result)
+    result.value = state.value
+    result.constant = state.constant
+    result.positions = state.positions  # PackedSet is a value type, safe to copy
+    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
+    result.evalMethod = state.evalMethod
+
+    case state.evalMethod:
+        of PositionBased:
+            result.coefficient = state.coefficient  # Table is a value type, safe to copy
+        of ExpressionBased:
+            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
+            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+
 func sum*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     let (allRefs, positions) = isAllRefs(expressions)
 
