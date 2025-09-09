@@ -553,3 +553,84 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
         of GlobalCardinalityType:
             constraint.globalCardinalityState.updatePosition(position, newValue)
 
+################################################################################
+# Deep copy for StatefulConstraint
+################################################################################
+
+proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
+    ## Creates a deep copy of a stateful constraint for thread-safe parallel processing
+    ## All constraints are reset to their initial state (cost = 0) for consistency
+    case constraint.stateType:
+        of AllDifferentType:
+            # Create fresh AllDifferent constraint (initialize with cost: 0)
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: AllDifferentType,
+                allDifferentState: newAllDifferentConstraint[T](constraint.positions.toSeq())
+            )
+        of ElementType:
+            # Create fresh Element constraint (initialize with cost: 0)
+            if constraint.elementState.isConstantArray:
+                result = StatefulConstraint[T](
+                    positions: constraint.positions,
+                    stateType: ElementType,
+                    elementState: newElementState[T](
+                        constraint.elementState.indexPosition,
+                        constraint.elementState.constantArray,
+                        constraint.elementState.valuePosition
+                    )
+                )
+            else:
+                result = StatefulConstraint[T](
+                    positions: constraint.positions,
+                    stateType: ElementType,
+                    elementState: newElementState[T](
+                        constraint.elementState.indexPosition,
+                        constraint.elementState.arrayElements,
+                        constraint.elementState.valuePosition
+                    )
+                )
+        of AlgebraicType:
+            # Create fresh AlgebraicConstraint (constructor sets cost: 0)
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: AlgebraicType,
+                algebraicState: newAlgebraicConstraintState[T](
+                    constraint.algebraicState.constraint
+                )
+            )
+        of RelationalType:
+            # Create fresh RelationalConstraint (initialize with cost: 0)
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: RelationalType,
+                relationalState: RelationalConstraint[T](
+                    lincomb: constraint.relationalState.lincomb,
+                    relation: constraint.relationalState.relation,
+                    rhs: constraint.relationalState.rhs,
+                    cost: 0
+                )
+            )
+        of OrderingType:
+            # Create fresh OrderingConstraint (initialize with cost: 0)
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: OrderingType,
+                orderingState: OrderingConstraint[T](
+                    beforePos: constraint.orderingState.beforePos,
+                    afterPos: constraint.orderingState.afterPos,
+                    cost: 0
+                )
+            )
+        of GlobalCardinalityType:
+            # Create fresh GlobalCardinalityConstraint (initialize with cost: 0)
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: GlobalCardinalityType,
+                globalCardinalityState: GlobalCardinalityConstraint[T](
+                    positions: constraint.globalCardinalityState.positions,
+                    cardinalityConstraints: constraint.globalCardinalityState.cardinalityConstraints,
+                    cost: 0
+                )
+            )
+

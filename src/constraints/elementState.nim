@@ -211,3 +211,4 @@ proc moveDelta*[T](state: ElementState[T], position: int, oldValue, newValue: T)
 
         # Array change doesn't affect currently indexed element
         return 0
+

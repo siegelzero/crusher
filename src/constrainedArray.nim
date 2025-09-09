@@ -131,3 +131,24 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     return reduced
 
+################################################################################
+# Deep copy for ConstrainedArray
+################################################################################
+
+proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
+    ## Creates a deep copy of a ConstrainedArray for thread-safe parallel processing
+    result.len = arr.len
+
+    # Deep copy the domain (seq[seq[T]] requires copying both outer and inner sequences)
+    result.domain = newSeq[seq[T]](arr.domain.len)
+    for i, innerSeq in arr.domain:
+        result.domain[i] = innerSeq  # This creates a deep copy of the inner seq[T]
+
+    # Deep copy entries - AlgebraicExpression[T] are functionally immutable but we copy the seq
+    result.entries = arr.entries  # seq itself is copied by assignment
+
+    # Deep copy all stateful constraints
+    result.constraints = newSeq[StatefulConstraint[T]](arr.constraints.len)
+    for i, constraint in arr.constraints:
+        result.constraints[i] = constraint.deepCopy()
+
