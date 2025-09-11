@@ -3,7 +3,7 @@ import std/packedsets
 import constrainedArray
 import constraints/[algebraic, stateful, elementState]
 export elementState.ArrayElement
-import expressions/[algebraic, stateful, sumExpression, maxExpression, minExpression]
+import expressions/[algebraic, sumExpression, maxExpression, minExpression]
 
 ################################################################################
 # Type definitions
@@ -14,6 +14,8 @@ type
         system: ConstraintSystem[T]
         offset: int
         size: int
+
+    ConstrainedVariable*[T] = ref object of VariableContainer[T]
 
     ConstrainedSequence*[T] = ref object of VariableContainer[T]
         n: int
@@ -48,16 +50,26 @@ func init*[T](cvar: VariableContainer[T], system: ConstraintSystem[T]) =
     cvar.system = system
     cvar.offset = system.baseArray.len
 
+func init*[T](cvar: ConstrainedVariable[T], system: ConstraintSystem[T]) =
+    VariableContainer[T](cvar).init(system)
+    cvar.size = 1
+
 func init*[T](cvar: ConstrainedSequence[T], system: ConstraintSystem[T], n: int) =
-    cvar.init(system)
+    VariableContainer[T](cvar).init(system)
     cvar.size = n
     cvar.n = n
 
 func init*[T](cvar: ConstrainedMatrix[T], system: ConstraintSystem[T], m, n: int) =
-    cvar.init(system)
+    VariableContainer[T](cvar).init(system)
     cvar.size = m*n
     cvar.m = m
     cvar.n = n
+
+func newConstrainedVariable*[T](system: ConstraintSystem[T]): ConstrainedVariable[T] =
+    new(result)
+    result.init(system)
+    system.baseArray.extendArray(1)
+    system.variables.add(result)
 
 func newConstrainedSequence*[T](system: ConstraintSystem[T], n: int): ConstrainedSequence[T] =
     new(result)
@@ -75,6 +87,37 @@ func newConstrainedMatrix*[T](system: ConstraintSystem[T], m, n: int): Constrain
 # ConstrainedVariable access
 ################################################################################
 
+func value*[T](cvar: ConstrainedVariable[T]): AlgebraicExpression[T] {.inline.} =
+    cvar.system.baseArray[cvar.offset]
+
+converter toAlgebraicExpression*[T](cvar: ConstrainedVariable[T]): AlgebraicExpression[T] {.inline.} =
+    cvar.value
+
+# Template for ConstrainedVariable comparison operators
+template VarVarOp(op: untyped) =
+    func op*[T](left, right: ConstrainedVariable[T]): AlgebraicConstraint[T] {.inline.} =
+        op(left.value, right.value)
+
+template VarConstOp(op: untyped) =
+    func op*[T: SomeNumber](left: ConstrainedVariable[T], right: T): StatefulConstraint[T] {.inline.} =
+        op(left.value, right)
+
+    func op*[T: SomeNumber](left: T, right: ConstrainedVariable[T]): StatefulConstraint[T] {.inline.} =
+        op(left, right.value)
+
+# Generate all comparison operators
+VarVarOp(`==`)
+VarVarOp(`>`)
+VarVarOp(`>=`)
+VarVarOp(`<`)
+VarVarOp(`<=`)
+
+VarConstOp(`==`)
+VarConstOp(`>`)
+VarConstOp(`>=`)
+VarConstOp(`<`)
+VarConstOp(`<=`)
+
 func `[]`*[T](cvar: ConstrainedSequence[T], i: int): AlgebraicExpression[T] {.inline.} =
     cvar.system.baseArray[cvar.offset + i]
 
@@ -85,6 +128,9 @@ func positions[T](cvar: VariableContainer[T]): seq[int] =
     result = newSeq[int](cvar.size)
     for i in 0..<cvar.size:
         result[i] = cvar.offset + i
+
+func assignment*[T](cvar: ConstrainedVariable[T]): T =
+    cvar.system.assignment[cvar.offset]
 
 func assignment*[T](cvar: ConstrainedSequence[T]): seq[T] =
     cvar.system.assignment[cvar.offset..<(cvar.offset + cvar.size)]
@@ -121,6 +167,7 @@ iterator rows*[T](cvar: ConstrainedMatrix[T]): seq[AlgebraicExpression[T]] =
 # Displaying
 ################################################################################
 
+func `$`*[T](cvar: ConstrainedVariable[T]): string = $(cvar.assignment)
 func `$`*[T](cvar: ConstrainedSequence[T]): string = $(cvar.assignment)
 func `$`*[T](cvar: ConstrainedMatrix[T]): string = $(cvar.assignment)
 
@@ -190,7 +237,7 @@ proc addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstra
         StatefulConstraint[T](
             positions: constraint.positions,
             stateType: AlgebraicType,
-            algebraicConstraintState: newAlgebraicConstraintState[T](constraint))
+            algebraicState: newAlgebraicConstraintState[T](constraint))
         )
 
 func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[StatefulConstraint[T]]) =
@@ -261,7 +308,14 @@ proc deepCopy*[T](system: ConstraintSystem[T]): ConstraintSystem[T] =
     result.variables = newSeq[VariableContainer[T]](system.variables.len)
     for i, variable in system.variables:
         # Type-safe deep copy of variable containers
-        if variable of ConstrainedSequence[T]:
+        if variable of ConstrainedVariable[T]:
+            let var_var = ConstrainedVariable[T](variable)
+            result.variables[i] = ConstrainedVariable[T](
+                system: result,
+                offset: var_var.offset,
+                size: var_var.size
+            )
+        elif variable of ConstrainedSequence[T]:
             let seq_var = ConstrainedSequence[T](variable)
             result.variables[i] = ConstrainedSequence[T](
                 system: result,

@@ -16,7 +16,7 @@ help:
 	@echo "  all      - Run all targets (currently just test)"
 	@echo ""
 
-test:
+test: clean
 	@echo "🚀 Auto-discovering and running all test files..."
 	@echo "================================================"
 	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
