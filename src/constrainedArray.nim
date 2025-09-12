@@ -42,10 +42,19 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
                 linear=true
             )
         )
+    var domains = newSeq[seq[T]](n)
+    # Initialize all domains with a reasonable default range
+    when T is int:
+        for i in 0..<n:
+            domains[i] = toSeq(-100..100)  # Default integer range
+    else:
+        # For other types, leave empty (will need type-specific defaults)
+        discard
+
     return ConstrainedArray[T](
         len: n,
         constraints: newSeq[StatefulConstraint[T]](),
-        domain: newSeq[seq[T]](n),
+        domain: domains,
         entries: entries
     )
 
@@ -60,7 +69,11 @@ func extendArray*[T](arr: var ConstrainedArray[T], m: int) =
                 linear=true
             )
         )
-        arr.domain.add(newSeq[T]())
+        # Add default domain for new element
+        when T is int:
+            arr.domain.add(toSeq(-100..100))
+        else:
+            arr.domain.add(newSeq[T]())
     arr.len += m
 
 ################################################################################

@@ -179,6 +179,11 @@ func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
     # sets the domain of the constrained variable
     cvar.system.baseArray.setDomain(domain)
 
+func setDomain*[T](cvar: ConstrainedSequence[T], domain: openArray[T]) =
+    # sets the domain for all positions in the constrained sequence
+    for i in 0..<cvar.size:
+        cvar.system.baseArray.setDomain(cvar.offset + i, domain)
+
 ################################################################################
 # ConstrainedVariable methods
 ################################################################################
@@ -290,6 +295,29 @@ proc element*[T](indexExpr: AlgebraicExpression[T], mixedArray: seq[ArrayElement
         stateType: ElementType,
         elementState: elementState
     )
+
+proc element*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSequence[T], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    # Creates element constraint: sequence[indexExpr] = valueExpr
+    var variableArray: seq[AlgebraicExpression[T]] = @[]
+    for i in 0..<sequence.n:
+        variableArray.add(sequence[i])
+    return element(indexExpr, variableArray, valueExpr)
+
+proc element*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSequence[T], value: T): StatefulConstraint[T] =
+    # Creates element constraint: sequence[indexExpr] = value (constant)
+    # This means: the value at sequence[indexExpr] should equal the constant value
+
+    # Create a variable constrained to the target value
+    var valueVar = sequence.system.newConstrainedVariable()
+    sequence.system.baseArray.setDomain(valueVar.offset, [value])
+
+    # Create array of sequence elements
+    var variableArray: seq[AlgebraicExpression[T]] = @[]
+    for i in 0..<sequence.n:
+        variableArray.add(sequence[i])
+
+    # The element constraint: variableArray[indexExpr] = valueVar
+    return element(indexExpr, variableArray, valueVar)
 
 ################################################################################
 # Deep copy for ConstraintSystem
