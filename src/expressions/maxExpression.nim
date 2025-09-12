@@ -133,19 +133,23 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
 
 proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
     # Creates a deep copy of a MaxExpression for thread-safe parallel processing
-    new(result)
-    result.value = state.value
-    result.positions = state.positions  # PackedSet is a value type, safe to copy
-    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
-    result.evalMethod = state.evalMethod
-
     case state.evalMethod:
         of PositionBased:
-            # All fields already copied - no additional mutable state
-            discard
+            result = MaxExpression[T](
+                evalMethod: PositionBased,
+                value: state.value,
+                positions: state.positions,  # PackedSet is a value type, safe to copy
+                currentAssignment: state.currentAssignment  # Table is a value type, safe to copy
+            )
         of ExpressionBased:
-            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
-            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+            result = MaxExpression[T](
+                evalMethod: ExpressionBased,
+                value: state.value,
+                positions: state.positions,  # PackedSet is a value type, safe to copy
+                currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
+                expressions: state.expressions,  # seq[AlgebraicExpression] should be immutable
+                expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
+            )
 
 ################################################################################
 # MaxExpression creation helpers for constraint syntax

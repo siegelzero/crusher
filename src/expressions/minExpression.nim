@@ -133,19 +133,23 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
 
 proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
     # Creates a deep copy of a MinExpression for thread-safe parallel processing
-    new(result)
-    result.value = state.value
-    result.positions = state.positions  # PackedSet is a value type, safe to copy
-    result.currentAssignment = state.currentAssignment  # Table is a value type, safe to copy
-    result.evalMethod = state.evalMethod
-
     case state.evalMethod:
         of PositionBased:
-            # All fields already copied - no additional mutable state
-            discard
+            result = MinExpression[T](
+                evalMethod: PositionBased,
+                value: state.value,
+                positions: state.positions,  # PackedSet is a value type, safe to copy
+                currentAssignment: state.currentAssignment  # Table is a value type, safe to copy
+            )
         of ExpressionBased:
-            result.expressions = state.expressions  # seq[AlgebraicExpression] should be immutable
-            result.expressionsAtPosition = state.expressionsAtPosition  # Table is a value type, safe to copy
+            result = MinExpression[T](
+                evalMethod: ExpressionBased,
+                value: state.value,
+                positions: state.positions,  # PackedSet is a value type, safe to copy
+                currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
+                expressions: state.expressions,  # seq[AlgebraicExpression] should be immutable
+                expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
+            )
 
 ################################################################################
 # MinExpression creation helpers for constraint syntax

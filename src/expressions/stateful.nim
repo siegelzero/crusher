@@ -158,3 +158,50 @@ func moveDelta*[T](expression: Expression[T], position: int,
         return expression.maxExpr.moveDelta(position, oldValue, newValue)
     of ConstantExpr:
         return 0  # Constants don't change
+
+################################################################################
+# Deep copy implementations for thread-safe parallel processing
+################################################################################
+
+proc deepCopy*[T](expression: StatefulAlgebraicExpression[T]): StatefulAlgebraicExpression[T] =
+    ## Creates a deep copy of a StatefulAlgebraicExpression preserving all runtime state
+    result = StatefulAlgebraicExpression[T](
+        algebraicExpr: expression.algebraicExpr.deepCopy(),  # Deep copy the underlying algebraic expression
+        positions: expression.positions,  # PackedSet is a value type, safe to copy
+        value: expression.value,
+        currentAssignment: expression.currentAssignment  # Table is a value type, safe to copy
+    )
+
+proc deepCopy*[T](expression: Expression[T]): Expression[T] =
+    ## Creates a deep copy of an Expression preserving all runtime state
+    case expression.kind:
+        of StatefulAlgebraicExpr:
+            result = Expression[T](
+                kind: StatefulAlgebraicExpr,
+                positions: expression.positions,  # PackedSet is a value type, safe to copy
+                algebraicExpr: expression.algebraicExpr.deepCopy()  # Deep copy StatefulAlgebraicExpression
+            )
+        of SumExpr:
+            result = Expression[T](
+                kind: SumExpr,
+                positions: expression.positions,  # PackedSet is a value type, safe to copy
+                sumExpr: expression.sumExpr.deepCopy()  # Deep copy SumExpression
+            )
+        of MinExpr:
+            result = Expression[T](
+                kind: MinExpr,
+                positions: expression.positions,  # PackedSet is a value type, safe to copy
+                minExpr: expression.minExpr.deepCopy()  # Deep copy MinExpression
+            )
+        of MaxExpr:
+            result = Expression[T](
+                kind: MaxExpr,
+                positions: expression.positions,  # PackedSet is a value type, safe to copy
+                maxExpr: expression.maxExpr.deepCopy()  # Deep copy MaxExpression
+            )
+        of ConstantExpr:
+            result = Expression[T](
+                kind: ConstantExpr,
+                positions: expression.positions,  # PackedSet is a value type, safe to copy
+                constantValue: expression.constantValue  # Constants are immutable
+            )

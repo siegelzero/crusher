@@ -97,3 +97,39 @@ proc buildExpressionPositionMap*[T](expressions: openArray[AlgebraicExpression[T
                 result[pos].add(i)
             else:
                 result[pos] = @[i]
+
+################################################################################
+# Deep copy for ExpressionNode and AlgebraicExpression
+################################################################################
+
+proc deepCopy*[T](node: ExpressionNode[T]): ExpressionNode[T] =
+    ## Creates a deep copy of an ExpressionNode for thread-safe parallel processing
+    case node.kind:
+        of LiteralNode:
+            # Literals are immutable - safe to create new instance
+            result = ExpressionNode[T](kind: LiteralNode, value: node.value)
+        of RefNode:
+            # Position references are immutable - safe to create new instance
+            result = ExpressionNode[T](kind: RefNode, position: node.position)
+        of UnaryOpNode:
+            # Recursively copy the target node
+            result = ExpressionNode[T](
+                kind: UnaryOpNode,
+                unaryOp: node.unaryOp,
+                target: node.target.deepCopy()
+            )
+        of BinaryOpNode:
+            # Recursively copy both left and right nodes
+            result = ExpressionNode[T](
+                kind: BinaryOpNode,
+                binaryOp: node.binaryOp,
+                left: node.left.deepCopy(),
+                right: node.right.deepCopy()
+            )
+
+proc deepCopy*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] =
+    ## Creates a deep copy of an AlgebraicExpression for thread-safe parallel processing
+    new(result)
+    result.positions = expression.positions  # PackedSet is a value type, safe to copy
+    result.node = expression.node.deepCopy()  # Deep copy the node structure
+    result.linear = expression.linear

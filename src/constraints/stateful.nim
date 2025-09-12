@@ -812,64 +812,186 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 )
             )
         of RelationalType:
-            # Create fresh RelationalConstraint (initialize with cost: 0)
+            # Create deep copy preserving all runtime state including expression state
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: RelationalType,
                 relationalState: RelationalConstraint[T](
-                    lincomb: constraint.relationalState.lincomb,
+                    leftExpr: constraint.relationalState.leftExpr.deepCopy(),
+                    rightExpr: constraint.relationalState.rightExpr.deepCopy(),
                     relation: constraint.relationalState.relation,
-                    rhs: constraint.relationalState.rhs,
-                    cost: 0
+                    cost: constraint.relationalState.cost,
+                    positions: constraint.relationalState.positions,
+                    leftValue: constraint.relationalState.leftValue,
+                    rightValue: constraint.relationalState.rightValue
                 )
             )
         of OrderingType:
-            # Create fresh OrderingConstraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: OrderingType,
-                orderingState: OrderingConstraint[T](
-                    beforePos: constraint.orderingState.beforePos,
-                    afterPos: constraint.orderingState.afterPos,
-                    cost: 0
-                )
-            )
+            # Create proper deep copy preserving all runtime state
+            case constraint.orderingState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: OrderingType,
+                        orderingState: OrderingConstraint[T](
+                            orderingType: constraint.orderingState.orderingType,
+                            currentAssignment: constraint.orderingState.currentAssignment,
+                            cost: constraint.orderingState.cost,
+                            evalMethod: PositionBased,
+                            positions: constraint.orderingState.positions,
+                            sortedPositions: constraint.orderingState.sortedPositions
+                        )
+                    )
+                of ExpressionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: OrderingType,
+                        orderingState: OrderingConstraint[T](
+                            orderingType: constraint.orderingState.orderingType,
+                            currentAssignment: constraint.orderingState.currentAssignment,
+                            cost: constraint.orderingState.cost,
+                            evalMethod: ExpressionBased,
+                            expressions: constraint.orderingState.expressions,
+                            expressionsAtPosition: constraint.orderingState.expressionsAtPosition
+                        )
+                    )
         of GlobalCardinalityType:
-            # Create fresh GlobalCardinalityConstraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: GlobalCardinalityType,
-                globalCardinalityState: GlobalCardinalityConstraint[T](
-                    positions: constraint.globalCardinalityState.positions,
-                    cardinalityConstraints: constraint.globalCardinalityState.cardinalityConstraints,
-                    cost: 0
-                )
-            )
+            # Create deep copy preserving all runtime state
+            case constraint.globalCardinalityState.evalMethod:
+                of PositionBased:
+                    case constraint.globalCardinalityState.constraintType:
+                        of ExactCounts:
+                            result = StatefulConstraint[T](
+                                positions: constraint.positions,
+                                stateType: GlobalCardinalityType,
+                                globalCardinalityState: GlobalCardinalityConstraint[T](
+                                    currentAssignment: constraint.globalCardinalityState.currentAssignment,
+                                    countTable: constraint.globalCardinalityState.countTable,
+                                    cover: constraint.globalCardinalityState.cover,
+                                    cost: constraint.globalCardinalityState.cost,
+                                    evalMethod: PositionBased,
+                                    positions: constraint.globalCardinalityState.positions,
+                                    constraintType: ExactCounts,
+                                    targetCounts: constraint.globalCardinalityState.targetCounts
+                                )
+                            )
+                        of BoundedCounts:
+                            result = StatefulConstraint[T](
+                                positions: constraint.positions,
+                                stateType: GlobalCardinalityType,
+                                globalCardinalityState: GlobalCardinalityConstraint[T](
+                                    currentAssignment: constraint.globalCardinalityState.currentAssignment,
+                                    countTable: constraint.globalCardinalityState.countTable,
+                                    cover: constraint.globalCardinalityState.cover,
+                                    cost: constraint.globalCardinalityState.cost,
+                                    evalMethod: PositionBased,
+                                    positions: constraint.globalCardinalityState.positions,
+                                    constraintType: BoundedCounts,
+                                    lowerBounds: constraint.globalCardinalityState.lowerBounds,
+                                    upperBounds: constraint.globalCardinalityState.upperBounds
+                                )
+                            )
+                of ExpressionBased:
+                    case constraint.globalCardinalityState.constraintType:
+                        of ExactCounts:
+                            result = StatefulConstraint[T](
+                                positions: constraint.positions,
+                                stateType: GlobalCardinalityType,
+                                globalCardinalityState: GlobalCardinalityConstraint[T](
+                                    currentAssignment: constraint.globalCardinalityState.currentAssignment,
+                                    countTable: constraint.globalCardinalityState.countTable,
+                                    cover: constraint.globalCardinalityState.cover,
+                                    cost: constraint.globalCardinalityState.cost,
+                                    evalMethod: ExpressionBased,
+                                    expressions: constraint.globalCardinalityState.expressions,
+                                    expressionsAtPosition: constraint.globalCardinalityState.expressionsAtPosition,
+                                    constraintType: ExactCounts,
+                                    targetCounts: constraint.globalCardinalityState.targetCounts
+                                )
+                            )
+                        of BoundedCounts:
+                            result = StatefulConstraint[T](
+                                positions: constraint.positions,
+                                stateType: GlobalCardinalityType,
+                                globalCardinalityState: GlobalCardinalityConstraint[T](
+                                    currentAssignment: constraint.globalCardinalityState.currentAssignment,
+                                    countTable: constraint.globalCardinalityState.countTable,
+                                    cover: constraint.globalCardinalityState.cover,
+                                    cost: constraint.globalCardinalityState.cost,
+                                    evalMethod: ExpressionBased,
+                                    expressions: constraint.globalCardinalityState.expressions,
+                                    expressionsAtPosition: constraint.globalCardinalityState.expressionsAtPosition,
+                                    constraintType: BoundedCounts,
+                                    lowerBounds: constraint.globalCardinalityState.lowerBounds,
+                                    upperBounds: constraint.globalCardinalityState.upperBounds
+                                )
+                            )
         of MultiknapsackType:
-            # Create fresh MultiknapsackConstraint (initialize with cost: 0)
-            # Note: This is a simplified deepCopy - proper implementation would preserve all constraint state
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: MultiknapsackType,
-                multiknapsackState: newMultiknapsackConstraint[T](
-                    constraint.positions.toSeq(),
-                    constraint.multiknapsackState.weights,
-                    constraint.multiknapsackState.capacities.pairs.toSeq()
-                )
-            )
+            # Create proper deep copy preserving all runtime state
+            case constraint.multiknapsackState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: MultiknapsackType,
+                        multiknapsackState: MultiknapsackConstraint[T](
+                            currentAssignment: constraint.multiknapsackState.currentAssignment,
+                            weights: constraint.multiknapsackState.weights,
+                            capacities: constraint.multiknapsackState.capacities,
+                            loadTable: constraint.multiknapsackState.loadTable,
+                            cost: constraint.multiknapsackState.cost,
+                            evalMethod: PositionBased,
+                            positions: constraint.multiknapsackState.positions
+                        )
+                    )
+                of ExpressionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: MultiknapsackType,
+                        multiknapsackState: MultiknapsackConstraint[T](
+                            currentAssignment: constraint.multiknapsackState.currentAssignment,
+                            weights: constraint.multiknapsackState.weights,
+                            capacities: constraint.multiknapsackState.capacities,
+                            loadTable: constraint.multiknapsackState.loadTable,
+                            cost: constraint.multiknapsackState.cost,
+                            evalMethod: ExpressionBased,
+                            expressions: constraint.multiknapsackState.expressions,
+                            expressionsAtPosition: constraint.multiknapsackState.expressionsAtPosition
+                        )
+                    )
         of SequenceType:
-            # Create fresh SequenceConstraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: SequenceType,
-                sequenceState: newSequenceConstraint[T](
-                    constraint.positions.toSeq(),
-                    constraint.sequenceState.minInSet,
-                    constraint.sequenceState.maxInSet,
-                    constraint.sequenceState.windowSize,
-                    constraint.sequenceState.targetSet.toSeq()
-                )
-            )
+            # Create deep copy preserving all runtime state
+            case constraint.sequenceState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: SequenceType,
+                        sequenceState: SequenceConstraint[T](
+                            currentAssignment: constraint.sequenceState.currentAssignment,
+                            cost: constraint.sequenceState.cost,
+                            minInSet: constraint.sequenceState.minInSet,
+                            maxInSet: constraint.sequenceState.maxInSet,
+                            windowSize: constraint.sequenceState.windowSize,
+                            targetSet: constraint.sequenceState.targetSet,
+                            evalMethod: PositionBased,
+                            positions: constraint.sequenceState.positions
+                        )
+                    )
+                of ExpressionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: SequenceType,
+                        sequenceState: SequenceConstraint[T](
+                            currentAssignment: constraint.sequenceState.currentAssignment,
+                            cost: constraint.sequenceState.cost,
+                            minInSet: constraint.sequenceState.minInSet,
+                            maxInSet: constraint.sequenceState.maxInSet,
+                            windowSize: constraint.sequenceState.windowSize,
+                            targetSet: constraint.sequenceState.targetSet,
+                            evalMethod: ExpressionBased,
+                            expressions: constraint.sequenceState.expressions,
+                            expressionsAtPosition: constraint.sequenceState.expressionsAtPosition
+                        )
+                    )
 
 
 

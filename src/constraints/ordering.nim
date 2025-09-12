@@ -49,11 +49,11 @@ type
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[int]
-                sortedPositions: seq[int]
+                positions*: PackedSet[int]
+                sortedPositions*: seq[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # Ordering violation detection templates

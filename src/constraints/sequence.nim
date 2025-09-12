@@ -27,16 +27,16 @@ type
         # variables must take their values in set S
         currentAssignment*: Table[int, T]
         cost*: int
-        minInSet: int      # l - minimum occurrences in set S within any q consecutive
-        maxInSet: int      # u - maximum occurrences in set S within any q consecutive
-        windowSize: int    # q - size of consecutive window
-        targetSet: HashSet[T]  # S - target set of values
+        minInSet*: int      # l - minimum occurrences in set S within any q consecutive
+        maxInSet*: int      # u - maximum occurrences in set S within any q consecutive
+        windowSize*: int    # q - size of consecutive window
+        targetSet*: HashSet[T]  # S - target set of values
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[int]
+                positions*: PackedSet[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # SequenceConstraint creation

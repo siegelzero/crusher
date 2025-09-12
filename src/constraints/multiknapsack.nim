@@ -20,16 +20,16 @@ import ../expressions/expressions
 type
     MultiknapsackConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
-        weights: seq[T]  # Weight for each position index
-        capacities: Table[T, T]  # Capacity for each value
-        loadTable: Table[T, T]  # Current load for each value
+        weights*: seq[T]  # Weight for each position index
+        capacities*: Table[T, T]  # Capacity for each value
+        loadTable*: Table[T, T]  # Current load for each value
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[int]
+                positions*: PackedSet[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
 
 ################################################################################
 # MultiknapsackConstraint creation

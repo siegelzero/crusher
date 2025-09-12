@@ -38,21 +38,21 @@ type
 
     GlobalCardinalityConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
-        countTable: Table[T, int]  # Track actual counts of each value
-        cover: seq[T]  # Values to count
+        countTable*: Table[T, int]  # Track actual counts of each value
+        cover*: seq[T]  # Values to count
         cost*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
-                positions: PackedSet[int]
+                positions*: PackedSet[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
-                expressionsAtPosition: Table[int, seq[int]]
+                expressions*: seq[AlgebraicExpression[T]]
+                expressionsAtPosition*: Table[int, seq[int]]
         case constraintType*: GlobalCardinalityType
             of ExactCounts:
-                targetCounts: Table[T, int]  # Target counts for each value
+                targetCounts*: Table[T, int]  # Target counts for each value
             of BoundedCounts:
-                lowerBounds: Table[T, int]   # Lower bounds
-                upperBounds: Table[T, int]   # Upper bounds
+                lowerBounds*: Table[T, int]   # Lower bounds
+                upperBounds*: Table[T, int]   # Upper bounds
 
 ################################################################################
 # GlobalCardinalityConstraint creation
