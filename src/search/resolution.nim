@@ -1,6 +1,6 @@
 import std/os
 
-import heuristics, tabuSearch
+import heuristics, tabu
 import ../constraintSystem
 
 

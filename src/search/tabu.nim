@@ -2,6 +2,9 @@ import std/[packedsets, random, sequtils, tables]
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState]
 import ../constrainedArray
+import ../expressions/expressions
+
+randomize()
 
 ################################################################################
 # Type definitions
@@ -59,7 +62,6 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 ################################################################################
 
 proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
-    # Computes penalties for all constraints involving the position, and updates penalty map
     var penalty: int
     for value in state.reducedDomain[position]:
         penalty = 0
@@ -69,7 +71,6 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
 
 
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
-    # Updates penalties for all neighboring positions to the given position
     for nbr in state.neighbors[position]:
         state.updatePenaltiesForPosition(nbr)
 
@@ -83,7 +84,6 @@ proc rebuildPenaltyMap*[T](state: TabuState[T]) =
 ################################################################################
 
 proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
-    # Initializes all structures and data for the state TabuState[T]
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
@@ -95,13 +95,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     for pos in carray.allPositions():
         state.tabu[pos] = initTable[T, int]()
 
-    # Group constraints involving each position
     for constraint in carray.constraints:
         state.constraints.add(constraint)
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
 
-    # Collect neighbors of each position
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
     for pos in carray.allPositions():
         neighborSet.clear()
@@ -110,23 +108,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
         neighborSet.excl(pos)
         state.neighbors[pos] = toSeq(neighborSet)
 
-    # Initialize with random assignment
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
         state.assignment[pos] = sample(state.reducedDomain[pos])
 
-    # Initialize constraint states with current assignment
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
-    # Compute cost
     for cons in carray.constraints:
         state.cost += cons.penalty()
 
     state.bestCost = state.cost
     state.bestAssignment = state.assignment
 
-    # Construct penalty map for each location and value
     state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
     for pos in state.carray.allPositions():
         state.penaltyMap[pos] = initTable[T, int]()
@@ -136,7 +130,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
 
 
 proc newTabuState*[T](carray: ConstrainedArray[T]): TabuState[T] =
-    # Allocates and initializes new TabuState[T]
     new(result)
     result.init(carray)
 
@@ -145,16 +138,70 @@ proc newTabuState*[T](carray: ConstrainedArray[T]): TabuState[T] =
 ################################################################################
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
-    # Updates current assignment of state by setting value to the position
     let penalty = state.penaltyMap[position].getOrDefault(state.assignment[position], 0)
     let delta = state.penaltyMap[position].getOrDefault(value, 0) - penalty
-    # Update assignment
     state.assignment[position] = value
 
-    # Update all computed constraints that involve this position
     for constraint in state.constraintsAtPosition[position]:
         constraint.updatePosition(position, value)
 
-    # Update cost of state for the given move
     state.cost += delta
     state.updateNeighborPenalties(position)
+
+################################################################################
+# Search Algorithm Implementation
+################################################################################
+
+proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
+    var
+        delta: int
+        bestMoveCost = high(int)
+        oldPenalty: int
+        oldValue: T
+
+    for position in state.carray.allPositions():
+        oldValue = state.assignment[position]
+        oldPenalty = state.penaltyMap[position].getOrDefault(oldValue, 0)
+        if oldPenalty == 0:
+            continue
+
+        for newValue in state.reducedDomain[position]:
+            if newValue == oldValue:
+                continue
+            delta = state.penaltyMap[position].getOrDefault(newValue, 0) - oldPenalty
+            if state.tabu[position].getOrDefault(newValue, 0) <= state.iteration or state.cost + delta < state.bestCost:
+                if state.cost + delta < bestMoveCost:
+                    result = @[(position, newValue)]
+                    bestMoveCost = state.cost + delta
+                elif state.cost + delta == bestMoveCost:
+                    result.add((position, newValue))
+
+
+proc applyBestMove[T](state: TabuState[T]) {.inline.} =
+    let moves = state.bestMoves()
+
+    if moves.len > 0:
+        let (position, newValue) = sample(moves)
+        let oldValue = state.assignment[position]
+        state.assignValue(position, newValue)
+        state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
+
+
+proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
+    var lastImprovement = 0
+
+    while state.iteration - lastImprovement < threshold:
+        state.applyBestMove()
+        if state.cost < state.bestCost:
+            lastImprovement = state.iteration
+            state.bestCost = state.cost
+            state.bestAssignment = state.assignment
+        if state.cost == 0:
+            return state
+        state.iteration += 1
+    return state
+
+
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int): TabuState[T] =
+    var state = newTabuState[T](carray)
+    return state.tabuImprove(threshold)
