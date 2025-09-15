@@ -17,7 +17,6 @@ type
         constraints*: seq[StatefulConstraint[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[Table[T, int]]
-        reducedDomain*: seq[seq[T]]
 
         assignment*: seq[T]
         cost*: int
@@ -63,7 +62,7 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 
 proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
     var penalty: int
-    for value in state.reducedDomain[position]:
+    for value in state.carray.reducedDomain[position]:
         penalty = 0
         for constraint in state.constraintsAtPosition[position]:
             penalty += state.movePenalty(constraint, position, value)
@@ -87,7 +86,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
-    state.reducedDomain = reduceDomain(state.carray)
 
     state.iteration = 0
     state.tabu = newSeq[Table[T, int]](carray.len)
@@ -110,7 +108,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
 
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        state.assignment[pos] = sample(state.reducedDomain[pos])
+        state.assignment[pos] = sample(state.carray.reducedDomain[pos])
 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
@@ -165,7 +163,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         if oldPenalty == 0:
             continue
 
-        for newValue in state.reducedDomain[position]:
+        for newValue in state.carray.reducedDomain[position]:
             if newValue == oldValue:
                 continue
             delta = state.penaltyMap[position].getOrDefault(newValue, 0) - oldPenalty

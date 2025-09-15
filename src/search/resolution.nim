@@ -1,41 +1,20 @@
 import std/os
 
-import heuristics, tabu
+import tabu
 import ../constraintSystem
+import ../constrainedArray
 
 
 type NoSolutionFoundError* = object of CatchableError
 
 
-proc resolve*[T](system: ConstraintSystem[T],
-                 parallel=false,
-                 tabuThreshold=10000,
-                 maxAttempts=1000,
-                 attemptThreshold=100) =
+proc resolve*[T](system: ConstraintSystem[T], tabuThreshold=10000) =
+    # Compute reduced domain once and cache it
+    if system.baseArray.reducedDomain.len == 0:
+        system.baseArray.reducedDomain = reduceDomain(system.baseArray)
 
-    if not parallel:
-        var improved = system.baseArray.tabuImprove(tabuThreshold)
-        if improved.cost == 0:
-            system.assignment = improved.assignment
-            return
-        raise newException(NoSolutionFoundError, "Can't find satisfying solution")
-    else:
-        var lastImprovement = 0
-        var bestAttempt = high(int)
-        var attempt = 0
-
-        for improved in system.baseArray.parallelSearch(tabuThreshold, maxAttempts):
-            attempt += 1
-
-            if improved.cost < bestAttempt:
-                bestAttempt = improved.cost
-                lastImprovement = attempt
-
-            if improved.cost == 0:
-                system.assignment = improved.assignment
-                return
-
-            if attempt - lastImprovement > attemptThreshold:
-                break
-
+    var improved = system.baseArray.tabuImprove(tabuThreshold)
+    if improved.cost == 0:
+        system.assignment = improved.assignment
+        return
     raise newException(NoSolutionFoundError, "Can't find satisfying solution")

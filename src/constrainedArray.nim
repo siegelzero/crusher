@@ -13,6 +13,7 @@ type
         len*: int
         constraints*: seq[StatefulConstraint[T]]
         domain*: seq[seq[T]]
+        reducedDomain*: seq[seq[T]]
         entries*: seq[AlgebraicExpression[T]]
 
 ################################################################################
@@ -55,6 +56,7 @@ func initConstrainedArray*[T](n: int): ConstrainedArray[T] =
         len: n,
         constraints: newSeq[StatefulConstraint[T]](),
         domain: domains,
+        reducedDomain: @[],
         entries: entries
     )
 
@@ -156,6 +158,14 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     result.domain = newSeq[seq[T]](arr.domain.len)
     for i, innerSeq in arr.domain:
         result.domain[i] = innerSeq  # This creates a deep copy of the inner seq[T]
+
+    # Deep copy the reducedDomain if it exists
+    if arr.reducedDomain.len > 0:
+        result.reducedDomain = newSeq[seq[T]](arr.reducedDomain.len)
+        for i, innerSeq in arr.reducedDomain:
+            result.reducedDomain[i] = innerSeq  # This creates a deep copy of the inner seq[T]
+    else:
+        result.reducedDomain = @[]
 
     # Deep copy entries - AlgebraicExpression[T] are functionally immutable but we copy the seq
     result.entries = arr.entries  # seq itself is copied by assignment
