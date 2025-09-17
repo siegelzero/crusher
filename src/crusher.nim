@@ -4,8 +4,10 @@ import constraints/[algebraic, stateful, ordering, globalCardinality, atleast, a
 import expressions/expressions
 import search/[optimization, resolution]
 import constraintSystem
+import constrainedArray
 
 export constraintSystem,
+       constrainedArray,
        stateful,
        algebraic,
        expressions,

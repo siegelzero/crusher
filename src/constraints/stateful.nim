@@ -319,6 +319,15 @@ template ExprConstRel(rel, relEnum: untyped) =
             relationalState: constraint
         )
 
+    # StatefulAlgebraicExpression-to-constant relations
+    func `rel`*[T](left: StatefulAlgebraicExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left.algebraicExpr, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalType,
+            relationalState: constraint
+        )
+
 # Generate expression-to-constant operators
 ExprConstRel(`==`, EqualTo)
 ExprConstRel(`!=`, NotEqualTo)

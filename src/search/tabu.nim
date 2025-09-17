@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, tables]
+import std/[packedsets, random, sequtils, tables, atomics]
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState]
 import ../constrainedArray
@@ -185,10 +185,14 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.tabu[position][oldValue] = state.iteration + 1 + state.iteration mod 10
 
 
-proc tabuImprove*[T](state: TabuState[T], threshold: int): TabuState[T] =
+proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil): TabuState[T] =
     var lastImprovement = 0
 
     while state.iteration - lastImprovement < threshold:
+        # Check for early termination signal
+        if shouldStop != nil and shouldStop[].load():
+            return state
+
         state.applyBestMove()
         if state.cost < state.bestCost:
             lastImprovement = state.iteration

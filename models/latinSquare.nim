@@ -23,7 +23,7 @@ proc latinSquare*(n: int) =
     for i in 0..<n:
         sys.addConstraint(X[i, 0] == i)
 
-    sys.resolve()
+    sys.resolve(parallel=true, verbose=true)
 
     echo X
 

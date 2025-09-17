@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test clean all format
+.PHONY: help test test-parallel clean all format
 
 # Default target
 help:
@@ -9,11 +9,12 @@ help:
 	@echo "==============================="
 	@echo ""
 	@echo "Available targets:"
-	@echo "  help     - Show this help message"
-	@echo "  test     - Auto-discover and run all test_*.nim files in tests/"
-	@echo "  clean    - Clean all compiled executables"
-	@echo "  format   - Strip trailing whitespace from all *.nim files"
-	@echo "  all      - Run all targets (currently just test)"
+	@echo "  help         - Show this help message"
+	@echo "  test         - Auto-discover and run all test_*.nim files in tests/"
+	@echo "  test-parallel- Run all tests with threading support enabled"
+	@echo "  clean        - Clean all compiled executables"
+	@echo "  format       - Strip trailing whitespace from all *.nim files"
+	@echo "  all          - Run all targets (currently just test)"
 	@echo ""
 
 test: clean
@@ -21,10 +22,20 @@ test: clean
 	@echo "================================================"
 	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
 		echo "Running $$test_file..."; \
-		nim c -r --path:./src $$test_file || exit 1; \
+		nim c -r --threads:on --mm:arc -d:release $$test_file || exit 1; \
 		echo ""; \
 	done
 	@echo "✅ All tests completed successfully!"
+
+test-parallel: clean
+	@echo "🚀 Auto-discovering and running all test files with threading..."
+	@echo "============================================================="
+	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
+		echo "Running $$test_file with threading..."; \
+		nim c -r --threads:on --mm:arc -d:release $$test_file || exit 1; \
+		echo ""; \
+	done
+	@echo "✅ All parallel tests completed successfully!"
 
 # Clean all compiled executables
 clean:

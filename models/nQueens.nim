@@ -23,7 +23,7 @@ proc nQueens*(n: int) =
         terms.add(x[i] + i)
     sys.addConstraint(allDifferent(terms))
 
-    sys.resolve()
+    sys.resolve(10000, parallel=true, verbose=true)
 
     echo x
 

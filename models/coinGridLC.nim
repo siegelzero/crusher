@@ -21,7 +21,7 @@ proc coingrid*(n, c: int) =
 
     let objective = foldl(objectiveTerms, a + b)
     let linear = linearize(objective)
-    sys.minimize(linear, parallel=true)
+    sys.minimize(linear, parallel=true, verbose=false)
 
 
 when isMainModule:

@@ -1,20 +1,37 @@
-import std/os
+import std/[os, strformat]
 
 import tabu
 import ../constraintSystem
 import ../constrainedArray
 
+when compileOption("threads"):
+    import parallelResolution
 
-type NoSolutionFoundError* = object of CatchableError
-
-
-proc resolve*[T](system: ConstraintSystem[T], tabuThreshold=10000) =
+proc resolve*[T](system: ConstraintSystem[T],
+                tabuThreshold: int = 10000,
+                parallel: bool = false,
+                populationSize: int = 32,
+                numWorkers: int = 0,
+                verbose: bool = false) =
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
 
-    var improved = system.baseArray.tabuImprove(tabuThreshold)
-    if improved.cost == 0:
-        system.assignment = improved.assignment
+    if parallel:
+        if verbose:
+            echo "Using parallel search"
+        parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose)
         return
-    raise newException(NoSolutionFoundError, "Can't find satisfying solution")
+    else:
+      # Sequential fallback
+      if verbose:
+          echo "Using sequential search"
+      var improved = system.baseArray.tabuImprove(tabuThreshold)
+      if improved.cost == 0:
+          system.assignment = improved.assignment
+          if verbose:
+              echo "Sequential search found solution"
+          return
+      if verbose:
+          echo &"Sequential search failed with best cost: {improved.cost}"
+      raise newException(NoSolutionFoundError, "Can't find satisfying solution")

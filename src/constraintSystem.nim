@@ -10,6 +10,7 @@ import expressions/[algebraic, sumExpression, maxExpression, minExpression]
 ################################################################################
 
 type
+    NoSolutionFoundError* = object of CatchableError
     VariableContainer[T] = ref object of RootObj
         system: ConstraintSystem[T]
         offset: int
@@ -249,6 +250,13 @@ func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[Stat
     # adds constraints to the system
     for constraint in constraints:
         system.baseArray.addBaseConstraint(constraint)
+
+proc initialize*[T](system: ConstraintSystem[T], assignment: seq[T]) =
+    # Initialize the system with a complete assignment
+    system.assignment = assignment
+    # Initialize all constraints with this assignment
+    for constraint in system.baseArray.constraints:
+        constraint.initialize(assignment)
 
 ################################################################################
 # Element constraint functions
