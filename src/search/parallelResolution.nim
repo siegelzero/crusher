@@ -10,6 +10,7 @@ type
         bestCost*: int  # Store cost instead of full state
         bestSolution*: seq[T]  # Safe copy of solution values
         workerId*: int
+        iterations*: int
 
     SharedResults*[T] = object
         results*: seq[BatchResult[T]]
@@ -85,7 +86,8 @@ proc batchWorker*[T](data: BatchWorkerData[T]) {.thread.} =
             found: foundSolution,
             bestCost: if bestState != nil: bestState.bestCost else: high(int),
             bestSolution: solutionCopy,
-            workerId: data.workerId
+            workerId: data.workerId,
+            iterations: if bestState != nil: bestState.iteration else: 0
         )
 
         if data.verbose:
@@ -103,7 +105,8 @@ proc batchWorker*[T](data: BatchWorkerData[T]) {.thread.} =
             found: false,
             bestCost: high(int),
             bestSolution: newSeq[T](),
-            workerId: data.workerId
+            workerId: data.workerId,
+            iterations: 0
         )
 
         # Thread-safe result storage
@@ -142,7 +145,8 @@ proc batchImprove*[T](population: var seq[TabuState[T]],
             found: improved.bestCost == 0,
             bestCost: improved.bestCost,
             bestSolution: solutionCopy,
-            workerId: 0
+            workerId: 0,
+            iterations: improved.iteration
         )
 
     # Initialize shared state for coordination
@@ -292,6 +296,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         # Initialize the system with the found solution
         let solutionCopy = @(bestResult.bestSolution)
         system.initialize(solutionCopy)
+        system.lastIterations = bestResult.iterations
     else:
         # No perfect solution found - reject partial solutions to match sequential behavior
         if verbose:

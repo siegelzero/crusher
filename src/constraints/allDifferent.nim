@@ -44,7 +44,7 @@ type
             of PositionBased:
                 positions: PackedSet[int]
             of ExpressionBased:
-                expressions: seq[AlgebraicExpression[T]]
+                expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition: Table[int, seq[int]]
 
 ################################################################################

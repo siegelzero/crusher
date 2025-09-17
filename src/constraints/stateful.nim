@@ -762,11 +762,19 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
     case constraint.stateType:
         of AllDifferentType:
             # Create fresh AllDifferent constraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: AllDifferentType,
-                allDifferentState: newAllDifferentConstraint[T](constraint.positions.toSeq())
-            )
+            case constraint.allDifferentState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AllDifferentType,
+                        allDifferentState: newAllDifferentConstraint[T](constraint.positions.toSeq())
+                    )
+                of ExpressionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AllDifferentType,
+                        allDifferentState: newAllDifferentConstraint[T](constraint.allDifferentState.expressions)
+                    )
         of AtLeastType:
             # Create fresh AtLeast constraint (initialize with cost: 0)
             result = StatefulConstraint[T](

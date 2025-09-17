@@ -28,7 +28,8 @@ proc resolve*[T](system: ConstraintSystem[T],
           echo "Using sequential search"
       var improved = system.baseArray.tabuImprove(tabuThreshold)
       if improved.cost == 0:
-          system.assignment = improved.assignment
+          system.initialize(improved.assignment)
+          system.lastIterations = improved.iteration
           if verbose:
               echo "Sequential search found solution"
           return

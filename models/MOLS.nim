@@ -48,7 +48,7 @@ proc MOLSSystem*(n: int) =
             pairs.add(X[i, j] + n*Y[i, j])
     sys.addConstraint(allDifferent(pairs))
 
-    sys.resolve(10000, 1000)
+    sys.resolve(10000, parallel=true, verbose=false)
 
     for row in X.assignment():
         echo row

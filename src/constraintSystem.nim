@@ -29,6 +29,7 @@ type
         variables*: seq[VariableContainer[T]]
         baseArray*: ConstrainedArray[T]
         assignment*: seq[T]
+        lastIterations*: int
 
 ################################################################################
 # ConstraintSystem creation
@@ -40,7 +41,8 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
         size: 0,
         baseArray: initConstrainedArray[T](0),
         variables: newSeq[VariableContainer[T]](),
-        assignment: newSeq[T]()
+        assignment: newSeq[T](),
+        lastIterations: 0
     )
 
 ################################################################################

@@ -95,6 +95,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
 
     for constraint in carray.constraints:
         state.constraints.add(constraint)
+
+    for constraint in state.constraints:
         for pos in constraint.positions:
             state.constraintsAtPosition[pos].add(constraint)
 
@@ -108,22 +110,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
 
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        state.assignment[pos] = sample(state.carray.reducedDomain[pos])
+        state.assignment[pos] = sample(carray.reducedDomain[pos])
 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
-    for cons in carray.constraints:
+    for cons in state.constraints:
         state.cost += cons.penalty()
 
     state.bestCost = state.cost
     state.bestAssignment = state.assignment
 
     state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
-    for pos in state.carray.allPositions():
+    for pos in carray.allPositions():
         state.penaltyMap[pos] = initTable[T, int]()
 
-    for pos in state.carray.allPositions():
+    for pos in carray.allPositions():
         state.updatePenaltiesForPosition(pos)
 
 
