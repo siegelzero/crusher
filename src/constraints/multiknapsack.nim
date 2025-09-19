@@ -127,7 +127,7 @@ proc initialize*[T](state: MultiknapsackConstraint[T], assignment: seq[T]) =
     case state.evalMethod:
         of PositionBased:
             var posIndex = 0
-            for pos in state.positions:
+            for pos in state.positions.items:
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
                 incrementLoad(state.loadTable, value, state.weights[posIndex])
@@ -155,7 +155,7 @@ proc updatePosition*[T](state: MultiknapsackConstraint[T], position: int, newVal
                 state.currentAssignment[position] = newValue
                 # Find the weight for this position
                 var posIndex = 0
-                for pos in state.positions:
+                for pos in state.positions.items:
                     if pos == position:
                         state.adjustLoads(oldValue, newValue, state.weights[posIndex])
                         break
@@ -186,7 +186,7 @@ proc moveDelta*[T](state: MultiknapsackConstraint[T], position: int, oldValue, n
         of PositionBased:
             # Find the weight for this position
             var posIndex = 0
-            for pos in state.positions:
+            for pos in state.positions.items:
                 if pos == position:
                     let weight = state.weights[posIndex]
                     result = simulateLoadChange(state, oldValue, -weight) + simulateLoadChange(state, newValue, weight)

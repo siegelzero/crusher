@@ -26,7 +26,7 @@ suite "Mixed Integer Programming Tests":
         let objective = 5*x[0] + 7*x[1] + 10*x[2] + 3*x[3] + x[4]
 
         # Solve using minimization
-        sys.minimize(objective)
+        sys.minimize(objective, parallel=true, verbose=true)
 
         # Verify the solution
         let solution = x.assignment
@@ -58,7 +58,7 @@ suite "Mixed Integer Programming Tests":
         let objective = linearize(5*x[0] + 7*x[1] + 10*x[2] + 3*x[3] + x[4])
 
         # Solve using minimization (disable parallel for deterministic results)
-        sys.minimize(objective, parallel=false)
+        sys.minimize(objective, parallel=true, verbose=true)
 
         # Verify the solution
         let solution = x.assignment
@@ -86,7 +86,7 @@ suite "Mixed Integer Programming Tests":
 
         # Minimize cost (x2 has highest cost, so should be avoided)
         let objective = x[0] + 2*x[1] + 3*x[2]
-        sys.minimize(objective)
+        sys.minimize(objective, parallel=true, verbose=true)
 
         let solution = x.assignment
         let objectiveValue = objective.evaluate(solution)

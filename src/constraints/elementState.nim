@@ -143,7 +143,7 @@ proc initialize*[T](state: ElementState[T], assignment: seq[T]) =
     state.currentAssignment.clear()
 
     # Store current assignments for all relevant positions
-    for pos in state.positions:
+    for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
 
     # Calculate cost: cost = 1 if value != array[index], else 0

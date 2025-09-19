@@ -32,7 +32,7 @@ func newSumExpression*[T](positions: openArray[int]): SumExpression[T] =
         coefficient: initTable[int, T]()
     )
 
-    for pos in positions:
+    for pos in positions.items:
         result.coefficient[pos] = 1
 
 
@@ -73,7 +73,7 @@ func newSumExpression*[T](expressions: openArray[AlgebraicExpression[T]]): SumEx
 
 func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
     # Initialize the SumExpression with the given assignment, and updates the value.
-    for pos in state.positions:
+    for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
     state.value = state.evaluate(assignment)
 
@@ -84,7 +84,7 @@ func evaluate*[T](state: SumExpression[T], assignment: seq[T]|Table[int, T]): T 
     case state.evalMethod:
         of PositionBased:
             # For position-based: sum coefficient[pos] * assignment[pos]
-            for pos in state.positions:
+            for pos in state.positions.items:
                 result += state.coefficient[pos] * assignment[pos]
 
         of ExpressionBased:
@@ -149,12 +149,12 @@ func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
     var constant: T
     var coefficients, assignment: Table[int, T]
     # evaluate with all variables zero to get constant coefficient
-    for pos in expression.positions:
+    for pos in expression.positions.items:
         assignment[pos] = 0
 
     constant = expression.evaluate(assignment)
     # extract each coefficient
-    for pos in expression.positions:
+    for pos in expression.positions.items:
         assignment[pos] = 1
         coefficients[pos] = expression.evaluate(assignment) - constant
         assignment[pos] = 0

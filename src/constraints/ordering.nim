@@ -74,7 +74,7 @@ func newOrderingConstraint*[T](positions: openArray[int], orderingType: Ordering
     new(result)
     # For all ordering types, we always sort positions in ascending order
     # The ordering type determines how we check values, not position order
-    let sortedPositions = sorted(toSeq(positions))
+    let sortedPositions = sorted(@positions)
 
     result = OrderingConstraint[T](
         orderingType: orderingType,
@@ -155,7 +155,7 @@ func countViolations[T](state: OrderingConstraint[T]): int {.inline.} =
 proc initialize*[T](state: OrderingConstraint[T], assignment: seq[T]) =
     case state.evalMethod:
         of PositionBased:
-            for pos in state.positions:
+            for pos in state.positions.items:
                 state.currentAssignment[pos] = assignment[pos]
 
         of ExpressionBased:

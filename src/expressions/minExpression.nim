@@ -52,7 +52,7 @@ func newMinExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MinEx
 
 func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
     # Initialize the MinExpression with the given assignment, and updates the value.
-    for pos in state.positions:
+    for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
     state.value = state.evaluate(assignment)
 
@@ -60,7 +60,7 @@ func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[int, T]): T 
     var minValue: T = high(T)
     case state.evalMethod:
         of PositionBased:
-            for pos in state.positions:
+            for pos in state.positions.items:
                 minValue = min(minValue, assignment[pos])
         of ExpressionBased:
             for exp in state.expressions:
@@ -114,7 +114,7 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
                 # We're changing the current minimum to a larger value
                 # Need to find what the new minimum would be among remaining values
                 var newMin: T = high(T)
-                for pos in state.positions:
+                for pos in state.positions.items:
                     let val = if pos == position: newValue else: state.currentAssignment[pos]
                     if val < newMin:
                         newMin = val

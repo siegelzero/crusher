@@ -35,7 +35,7 @@ func newAlgebraicConstraintState*[T](constraint: AlgebraicConstraint[T]): Statef
 
 func initialize*[T](state: StatefulAlgebraicConstraint[T], assignment: seq[T]) =
     # Initializes the state with the given assignment.
-    for pos in state.positions:
+    for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
     state.cost = state.constraint.penalty(assignment)
 
@@ -820,12 +820,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                     )
                 )
         of AlgebraicType:
-            # Create fresh AlgebraicConstraint (constructor sets cost: 0)
+            # Create fresh AlgebraicConstraint with deep copy of the expression (constructor sets cost: 0)
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: AlgebraicType,
                 algebraicState: newAlgebraicConstraintState[T](
-                    constraint.algebraicState.constraint
+                    constraint.algebraicState.constraint.deepCopy()
                 )
             )
         of RelationalType:

@@ -28,7 +28,7 @@ func newStatefulAlgebraicExpression*[T](expression: AlgebraicExpression[T]): Sta
 func initialize*[T](expression: StatefulAlgebraicExpression[T], assignment: seq[T]) =
     # Initialize with the given assignment
     expression.currentAssignment.clear()
-    for position in expression.positions:
+    for position in expression.positions.items:
         expression.currentAssignment[position] = assignment[position]
     expression.value = expression.algebraicExpr.evaluate(assignment)
 

@@ -54,30 +54,25 @@ proc testParallelMagicSquare() =
     echo "Parallel magic square solution found in ", parallel_time, " seconds"
     echo "Solution: ", solution
 
-proc testBatchImprove() =
-    # Test batchImprove with a small problem
+proc testParallelResolve() =
+    # Test parallelResolve directly with a simple problem
     var system = initConstraintSystem[int]()
     let sequence = newConstrainedSequence[int](system, 4)
     sequence.setDomain([1, 2, 3, 4])
     system.addConstraint(sequence.allDifferent())
 
-    # Create population manually
-    var population = newSeq[TabuState[int]]()
-    for i in 0..7:
-        let systemCopy = system.deepCopy()
-        if systemCopy.baseArray.reducedDomain.len == 0:
-            systemCopy.baseArray.reducedDomain = reduceDomain(systemCopy.baseArray)
-        population.add(newTabuState[int](systemCopy.baseArray))
+    # Test parallelResolve directly
+    echo "Testing parallelResolve with verbose logging:"
+    parallelResolve(system, populationSize=8, numWorkers=2, tabuThreshold=1000, verbose=true)
 
-    # Test with different worker counts and verbose logging
-    echo "Testing batchImprove with verbose logging:"
-    let result2 = batchImprove(population, numWorkers=2, tabuThreshold=1000, verbose=true)
-    check(result2.bestCost == 0)  # Should find solution
+    # Check that a solution was found
+    check(system.assignment.len == 4)
 
-    let result4 = batchImprove(population, numWorkers=4, tabuThreshold=1000, verbose=true)
-    check(result4.bestCost == 0)  # Should find solution
+    # Verify the solution is valid (all different values 1-4)
+    let sortedSolution = sorted(system.assignment)
+    check(sortedSolution == @[1, 2, 3, 4])
 
-    echo "BatchImprove tests passed"
+    echo "ParallelResolve test passed"
 
 proc testWorkerCountDetection() =
     # Test automatic worker count detection
@@ -118,8 +113,8 @@ suite "Parallel Search Tests":
     test "Magic Square Parallel Resolution":
         testParallelMagicSquare()
 
-    test "Batch Improve Functionality":
-        testBatchImprove()
+    test "Parallel Resolve Functionality":
+        testParallelResolve()
 
     test "Worker Count Detection":
         testWorkerCountDetection()

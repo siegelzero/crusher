@@ -102,7 +102,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
     var value: T
     case state.evalMethod:
         of PositionBased:
-            for pos in state.positions:
+            for pos in state.positions.items:
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
                 incrementCount(state.countTable, value)

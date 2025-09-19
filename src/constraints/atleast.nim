@@ -87,7 +87,7 @@ proc initialize*[T](state: AtLeastConstraint[T], assignment: seq[T]) =
 
     case state.evalMethod:
         of PositionBased:
-            for pos in state.positions:
+            for pos in state.positions.items:
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
                 if value == state.targetValue:

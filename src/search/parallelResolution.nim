@@ -1,4 +1,4 @@
-import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat]
+import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random]
 
 import tabu
 import ../constraintSystem
@@ -12,250 +12,216 @@ type
         workerId*: int
         iterations*: int
 
-    SharedResults*[T] = object
-        results*: seq[BatchResult[T]]
-        lock*: Lock
-        completed*: Atomic[int]
-
-    BatchWorkerData*[T] = object
-        states*: ptr seq[TabuState[T]]  # Use pointer for mutability
-        workerId*: int
-        shouldStop*: ptr Atomic[bool]
-        sharedResults*: ptr SharedResults[T]
+    # Iterator-based approach types
+    StatePool*[T] = object
+        states*: seq[TabuState[T]]  # Pool of states to process
+        nextTaskIndex*: Atomic[int]  # Index of next state to assign
+        solutionFound*: Atomic[bool]  # Global solution flag
         tabuThreshold*: int
         verbose*: bool
+        results*: seq[BatchResult[T]]  # Collected results
+        resultsLock*: Lock  # Protect results array
 
-proc batchWorker*[T](data: BatchWorkerData[T]) {.thread.} =
-    try:
-        let startTime = epochTime()
-        var bestState: TabuState[T] = nil
-        var foundSolution = false
-        var solutionCopy = newSeq[T]()  # Copy solution immediately when found
-
-        if data.verbose:
-            echo &"[Worker {data.workerId}] Starting with {data.states[].len} states, tabu threshold: {data.tabuThreshold}"
-
-        # Process each state assigned to this worker
-        for i, state in data.states[]:
-            # Check for early termination before processing
-            if data.shouldStop[].load():
-                if data.verbose:
-                    echo &"[Worker {data.workerId}] Early termination requested after processing {i} states"
-                break
-
-            let stateStartTime = epochTime()
-
-            # Run tabu improvement on this state
-            let improved = state.tabuImprove(data.tabuThreshold, data.shouldStop)
-
-            let stateTime = epochTime() - stateStartTime
-
-            if data.verbose:
-                echo &"[Worker {data.workerId}] State {i}: cost {state.cost} -> {improved.bestCost} (time: {stateTime:.3f}s)"
-
-            # Update the best state for this worker
-            if bestState == nil or improved.bestCost < bestState.bestCost:
-                bestState = improved
-                if data.verbose:
-                    echo &"[Worker {data.workerId}] New best cost: {bestState.bestCost}"
-
-            # If we found a solution, notify and stop all workers
-            if improved.bestCost == 0:
-                data.shouldStop[].store(true)
-                foundSolution = true
-                bestState = improved
-                # Copy solution immediately to avoid memory issues
-                solutionCopy = newSeq[T](improved.bestAssignment.len)
-                for i in 0..<improved.bestAssignment.len:
-                    solutionCopy[i] = improved.bestAssignment[i]
-                if data.verbose:
-                    echo &"[Worker {data.workerId}] SOLUTION FOUND! Cost: 0, stopping all workers"
-                    echo &"[Worker {data.workerId}] Solution: {solutionCopy}"
-                break
-
-        let totalTime = epochTime() - startTime
-
-        # Always copy the best solution found (if any), not just perfect solutions
-        if bestState != nil and solutionCopy.len == 0:
-            solutionCopy = newSeq[T](bestState.bestAssignment.len)
-            for i in 0..<bestState.bestAssignment.len:
-                solutionCopy[i] = bestState.bestAssignment[i]
-
-        # Send result back with safe copy of solution
-        let result = BatchResult[T](
-            found: foundSolution,
-            bestCost: if bestState != nil: bestState.bestCost else: high(int),
-            bestSolution: solutionCopy,
-            workerId: data.workerId,
-            iterations: if bestState != nil: bestState.iteration else: 0
-        )
-
-        if data.verbose:
-            let bestCostStr = if bestState != nil: $bestState.bestCost else: "nil"
-            echo &"[Worker {data.workerId}] Completed in {totalTime:.3f}s, best cost: {bestCostStr}, solution: {foundSolution}"
-
-        # Thread-safe result storage
-        withLock data.sharedResults[].lock:
-            data.sharedResults[].results.add(result)
-        discard data.sharedResults[].completed.fetchAdd(1)
-
-    except CatchableError:
-        # Send error result
-        let result = BatchResult[T](
-            found: false,
-            bestCost: high(int),
-            bestSolution: newSeq[T](),
-            workerId: data.workerId,
-            iterations: 0
-        )
-
-        # Thread-safe result storage
-        withLock data.sharedResults[].lock:
-            data.sharedResults[].results.add(result)
-        discard data.sharedResults[].completed.fetchAdd(1)
+    IterativeWorkerData*[T] = object
+        workerId*: int
+        pool*: ptr StatePool[T]
 
 proc getOptimalWorkerCount*(): int =
     # Use CPU count, but cap at reasonable maximum
     min(countProcessors(), 8)
 
-proc batchImprove*[T](population: var seq[TabuState[T]],
-                     numWorkers: int = 0,
-                     tabuThreshold: int = 10000,
-                     verbose: bool = false): BatchResult[T] =
+proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
+    try:
+        randomize()
+        let pool = data.pool
+
+        while not pool.solutionFound.load():
+            let taskIndex = pool.nextTaskIndex.fetchAdd(1)
+
+            if taskIndex >= pool.states.len:
+                break
+
+            if pool.solutionFound.load():
+                break
+
+            if pool.verbose:
+                echo &"[Worker {data.workerId}] Processing task {taskIndex}"
+
+            let state = pool.states[taskIndex]
+            let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound)
+
+            let result = BatchResult[T](
+                found: improved.bestCost == 0,
+                bestCost: improved.bestCost,
+                bestSolution: improved.assignment,
+                workerId: data.workerId,
+                iterations: improved.iteration
+            )
+
+            if result.found:
+                pool.solutionFound.store(true)
+                if pool.verbose:
+                    echo &"[Worker {data.workerId}] SOLUTION FOUND!"
+
+            # Store result in shared array
+            withLock pool.resultsLock:
+                pool.results.add(result)
+
+            if result.found:
+                break
+
+    except CatchableError:
+        discard  # Worker error handled gracefully
+
+iterator improveStates*[T](population: seq[TabuState[T]],
+                           numWorkers: int = 0,
+                           tabuThreshold: int = 10000,
+                           verbose: bool = false): BatchResult[T] =
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
 
     if verbose:
-        echo &"[BatchImprove] Starting with {population.len} states, {actualWorkers} workers, tabu threshold: {tabuThreshold}"
+        echo &"[ImproveStates] Starting iterator with {population.len} states, {actualWorkers} workers, tabu threshold: {tabuThreshold}"
 
-    if population.len == 0:
-        raise newException(ValueError, "Empty population provided to batchImprove")
-
-    # If only one state or one worker, process sequentially
-    if population.len == 1 or actualWorkers == 1:
-        if verbose:
-            echo "[BatchImprove] Using sequential processing (single state or worker)"
-        var improved = population[0].tabuImprove(tabuThreshold)
-        if verbose:
-            echo &"[BatchImprove] Sequential result: cost {improved.bestCost}"
-        # Always copy the best solution found, regardless of cost
-        var solutionCopy = newSeq[T](improved.bestAssignment.len)
-        for i in 0..<improved.bestAssignment.len:
-            solutionCopy[i] = improved.bestAssignment[i]
-        return BatchResult[T](
-            found: improved.bestCost == 0,
-            bestCost: improved.bestCost,
-            bestSolution: solutionCopy,
-            workerId: 0,
-            iterations: improved.iteration
-        )
-
-    # Initialize shared state for coordination
-    var shouldStop: Atomic[bool]
-    shouldStop.store(false)
-
-    var sharedResults = SharedResults[T](
-        results: newSeq[BatchResult[T]](),
-        completed: Atomic[int]()
-    )
-    initLock(sharedResults.lock)
-    sharedResults.completed.store(0)
-
-    # Distribute population among workers
-    var workers = newSeq[Thread[BatchWorkerData[T]]](actualWorkers)
-    var workerData = newSeq[BatchWorkerData[T]](actualWorkers)
-    var workerStates = newSeq[seq[TabuState[T]]](actualWorkers)
-
-    let statesPerWorker = population.len div actualWorkers
-    let remainder = population.len mod actualWorkers
-
-    if verbose:
-        echo &"[BatchImprove] Distributing {population.len} states: {statesPerWorker} per worker, {remainder} remainder"
-
-    var stateIndex = 0
-    for i in 0..<actualWorkers:
-        let startIdx = stateIndex
-        let endIdx = stateIndex + statesPerWorker + (if i < remainder: 1 else: 0)
-
-        # Create a copy for this worker
-        workerStates[i] = population[startIdx..<endIdx]
-        workerData[i] = BatchWorkerData[T](
-            states: addr workerStates[i],
-            workerId: i,
-            shouldStop: addr shouldStop,
-            sharedResults: addr sharedResults,
-            tabuThreshold: tabuThreshold,
-            verbose: verbose
-        )
-
-        if verbose:
-            echo &"[BatchImprove] Starting worker {i} with {workerStates[i].len} states (indices {startIdx}..<{endIdx})"
-
-        createThread(workers[i], batchWorker[T], workerData[i])
-        stateIndex = endIdx
-
-    let batchStartTime = epochTime()
-    var lastProgressTime = batchStartTime
-
-    # Wait for all workers to complete
-    while sharedResults.completed.load() < actualWorkers:
-        # Check if any worker found a solution
-        var foundSolution = false
-        withLock sharedResults.lock:
-            for result in sharedResults.results:
+    if population.len > 0:
+        # If only one state or one worker, process sequentially
+        if population.len == 1 or actualWorkers == 1:
+            if verbose:
+                echo "[ImproveStates] Using sequential processing"
+            for i, state in population:
+                if verbose:
+                    echo &"[ImproveStates] Processing state {i}"
+                let improved = state.tabuImprove(tabuThreshold)
+                let result = BatchResult[T](
+                    found: improved.bestCost == 0,
+                    bestCost: improved.bestCost,
+                    bestSolution: improved.assignment,
+                    workerId: 0,
+                    iterations: improved.iteration
+                )
+                yield result
                 if result.found:
-                    foundSolution = true
+                    if verbose:
+                        echo &"[ImproveStates] Solution found at state {i}, terminating"
+                    break
+        else:
+            # Parallel processing setup
+            var pool = StatePool[T](
+                states: population,
+                tabuThreshold: tabuThreshold,
+                verbose: verbose,
+                results: newSeq[BatchResult[T]]()
+            )
+            pool.nextTaskIndex.store(0)
+            pool.solutionFound.store(false)
+            initLock(pool.resultsLock)
+
+            # Start workers
+            var workers = newSeq[Thread[IterativeWorkerData[T]]](actualWorkers)
+            var workerData = newSeq[IterativeWorkerData[T]](actualWorkers)
+
+            for i in 0..<actualWorkers:
+                workerData[i] = IterativeWorkerData[T](
+                    workerId: i,
+                    pool: addr pool
+                )
+                createThread(workers[i], iterativeWorker[T], workerData[i])
+
+            # Monitor and yield results as they become available
+            var yieldedResults = 0
+            var lastResultCount = 0
+
+            while yieldedResults < population.len and not pool.solutionFound.load():
+                # Check for new results
+                var currentResults: seq[BatchResult[T]]
+                withLock pool.resultsLock:
+                    currentResults = pool.results
+
+                # Yield any new results
+                for i in lastResultCount..<currentResults.len:
+                    let result = currentResults[i]
+                    if verbose:
+                        echo &"[ImproveStates] Yielding result: cost={result.bestCost}, solution={result.found}"
+                    yield result
+                    inc yieldedResults
+
+                    if result.found:
+                        pool.solutionFound.store(true)
+                        if verbose:
+                            echo "[ImproveStates] Solution found, terminating iterator"
+                        break
+
+                lastResultCount = currentResults.len
+
+                if yieldedResults >= population.len or pool.solutionFound.load():
                     break
 
-        if foundSolution:
-            shouldStop.store(true)
-            if verbose:
-                echo "[BatchImprove] Solution found, signaling all workers to stop"
+                sleep(1)  # Small delay to avoid busy waiting
 
-        # Progress reporting
-        if verbose:
-            let currentTime = epochTime()
-            if currentTime - lastProgressTime > 5.0:  # Report every 5 seconds
-                let completed = sharedResults.completed.load()
-                let elapsed = currentTime - batchStartTime
-                echo &"[BatchImprove] Progress: {completed}/{actualWorkers} workers completed (elapsed: {elapsed:.1f}s)"
-                lastProgressTime = currentTime
+            # Signal all workers to stop if not already done
+            if not pool.solutionFound.load():
+                pool.solutionFound.store(true)
 
-        # Small delay to avoid busy waiting
-        sleep(1)
+            # Wait for workers to complete
+            for i in 0..<actualWorkers:
+                joinThread(workers[i])
 
-    if verbose:
-        echo "[BatchImprove] All workers completed, joining threads..."
+            # Small delay to ensure all worker cleanup is complete
+            sleep(10)
 
-    # Wait for all threads to complete
-    joinThreads(workers)
+            # Yield any remaining results after all workers are done
+            withLock pool.resultsLock:
+                for i in lastResultCount..<pool.results.len:
+                    if yieldedResults < population.len:
+                        yield pool.results[i]
+                        inc yieldedResults
 
-    let totalTime = epochTime() - batchStartTime
+            # Clear the results array to prevent memory issues
+            withLock pool.resultsLock:
+                pool.results.setLen(0)
 
-    # Find best result
+            deinitLock(pool.resultsLock)
+
+            # Additional cleanup - ensure all worker data is cleared
+            for i in 0..<workerData.len:
+                workerData[i].pool = nil
+
+proc dynamicImprove*[T](population: var seq[TabuState[T]],
+                       numWorkers: int = 0,
+                       tabuThreshold: int = 10000,
+                       verbose: bool = false): BatchResult[T] =
+    if population.len == 0:
+        raise newException(ValueError, "Empty population provided to dynamicImprove")
+
     var bestResult: BatchResult[T]
     var solutionFound = false
     var bestResultInitialized = false
 
-    withLock sharedResults.lock:
+    # Use the iterator to process states one by one
+    for result in improveStates(population, numWorkers, tabuThreshold, verbose):
         if verbose:
-            echo &"[BatchImprove] Analyzing {sharedResults.results.len} worker results..."
+            echo &"[DynamicImprove] Received result: cost={result.bestCost}, solution={result.found}"
 
-        for result in sharedResults.results:
+        # Update best result
+        if result.found and not solutionFound:
+            solutionFound = true
+            bestResult = result
+            bestResultInitialized = true
             if verbose:
-                echo &"[BatchImprove] Worker {result.workerId}: cost={result.bestCost}, solution={result.found}"
+                echo "[DynamicImprove] Solution found, terminating"
+            break
+        elif not solutionFound and (not bestResultInitialized or result.bestCost < bestResult.bestCost):
+            bestResult = result
+            bestResultInitialized = true
 
-            if result.found and not solutionFound:
-                solutionFound = true
-                bestResult = result
-                bestResultInitialized = true
-            elif not solutionFound and (not bestResultInitialized or result.bestCost < bestResult.bestCost):
-                bestResult = result
-                bestResultInitialized = true
-
-    if verbose:
-        echo &"[BatchImprove] Completed in {totalTime:.3f}s, best cost: {bestResult.bestCost}, solution found: {solutionFound}"
-
-    deinitLock(sharedResults.lock)
+    if not bestResultInitialized:
+        # Fallback result if no results were produced
+        bestResult = BatchResult[T](
+            found: false,
+            bestCost: high(int),
+            bestSolution: newSeq[T](),
+            workerId: -1,
+            iterations: 0
+        )
 
     return bestResult
 
@@ -285,8 +251,14 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     if verbose:
         echo &"[ParallelResolve] Created {populationSize} initial states in {populationTime:.3f}s"
 
-    # Process population in parallel
-    let bestResult = batchImprove(population, numWorkers, tabuThreshold, verbose)
+    # Process population in parallel using dynamic dispatcher
+    let bestResult = dynamicImprove(population, numWorkers, tabuThreshold, verbose)
+
+    # Explicitly clear population to control destruction order and avoid potential memory issues
+    # This helps prevent double-free issues with shared constraint references
+    for i in 0..<population.len:
+        population[i] = nil
+    population.setLen(0)
 
     # Check if perfect solution was found (cost == 0 means all constraints satisfied)
     if bestResult.found and bestResult.bestSolution.len > 0:

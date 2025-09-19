@@ -114,7 +114,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     for cons in carray.constraints:
         if cons.positions.len != 1:
             continue
-        var pos = toSeq(cons.positions)[0]
+        let pos = toSeq(cons.positions)[0]
         # Create a temporary assignment for testing this constraint
         var tempAssignment = newSeq[T](carray.len)
         # Initialize with first values from domains (doesn't matter, we only care about position pos)

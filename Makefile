@@ -22,7 +22,7 @@ test: clean
 	@echo "================================================"
 	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
 		echo "Running $$test_file..."; \
-		nim c -r --threads:on --mm:arc -d:release $$test_file || exit 1; \
+		nim c -r --threads:on --mm:arc --deepcopy:on -d:release $$test_file || exit 1; \
 		echo ""; \
 	done
 	@echo "✅ All tests completed successfully!"
@@ -32,7 +32,7 @@ test-parallel: clean
 	@echo "============================================================="
 	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
 		echo "Running $$test_file with threading..."; \
-		nim c -r --threads:on --mm:arc -d:release $$test_file || exit 1; \
+		nim c -r --threads:on --mm:arc --deepcopy:on -d:release $$test_file || exit 1; \
 		echo ""; \
 	done
 	@echo "✅ All parallel tests completed successfully!"

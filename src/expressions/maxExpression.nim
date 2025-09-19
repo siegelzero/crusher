@@ -52,7 +52,7 @@ func newMaxExpression*[T](expressions: openArray[AlgebraicExpression[T]]): MaxEx
 
 func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
     # Initialize the MaxExpression with the given assignment, and updates the value.
-    for pos in state.positions:
+    for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
     state.value = state.evaluate(assignment)
 
@@ -60,7 +60,7 @@ func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[int, T]): T 
     var maxValue: T = low(T)
     case state.evalMethod:
         of PositionBased:
-            for pos in state.positions:
+            for pos in state.positions.items:
                 maxValue = max(maxValue, assignment[pos])
         of ExpressionBased:
             for exp in state.expressions:
@@ -114,7 +114,7 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
                 # We're changing the current maximum to a smaller value
                 # Need to find what the new maximum would be among remaining values
                 var newMax: T = low(T)
-                for pos in state.positions:
+                for pos in state.positions.items:
                     let val = if pos == position: newValue else: state.currentAssignment[pos]
                     if val > newMax:
                         newMax = val

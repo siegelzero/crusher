@@ -97,7 +97,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T]) =
         state.constraints.add(constraint)
 
     for constraint in state.constraints:
-        for pos in constraint.positions:
+        for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
 
     var neighborSet: PackedSet[int] = toPackedSet[int]([])
@@ -200,8 +200,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             lastImprovement = state.iteration
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
-        if state.cost == 0:
-            return state
+            if state.cost == 0:
+                return state
         state.iteration += 1
     return state
 
