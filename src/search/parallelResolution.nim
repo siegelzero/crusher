@@ -67,7 +67,9 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
             if result.found:
                 pool.solutionFound.store(true)
                 if pool.verbose:
-                    echo &"[Worker {data.workerId}] SOLUTION FOUND!"
+                    let elapsed = result.endTime - result.startTime
+                    let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+                    echo &"[Worker {data.workerId}] SOLUTION FOUND! rate={rate:.1f} iter/s"
 
             # Store result in shared array
             withLock pool.resultsLock:
@@ -111,7 +113,9 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 yield result
                 if result.found:
                     if verbose:
-                        echo &"[ImproveStates] Solution found at state {i}, terminating"
+                        let elapsed = result.endTime - result.startTime
+                        let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+                        echo &"[ImproveStates] Solution found at state {i}, terminating, rate={rate:.1f} iter/s"
                     break
         else:
             # Parallel processing setup
@@ -159,7 +163,9 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                     if result.found:
                         pool.solutionFound.store(true)
                         if verbose:
-                            echo "[ImproveStates] Solution found, terminating iterator"
+                            let elapsed = result.endTime - result.startTime
+                            let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+                            echo &"[ImproveStates] Solution found, terminating iterator, rate={rate:.1f} iter/s"
                         break
 
                 lastResultCount = currentResults.len
@@ -269,7 +275,9 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Check if perfect solution was found (cost == 0 means all constraints satisfied)
     if bestResult.found and bestResult.assignment.len > 0:
         if verbose:
-            echo &"[ParallelResolve] SUCCESS: Found solution with cost 0"
+            let elapsed = bestResult.endTime - bestResult.startTime
+            let rate = if elapsed > 0: bestResult.iterations.float / elapsed else: 0.0
+            echo &"[ParallelResolve] SUCCESS: Found solution with cost 0, rate={rate:.1f} iter/s"
         # Initialize the system with the found solution
         let solutionCopy = @(bestResult.assignment)
         system.initialize(solutionCopy)
