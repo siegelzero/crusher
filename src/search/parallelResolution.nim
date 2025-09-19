@@ -7,10 +7,12 @@ import ../constrainedArray
 type
     BatchResult*[T] = object
         found*: bool
-        bestCost*: int  # Store cost instead of full state
-        bestSolution*: seq[T]  # Safe copy of solution values
+        cost*: int  # Store cost instead of full state
+        assignment*: seq[T]  # Safe copy of solution values
         workerId*: int
         iterations*: int
+        startTime*: float
+        endTime*: float
 
     # Iterator-based approach types
     StatePool*[T] = object
@@ -48,14 +50,18 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
                 echo &"[Worker {data.workerId}] Processing task {taskIndex}"
 
             let state = pool.states[taskIndex]
+            let startTime = epochTime()
             let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound)
+            let endTime = epochTime()
 
             let result = BatchResult[T](
                 found: improved.bestCost == 0,
-                bestCost: improved.bestCost,
-                bestSolution: improved.assignment,
+                cost: improved.bestCost,
+                assignment: improved.assignment,
                 workerId: data.workerId,
-                iterations: improved.iteration
+                iterations: improved.iteration,
+                startTime: startTime,
+                endTime: endTime
             )
 
             if result.found:
@@ -90,13 +96,17 @@ iterator improveStates*[T](population: seq[TabuState[T]],
             for i, state in population:
                 if verbose:
                     echo &"[ImproveStates] Processing state {i}"
+                let startTime = epochTime()
                 let improved = state.tabuImprove(tabuThreshold)
+                let endTime = epochTime()
                 let result = BatchResult[T](
                     found: improved.bestCost == 0,
-                    bestCost: improved.bestCost,
-                    bestSolution: improved.assignment,
+                    cost: improved.bestCost,
+                    assignment: improved.assignment,
                     workerId: 0,
-                    iterations: improved.iteration
+                    iterations: improved.iteration,
+                    startTime: startTime,
+                    endTime: endTime
                 )
                 yield result
                 if result.found:
@@ -140,7 +150,9 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 for i in lastResultCount..<currentResults.len:
                     let result = currentResults[i]
                     if verbose:
-                        echo &"[ImproveStates] Yielding result: cost={result.bestCost}, solution={result.found}"
+                        let elapsed = result.endTime - result.startTime
+                        let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+                        echo &"[ImproveStates] Yielding result: cost={result.cost}, solution={result.found}, rate={rate:.1f} iter/s"
                     yield result
                     inc yieldedResults
 
@@ -198,8 +210,6 @@ proc dynamicImprove*[T](population: var seq[TabuState[T]],
 
     # Use the iterator to process states one by one
     for result in improveStates(population, numWorkers, tabuThreshold, verbose):
-        if verbose:
-            echo &"[DynamicImprove] Received result: cost={result.bestCost}, solution={result.found}"
 
         # Update best result
         if result.found and not solutionFound:
@@ -209,7 +219,7 @@ proc dynamicImprove*[T](population: var seq[TabuState[T]],
             if verbose:
                 echo "[DynamicImprove] Solution found, terminating"
             break
-        elif not solutionFound and (not bestResultInitialized or result.bestCost < bestResult.bestCost):
+        elif not solutionFound and (not bestResultInitialized or result.cost < bestResult.cost):
             bestResult = result
             bestResultInitialized = true
 
@@ -217,10 +227,12 @@ proc dynamicImprove*[T](population: var seq[TabuState[T]],
         # Fallback result if no results were produced
         bestResult = BatchResult[T](
             found: false,
-            bestCost: high(int),
-            bestSolution: newSeq[T](),
+            cost: high(int),
+            assignment: newSeq[T](),
             workerId: -1,
-            iterations: 0
+            iterations: 0,
+            startTime: 0.0,
+            endTime: 0.0
         )
 
     return bestResult
@@ -255,19 +267,18 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     let bestResult = dynamicImprove(population, numWorkers, tabuThreshold, verbose)
 
     # Check if perfect solution was found (cost == 0 means all constraints satisfied)
-    if bestResult.found and bestResult.bestSolution.len > 0:
+    if bestResult.found and bestResult.assignment.len > 0:
         if verbose:
             echo &"[ParallelResolve] SUCCESS: Found solution with cost 0"
-            echo &"[ParallelResolve] Solution length: {bestResult.bestSolution.len}"
         # Initialize the system with the found solution
-        let solutionCopy = @(bestResult.bestSolution)
+        let solutionCopy = @(bestResult.assignment)
         system.initialize(solutionCopy)
         system.lastIterations = bestResult.iterations
     else:
         # No perfect solution found - reject partial solutions to match sequential behavior
         if verbose:
-            if bestResult.bestSolution.len > 0:
-                echo &"[ParallelResolve] FAILED: No valid solution found, best cost achieved was {bestResult.bestCost}"
+            if bestResult.assignment.len > 0:
+                echo &"[ParallelResolve] FAILED: No valid solution found, best cost achieved was {bestResult.cost}"
             else:
                 echo &"[ParallelResolve] FAILED: No solution found"
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
