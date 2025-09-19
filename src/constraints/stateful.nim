@@ -770,10 +770,14 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         allDifferentState: newAllDifferentConstraint[T](constraint.positions.toSeq())
                     )
                 of ExpressionBased:
+                    # Deep copy expressions to ensure independence
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.allDifferentState.expressions.len)
+                    for i, expr in constraint.allDifferentState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,
                         stateType: AllDifferentType,
-                        allDifferentState: newAllDifferentConstraint[T](constraint.allDifferentState.expressions)
+                        allDifferentState: newAllDifferentConstraint[T](copiedExpressions)
                     )
         of AtLeastType:
             # Create fresh AtLeast constraint (initialize with cost: 0)
@@ -860,6 +864,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         )
                     )
                 of ExpressionBased:
+                    # Deep copy expressions to ensure independence
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.orderingState.expressions.len)
+                    for i, expr in constraint.orderingState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,
                         stateType: OrderingType,
@@ -868,7 +876,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             currentAssignment: constraint.orderingState.currentAssignment,
                             cost: constraint.orderingState.cost,
                             evalMethod: ExpressionBased,
-                            expressions: constraint.orderingState.expressions,
+                            expressions: copiedExpressions,
                             expressionsAtPosition: constraint.orderingState.expressionsAtPosition
                         )
                     )
@@ -911,6 +919,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 of ExpressionBased:
                     case constraint.globalCardinalityState.constraintType:
                         of ExactCounts:
+                            # Deep copy expressions to ensure independence
+                            var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.globalCardinalityState.expressions.len)
+                            for i, expr in constraint.globalCardinalityState.expressions:
+                                copiedExpressions[i] = expr.deepCopy()
                             result = StatefulConstraint[T](
                                 positions: constraint.positions,
                                 stateType: GlobalCardinalityType,
@@ -920,13 +932,17 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                                     cover: constraint.globalCardinalityState.cover,
                                     cost: constraint.globalCardinalityState.cost,
                                     evalMethod: ExpressionBased,
-                                    expressions: constraint.globalCardinalityState.expressions,
+                                    expressions: copiedExpressions,
                                     expressionsAtPosition: constraint.globalCardinalityState.expressionsAtPosition,
                                     constraintType: ExactCounts,
                                     targetCounts: constraint.globalCardinalityState.targetCounts
                                 )
                             )
                         of BoundedCounts:
+                            # Deep copy expressions to ensure independence
+                            var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.globalCardinalityState.expressions.len)
+                            for i, expr in constraint.globalCardinalityState.expressions:
+                                copiedExpressions[i] = expr.deepCopy()
                             result = StatefulConstraint[T](
                                 positions: constraint.positions,
                                 stateType: GlobalCardinalityType,
@@ -936,7 +952,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                                     cover: constraint.globalCardinalityState.cover,
                                     cost: constraint.globalCardinalityState.cost,
                                     evalMethod: ExpressionBased,
-                                    expressions: constraint.globalCardinalityState.expressions,
+                                    expressions: copiedExpressions,
                                     expressionsAtPosition: constraint.globalCardinalityState.expressionsAtPosition,
                                     constraintType: BoundedCounts,
                                     lowerBounds: constraint.globalCardinalityState.lowerBounds,
@@ -961,6 +977,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         )
                     )
                 of ExpressionBased:
+                    # Deep copy expressions to ensure independence
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.multiknapsackState.expressions.len)
+                    for i, expr in constraint.multiknapsackState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,
                         stateType: MultiknapsackType,
@@ -971,7 +991,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             loadTable: constraint.multiknapsackState.loadTable,
                             cost: constraint.multiknapsackState.cost,
                             evalMethod: ExpressionBased,
-                            expressions: constraint.multiknapsackState.expressions,
+                            expressions: copiedExpressions,
                             expressionsAtPosition: constraint.multiknapsackState.expressionsAtPosition
                         )
                     )
@@ -994,6 +1014,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         )
                     )
                 of ExpressionBased:
+                    # Deep copy expressions to ensure independence
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.sequenceState.expressions.len)
+                    for i, expr in constraint.sequenceState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,
                         stateType: SequenceType,
@@ -1005,7 +1029,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             windowSize: constraint.sequenceState.windowSize,
                             targetSet: constraint.sequenceState.targetSet,
                             evalMethod: ExpressionBased,
-                            expressions: constraint.sequenceState.expressions,
+                            expressions: copiedExpressions,
                             expressionsAtPosition: constraint.sequenceState.expressionsAtPosition
                         )
                     )

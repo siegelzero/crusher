@@ -254,12 +254,6 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Process population in parallel using dynamic dispatcher
     let bestResult = dynamicImprove(population, numWorkers, tabuThreshold, verbose)
 
-    # Explicitly clear population to control destruction order and avoid potential memory issues
-    # This helps prevent double-free issues with shared constraint references
-    for i in 0..<population.len:
-        population[i] = nil
-    population.setLen(0)
-
     # Check if perfect solution was found (cost == 0 means all constraints satisfied)
     if bestResult.found and bestResult.bestSolution.len > 0:
         if verbose:
