@@ -1,3 +1,4 @@
 import algebraic
 import stateful
-export algebraic, stateful
+import types
+export algebraic, stateful, types

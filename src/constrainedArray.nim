@@ -1,7 +1,6 @@
 import std/[packedsets, sequtils, strformat]
 
-import constraints/stateful
-import constraints/algebraic
+import constraints/[stateful, algebraic, types]
 import expressions/expressions
 
 ################################################################################
@@ -133,7 +132,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     # RelationalConstraint needs to be evaluated differently
                     # Skip for now - these are typically multi-variable anyway
                     continue
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, LogicalType:
                     # Skip these constraint types for domain reduction
                     continue
 

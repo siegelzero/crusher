@@ -1,22 +1,10 @@
 import std/[packedsets, sequtils, tables]
 
 import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence
-import constraintNode
+import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
-################################################################################
-# StatefulAlgebraicConstraint - moved from algebraic.nim
-################################################################################
-
-type
-    StatefulAlgebraicConstraint*[T] = ref object
-        # Stateful Constraint backed by an Algebraic Constraint, where the current
-        # assignment is saved, along with the cost.
-        # This constraint form has state which is updated as the assignment changes.
-        currentAssignment*: Table[int, T]
-        cost*: int
-        constraint*: AlgebraicConstraint[T]
-        positions: PackedSet[int]
+# StatefulAlgebraicConstraint moved to types.nim
 
 # StatefulAlgebraicConstraint Creation
 
@@ -55,47 +43,142 @@ func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValu
     state.currentAssignment[position] = oldValue
     return delta
 
+# StatefulConstraint definition moved to types.nim
+
 ################################################################################
-# Stateful Constraint Wrapper Type definitions
+# LogicalConstraint implementation - type definition is in types.nim
 ################################################################################
 
-type
-    StatefulConstraintType* = enum
-        AllDifferentType,
-        AtLeastType,
-        AtMostType,
-        ElementType,
-        AlgebraicType,
-        RelationalType,
-        OrderingType,
-        GlobalCardinalityType,
-        MultiknapsackType,
-        SequenceType
+# Helper functions for penalty calculation
+func calculateUnaryPenalty[T](op: UnaryRelation, targetPenalty: T): T {.inline.} =
+    ## Calculates penalty for unary operations
+    case op:
+    of Not:
+        return if targetPenalty == 0: 1 else: 0
 
-    StatefulConstraint*[T] = object
-        positions*: PackedSet[int]
-        case stateType*: StatefulConstraintType
-            of AllDifferentType:
-                allDifferentState*: AllDifferentConstraint[T]
-            of AtLeastType:
-                atLeastState*: AtLeastConstraint[T]
-            of AtMostType:
-                atMostState*: AtMostConstraint[T]
-            of ElementType:
-                elementState*: ElementState[T]
-            of AlgebraicType:
-                algebraicState*: StatefulAlgebraicConstraint[T]
-            of RelationalType:
-                relationalState*: RelationalConstraint[T]
-            of OrderingType:
-                orderingState*: OrderingConstraint[T]
-            of GlobalCardinalityType:
-                globalCardinalityState*: GlobalCardinalityConstraint[T]
-            of MultiknapsackType:
-                multiknapsackState*: MultiknapsackConstraint[T]
-            of SequenceType:
-                sequenceState*: SequenceConstraint[T]
+func calculateLogicalPenalty[T](op: LogicalOperation, leftPenalty, rightPenalty: T): T {.inline.} =
+    ## Calculates penalty for logical operations based on child constraint penalties
+    case op:
+    of And:
+        # Both must be satisfied
+        return leftPenalty + rightPenalty
+    of Or:
+        # At least one must be satisfied
+        return min(leftPenalty, rightPenalty)
+    of Xor:
+        # Exactly one must be satisfied
+        return if (leftPenalty == 0) != (rightPenalty == 0): 0 else: 1
+    of Implies:
+        # If left then right
+        return if leftPenalty == 0 and rightPenalty > 0: 1 else: 0
+    of Iff:
+        # Both or neither
+        return if (leftPenalty == 0) == (rightPenalty == 0): 0 else: 1
 
+# LogicalConstraint creation functions
+func newLogicalConstraint*[T](leftConstraint, rightConstraint: StatefulConstraint[T],
+                              logicalOp: LogicalOperation): LogicalConstraint[T] =
+    ## Creates a new binary LogicalConstraint combining two stateful constraints
+    result = LogicalConstraint[T](
+        isUnary: false,
+        logicalOp: logicalOp,
+        leftConstraint: leftConstraint,
+        rightConstraint: rightConstraint,
+        cost: 0,
+        positions: leftConstraint.positions + rightConstraint.positions
+    )
+
+func newUnaryLogicalConstraint*[T](targetConstraint: StatefulConstraint[T],
+                                   unaryOp: UnaryRelation): LogicalConstraint[T] =
+    ## Creates a new unary LogicalConstraint (like NOT)
+    result = LogicalConstraint[T](
+        isUnary: true,
+        unaryOp: unaryOp,
+        targetConstraint: targetConstraint,
+        cost: 0,
+        positions: targetConstraint.positions
+    )
+
+# LogicalConstraint State Management
+func initialize*[T](constraint: LogicalConstraint[T], assignment: seq[T]) =
+    ## Initialize the logical constraint with the given assignment
+    case constraint.isUnary:
+    of true:
+        constraint.targetConstraint.initialize(assignment)
+        let targetPenalty = constraint.targetConstraint.penalty()
+        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, targetPenalty)
+    of false:
+        constraint.leftConstraint.initialize(assignment)
+        constraint.rightConstraint.initialize(assignment)
+        constraint.cost = calculateLogicalPenalty(
+            constraint.logicalOp,
+            constraint.leftConstraint.penalty(),
+            constraint.rightConstraint.penalty()
+        )
+
+func moveDelta*[T](constraint: LogicalConstraint[T], position: int, oldValue, newValue: T): int =
+    ## Calculate the change in penalty for a position change
+    # Early exit if position doesn't affect this constraint
+    if position notin constraint.positions:
+        return 0
+
+    case constraint.isUnary:
+    of true:
+        let targetDelta = constraint.targetConstraint.moveDelta(position, oldValue, newValue)
+        let newTargetPenalty = constraint.targetConstraint.penalty() + targetDelta
+        let newCost = calculateUnaryPenalty(constraint.unaryOp, newTargetPenalty)
+        return newCost - constraint.cost
+    of false:
+        let leftDelta = constraint.leftConstraint.moveDelta(position, oldValue, newValue)
+        let rightDelta = constraint.rightConstraint.moveDelta(position, oldValue, newValue)
+
+        let newLeftPenalty = constraint.leftConstraint.penalty() + leftDelta
+        let newRightPenalty = constraint.rightConstraint.penalty() + rightDelta
+
+        let newCost = calculateLogicalPenalty(constraint.logicalOp, newLeftPenalty, newRightPenalty)
+        return newCost - constraint.cost
+
+func updatePosition*[T](constraint: LogicalConstraint[T], position: int, newValue: T) =
+    ## Update a position with a new value
+    case constraint.isUnary:
+    of true:
+        constraint.targetConstraint.updatePosition(position, newValue)
+        let targetPenalty = constraint.targetConstraint.penalty()
+        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, targetPenalty)
+    of false:
+        constraint.leftConstraint.updatePosition(position, newValue)
+        constraint.rightConstraint.updatePosition(position, newValue)
+        constraint.cost = calculateLogicalPenalty(
+            constraint.logicalOp,
+            constraint.leftConstraint.penalty(),
+            constraint.rightConstraint.penalty()
+        )
+
+func penalty*[T](constraint: LogicalConstraint[T]): int =
+    ## Get the current penalty
+    return constraint.cost
+
+# Deep copy support
+proc deepCopy*[T](constraint: LogicalConstraint[T]): LogicalConstraint[T] =
+    ## Creates a deep copy of a LogicalConstraint for thread-safe parallel processing
+    case constraint.isUnary:
+    of true:
+        result = LogicalConstraint[T](
+            isUnary: true,
+            unaryOp: constraint.unaryOp,
+            targetConstraint: constraint.targetConstraint.deepCopy(),
+            cost: constraint.cost,
+            positions: constraint.positions  # PackedSet is a value type, safe to copy
+        )
+    of false:
+        result = LogicalConstraint[T](
+            isUnary: false,
+            logicalOp: constraint.logicalOp,
+            leftConstraint: constraint.leftConstraint.deepCopy(),
+            rightConstraint: constraint.rightConstraint.deepCopy(),
+            cost: constraint.cost,
+            positions: constraint.positions  # PackedSet is a value type, safe to copy
+        )
 
 func `$`*[T](constraint: StatefulConstraint[T]): string =
     case constraint.stateType:
@@ -119,6 +202,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Multiknapsack Constraint"
         of SequenceType:
             return "Sequence Constraint"
+        of LogicalType:
+            return "Logical Constraint"
 
 ################################################################################
 # Evaluation
@@ -146,6 +231,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.multiknapsackState.cost
         of SequenceType:
             return constraint.sequenceState.cost
+        of LogicalType:
+            return constraint.logicalState.cost
 
 ################################################################################
 # Computed Constraints
@@ -703,6 +790,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.multiknapsackState.initialize(assignment)
         of SequenceType:
             constraint.sequenceState.initialize(assignment)
+        of LogicalType:
+            constraint.logicalState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -727,6 +816,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
         of SequenceType:
             constraint.sequenceState.moveDelta(position, oldValue, newValue)
+        of LogicalType:
+            constraint.logicalState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -751,6 +842,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.multiknapsackState.updatePosition(position, newValue)
         of SequenceType:
             constraint.sequenceState.updatePosition(position, newValue)
+        of LogicalType:
+            constraint.logicalState.updatePosition(position, newValue)
 
 ################################################################################
 # Deep copy for StatefulConstraint
@@ -1033,6 +1126,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             expressionsAtPosition: constraint.sequenceState.expressionsAtPosition
                         )
                     )
+        of LogicalType:
+            # Create deep copy of logical constraint with deep copied children
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: LogicalType,
+                logicalState: constraint.logicalState.deepCopy()
+            )
 
 
 
@@ -1106,3 +1206,81 @@ func sequence*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, 
             stateType: SequenceType,
             sequenceState: newSequenceConstraint[T](expressions, minInSet, maxInSet, windowSize, targetSet)
         )
+
+################################################################################
+# Logical Operators for StatefulConstraint
+################################################################################
+
+template StatefulLogicalOp(op, opEnum: untyped) =
+    func `op`*[T](left, right: StatefulConstraint[T]): StatefulConstraint[T] =
+        ## Creates a logical constraint combining two stateful constraints
+        StatefulConstraint[T](
+            positions: left.positions + right.positions,
+            stateType: LogicalType,
+            logicalState: newLogicalConstraint[T](left, right, opEnum)
+        )
+
+StatefulLogicalOp(`and`, And)
+StatefulLogicalOp(`or`, Or)
+StatefulLogicalOp(`xor`, Xor)
+StatefulLogicalOp(`implies`, Implies)
+StatefulLogicalOp(`iff`, Iff)
+
+# More intuitive syntax for implies and iff
+StatefulLogicalOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+StatefulLogicalOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+
+# NOT operator for StatefulConstraint
+func `not`*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
+    ## Creates a logical NOT constraint for a stateful constraint
+    StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: LogicalType,
+        logicalState: newUnaryLogicalConstraint[T](constraint, Not)
+    )
+
+################################################################################
+# AlgebraicConstraint to StatefulConstraint Conversion
+################################################################################
+
+func toStateful*[T](constraint: AlgebraicConstraint[T]): StatefulConstraint[T] =
+    ## Converts an AlgebraicConstraint to a StatefulConstraint
+    ## This enables mixing algebraic and stateful constraints in logical operations
+    StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: AlgebraicType,
+        algebraicState: newAlgebraicConstraintState(constraint)
+    )
+
+################################################################################
+# Mixed Constraint Type Logical Operators
+################################################################################
+
+template MixedLogicalOp(op, opEnum: untyped) =
+    # StatefulConstraint op AlgebraicConstraint
+    func `op`*[T](left: StatefulConstraint[T], right: AlgebraicConstraint[T]): StatefulConstraint[T] =
+        ## Logical operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
+        StatefulConstraint[T](
+            positions: left.positions + right.positions,
+            stateType: LogicalType,
+            logicalState: newLogicalConstraint[T](left, right.toStateful(), opEnum)
+        )
+
+    # AlgebraicConstraint op StatefulConstraint
+    func `op`*[T](left: AlgebraicConstraint[T], right: StatefulConstraint[T]): StatefulConstraint[T] =
+        ## Logical operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
+        StatefulConstraint[T](
+            positions: left.positions + right.positions,
+            stateType: LogicalType,
+            logicalState: newLogicalConstraint[T](left.toStateful(), right, opEnum)
+        )
+
+MixedLogicalOp(`and`, And)
+MixedLogicalOp(`or`, Or)
+MixedLogicalOp(`xor`, Xor)
+MixedLogicalOp(`implies`, Implies)
+MixedLogicalOp(`iff`, Iff)
+
+# More intuitive syntax for implies and iff with mixed types
+MixedLogicalOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+MixedLogicalOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"

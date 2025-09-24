@@ -79,6 +79,32 @@ ExpExpRel(`<`, LessThan)
 ExpExpRel(`<=`, LessThanEq)
 
 ################################################################################
+# Binary Logical Operations on Constraints
+################################################################################
+
+template LogicalBinaryOp(op, opEnum: untyped) =
+    func `op`*[T](left, right: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
+        AlgebraicConstraint[T](
+            positions: left.positions + right.positions,
+            node: ConstraintNode[T](
+                kind: LogicalNode,
+                logicalOp: opEnum,
+                leftConstraint: left.node,
+                rightConstraint: right.node
+            )
+        )
+
+LogicalBinaryOp(`and`, And)
+LogicalBinaryOp(`or`, Or)
+LogicalBinaryOp(`xor`, Xor)
+LogicalBinaryOp(`implies`, Implies)
+LogicalBinaryOp(`iff`, Iff)
+
+# More intuitive syntax for implies and iff
+LogicalBinaryOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+LogicalBinaryOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+
+################################################################################
 # Evaluation
 ################################################################################
 

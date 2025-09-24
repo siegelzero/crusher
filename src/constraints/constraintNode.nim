@@ -21,9 +21,17 @@ type
         CommonFactor,
         CoPrime,
 
+    LogicalOperation* = enum
+        And,
+        Or,
+        Xor,
+        Implies,
+        Iff
+
     NodeType* = enum
         UnaryRelNode,
-        BinaryRelNode
+        BinaryRelNode,
+        LogicalNode
 
     ConstraintNode*[T] = ref object
         case kind*: NodeType
@@ -33,6 +41,9 @@ type
             of BinaryRelNode:
                 binaryRel*: BinaryRelation
                 left*, right*: ExpressionNode[T]
+            of LogicalNode:
+                logicalOp*: LogicalOperation
+                leftConstraint*, rightConstraint*: ConstraintNode[T]
 
 ################################################################################
 # Evaluation
@@ -72,6 +83,21 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
             let right = node.right.evaluate(assignment)
             return node.binaryRel.evaluate(left, right)
 
+        of LogicalNode:
+            let left = node.leftConstraint.evaluate(assignment)
+            let right = node.rightConstraint.evaluate(assignment)
+            case node.logicalOp:
+                of And:
+                    return left and right
+                of Or:
+                    return left or right
+                of Xor:
+                    return left != right
+                of Implies:
+                    return (not left) or right
+                of Iff:
+                    return left == right
+
 
 func penalty*[T](relation: BinaryRelation, left, right: T): T =
     return if relation.evaluate(left, right): return 0 else: 1
@@ -89,3 +115,23 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
             let left = node.left.evaluate(assignment)
             let right = node.right.evaluate(assignment)
             return node.binaryRel.penalty(left, right)
+
+        of LogicalNode:
+            let leftPenalty = node.leftConstraint.penalty(assignment)
+            let rightPenalty = node.rightConstraint.penalty(assignment)
+            case node.logicalOp:
+                of And:
+                    # Both must be satisfied
+                    return leftPenalty + rightPenalty
+                of Or:
+                    # At least one must be satisfied
+                    return min(leftPenalty, rightPenalty)
+                of Xor:
+                    # Exactly one must be satisfied
+                    return if (leftPenalty == 0) != (rightPenalty == 0): 0 else: 1
+                of Implies:
+                    # If left then right
+                    return if leftPenalty == 0 and rightPenalty > 0: 1 else: 0
+                of Iff:
+                    # Both or neither
+                    return if (leftPenalty == 0) == (rightPenalty == 0): 0 else: 1
