@@ -40,11 +40,14 @@ type
             # Unary operation (like NOT)
             unaryOp*: UnaryRelation
             targetConstraint*: StatefulConstraint[T]
+            cachedTargetPenalty*: int  # Cache target constraint penalty
         of false:
             # Binary operation (like AND, OR, etc.)
             logicalOp*: LogicalOperation
             leftConstraint*: StatefulConstraint[T]
             rightConstraint*: StatefulConstraint[T]
+            cachedLeftPenalty*: int   # Cache left constraint penalty
+            cachedRightPenalty*: int  # Cache right constraint penalty
 
     StatefulConstraint*[T] = ref object
         positions*: PackedSet[int]

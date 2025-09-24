@@ -4,6 +4,8 @@ import algebraic, allDifferent, atleast, atmost, elementState, relationalConstra
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
+export StatefulConstraint, StatefulConstraintType, StatefulAlgebraicConstraint, LogicalConstraint
+
 # StatefulAlgebraicConstraint moved to types.nim
 
 # StatefulAlgebraicConstraint Creation
@@ -84,6 +86,8 @@ func newLogicalConstraint*[T](leftConstraint, rightConstraint: StatefulConstrain
         logicalOp: logicalOp,
         leftConstraint: leftConstraint,
         rightConstraint: rightConstraint,
+        cachedLeftPenalty: 0,
+        cachedRightPenalty: 0,
         cost: 0,
         positions: leftConstraint.positions + rightConstraint.positions
     )
@@ -95,63 +99,78 @@ func newUnaryLogicalConstraint*[T](targetConstraint: StatefulConstraint[T],
         isUnary: true,
         unaryOp: unaryOp,
         targetConstraint: targetConstraint,
+        cachedTargetPenalty: 0,
         cost: 0,
         positions: targetConstraint.positions
     )
 
 # LogicalConstraint State Management
 func initialize*[T](constraint: LogicalConstraint[T], assignment: seq[T]) =
-    ## Initialize the logical constraint with the given assignment
+    ## Initialize the logical constraint with the given assignment and cache child penalties
     case constraint.isUnary:
     of true:
         constraint.targetConstraint.initialize(assignment)
-        let targetPenalty = constraint.targetConstraint.penalty()
-        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, targetPenalty)
+        constraint.cachedTargetPenalty = constraint.targetConstraint.penalty()
+        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, constraint.cachedTargetPenalty)
     of false:
         constraint.leftConstraint.initialize(assignment)
         constraint.rightConstraint.initialize(assignment)
+        constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
+        constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
         constraint.cost = calculateLogicalPenalty(
             constraint.logicalOp,
-            constraint.leftConstraint.penalty(),
-            constraint.rightConstraint.penalty()
+            constraint.cachedLeftPenalty,
+            constraint.cachedRightPenalty
         )
 
 func moveDelta*[T](constraint: LogicalConstraint[T], position: int, oldValue, newValue: T): int =
-    ## Calculate the change in penalty for a position change
+    ## Calculate the change in penalty for a position change using cached penalties
     # Early exit if position doesn't affect this constraint
     if position notin constraint.positions:
         return 0
 
     case constraint.isUnary:
     of true:
-        let targetDelta = constraint.targetConstraint.moveDelta(position, oldValue, newValue)
-        let newTargetPenalty = constraint.targetConstraint.penalty() + targetDelta
+        # Only calculate delta if position affects the target constraint
+        let targetDelta = if position in constraint.targetConstraint.positions:
+            constraint.targetConstraint.moveDelta(position, oldValue, newValue)
+        else: 0
+
+        let newTargetPenalty = constraint.cachedTargetPenalty + targetDelta
         let newCost = calculateUnaryPenalty(constraint.unaryOp, newTargetPenalty)
         return newCost - constraint.cost
     of false:
-        let leftDelta = constraint.leftConstraint.moveDelta(position, oldValue, newValue)
-        let rightDelta = constraint.rightConstraint.moveDelta(position, oldValue, newValue)
+        # Only calculate deltas for constraints that actually depend on this position
+        let leftDelta = if position in constraint.leftConstraint.positions:
+            constraint.leftConstraint.moveDelta(position, oldValue, newValue)
+        else: 0
 
-        let newLeftPenalty = constraint.leftConstraint.penalty() + leftDelta
-        let newRightPenalty = constraint.rightConstraint.penalty() + rightDelta
+        let rightDelta = if position in constraint.rightConstraint.positions:
+            constraint.rightConstraint.moveDelta(position, oldValue, newValue)
+        else: 0
+
+        let newLeftPenalty = constraint.cachedLeftPenalty + leftDelta
+        let newRightPenalty = constraint.cachedRightPenalty + rightDelta
 
         let newCost = calculateLogicalPenalty(constraint.logicalOp, newLeftPenalty, newRightPenalty)
         return newCost - constraint.cost
 
 func updatePosition*[T](constraint: LogicalConstraint[T], position: int, newValue: T) =
-    ## Update a position with a new value
+    ## Update a position with a new value and maintain cached penalties
     case constraint.isUnary:
     of true:
         constraint.targetConstraint.updatePosition(position, newValue)
-        let targetPenalty = constraint.targetConstraint.penalty()
-        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, targetPenalty)
+        constraint.cachedTargetPenalty = constraint.targetConstraint.penalty()
+        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, constraint.cachedTargetPenalty)
     of false:
         constraint.leftConstraint.updatePosition(position, newValue)
         constraint.rightConstraint.updatePosition(position, newValue)
+        constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
+        constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
         constraint.cost = calculateLogicalPenalty(
             constraint.logicalOp,
-            constraint.leftConstraint.penalty(),
-            constraint.rightConstraint.penalty()
+            constraint.cachedLeftPenalty,
+            constraint.cachedRightPenalty
         )
 
 func penalty*[T](constraint: LogicalConstraint[T]): int =
@@ -167,6 +186,7 @@ proc deepCopy*[T](constraint: LogicalConstraint[T]): LogicalConstraint[T] =
             isUnary: true,
             unaryOp: constraint.unaryOp,
             targetConstraint: constraint.targetConstraint.deepCopy(),
+            cachedTargetPenalty: constraint.cachedTargetPenalty,
             cost: constraint.cost,
             positions: constraint.positions  # PackedSet is a value type, safe to copy
         )
@@ -176,6 +196,8 @@ proc deepCopy*[T](constraint: LogicalConstraint[T]): LogicalConstraint[T] =
             logicalOp: constraint.logicalOp,
             leftConstraint: constraint.leftConstraint.deepCopy(),
             rightConstraint: constraint.rightConstraint.deepCopy(),
+            cachedLeftPenalty: constraint.cachedLeftPenalty,
+            cachedRightPenalty: constraint.cachedRightPenalty,
             cost: constraint.cost,
             positions: constraint.positions  # PackedSet is a value type, safe to copy
         )
