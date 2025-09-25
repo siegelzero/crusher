@@ -360,32 +360,21 @@ suite "Logical Constraint Tests":
 
     test "All different except 0 constraint using logical operators":
         var sys = initConstraintSystem[int]()
-        var sequence = sys.newConstrainedSequence(4)
+        var X = sys.newConstrainedSequence(4)
 
         # Domain includes 0 (which can be repeated) and other values (which must be unique)
-        sequence.setDomain([0, 1, 2, 3, 4, 5])
+        X.setDomain([0, 1, 2])
 
         # Create all_different_except_0 constraint using mixed algebraic and stateful approach:
         # For all pairs (i,j) where i < j: (X[i] != 0) and (X[j] != 0) implies X[i] != X[j]
         for i in 0..<4:
             for j in (i+1)..<4:
-                # Create the constraints
-                let xi_not_zero = not (sequence[i] == 0)  # StatefulConstraint
-                let xj_not_zero = not (sequence[j] == 0)  # StatefulConstraint
-                let both_nonzero = xi_not_zero and xj_not_zero  # StatefulConstraint
-
-                # Expression comparison now returns StatefulConstraint for consistency
-                let values_same = sequence[i] == sequence[j]  # StatefulConstraint
-                let values_different = not values_same  # StatefulConstraint
-
-                # Mix different StatefulConstraints
-                let constraint = both_nonzero and values_different
-                sys.addConstraint(constraint)
+                sys.addConstraint(((X[i] != 0) and (X[j] != 0)) -> X[i] != X[j])
 
         try:
             sys.resolve(verbose=false)
 
-            let assignment = sequence.assignment()
+            let assignment = X.assignment()
             echo "Found all_different_except_0 solution: ", assignment
 
             # Verify the constraint: all non-zero values should be unique
