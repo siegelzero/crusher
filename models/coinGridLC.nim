@@ -20,7 +20,7 @@ proc coingrid*(n, c: int) =
                 objectiveTerms.add(X[i, j]*(i - j)*(i - j))
 
     let objective = sum(objectiveTerms)
-    sys.minimize(objective, parallel=true, verbose=false)
+    sys.minimize(objective, parallel=true, verbose=true)
 
 
 when isMainModule:
