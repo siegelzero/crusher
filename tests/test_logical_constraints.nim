@@ -374,11 +374,11 @@ suite "Logical Constraint Tests":
                 let xj_not_zero = not (sequence[j] == 0)  # StatefulConstraint
                 let both_nonzero = xi_not_zero and xj_not_zero  # StatefulConstraint
 
-                # For the expression comparison, use AlgebraicConstraint
-                let values_same = sequence[i] == sequence[j]  # AlgebraicConstraint
-                let values_different = not values_same  # AlgebraicConstraint
+                # Expression comparison now returns StatefulConstraint for consistency
+                let values_same = sequence[i] == sequence[j]  # StatefulConstraint
+                let values_different = not values_same  # StatefulConstraint
 
-                # Mix StatefulConstraint and AlgebraicConstraint - automatic conversion
+                # Mix different StatefulConstraints
                 let constraint = both_nonzero and values_different
                 sys.addConstraint(constraint)
 

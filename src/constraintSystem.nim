@@ -98,15 +98,15 @@ converter toAlgebraicExpression*[T](cvar: ConstrainedVariable[T]): AlgebraicExpr
 
 # Template for ConstrainedVariable comparison operators
 template VarVarOp(op: untyped) =
-    func op*[T](left, right: ConstrainedVariable[T]): AlgebraicConstraint[T] {.inline.} =
-        op(left.value, right.value)
+    func op*[T](left, right: ConstrainedVariable[T]): StatefulConstraint[T] {.inline.} =
+        stateful.op(left.value, right.value)
 
 template VarConstOp(op: untyped) =
     func op*[T: SomeNumber](left: ConstrainedVariable[T], right: T): StatefulConstraint[T] {.inline.} =
-        op(left.value, right)
+        stateful.op(left.value, right)
 
     func op*[T: SomeNumber](left: T, right: ConstrainedVariable[T]): StatefulConstraint[T] {.inline.} =
-        op(left, right.value)
+        stateful.op(left, right.value)
 
 # Generate all comparison operators
 VarVarOp(`==`)

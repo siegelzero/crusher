@@ -381,6 +381,15 @@ template ExprExprRel(rel, relEnum: untyped) =
             relationalState: constraint
         )
 
+    # AlgebraicExpression-to-AlgebraicExpression relations
+    func `rel`*[T](left: AlgebraicExpression[T], right: AlgebraicExpression[T]): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalType,
+            relationalState: constraint
+        )
+
 
 # Generate all relational operators for expression-to-expression
 ExprExprRel(`==`, EqualTo)

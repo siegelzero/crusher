@@ -57,26 +57,9 @@ func `not`*[T](constraint: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inl
 
 ################################################################################
 # Binary (AlgebraicExpression, AlgebraicExpression) Relations
+# DEPRECATED: These operators have been moved to stateful.nim for consistency
+# All relational operators now return StatefulConstraint for unified API
 ################################################################################
-
-template ExpExpRel(rel, relEnum: untyped) =
-    # Template for xRy for x, y Algebraic Expressions and R a binary relation
-    func `rel`*[T](left, right: AlgebraicExpression[T]): AlgebraicConstraint[T] {.inline.} =
-        AlgebraicConstraint[T](
-            positions: left.positions + right.positions,
-            node: ConstraintNode[T](
-                kind: BinaryRelNode,
-                binaryRel: relEnum,
-                left: left.node,
-                right: right.node
-            )
-        )
-
-ExpExpRel(`==`, EqualTo)
-ExpExpRel(`>`, GreaterThan)
-ExpExpRel(`>=`, GreaterThanEq)
-ExpExpRel(`<`, LessThan)
-ExpExpRel(`<=`, LessThanEq)
 
 ################################################################################
 # Binary Logical Operations on Constraints
