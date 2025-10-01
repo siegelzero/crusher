@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence
+import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -226,6 +226,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Sequence Constraint"
         of BooleanType:
             return "Boolean Constraint"
+        of CumulativeType:
+            return "Cumulative Constraint"
 
 ################################################################################
 # Evaluation
@@ -255,6 +257,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.sequenceState.cost
         of BooleanType:
             return constraint.booleanState.cost
+        of CumulativeType:
+            return constraint.cumulativeState.cost
 
 ################################################################################
 # Computed Constraints
@@ -823,6 +827,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.sequenceState.initialize(assignment)
         of BooleanType:
             constraint.booleanState.initialize(assignment)
+        of CumulativeType:
+            constraint.cumulativeState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -849,6 +855,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.sequenceState.moveDelta(position, oldValue, newValue)
         of BooleanType:
             constraint.booleanState.moveDelta(position, oldValue, newValue)
+        of CumulativeType:
+            constraint.cumulativeState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -875,6 +883,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.sequenceState.updatePosition(position, newValue)
         of BooleanType:
             constraint.booleanState.updatePosition(position, newValue)
+        of CumulativeType:
+            constraint.cumulativeState.updatePosition(position, newValue)
 
 ################################################################################
 # Deep copy for StatefulConstraint
@@ -1157,6 +1167,44 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             expressionsAtPosition: constraint.sequenceState.expressionsAtPosition
                         )
                     )
+        of CumulativeType:
+            # Create deep copy preserving all runtime state
+            case constraint.cumulativeState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: CumulativeType,
+                        cumulativeState: CumulativeConstraint[T](
+                            currentAssignment: constraint.cumulativeState.currentAssignment,
+                            resourceProfile: constraint.cumulativeState.resourceProfile,
+                            cost: constraint.cumulativeState.cost,
+                            limit: constraint.cumulativeState.limit,
+                            evalMethod: PositionBased,
+                            originPositions: constraint.cumulativeState.originPositions,
+                            durations: constraint.cumulativeState.durations,
+                            heights: constraint.cumulativeState.heights
+                        )
+                    )
+                of ExpressionBased:
+                    # Deep copy expressions to ensure independence
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.cumulativeState.originExpressions.len)
+                    for i, expr in constraint.cumulativeState.originExpressions:
+                        copiedExpressions[i] = expr.deepCopy()
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: CumulativeType,
+                        cumulativeState: CumulativeConstraint[T](
+                            currentAssignment: constraint.cumulativeState.currentAssignment,
+                            resourceProfile: constraint.cumulativeState.resourceProfile,
+                            cost: constraint.cumulativeState.cost,
+                            limit: constraint.cumulativeState.limit,
+                            evalMethod: ExpressionBased,
+                            originExpressions: copiedExpressions,
+                            durationsExpr: constraint.cumulativeState.durationsExpr,
+                            heightsExpr: constraint.cumulativeState.heightsExpr,
+                            expressionsAtPosition: constraint.cumulativeState.expressionsAtPosition
+                        )
+                    )
         of BooleanType:
             # Create deep copy of boolean constraint with deep copied children
             result = StatefulConstraint[T](
@@ -1236,6 +1284,42 @@ func sequence*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, 
             positions: allPositions,
             stateType: SequenceType,
             sequenceState: newSequenceConstraint[T](expressions, minInSet, maxInSet, windowSize, targetSet)
+        )
+
+################################################################################
+# Cumulative wrapper functions
+################################################################################
+
+func cumulative*[T](originPositions: openArray[int], durations: openArray[T], heights: openArray[T], limit: T): StatefulConstraint[T] =
+    ## Creates a cumulative constraint for resource-constrained scheduling.
+    ## - originPositions: Variable positions representing task start times
+    ## - durations: Duration of each task (constant)
+    ## - heights: Resource consumption of each task (constant)
+    ## - limit: Maximum resource capacity
+    ## Example: cumulative([0,1,2,3,4], [3,9,10,6,2], [1,2,1,1,3], 8) for project scheduling
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](originPositions),
+        stateType: CumulativeType,
+        cumulativeState: newCumulativeConstraint[T](originPositions, durations, heights, limit)
+    )
+
+func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: openArray[T], heights: openArray[T], limit: T): StatefulConstraint[T] =
+    ## Returns cumulative constraint for the given origin expressions.
+    let (allRefs, positions) = isAllRefs(originExpressions)
+
+    if allRefs:
+        # Use more efficient position based constraint if all expressions are refnodes
+        return cumulative[T](positions, durations, heights, limit)
+    else:
+        # Collect all positions from expressions for the constraint positions field
+        var allPositions = toPackedSet[int]([])
+        for exp in originExpressions:
+            allPositions.incl(exp.positions)
+
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: CumulativeType,
+            cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit)
         )
 
 ################################################################################

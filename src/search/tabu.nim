@@ -1,6 +1,6 @@
 import std/[packedsets, random, sequtils, tables, atomics]
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -57,6 +57,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.sequenceState.cost + constraint.sequenceState.moveDelta(position, oldValue, newValue)
         of BooleanType:
             result = constraint.booleanState.cost + constraint.booleanState.moveDelta(position, oldValue, newValue)
+        of CumulativeType:
+            result = constraint.cumulativeState.cost + constraint.cumulativeState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines

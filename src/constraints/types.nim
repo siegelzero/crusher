@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence
+import allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative
 
 ################################################################################
 # Shared constraint type definitions
@@ -19,7 +19,8 @@ type
         GlobalCardinalityType,
         MultiknapsackType,
         SequenceType,
-        BooleanType
+        BooleanType,
+        CumulativeType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -74,3 +75,5 @@ type
                 sequenceState*: SequenceConstraint[T]
             of BooleanType:
                 booleanState*: BooleanConstraint[T]
+            of CumulativeType:
+                cumulativeState*: CumulativeConstraint[T]
