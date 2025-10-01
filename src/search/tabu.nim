@@ -55,8 +55,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.multiknapsackState.cost + constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
         of SequenceType:
             result = constraint.sequenceState.cost + constraint.sequenceState.moveDelta(position, oldValue, newValue)
-        of LogicalType:
-            result = constraint.logicalState.cost + constraint.logicalState.moveDelta(position, oldValue, newValue)
+        of BooleanType:
+            result = constraint.booleanState.cost + constraint.booleanState.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Penalty Map Routines

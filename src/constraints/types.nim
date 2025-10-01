@@ -19,7 +19,7 @@ type
         GlobalCardinalityType,
         MultiknapsackType,
         SequenceType,
-        LogicalType
+        BooleanType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -32,7 +32,7 @@ type
         positions*: PackedSet[int]
 
     # Complete constraint type definitions
-    LogicalConstraint*[T] = ref object
+    BooleanConstraint*[T] = ref object
         cost*: int
         positions*: PackedSet[int]
         case isUnary*: bool
@@ -43,7 +43,7 @@ type
             cachedTargetPenalty*: int  # Cache target constraint penalty
         of false:
             # Binary operation (like AND, OR, etc.)
-            logicalOp*: LogicalOperation
+            booleanOp*: BooleanOperation
             leftConstraint*: StatefulConstraint[T]
             rightConstraint*: StatefulConstraint[T]
             cachedLeftPenalty*: int   # Cache left constraint penalty
@@ -72,5 +72,5 @@ type
                 multiknapsackState*: MultiknapsackConstraint[T]
             of SequenceType:
                 sequenceState*: SequenceConstraint[T]
-            of LogicalType:
-                logicalState*: LogicalConstraint[T]
+            of BooleanType:
+                booleanState*: BooleanConstraint[T]

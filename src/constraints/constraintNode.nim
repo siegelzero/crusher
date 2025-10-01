@@ -21,7 +21,7 @@ type
         CommonFactor,
         CoPrime,
 
-    LogicalOperation* = enum
+    BooleanOperation* = enum
         And,
         Or,
         Xor,
@@ -31,7 +31,7 @@ type
     NodeType* = enum
         UnaryRelNode,
         BinaryRelNode,
-        LogicalNode
+        BooleanNode
 
     ConstraintNode*[T] = ref object
         case kind*: NodeType
@@ -41,8 +41,8 @@ type
             of BinaryRelNode:
                 binaryRel*: BinaryRelation
                 left*, right*: ExpressionNode[T]
-            of LogicalNode:
-                logicalOp*: LogicalOperation
+            of BooleanNode:
+                booleanOp*: BooleanOperation
                 leftConstraint*, rightConstraint*: ConstraintNode[T]
 
 ################################################################################
@@ -83,10 +83,10 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
             let right = node.right.evaluate(assignment)
             return node.binaryRel.evaluate(left, right)
 
-        of LogicalNode:
+        of BooleanNode:
             let left = node.leftConstraint.evaluate(assignment)
             let right = node.rightConstraint.evaluate(assignment)
-            case node.logicalOp:
+            case node.booleanOp:
                 of And:
                     return left and right
                 of Or:
@@ -116,10 +116,10 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
             let right = node.right.evaluate(assignment)
             return node.binaryRel.penalty(left, right)
 
-        of LogicalNode:
+        of BooleanNode:
             let leftPenalty = node.leftConstraint.penalty(assignment)
             let rightPenalty = node.rightConstraint.penalty(assignment)
-            case node.logicalOp:
+            case node.booleanOp:
                 of And:
                     # Both must be satisfied
                     return leftPenalty + rightPenalty

@@ -62,30 +62,30 @@ func `not`*[T](constraint: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inl
 ################################################################################
 
 ################################################################################
-# Binary Logical Operations on Constraints
+# Binary Boolean Operations on Constraints
 ################################################################################
 
-template LogicalBinaryOp(op, opEnum: untyped) =
+template BooleanBinaryOp(op, opEnum: untyped) =
     func `op`*[T](left, right: AlgebraicConstraint[T]): AlgebraicConstraint[T] {.inline.} =
         AlgebraicConstraint[T](
             positions: left.positions + right.positions,
             node: ConstraintNode[T](
-                kind: LogicalNode,
-                logicalOp: opEnum,
+                kind: BooleanNode,
+                booleanOp: opEnum,
                 leftConstraint: left.node,
                 rightConstraint: right.node
             )
         )
 
-LogicalBinaryOp(`and`, And)
-LogicalBinaryOp(`or`, Or)
-LogicalBinaryOp(`xor`, Xor)
-LogicalBinaryOp(`implies`, Implies)
-LogicalBinaryOp(`iff`, Iff)
+BooleanBinaryOp(`and`, And)
+BooleanBinaryOp(`or`, Or)
+BooleanBinaryOp(`xor`, Xor)
+BooleanBinaryOp(`implies`, Implies)
+BooleanBinaryOp(`iff`, Iff)
 
 # More intuitive syntax for implies and iff
-LogicalBinaryOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
-LogicalBinaryOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+BooleanBinaryOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+BooleanBinaryOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
 
 ################################################################################
 # Evaluation

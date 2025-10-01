@@ -1,8 +1,8 @@
 import std/[sequtils, unittest]
 import crusher
 
-suite "Logical Constraint Tests":
-    test "Basic logical AND constraint with resolve":
+suite "Boolean Constraint Tests":
+    test "Basic boolean AND constraint with resolve":
         # Create a simple constraint system
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
@@ -17,7 +17,7 @@ suite "Logical Constraint Tests":
         let c2 = y < 4  # y < 4
         let andConstraint = c1 and c2
 
-        # Add the logical constraint to the system
+        # Add the boolean constraint to the system
         sys.addConstraint(andConstraint)
 
         # Solve the constraint system
@@ -39,7 +39,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for x > 2 AND y < 4"
             check false
 
-    test "Logical OR constraint with resolve":
+    test "Boolean OR constraint with resolve":
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
         var y = sys.newConstrainedVariable()
@@ -70,7 +70,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for x == 5 OR y == 5"
             check false
 
-    test "Logical XOR constraint":
+    test "Boolean XOR constraint":
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
         var y = sys.newConstrainedVariable()
@@ -190,7 +190,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for legacy implies"
             check false
 
-    test "Complex nested logical constraint":
+    test "Complex nested boolean constraint":
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
         var y = sys.newConstrainedVariable()
@@ -223,7 +223,7 @@ suite "Logical Constraint Tests":
             check (leftSide or rightSide)
 
         except NoSolutionFoundError:
-            echo "Failed: Should have found a solution for complex logical constraint"
+            echo "Failed: Should have found a solution for complex boolean constraint"
             check false
 
     test "Complex expression with intuitive operators":
@@ -236,7 +236,7 @@ suite "Logical Constraint Tests":
         y.setDomain([1, 2, 3])
         z.setDomain([1, 2, 3])
 
-        # Complex logical expression using intuitive operators:
+        # Complex boolean expression using intuitive operators:
         # (x > 1) -> (y == 2) and (y == 2) <-> (z == 3)
         let complexConstraint = ((x > 1) -> (y == 2)) and ((y == 2) <-> (z == 3))
 
@@ -258,10 +258,10 @@ suite "Logical Constraint Tests":
             check implies_satisfied and iff_satisfied
 
         except NoSolutionFoundError:
-            echo "Failed: Should have found a solution for complex logical expression"
+            echo "Failed: Should have found a solution for complex boolean expression"
             check false
 
-    test "Logical constraint with stateful constraints":
+    test "Boolean constraint with stateful constraints":
         var sys = initConstraintSystem[int]()
         var sequence = sys.newConstrainedSequence(3)
         var x = sys.newConstrainedVariable()
@@ -272,9 +272,9 @@ suite "Logical Constraint Tests":
         # Mix algebraic and stateful constraints
         let algebraicConstraint = x > 3
         let statefulConstraint = sequence.sum() == 6
-        let mixedLogical = algebraicConstraint and statefulConstraint
+        let mixedBoolean = algebraicConstraint and statefulConstraint
 
-        sys.addConstraint(mixedLogical)
+        sys.addConstraint(mixedBoolean)
 
         try:
             sys.resolve(verbose=false)
@@ -290,7 +290,7 @@ suite "Logical Constraint Tests":
             check sumVal == 6
 
         except NoSolutionFoundError:
-            echo "Failed: Should have found a solution for mixed logical constraint"
+            echo "Failed: Should have found a solution for mixed boolean constraint"
             check false
 
     test "Mixed old and new syntax should work":
@@ -327,7 +327,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for mixed syntax"
             check false
 
-    test "NOT operator with logical combinations":
+    test "NOT operator with boolean combinations":
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
         var y = sys.newConstrainedVariable()
@@ -358,7 +358,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for NOT constraint"
             check false
 
-    test "All different except 0 constraint using logical operators":
+    test "All different except 0 constraint using boolean operators":
         var sys = initConstraintSystem[int]()
         var X = sys.newConstrainedSequence(4)
 
@@ -394,7 +394,7 @@ suite "Logical Constraint Tests":
             echo "Failed: Should have found a solution for all_different_except_0"
             check false
 
-    test "Complex logical constraint with sum, min, and max expressions":
+    test "Complex boolean constraint with sum, min, and max expressions":
         var sys = initConstraintSystem[int]()
         var sequence = sys.newConstrainedSequence(10)  # 10 variables
 

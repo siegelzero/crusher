@@ -1,7 +1,7 @@
 import std/[sequtils, unittest]
 import crusher
 
-suite "Intuitive Logical Operator Syntax":
+suite "Intuitive Boolean Operator Syntax":
     test "Arrow operator -> for implies":
         var sys = initConstraintSystem[int]()
         var x = sys.newConstrainedVariable()
@@ -69,7 +69,7 @@ suite "Intuitive Logical Operator Syntax":
         y.setDomain([1, 2, 3])
         z.setDomain([1, 2, 3])
 
-        # Complex logical expression using intuitive operators:
+        # Complex boolean expression using intuitive operators:
         # (x > 1) -> (y == 2) and (y == 2) <-> (z == 3)
         let complexConstraint = ((x > 1) -> (y == 2)) and ((y == 2) <-> (z == 3))
 
@@ -91,7 +91,7 @@ suite "Intuitive Logical Operator Syntax":
             check implies_satisfied and iff_satisfied
 
         except NoSolutionFoundError:
-            echo "Failed: Should have found a solution for complex logical expression"
+            echo "Failed: Should have found a solution for complex boolean expression"
             check false
 
     test "Mixed old and new syntax should work":

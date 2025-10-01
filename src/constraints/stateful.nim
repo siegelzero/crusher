@@ -4,7 +4,7 @@ import algebraic, allDifferent, atleast, atmost, elementState, relationalConstra
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
-export StatefulConstraint, StatefulConstraintType, StatefulAlgebraicConstraint, LogicalConstraint
+export StatefulConstraint, StatefulConstraintType, StatefulAlgebraicConstraint, BooleanConstraint
 
 # StatefulAlgebraicConstraint moved to types.nim
 
@@ -48,7 +48,7 @@ func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValu
 # StatefulConstraint definition moved to types.nim
 
 ################################################################################
-# LogicalConstraint implementation - type definition is in types.nim
+# BooleanConstraint implementation - type definition is in types.nim
 ################################################################################
 
 # Helper functions for penalty calculation
@@ -58,8 +58,8 @@ func calculateUnaryPenalty[T](op: UnaryRelation, targetPenalty: T): T {.inline.}
     of Not:
         return if targetPenalty == 0: 1 else: 0
 
-func calculateLogicalPenalty[T](op: LogicalOperation, leftPenalty, rightPenalty: T): T {.inline.} =
-    ## Calculates penalty for logical operations based on child constraint penalties
+func calculateBooleanPenalty[T](op: BooleanOperation, leftPenalty, rightPenalty: T): T {.inline.} =
+    ## Calculates penalty for boolean operations based on child constraint penalties
     case op:
     of And:
         # Both must be satisfied
@@ -77,13 +77,13 @@ func calculateLogicalPenalty[T](op: LogicalOperation, leftPenalty, rightPenalty:
         # Both or neither
         return if (leftPenalty == 0) == (rightPenalty == 0): 0 else: 1
 
-# LogicalConstraint creation functions
-func newLogicalConstraint*[T](leftConstraint, rightConstraint: StatefulConstraint[T],
-                              logicalOp: LogicalOperation): LogicalConstraint[T] =
-    ## Creates a new binary LogicalConstraint combining two stateful constraints
-    result = LogicalConstraint[T](
+# BooleanConstraint creation functions
+func newBooleanConstraint*[T](leftConstraint, rightConstraint: StatefulConstraint[T],
+                              booleanOp: BooleanOperation): BooleanConstraint[T] =
+    ## Creates a new binary BooleanConstraint combining two stateful constraints
+    result = BooleanConstraint[T](
         isUnary: false,
-        logicalOp: logicalOp,
+        booleanOp: booleanOp,
         leftConstraint: leftConstraint,
         rightConstraint: rightConstraint,
         cachedLeftPenalty: 0,
@@ -92,10 +92,10 @@ func newLogicalConstraint*[T](leftConstraint, rightConstraint: StatefulConstrain
         positions: leftConstraint.positions + rightConstraint.positions
     )
 
-func newUnaryLogicalConstraint*[T](targetConstraint: StatefulConstraint[T],
-                                   unaryOp: UnaryRelation): LogicalConstraint[T] =
-    ## Creates a new unary LogicalConstraint (like NOT)
-    result = LogicalConstraint[T](
+func newUnaryBooleanConstraint*[T](targetConstraint: StatefulConstraint[T],
+                                   unaryOp: UnaryRelation): BooleanConstraint[T] =
+    ## Creates a new unary BooleanConstraint (like NOT)
+    result = BooleanConstraint[T](
         isUnary: true,
         unaryOp: unaryOp,
         targetConstraint: targetConstraint,
@@ -104,9 +104,9 @@ func newUnaryLogicalConstraint*[T](targetConstraint: StatefulConstraint[T],
         positions: targetConstraint.positions
     )
 
-# LogicalConstraint State Management
-func initialize*[T](constraint: LogicalConstraint[T], assignment: seq[T]) =
-    ## Initialize the logical constraint with the given assignment and cache child penalties
+# BooleanConstraint State Management
+func initialize*[T](constraint: BooleanConstraint[T], assignment: seq[T]) =
+    ## Initialize the boolean constraint with the given assignment and cache child penalties
     case constraint.isUnary:
     of true:
         constraint.targetConstraint.initialize(assignment)
@@ -117,13 +117,13 @@ func initialize*[T](constraint: LogicalConstraint[T], assignment: seq[T]) =
         constraint.rightConstraint.initialize(assignment)
         constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
         constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
-        constraint.cost = calculateLogicalPenalty(
-            constraint.logicalOp,
+        constraint.cost = calculateBooleanPenalty(
+            constraint.booleanOp,
             constraint.cachedLeftPenalty,
             constraint.cachedRightPenalty
         )
 
-func moveDelta*[T](constraint: LogicalConstraint[T], position: int, oldValue, newValue: T): int =
+func moveDelta*[T](constraint: BooleanConstraint[T], position: int, oldValue, newValue: T): int =
     ## Calculate the change in penalty for a position change using cached penalties
     # Early exit if position doesn't affect this constraint
     if position notin constraint.positions:
@@ -152,10 +152,10 @@ func moveDelta*[T](constraint: LogicalConstraint[T], position: int, oldValue, ne
         let newLeftPenalty = constraint.cachedLeftPenalty + leftDelta
         let newRightPenalty = constraint.cachedRightPenalty + rightDelta
 
-        let newCost = calculateLogicalPenalty(constraint.logicalOp, newLeftPenalty, newRightPenalty)
+        let newCost = calculateBooleanPenalty(constraint.booleanOp, newLeftPenalty, newRightPenalty)
         return newCost - constraint.cost
 
-func updatePosition*[T](constraint: LogicalConstraint[T], position: int, newValue: T) =
+func updatePosition*[T](constraint: BooleanConstraint[T], position: int, newValue: T) =
     ## Update a position with a new value and maintain cached penalties
     case constraint.isUnary:
     of true:
@@ -167,22 +167,22 @@ func updatePosition*[T](constraint: LogicalConstraint[T], position: int, newValu
         constraint.rightConstraint.updatePosition(position, newValue)
         constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
         constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
-        constraint.cost = calculateLogicalPenalty(
-            constraint.logicalOp,
+        constraint.cost = calculateBooleanPenalty(
+            constraint.booleanOp,
             constraint.cachedLeftPenalty,
             constraint.cachedRightPenalty
         )
 
-func penalty*[T](constraint: LogicalConstraint[T]): int =
+func penalty*[T](constraint: BooleanConstraint[T]): int =
     ## Get the current penalty
     return constraint.cost
 
 # Deep copy support
-proc deepCopy*[T](constraint: LogicalConstraint[T]): LogicalConstraint[T] =
-    ## Creates a deep copy of a LogicalConstraint for thread-safe parallel processing
+proc deepCopy*[T](constraint: BooleanConstraint[T]): BooleanConstraint[T] =
+    ## Creates a deep copy of a BooleanConstraint for thread-safe parallel processing
     case constraint.isUnary:
     of true:
-        result = LogicalConstraint[T](
+        result = BooleanConstraint[T](
             isUnary: true,
             unaryOp: constraint.unaryOp,
             targetConstraint: constraint.targetConstraint.deepCopy(),
@@ -191,9 +191,9 @@ proc deepCopy*[T](constraint: LogicalConstraint[T]): LogicalConstraint[T] =
             positions: constraint.positions  # PackedSet is a value type, safe to copy
         )
     of false:
-        result = LogicalConstraint[T](
+        result = BooleanConstraint[T](
             isUnary: false,
-            logicalOp: constraint.logicalOp,
+            booleanOp: constraint.booleanOp,
             leftConstraint: constraint.leftConstraint.deepCopy(),
             rightConstraint: constraint.rightConstraint.deepCopy(),
             cachedLeftPenalty: constraint.cachedLeftPenalty,
@@ -224,8 +224,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Multiknapsack Constraint"
         of SequenceType:
             return "Sequence Constraint"
-        of LogicalType:
-            return "Logical Constraint"
+        of BooleanType:
+            return "Boolean Constraint"
 
 ################################################################################
 # Evaluation
@@ -253,8 +253,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.multiknapsackState.cost
         of SequenceType:
             return constraint.sequenceState.cost
-        of LogicalType:
-            return constraint.logicalState.cost
+        of BooleanType:
+            return constraint.booleanState.cost
 
 ################################################################################
 # Computed Constraints
@@ -821,8 +821,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.multiknapsackState.initialize(assignment)
         of SequenceType:
             constraint.sequenceState.initialize(assignment)
-        of LogicalType:
-            constraint.logicalState.initialize(assignment)
+        of BooleanType:
+            constraint.booleanState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -847,8 +847,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
         of SequenceType:
             constraint.sequenceState.moveDelta(position, oldValue, newValue)
-        of LogicalType:
-            constraint.logicalState.moveDelta(position, oldValue, newValue)
+        of BooleanType:
+            constraint.booleanState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -873,8 +873,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.multiknapsackState.updatePosition(position, newValue)
         of SequenceType:
             constraint.sequenceState.updatePosition(position, newValue)
-        of LogicalType:
-            constraint.logicalState.updatePosition(position, newValue)
+        of BooleanType:
+            constraint.booleanState.updatePosition(position, newValue)
 
 ################################################################################
 # Deep copy for StatefulConstraint
@@ -1157,12 +1157,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             expressionsAtPosition: constraint.sequenceState.expressionsAtPosition
                         )
                     )
-        of LogicalType:
-            # Create deep copy of logical constraint with deep copied children
+        of BooleanType:
+            # Create deep copy of boolean constraint with deep copied children
             result = StatefulConstraint[T](
                 positions: constraint.positions,
-                stateType: LogicalType,
-                logicalState: constraint.logicalState.deepCopy()
+                stateType: BooleanType,
+                booleanState: constraint.booleanState.deepCopy()
             )
 
 
@@ -1239,35 +1239,35 @@ func sequence*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, 
         )
 
 ################################################################################
-# Logical Operators for StatefulConstraint
+# Boolean Operators for StatefulConstraint
 ################################################################################
 
-template StatefulLogicalOp(op, opEnum: untyped) =
+template StatefulBooleanOp(op, opEnum: untyped) =
     func `op`*[T](left, right: StatefulConstraint[T]): StatefulConstraint[T] =
-        ## Creates a logical constraint combining two stateful constraints
+        ## Creates a boolean constraint combining two stateful constraints
         StatefulConstraint[T](
             positions: left.positions + right.positions,
-            stateType: LogicalType,
-            logicalState: newLogicalConstraint[T](left, right, opEnum)
+            stateType: BooleanType,
+            booleanState: newBooleanConstraint[T](left, right, opEnum)
         )
 
-StatefulLogicalOp(`and`, And)
-StatefulLogicalOp(`or`, Or)
-StatefulLogicalOp(`xor`, Xor)
-StatefulLogicalOp(`implies`, Implies)
-StatefulLogicalOp(`iff`, Iff)
+StatefulBooleanOp(`and`, And)
+StatefulBooleanOp(`or`, Or)
+StatefulBooleanOp(`xor`, Xor)
+StatefulBooleanOp(`implies`, Implies)
+StatefulBooleanOp(`iff`, Iff)
 
 # More intuitive syntax for implies and iff
-StatefulLogicalOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
-StatefulLogicalOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+StatefulBooleanOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+StatefulBooleanOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
 
 # NOT operator for StatefulConstraint
 func `not`*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
-    ## Creates a logical NOT constraint for a stateful constraint
+    ## Creates a boolean NOT constraint for a stateful constraint
     StatefulConstraint[T](
         positions: constraint.positions,
-        stateType: LogicalType,
-        logicalState: newUnaryLogicalConstraint[T](constraint, Not)
+        stateType: BooleanType,
+        booleanState: newUnaryBooleanConstraint[T](constraint, Not)
     )
 
 ################################################################################
@@ -1276,7 +1276,7 @@ func `not`*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
 
 func toStateful*[T](constraint: AlgebraicConstraint[T]): StatefulConstraint[T] =
     ## Converts an AlgebraicConstraint to a StatefulConstraint
-    ## This enables mixing algebraic and stateful constraints in logical operations
+    ## This enables mixing algebraic and stateful constraints in boolean operations
     StatefulConstraint[T](
         positions: constraint.positions,
         stateType: AlgebraicType,
@@ -1284,34 +1284,34 @@ func toStateful*[T](constraint: AlgebraicConstraint[T]): StatefulConstraint[T] =
     )
 
 ################################################################################
-# Mixed Constraint Type Logical Operators
+# Mixed Constraint Type Boolean Operators
 ################################################################################
 
-template MixedLogicalOp(op, opEnum: untyped) =
+template MixedBooleanOp(op, opEnum: untyped) =
     # StatefulConstraint op AlgebraicConstraint
     func `op`*[T](left: StatefulConstraint[T], right: AlgebraicConstraint[T]): StatefulConstraint[T] =
-        ## Logical operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
+        ## Boolean operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
         StatefulConstraint[T](
             positions: left.positions + right.positions,
-            stateType: LogicalType,
-            logicalState: newLogicalConstraint[T](left, right.toStateful(), opEnum)
+            stateType: BooleanType,
+            booleanState: newBooleanConstraint[T](left, right.toStateful(), opEnum)
         )
 
     # AlgebraicConstraint op StatefulConstraint
     func `op`*[T](left: AlgebraicConstraint[T], right: StatefulConstraint[T]): StatefulConstraint[T] =
-        ## Logical operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
+        ## Boolean operator with automatic conversion of AlgebraicConstraint to StatefulConstraint
         StatefulConstraint[T](
             positions: left.positions + right.positions,
-            stateType: LogicalType,
-            logicalState: newLogicalConstraint[T](left.toStateful(), right, opEnum)
+            stateType: BooleanType,
+            booleanState: newBooleanConstraint[T](left.toStateful(), right, opEnum)
         )
 
-MixedLogicalOp(`and`, And)
-MixedLogicalOp(`or`, Or)
-MixedLogicalOp(`xor`, Xor)
-MixedLogicalOp(`implies`, Implies)
-MixedLogicalOp(`iff`, Iff)
+MixedBooleanOp(`and`, And)
+MixedBooleanOp(`or`, Or)
+MixedBooleanOp(`xor`, Xor)
+MixedBooleanOp(`implies`, Implies)
+MixedBooleanOp(`iff`, Iff)
 
 # More intuitive syntax for implies and iff with mixed types
-MixedLogicalOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
-MixedLogicalOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+MixedBooleanOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
+MixedBooleanOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
