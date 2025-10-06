@@ -4,6 +4,74 @@ This document provides comprehensive documentation for the global constraints av
 
 ## Global Constraints
 
+### Cumulative Constraint
+
+**Function**: `cumulative(originPositions, durations, heights, limit)`
+
+**Definition**: Resource-constrained scheduling constraint that ensures at each point in time, the total resource consumption of overlapping tasks does not exceed a given capacity limit.
+
+**Mathematical Form**: `∀t ∈ Time : Σ(tasks i where origin[i] ≤ t < origin[i] + duration[i]) height[i] ≤ limit`
+
+**Parameters**:
+- `originPositions`: Variable positions representing task start times
+- `durations`: Duration of each task (constant values)
+- `heights`: Resource consumption/demand of each task (constant values)
+- `limit`: Maximum resource capacity available
+
+**Usage Examples**:
+```nim
+# Project scheduling: 5 tasks with resource constraints
+let durations = @[3, 9, 10, 6, 2]
+let heights = @[1, 2, 1, 1, 3]
+let limit = 8
+
+var sys = initConstraintSystem[int]()
+var origins = sys.newConstrainedSequence(5)
+origins.setDomain(toSeq(1..20))
+
+sys.addConstraint(cumulative[int]([0,1,2,3,4], durations, heights, limit))
+sys.resolve()
+
+# Machine scheduling with limited capacity
+let machineDurations = @[4, 3, 5, 2]
+let machineLoads = @[3, 2, 4, 1]
+let machineCapacity = 6
+
+sys.addConstraint(cumulative[int](taskPositions, machineDurations, machineLoads, machineCapacity))
+
+# Expression-based origins (e.g., x[i] + offset[i])
+var originExprs: seq[AlgebraicExpression[int]] = @[]
+for i in 0..< n:
+    originExprs.add(x[i] + offsets[i])
+sys.addConstraint(cumulative[int](originExprs, durations, heights, limit))
+```
+
+**Applications**:
+- **Project Scheduling**: Tasks competing for shared resources (workers, machines, tools)
+- **Manufacturing**: Production scheduling with machine capacity constraints
+- **Computing**: Job scheduling with CPU/memory/bandwidth limits
+- **Logistics**: Vehicle routing with capacity constraints over time
+- **Energy Management**: Power consumption scheduling within grid capacity
+- **Workforce Planning**: Staff allocation with headcount limits per time period
+
+**Violation Cost**: Sum of resource overloads across all time points
+- For each time `t` where demand > limit: `cost += (demand - limit)`
+- Encourages solutions that minimize resource conflicts and overutilization
+
+**Performance**:
+- Efficient incremental updates via event-based timeline tracking
+- O(k) move evaluation where k = number of affected time points
+- Optimized for both position-based and expression-based evaluations
+- Integrated with Crusher's tabu search and parallel optimization
+
+**Key Features**:
+- **Event-based tracking**: Maintains resource profile only for active time points
+- **Incremental updates**: Efficiently recalculates only affected portions of timeline
+- **Expression support**: Origins can be algebraic expressions (e.g., `x[i] + delay`)
+- **Auto-optimization**: Automatically uses faster position-based mode when possible
+
+---
+
 ### Multiknapsack Constraint
 
 **Function**: `multiknapsack(positions, weights, capacities)`

@@ -136,6 +136,12 @@ proc recalculateCost[T](state: CumulativeConstraint[T]) =
         if usage > state.limit:
             state.cost += int(usage - state.limit)
 
+proc calculateCostDelta[T](oldUsage, newUsage, limit: T): int {.inline.} =
+    ## Calculates the change in cost when usage changes at a single time point
+    let oldOverload = max(0, int(oldUsage - limit))
+    let newOverload = max(0, int(newUsage - limit))
+    return newOverload - oldOverload
+
 ################################################################################
 # CumulativeConstraint initialization and updates
 ################################################################################
@@ -175,29 +181,79 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
             # Find which task this position corresponds to
             for i, pos in state.originPositions:
                 if pos == position:
-                    # Remove old task instance from profile
+                    let duration = state.durations[i]
+
+                    # Collect all affected time points and their old usage
+                    var affectedTimes = initTable[T, T]()  # time -> old usage
+                    for t in oldValue ..< (oldValue + duration):
+                        affectedTimes[t] = state.resourceProfile.getResourceUsage(t)
+                    for t in newValue ..< (newValue + duration):
+                        if t notin affectedTimes:
+                            affectedTimes[t] = state.resourceProfile.getResourceUsage(t)
+
+                    # Update profile
                     state.updateResourceProfile(i, oldValue, isAdding = false)
-                    # Add new task instance to profile
                     state.currentAssignment[position] = newValue
                     state.updateResourceProfile(i, newValue, isAdding = true)
+
+                    # Calculate and apply cost delta incrementally
+                    var costDelta = 0
+                    for time, oldUsage in affectedTimes.pairs:
+                        let newUsage = state.resourceProfile.getResourceUsage(time)
+                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                    state.cost += costDelta
                     break
 
         of ExpressionBased:
             # Find all expressions affected by this position
             if position in state.expressionsAtPosition:
-                for i in state.expressionsAtPosition[position]:
-                    # Remove old contribution
-                    let oldOrigin = state.originExpressions[i].evaluate(state.currentAssignment)
-                    state.updateResourceProfile(i, oldOrigin, isAdding = false)
+                # Collect all affected time points and their old usage, plus old/new origins
+                var affectedTimes = initTable[T, T]()  # time -> old usage
+                var oldOrigins = newSeq[T](state.expressionsAtPosition[position].len)
+                var newOrigins = newSeq[T](state.expressionsAtPosition[position].len)
 
-                    # Update assignment and add new contribution
-                    state.currentAssignment[position] = newValue
-                    let newOrigin = state.originExpressions[i].evaluate(state.currentAssignment)
-                    state.updateResourceProfile(i, newOrigin, isAdding = true)
-            else:
+                # First pass: evaluate all old origins and collect affected times
+                var idx = 0
+                for i in state.expressionsAtPosition[position]:
+                    oldOrigins[idx] = state.originExpressions[i].evaluate(state.currentAssignment)
+                    let duration = state.durationsExpr[i]
+
+                    # Track old task time range
+                    for t in oldOrigins[idx] ..< (oldOrigins[idx] + duration):
+                        if t notin affectedTimes:
+                            affectedTimes[t] = state.resourceProfile.getResourceUsage(t)
+                    idx += 1
+
+                # Update assignment once
                 state.currentAssignment[position] = newValue
 
-    state.recalculateCost()
+                # Second pass: evaluate all new origins and collect affected times
+                idx = 0
+                for i in state.expressionsAtPosition[position]:
+                    newOrigins[idx] = state.originExpressions[i].evaluate(state.currentAssignment)
+                    let duration = state.durationsExpr[i]
+
+                    # Track new task time range
+                    for t in newOrigins[idx] ..< (newOrigins[idx] + duration):
+                        if t notin affectedTimes:
+                            affectedTimes[t] = state.resourceProfile.getResourceUsage(t)
+                    idx += 1
+
+                # Third pass: update resource profile
+                idx = 0
+                for i in state.expressionsAtPosition[position]:
+                    state.updateResourceProfile(i, oldOrigins[idx], isAdding = false)
+                    state.updateResourceProfile(i, newOrigins[idx], isAdding = true)
+                    idx += 1
+
+                # Calculate and apply cost delta incrementally
+                var costDelta = 0
+                for time, oldUsage in affectedTimes.pairs:
+                    let newUsage = state.resourceProfile.getResourceUsage(time)
+                    costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                state.cost += costDelta
+            else:
+                state.currentAssignment[position] = newValue
 
 proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newValue: T): int =
     ## Calculates the cost delta for moving a position from oldValue to newValue
