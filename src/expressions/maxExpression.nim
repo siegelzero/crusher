@@ -91,14 +91,9 @@ func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.i
             # Otherwise, the maximum doesn't change
 
         of ExpressionBased:
-            # Only evaluate expressions that depend on the changed position
-            for idx in state.expressionsAtPosition[position]:
-                let expValue = state.expressions[idx].evaluate(state.currentAssignment)
-                if expValue > state.value:
-                    state.value = expValue
-                elif expValue == state.value and newValue < oldValue:
-                    state.value = state.evaluate(state.currentAssignment)
-                    break
+            # For expression-based, always recalculate since tracking which expression
+            # previously provided the max is complex (the old optimization was buggy)
+            state.value = state.evaluate(state.currentAssignment)
 
 func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in maximum value obtained by reassigning position from oldValue to newValue.
