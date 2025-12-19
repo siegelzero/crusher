@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative
+import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -228,6 +228,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Boolean Constraint"
         of CumulativeType:
             return "Cumulative Constraint"
+        of GeostType:
+            return "Geost Constraint"
 
 ################################################################################
 # Evaluation
@@ -259,6 +261,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.booleanState.cost
         of CumulativeType:
             return constraint.cumulativeState.cost
+        of GeostType:
+            return constraint.geostState.cost
 
 ################################################################################
 # Computed Constraints
@@ -829,6 +833,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.booleanState.initialize(assignment)
         of CumulativeType:
             constraint.cumulativeState.initialize(assignment)
+        of GeostType:
+            constraint.geostState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -857,6 +863,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.booleanState.moveDelta(position, oldValue, newValue)
         of CumulativeType:
             constraint.cumulativeState.moveDelta(position, oldValue, newValue)
+        of GeostType:
+            constraint.geostState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -885,6 +893,19 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.booleanState.updatePosition(position, newValue)
         of CumulativeType:
             constraint.cumulativeState.updatePosition(position, newValue)
+        of GeostType:
+            constraint.geostState.updatePosition(position, newValue)
+
+
+func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
+    ## Returns positions affected by the last updatePosition call.
+    ## For most constraints, this is all positions in the constraint.
+    ## For GeostConstraint, this returns a smarter subset based on cell overlap tracking.
+    case constraint.stateType:
+        of GeostType:
+            return constraint.geostState.getAffectedPositions()
+        else:
+            return constraint.positions
 
 ################################################################################
 # Deep copy for StatefulConstraint
@@ -937,26 +958,49 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
             )
         of ElementType:
             # Create fresh Element constraint (initialize with cost: 0)
-            if constraint.elementState.isConstantArray:
-                result = StatefulConstraint[T](
-                    positions: constraint.positions,
-                    stateType: ElementType,
-                    elementState: newElementState[T](
-                        constraint.elementState.indexPosition,
-                        constraint.elementState.constantArray,
-                        constraint.elementState.valuePosition
-                    )
-                )
-            else:
-                result = StatefulConstraint[T](
-                    positions: constraint.positions,
-                    stateType: ElementType,
-                    elementState: newElementState[T](
-                        constraint.elementState.indexPosition,
-                        constraint.elementState.arrayElements,
-                        constraint.elementState.valuePosition
-                    )
-                )
+            case constraint.elementState.evalMethod:
+                of PositionBased:
+                    if constraint.elementState.isConstantArray:
+                        result = StatefulConstraint[T](
+                            positions: constraint.positions,
+                            stateType: ElementType,
+                            elementState: newElementState[T](
+                                constraint.elementState.indexPosition,
+                                constraint.elementState.constantArray,
+                                constraint.elementState.valuePosition
+                            )
+                        )
+                    else:
+                        result = StatefulConstraint[T](
+                            positions: constraint.positions,
+                            stateType: ElementType,
+                            elementState: newElementState[T](
+                                constraint.elementState.indexPosition,
+                                constraint.elementState.arrayElements,
+                                constraint.elementState.valuePosition
+                            )
+                        )
+                of ExpressionBased:
+                    if constraint.elementState.isConstantArrayEB:
+                        result = StatefulConstraint[T](
+                            positions: constraint.positions,
+                            stateType: ElementType,
+                            elementState: newElementStateExprBasedConst[T](
+                                constraint.elementState.indexExpression,
+                                constraint.elementState.constantArrayEB,
+                                constraint.elementState.valueExpression
+                            )
+                        )
+                    else:
+                        result = StatefulConstraint[T](
+                            positions: constraint.positions,
+                            stateType: ElementType,
+                            elementState: newElementStateExprBased[T](
+                                constraint.elementState.indexExpression,
+                                constraint.elementState.arrayExpressionsEB,
+                                constraint.elementState.valueExpression
+                            )
+                        )
         of AlgebraicType:
             # Create fresh AlgebraicConstraint with deep copy of the expression (constructor sets cost: 0)
             result = StatefulConstraint[T](
@@ -1212,6 +1256,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: BooleanType,
                 booleanState: constraint.booleanState.deepCopy()
             )
+        of GeostType:
+            # Create deep copy of geost constraint
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: GeostType,
+                geostState: constraint.geostState.deepCopy()
+            )
 
 
 
@@ -1321,6 +1372,32 @@ func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: o
             stateType: CumulativeType,
             cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit)
         )
+
+################################################################################
+# Geost wrapper functions
+################################################################################
+
+func geost*[T](placementPositions: seq[int], cellsByPlacement: seq[seq[seq[int]]]): StatefulConstraint[T] =
+    ## Creates a geost constraint for geometric non-overlap in placement problems.
+    ## This is a local-search optimized implementation of the classic geost constraint.
+    ##
+    ## - placementPositions: Variable positions representing placement choice for each object
+    ## - cellsByPlacement: cellsByPlacement[objectIdx][placementIdx] = cells covered by that placement
+    ##
+    ## Each object selects a placement from its domain, and the constraint ensures no two
+    ## objects cover the same cell. Shapes are defined by cell lists (discrete grid cells)
+    ## rather than shifted boxes.
+    ##
+    ## See: https://sofdem.github.io/gccat/gccat/Cgeost.html
+    ##
+    ## Example: For a puzzle with 5 pieces where each piece can be placed in various positions:
+    ##   geost[int](@[0,1,2,3,4], cellsByPlacement)
+    let geostConstraint = newGeostConstraint[T](placementPositions, cellsByPlacement)
+    return StatefulConstraint[T](
+        positions: geostConstraint.positions,
+        stateType: GeostType,
+        geostState: geostConstraint
+    )
 
 ################################################################################
 # Boolean Operators for StatefulConstraint

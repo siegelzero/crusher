@@ -12,7 +12,7 @@ proc resolve*[T](system: ConstraintSystem[T],
                 parallel: bool = false,
                 populationSize: int = 32,
                 numWorkers: int = 0,
-                verbose: bool = false) =
+                verbose: bool = true) =
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
@@ -23,16 +23,16 @@ proc resolve*[T](system: ConstraintSystem[T],
         parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose)
         return
     else:
-      # Sequential fallback
-      if verbose:
-          echo "Using sequential search"
-      var improved = system.baseArray.tabuImprove(tabuThreshold)
-      if improved.cost == 0:
-          system.initialize(improved.assignment)
-          system.lastIterations = improved.iteration
-          if verbose:
-              echo "Sequential search found solution"
-          return
-      if verbose:
-          echo &"Sequential search failed with best cost: {improved.cost}"
-      raise newException(NoSolutionFoundError, "Can't find satisfying solution")
+        # Sequential fallback
+        if verbose:
+            echo "Using sequential search"
+        var improved = system.baseArray.tabuImprove(tabuThreshold, verbose)
+        if improved.cost == 0:
+            system.initialize(improved.assignment)
+            system.lastIterations = improved.iteration
+            if verbose:
+                echo "Sequential search found solution"
+            return
+        if verbose:
+            echo &"Sequential search failed with best cost: {improved.cost}"
+        raise newException(NoSolutionFoundError, "Can't find satisfying solution")

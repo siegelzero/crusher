@@ -180,10 +180,15 @@ func `$`*[T](cvar: ConstrainedMatrix[T]): string = $(cvar.assignment)
 
 func setDomain*[T](cvar: VariableContainer[T], domain: openArray[T]) =
     # sets the domain of the constrained variable
-    cvar.system.baseArray.setDomain(domain)
+    cvar.system.baseArray.setDomain(cvar.offset, domain)
 
 func setDomain*[T](cvar: ConstrainedSequence[T], domain: openArray[T]) =
     # sets the domain for all positions in the constrained sequence
+    for i in 0..<cvar.size:
+        cvar.system.baseArray.setDomain(cvar.offset + i, domain)
+
+func setDomain*[T](cvar: ConstrainedMatrix[T], domain: openArray[T]) =
+    # sets the domain for all positions in the constrained matrix
     for i in 0..<cvar.size:
         cvar.system.baseArray.setDomain(cvar.offset + i, domain)
 
@@ -328,6 +333,52 @@ proc element*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSequenc
 
     # The element constraint: variableArray[indexExpr] = valueVar
     return element(indexExpr, variableArray, valueVar)
+
+proc elementExpr*[T](indexExpr: AlgebraicExpression[T], arrayExprs: seq[AlgebraicExpression[T]], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    ## Creates expression-based element constraint: arrayExprs[indexExpr] = valueExpr
+    ## This supports computed index expressions like (Y * W + X)
+    ## Use this when indexExpr is not a simple variable but a computed expression
+    let elementState = newElementStateExprBased[T](indexExpr, arrayExprs, valueExpr)
+
+    return StatefulConstraint[T](
+        positions: elementState.positions,
+        stateType: ElementType,
+        elementState: elementState
+    )
+
+proc elementExpr*[T](indexExpr: AlgebraicExpression[T], constantArray: seq[T], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    ## Creates expression-based element constraint with constant array: constantArray[indexExpr] = valueExpr
+    ## This supports computed index expressions like (Y * W + X) into a constant lookup table
+    ## Useful for shape lookups: Shape[Rr * 3 + Cf] where Shape is a constant array
+    let elementState = newElementStateExprBasedConst[T](indexExpr, constantArray, valueExpr)
+
+    return StatefulConstraint[T](
+        positions: elementState.positions,
+        stateType: ElementType,
+        elementState: elementState
+    )
+
+proc elementExpr*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSequence[T], valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    ## Creates expression-based element constraint: sequence[indexExpr] = valueExpr
+    ## This supports computed index expressions like (Y * W + X)
+    var arrayExprs: seq[AlgebraicExpression[T]] = @[]
+    for i in 0..<sequence.n:
+        arrayExprs.add(sequence[i])
+    return elementExpr(indexExpr, arrayExprs, valueExpr)
+
+proc elementExpr*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSequence[T], value: T): StatefulConstraint[T] =
+    ## Creates expression-based element constraint: sequence[indexExpr] = value (constant)
+    ## This supports computed index expressions like (Y * W + X)
+
+    # Create a variable constrained to the target value
+    var valueVar = sequence.system.newConstrainedVariable()
+    sequence.system.baseArray.setDomain(valueVar.offset, [value])
+
+    var arrayExprs: seq[AlgebraicExpression[T]] = @[]
+    for i in 0..<sequence.n:
+        arrayExprs.add(sequence[i])
+
+    return elementExpr(indexExpr, arrayExprs, valueVar)
 
 ################################################################################
 # Deep copy for ConstraintSystem

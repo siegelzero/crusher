@@ -34,6 +34,9 @@
 
 import std/[packedsets, tables]
 
+import ../expressions/expressions
+import common
+
 ################################################################################
 # Type definitions
 ################################################################################
@@ -49,25 +52,37 @@ type
     ElementState*[T] = ref object
         currentAssignment*: Table[int, T]
         cost*: int
-        indexPosition*: int
-        valuePosition*: int
-        case isConstantArray*: bool
-            of true:
-                constantArray*: seq[T]
-            of false:
-                arrayElements*: seq[ArrayElement[T]]
-                arrayPositions*: PackedSet[int]
         positions*: PackedSet[int]
+        case evalMethod*: StateEvalMethod
+            of PositionBased:
+                indexPosition*: int
+                valuePosition*: int
+                case isConstantArray*: bool
+                    of true:
+                        constantArray*: seq[T]
+                    of false:
+                        arrayElements*: seq[ArrayElement[T]]
+                        arrayPositions*: PackedSet[int]
+            of ExpressionBased:
+                indexExpression*: AlgebraicExpression[T]
+                valueExpression*: AlgebraicExpression[T]
+                isConstantArrayEB*: bool
+                constantArrayEB*: seq[T]  # Used when isConstantArrayEB = true
+                arrayExpressionsEB*: seq[AlgebraicExpression[T]]  # Used when isConstantArrayEB = false
+                indexExprPositions*: Table[int, seq[int]]  # positions affecting index expr
+                valueExprPositions*: Table[int, seq[int]]  # positions affecting value expr
+                arrayExprPositions*: Table[int, seq[int]]  # positions affecting array elements (empty for constant)
 
 ################################################################################
 # ElementState creation
 ################################################################################
 
 func newElementState*[T](indexPos: int, constantArray: seq[T], valuePos: int): ElementState[T] =
-    # Allocates and initializes new ElementState[T] for constant array
+    # Allocates and initializes new ElementState[T] for constant array (position-based)
     new(result)
     result = ElementState[T](
         cost: 0,
+        evalMethod: PositionBased,
         indexPosition: indexPos,
         valuePosition: valuePos,
         isConstantArray: true,
@@ -77,7 +92,7 @@ func newElementState*[T](indexPos: int, constantArray: seq[T], valuePos: int): E
     )
 
 func newElementState*[T](indexPos: int, arrayElements: seq[ArrayElement[T]], valuePos: int): ElementState[T] =
-    # Allocates and initializes new ElementState[T] for variable array
+    # Allocates and initializes new ElementState[T] for variable array (position-based)
     new(result)
 
     # Collect all variable positions involved
@@ -91,6 +106,7 @@ func newElementState*[T](indexPos: int, arrayElements: seq[ArrayElement[T]], val
 
     result = ElementState[T](
         cost: 0,
+        evalMethod: PositionBased,
         indexPosition: indexPos,
         valuePosition: valuePos,
         isConstantArray: false,
@@ -100,38 +116,139 @@ func newElementState*[T](indexPos: int, arrayElements: seq[ArrayElement[T]], val
         currentAssignment: initTable[int, T]()
     )
 
+func newElementStateExprBased*[T](indexExpr: AlgebraicExpression[T],
+                                   arrayExprs: seq[AlgebraicExpression[T]],
+                                   valueExpr: AlgebraicExpression[T]): ElementState[T] =
+    # Allocates and initializes new ElementState[T] for expression-based evaluation with variable array
+    # This supports computed index expressions like (Y * W + X)
+    new(result)
+
+    # Collect all positions from all expressions
+    var allPositions = initPackedSet[int]()
+    allPositions.incl(indexExpr.positions)
+    allPositions.incl(valueExpr.positions)
+    for expr in arrayExprs:
+        allPositions.incl(expr.positions)
+
+    # Build position maps for each expression type
+    let indexExprPositions = buildExpressionPositionMap(@[indexExpr])
+    let valueExprPositions = buildExpressionPositionMap(@[valueExpr])
+    let arrayExprPositions = buildExpressionPositionMap(arrayExprs)
+
+    result = ElementState[T](
+        cost: 0,
+        evalMethod: ExpressionBased,
+        indexExpression: indexExpr,
+        valueExpression: valueExpr,
+        isConstantArrayEB: false,
+        constantArrayEB: @[],
+        arrayExpressionsEB: arrayExprs,
+        indexExprPositions: indexExprPositions,
+        valueExprPositions: valueExprPositions,
+        arrayExprPositions: arrayExprPositions,
+        positions: allPositions,
+        currentAssignment: initTable[int, T]()
+    )
+
+func newElementStateExprBasedConst*[T](indexExpr: AlgebraicExpression[T],
+                                        constantArray: seq[T],
+                                        valueExpr: AlgebraicExpression[T]): ElementState[T] =
+    # Allocates and initializes new ElementState[T] for expression-based evaluation with constant array
+    # This supports computed index expressions like (Y * W + X) into a constant lookup table
+    # Useful for shape lookups: Shape[Rr * 3 + Cf]
+    new(result)
+
+    # Collect all positions from index and value expressions only (array is constant)
+    var allPositions = initPackedSet[int]()
+    allPositions.incl(indexExpr.positions)
+    allPositions.incl(valueExpr.positions)
+
+    # Build position maps for index and value expressions
+    let indexExprPositions = buildExpressionPositionMap(@[indexExpr])
+    let valueExprPositions = buildExpressionPositionMap(@[valueExpr])
+
+    result = ElementState[T](
+        cost: 0,
+        evalMethod: ExpressionBased,
+        indexExpression: indexExpr,
+        valueExpression: valueExpr,
+        isConstantArrayEB: true,
+        constantArrayEB: constantArray,
+        arrayExpressionsEB: @[],
+        indexExprPositions: indexExprPositions,
+        valueExprPositions: valueExprPositions,
+        arrayExprPositions: initTable[int, seq[int]](),  # Empty - no array positions for constant
+        positions: allPositions,
+        currentAssignment: initTable[int, T]()
+    )
+
 ################################################################################
 # ElementState utility functions
 ################################################################################
 
 func getArrayValue*[T](state: ElementState[T], index: int): T =
     # Get the value at the given index in the array (constant or variable)
-    case state.isConstantArray:
-        of true:
-            if index >= 0 and index < state.constantArray.len:
-                return state.constantArray[index]
-            else:
-                # Index out of bounds - this will cause constraint violation
-                # Return a default value, cost calculation will handle the violation
-                return T.default
-        of false:
-            if index >= 0 and index < state.arrayElements.len:
-                let element = state.arrayElements[index]
-                if element.isConstant:
-                    return element.constantValue
+    case state.evalMethod:
+        of PositionBased:
+            case state.isConstantArray:
+                of true:
+                    if index >= 0 and index < state.constantArray.len:
+                        return state.constantArray[index]
+                    else:
+                        return T.default
+                of false:
+                    if index >= 0 and index < state.arrayElements.len:
+                        let element = state.arrayElements[index]
+                        if element.isConstant:
+                            return element.constantValue
+                        else:
+                            return state.currentAssignment[element.variablePosition]
+                    else:
+                        return T.default
+        of ExpressionBased:
+            if state.isConstantArrayEB:
+                # Constant array with expression index
+                if index >= 0 and index < state.constantArrayEB.len:
+                    return state.constantArrayEB[index]
                 else:
-                    return state.currentAssignment[element.variablePosition]
+                    return T.default
             else:
-                # Index out of bounds
-                return T.default
+                # Variable array with expression index
+                if index >= 0 and index < state.arrayExpressionsEB.len:
+                    return state.arrayExpressionsEB[index].evaluate(state.currentAssignment)
+                else:
+                    return T.default
 
 func getArraySize*[T](state: ElementState[T]): int =
     # Get the size of the array
-    case state.isConstantArray:
-        of true:
-            return state.constantArray.len
-        of false:
-            return state.arrayElements.len
+    case state.evalMethod:
+        of PositionBased:
+            case state.isConstantArray:
+                of true:
+                    return state.constantArray.len
+                of false:
+                    return state.arrayElements.len
+        of ExpressionBased:
+            if state.isConstantArrayEB:
+                return state.constantArrayEB.len
+            else:
+                return state.arrayExpressionsEB.len
+
+func getIndexValue*[T](state: ElementState[T]): T =
+    # Get the current index value
+    case state.evalMethod:
+        of PositionBased:
+            return state.currentAssignment[state.indexPosition]
+        of ExpressionBased:
+            return state.indexExpression.evaluate(state.currentAssignment)
+
+func getValueValue*[T](state: ElementState[T]): T =
+    # Get the current value expression result
+    case state.evalMethod:
+        of PositionBased:
+            return state.currentAssignment[state.valuePosition]
+        of ExpressionBased:
+            return state.valueExpression.evaluate(state.currentAssignment)
 
 ################################################################################
 # ElementState initialization and updates
@@ -147,8 +264,8 @@ proc initialize*[T](state: ElementState[T], assignment: seq[T]) =
         state.currentAssignment[pos] = assignment[pos]
 
     # Calculate cost: cost = 1 if value != array[index], else 0
-    let indexValue = assignment[state.indexPosition]
-    let valueValue = assignment[state.valuePosition]
+    let indexValue = state.getIndexValue()
+    let valueValue = state.getValueValue()
 
     # Check bounds and calculate cost
     let arraySize = state.getArraySize()
@@ -174,9 +291,9 @@ proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
     # Update assignment
     state.currentAssignment[position] = newValue
 
-    # Recalculate cost
-    let indexValue = state.currentAssignment[state.indexPosition]
-    let valueValue = state.currentAssignment[state.valuePosition]
+    # Recalculate cost using helper functions (works for both position and expression based)
+    let indexValue = state.getIndexValue()
+    let valueValue = state.getValueValue()
 
     let arraySize = state.getArraySize()
     if indexValue >= 0 and indexValue < arraySize:
@@ -196,53 +313,82 @@ proc moveDelta*[T](state: ElementState[T], position: int, oldValue, newValue: T)
 
     let arraySize = state.getArraySize()
 
-    # Handle each position type with minimal calculation
-    if position == state.indexPosition:
-        # Index variable changed: array[newValue] vs array[oldValue]
-        let valueValue = state.currentAssignment[state.valuePosition]
+    case state.evalMethod:
+        of PositionBased:
+            # Handle each position type with minimal calculation
+            if position == state.indexPosition:
+                # Index variable changed: array[newValue] vs array[oldValue]
+                let valueValue = state.currentAssignment[state.valuePosition]
 
-        # Old constraint satisfaction
-        var oldSatisfied = false
-        if oldValue >= 0 and oldValue < arraySize:
-            let oldArrayValue = state.getArrayValue(oldValue)
-            oldSatisfied = (valueValue == oldArrayValue)
+                # Old constraint satisfaction
+                var oldSatisfied = false
+                if oldValue >= 0 and oldValue < arraySize:
+                    let oldArrayValue = state.getArrayValue(oldValue)
+                    oldSatisfied = (valueValue == oldArrayValue)
 
-        # New constraint satisfaction
-        var newSatisfied = false
-        if newValue >= 0 and newValue < arraySize:
-            let newArrayValue = state.getArrayValue(newValue)
-            newSatisfied = (valueValue == newArrayValue)
+                # New constraint satisfaction
+                var newSatisfied = false
+                if newValue >= 0 and newValue < arraySize:
+                    let newArrayValue = state.getArrayValue(newValue)
+                    newSatisfied = (valueValue == newArrayValue)
 
-        # Return delta: 0 if satisfied, 1 if violated
-        return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
-
-    elif position == state.valuePosition:
-        # Value variable changed: simple comparison with current array value
-        let indexValue = state.currentAssignment[state.indexPosition]
-
-        if indexValue >= 0 and indexValue < arraySize:
-            let arrayValue = state.getArrayValue(indexValue)
-            let oldSatisfied = (oldValue == arrayValue)
-            let newSatisfied = (newValue == arrayValue)
-            return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
-        else:
-            # Index out of bounds - constraint always violated regardless of value
-            return 0
-
-    else:
-        # Array variable changed - only affects constraint if it's the indexed element
-        let indexValue = state.currentAssignment[state.indexPosition]
-        let valueValue = state.currentAssignment[state.valuePosition]
-
-        # Find which array element this position corresponds to
-        if not state.isConstantArray and indexValue >= 0 and indexValue < arraySize:
-            let element = state.arrayElements[indexValue]
-            if not element.isConstant and element.variablePosition == position:
-                # This array position is currently indexed
-                let oldSatisfied = (valueValue == oldValue)
-                let newSatisfied = (valueValue == newValue)
+                # Return delta: 0 if satisfied, 1 if violated
                 return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
 
-        # Array change doesn't affect currently indexed element
-        return 0
+            elif position == state.valuePosition:
+                # Value variable changed: simple comparison with current array value
+                let indexValue = state.currentAssignment[state.indexPosition]
+
+                if indexValue >= 0 and indexValue < arraySize:
+                    let arrayValue = state.getArrayValue(indexValue)
+                    let oldSatisfied = (oldValue == arrayValue)
+                    let newSatisfied = (newValue == arrayValue)
+                    return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
+                else:
+                    # Index out of bounds - constraint always violated regardless of value
+                    return 0
+
+            else:
+                # Array variable changed - only affects constraint if it's the indexed element
+                let indexValue = state.currentAssignment[state.indexPosition]
+                let valueValue = state.currentAssignment[state.valuePosition]
+
+                # Find which array element this position corresponds to
+                if not state.isConstantArray and indexValue >= 0 and indexValue < arraySize:
+                    let element = state.arrayElements[indexValue]
+                    if not element.isConstant and element.variablePosition == position:
+                        # This array position is currently indexed
+                        let oldSatisfied = (valueValue == oldValue)
+                        let newSatisfied = (valueValue == newValue)
+                        return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
+
+                # Array change doesn't affect currently indexed element
+                return 0
+
+        of ExpressionBased:
+            # For expression-based, we need to evaluate the constraint with old and new values
+            # Save original assignment value
+            let originalValue = state.currentAssignment[position]
+
+            # Calculate old cost (with original value)
+            let oldIndexValue = state.indexExpression.evaluate(state.currentAssignment)
+            let oldValueValue = state.valueExpression.evaluate(state.currentAssignment)
+            var oldSatisfied = false
+            if oldIndexValue >= 0 and oldIndexValue < arraySize:
+                let oldArrayValue = state.getArrayValue(oldIndexValue)
+                oldSatisfied = (oldValueValue == oldArrayValue)
+
+            # Temporarily update assignment to calculate new cost
+            state.currentAssignment[position] = newValue
+            let newIndexValue = state.indexExpression.evaluate(state.currentAssignment)
+            let newValueValue = state.valueExpression.evaluate(state.currentAssignment)
+            var newSatisfied = false
+            if newIndexValue >= 0 and newIndexValue < arraySize:
+                let newArrayValue = state.getArrayValue(newIndexValue)
+                newSatisfied = (newValueValue == newArrayValue)
+
+            # Restore original assignment
+            state.currentAssignment[position] = originalValue
+
+            return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
 

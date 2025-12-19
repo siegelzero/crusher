@@ -254,16 +254,33 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
 
     # Compute reduced domain once
     if system.baseArray.reducedDomain.len == 0:
+        if verbose:
+            echo &"[ParallelResolve] Computing reduced domain for {system.baseArray.len} positions, {system.baseArray.constraints.len} constraints..."
+        let reducedDomainStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
         if verbose:
-            echo &"[ParallelResolve] Computed reduced domain size: {system.baseArray.reducedDomain.len}"
+            let reducedTime = epochTime() - reducedDomainStart
+            echo &"[ParallelResolve] Computed reduced domain in {reducedTime:.3f}s"
 
     # Create population of TabuStates from deepCopies
     let populationStartTime = epochTime()
+    if verbose:
+        echo &"[ParallelResolve] Creating {populationSize} TabuStates..."
     var population = newSeq[TabuState[T]](populationSize)
     for i in 0..<populationSize:
+        if verbose and i == 0:
+            echo &"[ParallelResolve] Creating state 0..."
+        let copyStart = epochTime()
         let systemCopy = system.deepCopy()
-        population[i] = newTabuState[T](systemCopy.baseArray)
+        if verbose and i == 0:
+            let copyTime = epochTime() - copyStart
+            echo &"[ParallelResolve] deepCopy took {copyTime:.3f}s"
+        let tabuStart = epochTime()
+        population[i] = newTabuState[T](systemCopy.baseArray, verbose)
+        if verbose and i == 0:
+            let tabuTime = epochTime() - tabuStart
+            echo &"[ParallelResolve] newTabuState took {tabuTime:.3f}s"
+            echo &"[ParallelResolve] Initial cost for state 0: {population[0].cost}"
 
     let populationTime = epochTime() - populationStartTime
     if verbose:
