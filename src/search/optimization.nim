@@ -15,17 +15,17 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       objective: ObjectiveType[T],
                       parallel=true,
                       tabuThreshold=1000,
-                      populationSize=32,
+                      populationSize=8,
                       numWorkers=0,
                       verbose=false,
-                      multiplier=6,
+                      multiplier=2,
                       ) =
         # Find initial solution
         system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
                       populationSize=populationSize, numWorkers=numWorkers, verbose=verbose)
         objective.initialize(system.assignment)
         var currentCost = objective.value
-        var currentTabuThreshold = max(system.lastIterations * multiplier, 1000)
+        var currentTabuThreshold = max(system.lastIterations*multiplier, 1000)
 
         echo "Found initial solution with value ", currentCost
         if verbose:

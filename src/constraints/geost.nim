@@ -199,6 +199,11 @@ proc penalty*[T](constraint: GeostConstraint[T]): int =
     return constraint.cost
 
 
+proc getAffectedPositions*[T](constraint: GeostConstraint[T]): PackedSet[int] =
+    # Return positions that were affected by the last updatePosition call
+    # This is used by tabu search for smarter neighbor updates
+    return constraint.lastAffectedPositions
+
 proc deepCopy*[T](constraint: GeostConstraint[T]): GeostConstraint[T] =
     # Create a deep copy for parallel search
     result = GeostConstraint[T](
