@@ -14,9 +14,12 @@
 
 import std/[tables, packedsets, sequtils]
 
+################################################################################
+# Type definitions
+################################################################################
+
 type
     GeostConstraint*[T] = ref object
-        ## Constraint ensuring piece placements don't overlap
         numPieces*: int
         positions*: PackedSet[int]        # All placement variable positions
         placementPositions*: seq[int]     # Position of each piece's placement variable
@@ -37,9 +40,6 @@ type
 
 proc newGeostConstraint*[T](placementPositions: seq[int], cellsByPlacement: seq[seq[seq[int]]]): GeostConstraint[T] =
     # Create a new geost constraint
-    # placementPositions: position indices for each piece's placement variable
-    # cellsByPlacement: cellsByPlacement[pieceIdx][placementIdx] = cells covered
-
     assert placementPositions.len == cellsByPlacement.len,
         "placementPositions and cellsByPlacement must have the same length (one entry per piece)"
 
@@ -88,7 +88,7 @@ proc moveDelta*[T](constraint: GeostConstraint[T], position: int, oldValue, newV
     ## Calculate change in penalty if we change position from oldValue to newValue
     # O(1) lookup for which piece this position belongs to
     if position notin constraint.positionToPiece:
-        return 0  # Position doesn't affect this constraint
+        return 0
 
     let pieceIdx = constraint.positionToPiece[position]
     let oldPlacement = oldValue.int
@@ -117,8 +117,7 @@ proc moveDelta*[T](constraint: GeostConstraint[T], position: int, oldValue, newV
     # Remove old cells: reducing coverage from N to N-1
     # Penalty decreases if N >= 2 (was overlapping, now less so)
     for cell in oldCells:
-        let count = constraint.cellCoverage.getOrDefault(cell, 0)
-        if count >= 2:
+        if constraint.cellCoverage.getOrDefault(cell, 0) >= 2:
             delta -= 1  # One less overlap at this cell
 
     # Add new cells: increasing coverage from N to N+1
@@ -136,7 +135,7 @@ proc moveDelta*[T](constraint: GeostConstraint[T], position: int, oldValue, newV
 
 
 proc updatePosition*[T](constraint: GeostConstraint[T], position: int, newValue: T) =
-    ## Update the constraint state after a move is applied
+    # Update the constraint state after a move is applied
     # O(1) lookup for which piece this position belongs to
     if position notin constraint.positionToPiece:
         return
@@ -152,44 +151,42 @@ proc updatePosition*[T](constraint: GeostConstraint[T], position: int, newValue:
     constraint.lastAffectedPositions.clear()
 
     # Remove coverage from old placement
-    if oldPlacement < constraint.cellsByPlacement[pieceIdx].len:
-        for cell in constraint.cellsByPlacement[pieceIdx][oldPlacement]:
-            # Any piece at this cell is affected
-            if cell in constraint.piecesAtCell:
-                for otherPiece in constraint.piecesAtCell[cell].items:
-                    if otherPiece != pieceIdx:
-                        constraint.lastAffectedPositions.incl(constraint.placementPositions[otherPiece])
+    for cell in constraint.cellsByPlacement[pieceIdx][oldPlacement]:
+        # Any piece at this cell is affected
+        if cell in constraint.piecesAtCell:
+            for otherPiece in constraint.piecesAtCell[cell].items:
+                if otherPiece != pieceIdx:
+                    constraint.lastAffectedPositions.incl(constraint.placementPositions[otherPiece])
 
-            let oldCount = constraint.cellCoverage.getOrDefault(cell, 0)
-            if oldCount >= 2:
-                constraint.cost -= 1
-            if oldCount > 1:
-                constraint.cellCoverage[cell] = oldCount - 1
-            else:
-                constraint.cellCoverage.del(cell)
-            # Update piecesAtCell
-            if cell in constraint.piecesAtCell:
-                constraint.piecesAtCell[cell].excl(pieceIdx)
-                if constraint.piecesAtCell[cell].len == 0:
-                    constraint.piecesAtCell.del(cell)
+        let oldCount = constraint.cellCoverage.getOrDefault(cell, 0)
+        if oldCount >= 2:
+            constraint.cost -= 1
+        if oldCount > 1:
+            constraint.cellCoverage[cell] = oldCount - 1
+        else:
+            constraint.cellCoverage.del(cell)
+        # Update piecesAtCell
+        if cell in constraint.piecesAtCell:
+            constraint.piecesAtCell[cell].excl(pieceIdx)
+            if constraint.piecesAtCell[cell].len == 0:
+                constraint.piecesAtCell.del(cell)
 
     # Add coverage from new placement
-    if newPlacement < constraint.cellsByPlacement[pieceIdx].len:
-        for cell in constraint.cellsByPlacement[pieceIdx][newPlacement]:
-            # Any piece at this cell is affected
-            if cell in constraint.piecesAtCell:
-                for otherPiece in constraint.piecesAtCell[cell].items:
-                    if otherPiece != pieceIdx:
-                        constraint.lastAffectedPositions.incl(constraint.placementPositions[otherPiece])
+    for cell in constraint.cellsByPlacement[pieceIdx][newPlacement]:
+        # Any piece at this cell is affected
+        if cell in constraint.piecesAtCell:
+            for otherPiece in constraint.piecesAtCell[cell].items:
+                if otherPiece != pieceIdx:
+                    constraint.lastAffectedPositions.incl(constraint.placementPositions[otherPiece])
 
-            let oldCount = constraint.cellCoverage.getOrDefault(cell, 0)
-            constraint.cellCoverage[cell] = oldCount + 1
-            if oldCount >= 1:
-                constraint.cost += 1
-            # Update piecesAtCell
-            if cell notin constraint.piecesAtCell:
-                constraint.piecesAtCell[cell] = initPackedSet[int]()
-            constraint.piecesAtCell[cell].incl(pieceIdx)
+        let oldCount = constraint.cellCoverage.getOrDefault(cell, 0)
+        constraint.cellCoverage[cell] = oldCount + 1
+        if oldCount >= 1:
+            constraint.cost += 1
+        # Update piecesAtCell
+        if cell notin constraint.piecesAtCell:
+            constraint.piecesAtCell[cell] = initPackedSet[int]()
+        constraint.piecesAtCell[cell].incl(pieceIdx)
 
     constraint.currentPlacements[pieceIdx] = newPlacement
 
@@ -203,6 +200,7 @@ proc getAffectedPositions*[T](constraint: GeostConstraint[T]): PackedSet[int] =
     # Return positions that were affected by the last updatePosition call
     # This is used by tabu search for smarter neighbor updates
     return constraint.lastAffectedPositions
+
 
 proc deepCopy*[T](constraint: GeostConstraint[T]): GeostConstraint[T] =
     # Create a deep copy for parallel search
@@ -222,4 +220,4 @@ proc deepCopy*[T](constraint: GeostConstraint[T]): GeostConstraint[T] =
     for k, v in constraint.cellCoverage.pairs:
         result.cellCoverage[k] = v
     for k, v in constraint.piecesAtCell.pairs:
-        result.piecesAtCell[k] = v  # PackedSet copied by value
+        result.piecesAtCell[k] = v

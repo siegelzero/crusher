@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, strformat]
+import std/[packedsets, sequtils, strformat, tables]
 
 import constraints/[stateful, algebraic, types]
 import expressions/expressions

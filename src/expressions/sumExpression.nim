@@ -174,13 +174,17 @@ proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
                 coefficient: state.coefficient  # Table is a value type, safe to copy
             )
         of ExpressionBased:
+            # Deep copy all expressions to ensure thread safety
+            var copiedExpressions = newSeq[AlgebraicExpression[T]](state.expressions.len)
+            for i, expr in state.expressions:
+                copiedExpressions[i] = expr.deepCopy()
             result = SumExpression[T](
                 value: state.value,
                 constant: state.constant,
                 positions: state.positions,  # PackedSet is a value type, safe to copy
                 currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
                 evalMethod: ExpressionBased,
-                expressions: state.expressions,  # seq[AlgebraicExpression] should be immutable
+                expressions: copiedExpressions,
                 expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
             )
 

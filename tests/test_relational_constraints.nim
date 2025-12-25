@@ -186,3 +186,51 @@ suite "RelationalConstraint Tests":
         let usedValues = values.toHashSet()
         check usedValues.len == 5  # All values should be unique
         check usedValues == [-2, -1, 0, 1, 2].toHashSet()  # Should be exactly the domain
+
+    test "Bus scheduling optimization (Taha, Introduction to Operations Research)":
+        ## Bus scheduling problem from Taha, page 58
+        ## Source: https://www.hakank.org/picat/bus_schedule.pi
+        ##
+        ## Schedule buses across 6 time slots, each bus works 2 consecutive slots.
+        ## Minimize total buses while meeting demand at each slot.
+        ## Optimal solution: 26 buses
+
+        const
+            TimeSlots = 6
+            Demands = [8, 10, 7, 12, 4, 4]
+            OptimalBuses = 26
+            MaxBusesPerSlot = 45
+
+        var sys = initConstraintSystem[int]()
+
+        # X[i] = number of buses starting at time slot i
+        var X = sys.newConstrainedSequence(TimeSlots)
+        X.setDomain(toSeq(0..MaxBusesPerSlot))
+
+        # Coverage constraints: X[i] + X[i+1] >= Demands[i]
+        for i in 0..<(TimeSlots - 1):
+            sys.addConstraint(X[i] + X[i + 1] >= Demands[i])
+
+        # Cyclic constraint: X[5] + X[0] == Demands[5]
+        sys.addConstraint(X[TimeSlots - 1] + X[0] == Demands[TimeSlots - 1])
+
+        # Minimize total buses
+        var busExprs: seq[AlgebraicExpression[int]] = @[]
+        for i in 0..<TimeSlots:
+            busExprs.add(X[i])
+        let totalBuses = sum(busExprs)
+
+        sys.minimize(totalBuses, parallel=true, verbose=false)
+
+        let solution = X.assignment
+        var total = 0
+        for i in 0..<TimeSlots:
+            total += solution[i]
+
+        # Verify coverage constraints
+        for i in 0..<(TimeSlots - 1):
+            check solution[i] + solution[i + 1] >= Demands[i]
+        check solution[TimeSlots - 1] + solution[0] == Demands[TimeSlots - 1]
+
+        echo "  Bus schedule: ", solution, " (total: ", total, ")"
+        check total == OptimalBuses

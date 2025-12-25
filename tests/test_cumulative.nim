@@ -216,3 +216,63 @@ suite "Cumulative Constraint Tests":
         check validateCumulativeSolution(solution, durations, heights, limit)
 
         echo "  Found solution for tight constraint: origins = ", solution
+
+    test "Schedule1 optimization (SICStus Prolog / Beldiceanu & Contejean 94)":
+        ## Cumulative scheduling optimization problem
+        ## Original source: https://www.hakank.org/picat/schedule1.pi
+        ## From SICStus Prolog documentation
+        ##
+        ## 7 tasks with known optimal makespan of 23
+        ## Task Duration Resource
+        ##  t1    16       2
+        ##  t2     6       9
+        ##  t3    13       3
+        ##  t4     7       7
+        ##  t5     5      10
+        ##  t6    18       1
+        ##  t7     4      11
+
+        const
+            NumTasks = 7
+            Capacity = 13
+            Durations = @[16, 6, 13, 7, 5, 18, 4]
+            Resources = @[2, 9, 3, 7, 10, 1, 11]
+            OptimalMakespan = 23
+
+        var sys = initConstraintSystem[int]()
+
+        # Start times for each task (domain 1..30 as in original model)
+        var startTimes = sys.newConstrainedSequence(NumTasks)
+        startTimes.setDomain(toSeq(1..30))
+
+        # Create algebraic expressions for cumulative constraint
+        var startExpressions: seq[AlgebraicExpression[int]] = @[]
+        for i in 0..<NumTasks:
+            startExpressions.add(startTimes[i])
+
+        # Cumulative constraint
+        sys.addConstraint(cumulative[int](startExpressions, Durations, Resources, Capacity))
+
+        # Create end time expressions and minimize makespan
+        var endExpressions: seq[AlgebraicExpression[int]] = @[]
+        for i in 0..<NumTasks:
+            endExpressions.add(startTimes[i] + Durations[i])
+
+        let makespan = max(endExpressions)
+
+        # Optimize
+        sys.minimize(makespan, parallel=true, verbose=false)
+
+        # Validate solution
+        let solution = startTimes.assignment
+        check validateCumulativeSolution(solution, Durations, Resources, Capacity)
+
+        # Calculate actual makespan
+        var actualMakespan = 0
+        for i in 0..<NumTasks:
+            actualMakespan = max(actualMakespan, solution[i] + Durations[i])
+
+        echo "  Found makespan: ", actualMakespan, " (optimal: ", OptimalMakespan, ")"
+        echo "  Start times: ", solution
+
+        check actualMakespan == OptimalMakespan

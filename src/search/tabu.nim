@@ -9,7 +9,7 @@ randomize()
 
 # Logging configuration
 const LogInterval* = 5000  # Log every N iterations
-const ProfileMoveDelta* = true  # Enable moveDelta profiling
+const ProfileMoveDelta* = false  # Enable moveDelta profiling (disable for performance)
 
 ################################################################################
 # Type definitions
@@ -102,16 +102,51 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
         state.penaltyMap[position][value] = penalty
 
 
+proc updatePenaltiesForValues[T](state: TabuState[T], position: int, values: seq[T]) =
+    ## Update penalty map for specific domain values at a position.
+    ## This is more efficient than updating all values when only some are affected.
+    var penalty: int
+    for value in values:
+        penalty = 0
+        for constraint in state.constraintsAtPosition[position]:
+            penalty += state.movePenalty(constraint, position, value)
+        state.penaltyMap[position][value] = penalty
+
+
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     ## Update penalty map for positions affected by a change at `position`.
     ## Uses getAffectedPositions() which returns a smarter subset for some constraints.
-    var neighborSet: PackedSet[int] = initPackedSet[int]()
+    ## Also uses getAffectedDomainValues() to only update affected domain values.
+
+    # Collect affected positions and their affected domain values from each constraint
+    var neighborAffectedValues: Table[int, seq[T]] = initTable[int, seq[T]]()
+    var neighborsNeedFullUpdate: PackedSet[int] = initPackedSet[int]()
+
     for constraint in state.constraintsAtPosition[position]:
-        for pos in constraint.getAffectedPositions().items:
+        let affectedPositions = constraint.getAffectedPositions()
+        for pos in affectedPositions.items:
             if pos != position:
-                neighborSet.incl(pos)
-    for nbr in neighborSet.items:
+                # Get affected domain values for this position from this constraint
+                let affectedVals = constraint.getAffectedDomainValues(pos)
+                if affectedVals.len == 0:
+                    # Empty means full update needed for this constraint
+                    neighborsNeedFullUpdate.incl(pos)
+                else:
+                    # Collect affected values
+                    if pos notin neighborAffectedValues:
+                        neighborAffectedValues[pos] = @[]
+                    for v in affectedVals:
+                        if v notin neighborAffectedValues[pos]:
+                            neighborAffectedValues[pos].add(v)
+
+    # Update positions that need full update
+    for nbr in neighborsNeedFullUpdate.items:
         state.updatePenaltiesForPosition(nbr)
+
+    # Update positions with partial updates (only affected values)
+    for nbr, values in neighborAffectedValues.pairs:
+        if nbr notin neighborsNeedFullUpdate:
+            state.updatePenaltiesForValues(nbr, values)
 
 
 proc rebuildPenaltyMap*[T](state: TabuState[T]) =

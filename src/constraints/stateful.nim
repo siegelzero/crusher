@@ -900,12 +900,25 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
     ## Returns positions affected by the last updatePosition call.
     ## For most constraints, this is all positions in the constraint.
-    ## For GeostConstraint, this returns a smarter subset based on cell overlap tracking.
+    ## For Cumulative and Geost constraints, returns a smarter subset.
     case constraint.stateType:
+        of CumulativeType:
+            return constraint.cumulativeState.getAffectedPositions()
         of GeostType:
             return constraint.geostState.getAffectedPositions()
         else:
             return constraint.positions
+
+
+func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: int): seq[T] =
+    ## Returns domain values for `position` that need penalty recalculation after the last change.
+    ## For most constraints, returns empty (meaning all values need recalculation).
+    ## For Cumulative constraints, returns only values overlapping with the changed time range.
+    case constraint.stateType:
+        of CumulativeType:
+            return constraint.cumulativeState.getAffectedDomainValues(position)
+        else:
+            return @[]
 
 ################################################################################
 # Deep copy for StatefulConstraint
@@ -1223,10 +1236,14 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             resourceProfile: constraint.cumulativeState.resourceProfile,
                             cost: constraint.cumulativeState.cost,
                             limit: constraint.cumulativeState.limit,
+                            maxTime: constraint.cumulativeState.maxTime,
+                            lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
+                            lastOldValue: constraint.cumulativeState.lastOldValue,
                             evalMethod: PositionBased,
                             originPositions: constraint.cumulativeState.originPositions,
                             durations: constraint.cumulativeState.durations,
-                            heights: constraint.cumulativeState.heights
+                            heights: constraint.cumulativeState.heights,
+                            positionToTask: constraint.cumulativeState.positionToTask
                         )
                     )
                 of ExpressionBased:
@@ -1242,6 +1259,9 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             resourceProfile: constraint.cumulativeState.resourceProfile,
                             cost: constraint.cumulativeState.cost,
                             limit: constraint.cumulativeState.limit,
+                            maxTime: constraint.cumulativeState.maxTime,
+                            lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
+                            lastOldValue: constraint.cumulativeState.lastOldValue,
                             evalMethod: ExpressionBased,
                             originExpressions: copiedExpressions,
                             durationsExpr: constraint.cumulativeState.durationsExpr,

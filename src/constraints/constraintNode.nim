@@ -100,7 +100,24 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
 
 
 func penalty*[T](relation: BinaryRelation, left, right: T): T =
-    return if relation.evaluate(left, right): return 0 else: 1
+    ## Graduated penalty for inequalities - returns degree of violation
+    ## Binary penalty for equality/other relations where gradient doesn't help
+    case relation:
+        of EqualTo, NotEqualTo, CommonFactor, CoPrime:
+            # Binary - no natural gradient for these
+            return if relation.evaluate(left, right): T(0) else: T(1)
+        of LessThan:
+            # left < right: if violated, how much do we need to decrease left (or increase right)?
+            return if left < right: T(0) else: left - right + T(1)
+        of LessThanEq:
+            # left <= right
+            return if left <= right: T(0) else: left - right
+        of GreaterThan:
+            # left > right: if violated, how much do we need to increase left (or decrease right)?
+            return if left > right: T(0) else: right - left + T(1)
+        of GreaterThanEq:
+            # left >= right
+            return if left >= right: T(0) else: right - left
 
 
 proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T =
