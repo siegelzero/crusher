@@ -261,7 +261,7 @@ suite "Cumulative Constraint Tests":
         let makespan = max(endExpressions)
 
         # Optimize
-        sys.minimize(makespan, parallel=true, verbose=false)
+        sys.minimize(makespan, parallel=true, verbose=false, multiplier=20)
 
         # Validate solution
         let solution = startTimes.assignment

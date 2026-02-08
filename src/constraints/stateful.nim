@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost
+import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -230,6 +230,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Cumulative Constraint"
         of GeostType:
             return "Geost Constraint"
+        of IrdcsType:
+            return "IRDCS Constraint"
 
 ################################################################################
 # Evaluation
@@ -263,6 +265,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.cumulativeState.cost
         of GeostType:
             return constraint.geostState.cost
+        of IrdcsType:
+            return constraint.irdcsState.cost
 
 ################################################################################
 # Computed Constraints
@@ -835,6 +839,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.cumulativeState.initialize(assignment)
         of GeostType:
             constraint.geostState.initialize(assignment)
+        of IrdcsType:
+            constraint.irdcsState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -865,6 +871,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.cumulativeState.moveDelta(position, oldValue, newValue)
         of GeostType:
             constraint.geostState.moveDelta(position, oldValue, newValue)
+        of IrdcsType:
+            constraint.irdcsState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -895,6 +903,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.cumulativeState.updatePosition(position, newValue)
         of GeostType:
             constraint.geostState.updatePosition(position, newValue)
+        of IrdcsType:
+            constraint.irdcsState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1283,6 +1293,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: GeostType,
                 geostState: constraint.geostState.deepCopy()
             )
+        of IrdcsType:
+            # Create deep copy of IRDCS constraint
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: IrdcsType,
+                irdcsState: constraint.irdcsState.deepCopy()
+            )
 
 
 
@@ -1417,6 +1434,38 @@ func geost*[T](placementPositions: seq[int], cellsByPlacement: seq[seq[seq[int]]
         positions: geostConstraint.positions,
         stateType: GeostType,
         geostState: geostConstraint
+    )
+
+################################################################################
+# IRDCS wrapper functions
+################################################################################
+
+func irdcs*[T](n: int, singletonPenalty: int = 1): StatefulConstraint[T] =
+    ## Creates an IRDCS constraint for interval [1, n].
+    ## An Incongruent Restricted Disjoint Covering System ensures:
+    ## - Each position is assigned a modulus
+    ## - All positions with the same modulus have the same residue (mod that modulus)
+    ## - Each modulus used must cover at least 2 positions
+    ##
+    ## Variable positions are assumed to be 0 to n-1.
+    ##
+    ## See: "Odd Incongruent Restricted Disjoint Covering Systems" by Paul Robert Emanuel
+    ## INTEGERS 12A (2012)
+    let irdcsConstraint = newIrdcsConstraint[T](n, singletonPenalty)
+    return StatefulConstraint[T](
+        positions: irdcsConstraint.positions,
+        stateType: IrdcsType,
+        irdcsState: irdcsConstraint
+    )
+
+func irdcs*[T](positions: openArray[int], singletonPenalty: int = 1): StatefulConstraint[T] =
+    ## Creates an IRDCS constraint for the given variable positions.
+    ## The interval indices are derived from position order (first position = index 1, etc.)
+    let irdcsConstraint = newIrdcsConstraint[T](positions.toSeq, singletonPenalty)
+    return StatefulConstraint[T](
+        positions: irdcsConstraint.positions,
+        stateType: IrdcsType,
+        irdcsState: irdcsConstraint
     )
 
 ################################################################################
