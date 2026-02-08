@@ -152,13 +152,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 let pos = cumState.originPositions[taskIdx]
                 let height = cumState.heights[taskIdx]
 
-                # Reduction 3: task height exceeds capacity — no feasible placement exists
-                # (skip pruning this task; the solver will fail to reach cost 0)
+                # Skip tasks whose height exceeds capacity — no feasible placement exists
+                # (the solver will fail to reach cost 0)
                 if height > cumState.limit:
                     continue
 
-                # Reduction 2: origin must be >= 0 (negative origins place the task
-                # partially outside the tracked resource profile, hiding violations)
+                # Prune negative origins (they place the task partially outside the
+                # tracked resource profile, hiding violations)
                 var toExclude: seq[T] = @[]
                 for v in currentDomain[pos].items:
                     if v < T(0):
