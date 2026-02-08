@@ -140,6 +140,35 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 # echo "Excluding ", d, " from ", pos
                 currentDomain[pos].excl(d)
 
+    # Cumulative constraint domain reduction
+    for cons in carray.constraints:
+        if cons.stateType != CumulativeType:
+            continue
+
+        let cumState = cons.cumulativeState
+        case cumState.evalMethod:
+        of PositionBased:
+            for taskIdx in 0..<cumState.originPositions.len:
+                let pos = cumState.originPositions[taskIdx]
+                let height = cumState.heights[taskIdx]
+
+                # Reduction 3: task height exceeds capacity — no feasible placement exists
+                # (skip pruning this task; the solver will fail to reach cost 0)
+                if height > cumState.limit:
+                    continue
+
+                # Reduction 2: origin must be >= 0 (negative origins place the task
+                # partially outside the tracked resource profile, hiding violations)
+                var toExclude: seq[T] = @[]
+                for v in currentDomain[pos].items:
+                    if v < T(0):
+                        toExclude.add(v)
+                for v in toExclude:
+                    currentDomain[pos].excl(v)
+
+        of ExpressionBased:
+            discard
+
     for pos in carray.allPositions():
         reduced[pos] = toSeq(currentDomain[pos])
 

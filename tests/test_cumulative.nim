@@ -44,7 +44,7 @@ suite "Cumulative Constraint Tests":
         sys.addConstraint(cumulative[int]([0, 1, 2, 3, 4], durations, heights, limit))
 
         # Solve
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         # Extract and validate solution
         let solution = origins.assignment
@@ -62,7 +62,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1, 2], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -79,7 +79,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -105,7 +105,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1, 2, 3], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -128,7 +128,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int](originExprs, durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         # Evaluate actual origins from expressions
         let assignment = x.assignment
@@ -152,7 +152,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -169,7 +169,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1, 2], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -187,7 +187,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1, 2, 3, 4], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -210,7 +210,7 @@ suite "Cumulative Constraint Tests":
 
         sys.addConstraint(cumulative[int]([0, 1, 2, 3], durations, heights, limit))
 
-        sys.resolve()
+        sys.resolve(parallel=true)
 
         let solution = origins.assignment
         check validateCumulativeSolution(solution, durations, heights, limit)
@@ -262,7 +262,7 @@ suite "Cumulative Constraint Tests":
 
         # Optimize
         sys.minimize(makespan, parallel=true, verbose=false,
-                     populationSize=16, tabuThreshold=50000)
+                     populationSize=32, tabuThreshold=50000)
 
         # Validate solution
         let solution = startTimes.assignment

@@ -6,7 +6,8 @@
 # **Constraint Definition**:
 # `∀t ∈ Time : Σ(tasks i where origin[i] ≤ t < origin[i] + duration[i]) height[i] ≤ limit`
 #
-# **Performance**: O(k) move evaluation where k = number of affected time points
+# **Performance**: O(min(|shift|, duration)) move evaluation via symmetric difference.
+# Only the time points entering/leaving the task's range are examined.
 # Uses array-based resource profile for O(1) access instead of hash tables.
 
 import std/[packedsets, sequtils, tables]
@@ -215,41 +216,41 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
 
     case state.evalMethod:
         of PositionBased:
-            # O(1) lookup for which task this position corresponds to
             if position < state.positionToTask.len and state.positionToTask[position] >= 0:
                 let i = state.positionToTask[position]
                 let duration = state.durations[i]
-
-                # Calculate cost delta for affected time points
-                var costDelta = 0
                 let height = state.heights[i]
+                var costDelta = 0
 
-                # Old range
                 let oldStart = int(oldValue)
                 let oldEnd = int(oldValue + duration)
-                # New range
                 let newStart = int(newValue)
                 let newEnd = int(newValue + duration)
+                let tMax = state.maxTime + 1
 
-                # Process old range (task being removed)
-                for t in oldStart ..< min(oldEnd, state.maxTime + 1):
-                    if t >= 0:
-                        let inNewRange = t >= newStart and t < newEnd
-                        if not inNewRange:
-                            let oldUsage = state.resourceProfile[t]
-                            let newUsage = oldUsage - height
-                            costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
-                            state.resourceProfile[t] = newUsage
-
-                # Process new range (task being added)
-                for t in newStart ..< min(newEnd, state.maxTime + 1):
-                    if t >= 0:
-                        let inOldRange = t >= oldStart and t < oldEnd
-                        if not inOldRange:
-                            let oldUsage = state.resourceProfile[t]
-                            let newUsage = oldUsage + height
-                            costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
-                            state.resourceProfile[t] = newUsage
+                # Symmetric difference: only update time points that actually change
+                if newStart > oldStart:
+                    for t in max(0, oldStart) ..< min(tMax, min(newStart, oldEnd)):
+                        let oldUsage = state.resourceProfile[t]
+                        let newUsage = oldUsage - height
+                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                        state.resourceProfile[t] = newUsage
+                    for t in max(0, max(oldEnd, newStart)) ..< min(tMax, newEnd):
+                        let oldUsage = state.resourceProfile[t]
+                        let newUsage = oldUsage + height
+                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                        state.resourceProfile[t] = newUsage
+                else:
+                    for t in max(0, newStart) ..< min(tMax, min(oldStart, newEnd)):
+                        let oldUsage = state.resourceProfile[t]
+                        let newUsage = oldUsage + height
+                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                        state.resourceProfile[t] = newUsage
+                    for t in max(0, max(newEnd, oldStart)) ..< min(tMax, oldEnd):
+                        let oldUsage = state.resourceProfile[t]
+                        let newUsage = oldUsage - height
+                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+                        state.resourceProfile[t] = newUsage
 
                 state.currentAssignment[position] = newValue
                 state.cost += costDelta
@@ -257,48 +258,55 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
                 state.currentAssignment[position] = newValue
 
         of ExpressionBased:
-            # Find all expressions affected by this position
             if position in state.expressionsAtPosition:
                 var costDelta = 0
+                let tMax = state.maxTime + 1
 
+                # Evaluate all old/new origins upfront (before mutating assignment)
+                var changes: seq[tuple[oldStart, oldEnd, newStart, newEnd: int, height: T]]
                 for i in state.expressionsAtPosition[position]:
-                    # Evaluate old origin
                     var tempAssign = initTable[int, T]()
                     for pos in state.originExpressions[i].positions.items:
                         tempAssign[pos] = state.currentAssignment[pos]
                     let oldOrigin = state.originExpressions[i].evaluate(tempAssign)
+                    tempAssign[position] = newValue
+                    let newOrigin = state.originExpressions[i].evaluate(tempAssign)
+                    if oldOrigin == newOrigin:
+                        continue
                     let duration = state.durationsExpr[i]
-                    let height = state.heightsExpr[i]
+                    changes.add((
+                        oldStart: int(oldOrigin), oldEnd: int(oldOrigin + duration),
+                        newStart: int(newOrigin), newEnd: int(newOrigin + duration),
+                        height: state.heightsExpr[i]
+                    ))
 
-                    # Remove old task contribution
-                    let oldStart = int(oldOrigin)
-                    let oldEnd = int(oldOrigin + duration)
-                    for t in oldStart ..< min(oldEnd, state.maxTime + 1):
-                        if t >= 0:
-                            let oldUsage = state.resourceProfile[t]
-                            state.resourceProfile[t] = oldUsage - height
-                            costDelta += calculateCostDelta(oldUsage, oldUsage - height, state.limit)
+                # Pass 1: remove "leaving" time points (in old range but not new)
+                for c in changes:
+                    if c.newStart > c.oldStart:
+                        for t in max(0, c.oldStart) ..< min(tMax, min(c.newStart, c.oldEnd)):
+                            let u = state.resourceProfile[t]
+                            state.resourceProfile[t] = u - c.height
+                            costDelta += calculateCostDelta(u, u - c.height, state.limit)
+                    else:
+                        for t in max(0, max(c.newEnd, c.oldStart)) ..< min(tMax, c.oldEnd):
+                            let u = state.resourceProfile[t]
+                            state.resourceProfile[t] = u - c.height
+                            costDelta += calculateCostDelta(u, u - c.height, state.limit)
 
-                # Update assignment
                 state.currentAssignment[position] = newValue
 
-                for i in state.expressionsAtPosition[position]:
-                    # Evaluate new origin
-                    var tempAssign = initTable[int, T]()
-                    for pos in state.originExpressions[i].positions.items:
-                        tempAssign[pos] = state.currentAssignment[pos]
-                    let newOrigin = state.originExpressions[i].evaluate(tempAssign)
-                    let duration = state.durationsExpr[i]
-                    let height = state.heightsExpr[i]
-
-                    # Add new task contribution
-                    let newStart = int(newOrigin)
-                    let newEnd = int(newOrigin + duration)
-                    for t in newStart ..< min(newEnd, state.maxTime + 1):
-                        if t >= 0:
-                            let oldUsage = state.resourceProfile[t]
-                            state.resourceProfile[t] = oldUsage + height
-                            costDelta += calculateCostDelta(oldUsage, oldUsage + height, state.limit)
+                # Pass 2: add "entering" time points (in new range but not old)
+                for c in changes:
+                    if c.newStart > c.oldStart:
+                        for t in max(0, max(c.oldEnd, c.newStart)) ..< min(tMax, c.newEnd):
+                            let u = state.resourceProfile[t]
+                            state.resourceProfile[t] = u + c.height
+                            costDelta += calculateCostDelta(u, u + c.height, state.limit)
+                    else:
+                        for t in max(0, c.newStart) ..< min(tMax, min(c.oldStart, c.newEnd)):
+                            let u = state.resourceProfile[t]
+                            state.resourceProfile[t] = u + c.height
+                            costDelta += calculateCostDelta(u, u + c.height, state.limit)
 
                 state.cost += costDelta
             else:
@@ -440,8 +448,8 @@ proc getGoodStartTimes*[T](state: CumulativeConstraint[T], position: int, maxCan
             discard
 
 proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newValue: T): int =
-    ## Calculates the cost delta for moving a position from oldValue to newValue
-    ## O(duration) complexity - only examines affected time points
+    ## Calculates the cost delta for moving a position from oldValue to newValue.
+    ## O(min(|shift|, duration)) complexity via symmetric difference of old/new time ranges.
     if oldValue == newValue:
         return 0
 
@@ -453,31 +461,32 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
             let i = state.positionToTask[position]
             let duration = state.durations[i]
             let height = state.heights[i]
-
             var costDelta = 0
 
             let oldStart = int(oldValue)
             let oldEnd = int(oldValue + duration)
             let newStart = int(newValue)
             let newEnd = int(newValue + duration)
+            let tMax = state.maxTime + 1
 
-            # Time points where task is being removed (old position)
-            for t in oldStart ..< min(oldEnd, state.maxTime + 1):
-                if t >= 0:
-                    let inNewRange = t >= newStart and t < newEnd
-                    if not inNewRange:
-                        let oldUsage = state.resourceProfile[t]
-                        let newUsage = oldUsage - height
-                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
-
-            # Time points where task is being added (new position)
-            for t in newStart ..< min(newEnd, state.maxTime + 1):
-                if t >= 0:
-                    let inOldRange = t >= oldStart and t < oldEnd
-                    if not inOldRange:
-                        let oldUsage = state.resourceProfile[t]
-                        let newUsage = oldUsage + height
-                        costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+            # Symmetric difference: only visit time points that actually change.
+            # For a shift of k, this touches O(min(k, duration)) points instead of O(2*duration).
+            if newStart > oldStart:
+                # Shift right: left tail leaves, right tail enters
+                for t in max(0, oldStart) ..< min(tMax, min(newStart, oldEnd)):
+                    costDelta += calculateCostDelta(state.resourceProfile[t],
+                        state.resourceProfile[t] - height, state.limit)
+                for t in max(0, max(oldEnd, newStart)) ..< min(tMax, newEnd):
+                    costDelta += calculateCostDelta(state.resourceProfile[t],
+                        state.resourceProfile[t] + height, state.limit)
+            else:
+                # Shift left: left tail enters, right tail leaves
+                for t in max(0, newStart) ..< min(tMax, min(oldStart, newEnd)):
+                    costDelta += calculateCostDelta(state.resourceProfile[t],
+                        state.resourceProfile[t] + height, state.limit)
+                for t in max(0, max(newEnd, oldStart)) ..< min(tMax, oldEnd):
+                    costDelta += calculateCostDelta(state.resourceProfile[t],
+                        state.resourceProfile[t] - height, state.limit)
 
             return costDelta
 
@@ -486,29 +495,37 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
                 return 0
 
             var profileDelta = initTable[int, T]()
+            let tMax = state.maxTime + 1
 
             for i in state.expressionsAtPosition[position]:
-                # Evaluate old origin
                 var tempAssign = initTable[int, T]()
                 for pos in state.originExpressions[i].positions.items:
                     tempAssign[pos] = state.currentAssignment[pos]
                 let oldOrigin = state.originExpressions[i].evaluate(tempAssign)
-                let duration = state.durationsExpr[i]
-                let height = state.heightsExpr[i]
-
-                # Track changes from removing old task
-                for t in int(oldOrigin) ..< int(oldOrigin + duration):
-                    if t >= 0 and t <= state.maxTime:
-                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) - height
-
-                # Evaluate new origin with updated position
                 tempAssign[position] = newValue
                 let newOrigin = state.originExpressions[i].evaluate(tempAssign)
 
-                # Track changes from adding new task
-                for t in int(newOrigin) ..< int(newOrigin + duration):
-                    if t >= 0 and t <= state.maxTime:
+                if oldOrigin == newOrigin:
+                    continue
+
+                let duration = state.durationsExpr[i]
+                let height = state.heightsExpr[i]
+                let oldStart = int(oldOrigin)
+                let oldEnd = int(oldOrigin + duration)
+                let newStart = int(newOrigin)
+                let newEnd = int(newOrigin + duration)
+
+                # Symmetric difference: only track time points that actually change
+                if newStart > oldStart:
+                    for t in max(0, oldStart) ..< min(tMax, min(newStart, oldEnd)):
+                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) - height
+                    for t in max(0, max(oldEnd, newStart)) ..< min(tMax, newEnd):
                         profileDelta[t] = profileDelta.getOrDefault(t, T(0)) + height
+                else:
+                    for t in max(0, newStart) ..< min(tMax, min(oldStart, newEnd)):
+                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) + height
+                    for t in max(0, max(newEnd, oldStart)) ..< min(tMax, oldEnd):
+                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) - height
 
             # Calculate cost delta
             var costDelta = 0
