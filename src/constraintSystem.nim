@@ -220,6 +220,11 @@ proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.positions)
 
+proc circuit*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # circuit constraint for the variable
+    # Returns constraint requiring that values form a single Hamiltonian circuit.
+    circuit[T](cvar.positions)
+
 proc increasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # increasing constraint for the variable
     # Returns constraint requiring that all values in the container be in non-decreasing order.

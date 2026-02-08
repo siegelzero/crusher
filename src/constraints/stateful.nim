@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs
+import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -232,6 +232,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Geost Constraint"
         of IrdcsType:
             return "IRDCS Constraint"
+        of CircuitType:
+            return "Circuit Constraint"
 
 ################################################################################
 # Evaluation
@@ -267,6 +269,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.geostState.cost
         of IrdcsType:
             return constraint.irdcsState.cost
+        of CircuitType:
+            return constraint.circuitState.cost
 
 ################################################################################
 # Computed Constraints
@@ -841,6 +845,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.geostState.initialize(assignment)
         of IrdcsType:
             constraint.irdcsState.initialize(assignment)
+        of CircuitType:
+            constraint.circuitState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -873,6 +879,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.geostState.moveDelta(position, oldValue, newValue)
         of IrdcsType:
             constraint.irdcsState.moveDelta(position, oldValue, newValue)
+        of CircuitType:
+            constraint.circuitState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -905,6 +913,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.geostState.updatePosition(position, newValue)
         of IrdcsType:
             constraint.irdcsState.updatePosition(position, newValue)
+        of CircuitType:
+            constraint.circuitState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1300,6 +1310,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: IrdcsType,
                 irdcsState: constraint.irdcsState.deepCopy()
             )
+        of CircuitType:
+            # Create deep copy of Circuit constraint
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: CircuitType,
+                circuitState: constraint.circuitState.deepCopy()
+            )
 
 
 
@@ -1466,6 +1483,32 @@ func irdcs*[T](positions: openArray[int], singletonPenalty: int = 1): StatefulCo
         positions: irdcsConstraint.positions,
         stateType: IrdcsType,
         irdcsState: irdcsConstraint
+    )
+
+################################################################################
+# Circuit wrapper functions
+################################################################################
+
+func circuit*[T](positions: openArray[int]): StatefulConstraint[T] =
+    ## Creates a Circuit constraint ensuring variables form a single Hamiltonian circuit.
+    ## Uses 1-based convention: value j at position i means "from node i, go to node j."
+    ##
+    ## **Mathematical Form**: The successor function defined by the variables forms exactly
+    ## one cycle visiting all n nodes.
+    ##
+    ## **Parameters**:
+    ## - `positions`: Variable positions that define the successor function
+    ##
+    ## **Note**: Does NOT enforce allDifferent. Add both constraints:
+    ##   sys.addConstraint(allDifferent(x))
+    ##   sys.addConstraint(circuit(x))
+    ##
+    ## **Violation Cost**: max(0, numCycles - 1) + numTailNodes
+    let circuitConstraint = newCircuitConstraint[T](positions)
+    return StatefulConstraint[T](
+        positions: circuitConstraint.positions,
+        stateType: CircuitType,
+        circuitState: circuitConstraint
     )
 
 ################################################################################

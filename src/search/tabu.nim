@@ -86,6 +86,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.geostState.cost + constraint.geostState.moveDelta(position, oldValue, newValue)
         of IrdcsType:
             result = constraint.irdcsState.cost + constraint.irdcsState.moveDelta(position, oldValue, newValue)
+        of CircuitType:
+            result = constraint.circuitState.cost + constraint.circuitState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

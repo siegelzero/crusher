@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs
+import allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit
 
 ################################################################################
 # Shared constraint type definitions
@@ -22,7 +22,8 @@ type
         BooleanType,
         CumulativeType,
         GeostType,
-        IrdcsType
+        IrdcsType,
+        CircuitType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -83,3 +84,5 @@ type
                 geostState*: GeostConstraint[T]
             of IrdcsType:
                 irdcsState*: IrdcsConstraint[T]
+            of CircuitType:
+                circuitState*: CircuitConstraint[T]
