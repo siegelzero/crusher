@@ -1,5 +1,6 @@
 import std/[sequtils, tables, unittest]
 import crusher
+import constraints/circuit
 
 proc validateCircuit(assignment: seq[int], n: int): bool =
     ## Validate that an assignment forms a single Hamiltonian circuit.
@@ -134,3 +135,87 @@ suite "Circuit Constraint":
             let dr = abs(fromRow - toRow)
             let dc = abs(fromCol - toCol)
             check (dr == 1 and dc == 2) or (dr == 2 and dc == 1)
+
+    test "Multi-step moveDelta + updatePosition consistency":
+        # Simulate solver behavior: repeatedly pick a move, check delta, apply, verify
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(1..6))
+        sys.addConstraint(circuit(x))
+
+        let initial = @[2, 1, 4, 3, 6, 5]
+        sys.initialize(initial)
+
+        let constraint = sys.baseArray.constraints[0]
+        let circuitRef = constraint.circuitState
+        var current = initial
+
+        # Sequence of moves: (position, newValue)
+        let moves = @[
+            (1, 3), (0, 4), (3, 1), (5, 2), (2, 6), (4, 3),
+            (0, 1), (1, 2), (3, 5), (2, 3), (5, 6), (4, 1),
+            (0, 3), (1, 5), (2, 1), (3, 6), (4, 4), (5, 2),
+        ]
+
+        for (pos, newVal) in moves:
+            let oldVal = current[pos]
+            # Check moveDelta
+            let delta = constraint.moveDelta(pos, oldVal, newVal)
+            let costBefore = constraint.penalty()
+            # Apply
+            constraint.updatePosition(pos, newVal)
+            current[pos] = newVal
+            let actualCost = constraint.penalty()
+            # Verify via full recomputation
+            let expectedCost = circuitRef.computePenalty()
+            check actualCost == expectedCost
+            # Verify delta was correct
+            check actualCost == costBefore + delta
+            # Also verify moveDelta for all possible next moves from this state
+            for testPos in 0..<6:
+                for testVal in 1..6:
+                    if testVal == current[testPos]:
+                        continue
+                    let testDelta = constraint.moveDelta(testPos, current[testPos], testVal)
+                    let oldSucc2 = circuitRef.successorArray[testPos]
+                    circuitRef.successorArray[testPos] = testVal - 1
+                    let expectedCost2 = circuitRef.computePenalty()
+                    circuitRef.successorArray[testPos] = oldSucc2
+                    check testDelta == expectedCost2 - actualCost
+
+    test "Exhaustive moveDelta consistency (6-node, all moves)":
+        # Try every possible (position, newValue) on several starting configurations
+        # and verify that moveDelta matches full recomputation via computePenalty.
+        let configs = @[
+            @[2, 3, 4, 5, 6, 1],  # single circuit
+            @[2, 1, 4, 3, 6, 5],  # three 2-cycles
+            @[1, 2, 3, 4, 5, 6],  # all self-loops
+            @[3, 1, 2, 6, 4, 5],  # two 3-cycles
+            @[2, 3, 1, 5, 6, 4],  # two 3-cycles (different)
+            @[4, 5, 6, 1, 2, 3],  # two 3-cycles (shifted)
+        ]
+
+        for config in configs:
+            var sys = initConstraintSystem[int]()
+            var x = sys.newConstrainedSequence(6)
+            x.setDomain(toSeq(1..6))
+            sys.addConstraint(circuit(x))
+
+            sys.initialize(config)
+
+            let constraint = sys.baseArray.constraints[0]
+            let circuitRef = constraint.circuitState
+
+            for pos in 0..<6:
+                let oldVal = config[pos]
+                for newVal in 1..6:
+                    if newVal == oldVal:
+                        continue
+                    let delta = constraint.moveDelta(pos, oldVal, newVal)
+                    # Compute expected via full recomputation
+                    let oldSucc = circuitRef.successorArray[pos]
+                    circuitRef.successorArray[pos] = newVal - 1
+                    let expectedNewCost = circuitRef.computePenalty()
+                    circuitRef.successorArray[pos] = oldSucc
+                    let expectedDelta = expectedNewCost - constraint.penalty()
+                    check delta == expectedDelta
