@@ -183,9 +183,60 @@ suite "Circuit Constraint":
                     circuitRef.successorArray[testPos] = oldSucc2
                     check testDelta == expectedCost2 - actualCost
 
-    test "Exhaustive moveDelta consistency (6-node, all moves)":
+    test "Non-permutation multi-step consistency":
+        # Exercises non-permutation states where multiple nodes share a successor,
+        # causing tails and component splits/merges. This verifies that the old
+        # successor's component doesn't need separate tracking (it's always in comp1
+        # because nodeIdx → oldSucc is an edge in the functional graph).
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(1..6))
+        sys.addConstraint(circuit(x))
+
+        # Start with a non-permutation: nodes 0 and 3 both point to node 1
+        let initial = @[2, 3, 1, 2, 6, 5]
+        sys.initialize(initial)
+
+        let constraint = sys.baseArray.constraints[0]
+        let circuitRef = constraint.circuitState
+        var current = initial
+
+        # Moves that create and destroy non-permutation states, splitting/merging components
+        let moves = @[
+            (0, 4),  # node 0 now points to 3 (was pointing to 1, splitting that component)
+            (3, 5),  # node 3 now points to 4, separate from node 0's chain
+            (5, 2),  # merge components: node 5 joins node 1's chain
+            (2, 2),  # self-loop on node 2 (non-permutation, multiple tails into node 1)
+            (4, 2),  # node 4 self-loops too
+            (1, 1),  # node 1 self-loops: now 3 self-loops + tails
+            (0, 1),  # re-link node 0 to node 0 (self-loop)
+            (3, 4),  # rebuild: node 3 -> node 3 (self-loop)
+            (5, 6),  # node 5 -> node 5 (self-loop via 1-based)
+            (0, 2),  # start rebuilding a circuit
+            (1, 3),
+            (2, 4),
+            (3, 5),
+            (4, 6),
+            (5, 1),  # now it's a valid single circuit
+        ]
+
+        for (pos, newVal) in moves:
+            let oldVal = current[pos]
+            let delta = constraint.moveDelta(pos, oldVal, newVal)
+            let costBefore = constraint.penalty()
+            constraint.updatePosition(pos, newVal)
+            current[pos] = newVal
+            let actualCost = constraint.penalty()
+            let expectedCost = circuitRef.computePenalty()
+            check actualCost == expectedCost
+            check actualCost == costBefore + delta
+
+        # Final state should be a valid circuit
+        check constraint.penalty() == 0
+
+    test "Exhaustive moveDelta consistency (6-node, all moves, incl. non-permutations)":
         # Try every possible (position, newValue) on several starting configurations
-        # and verify that moveDelta matches full recomputation via computePenalty.
+        # including non-permutation states, and verify moveDelta matches computePenalty.
         let configs = @[
             @[2, 3, 4, 5, 6, 1],  # single circuit
             @[2, 1, 4, 3, 6, 5],  # three 2-cycles
@@ -193,6 +244,10 @@ suite "Circuit Constraint":
             @[3, 1, 2, 6, 4, 5],  # two 3-cycles
             @[2, 3, 1, 5, 6, 4],  # two 3-cycles (different)
             @[4, 5, 6, 1, 2, 3],  # two 3-cycles (shifted)
+            @[2, 3, 1, 2, 6, 5],  # non-permutation: 0,3 both -> node 1
+            @[1, 1, 1, 1, 1, 1],  # non-permutation: all point to node 0
+            @[2, 2, 4, 4, 6, 6],  # non-permutation: pairs share successors
+            @[3, 3, 1, 6, 6, 4],  # non-permutation: two convergent chains
         ]
 
         for config in configs:

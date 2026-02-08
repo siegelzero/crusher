@@ -295,8 +295,12 @@ proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, ne
     let newSucc = int(newValue) - 1
     let n = constraint.n
 
-    # Identify affected components
+    # Identify affected components: comp1 (moved node) and comp2 (new successor).
+    # The OLD successor doesn't need a separate lookup because nodeIdx → oldSucc
+    # is an edge, so oldSucc is already in comp1 by definition.
     let comp1 = constraint.componentId[nodeIdx]
+    let oldSucc = constraint.successorArray[nodeIdx]
+    assert oldSucc < 0 or oldSucc >= n or constraint.componentId[oldSucc] == comp1
     var comp2 = -1
     if newSucc >= 0 and newSucc < n:
         comp2 = constraint.componentId[newSucc]
@@ -313,7 +317,6 @@ proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, ne
         if constraint.componentId[i] == comp1 or
            (comp2 >= 0 and constraint.componentId[i] == comp2):
             constraint.scratchInAffected[i] = true
-            constraint.scratchPath.setLen(0) # reuse as temp
             affectedCount += 1
             # Track old cycle/tail status
             if constraint.cycleId[i] == -1:
@@ -338,7 +341,6 @@ proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, ne
             affectedNodes.add(i)
 
     # Temporarily set successor
-    let oldSucc = constraint.successorArray[nodeIdx]
     constraint.successorArray[nodeIdx] = newSucc
 
     # Mini-traverse affected nodes
@@ -372,8 +374,11 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
 
     constraint.currentAssignment[position] = newValue
 
-    # Identify affected components
+    # Identify affected components: comp1 (moved node) and comp2 (new successor).
+    # The OLD successor is already in comp1 (nodeIdx → oldSucc is an edge).
     let comp1 = constraint.componentId[nodeIdx]
+    let oldSucc = constraint.successorArray[nodeIdx]
+    assert oldSucc < 0 or oldSucc >= n or constraint.componentId[oldSucc] == comp1
     var comp2 = -1
     if newSucc >= 0 and newSucc < n:
         comp2 = constraint.componentId[newSucc]
