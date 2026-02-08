@@ -187,6 +187,10 @@ func setDomain*[T](cvar: ConstrainedSequence[T], domain: openArray[T]) =
     for i in 0..<cvar.size:
         cvar.system.baseArray.setDomain(cvar.offset + i, domain)
 
+func setDomain*[T](cvar: ConstrainedSequence[T], index: int, domain: openArray[T]) =
+    # sets the domain for a single element of the constrained sequence
+    cvar.system.baseArray.setDomain(cvar.offset + index, domain)
+
 func setDomain*[T](cvar: ConstrainedMatrix[T], domain: openArray[T]) =
     # sets the domain for all positions in the constrained matrix
     for i in 0..<cvar.size:

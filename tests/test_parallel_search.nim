@@ -9,7 +9,7 @@ proc testParallelMagicSquare() =
     let magic_square = newConstrainedMatrix[int](system, 3, 3)
 
     # Set domain to 1-9 for all cells
-    system.baseArray.setDomain([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    magic_square.setDomain([1, 2, 3, 4, 5, 6, 7, 8, 9])
 
     # All cells must be different
     system.addConstraint(magic_square.allDifferent())

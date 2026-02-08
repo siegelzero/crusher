@@ -30,8 +30,7 @@ proc knightsTour*(n: int) =
                 let nc = col + dy[k]
                 if nr >= 0 and nr < n and nc >= 0 and nc < n:
                     moves.add(nr * n + nc + 1)  # 1-based successor values
-            let pos = x[cell].node.position
-            sys.baseArray.setDomain(pos, moves)
+            x.setDomain(cell, moves)
 
     sys.addConstraint(allDifferent(x))
     sys.addConstraint(circuit(x))

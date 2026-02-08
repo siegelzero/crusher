@@ -112,8 +112,7 @@ suite "Circuit Constraint":
                     let nc = col + knightDy[k]
                     if nr >= 0 and nr < N and nc >= 0 and nc < N:
                         moves.add(nr * N + nc + 1)  # 1-based
-                let pos = x[cell].node.position
-                sys.baseArray.setDomain(pos, moves)
+                x.setDomain(cell, moves)
 
         sys.addConstraint(allDifferent(x))
         sys.addConstraint(circuit(x))
