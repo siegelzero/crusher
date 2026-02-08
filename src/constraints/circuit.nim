@@ -59,7 +59,8 @@ proc computePenalty*[T](constraint: CircuitConstraint[T]): int =
             path.add(current)
             let succ = constraint.successorArray[current]
             if succ < 0 or succ >= n:
-                # Out of bounds - all path nodes are tails
+                # Out of bounds - set current to succ so post-loop bounds check fails
+                current = succ
                 break
             current = succ
 
@@ -154,9 +155,16 @@ proc deepCopy*[T](constraint: CircuitConstraint[T]): CircuitConstraint[T] =
     ## Creates a deep copy for parallel search.
     new(result)
     result.n = constraint.n
-    result.positions = constraint.positions
-    result.sortedPositions = constraint.sortedPositions
-    result.positionToIndex = constraint.positionToIndex
-    result.successorArray = constraint.successorArray
+    result.positions = constraint.positions  # PackedSet is value type
+    result.sortedPositions = constraint.sortedPositions  # Read-only after construction
+    result.positionToIndex = constraint.positionToIndex  # Read-only after construction
     result.cost = constraint.cost
-    result.currentAssignment = constraint.currentAssignment
+
+    # Deep copy mutable state
+    result.successorArray = newSeq[int](constraint.n)
+    for i in 0..<constraint.n:
+        result.successorArray[i] = constraint.successorArray[i]
+
+    result.currentAssignment = initTable[int, T]()
+    for k, v in constraint.currentAssignment.pairs:
+        result.currentAssignment[k] = v
