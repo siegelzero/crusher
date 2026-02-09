@@ -267,6 +267,10 @@ func addConstraints*[T](system: ConstraintSystem[T], constraints: openArray[Stat
     for constraint in constraints:
         system.baseArray.addBaseConstraint(constraint)
 
+proc removeLastConstraint*[T](system: ConstraintSystem[T]) =
+    # Removes the last constraint from the system
+    system.baseArray.removeLastConstraint()
+
 proc initialize*[T](system: ConstraintSystem[T], assignment: seq[T]) =
     # Initialize the system with a complete assignment
     system.assignment = assignment

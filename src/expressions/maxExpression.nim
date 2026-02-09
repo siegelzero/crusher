@@ -119,12 +119,33 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
                 return 0
 
         of ExpressionBased:
-            # For expression-based: compute new maximum by evaluating all expressions
-            var tempAssignment = state.currentAssignment
-            tempAssignment[position] = newValue
+            if position notin state.expressionsAtPosition:
+                return 0
 
-            let newMax = state.evaluate(tempAssignment)
-            return newMax - currentMax
+            let affected = state.expressionsAtPosition[position]
+
+            # Compute max of affected expressions with current (old) value
+            var maxOldAffected: T = low(T)
+            for i in affected:
+                maxOldAffected = max(maxOldAffected, state.expressions[i].evaluate(state.currentAssignment))
+
+            # Compute max of affected expressions with new value
+            state.currentAssignment[position] = newValue
+            var maxNewAffected: T = low(T)
+            for i in affected:
+                maxNewAffected = max(maxNewAffected, state.expressions[i].evaluate(state.currentAssignment))
+            state.currentAssignment[position] = oldValue
+
+            if maxNewAffected > currentMax:
+                return maxNewAffected - currentMax
+            elif maxOldAffected >= currentMax and maxNewAffected < maxOldAffected:
+                # Max-providing expression decreased — need full scan
+                state.currentAssignment[position] = newValue
+                let newMax = state.evaluate(state.currentAssignment)
+                state.currentAssignment[position] = oldValue
+                return newMax - currentMax
+            else:
+                return 0
 
 proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
     # Creates a deep copy of a MaxExpression for thread-safe parallel processing

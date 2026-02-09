@@ -75,7 +75,7 @@ proc solveFurnitureMoving(): tuple[solution: seq[int], makespan: int] =
     let makespanExpr = max(endExprs)
 
     sys.minimize(makespanExpr, verbose=false, parallel=true,
-                 populationSize=16, tabuThreshold=50000)
+                 populationSize=16, tabuThreshold=10000)
 
     let solution = startTimes.assignment
     var makespan = 0

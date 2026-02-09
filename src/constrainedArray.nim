@@ -97,6 +97,11 @@ proc addBaseConstraint*[T](arr: var ConstrainedArray[T], cons: StatefulConstrain
     # Adds the constraint to the
     arr.constraints.add(cons)
 
+proc removeLastConstraint*[T](arr: var ConstrainedArray[T]) {.inline.} =
+    # Removes the last constraint and invalidates cached reduced domain
+    arr.constraints.setLen(arr.constraints.len - 1)
+    arr.reducedDomain = @[]
+
 ################################################################################
 # ConstrainedArray domain reduction
 ################################################################################

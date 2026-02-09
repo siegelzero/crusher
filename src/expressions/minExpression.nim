@@ -119,12 +119,33 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
                 return 0
 
         of ExpressionBased:
-            # For expression-based: compute new minimum by evaluating all expressions
-            var tempAssignment = state.currentAssignment
-            tempAssignment[position] = newValue
+            if position notin state.expressionsAtPosition:
+                return 0
 
-            let newMin = state.evaluate(tempAssignment)
-            return newMin - currentMin
+            let affected = state.expressionsAtPosition[position]
+
+            # Compute min of affected expressions with current (old) value
+            var minOldAffected: T = high(T)
+            for i in affected:
+                minOldAffected = min(minOldAffected, state.expressions[i].evaluate(state.currentAssignment))
+
+            # Compute min of affected expressions with new value
+            state.currentAssignment[position] = newValue
+            var minNewAffected: T = high(T)
+            for i in affected:
+                minNewAffected = min(minNewAffected, state.expressions[i].evaluate(state.currentAssignment))
+            state.currentAssignment[position] = oldValue
+
+            if minNewAffected < currentMin:
+                return minNewAffected - currentMin
+            elif minOldAffected <= currentMin and minNewAffected > minOldAffected:
+                # Min-providing expression increased — need full scan
+                state.currentAssignment[position] = newValue
+                let newMin = state.evaluate(state.currentAssignment)
+                state.currentAssignment[position] = oldValue
+                return newMin - currentMin
+            else:
+                return 0
 
 proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
     # Creates a deep copy of a MinExpression for thread-safe parallel processing

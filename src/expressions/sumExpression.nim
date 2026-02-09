@@ -129,18 +129,16 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
             return state.coefficient[position] * (newValue - oldValue)
 
         of ExpressionBased:
-            # For expression-based: calculate delta from affected expressions
+            # Temporarily mutate, evaluate, restore (avoids table copy)
             result = 0
-            var tempAssignment = state.currentAssignment
-
             for i in state.expressionsAtPosition[position]:
-                # Calculate old expression value
-                tempAssignment[position] = oldValue
-                let oldExpValue = state.expressions[i].evaluate(tempAssignment)
+                # Calculate old expression value (assignment already has oldValue)
+                let oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
 
                 # Calculate new expression value
-                tempAssignment[position] = newValue
-                let newExpValue = state.expressions[i].evaluate(tempAssignment)
+                state.currentAssignment[position] = newValue
+                let newExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                state.currentAssignment[position] = oldValue
 
                 result += (newExpValue - oldExpValue)
 

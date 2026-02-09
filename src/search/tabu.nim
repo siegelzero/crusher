@@ -27,6 +27,7 @@ type
         constraints*: seq[StatefulConstraint[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[Table[T, int]]
+        constraintPenalties*: seq[seq[Table[T, int]]]  # [pos][local_constraint_idx][value]
 
         assignment*: seq[T]
         cost*: int
@@ -98,59 +99,64 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 ################################################################################
 
 proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
-    var penalty: int
+    ## Full rebuild of penalty map at position, including per-constraint cache.
     for value in state.carray.reducedDomain[position]:
-        penalty = 0
-        for constraint in state.constraintsAtPosition[position]:
-            penalty += state.movePenalty(constraint, position, value)
-        state.penaltyMap[position][value] = penalty
+        var total = 0
+        for ci, constraint in state.constraintsAtPosition[position]:
+            let p = state.movePenalty(constraint, position, value)
+            state.constraintPenalties[position][ci][value] = p
+            total += p
+        state.penaltyMap[position][value] = total
 
 
-proc updatePenaltiesForValues[T](state: TabuState[T], position: int, values: seq[T]) =
-    ## Update penalty map for specific domain values at a position.
-    ## This is more efficient than updating all values when only some are affected.
-    var penalty: int
+proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx: int) =
+    ## Incrementally update penalty map at position for a single constraint.
+    ## Only recomputes that constraint's contribution and adjusts the total.
+    let constraint = state.constraintsAtPosition[position][localIdx]
+    for value in state.carray.reducedDomain[position]:
+        let newP = state.movePenalty(constraint, position, value)
+        let oldP = state.constraintPenalties[position][localIdx].getOrDefault(value, 0)
+        state.penaltyMap[position][value] += (newP - oldP)
+        state.constraintPenalties[position][localIdx][value] = newP
+
+
+proc updateConstraintAtPositionValues[T](state: TabuState[T], position: int, localIdx: int, values: seq[T]) =
+    ## Incrementally update penalty map for specific domain values at position for a single constraint.
+    ## Only updates values that exist in the penalty map (i.e., in the reduced domain).
+    let constraint = state.constraintsAtPosition[position][localIdx]
     for value in values:
-        penalty = 0
-        for constraint in state.constraintsAtPosition[position]:
-            penalty += state.movePenalty(constraint, position, value)
-        state.penaltyMap[position][value] = penalty
+        if value notin state.penaltyMap[position]:
+            continue
+        let newP = state.movePenalty(constraint, position, value)
+        let oldP = state.constraintPenalties[position][localIdx].getOrDefault(value, 0)
+        state.penaltyMap[position][value] += (newP - oldP)
+        state.constraintPenalties[position][localIdx][value] = newP
+
+
+proc findLocalConstraintIdx[T](state: TabuState[T], position: int, constraint: StatefulConstraint[T]): int {.inline.} =
+    ## Find the local index of a constraint at a position by reference identity.
+    for i, c in state.constraintsAtPosition[position]:
+        if cast[pointer](c) == cast[pointer](constraint):
+            return i
+    return -1
 
 
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     ## Update penalty map for positions affected by a change at `position`.
-    ## Uses getAffectedPositions() which returns a smarter subset for some constraints.
-    ## Also uses getAffectedDomainValues() to only update affected domain values.
-
-    # Collect affected positions and their affected domain values from each constraint
-    var neighborAffectedValues: Table[int, seq[T]] = initTable[int, seq[T]]()
-    var neighborsNeedFullUpdate: PackedSet[int] = initPackedSet[int]()
+    ## Only recomputes the specific constraint(s) that changed at each neighbor,
+    ## not all constraints at that position.
 
     for constraint in state.constraintsAtPosition[position]:
         let affectedPositions = constraint.getAffectedPositions()
         for pos in affectedPositions.items:
-            if pos != position:
-                # Get affected domain values for this position from this constraint
-                let affectedVals = constraint.getAffectedDomainValues(pos)
-                if affectedVals.len == 0:
-                    # Empty means full update needed for this constraint
-                    neighborsNeedFullUpdate.incl(pos)
-                else:
-                    # Collect affected values
-                    if pos notin neighborAffectedValues:
-                        neighborAffectedValues[pos] = @[]
-                    for v in affectedVals:
-                        if v notin neighborAffectedValues[pos]:
-                            neighborAffectedValues[pos].add(v)
-
-    # Update positions that need full update
-    for nbr in neighborsNeedFullUpdate.items:
-        state.updatePenaltiesForPosition(nbr)
-
-    # Update positions with partial updates (only affected values)
-    for nbr, values in neighborAffectedValues.pairs:
-        if nbr notin neighborsNeedFullUpdate:
-            state.updatePenaltiesForValues(nbr, values)
+            if pos == position:
+                continue
+            let localIdx = state.findLocalConstraintIdx(pos, constraint)
+            let affectedVals = constraint.getAffectedDomainValues(pos)
+            if affectedVals.len == 0:
+                state.updateConstraintAtPosition(pos, localIdx)
+            else:
+                state.updateConstraintAtPositionValues(pos, localIdx, affectedVals)
 
 
 proc rebuildPenaltyMap*[T](state: TabuState[T]) =
@@ -254,8 +260,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.bestAssignment = state.assignment
 
     state.penaltyMap = newSeq[Table[T, int]](state.carray.len)
+    state.constraintPenalties = newSeq[seq[Table[T, int]]](state.carray.len)
     for pos in carray.allPositions():
         state.penaltyMap[pos] = initTable[T, int]()
+        state.constraintPenalties[pos] = newSeq[Table[T, int]](state.constraintsAtPosition[pos].len)
+        for ci in 0..<state.constraintsAtPosition[pos].len:
+            state.constraintPenalties[pos][ci] = initTable[T, int]()
 
     if verbose:
         echo "[TabuState] Starting penalty map computation for " & $carray.len & " positions..."
@@ -405,6 +415,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     if state.verbose:
         let elapsed = epochTime() - state.startTime
         echo &"[Tabu] Search ended: best_cost={state.bestCost} iterations={state.iteration} elapsed={elapsed:.2f}s"
+        state.logProfileStats()
 
     return state
 
