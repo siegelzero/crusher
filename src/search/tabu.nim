@@ -138,7 +138,7 @@ proc findLocalConstraintIdx[T](state: TabuState[T], position: int, constraint: S
     for i, c in state.constraintsAtPosition[position]:
         if cast[pointer](c) == cast[pointer](constraint):
             return i
-    return -1
+    assert false, "constraint not found at position " & $position
 
 
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =

@@ -38,7 +38,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var hi = currentCost - 1
         else:
             var lo = currentCost + 1
-            var hi = if upperBound != high(int): upperBound else: currentCost * 2
+            var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
         if verbose:
             echo "Initial iterations: ", system.lastIterations, ", next threshold: ", currentTabuThreshold
