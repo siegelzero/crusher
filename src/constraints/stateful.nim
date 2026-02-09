@@ -59,7 +59,8 @@ func calculateUnaryPenalty[T](op: UnaryRelation, targetPenalty: T): T {.inline.}
         return if targetPenalty == 0: 1 else: 0
 
 func calculateBooleanPenalty[T](op: BooleanOperation, leftPenalty, rightPenalty: T): T {.inline.} =
-    ## Calculates penalty for boolean operations based on child constraint penalties
+    ## Calculates penalty for boolean operations based on child constraint penalties.
+    ## Uses graduated penalties where possible to give the tabu search gradient information.
     case op:
     of And:
         # Both must be satisfied
@@ -69,13 +70,19 @@ func calculateBooleanPenalty[T](op: BooleanOperation, leftPenalty, rightPenalty:
         return min(leftPenalty, rightPenalty)
     of Xor:
         # Exactly one must be satisfied
-        return if (leftPenalty == 0) != (rightPenalty == 0): 0 else: 1
+        if (leftPenalty == 0) != (rightPenalty == 0): return 0  # exactly one satisfied
+        elif leftPenalty == 0: return 1                         # both satisfied, must break one
+        else: return min(leftPenalty, rightPenalty)              # both violated, guide toward easier fix
     of Implies:
-        # If left then right
-        return if leftPenalty == 0 and rightPenalty > 0: 1 else: 0
+        # If left then right: graduated consequent penalty guides search
+        if leftPenalty > 0: return 0       # antecedent false → trivially satisfied
+        else: return rightPenalty           # antecedent true → pass through consequent penalty
     of Iff:
-        # Both or neither
-        return if (leftPenalty == 0) == (rightPenalty == 0): 0 else: 1
+        # Both or neither: graduated penalty guides toward satisfying the violated side
+        if leftPenalty == 0 and rightPenalty == 0: return 0
+        elif leftPenalty > 0 and rightPenalty > 0: return 0
+        elif leftPenalty == 0: return rightPenalty  # left satisfied, guide toward satisfying right
+        else: return leftPenalty                    # right satisfied, guide toward satisfying left
 
 # BooleanConstraint creation functions
 func newBooleanConstraint*[T](leftConstraint, rightConstraint: StatefulConstraint[T],
@@ -124,7 +131,9 @@ func initialize*[T](constraint: BooleanConstraint[T], assignment: seq[T]) =
         )
 
 func moveDelta*[T](constraint: BooleanConstraint[T], position: int, oldValue, newValue: T): int =
-    ## Calculate the change in penalty for a position change using cached penalties
+    ## Calculate the change in penalty for a position change using cached penalties.
+    ## Uses short-circuit logic to skip expensive child moveDelta calls when cached
+    ## state proves the overall result cannot change.
     # Early exit if position doesn't affect this constraint
     if position notin constraint.positions:
         return 0
@@ -140,12 +149,31 @@ func moveDelta*[T](constraint: BooleanConstraint[T], position: int, oldValue, ne
         let newCost = calculateUnaryPenalty(constraint.unaryOp, newTargetPenalty)
         return newCost - constraint.cost
     of false:
-        # Only calculate deltas for constraints that actually depend on this position
-        let leftDelta = if position in constraint.leftConstraint.positions:
+        let posInLeft = position in constraint.leftConstraint.positions
+        let posInRight = position in constraint.rightConstraint.positions
+
+        # Short-circuit: skip expensive child moveDelta when cached state proves result is unchanged
+        case constraint.booleanOp:
+        of Implies:
+            # Implies satisfied when antecedent is false (leftPenalty > 0) or consequent is true (rightPenalty == 0)
+            if not posInLeft and constraint.cachedLeftPenalty > 0:
+                return 0  # antecedent stays false → trivially satisfied regardless of right
+            if not posInRight and constraint.cachedRightPenalty == 0:
+                return 0  # consequent stays true → satisfied regardless of left
+        of Or:
+            # Or satisfied when either side has penalty 0
+            if not posInLeft and constraint.cachedLeftPenalty == 0:
+                return 0  # left stays satisfied → Or stays at 0 regardless of right
+            if not posInRight and constraint.cachedRightPenalty == 0:
+                return 0  # right stays satisfied → Or stays at 0 regardless of left
+        else:
+            discard
+
+        let leftDelta = if posInLeft:
             constraint.leftConstraint.moveDelta(position, oldValue, newValue)
         else: 0
 
-        let rightDelta = if position in constraint.rightConstraint.positions:
+        let rightDelta = if posInRight:
             constraint.rightConstraint.moveDelta(position, oldValue, newValue)
         else: 0
 
@@ -156,17 +184,21 @@ func moveDelta*[T](constraint: BooleanConstraint[T], position: int, oldValue, ne
         return newCost - constraint.cost
 
 func updatePosition*[T](constraint: BooleanConstraint[T], position: int, newValue: T) =
-    ## Update a position with a new value and maintain cached penalties
+    ## Update a position with a new value and maintain cached penalties.
+    ## Only updates children that are actually affected by the position change.
     case constraint.isUnary:
     of true:
-        constraint.targetConstraint.updatePosition(position, newValue)
-        constraint.cachedTargetPenalty = constraint.targetConstraint.penalty()
-        constraint.cost = calculateUnaryPenalty(constraint.unaryOp, constraint.cachedTargetPenalty)
+        if position in constraint.targetConstraint.positions:
+            constraint.targetConstraint.updatePosition(position, newValue)
+            constraint.cachedTargetPenalty = constraint.targetConstraint.penalty()
+            constraint.cost = calculateUnaryPenalty(constraint.unaryOp, constraint.cachedTargetPenalty)
     of false:
-        constraint.leftConstraint.updatePosition(position, newValue)
-        constraint.rightConstraint.updatePosition(position, newValue)
-        constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
-        constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
+        if position in constraint.leftConstraint.positions:
+            constraint.leftConstraint.updatePosition(position, newValue)
+            constraint.cachedLeftPenalty = constraint.leftConstraint.penalty()
+        if position in constraint.rightConstraint.positions:
+            constraint.rightConstraint.updatePosition(position, newValue)
+            constraint.cachedRightPenalty = constraint.rightConstraint.penalty()
         constraint.cost = calculateBooleanPenalty(
             constraint.booleanOp,
             constraint.cachedLeftPenalty,

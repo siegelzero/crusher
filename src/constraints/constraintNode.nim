@@ -145,10 +145,16 @@ proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T
                     return min(leftPenalty, rightPenalty)
                 of Xor:
                     # Exactly one must be satisfied
-                    return if (leftPenalty == 0) != (rightPenalty == 0): 0 else: 1
+                    if (leftPenalty == 0) != (rightPenalty == 0): return 0  # exactly one satisfied
+                    elif leftPenalty == 0: return 1                         # both satisfied, must break one
+                    else: return min(leftPenalty, rightPenalty)              # both violated, guide toward easier fix
                 of Implies:
-                    # If left then right
-                    return if leftPenalty == 0 and rightPenalty > 0: 1 else: 0
+                    # If left then right: graduated consequent penalty guides search
+                    if leftPenalty > 0: return 0       # antecedent false → trivially satisfied
+                    else: return rightPenalty           # antecedent true → pass through consequent penalty
                 of Iff:
-                    # Both or neither
-                    return if (leftPenalty == 0) == (rightPenalty == 0): 0 else: 1
+                    # Both or neither: graduated penalty guides toward satisfying the violated side
+                    if leftPenalty == 0 and rightPenalty == 0: return 0
+                    elif leftPenalty > 0 and rightPenalty > 0: return 0
+                    elif leftPenalty == 0: return rightPenalty  # left satisfied, guide toward satisfying right
+                    else: return leftPenalty                    # right satisfied, guide toward satisfying left
