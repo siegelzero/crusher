@@ -262,7 +262,7 @@ suite "Cumulative Constraint Tests":
 
         # Optimize
         sys.minimize(makespan, parallel=true, verbose=false,
-                     populationSize=32, tabuThreshold=50000)
+                     populationSize=10, tabuThreshold=100)
 
         # Validate solution
         let solution = startTimes.assignment

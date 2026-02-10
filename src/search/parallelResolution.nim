@@ -1,8 +1,11 @@
-import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random]
+import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random, algorithm]
 
 import tabu
+import candidatePool
 import ../constraintSystem
 import ../constrainedArray
+
+export candidatePool
 
 type
     BatchResult*[T] = object
@@ -223,7 +226,10 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
                         populationSize: int = 16,
                         numWorkers: int = 0,
                         tabuThreshold: int = 10000,
-                        verbose: bool = false) =
+                        verbose: bool = false,
+                        failedPool: var CandidatePool[T]): bool =
+    ## Run parallel tabu search. Returns true if solution found (system initialized).
+    ## On failure, populates failedPool with best results for scatter search continuation.
     let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
     if verbose:
         echo &"[Solve] vars={system.baseArray.len} constraints={system.baseArray.constraints.len} pop={populationSize} workers={actualWorkers} threshold={tabuThreshold}"
@@ -247,19 +253,33 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         let populationTime = epochTime() - populationStartTime
         echo &"[Solve] Created {populationSize} states in {populationTime:.3f}s"
 
-    # Process population in parallel using dynamic dispatcher
-    let bestResult = dynamicImprove(population, numWorkers, tabuThreshold, verbose)
+    # Collect all results from parallel tabu improvement
+    var allResults: seq[PoolEntry[T]] = @[]
 
-    # Check if perfect solution was found (cost == 0 means all constraints satisfied)
-    if bestResult.found and bestResult.assignment.len > 0:
-        if verbose:
-            let elapsed = bestResult.endTime - bestResult.startTime
-            let rate = if elapsed > 0: bestResult.iterations.float / elapsed else: 0.0
-            echo &"[Solve] Solution found by S{bestResult.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)"
-        let solutionCopy = @(bestResult.assignment)
-        system.initialize(solutionCopy)
-        system.lastIterations = bestResult.iterations
-    else:
-        if verbose:
-            echo &"[Solve] Failed: best cost={bestResult.cost}"
-        raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
+    for result in improveStates(population, numWorkers, tabuThreshold, verbose):
+        if result.found:
+            if verbose:
+                let elapsed = result.endTime - result.startTime
+                let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+                echo &"[Solve] Solution found by S{result.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)"
+            system.initialize(result.assignment)
+            system.lastIterations = result.iterations
+            return true
+        allResults.add(PoolEntry[T](
+            assignment: result.assignment,
+            cost: result.cost
+        ))
+
+    # No solution found — build pool from results for scatter continuation
+    if allResults.len > 0:
+        let poolSize = min(populationSize, 10)
+        allResults.sort(proc(a, b: PoolEntry[T]): int = cmp(a.cost, b.cost))
+        let keepCount = min(poolSize, allResults.len)
+        failedPool.entries = allResults[0..<keepCount]
+        failedPool.updateBounds()
+
+    if verbose:
+        let bestCost = if allResults.len > 0: allResults[0].cost else: -1
+        echo &"[Solve] Initial parallel search failed: best cost={bestCost}"
+
+    return false

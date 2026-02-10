@@ -194,7 +194,7 @@ proc resetProfileStats*[T](state: TabuState[T]) =
 # TabuState creation
 ################################################################################
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0) =
+proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[]) =
     state.id = id
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
@@ -244,7 +244,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     state.assignment = newSeq[T](carray.len)
     for pos in carray.allPositions():
-        state.assignment[pos] = sample(carray.reducedDomain[pos])
+        if initialAssignment.len > 0:
+            state.assignment[pos] = initialAssignment[pos]
+        else:
+            state.assignment[pos] = sample(carray.reducedDomain[pos])
 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
@@ -291,6 +294,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
     result.init(carray, verbose, id)
+
+proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
+    new(result)
+    result.init(carray, verbose, id, initialAssignment = assignment)
 
 ################################################################################
 # Value Assignment

@@ -5,7 +5,8 @@ import ../constraintSystem
 import ../constrainedArray
 
 when compileOption("threads"):
-    import parallelResolution
+    import parallelResolution  # also exports candidatePool
+    import scatterSearch
 
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
@@ -18,8 +19,20 @@ proc resolve*[T](system: ConstraintSystem[T],
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
 
     if parallel:
-        parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose)
-        return
+        var pool: CandidatePool[T]
+        if parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose, pool):
+            return
+
+        # Parallel tabu failed — continue with scatter search using collected results
+        if pool.entries.len > 0:
+            let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
+            if verbose:
+                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost})"
+                pool.poolStatistics()
+            if scatterImprove(system, pool, iterations = 3, tabuThreshold, tabuThreshold, actualWorkers, verbose):
+                return
+
+        raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
     else:
         var improved = system.baseArray.tabuImprove(tabuThreshold, verbose)
         if improved.cost == 0:

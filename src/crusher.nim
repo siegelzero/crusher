@@ -2,7 +2,7 @@ import std/packedsets
 
 import constraints/[algebraic, stateful, ordering, globalCardinality, atleast, atmost, multiknapsack, sequence, relationalConstraint, constraintNode, irdcs, circuit]
 import expressions/expressions
-import search/[optimization, resolution]
+import search/[optimization, resolution, scatterSearch]
 import constraintSystem
 import constrainedArray
 
@@ -13,6 +13,7 @@ export constraintSystem,
        expressions,
        optimization,
        resolution,
+       scatterSearch,
        packedsets,
        ordering,
        globalCardinality,

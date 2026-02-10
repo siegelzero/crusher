@@ -118,7 +118,7 @@ suite "Circuit Constraint":
         sys.addConstraint(allDifferent(x))
         sys.addConstraint(circuit(x))
 
-        sys.resolve(parallel=true, tabuThreshold=50000)
+        sys.resolve(parallel=true, tabuThreshold=1000, populationSize=10)
 
         let sol = x.assignment()
 
