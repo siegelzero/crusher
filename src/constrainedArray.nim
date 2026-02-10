@@ -1,7 +1,11 @@
 import std/[packedsets, sequtils, strformat, tables]
 
 import constraints/[stateful, algebraic, types]
+import constraints/constraintNode
+import constraints/relationalConstraint
 import expressions/expressions
+import expressions/stateful as exprStateful
+import expressions/sumExpression
 
 ################################################################################
 # Type definitions
@@ -103,6 +107,91 @@ proc removeLastConstraint*[T](arr: var ConstrainedArray[T]) {.inline.} =
     arr.reducedDomain = @[]
 
 ################################################################################
+# Bounds propagation helpers
+################################################################################
+
+func ceilDivPositive[T](a, b: T): T =
+    ## ceil(a / b) for b > 0
+    if a >= 0: (a + b - 1) div b
+    else: -((-a) div b)
+
+func floorDivPositive[T](a, b: T): T =
+    ## floor(a / b) for b > 0
+    if a >= 0: a div b
+    else: -((-a + b - 1) div b)
+
+type
+    LinearForm[T] = object
+        coefficients: Table[int, T]
+        constant: T
+        relation: BinaryRelation
+
+proc extractLinearForm[T](cons: RelationalConstraint[T]): (bool, LinearForm[T]) =
+    ## Extract a normalized linear form from a RelationalConstraint.
+    ## Returns (success, linearForm) where the form represents:
+    ##   Σ(coeff[i] * x[i]) + constant  `relation`  0
+    var leftCoeffs: Table[int, T]
+    var leftConst: T
+    var rightCoeffs: Table[int, T]
+    var rightConst: T
+
+    # Extract left side
+    case cons.leftExpr.kind
+    of SumExpr:
+        let s = cons.leftExpr.sumExpr
+        case s.evalMethod
+        of PositionBased:
+            leftCoeffs = s.coefficient
+            leftConst = s.constant
+        of ExpressionBased:
+            return (false, LinearForm[T]())
+    of ConstantExpr:
+        leftConst = cons.leftExpr.constantValue
+    else:
+        return (false, LinearForm[T]())
+
+    # Extract right side
+    case cons.rightExpr.kind
+    of SumExpr:
+        let s = cons.rightExpr.sumExpr
+        case s.evalMethod
+        of PositionBased:
+            rightCoeffs = s.coefficient
+            rightConst = s.constant
+        of ExpressionBased:
+            return (false, LinearForm[T]())
+    of ConstantExpr:
+        rightConst = cons.rightExpr.constantValue
+    else:
+        return (false, LinearForm[T]())
+
+    # Merge: left - right
+    var merged: Table[int, T]
+    for pos in leftCoeffs.keys:
+        merged[pos] = leftCoeffs[pos]
+    for pos in rightCoeffs.keys:
+        if pos in merged:
+            merged[pos] = merged[pos] - rightCoeffs[pos]
+        else:
+            merged[pos] = -rightCoeffs[pos]
+
+    # Remove zero-coefficient entries
+    var toRemove: seq[int]
+    for pos in merged.keys:
+        if merged[pos] == 0:
+            toRemove.add(pos)
+    for pos in toRemove:
+        merged.del(pos)
+
+    let mergedConst = leftConst - rightConst
+
+    return (true, LinearForm[T](
+        coefficients: merged,
+        constant: mergedConst,
+        relation: cons.relation
+    ))
+
+################################################################################
 # ConstrainedArray domain reduction
 ################################################################################
 
@@ -174,6 +263,126 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         of ExpressionBased:
             discard
 
+    # Phase 3: Bounds propagation for linear relational constraints
+    # Pre-extract linear forms from relational constraints
+    var linearForms: seq[LinearForm[T]]
+    for cons in carray.constraints:
+        if cons.stateType != RelationalType:
+            continue
+        let (success, form) = extractLinearForm(cons.relationalState)
+        if success:
+            linearForms.add(form)
+
+    if linearForms.len > 0:
+        discard
+
+        # Compute initial domainMin/domainMax from current PackedSets
+        var domainMin = newSeq[T](carray.len)
+        var domainMax = newSeq[T](carray.len)
+        for pos in carray.allPositions():
+            if currentDomain[pos].len > 0:
+                domainMin[pos] = T.high
+                domainMax[pos] = T.low
+                for v in currentDomain[pos].items:
+                    if v < domainMin[pos]: domainMin[pos] = v
+                    if v > domainMax[pos]: domainMax[pos] = v
+            else:
+                domainMin[pos] = T(0)
+                domainMax[pos] = T(0)
+
+        # Normalize each linear form to >= 0 and propagate bounds
+        type NormalizedForm = object
+            coefficients: Table[int, T]
+            constant: T
+
+        var normalizedForms: seq[NormalizedForm]
+        for form in linearForms:
+            case form.relation
+            of GreaterThanEq:
+                # Σ(a_i * x_i) + C >= 0
+                normalizedForms.add(NormalizedForm(
+                    coefficients: form.coefficients, constant: form.constant))
+            of LessThanEq:
+                # negate: Σ(-a_i * x_i) - C >= 0
+                var negCoeffs: Table[int, T]
+                for pos in form.coefficients.keys:
+                    negCoeffs[pos] = -form.coefficients[pos]
+                normalizedForms.add(NormalizedForm(
+                    coefficients: negCoeffs, constant: -form.constant))
+            of GreaterThan:
+                # Σ(a_i * x_i) + (C - 1) >= 0
+                normalizedForms.add(NormalizedForm(
+                    coefficients: form.coefficients, constant: form.constant - 1))
+            of LessThan:
+                # negate + adjust: Σ(-a_i * x_i) + (-C - 1) >= 0
+                var negCoeffs: Table[int, T]
+                for pos in form.coefficients.keys:
+                    negCoeffs[pos] = -form.coefficients[pos]
+                normalizedForms.add(NormalizedForm(
+                    coefficients: negCoeffs, constant: -form.constant - 1))
+            of EqualTo:
+                # Both >= 0 and <= 0 (negate for >= 0)
+                normalizedForms.add(NormalizedForm(
+                    coefficients: form.coefficients, constant: form.constant))
+                var negCoeffs: Table[int, T]
+                for pos in form.coefficients.keys:
+                    negCoeffs[pos] = -form.coefficients[pos]
+                normalizedForms.add(NormalizedForm(
+                    coefficients: negCoeffs, constant: -form.constant))
+            of NotEqualTo, CommonFactor, CoPrime:
+                discard
+
+        # Fixed-point loop
+        for iteration in 0..<100:
+            var changed = false
+
+            for form in normalizedForms:
+                # For each variable x_j with coefficient a_j:
+                # We have: a_j * x_j + rest + C >= 0
+                # rest = Σ_{i≠j}(a_i * x_i)
+                for pos_j in form.coefficients.keys:
+                    let a_j = form.coefficients[pos_j]
+                    if a_j == 0: continue
+
+                    # Compute restMax: max possible value of rest = Σ_{i≠j}(a_i * x_i)
+                    var restMax: T = 0
+                    for pos_i in form.coefficients.keys:
+                        if pos_i == pos_j: continue
+                        let a_i = form.coefficients[pos_i]
+                        if a_i > 0:
+                            restMax += a_i * domainMax[pos_i]
+                        else:
+                            restMax += a_i * domainMin[pos_i]
+
+                    # a_j * x_j >= -C - restMax  (i.e., bound = -C - restMax)
+                    let bound = -form.constant - restMax
+
+                    if a_j > 0:
+                        # x_j >= ceil(bound / a_j)
+                        let newMin = ceilDivPositive(bound, a_j)
+                        if newMin > domainMin[pos_j]:
+                            domainMin[pos_j] = newMin
+                            changed = true
+                    else:  # a_j < 0
+                        # x_j <= floor(-bound / (-a_j))
+                        let newMax = floorDivPositive(-bound, -a_j)
+                        if newMax < domainMax[pos_j]:
+                            domainMax[pos_j] = newMax
+                            changed = true
+
+            if not changed:
+                break
+
+        # Apply tightened bounds to PackedSets
+        for pos in carray.allPositions():
+            var toExclude: seq[T]
+            for v in currentDomain[pos].items:
+                if v < domainMin[pos] or v > domainMax[pos]:
+                    toExclude.add(v)
+            for v in toExclude:
+                currentDomain[pos].excl(v)
+
+    # Phase 4: Convert PackedSets to output sequences
     for pos in carray.allPositions():
         reduced[pos] = toSeq(currentDomain[pos])
 

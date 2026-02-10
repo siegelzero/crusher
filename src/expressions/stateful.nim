@@ -89,9 +89,13 @@ proc newExpression*[T](expression: StatefulAlgebraicExpression[T]): Expression[T
     Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: expression, positions: expression.positions)
 
 proc newExpression*[T](expression: AlgebraicExpression[T]): Expression[T] =
-    # Convert AlgebraicExpression to StatefulAlgebraicExpression
-    let statefulExpression = newStatefulAlgebraicExpression(expression)
-    Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: statefulExpression, positions: expression.positions)
+    if expression.linear:
+        # Automatically linearize for O(1) incremental updates
+        let linearized = linearize(expression)
+        Expression[T](kind: SumExpr, sumExpr: linearized, positions: linearized.positions)
+    else:
+        let statefulExpression = newStatefulAlgebraicExpression(expression)
+        Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: statefulExpression, positions: expression.positions)
 
 proc newExpression*[T](expression: SumExpression[T]): Expression[T] =
     Expression[T](kind: SumExpr, sumExpr: expression, positions: expression.positions)

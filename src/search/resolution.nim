@@ -18,21 +18,14 @@ proc resolve*[T](system: ConstraintSystem[T],
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
 
     if parallel:
-        if verbose:
-            echo "Using parallel search"
         parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose)
         return
     else:
-        # Sequential fallback
-        if verbose:
-            echo "Using sequential search"
         var improved = system.baseArray.tabuImprove(tabuThreshold, verbose)
         if improved.cost == 0:
             system.initialize(improved.assignment)
             system.lastIterations = improved.iteration
-            if verbose:
-                echo "Sequential search found solution"
             return
         if verbose:
-            echo &"Sequential search failed with best cost: {improved.cost}"
+            echo &"[Solve] Sequential failed: best cost={improved.cost}"
         raise newException(NoSolutionFoundError, "Can't find satisfying solution")

@@ -8,7 +8,7 @@ import ../expressions/expressions
 randomize()
 
 # Logging configuration
-const LogInterval* = 5000  # Log every N iterations
+const LogInterval* = 50000  # Log every N iterations
 const ProfileMoveDelta* = false  # Enable moveDelta profiling (disable for performance)
 
 ################################################################################
@@ -22,6 +22,7 @@ type
         totalTime*: float  # in seconds
 
     TabuState*[T] = ref object of RootObj
+        id*: int  # Identifies this state in parallel runs
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
         constraints*: seq[StatefulConstraint[T]]
@@ -193,7 +194,8 @@ proc resetProfileStats*[T](state: TabuState[T]) =
 # TabuState creation
 ################################################################################
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false) =
+proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0) =
+    state.id = id
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
@@ -220,9 +222,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
 
-    if verbose:
-        echo "[TabuState] Built constraintsAtPosition in " & $(epochTime() - initStart) & "s"
-        # Log constraint stats
+    if verbose and id == 0:
+        echo "[Init] Built constraintsAtPosition in " & $(epochTime() - initStart) & "s"
         var maxPositions = 0
         var totalPositions = 0
         for c in state.constraints:
@@ -230,7 +231,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             totalPositions += pcount
             if pcount > maxPositions:
                 maxPositions = pcount
-        echo "[TabuState] Constraints: " & $state.constraints.len & " total, max positions=" & $maxPositions & " avg=" & $(totalPositions div max(1, state.constraints.len))
+        echo "[Init] Constraints: " & $state.constraints.len & " total, max_pos=" & $maxPositions & " avg_pos=" & $(totalPositions div max(1, state.constraints.len))
         initStart = epochTime()
 
     # Skip expensive neighbor precomputation - compute lazily during search
@@ -238,8 +239,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for pos in carray.allPositions():
         state.neighbors[pos] = @[]
 
-    if verbose:
-        echo "[TabuState] Initialized neighbors (lazy) in " & $(epochTime() - initStart) & "s"
+    if verbose and id == 0:
         initStart = epochTime()
 
     state.assignment = newSeq[T](carray.len)
@@ -249,8 +249,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
-    if verbose:
-        echo "[TabuState] Initialized constraints in " & $(epochTime() - initStart) & "s"
+    if verbose and id == 0:
+        echo "[Init] Initialized constraints in " & $(epochTime() - initStart) & "s"
         initStart = epochTime()
 
     for cons in state.constraints:
@@ -267,31 +267,30 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for ci in 0..<state.constraintsAtPosition[pos].len:
             state.constraintPenalties[pos][ci] = initTable[T, int]()
 
-    if verbose:
-        echo "[TabuState] Starting penalty map computation for " & $carray.len & " positions..."
+    if verbose and id == 0:
         var totalDomainSize = 0
         for pos in carray.allPositions():
             totalDomainSize += carray.reducedDomain[pos].len
-        echo "[TabuState] Total domain values to compute: " & $totalDomainSize
+        echo "[Init] Building penalty map: " & $carray.len & " positions, " & $totalDomainSize & " domain values"
 
     var penaltyStart = epochTime()
     for pos in carray.allPositions():
         state.updatePenaltiesForPosition(pos)
-        if verbose and pos mod 500 == 0 and pos > 0:
+        if verbose and id == 0 and pos mod 500 == 0 and pos > 0:
             let elapsed = epochTime() - penaltyStart
             let rate = pos.float / max(elapsed, 0.001)
             let eta = (carray.len - pos).float / max(rate, 0.001)
-            echo "[TabuState] Penalties: " & $pos & "/" & $carray.len & " rate=" & $rate.int & "/s eta=" & $eta.int & "s"
+            echo "[Init] Penalties: " & $pos & "/" & $carray.len & " rate=" & $rate.int & "/s eta=" & $eta.int & "s"
 
-    if verbose:
-        echo "[TabuState] Built penalty map in " & $(epochTime() - initStart) & "s"
+    if verbose and id == 0:
+        echo "[Init] Built penalty map in " & $(epochTime() - initStart) & "s"
         state.logProfileStats()
-        state.resetProfileStats()  # Reset for search phase
+        state.resetProfileStats()
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false): TabuState[T] =
+proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
-    result.init(carray, verbose)
+    result.init(carray, verbose, id)
 
 ################################################################################
 # Value Assignment
@@ -361,15 +360,12 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
 proc logProgress[T](state: TabuState[T], lastImprovement: int) =
     ## Log search progress periodically
     let now = epochTime()
-    let elapsed = now - state.lastLogTime
-    let itersSinceLog = state.iteration - state.lastLogIteration
     let totalElapsed = now - state.startTime
-    let iterRate = if elapsed > 0: itersSinceLog.float / elapsed else: 0.0
     let overallRate = if totalElapsed > 0: state.iteration.float / totalElapsed else: 0.0
     let stagnation = state.iteration - lastImprovement
 
-    echo &"[Tabu] iter={state.iteration:>7} cost={state.cost:>5} best={state.bestCost:>5} " &
-         &"moves={state.movesExplored:>6} rate={iterRate:>7.0f}/s overall={overallRate:>7.0f}/s stag={stagnation:>5}"
+    echo &"[Tabu S{state.id}] iter={state.iteration:>7} cost={state.bestCost:>5} " &
+         &"rate={overallRate:>7.0f}/s stag={stagnation:>5} elapsed={totalElapsed:>5.1f}s"
 
     state.lastLogTime = now
     state.lastLogIteration = state.iteration
@@ -384,8 +380,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     state.lastLogIteration = 0
 
     if state.verbose:
-        echo &"[Tabu] Starting search: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold}"
-        echo &"[Tabu] Initial cost={state.cost}"
+        echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}"
 
     while state.iteration - lastImprovement < threshold:
         # Check for early termination signal
@@ -397,14 +392,11 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             lastImprovement = state.iteration
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
-            if state.verbose and state.bestCost > 0:
-                let elapsed = epochTime() - state.startTime
-                echo &"[Tabu] IMPROVED at iter={state.iteration} cost={state.bestCost} elapsed={elapsed:.1f}s"
             if state.cost == 0:
                 if state.verbose:
                     let elapsed = epochTime() - state.startTime
                     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-                    echo &"[Tabu] SOLUTION FOUND at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
+                    echo &"[Tabu S{state.id}] Solution found at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
                 return state
         state.iteration += 1
 
@@ -414,7 +406,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
     if state.verbose:
         let elapsed = epochTime() - state.startTime
-        echo &"[Tabu] Search ended: best_cost={state.bestCost} iterations={state.iteration} elapsed={elapsed:.2f}s"
+        let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
+        echo &"[Tabu S{state.id}] Exhausted: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
         state.logProfileStats()
 
     return state

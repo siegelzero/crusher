@@ -2,6 +2,7 @@
 import resolution
 import ../expressions/expressions
 import ../expressions/stateful
+import ../expressions/sumExpression
 import ../constraintSystem
 
 type
@@ -30,7 +31,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var currentTabuThreshold = max(system.lastIterations*multiplier, 1000)
         var hasBoundConstraint = false
 
-        echo "Found initial solution with value ", currentCost
+        echo "[Opt] Initial solution: ", currentCost
 
         # Binary search bounds
         when direction == Minimize:
@@ -41,8 +42,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
         if verbose:
-            echo "Initial iterations: ", system.lastIterations, ", next threshold: ", currentTabuThreshold
-            echo "Binary search range: [", lo, ", ", hi, "]"
+            echo "[Opt] Binary search: [", lo, ", ", hi, "] threshold=", currentTabuThreshold
 
         while lo <= hi:
             let bestSolution = system.assignment
@@ -58,7 +58,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             hasBoundConstraint = true
 
             if verbose:
-                echo "Trying target: ", target, " (range [", lo, ", ", hi, "])"
+                echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
 
             # Use a capped threshold for probing to fail fast on infeasible targets
             let probeThreshold = min(currentTabuThreshold, tabuThreshold)
@@ -74,9 +74,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 objective.initialize(system.assignment)
                 currentCost = objective.value
                 currentTabuThreshold = max(system.lastIterations * multiplier, 1000)
-                echo "Found solution with objective ", objective.value
+                echo "[Opt] Improved: ", objective.value
                 if verbose:
-                    echo "Iterations: ", system.lastIterations, ", next threshold: ", currentTabuThreshold
+                    echo "[Opt] iters=", system.lastIterations, " next_threshold=", currentTabuThreshold
                 when direction == Minimize:
                     hi = currentCost - 1
                 else:
@@ -95,7 +95,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             system.removeLastConstraint()
         system.initialize(system.assignment)
         objective.initialize(system.assignment)
-        echo "Optimization complete. Final optimal value: ", objective.value
+        echo "[Opt] Done: ", objective.value
 
 # Generate minimize and maximize procedures for all stateful expression types
 optimizeImpl(SumExpression, Minimize, minimize)
@@ -121,13 +121,17 @@ template algebraicWrapper(procName: untyped) =
                       lowerBound=low(int),
                       upperBound=high(int),
                       ) =
-        # Convert AlgebraicExpression to StatefulAlgebraicExpression
-        let statefulObjective = newStatefulAlgebraicExpression(objective)
-
-        # Forward all arguments to the template-generated function
-        procName(system, statefulObjective, parallel=parallel, tabuThreshold=tabuThreshold,
-                populationSize=populationSize, numWorkers=numWorkers, verbose=verbose, multiplier=multiplier,
-                lowerBound=lowerBound, upperBound=upperBound)
+        if objective.linear:
+            # Automatically linearize for O(1) incremental updates
+            let linearizedObjective = linearize(objective)
+            procName(system, linearizedObjective, parallel=parallel, tabuThreshold=tabuThreshold,
+                    populationSize=populationSize, numWorkers=numWorkers, verbose=verbose, multiplier=multiplier,
+                    lowerBound=lowerBound, upperBound=upperBound)
+        else:
+            let statefulObjective = newStatefulAlgebraicExpression(objective)
+            procName(system, statefulObjective, parallel=parallel, tabuThreshold=tabuThreshold,
+                    populationSize=populationSize, numWorkers=numWorkers, verbose=verbose, multiplier=multiplier,
+                    lowerBound=lowerBound, upperBound=upperBound)
 
 # Generate AlgebraicExpression wrappers
 algebraicWrapper(minimize)

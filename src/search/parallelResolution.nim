@@ -46,8 +46,7 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
             if pool.solutionFound.load():
                 break
 
-            if pool.verbose:
-                echo &"[Worker {data.workerId}] Processing task {taskIndex}"
+            discard  # Worker picks up task silently
 
             let state = pool.states[taskIndex]
             let startTime = epochTime()
@@ -66,10 +65,6 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
 
             if result.found:
                 pool.solutionFound.store(true)
-                if pool.verbose:
-                    let elapsed = result.endTime - result.startTime
-                    let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
-                    echo &"[Worker {data.workerId}] SOLUTION FOUND! rate={rate:.1f} iter/s"
 
             # Store result in shared array
             withLock pool.resultsLock:
@@ -87,17 +82,12 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                            verbose: bool = false): BatchResult[T] =
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
 
-    if verbose:
-        echo &"[ImproveStates] Starting iterator with {population.len} states, {actualWorkers} workers, tabu threshold: {tabuThreshold}"
+    discard
 
     if population.len > 0:
         # If only one state or one worker, process sequentially
         if population.len == 1 or actualWorkers == 1:
-            if verbose:
-                echo "[ImproveStates] Using sequential processing"
             for i, state in population:
-                if verbose:
-                    echo &"[ImproveStates] Processing state {i}"
                 let startTime = epochTime()
                 let improved = state.tabuImprove(tabuThreshold)
                 let endTime = epochTime()
@@ -112,10 +102,6 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 )
                 yield result
                 if result.found:
-                    if verbose:
-                        let elapsed = result.endTime - result.startTime
-                        let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
-                        echo &"[ImproveStates] Solution found at state {i}, terminating, rate={rate:.1f} iter/s"
                     break
         else:
             # Parallel processing setup
@@ -153,19 +139,11 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 # Yield any new results
                 for i in lastResultCount..<currentResults.len:
                     let result = currentResults[i]
-                    if verbose:
-                        let elapsed = result.endTime - result.startTime
-                        let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
-                        echo &"[ImproveStates] Yielding result: cost={result.cost}, solution={result.found}, rate={rate:.1f} iter/s"
                     yield result
                     inc yieldedResults
 
                     if result.found:
                         pool.solutionFound.store(true)
-                        if verbose:
-                            let elapsed = result.endTime - result.startTime
-                            let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
-                            echo &"[ImproveStates] Solution found, terminating iterator, rate={rate:.1f} iter/s"
                         break
 
                 lastResultCount = currentResults.len
@@ -222,8 +200,6 @@ proc dynamicImprove*[T](population: var seq[TabuState[T]],
             solutionFound = true
             bestResult = result
             bestResultInitialized = true
-            if verbose:
-                echo "[DynamicImprove] Solution found, terminating"
             break
         elif not solutionFound and (not bestResultInitialized or result.cost < bestResult.cost):
             bestResult = result
@@ -248,43 +224,28 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
                         numWorkers: int = 0,
                         tabuThreshold: int = 10000,
                         verbose: bool = false) =
+    let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
     if verbose:
-        let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
-        echo &"[ParallelResolve] Starting with population size: {populationSize}, workers: {actualWorkers}, tabu threshold: {tabuThreshold}"
+        echo &"[Solve] vars={system.baseArray.len} constraints={system.baseArray.constraints.len} pop={populationSize} workers={actualWorkers} threshold={tabuThreshold}"
 
     # Compute reduced domain once
     if system.baseArray.reducedDomain.len == 0:
-        if verbose:
-            echo &"[ParallelResolve] Computing reduced domain for {system.baseArray.len} positions, {system.baseArray.constraints.len} constraints..."
         let reducedDomainStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
         if verbose:
             let reducedTime = epochTime() - reducedDomainStart
-            echo &"[ParallelResolve] Computed reduced domain in {reducedTime:.3f}s"
+            echo &"[Solve] Domain reduction: {reducedTime:.3f}s"
 
     # Create population of TabuStates from deepCopies
     let populationStartTime = epochTime()
-    if verbose:
-        echo &"[ParallelResolve] Creating {populationSize} TabuStates..."
     var population = newSeq[TabuState[T]](populationSize)
     for i in 0..<populationSize:
-        if verbose and i == 0:
-            echo &"[ParallelResolve] Creating state 0..."
-        let copyStart = epochTime()
         let systemCopy = system.deepCopy()
-        if verbose and i == 0:
-            let copyTime = epochTime() - copyStart
-            echo &"[ParallelResolve] deepCopy took {copyTime:.3f}s"
-        let tabuStart = epochTime()
-        population[i] = newTabuState[T](systemCopy.baseArray, verbose)
-        if verbose and i == 0:
-            let tabuTime = epochTime() - tabuStart
-            echo &"[ParallelResolve] newTabuState took {tabuTime:.3f}s"
-            echo &"[ParallelResolve] Initial cost for state 0: {population[0].cost}"
+        population[i] = newTabuState[T](systemCopy.baseArray, verbose, id=i)
 
-    let populationTime = epochTime() - populationStartTime
     if verbose:
-        echo &"[ParallelResolve] Created {populationSize} initial states in {populationTime:.3f}s"
+        let populationTime = epochTime() - populationStartTime
+        echo &"[Solve] Created {populationSize} states in {populationTime:.3f}s"
 
     # Process population in parallel using dynamic dispatcher
     let bestResult = dynamicImprove(population, numWorkers, tabuThreshold, verbose)
@@ -294,16 +255,11 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         if verbose:
             let elapsed = bestResult.endTime - bestResult.startTime
             let rate = if elapsed > 0: bestResult.iterations.float / elapsed else: 0.0
-            echo &"[ParallelResolve] SUCCESS: Found solution with cost 0, rate={rate:.1f} iter/s"
-        # Initialize the system with the found solution
+            echo &"[Solve] Solution found by S{bestResult.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)"
         let solutionCopy = @(bestResult.assignment)
         system.initialize(solutionCopy)
         system.lastIterations = bestResult.iterations
     else:
-        # No perfect solution found - reject partial solutions to match sequential behavior
         if verbose:
-            if bestResult.assignment.len > 0:
-                echo &"[ParallelResolve] FAILED: No valid solution found, best cost achieved was {bestResult.cost}"
-            else:
-                echo &"[ParallelResolve] FAILED: No solution found"
+            echo &"[Solve] Failed: best cost={bestResult.cost}"
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
