@@ -28,7 +28,7 @@ proc coingrid*(n, c: int) =
                 objectiveTerms.add(X[i, j]*(i - j)*(i - j))
 
     let objective = foldl(objectiveTerms, a + b)
-    sys.minimize(objective)
+    sys.minimize(objective, parallel=true, populationSize=10, tabuThreshold=500, verbose=true)
     # let linear = linearize(objective)
 
 

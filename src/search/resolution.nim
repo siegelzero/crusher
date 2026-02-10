@@ -29,7 +29,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             if verbose:
                 echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost})"
                 pool.poolStatistics()
-            if scatterImprove(system, pool, iterations = 3, tabuThreshold, tabuThreshold, actualWorkers, verbose):
+            if scatterImprove(system, pool, scatterThreshold = 3, tabuThreshold, tabuThreshold div 2, actualWorkers, verbose):
                 return
 
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")

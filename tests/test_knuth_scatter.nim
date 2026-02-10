@@ -63,7 +63,7 @@ suite "Knuth 1960 IBM 650 (Scatter Search)":
     sys.addConstraint(50*t[28] - 50*t[27] + x[0] >= 3)
 
     # Use scatter search to find a feasible solution
-    sys.scatterResolve(poolSize = 10, iterations = 10, tabuThreshold = 1000,
+    sys.scatterResolve(poolSize = 10, scatterThreshold = 10, tabuThreshold = 1000,
                        relinkThreshold = 500, verbose = true)
 
     let xSol = x.assignment()

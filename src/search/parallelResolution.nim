@@ -184,44 +184,6 @@ iterator improveStates*[T](population: seq[TabuState[T]],
             for i in 0..<workerData.len:
                 workerData[i].pool = nil
 
-proc dynamicImprove*[T](population: var seq[TabuState[T]],
-                       numWorkers: int = 0,
-                       tabuThreshold: int = 10000,
-                       verbose: bool = false): BatchResult[T] =
-    if population.len == 0:
-        raise newException(ValueError, "Empty population provided to dynamicImprove")
-
-    var bestResult: BatchResult[T]
-    var solutionFound = false
-    var bestResultInitialized = false
-
-    # Use the iterator to process states one by one
-    for result in improveStates(population, numWorkers, tabuThreshold, verbose):
-
-        # Update best result
-        if result.found and not solutionFound:
-            solutionFound = true
-            bestResult = result
-            bestResultInitialized = true
-            break
-        elif not solutionFound and (not bestResultInitialized or result.cost < bestResult.cost):
-            bestResult = result
-            bestResultInitialized = true
-
-    if not bestResultInitialized:
-        # Fallback result if no results were produced
-        bestResult = BatchResult[T](
-            found: false,
-            cost: high(int),
-            assignment: newSeq[T](),
-            workerId: -1,
-            iterations: 0,
-            startTime: 0.0,
-            endTime: 0.0
-        )
-
-    return bestResult
-
 proc parallelResolve*[T](system: ConstraintSystem[T],
                         populationSize: int = 16,
                         numWorkers: int = 0,
@@ -247,7 +209,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     var population = newSeq[TabuState[T]](populationSize)
     for i in 0..<populationSize:
         let systemCopy = system.deepCopy()
-        population[i] = newTabuState[T](systemCopy.baseArray, verbose, id=i)
+        population[i] = newTabuState[T](systemCopy.baseArray, verbose = false, id=i)
 
     if verbose:
         let populationTime = epochTime() - populationStartTime
@@ -256,7 +218,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Collect all results from parallel tabu improvement
     var allResults: seq[PoolEntry[T]] = @[]
 
-    for result in improveStates(population, numWorkers, tabuThreshold, verbose):
+    for result in improveStates(population, numWorkers, tabuThreshold, verbose = false):
         if result.found:
             if verbose:
                 let elapsed = result.endTime - result.startTime

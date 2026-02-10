@@ -145,23 +145,27 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
 
 proc scatterImprove*[T](system: ConstraintSystem[T],
                          pool: var CandidatePool[T],
-                         iterations: int = 3,
+                         scatterThreshold: int = 3,
                          tabuThreshold: int = 10000,
                          relinkThreshold: int = 5000,
                          numWorkers: int = 0,
                          verbose: bool = true): bool =
     ## Run scatter search iterations on an existing pool.
     ## Returns true if solution found (system is initialized).
-    ## Returns false if no solution found (pool contains best efforts).
+    ## Returns false after scatterThreshold iterations without improvement.
 
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
     let totalStart = currentTime()
     let poolSize = pool.entries.len
+    var itersSinceImprovement = 0
+    var iter = 0
 
-    for iter in 0..<iterations:
+    while itersSinceImprovement < scatterThreshold:
         let iterStart = currentTime()
+        let prevBestCost = pool.minCost
+        inc iter
         if verbose:
-            echo &"[Scatter] === Iteration {iter + 1}/{iterations} ==="
+            echo &"[Scatter] === Iteration {iter} (stale={itersSinceImprovement}/{scatterThreshold}) ==="
 
         # a. PATH RELINKING: For each pair, relink both directions
         let relinkStart = currentTime()
@@ -208,8 +212,12 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
         allPathEntries.sort(proc(a, b: PathEntry[T]): int = cmp(a.cost, b.cost))
         var promising: seq[PathEntry[T]] = @[]
         for pe in allPathEntries:
-            if pe.cost > 0:
-                promising.add(pe)
+            if pe.cost == 0:
+                system.initialize(pe.assignment)
+                if verbose:
+                    echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                return true
+            promising.add(pe)
             if promising.len >= maxPromising:
                 break
 
@@ -317,19 +325,27 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
 
         if verbose:
             echo &"[Scatter] Intensification took {currentTime() - intStart:.2f}s"
+
+        # Track improvement
+        if pool.minCost < prevBestCost:
+            itersSinceImprovement = 0
+        else:
+            inc itersSinceImprovement
+
+        if verbose:
             let iterElapsed = currentTime() - iterStart
             pool.poolStatistics()
-            echo &"[Scatter] Iteration {iter + 1} completed in {iterElapsed:.1f}s ({currentTime() - totalStart:.1f}s total)"
+            echo &"[Scatter] Iteration {iter} completed in {iterElapsed:.1f}s ({currentTime() - totalStart:.1f}s total)"
 
     # No solution found
     if verbose:
-        echo &"[Scatter] No solution after {iterations} iterations: best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
+        echo &"[Scatter] No solution after {iter} iterations (stale={scatterThreshold}): best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
     return false
 
 
 proc scatterResolve*[T](system: ConstraintSystem[T],
                          poolSize: int = 10,
-                         iterations: int = 5,
+                         scatterThreshold: int = 5,
                          tabuThreshold: int = 10000,
                          relinkThreshold: int = 5000,
                          numWorkers: int = 0,
@@ -340,7 +356,7 @@ proc scatterResolve*[T](system: ConstraintSystem[T],
     let totalStart = currentTime()
 
     if verbose:
-        echo &"[Scatter] vars={system.baseArray.len} constraints={system.baseArray.constraints.len} pool={poolSize} iters={iterations} threshold={tabuThreshold} relinkThreshold={relinkThreshold} workers={actualWorkers}"
+        echo &"[Scatter] vars={system.baseArray.len} constraints={system.baseArray.constraints.len} pool={poolSize} scatterThreshold={scatterThreshold} threshold={tabuThreshold} relinkThreshold={relinkThreshold} workers={actualWorkers}"
 
     # Compute reduced domain once
     if system.baseArray.reducedDomain.len == 0:
@@ -363,5 +379,5 @@ proc scatterResolve*[T](system: ConstraintSystem[T],
                 return
 
     # 2. Run scatter search iterations
-    if not scatterImprove(system, pool, iterations, tabuThreshold, relinkThreshold, actualWorkers, verbose):
+    if not scatterImprove(system, pool, scatterThreshold, tabuThreshold, relinkThreshold, actualWorkers, verbose):
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with scatter search")

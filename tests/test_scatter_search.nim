@@ -8,7 +8,7 @@ suite "Scatter Search Tests":
         x.setDomain(toSeq(1..5))
         sys.addConstraint(allDifferent(x))
 
-        sys.scatterResolve(poolSize = 6, iterations = 3, tabuThreshold = 1000,
+        sys.scatterResolve(poolSize = 6, scatterThreshold = 3, tabuThreshold = 1000,
                            relinkThreshold = 500, verbose = false)
 
         let solution = x.assignment
@@ -37,7 +37,7 @@ suite "Scatter Search Tests":
             terms.add(x[i] + i)
         sys.addConstraint(allDifferent(terms))
 
-        sys.scatterResolve(poolSize = 6, iterations = 3, tabuThreshold = 2000,
+        sys.scatterResolve(poolSize = 6, scatterThreshold = 3, tabuThreshold = 2000,
                            relinkThreshold = 1000, verbose = false)
 
         let solution = x.assignment
@@ -76,7 +76,7 @@ suite "Scatter Search Tests":
         sys.addConstraint(allDifferent(X))
         X.setDomain(toSeq(1..16))
 
-        sys.scatterResolve(poolSize = 8, iterations = 5, tabuThreshold = 5000,
+        sys.scatterResolve(poolSize = 8, scatterThreshold = 5, tabuThreshold = 5000,
                            relinkThreshold = 2000, verbose = false)
 
         let solution = X.assignment
