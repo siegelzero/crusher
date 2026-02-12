@@ -35,7 +35,7 @@ proc knightsTour*(n: int) =
     sys.addConstraint(allDifferent(x))
     sys.addConstraint(circuit(x))
 
-    sys.resolve(parallel=true, tabuThreshold=100000, verbose=true)
+    sys.resolve(parallel=true, tabuThreshold=2000, verbose=true)
 
     let sol = x.assignment()
 
