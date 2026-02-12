@@ -205,6 +205,13 @@ func sum*[T](cvar: ConstrainedSequence[T]): SumExpression[T] =
     # Constrained Sequence
     return newSumExpression[T](cvar.positions)
 
+func scalarProduct*[T](coefficients: openArray[T], cvar: ConstrainedSequence[T]): SumExpression[T] =
+    ## Returns weighted sum: coefficients[0]*cvar[0] + coefficients[1]*cvar[1] + ...
+    var exprs = newSeq[AlgebraicExpression[T]](cvar.n)
+    for i in 0..<cvar.n:
+        exprs[i] = cvar[i]
+    return scalarProduct[T](coefficients, exprs)
+
 func max*[T](cvar: ConstrainedSequence[T]): MaxExpression[T] =
     # Returns MaxExpression object representing the max of the
     # Constrained Sequence
@@ -223,6 +230,10 @@ proc allDifferent*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # all-different constraint for the variable
     # Returns constraint requiring that all values in the container be distinct.
     allDifferent[T](cvar.positions)
+
+proc allDifferentExcept0*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # all-different-except-0 constraint for the variable
+    allDifferentExcept0[T](cvar.positions)
 
 proc circuit*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # circuit constraint for the variable

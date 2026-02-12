@@ -226,7 +226,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     # RelationalConstraint needs to be evaluated differently
                     # Skip for now - these are typically multi-variable anyway
                     continue
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType:
                     # Skip these constraint types for domain reduction
                     continue
 

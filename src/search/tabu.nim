@@ -90,6 +90,14 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.irdcsState.cost + constraint.irdcsState.moveDelta(position, oldValue, newValue)
         of CircuitType:
             result = constraint.circuitState.cost + constraint.circuitState.moveDelta(position, oldValue, newValue)
+        of AllDifferentExcept0Type:
+            result = constraint.allDifferentExcept0State.cost + constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
+        of LexOrderType:
+            result = constraint.lexOrderState.cost + constraint.lexOrderState.moveDelta(position, oldValue, newValue)
+        of TableConstraintType:
+            result = constraint.tableConstraintState.cost + constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
+        of RegularType:
+            result = constraint.regularState.cost + constraint.regularState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

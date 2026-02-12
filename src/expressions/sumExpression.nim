@@ -195,3 +195,26 @@ func sum*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     else:
         # Use expression-based constraint for complex expressions
         return newSumExpression[T](expressions)
+
+func scalarProduct*[T](coefficients: openArray[T],
+                        expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
+    ## Creates a weighted sum: coefficients[0]*expressions[0] + coefficients[1]*expressions[1] + ...
+    assert coefficients.len == expressions.len, "coefficients and expressions must have same length"
+
+    let (allRefs, positions) = isAllRefs(expressions)
+
+    if allRefs:
+        # Build coefficient table for position-based evaluation
+        var coeffTable = initTable[int, T]()
+        for i, pos in positions:
+            if pos in coeffTable:
+                coeffTable[pos] += coefficients[i]
+            else:
+                coeffTable[pos] = coefficients[i]
+        return newSumExpression[T](coeffTable)
+    else:
+        # Create weighted algebraic expressions
+        var weightedExprs = newSeq[AlgebraicExpression[T]](expressions.len)
+        for i in 0..<expressions.len:
+            weightedExprs[i] = expressions[i] * coefficients[i]
+        return newSumExpression[T](weightedExprs)

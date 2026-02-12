@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -266,6 +266,14 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "IRDCS Constraint"
         of CircuitType:
             return "Circuit Constraint"
+        of AllDifferentExcept0Type:
+            return "AllDifferentExcept0 Constraint"
+        of LexOrderType:
+            return "LexOrder Constraint"
+        of TableConstraintType:
+            return "Table Constraint"
+        of RegularType:
+            return "Regular Constraint"
 
 ################################################################################
 # Evaluation
@@ -303,6 +311,14 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.irdcsState.cost
         of CircuitType:
             return constraint.circuitState.cost
+        of AllDifferentExcept0Type:
+            return constraint.allDifferentExcept0State.cost
+        of LexOrderType:
+            return constraint.lexOrderState.cost
+        of TableConstraintType:
+            return constraint.tableConstraintState.cost
+        of RegularType:
+            return constraint.regularState.cost
 
 ################################################################################
 # Computed Constraints
@@ -879,6 +895,14 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.irdcsState.initialize(assignment)
         of CircuitType:
             constraint.circuitState.initialize(assignment)
+        of AllDifferentExcept0Type:
+            constraint.allDifferentExcept0State.initialize(assignment)
+        of LexOrderType:
+            constraint.lexOrderState.initialize(assignment)
+        of TableConstraintType:
+            constraint.tableConstraintState.initialize(assignment)
+        of RegularType:
+            constraint.regularState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -913,6 +937,14 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.irdcsState.moveDelta(position, oldValue, newValue)
         of CircuitType:
             constraint.circuitState.moveDelta(position, oldValue, newValue)
+        of AllDifferentExcept0Type:
+            constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
+        of LexOrderType:
+            constraint.lexOrderState.moveDelta(position, oldValue, newValue)
+        of TableConstraintType:
+            constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
+        of RegularType:
+            constraint.regularState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -947,6 +979,14 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.irdcsState.updatePosition(position, newValue)
         of CircuitType:
             constraint.circuitState.updatePosition(position, newValue)
+        of AllDifferentExcept0Type:
+            constraint.allDifferentExcept0State.updatePosition(position, newValue)
+        of LexOrderType:
+            constraint.lexOrderState.updatePosition(position, newValue)
+        of TableConstraintType:
+            constraint.tableConstraintState.updatePosition(position, newValue)
+        of RegularType:
+            constraint.regularState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1349,6 +1389,57 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: CircuitType,
                 circuitState: constraint.circuitState.deepCopy()
             )
+        of AllDifferentExcept0Type:
+            case constraint.allDifferentExcept0State.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AllDifferentExcept0Type,
+                        allDifferentExcept0State: newAllDifferentExcept0Constraint[T](constraint.positions.toSeq())
+                    )
+                of ExpressionBased:
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.allDifferentExcept0State.expressions.len)
+                    for i, expr in constraint.allDifferentExcept0State.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AllDifferentExcept0Type,
+                        allDifferentExcept0State: newAllDifferentExcept0Constraint[T](copiedExpressions)
+                    )
+        of LexOrderType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: LexOrderType,
+                lexOrderState: newLexOrderConstraint[T](
+                    constraint.lexOrderState.leftPositions,
+                    constraint.lexOrderState.rightPositions,
+                    constraint.lexOrderState.lexType
+                )
+            )
+        of TableConstraintType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: TableConstraintType,
+                tableConstraintState: newTableConstraint[T](
+                    constraint.tableConstraintState.sortedPositions,
+                    constraint.tableConstraintState.tuples,
+                    constraint.tableConstraintState.mode
+                )
+            )
+        of RegularType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: RegularType,
+                regularState: newRegularConstraint[T](
+                    constraint.regularState.sortedPositions,
+                    constraint.regularState.nStates,
+                    constraint.regularState.inputMin,
+                    constraint.regularState.inputMax,
+                    constraint.regularState.transition,
+                    constraint.regularState.initialState,
+                    constraint.regularState.finalStates.toSeq()
+                )
+            )
 
 
 
@@ -1542,6 +1633,145 @@ func circuit*[T](positions: openArray[int]): StatefulConstraint[T] =
         stateType: CircuitType,
         circuitState: circuitConstraint
     )
+
+################################################################################
+# AllDifferentExcept0 wrapper functions
+################################################################################
+
+func allDifferentExcept0*[T](positions: openArray[int]): StatefulConstraint[T] =
+    ## Creates an AllDifferentExcept0 constraint ensuring all non-zero variables have distinct values.
+    ## Zero values are ignored (any number of variables can be 0).
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: AllDifferentExcept0Type,
+        allDifferentExcept0State: newAllDifferentExcept0Constraint[T](positions)
+    )
+
+func allDifferentExcept0*[T](expressions: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    ## Creates an AllDifferentExcept0 constraint for algebraic expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+    if allRefs:
+        return allDifferentExcept0[T](positions)
+    else:
+        var allPositions = toPackedSet[int]([])
+        for exp in expressions:
+            allPositions.incl(exp.positions)
+        return StatefulConstraint[T](
+            positions: allPositions,
+            stateType: AllDifferentExcept0Type,
+            allDifferentExcept0State: newAllDifferentExcept0Constraint[T](expressions)
+        )
+
+################################################################################
+# LexOrder wrapper functions
+################################################################################
+
+func lexLt*[T](leftPositions, rightPositions: openArray[int]): StatefulConstraint[T] =
+    ## Creates a strict lexicographic ordering constraint: L < R
+    let constraint = newLexOrderConstraint[T](leftPositions, rightPositions, Strict)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: LexOrderType,
+        lexOrderState: constraint
+    )
+
+func lexLe*[T](leftPositions, rightPositions: openArray[int]): StatefulConstraint[T] =
+    ## Creates a non-strict lexicographic ordering constraint: L <= R
+    let constraint = newLexOrderConstraint[T](leftPositions, rightPositions, NonStrict)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: LexOrderType,
+        lexOrderState: constraint
+    )
+
+func lexLt*[T](leftExprs, rightExprs: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    ## Creates a strict lexicographic ordering constraint for expressions.
+    let (allRefsL, positionsL) = isAllRefs(leftExprs)
+    let (allRefsR, positionsR) = isAllRefs(rightExprs)
+    if allRefsL and allRefsR:
+        return lexLt[T](positionsL, positionsR)
+    else:
+        # Fall back to position-based using expression positions
+        # For now, require ref nodes for lex ordering
+        assert allRefsL and allRefsR, "lexLt currently requires simple variable references"
+        return lexLt[T](positionsL, positionsR)
+
+func lexLe*[T](leftExprs, rightExprs: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    ## Creates a non-strict lexicographic ordering constraint for expressions.
+    let (allRefsL, positionsL) = isAllRefs(leftExprs)
+    let (allRefsR, positionsR) = isAllRefs(rightExprs)
+    if allRefsL and allRefsR:
+        return lexLe[T](positionsL, positionsR)
+    else:
+        assert allRefsL and allRefsR, "lexLe currently requires simple variable references"
+        return lexLe[T](positionsL, positionsR)
+
+################################################################################
+# Table constraint wrapper functions
+################################################################################
+
+func tableIn*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-in constraint: variable tuple must match one of the allowed tuples.
+    let constraint = newTableConstraint[T](positions, tuples, TableIn)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: TableConstraintType,
+        tableConstraintState: constraint
+    )
+
+func tableNotIn*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-not-in constraint: variable tuple must NOT match any forbidden tuple.
+    let constraint = newTableConstraint[T](positions, tuples, TableNotIn)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: TableConstraintType,
+        tableConstraintState: constraint
+    )
+
+func tableIn*[T](expressions: seq[AlgebraicExpression[T]], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-in constraint for expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+    if allRefs:
+        return tableIn[T](positions, tuples)
+    else:
+        assert allRefs, "tableIn currently requires simple variable references"
+        return tableIn[T](positions, tuples)
+
+func tableNotIn*[T](expressions: seq[AlgebraicExpression[T]], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-not-in constraint for expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+    if allRefs:
+        return tableNotIn[T](positions, tuples)
+    else:
+        assert allRefs, "tableNotIn currently requires simple variable references"
+        return tableNotIn[T](positions, tuples)
+
+################################################################################
+# Regular constraint wrapper functions
+################################################################################
+
+func regular*[T](positions: openArray[int], nStates: int, inputMin, inputMax: T,
+                  transition: seq[seq[int]], initialState: int,
+                  finalStates: openArray[int]): StatefulConstraint[T] =
+    ## Creates a regular constraint: sequence of variables must be accepted by a DFA.
+    let constraint = newRegularConstraint[T](positions, nStates, inputMin, inputMax,
+                                              transition, initialState, finalStates)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: RegularType,
+        regularState: constraint
+    )
+
+func regular*[T](expressions: seq[AlgebraicExpression[T]], nStates: int, inputMin, inputMax: T,
+                  transition: seq[seq[int]], initialState: int,
+                  finalStates: openArray[int]): StatefulConstraint[T] =
+    ## Creates a regular constraint for expressions.
+    let (allRefs, positions) = isAllRefs(expressions)
+    if allRefs:
+        return regular[T](positions, nStates, inputMin, inputMax, transition, initialState, finalStates)
+    else:
+        assert allRefs, "regular currently requires simple variable references"
+        return regular[T](positions, nStates, inputMin, inputMax, transition, initialState, finalStates)
 
 ################################################################################
 # Boolean Operators for StatefulConstraint
