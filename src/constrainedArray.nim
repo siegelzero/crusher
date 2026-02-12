@@ -373,6 +373,16 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if not changed:
                 break
 
+            # Check for infeasibility: if any domainMin > domainMax, the system
+            # is infeasible and further propagation would diverge
+            var infeasible = false
+            for pos in carray.allPositions():
+                if domainMin[pos] > domainMax[pos]:
+                    infeasible = true
+                    break
+            if infeasible:
+                break
+
         # Apply tightened bounds to PackedSets
         for pos in carray.allPositions():
             var toExclude: seq[T]

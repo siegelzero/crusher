@@ -91,10 +91,10 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
 
 
 proc buildInitialPopulation*[T](system: ConstraintSystem[T],
-                                 size: int,
-                                 tabuThreshold: int,
-                                 numWorkers: int,
-                                 verbose: bool): CandidatePool[T] =
+                                size: int,
+                                tabuThreshold: int,
+                                numWorkers: int,
+                                verbose: bool): CandidatePool[T] =
     ## Create random states, parallel tabu-improve, return best `size` as pool
     let createSize = size * 2
 
@@ -144,12 +144,12 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
 
 
 proc scatterImprove*[T](system: ConstraintSystem[T],
-                         pool: var CandidatePool[T],
-                         scatterThreshold: int = 3,
-                         tabuThreshold: int = 10000,
-                         relinkThreshold: int = 5000,
-                         numWorkers: int = 0,
-                         verbose: bool = true): bool =
+                        pool: var CandidatePool[T],
+                        scatterThreshold: int = 3,
+                        tabuThreshold: int = 10000,
+                        relinkThreshold: int = 5000,
+                        numWorkers: int = 0,
+                        verbose: bool = true): bool =
     ## Run scatter search iterations on an existing pool.
     ## Returns true if solution found (system is initialized).
     ## Returns false after scatterThreshold iterations without improvement.
@@ -344,12 +344,12 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
 
 
 proc scatterResolve*[T](system: ConstraintSystem[T],
-                         poolSize: int = 10,
-                         scatterThreshold: int = 5,
-                         tabuThreshold: int = 10000,
-                         relinkThreshold: int = 5000,
-                         numWorkers: int = 0,
-                         verbose: bool = true) =
+                        poolSize: int = 10,
+                        scatterThreshold: int = 5,
+                        tabuThreshold: int = 10000,
+                        relinkThreshold: int = 5000,
+                        numWorkers: int = 0,
+                        verbose: bool = true) =
     ## Scatter search: population-based metaheuristic combining path relinking with tabu search.
 
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers

@@ -33,7 +33,7 @@ proc magicSquare*(n: int) =
     sys.addConstraint(allDifferent(X))
     X.setDomain(toSeq(1..n*n))
 
-    sys.resolve()
+    sys.resolve(verbose=true, parallel=true, populationSize=16, tabuThreshold=1000)
     echo X
 
 

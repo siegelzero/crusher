@@ -18,6 +18,11 @@ proc resolve*[T](system: ConstraintSystem[T],
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
 
+    # Check for empty domains (infeasible after domain reduction)
+    for pos in system.baseArray.allPositions():
+        if system.baseArray.reducedDomain[pos].len == 0:
+            raise newException(NoSolutionFoundError, "Domain reduction found infeasibility")
+
     if parallel:
         var pool: CandidatePool[T]
         if parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose, pool):
@@ -29,7 +34,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             if verbose:
                 echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost})"
                 pool.poolStatistics()
-            if scatterImprove(system, pool, scatterThreshold = 3, tabuThreshold, tabuThreshold div 2, actualWorkers, verbose):
+            if scatterImprove(system, pool, scatterThreshold = 1, tabuThreshold, tabuThreshold div 2, actualWorkers, verbose):
                 return
 
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
