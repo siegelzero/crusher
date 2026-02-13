@@ -62,7 +62,7 @@ suite "Langford Sequence Tests":
             sys.addConstraint(element(position[i - 1], solution, i))
             sys.addConstraint(element(position[k + i - 1], solution, i))
 
-        sys.resolve(tabuThreshold=10000, parallel=True)
+        sys.resolve(tabuThreshold=10000, parallel=true)
 
         let result = solution.assignment
         echo "Langford sequence K=12: ", result

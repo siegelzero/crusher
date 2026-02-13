@@ -330,3 +330,4 @@ proc getAffectedDomainValues*[T](state: SequenceConstraint[T], position: int): s
     ## is already handled by getAffectedPositions returning empty.
     ## Return empty = "all values need recalculation" (the default).
     return @[]
+
