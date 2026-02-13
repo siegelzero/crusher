@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, strformat, tables]
 
-import constraints/[stateful, algebraic, types]
+import constraints/[stateful, algebraic, ordering, types]
 import constraints/constraintNode
 import constraints/relationalConstraint
 import expressions/expressions
@@ -267,11 +267,41 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     # Pre-extract linear forms from relational constraints
     var linearForms: seq[LinearForm[T]]
     for cons in carray.constraints:
-        if cons.stateType != RelationalType:
-            continue
-        let (success, form) = extractLinearForm(cons.relationalState)
-        if success:
-            linearForms.add(form)
+        if cons.stateType == RelationalType:
+            let (success, form) = extractLinearForm(cons.relationalState)
+            if success:
+                linearForms.add(form)
+        elif cons.stateType == OrderingType:
+            # Add synthetic linear forms for ordering constraints
+            # StrictlyIncreasing: x[p2] - x[p1] >= 1  →  x[p2] - x[p1] - 1 >= 0
+            # Increasing:         x[p2] - x[p1] >= 0
+            # StrictlyDecreasing: x[p1] - x[p2] >= 1  →  x[p1] - x[p2] - 1 >= 0
+            # Decreasing:         x[p1] - x[p2] >= 0
+            let ordState = cons.orderingState
+            if ordState.evalMethod == PositionBased:
+                for i in 0..<(ordState.sortedPositions.len - 1):
+                    let p1 = ordState.sortedPositions[i]
+                    let p2 = ordState.sortedPositions[i + 1]
+                    var coeffs: Table[int, T]
+                    var constant: T
+                    case ordState.orderingType:
+                    of StrictlyIncreasing:
+                        coeffs = {p2: T(1), p1: T(-1)}.toTable
+                        constant = T(-1)
+                    of Increasing:
+                        coeffs = {p2: T(1), p1: T(-1)}.toTable
+                        constant = T(0)
+                    of StrictlyDecreasing:
+                        coeffs = {p1: T(1), p2: T(-1)}.toTable
+                        constant = T(-1)
+                    of Decreasing:
+                        coeffs = {p1: T(1), p2: T(-1)}.toTable
+                        constant = T(0)
+                    linearForms.add(LinearForm[T](
+                        coefficients: coeffs,
+                        constant: constant,
+                        relation: GreaterThanEq
+                    ))
 
     if linearForms.len > 0:
         discard
@@ -392,7 +422,44 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             for v in toExclude:
                 currentDomain[pos].excl(v)
 
-    # Phase 4: Convert PackedSets to output sequences
+    # Phase 4: AllDifferent domain reduction
+    # - Cardinality check: if domain union has fewer values than variables, infeasible
+    # - Singleton propagation: if a variable has exactly one value, remove it from
+    #   all other variables in the same allDifferent constraint. Iterate to fixed point.
+    for cons in carray.constraints:
+        if cons.stateType != AllDifferentType:
+            continue
+        if cons.allDifferentState.evalMethod != PositionBased:
+            continue
+
+        let adPositions = toSeq(cons.positions.items)
+        let k = adPositions.len
+
+        # Cardinality check: union of all domains must have >= k values
+        var domainUnion: PackedSet[T]
+        for pos in adPositions:
+            domainUnion = domainUnion + currentDomain[pos]
+        if domainUnion.len < k:
+            # Infeasible — empty out a domain so resolve detects it
+            currentDomain[adPositions[0]] = initPackedSet[T]()
+
+        # Singleton propagation to fixed point
+        for iteration in 0..<k:
+            var changed = false
+            for pos in adPositions:
+                if currentDomain[pos].len == 1:
+                    var singletonVal: T
+                    for v in currentDomain[pos].items:
+                        singletonVal = v
+                    # Remove this value from all other variables
+                    for otherPos in adPositions:
+                        if otherPos != pos and singletonVal in currentDomain[otherPos]:
+                            currentDomain[otherPos].excl(singletonVal)
+                            changed = true
+            if not changed:
+                break
+
+    # Phase 5: Convert PackedSets to output sequences
     for pos in carray.allPositions():
         reduced[pos] = toSeq(currentDomain[pos])
 

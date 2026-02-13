@@ -18,6 +18,13 @@ proc resolve*[T](system: ConstraintSystem[T],
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        if verbose:
+            var totalOriginal, totalReduced: int
+            for pos in system.baseArray.allPositions():
+                totalOriginal += system.baseArray.domain[pos].len
+                totalReduced += system.baseArray.reducedDomain[pos].len
+            if totalReduced < totalOriginal:
+                echo &"[Solve] Domain reduction: {totalOriginal} -> {totalReduced} values ({100 - totalReduced * 100 div totalOriginal}% reduction)"
 
     # Check for empty domains (infeasible after domain reduction)
     for pos in system.baseArray.allPositions():
