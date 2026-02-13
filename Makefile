@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test test-parallel clean all format
+.PHONY: help test test-parallel csplib clean all format
 
 # Default target
 help:
@@ -12,6 +12,7 @@ help:
 	@echo "  help         - Show this help message"
 	@echo "  test         - Auto-discover and run all test_*.nim files in tests/"
 	@echo "  test-parallel- Run all tests with threading support enabled"
+	@echo "  csplib       - Run CSPLib benchmark tests (csplib/)"
 	@echo "  clean        - Clean all compiled executables"
 	@echo "  format       - Strip trailing whitespace from all *.nim files"
 	@echo "  all          - Run all targets (currently just test)"
@@ -26,6 +27,16 @@ test: clean
 		echo ""; \
 	done
 	@echo "✅ All tests completed successfully!"
+
+csplib: clean
+	@echo "🚀 Running CSPLib benchmark tests..."
+	@echo "====================================="
+	@for test_file in $$(find csplib -name 'test_*.nim' | sort); do \
+		echo "Running $$test_file..."; \
+		nim c -r --threads:on --mm:none --deepcopy:on -d:release $$test_file || exit 1; \
+		echo ""; \
+	done
+	@echo "✅ All CSPLib tests completed successfully!"
 
 test-parallel: clean
 	@echo "🚀 Auto-discovering and running all test files with threading..."

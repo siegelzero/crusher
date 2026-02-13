@@ -10,6 +10,7 @@ when compileOption("threads"):
 
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
+                scatterThreshold: int = 1,
                 parallel: bool = false,
                 populationSize: int = 32,
                 numWorkers: int = 0,
@@ -34,7 +35,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             if verbose:
                 echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost})"
                 pool.poolStatistics()
-            if scatterImprove(system, pool, scatterThreshold = 1, tabuThreshold, tabuThreshold div 2, actualWorkers, verbose):
+            if scatterImprove(system, pool, scatterThreshold, tabuThreshold, tabuThreshold div 2, actualWorkers, verbose):
                 return
 
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")

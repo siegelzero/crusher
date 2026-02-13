@@ -992,12 +992,14 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
     ## Returns positions affected by the last updatePosition call.
     ## For most constraints, this is all positions in the constraint.
-    ## For Cumulative and Geost constraints, returns a smarter subset.
+    ## For Cumulative, Geost, and Sequence constraints, returns a smarter subset.
     case constraint.stateType:
         of CumulativeType:
             return constraint.cumulativeState.getAffectedPositions()
         of GeostType:
             return constraint.geostState.getAffectedPositions()
+        of SequenceType:
+            return constraint.sequenceState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1006,9 +1008,14 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
     ## Returns domain values for `position` that need penalty recalculation after the last change.
     ## For most constraints, returns empty (meaning all values need recalculation).
     ## For Cumulative constraints, returns only values overlapping with the changed time range.
+    ## For GlobalCardinality, returns only the old/new values whose counts changed.
     case constraint.stateType:
         of CumulativeType:
             return constraint.cumulativeState.getAffectedDomainValues(position)
+        of GlobalCardinalityType:
+            return constraint.globalCardinalityState.getAffectedDomainValues(position)
+        of SequenceType:
+            return constraint.sequenceState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1292,6 +1299,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             maxInSet: constraint.sequenceState.maxInSet,
                             windowSize: constraint.sequenceState.windowSize,
                             targetSet: constraint.sequenceState.targetSet,
+                            lastChangedPosition: constraint.sequenceState.lastChangedPosition,
+                            sortedPositions: constraint.sequenceState.sortedPositions,
+                            positionIndex: constraint.sequenceState.positionIndex,
+                            windowCounts: constraint.sequenceState.windowCounts,
+                            lastChangeAffectedWindows: constraint.sequenceState.lastChangeAffectedWindows,
+                            lastOldValue: constraint.sequenceState.lastOldValue,
+                            lastNewValue: constraint.sequenceState.lastNewValue,
                             evalMethod: PositionBased,
                             positions: constraint.sequenceState.positions
                         )
@@ -1311,6 +1325,13 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             maxInSet: constraint.sequenceState.maxInSet,
                             windowSize: constraint.sequenceState.windowSize,
                             targetSet: constraint.sequenceState.targetSet,
+                            lastChangedPosition: constraint.sequenceState.lastChangedPosition,
+                            sortedPositions: constraint.sequenceState.sortedPositions,
+                            positionIndex: constraint.sequenceState.positionIndex,
+                            windowCounts: constraint.sequenceState.windowCounts,
+                            lastChangeAffectedWindows: constraint.sequenceState.lastChangeAffectedWindows,
+                            lastOldValue: constraint.sequenceState.lastOldValue,
+                            lastNewValue: constraint.sequenceState.lastNewValue,
                             evalMethod: ExpressionBased,
                             expressions: copiedExpressions,
                             expressionsAtPosition: constraint.sequenceState.expressionsAtPosition

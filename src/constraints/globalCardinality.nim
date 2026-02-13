@@ -41,6 +41,8 @@ type
         countTable*: Table[T, int]  # Track actual counts of each value
         cover*: seq[T]  # Values to count
         cost*: int
+        lastOldValue*: T  # Track old value from last updatePosition
+        lastNewValue*: T  # Track new value from last updatePosition
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 positions*: PackedSet[int]
@@ -234,6 +236,8 @@ proc initialize*[T](state: GlobalCardinalityConstraint[T], assignment: seq[T]) =
 proc updatePosition*[T](state: GlobalCardinalityConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
+    state.lastOldValue = oldValue
+    state.lastNewValue = newValue
     if oldValue != newValue:
         case state.evalMethod:
             of PositionBased:
@@ -295,3 +299,12 @@ proc moveDelta*[T](state: GlobalCardinalityConstraint[T], position: int, oldValu
 
             # Restore original value
             state.currentAssignment[position] = originalValue
+
+
+proc getAffectedDomainValues*[T](state: GlobalCardinalityConstraint[T], position: int): seq[T] =
+    ## Returns domain values at `position` that need penalty recalculation.
+    ## Only the old and new values from the last update changed their global counts,
+    ## so only those values need recalculation at neighbor positions.
+    if state.lastOldValue == state.lastNewValue:
+        return @[]
+    result = @[state.lastOldValue, state.lastNewValue]

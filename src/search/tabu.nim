@@ -25,6 +25,7 @@ type
         id*: int  # Identifies this state in parallel runs
         carray*: ConstrainedArray[T]
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
+        constraintIdxAt*: seq[Table[pointer, int]]  # [position][constraint_ptr] -> localIdx
         constraints*: seq[StatefulConstraint[T]]
         neighbors*: seq[seq[int]]
         penaltyMap*: seq[Table[T, int]]
@@ -143,11 +144,8 @@ proc updateConstraintAtPositionValues[T](state: TabuState[T], position: int, loc
 
 
 proc findLocalConstraintIdx[T](state: TabuState[T], position: int, constraint: StatefulConstraint[T]): int {.inline.} =
-    ## Find the local index of a constraint at a position by reference identity.
-    for i, c in state.constraintsAtPosition[position]:
-        if cast[pointer](c) == cast[pointer](constraint):
-            return i
-    assert false, "constraint not found at position " & $position
+    ## Find the local index of a constraint at a position via O(1) lookup.
+    return state.constraintIdxAt[position][cast[pointer](constraint)]
 
 
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
@@ -229,6 +227,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for constraint in state.constraints:
         for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
+
+    # Build O(1) constraint index lookup
+    state.constraintIdxAt = newSeq[Table[pointer, int]](carray.len)
+    for pos in carray.allPositions():
+        state.constraintIdxAt[pos] = initTable[pointer, int]()
+        for i, c in state.constraintsAtPosition[pos]:
+            state.constraintIdxAt[pos][cast[pointer](c)] = i
 
     if verbose and id == 0:
         echo "[Init] Built constraintsAtPosition in " & $(epochTime() - initStart) & "s"

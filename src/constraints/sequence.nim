@@ -31,6 +31,13 @@ type
         maxInSet*: int      # u - maximum occurrences in set S within any q consecutive
         windowSize*: int    # q - size of consecutive window
         targetSet*: HashSet[T]  # S - target set of values
+        lastChangedPosition*: int  # Track last changed position for smart neighbor updates
+        sortedPositions*: seq[int]  # Cached sorted position list
+        positionIndex*: Table[int, int]  # position -> index in sortedPositions
+        windowCounts*: seq[int]  # windowCounts[i] = count of values in targetSet for window i
+        lastChangeAffectedWindows*: bool  # did the last update change any window counts?
+        lastOldValue*: T  # For getAffectedDomainValues
+        lastNewValue*: T  # For getAffectedDomainValues
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 positions*: PackedSet[int]
@@ -41,6 +48,11 @@ type
 ################################################################################
 # SequenceConstraint creation
 ################################################################################
+
+func buildPositionIndex[T](state: SequenceConstraint[T]) =
+    state.positionIndex = initTable[int, int]()
+    for i, pos in state.sortedPositions:
+        state.positionIndex[pos] = i
 
 func newSequenceConstraint*[T](positions: openArray[int], minInSet, maxInSet, windowSize: int, targetSet: openArray[T]): SequenceConstraint[T] =
     # Allocates and initializes new SequenceConstraint[T] for positions
@@ -63,7 +75,11 @@ func newSequenceConstraint*[T](positions: openArray[int], minInSet, maxInSet, wi
         windowSize: windowSize,
         targetSet: setTable,
         currentAssignment: initTable[int, T](),
+        lastChangedPosition: -1,
+        sortedPositions: toSeq(positions).sorted(),
+        lastChangeAffectedWindows: true,
     )
+    result.buildPositionIndex()
 
 func newSequenceConstraint*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, windowSize: int, targetSet: openArray[T]): SequenceConstraint[T] =
     # Allocates and initializes new SequenceConstraint[T] for expressions
@@ -87,11 +103,23 @@ func newSequenceConstraint*[T](expressions: seq[AlgebraicExpression[T]], minInSe
         windowSize: windowSize,
         targetSet: setTable,
         currentAssignment: initTable[int, T](),
+        lastChangedPosition: -1,
+        sortedPositions: @[],
+        lastChangeAffectedWindows: true,
     )
 
 ################################################################################
 # SequenceConstraint utility functions
 ################################################################################
+
+func windowViolation(count, minInSet, maxInSet: int): int {.inline.} =
+    ## Returns the violation cost for a window with the given count of target values
+    if count < minInSet:
+        return minInSet - count
+    elif count > maxInSet:
+        return count - maxInSet
+    else:
+        return 0
 
 func countInSet[T](values: openArray[T], targetSet: HashSet[T]): int {.inline.} =
     ## Counts how many values from the array are in the target set
@@ -103,12 +131,7 @@ func countInSet[T](values: openArray[T], targetSet: HashSet[T]): int {.inline.} 
 func getWindowViolation[T](state: SequenceConstraint[T], window: openArray[T]): int {.inline.} =
     ## Returns the violation cost for a single window
     let countInTargetSet = countInSet(window, state.targetSet)
-    if countInTargetSet < state.minInSet:
-        return state.minInSet - countInTargetSet
-    elif countInTargetSet > state.maxInSet:
-        return countInTargetSet - state.maxInSet
-    else:
-        return 0
+    return windowViolation(countInTargetSet, state.minInSet, state.maxInSet)
 
 ################################################################################
 # SequenceConstraint initialization and updates
@@ -127,14 +150,16 @@ proc initialize*[T](state: SequenceConstraint[T], assignment: seq[T]) =
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
 
-            # Calculate cost by checking all consecutive windows
-            let positionList = state.positions.toSeq().sorted()
-            if positionList.len >= state.windowSize:
-                for i in 0..(positionList.len - state.windowSize):
-                    var window = newSeq[T](state.windowSize)
-                    for j in 0..<state.windowSize:
-                        window[j] = assignment[positionList[i + j]]
-                    state.cost += getWindowViolation(state, window)
+            # Calculate cost and build windowCounts
+            let nWindows = max(0, state.sortedPositions.len - state.windowSize + 1)
+            state.windowCounts = newSeq[int](nWindows)
+            for i in 0..<nWindows:
+                var count = 0
+                for j in 0..<state.windowSize:
+                    if assignment[state.sortedPositions[i + j]] in state.targetSet:
+                        count += 1
+                state.windowCounts[i] = count
+                state.cost += windowViolation(count, state.minInSet, state.maxInSet)
 
         of ExpressionBased:
             # Store assignment for all positions that affect expressions
@@ -151,39 +176,38 @@ proc initialize*[T](state: SequenceConstraint[T], assignment: seq[T]) =
 
 proc updatePosition*[T](state: SequenceConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
+    state.lastChangedPosition = position
     let oldValue = state.currentAssignment.getOrDefault(position, T(0))
+    state.lastOldValue = oldValue
+    state.lastNewValue = newValue
     if oldValue != newValue:
         case state.evalMethod:
             of PositionBased:
                 state.currentAssignment[position] = newValue
 
-                # Recalculate cost for all windows that include this position
-                let positionList = state.positions.toSeq().sorted()
-                let posIndex = positionList.find(position)
-                if posIndex >= 0:
-                    # Find all windows that include this position
-                    let startWindow = max(0, posIndex - state.windowSize + 1)
-                    let endWindow = min(posIndex, positionList.len - state.windowSize)
+                let posIdx = state.positionIndex.getOrDefault(position, -1)
+                if posIdx >= 0:
+                    let oldInSet = oldValue in state.targetSet
+                    let newInSet = newValue in state.targetSet
+                    state.lastChangeAffectedWindows = (oldInSet != newInSet)
 
-                    # Subtract old window costs and add new ones
-                    for i in startWindow..endWindow:
-                        # Calculate old window cost
-                        var oldWindow = newSeq[T](state.windowSize)
-                        for j in 0..<state.windowSize:
-                            if positionList[i + j] == position:
-                                oldWindow[j] = oldValue
-                            else:
-                                oldWindow[j] = state.currentAssignment[positionList[i + j]]
-                        state.cost -= getWindowViolation(state, oldWindow)
+                    if oldInSet != newInSet:
+                        let countDelta = if newInSet: 1 else: -1
+                        let nWindows = state.sortedPositions.len - state.windowSize + 1
+                        let startW = max(0, posIdx - state.windowSize + 1)
+                        let endW = min(posIdx, nWindows - 1)
 
-                        # Calculate new window cost
-                        var newWindow = newSeq[T](state.windowSize)
-                        for j in 0..<state.windowSize:
-                            newWindow[j] = state.currentAssignment[positionList[i + j]]
-                        state.cost += getWindowViolation(state, newWindow)
+                        for i in startW..endW:
+                            let oldCount = state.windowCounts[i]
+                            let newCount = oldCount + countDelta
+                            state.cost -= windowViolation(oldCount, state.minInSet, state.maxInSet)
+                            state.cost += windowViolation(newCount, state.minInSet, state.maxInSet)
+                            state.windowCounts[i] = newCount
+                    # else: no window counts change, cost stays the same
 
             of ExpressionBased:
                 state.currentAssignment[position] = newValue
+                state.lastChangeAffectedWindows = true  # conservative for expressions
 
                 # Recalculate cost for all windows that are affected by this position change
                 if position in state.expressionsAtPosition:
@@ -208,37 +232,31 @@ proc updatePosition*[T](state: SequenceConstraint[T], position: int, newValue: T
                             for j in 0..<state.windowSize:
                                 newWindow[j] = state.expressions[i + j].evaluate(state.currentAssignment)
                             state.cost += getWindowViolation(state, newWindow)
+    else:
+        state.lastChangeAffectedWindows = false
 
 func simulateWindowChange[T](state: SequenceConstraint[T], position: int, oldValue, newValue: T): int =
     ## Helper function to simulate cost change when updating a position
     var delta = 0
     case state.evalMethod:
         of PositionBased:
-            let positionList = state.positions.toSeq().sorted()
-            let posIndex = positionList.find(position)
-            if posIndex >= 0:
-                # Find all windows that include this position
-                let startWindow = max(0, posIndex - state.windowSize + 1)
-                let endWindow = min(posIndex, positionList.len - state.windowSize)
+            let oldInSet = oldValue in state.targetSet
+            let newInSet = newValue in state.targetSet
+            if oldInSet == newInSet:
+                return 0  # No window counts change → delta is always 0
 
-                for i in startWindow..endWindow:
-                    # Calculate old window cost
-                    var oldWindow = newSeq[T](state.windowSize)
-                    for j in 0..<state.windowSize:
-                        if positionList[i + j] == position:
-                            oldWindow[j] = oldValue
-                        else:
-                            oldWindow[j] = state.currentAssignment[positionList[i + j]]
-                    delta -= getWindowViolation(state, oldWindow)
+            let countDelta = if newInSet: 1 else: -1
+            let posIdx = state.positionIndex.getOrDefault(position, -1)
+            if posIdx >= 0:
+                let nWindows = state.sortedPositions.len - state.windowSize + 1
+                let startW = max(0, posIdx - state.windowSize + 1)
+                let endW = min(posIdx, nWindows - 1)
 
-                    # Calculate new window cost
-                    var newWindow = newSeq[T](state.windowSize)
-                    for j in 0..<state.windowSize:
-                        if positionList[i + j] == position:
-                            newWindow[j] = newValue
-                        else:
-                            newWindow[j] = state.currentAssignment[positionList[i + j]]
-                    delta += getWindowViolation(state, newWindow)
+                for i in startW..endW:
+                    let oldCount = state.windowCounts[i]
+                    let newCount = oldCount + countDelta
+                    delta -= windowViolation(oldCount, state.minInSet, state.maxInSet)
+                    delta += windowViolation(newCount, state.minInSet, state.maxInSet)
 
         of ExpressionBased:
             if position in state.expressionsAtPosition:
@@ -273,3 +291,42 @@ func simulateWindowChange[T](state: SequenceConstraint[T], position: int, oldVal
 func moveDelta*[T](state: SequenceConstraint[T], position: int, oldValue, newValue: T): int =
     # Returns cost delta for changing position from oldValue to newValue
     return simulateWindowChange(state, position, oldValue, newValue)
+
+
+proc getAffectedPositions*[T](state: SequenceConstraint[T]): PackedSet[int] =
+    ## Returns positions affected by the last updatePosition call.
+    ## Only positions sharing a window with lastChangedPosition need updates:
+    ## positions within [posIndex - windowSize + 1, posIndex + windowSize - 1]
+    ## in the sorted position list.
+    if state.lastChangedPosition < 0:
+        return state.positions
+
+    # If the last change didn't affect any window counts, no neighbors need updating
+    if not state.lastChangeAffectedWindows:
+        return initPackedSet[int]()
+
+    case state.evalMethod:
+        of PositionBased:
+            let posIndex = state.positionIndex.getOrDefault(state.lastChangedPosition, -1)
+            if posIndex < 0:
+                return state.positions
+
+            let startIdx = max(0, posIndex - state.windowSize + 1)
+            let endIdx = min(state.sortedPositions.len - 1, posIndex + state.windowSize - 1)
+
+            result = initPackedSet[int]()
+            for i in startIdx..endIdx:
+                result.incl(state.sortedPositions[i])
+
+        of ExpressionBased:
+            # For expression-based, fall back to all positions
+            return state.positions
+
+proc getAffectedDomainValues*[T](state: SequenceConstraint[T], position: int): seq[T] =
+    ## Returns domain values that need penalty recalculation.
+    ## When window counts changed (target-set membership flipped), ALL values at
+    ## neighbor positions need recalculation because the baseline window counts shifted.
+    ## When window counts didn't change, nothing needs recalculation — but that case
+    ## is already handled by getAffectedPositions returning empty.
+    ## Return empty = "all values need recalculation" (the default).
+    return @[]
