@@ -16,6 +16,17 @@ func newAlgebraicExpression*[T](positions: PackedSet[int],
 # Unary Expression Operations
 func `-`*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} = -1*expression
 
+func abs*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
+    newAlgebraicExpression[T](
+        positions=expression.positions,
+        node=ExpressionNode[T](
+            kind: UnaryOpNode,
+            unaryOp: AbsoluteValue,
+            target: expression.node
+        ),
+        linear=false
+    )
+
 # Binary (Expression, Expression) Operations
 template ExpExpOp(op, opref: untyped) =
     func `op`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
