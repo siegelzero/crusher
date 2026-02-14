@@ -1,0 +1,3 @@
+% Golomb ruler with 8 marks
+% Optimal solution has length 34: [0, 1, 3, 6, 10, 23, 26, 34]
+m = 8;

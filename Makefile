@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test test-parallel csplib clean all format
+.PHONY: help test test-parallel csplib clean all format fzcrusher
 
 # Default target
 help:
@@ -15,6 +15,7 @@ help:
 	@echo "  csplib       - Run CSPLib benchmark tests (csplib/)"
 	@echo "  clean        - Clean all compiled executables"
 	@echo "  format       - Strip trailing whitespace from all *.nim files"
+	@echo "  fzcrusher    - Build the FlatZinc solver binary"
 	@echo "  all          - Run all targets (currently just test)"
 	@echo ""
 
@@ -60,6 +61,10 @@ format:
 	@echo "🎨 Stripping trailing whitespace from *.nim files..."
 	@find . -name "*.nim" -type f -exec sed -i '' 's/[[:space:]]*$$//' {} \;
 	@echo "✅ Formatting complete"
+
+# Build the FlatZinc solver binary
+fzcrusher:
+	nim c --threads:on --mm:arc --deepcopy:on -d:release -o:fzcrusher src/fzcrusher.nim
 
 # Run all targets
 all: test

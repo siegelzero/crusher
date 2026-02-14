@@ -1,0 +1,28 @@
+% Small car sequencing instance
+% 10 cars, 5 options, 6 classes
+% Classic example from the literature (Dincbas, Simonis & van Hentenryck, 1988)
+%
+% Options capacity constraints:
+%   Option 1: at most 1 out of 2 consecutive cars
+%   Option 2: at most 2 out of 3 consecutive cars
+%   Option 3: at most 1 out of 3 consecutive cars
+%   Option 4: at most 2 out of 5 consecutive cars
+%   Option 5: at most 1 out of 5 consecutive cars
+
+numcars = 10;
+numoptions = 5;
+numclasses = 6;
+
+numberPerClass = [1, 1, 2, 2, 2, 2];
+
+optionsRequired = array2d(Classes, Options, [
+  1, 0, 1, 1, 0,
+  0, 0, 0, 1, 0,
+  0, 1, 0, 0, 1,
+  0, 1, 0, 1, 0,
+  1, 0, 1, 0, 0,
+  1, 1, 0, 0, 0
+]);
+
+windowSize = [2, 3, 3, 5, 5];
+optMax = [1, 2, 1, 2, 1];

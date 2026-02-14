@@ -1,0 +1,11 @@
+{
+  "id": "org.crusher.crusher",
+  "name": "Crusher",
+  "version": "1.0.0",
+  "mznlib": "mznlib",
+  "executable": "../fzcrusher",
+  "tags": ["cp", "int"],
+  "stdFlags": ["-a", "-s", "-v", "-p"],
+  "inputType": "FZN",
+  "needsSolns2Out": true
+}
