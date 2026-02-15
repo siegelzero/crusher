@@ -994,6 +994,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
     ## For most constraints, this is all positions in the constraint.
     ## For Cumulative, Geost, and Sequence constraints, returns a smarter subset.
     case constraint.stateType:
+        of AllDifferentType:
+            return constraint.allDifferentState.getAffectedPositions()
         of CumulativeType:
             return constraint.cumulativeState.getAffectedPositions()
         of GeostType:
@@ -1010,6 +1012,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
     ## For Cumulative constraints, returns only values overlapping with the changed time range.
     ## For GlobalCardinality, returns only the old/new values whose counts changed.
     case constraint.stateType:
+        of AllDifferentType:
+            return constraint.allDifferentState.getAffectedDomainValues(position)
         of CumulativeType:
             return constraint.cumulativeState.getAffectedDomainValues(position)
         of GlobalCardinalityType:

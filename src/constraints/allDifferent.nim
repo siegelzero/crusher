@@ -40,12 +40,20 @@ type
         currentAssignment*: Table[int, T]
         countTable: Table[T, int]
         cost*: int
+        lastOldValue*: T
+        lastNewValue*: T
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 positions: PackedSet[int]
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition: Table[int, seq[int]]
+                # Cached expression values and coefficients for O(1) moveDelta
+                exprValues*: seq[T]  # cached current expression values
+                exprCoeffs*: seq[Table[int, T]]  # [expr_idx][position] -> coefficient
+                exprConstants*: seq[T]  # constant term per expression
+                allLinear*: bool  # true if all expressions are linear
+                lastAffectedPositions*: PackedSet[int]  # positions affected by last updatePosition
 
 ################################################################################
 # AllDifferentConstraint creation
@@ -75,6 +83,26 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
     )
 
     result.expressionsAtPosition = buildExpressionPositionMap(expressions)
+
+    # Extract linear coefficients for O(1) moveDelta
+    result.allLinear = true
+    result.exprValues = newSeq[T](expressions.len)
+    result.exprCoeffs = newSeq[Table[int, T]](expressions.len)
+    result.exprConstants = newSeq[T](expressions.len)
+    for i, expr in expressions:
+        result.exprCoeffs[i] = initTable[int, T]()
+        if expr.linear:
+            # Extract coefficients by probing
+            var assignment = initTable[int, T]()
+            for pos in expr.positions.items:
+                assignment[pos] = T(0)
+            result.exprConstants[i] = expr.evaluate(assignment)
+            for pos in expr.positions.items:
+                assignment[pos] = T(1)
+                result.exprCoeffs[i][pos] = expr.evaluate(assignment) - result.exprConstants[i]
+                assignment[pos] = T(0)
+        else:
+            result.allLinear = false
 
 ################################################################################
 # AllDifferentConstraint utility functions
@@ -111,8 +139,9 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
             for pos in state.expressionsAtPosition.keys:
                 state.currentAssignment[pos] = assignment[pos]
 
-            for exp in state.expressions:
+            for i, exp in state.expressions:
                 value = exp.evaluate(state.currentAssignment)
+                state.exprValues[i] = value
                 incrementCount(state.countTable, value)
 
     # Calculate cost from count table for both methods
@@ -123,6 +152,8 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
 proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
+    state.lastOldValue = oldValue
+    state.lastNewValue = newValue
     if oldValue != newValue:
         case state.evalMethod:
             of PositionBased:
@@ -130,11 +161,19 @@ proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValu
                 state.adjustCounts(oldValue, newValue)
 
             of ExpressionBased:
+                state.lastAffectedPositions = initPackedSet[int]()
                 var oldExpValue, newExpValue: T
                 for i in state.expressionsAtPosition[position]:
-                    oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                    for pos in state.expressions[i].positions.items:
+                        state.lastAffectedPositions.incl(pos)
+                    oldExpValue = state.exprValues[i]
                     state.currentAssignment[position] = newValue
-                    newExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                    if state.allLinear:
+                        let coeff = state.exprCoeffs[i][position]
+                        newExpValue = oldExpValue + coeff * (newValue - oldValue)
+                    else:
+                        newExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                    state.exprValues[i] = newExpValue
                     state.adjustCounts(oldExpValue, newExpValue)
 
 
@@ -160,18 +199,41 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
 
         of ExpressionBased:
             for i in state.expressionsAtPosition[position]:
-                oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                oldExpValue = state.exprValues[i]
 
                 oldValueCount = getCount(state.countTable, oldExpValue)
                 result -= oldValueCount - 1
                 oldValueCount -= 1
                 result += max(0, oldValueCount - 1)
 
-                state.currentAssignment[position] = newValue
-                newExpValue = state.expressions[i].evaluate(state.currentAssignment)
-                state.currentAssignment[position] = oldValue
+                if state.allLinear:
+                    let coeff = state.exprCoeffs[i][position]
+                    newExpValue = oldExpValue + coeff * (newValue - oldValue)
+                else:
+                    state.currentAssignment[position] = newValue
+                    newExpValue = state.expressions[i].evaluate(state.currentAssignment)
+                    state.currentAssignment[position] = oldValue
 
                 newValueCount = getCount(state.countTable, newExpValue)
                 result -= max(0, newValueCount - 1)
                 newValueCount += 1
                 result += newValueCount - 1
+
+
+func getAffectedPositions*[T](state: AllDifferentConstraint[T]): PackedSet[int] =
+    case state.evalMethod:
+        of PositionBased:
+            return state.positions
+        of ExpressionBased:
+            return state.lastAffectedPositions
+
+
+func getAffectedDomainValues*[T](state: AllDifferentConstraint[T], position: int): seq[T] =
+    ## Returns only the old/new values whose counts changed, unless this position's
+    ## current value is one of them (in which case all values are affected since the
+    ## baseline removal cost changes).
+    let curVal = state.currentAssignment[position]
+    if curVal == state.lastOldValue or curVal == state.lastNewValue:
+        return @[]  # All values affected
+    else:
+        return @[state.lastOldValue, state.lastNewValue]

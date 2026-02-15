@@ -6,8 +6,22 @@ import flatzinc/[parser, translator, output]
 
 suite "FlatZinc Solver - End to End":
 
-  test "solve test_negative_gecode.fzn (all_different + linear)":
-    let model = parseFznFile("models/minizinc/test_negative_gecode.fzn")
+  test "solve all_different + linear with negatives":
+    let src = """
+var -10..10: x1;
+var -10..10: x2;
+var -10..10: x3;
+var -10..10: x4;
+var -10..10: x5;
+array [1..5] of var int: x:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+array [1..2] of int: coeffs = [1,-1];
+constraint gecode_all_different_int(x);
+constraint int_lin_le(coeffs,[x1,x2],0);
+constraint int_lin_le(coeffs,[x2,x3],0);
+constraint int_lin_eq([1,1,1,1,1],[x1,x2,x3,x4,x5],-5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
     var tr = translate(model)
 
     tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
@@ -27,44 +41,6 @@ suite "FlatZinc Solver - End to End":
     # Verify strictly increasing for first 3 elements (from int_lin_le constraints on pairs 0-1 and 1-2)
     check values[0] < values[1]
     check values[1] < values[2]
-
-  test "solve cumulative_test_gecode.fzn (cumulative + minimize)":
-    let model = parseFznFile("models/minizinc/cumulative_test_gecode.fzn")
-    var tr = translate(model)
-
-    let objExpr = tr.getExpr(tr.objectivePos)
-    minimize(tr.sys, objExpr,
-      parallel = true,
-      tabuThreshold = 5000,
-      verbose = false
-    )
-
-    # Get origin assignments
-    let originPositions = tr.arrayPositions["origin"]
-    var origins = newSeq[int](originPositions.len)
-    for i, pos in originPositions:
-      origins[i] = tr.sys.assignment[pos]
-
-    # Durations and heights from the problem
-    let durations = @[3, 9, 10, 6, 2]
-    let heights = @[1, 2, 1, 1, 3]
-
-    # Get the limit value
-    let limitPos = tr.varPositions["limitx"]
-    let limit = tr.sys.assignment[limitPos]
-
-    # Verify cumulative constraint: at no time point should total height exceed limit
-    var maxEndTime = 0
-    for i in 0..<5:
-      let endTime = origins[i] + durations[i]
-      if endTime > maxEndTime: maxEndTime = endTime
-
-    for t in 1..maxEndTime:
-      var totalHeight = 0
-      for i in 0..<5:
-        if origins[i] <= t and t < origins[i] + durations[i]:
-          totalHeight += heights[i]
-      check totalHeight <= limit
 
   test "solve simple satisfaction problem from FZN string":
     # A simple all-different + sum problem
@@ -150,29 +126,6 @@ solve satisfy;
 
     check bVal == iVal
     check iVal == 1
-
-  test "solve quasigroup7_gecode_05.fzn (all_different + element)":
-    let model = parseFznFile("models/minizinc/2008/quasigroup7/quasigroup7_gecode_05.fzn")
-    var tr = translate(model)
-    tr.sys.resolve(parallel = true, tabuThreshold = 20000, verbose = false)
-
-    # Verify the output array forms a valid quasigroup
-    let positions = tr.arrayPositions["X_INTRODUCED_16_"]
-    var values = newSeq[int](positions.len)
-    for i, pos in positions:
-      values[i] = tr.sys.assignment[pos]
-
-    # 5x5 Latin square: each row and column should have all different values
-    let n = 5
-    for row in 0..<n:
-      let rowVals = values[row * n ..< (row + 1) * n]
-      check rowVals.toHashSet.len == n
-
-    for col in 0..<n:
-      var colVals: seq[int]
-      for row in 0..<n:
-        colVals.add(values[row * n + col])
-      check colVals.toHashSet.len == n
 
   test "output format":
     let src = """

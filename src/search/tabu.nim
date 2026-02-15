@@ -245,6 +245,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if pcount > maxPositions:
                 maxPositions = pcount
         echo "[Init] Constraints: " & $state.constraints.len & " total, max_pos=" & $maxPositions & " avg_pos=" & $(totalPositions div max(1, state.constraints.len))
+        var maxConsAtPos = 0
+        var totalConsAtPos = 0
+        for pos in carray.allPositions():
+            let cnt = state.constraintsAtPosition[pos].len
+            totalConsAtPos += cnt
+            if cnt > maxConsAtPos:
+                maxConsAtPos = cnt
+        echo "[Init] Constraints per position: max=" & $maxConsAtPos & " avg=" & $(totalConsAtPos div max(1, carray.len))
         initStart = epochTime()
 
     # Skip expensive neighbor precomputation - compute lazily during search
@@ -317,19 +325,16 @@ proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: 
 ################################################################################
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
-    let oldValue = state.assignment[position]
-
-    # Compute delta directly from moveDelta (avoids stale penaltyMap values)
-    var delta = 0
-    for constraint in state.constraintsAtPosition[position]:
-        delta += constraint.moveDelta(position, oldValue, value)
-
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
         constraint.updatePosition(position, value)
 
-    state.cost += delta
+    # Recompute true cost from constraint penalties (avoids accumulated moveDelta errors
+    # with expression-based constraints where multiple expressions share a position)
+    state.cost = 0
+    for constraint in state.constraints:
+        state.cost += constraint.penalty()
 
     state.updatePenaltiesForPosition(position)
     state.updateNeighborPenalties(position)

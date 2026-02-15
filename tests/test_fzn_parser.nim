@@ -133,10 +133,24 @@ solve satisfy;
     let model = parseFzn(src)
     check model.variables.len == 1
 
-  test "parse test_negative_gecode.fzn":
-    let model = parseFznFile("models/minizinc/test_negative_gecode.fzn")
+  test "parse negative domains inline":
+    let src = """
+var -10..10: x1;
+var -10..10: x2;
+var -10..10: x3;
+var -10..10: x4;
+var -10..10: x5;
+array [1..5] of var int: x:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+array [1..2] of int: coeffs = [1,-1];
+constraint gecode_all_different_int(x);
+constraint int_lin_le(coeffs,[x1,x2],0);
+constraint int_lin_le(coeffs,[x2,x3],0);
+constraint int_lin_eq([1,1,1,1,1],[x1,x2,x3,x4,x5],-5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
     check model.variables.len == 6  # 5 scalar vars + 1 array
-    check model.parameters.len == 2  # 2 constant arrays
+    check model.parameters.len == 1  # 1 constant array
     check model.constraints.len == 4
     check model.solve.kind == Satisfy
 
@@ -151,8 +165,16 @@ solve satisfy;
     check model.constraints[2].name == "int_lin_le"
     check model.constraints[3].name == "int_lin_eq"
 
-  test "parse cumulative_test_gecode.fzn":
-    let model = parseFznFile("models/minizinc/cumulative_test_gecode.fzn")
+  test "parse cumulative inline":
+    let src = """
+var 0..20: s1;
+var 0..20: s2;
+var 0..20: limitx:: output_var;
+array [1..2] of var int: origin:: output_array([1..2]) = [s1,s2];
+constraint fzn_cumulative(origin,[3,5],[2,1],limitx);
+solve minimize limitx;
+"""
+    let model = parseFzn(src)
     check model.solve.kind == Minimize
     check model.solve.objective.kind == FznIdent
 

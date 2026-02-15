@@ -209,7 +209,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     var population = newSeq[TabuState[T]](populationSize)
     for i in 0..<populationSize:
         let systemCopy = system.deepCopy()
-        population[i] = newTabuState[T](systemCopy.baseArray, verbose = false, id=i)
+        population[i] = newTabuState[T](systemCopy.baseArray, verbose = (verbose and i == 0), id=i)
 
     if verbose:
         let populationTime = epochTime() - populationStartTime

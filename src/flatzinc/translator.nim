@@ -1,6 +1,6 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets]
 
 import parser
 import ../constraintSystem
@@ -27,18 +27,26 @@ type
     model*: FznModel
     # Objective expression position (for minimize/maximize)
     objectivePos*: int
+    # Maps defined variable name -> defining AlgebraicExpression (for defines_var elimination)
+    definedVarExprs*: Table[string, AlgebraicExpression[int]]
+    # Set of constraint indices that are defining constraints (to skip during translation)
+    definingConstraints*: PackedSet[int]
+    # Maps array name -> element variable names (for resolving defined vars in arrays)
+    arrayElementNames*: Table[string, seq[string]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
 
 proc resolveExprArg*(tr: FznTranslator, arg: FznExpr): AlgebraicExpression[int] =
   ## Resolves a FznExpr to an AlgebraicExpression.
-  ## For identifiers: looks up variable position.
+  ## For identifiers: looks up variable position, or returns defining expression for defined vars.
   ## For int literals: creates a literal expression with no positions.
   ## For bool literals: true=1, false=0.
   case arg.kind
   of FznIdent:
-    if arg.ident in tr.varPositions:
+    if arg.ident in tr.definedVarExprs:
+      return tr.definedVarExprs[arg.ident]
+    elif arg.ident in tr.varPositions:
       return tr.getExpr(tr.varPositions[arg.ident])
     elif arg.ident in tr.paramValues:
       let val = tr.paramValues[arg.ident]
@@ -108,7 +116,13 @@ proc resolveExprArray*(tr: FznTranslator, arg: FznExpr): seq[AlgebraicExpression
       result = newSeq[AlgebraicExpression[int]](positions.len)
       for i, pos in positions:
         if pos == -1:
-          raise newException(ValueError, &"Array '{arg.ident}' contains constants mixed with variables")
+          # Defined variable - use defining expression
+          if arg.ident in tr.arrayElementNames:
+            let elemName = tr.arrayElementNames[arg.ident][i]
+            if elemName in tr.definedVarExprs:
+              result[i] = tr.definedVarExprs[elemName]
+              continue
+          raise newException(ValueError, &"Array '{arg.ident}' element {i} has no position or defining expression")
         result[i] = tr.getExpr(pos)
     elif arg.ident in tr.arrayValues:
       # Constant array - create literal expressions
@@ -183,36 +197,9 @@ proc stripSolverPrefix(name: string): string =
       return "fzn_" & stripped
   return name
 
-proc translateVariables(tr: var FznTranslator) =
-  ## Creates ConstrainedVariables for all FZN variable declarations and sets domains.
-
-  # First pass: create all variables (non-array)
-  for decl in tr.model.variables:
-    if decl.isArray:
-      continue
-    let pos = tr.sys.baseArray.len
-    let v = tr.sys.newConstrainedVariable()
-    tr.varPositions[decl.name] = pos
-
-    # Set domain based on type
-    case decl.varType.kind
-    of FznIntRange:
-      v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
-    of FznIntSet:
-      v.setDomain(decl.varType.values)
-    of FznBool:
-      v.setDomain(@[0, 1])
-    of FznInt:
-      # Unbounded int - use a reasonable range
-      v.setDomain(toSeq(-1000..1000))
-    else:
-      v.setDomain(toSeq(-100..100))
-
-    # Check for output annotations
-    if decl.hasAnnotation("output_var"):
-      tr.outputVars.add(decl.name)
-
-  # Process parameter declarations (constant values and arrays)
+proc translateParameters(tr: var FznTranslator) =
+  ## Process parameter declarations (constant values and arrays).
+  ## Must be called before collectDefinedVars since it needs resolveIntArray.
   for decl in tr.model.parameters:
     if decl.isArray:
       if decl.value != nil and decl.value.kind == FznArrayLit:
@@ -242,6 +229,38 @@ proc translateVariables(tr: var FznTranslator) =
         else:
           discard
 
+proc translateVariables(tr: var FznTranslator) =
+  ## Creates ConstrainedVariables for all FZN variable declarations and sets domains.
+
+  # First pass: create all variables (non-array), skipping defined variables
+  for decl in tr.model.variables:
+    if decl.isArray:
+      continue
+    # Skip variables that will be replaced by defining expressions
+    if decl.name in tr.definedVarExprs:
+      continue
+    let pos = tr.sys.baseArray.len
+    let v = tr.sys.newConstrainedVariable()
+    tr.varPositions[decl.name] = pos
+
+    # Set domain based on type
+    case decl.varType.kind
+    of FznIntRange:
+      v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
+    of FznIntSet:
+      v.setDomain(decl.varType.values)
+    of FznBool:
+      v.setDomain(@[0, 1])
+    of FznInt:
+      # Unbounded int - use a reasonable range
+      v.setDomain(toSeq(-1000..1000))
+    else:
+      v.setDomain(toSeq(-100..100))
+
+    # Check for output annotations
+    if decl.hasAnnotation("output_var"):
+      tr.outputVars.add(decl.name)
+
   # Second pass: process variable arrays (they reference already-created variables)
   for decl in tr.model.variables:
     if not decl.isArray:
@@ -251,10 +270,16 @@ proc translateVariables(tr: var FznTranslator) =
       var allConstants = true
       var constantVals = newSeq[int](decl.value.elems.len)
 
+      var elemNames = newSeq[string](decl.value.elems.len)
       for i, e in decl.value.elems:
         case e.kind
         of FznIdent:
-          if e.ident in tr.varPositions:
+          elemNames[i] = e.ident
+          if e.ident in tr.definedVarExprs:
+            # Defined variable - use sentinel position, expression will be used later
+            positions[i] = -1
+            allConstants = false
+          elif e.ident in tr.varPositions:
             positions[i] = tr.varPositions[e.ident]
             allConstants = false
           elif e.ident in tr.paramValues:
@@ -286,6 +311,7 @@ proc translateVariables(tr: var FznTranslator) =
           discard
 
       tr.arrayPositions[decl.name] = positions
+      tr.arrayElementNames[decl.name] = elemNames
       if allConstants:
         tr.arrayValues[decl.name] = constantVals
 
@@ -714,8 +740,80 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     # global_cardinality(x, cover, counts)
     let exprs = tr.resolveExprArray(con.args[0])
     let cover = tr.resolveIntArray(con.args[1])
-    let counts = tr.resolveIntArray(con.args[2])
-    tr.sys.addConstraint(globalCardinality[int](exprs, cover, counts))
+    var constantCounts = true
+    var counts: seq[int]
+    try:
+      counts = tr.resolveIntArray(con.args[2])
+    except KeyError:
+      constantCounts = false
+
+    if constantCounts:
+      tr.sys.addConstraint(globalCardinality[int](exprs, cover, counts))
+    else:
+      let countExprs = tr.resolveExprArray(con.args[2])
+
+      # Check 1: All count expressions have singleton domains → use as constants
+      var allSingleton = true
+      var inferredCounts = newSeq[int](countExprs.len)
+      for i, ce in countExprs:
+        if ce.node.kind == RefNode:
+          let dom = tr.sys.baseArray.domain[ce.node.position]
+          if dom.len == 1:
+            inferredCounts[i] = dom[0]
+          else:
+            allSingleton = false; break
+        else:
+          allSingleton = false; break
+
+      if allSingleton:
+        tr.sys.addConstraint(globalCardinality[int](exprs, cover, inferredCounts))
+      else:
+        # Check 2: All count exprs reference the same position + closed GCC
+        var allSamePos = true
+        var countPos = -1
+        for ce in countExprs:
+          if ce.node.kind == RefNode:
+            if countPos == -1: countPos = ce.node.position
+            elif ce.node.position != countPos: allSamePos = false; break
+          else: allSamePos = false; break
+
+        var closed = false
+        if allSamePos and countPos >= 0:
+          let coverSet = cover.toHashSet()
+          closed = true
+          for xExpr in exprs:
+            if xExpr.node.kind == RefNode:
+              for v in tr.sys.baseArray.domain[xExpr.node.position]:
+                if v notin coverSet: closed = false; break
+            else: closed = false
+            if not closed: break
+
+        if allSamePos and closed and exprs.len mod cover.len == 0:
+          let target = exprs.len div cover.len
+          var targets = newSeq[int](cover.len)
+          for i in 0..<cover.len: targets[i] = target
+          tr.sys.addConstraint(globalCardinality[int](exprs, cover, targets))
+          tr.sys.baseArray.domain[countPos] = @[target]
+        else:
+          # Fallback: decompose into indicator variables + linear constraints
+          # For each cover value v, create: sum_j (x_j == v ? 1 : 0) == counts[i]
+          for i, v in cover:
+            var indicators: seq[AlgebraicExpression[int]]
+            for xExpr in exprs:
+              let pos = tr.sys.baseArray.len
+              let indicatorVar = tr.sys.newConstrainedVariable()
+              indicatorVar.setDomain(@[0, 1])
+              let indicatorExpr = tr.getExpr(pos)
+              indicators.add(indicatorExpr)
+              # (x_j == v) <-> (indicator == 1)
+              let litV = newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: v),
+                linear = true
+              )
+              tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
+            # sum(indicators) == countExprs[i]
+            tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
   of "fzn_global_cardinality_closed", "fzn_global_cardinality_low_up",
      "fzn_global_cardinality_low_up_closed":
@@ -776,6 +874,103 @@ proc translateSolve(tr: var FznTranslator) =
   of Satisfy:
     tr.objectivePos = -1
 
+proc collectDefinedVars(tr: var FznTranslator) =
+  ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
+  ## These variables will be replaced by their defining expressions instead of being created as positions.
+  var definedVarNames: Table[string, bool]
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name == "int_lin_eq" and con.hasAnnotation("defines_var"):
+      # Find the defines_var annotation
+      var ann: FznAnnotation
+      for a in con.annotations:
+        if a.name == "defines_var":
+          ann = a
+          break
+      if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+        let definedName = ann.args[0].ident
+        # Check: the defined var must be one of the variables in the constraint,
+        # and its coefficient must be 1 or -1 for exact integer arithmetic
+        let coeffs = tr.resolveIntArray(con.args[0])
+        let vars = con.args[1]
+        if vars.kind == FznArrayLit:
+          for vi, v in vars.elems:
+            if v.kind == FznIdent and v.ident == definedName and (coeffs[vi] == 1 or coeffs[vi] == -1):
+              definedVarNames[definedName] = true
+              tr.definingConstraints.incl(ci)
+              break
+  # Store the set of defined variable names for use in translateVariables
+  for name in definedVarNames.keys:
+    # Initialize with a placeholder - will be filled after variables are created
+    tr.definedVarExprs[name] = nil
+
+proc buildDefinedExpressions(tr: var FznTranslator) =
+  ## Second pass: build AlgebraicExpressions for defined variables using the positions
+  ## of non-defined variables that are already created.
+  for ci in tr.definingConstraints.items:
+    let con = tr.model.constraints[ci]
+    var ann: FznAnnotation
+    for a in con.annotations:
+      if a.name == "defines_var":
+        ann = a
+        break
+    let definedName = ann.args[0].ident
+    let coeffs = tr.resolveIntArray(con.args[0])
+    let rhs = tr.resolveIntArg(con.args[2])
+    let vars = con.args[1]
+
+    if vars.kind != FznArrayLit:
+      continue
+
+    # Find the defined variable's position in the constraint
+    var definedIdx = -1
+    for vi, v in vars.elems:
+      if v.kind == FznIdent and v.ident == definedName:
+        definedIdx = vi
+        break
+
+    if definedIdx < 0:
+      continue
+
+    let defCoeff = coeffs[definedIdx]
+    # Constraint: defCoeff * defined + sum(other_coeffs * other_vars) = rhs
+    # defined = (rhs - sum(other_coeffs * other_vars)) / defCoeff
+    # For defCoeff = 1: defined = rhs - sum(other_coeffs * other_vars)
+    # For defCoeff = -1: defined = sum(other_coeffs * other_vars) - rhs
+
+    # Build expression: start with the constant term (rhs / defCoeff)
+    var expr: AlgebraicExpression[int]
+    let sign = if defCoeff == 1: -1 else: 1  # negate other coefficients
+
+    var first = true
+    for vi, v in vars.elems:
+      if vi == definedIdx:
+        continue
+      let otherExpr = tr.resolveExprArg(v)
+      let scaledCoeff = sign * coeffs[vi]
+      let term = scaledCoeff * otherExpr
+      if first:
+        expr = term
+        first = false
+      else:
+        expr = expr + term
+
+    # Add constant term: sign * (-rhs) = rhs/defCoeff for the constant part
+    let constTerm = if defCoeff == 1: rhs else: -rhs
+    if constTerm != 0:
+      if first:
+        expr = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
+          linear = true
+        )
+        first = false
+      else:
+        expr = expr + constTerm
+
+    if not expr.isNil:
+      tr.definedVarExprs[definedName] = expr
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -784,9 +979,19 @@ proc translate*(model: FznModel): FznTranslator =
   result.paramValues = initTable[string, int]()
   result.arrayPositions = initTable[string, seq[int]]()
   result.arrayValues = initTable[string, seq[int]]()
+  result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
+  result.arrayElementNames = initTable[string, seq[string]]()
   result.objectivePos = -1
 
+  # Load parameters first (needed by collectDefinedVars for resolveIntArray)
+  result.translateParameters()
+  # Collect defined variables before translating variables
+  result.collectDefinedVars()
   result.translateVariables()
-  for con in model.constraints:
-    result.translateConstraint(con)
+  # Build expressions for defined variables using the now-created positions
+  result.buildDefinedExpressions()
+
+  for ci, con in model.constraints:
+    if ci notin result.definingConstraints:
+      result.translateConstraint(con)
   result.translateSolve()
