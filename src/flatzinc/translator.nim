@@ -27,6 +27,8 @@ type
     model*: FznModel
     # Objective expression position (for minimize/maximize)
     objectivePos*: int
+    # Set of variable names that will be replaced by defining expressions
+    definedVarNames*: HashSet[string]
     # Maps defined variable name -> defining AlgebraicExpression (for defines_var elimination)
     definedVarExprs*: Table[string, AlgebraicExpression[int]]
     # Set of constraint indices that are defining constraints (to skip during translation)
@@ -237,7 +239,7 @@ proc translateVariables(tr: var FznTranslator) =
     if decl.isArray:
       continue
     # Skip variables that will be replaced by defining expressions
-    if decl.name in tr.definedVarExprs:
+    if decl.name in tr.definedVarNames:
       continue
     let pos = tr.sys.baseArray.len
     let v = tr.sys.newConstrainedVariable()
@@ -275,7 +277,7 @@ proc translateVariables(tr: var FznTranslator) =
         case e.kind
         of FznIdent:
           elemNames[i] = e.ident
-          if e.ident in tr.definedVarExprs:
+          if e.ident in tr.definedVarNames:
             # Defined variable - use sentinel position, expression will be used later
             positions[i] = -1
             allConstants = false
@@ -901,8 +903,7 @@ proc collectDefinedVars(tr: var FznTranslator) =
               break
   # Store the set of defined variable names for use in translateVariables
   for name in definedVarNames.keys:
-    # Initialize with a placeholder - will be filled after variables are created
-    tr.definedVarExprs[name] = nil
+    tr.definedVarNames.incl(name)
 
 proc buildDefinedExpressions(tr: var FznTranslator) =
   ## Second pass: build AlgebraicExpressions for defined variables using the positions
@@ -968,8 +969,9 @@ proc buildDefinedExpressions(tr: var FznTranslator) =
       else:
         expr = expr + constTerm
 
-    if not expr.isNil:
-      tr.definedVarExprs[definedName] = expr
+    if expr.isNil:
+      raise newException(ValueError, &"Failed to build expression for defined variable '{definedName}'")
+    tr.definedVarExprs[definedName] = expr
 
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
@@ -979,6 +981,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.paramValues = initTable[string, int]()
   result.arrayPositions = initTable[string, seq[int]]()
   result.arrayValues = initTable[string, seq[int]]()
+  result.definedVarNames = initHashSet[string]()
   result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
   result.arrayElementNames = initTable[string, seq[string]]()
   result.objectivePos = -1
