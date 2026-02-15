@@ -99,6 +99,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.tableConstraintState.cost + constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
         of RegularType:
             result = constraint.regularState.cost + constraint.regularState.moveDelta(position, oldValue, newValue)
+        of CountEqType:
+            result = constraint.countEqState.cost + constraint.countEqState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

@@ -5,10 +5,17 @@ import std/[tables, sequtils, strutils, strformat, packedsets, sets]
 import parser
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/stateful
+import ../constraints/[stateful, countEq]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
 
 type
+  CountEqPattern* = object
+    ## A detected count_eq pattern from int_lin_eq → bool2int → int_eq_reif chains
+    linEqIdx*: int           # index of the int_lin_eq constraint
+    countValue*: int         # the constant value being counted
+    targetVarName*: string   # name of the target variable (the count)
+    arrayVarNames*: seq[string]  # names of the array variables being counted over
+
   FznTranslator* = object
     sys*: ConstraintSystem[int]
     # Maps FZN variable name -> position in the ConstrainedArray
@@ -35,6 +42,8 @@ type
     definingConstraints*: PackedSet[int]
     # Maps array name -> element variable names (for resolving defined vars in arrays)
     arrayElementNames*: Table[string, seq[string]]
+    # Detected count_eq patterns (mapped by int_lin_eq constraint index)
+    countEqPatterns*: Table[int, CountEqPattern]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -822,6 +831,28 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     # TODO: bounded cardinality variants
     discard
 
+  of "fzn_count_eq":
+    # count_eq(x, y, c) means count(x, y) == c
+    # x is array of var int, y is the value to count, c is var int (the count)
+    let arrayExprs = tr.resolveExprArray(con.args[0])
+    let countValue = tr.resolveIntArg(con.args[1])
+    let countExpr = tr.resolveExprArg(con.args[2])
+    # Extract positions
+    var arrayPos: seq[int]
+    for e in arrayExprs:
+      if e.node.kind == RefNode:
+        arrayPos.add(e.node.position)
+      else:
+        raise newException(ValueError, "fzn_count_eq requires simple variable references in array")
+    if countExpr.node.kind == RefNode:
+      tr.sys.addConstraint(countEq[int](arrayPos, countValue, countExpr.node.position))
+    else:
+      raise newException(ValueError, "fzn_count_eq requires a variable for the count argument")
+
+  of "fzn_count_eq_reif":
+    # Reified form - skip for now
+    discard
+
   of "fzn_at_least_int":
     # at_least(n, x, v) means at least n occurrences of v in x
     let n = tr.resolveIntArg(con.args[0])
@@ -910,6 +941,10 @@ proc buildDefinedExpressions(tr: var FznTranslator) =
   ## of non-defined variables that are already created.
   for ci in tr.definingConstraints.items:
     let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    # Only process int_lin_eq with defines_var (skip consumed count_eq intermediates)
+    if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+      continue
     var ann: FznAnnotation
     for a in con.annotations:
       if a.name == "defines_var":
@@ -973,6 +1008,175 @@ proc buildDefinedExpressions(tr: var FznTranslator) =
       raise newException(ValueError, &"Failed to build expression for defined variable '{definedName}'")
     tr.definedVarExprs[definedName] = expr
 
+proc detectCountPatterns(tr: var FznTranslator) =
+  ## Detects int_lin_eq → bool2int → int_eq_reif chains that implement count_eq.
+  ## Pattern: for each value v, n constraints of form:
+  ##   int_eq_reif(x_j, v, b_j) :: defines_var(b_j)
+  ##   bool2int(b_j, ind_j) :: defines_var(ind_j)
+  ##   int_lin_eq([1, -1, ..., -1], [target, ind_1, ..., ind_n], 0)
+  ## This replaces O(n²) decomposed constraints with a single count_eq.
+
+  # Build maps: variable name → defining constraint index
+  # bool2int(boolVar, intVar) :: defines_var(intVar) → intVar maps to constraint index
+  var bool2intDefs: Table[string, int]  # indicator var name → constraint index
+  # int_eq_reif(x, val, boolVar) :: defines_var(boolVar) → boolVar maps to constraint index
+  var intEqReifDefs: Table[string, int]  # bool var name → constraint index
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue  # Already consumed by defined-var elimination
+    let name = stripSolverPrefix(con.name)
+    if name == "bool2int" and con.hasAnnotation("defines_var"):
+      # bool2int(boolVar, intVar) :: defines_var(intVar)
+      if con.args.len >= 2 and con.args[1].kind == FznIdent:
+        bool2intDefs[con.args[1].ident] = ci
+    elif name == "int_eq_reif" and con.hasAnnotation("defines_var"):
+      # int_eq_reif(x, val, boolVar) :: defines_var(boolVar)
+      if con.args.len >= 3 and con.args[2].kind == FznIdent:
+        intEqReifDefs[con.args[2].ident] = ci
+
+  # Now scan for int_lin_eq constraints that match the pattern
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_eq":
+      continue
+
+    # int_lin_eq(coeffs, vars, rhs)
+    # Pattern: coeffs = [1, -1, -1, ..., -1], rhs = 0
+    # vars = [target, ind_1, ind_2, ..., ind_n]
+    let rhs = try: tr.resolveIntArg(con.args[2]) except: continue
+    if rhs != 0:
+      continue
+
+    let coeffs = try: tr.resolveIntArray(con.args[0]) except: continue
+    if coeffs.len < 2:
+      continue
+
+    # Check coefficient pattern: first is 1, rest are -1
+    if coeffs[0] != 1:
+      continue
+    var allNegOne = true
+    for i in 1..<coeffs.len:
+      if coeffs[i] != -1:
+        allNegOne = false
+        break
+    if not allNegOne:
+      continue
+
+    # Extract variable names - handle both inline arrays and named array references
+    let vars = con.args[1]
+    var varElems: seq[FznExpr]
+    if vars.kind == FznArrayLit:
+      varElems = vars.elems
+    elif vars.kind == FznIdent:
+      # Named array reference - find the array declaration
+      var found = false
+      for decl in tr.model.variables:
+        if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+          varElems = decl.value.elems
+          found = true
+          break
+      if not found:
+        continue
+    else:
+      continue
+
+    if varElems.len < 2:
+      continue
+
+    let targetArg = varElems[0]
+    if targetArg.kind != FznIdent:
+      continue
+    let targetName = targetArg.ident
+
+    # Check all indicator variables trace back through bool2int → int_eq_reif
+    var countValue: int
+    var countValueSet = false
+    var arrayVarNames: seq[string]
+    var consumedConstraints: seq[int]
+    var consumedVarNames: seq[string]
+    var valid = true
+
+    for i in 1..<varElems.len:
+      let indArg = varElems[i]
+      if indArg.kind != FznIdent:
+        valid = false
+        break
+
+      let indName = indArg.ident
+      if indName notin bool2intDefs:
+        valid = false
+        break
+
+      let b2iIdx = bool2intDefs[indName]
+      let b2iCon = tr.model.constraints[b2iIdx]
+      # bool2int(boolVar, intVar) — extract boolVar
+      if b2iCon.args[0].kind != FznIdent:
+        valid = false
+        break
+      let boolVarName = b2iCon.args[0].ident
+
+      if boolVarName notin intEqReifDefs:
+        valid = false
+        break
+
+      let eqReifIdx = intEqReifDefs[boolVarName]
+      let eqReifCon = tr.model.constraints[eqReifIdx]
+      # int_eq_reif(x, val, boolVar) — extract x and val
+      if eqReifCon.args[0].kind != FznIdent:
+        valid = false
+        break
+      if eqReifCon.args[1].kind != FznIntLit:
+        # Try param
+        let v = try: tr.resolveIntArg(eqReifCon.args[1]) except: (valid = false; 0)
+        if not valid:
+          break
+        if not countValueSet:
+          countValue = v
+          countValueSet = true
+        elif v != countValue:
+          valid = false
+          break
+      else:
+        let v = eqReifCon.args[1].intVal
+        if not countValueSet:
+          countValue = v
+          countValueSet = true
+        elif v != countValue:
+          valid = false
+          break
+
+      arrayVarNames.add(eqReifCon.args[0].ident)
+      consumedConstraints.add(b2iIdx)
+      consumedConstraints.add(eqReifIdx)
+      consumedVarNames.add(indName)
+      consumedVarNames.add(boolVarName)
+
+    if not valid or not countValueSet:
+      continue
+
+    # Pattern detected! Record it.
+    tr.countEqPatterns[ci] = CountEqPattern(
+      linEqIdx: ci,
+      countValue: countValue,
+      targetVarName: targetName,
+      arrayVarNames: arrayVarNames
+    )
+
+    # Mark consumed constraints (skip during translation)
+    # Note: the int_lin_eq itself (ci) is NOT added to definingConstraints —
+    # it's handled by the countEqPatterns check in the main loop
+    for idx in consumedConstraints:
+      tr.definingConstraints.incl(idx)  # the bool2int and int_eq_reif
+
+    # Mark intermediate variable names as defined (skip position creation)
+    for vn in consumedVarNames:
+      tr.definedVarNames.incl(vn)
+
+    stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -984,17 +1188,33 @@ proc translate*(model: FznModel): FznTranslator =
   result.definedVarNames = initHashSet[string]()
   result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
   result.arrayElementNames = initTable[string, seq[string]]()
+  result.countEqPatterns = initTable[int, CountEqPattern]()
   result.objectivePos = -1
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()
   # Collect defined variables before translating variables
   result.collectDefinedVars()
+  # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
+  result.detectCountPatterns()
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
 
   for ci, con in model.constraints:
-    if ci notin result.definingConstraints:
+    if ci in result.definingConstraints:
+      continue
+    if ci in result.countEqPatterns:
+      # Emit count_eq for detected pattern
+      let pattern = result.countEqPatterns[ci]
+      var arrayPos: seq[int]
+      for vn in pattern.arrayVarNames:
+        if vn in result.varPositions:
+          arrayPos.add(result.varPositions[vn])
+        else:
+          raise newException(KeyError, &"Unknown variable '{vn}' in count_eq pattern")
+      let targetPos = result.varPositions[pattern.targetVarName]
+      result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
+    else:
       result.translateConstraint(con)
   result.translateSolve()

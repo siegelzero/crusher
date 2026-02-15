@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -274,6 +274,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Table Constraint"
         of RegularType:
             return "Regular Constraint"
+        of CountEqType:
+            return "CountEq Constraint"
 
 ################################################################################
 # Evaluation
@@ -319,6 +321,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.tableConstraintState.cost
         of RegularType:
             return constraint.regularState.cost
+        of CountEqType:
+            return constraint.countEqState.cost
 
 ################################################################################
 # Computed Constraints
@@ -903,6 +907,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.tableConstraintState.initialize(assignment)
         of RegularType:
             constraint.regularState.initialize(assignment)
+        of CountEqType:
+            constraint.countEqState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -945,6 +951,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
         of RegularType:
             constraint.regularState.moveDelta(position, oldValue, newValue)
+        of CountEqType:
+            constraint.countEqState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -987,6 +995,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.tableConstraintState.updatePosition(position, newValue)
         of RegularType:
             constraint.regularState.updatePosition(position, newValue)
+        of CountEqType:
+            constraint.countEqState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1002,6 +1012,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.geostState.getAffectedPositions()
         of SequenceType:
             return constraint.sequenceState.getAffectedPositions()
+        of CountEqType:
+            return constraint.countEqState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1020,6 +1032,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.globalCardinalityState.getAffectedDomainValues(position)
         of SequenceType:
             return constraint.sequenceState.getAffectedDomainValues(position)
+        of CountEqType:
+            return constraint.countEqState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1465,6 +1479,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                     constraint.regularState.finalStates.toSeq()
                 )
             )
+        of CountEqType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: CountEqType,
+                countEqState: constraint.countEqState.deepCopy()
+            )
 
 
 
@@ -1797,6 +1817,27 @@ func regular*[T](expressions: seq[AlgebraicExpression[T]], nStates: int, inputMi
     else:
         assert allRefs, "regular currently requires simple variable references"
         return regular[T](positions, nStates, inputMin, inputMax, transition, initialState, finalStates)
+
+################################################################################
+# CountEq wrapper functions
+################################################################################
+
+func countEq*[T](arrayPositions: openArray[int], countValue: T, targetPosition: int): StatefulConstraint[T] =
+    ## Creates a CountEq constraint: count of `countValue` in array positions must equal
+    ## the value at `targetPosition`.
+    ##
+    ## **Mathematical Form**: `|{i ∈ arrayPositions : x[i] = countValue}| = x[targetPosition]`
+    ##
+    ## The target is a variable, not a constant. When the target variable changes,
+    ## the penalty changes. In nmseq, the target IS one of the array elements.
+    ##
+    ## **Violation Cost**: `|actualCount - requiredCount|`
+    let constraint = newCountEqConstraint[T](arrayPositions, countValue, targetPosition)
+    return StatefulConstraint[T](
+        positions: constraint.allPositions,
+        stateType: CountEqType,
+        countEqState: constraint
+    )
 
 ################################################################################
 # Boolean Operators for StatefulConstraint
