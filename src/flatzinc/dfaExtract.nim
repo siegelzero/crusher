@@ -4,7 +4,7 @@
 ## for a particular tile value. Each placement is a list of board cell indices
 ## where the tile appears.
 
-import std/[packedsets, strformat]
+import std/[packedsets]
 
 proc identifyTileInput*(transition: seq[seq[int]], nStates, nInputs: int): int =
   ## Determines which input symbol (0-indexed) is the "tile" input by finding

@@ -1036,6 +1036,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.sequenceState.getAffectedDomainValues(position)
         of CountEqType:
             return constraint.countEqState.getAffectedDomainValues(position)
+        of GeostType:
+            return constraint.geostState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1471,15 +1473,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: RegularType,
-                regularState: newRegularConstraint[T](
-                    constraint.regularState.sortedPositions,
-                    constraint.regularState.nStates,
-                    constraint.regularState.inputMin,
-                    constraint.regularState.inputMax,
-                    constraint.regularState.transition,
-                    constraint.regularState.initialState,
-                    constraint.regularState.finalStates.toSeq()
-                )
+                regularState: constraint.regularState.deepCopy()
             )
         of CountEqType:
             result = StatefulConstraint[T](

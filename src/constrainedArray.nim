@@ -654,7 +654,57 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             outerChanged = true
                             pruned += 1
 
-        # Phase 4: AllDifferent domain reduction
+        # Phase 4: Geost pairwise arc consistency
+        for cons in carray.constraints:
+            if cons.stateType != GeostType:
+                continue
+            let gs = cons.geostState
+            let np = gs.numPieces
+
+            # Convert each placement's cells to PackedSet for fast intersection check
+            var cellSets = newSeq[seq[PackedSet[int]]](np)
+            for p in 0..<np:
+                let pos = gs.placementPositions[p]
+                cellSets[p] = newSeq[PackedSet[int]](gs.cellsByPlacement[p].len)
+                for v in 0..<gs.cellsByPlacement[p].len:
+                    if T(v) notin currentDomain[pos]:
+                        continue
+                    for cell in gs.cellsByPlacement[p][v]:
+                        cellSets[p][v].incl(cell)
+
+            # For each pair of pieces, prune placements with no compatible partner
+            for a in 0..<np:
+                let posA = gs.placementPositions[a]
+                for b in (a+1)..<np:
+                    let posB = gs.placementPositions[b]
+                    # Check each placement of A against all placements of B
+                    for va in toSeq(currentDomain[posA].items):
+                        var hasCompat = false
+                        for vb in currentDomain[posB].items:
+                            if (cellSets[a][va] * cellSets[b][vb]).len == 0:
+                                hasCompat = true
+                                break
+                        if not hasCompat:
+                            currentDomain[posA].excl(va)
+                            outerChanged = true
+                    # Check each placement of B against all placements of A
+                    for vb in toSeq(currentDomain[posB].items):
+                        var hasCompat = false
+                        for va in currentDomain[posA].items:
+                            if (cellSets[b][vb] * cellSets[a][va]).len == 0:
+                                hasCompat = true
+                                break
+                        if not hasCompat:
+                            currentDomain[posB].excl(vb)
+                            outerChanged = true
+
+            if outerChanged:
+                stderr.writeLine(&"[Init] Geost arc consistency: {np} pieces, reduced domains")
+                for p in 0..<np:
+                    let pos = gs.placementPositions[p]
+                    stderr.writeLine(&"[Init]   Piece {p}: {gs.cellsByPlacement[p].len} -> {currentDomain[pos].len} placements")
+
+        # Phase 5: AllDifferent domain reduction
         for adPositions in allDiffGroups:
             let k = adPositions.len
 

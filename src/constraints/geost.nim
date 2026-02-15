@@ -28,6 +28,9 @@ type
         # Pre-computed placement data: cellsByPlacement[piece][placementIdx] = cells covered
         cellsByPlacement*: seq[seq[seq[int]]]
 
+        # Pre-computed index: cellToPlacementIdx[piece][cell] = placement indices covering that cell
+        cellToPlacementIdx*: seq[Table[int, seq[int]]]
+
         # Current state
         currentPlacements*: seq[int]      # Current placement index for each piece
         cellCoverage*: Table[int, int]    # cell -> count of pieces covering it
@@ -36,6 +39,7 @@ type
         # Track which pieces cover each cell (for efficient neighbor computation)
         piecesAtCell*: Table[int, PackedSet[int]]  # cell -> set of piece indices
         lastAffectedPositions*: PackedSet[int]  # Positions affected by last updatePosition
+        lastChangedCells*: PackedSet[int]  # Cells changed by last updatePosition
 
 
 proc newGeostConstraint*[T](placementPositions: seq[int], cellsByPlacement: seq[seq[seq[int]]]): GeostConstraint[T] =
@@ -56,6 +60,14 @@ proc newGeostConstraint*[T](placementPositions: seq[int], cellsByPlacement: seq[
     for pieceIdx, pos in placementPositions:
         result.positions.incl(pos)
         result.positionToPiece[pos] = pieceIdx
+
+    # Build cell-to-placement index for getAffectedDomainValues
+    result.cellToPlacementIdx = newSeq[Table[int, seq[int]]](result.numPieces)
+    for pieceIdx in 0..<result.numPieces:
+        result.cellToPlacementIdx[pieceIdx] = initTable[int, seq[int]]()
+        for placementIdx, cells in cellsByPlacement[pieceIdx]:
+            for cell in cells:
+                result.cellToPlacementIdx[pieceIdx].mgetOrPut(cell, @[]).add(placementIdx)
 
 
 proc initialize*[T](constraint: GeostConstraint[T], assignment: seq[T]) =
@@ -146,9 +158,15 @@ proc updatePosition*[T](constraint: GeostConstraint[T], position: int, newValue:
     if oldPlacement == newPlacement:
         return
 
-    # Track affected positions - pieces that might have their overlap status changed
-    # Clear and reuse instead of reallocating
+    # Track affected positions and changed cells
     constraint.lastAffectedPositions.clear()
+    constraint.lastChangedCells.clear()
+
+    # Collect all changed cells (old ∪ new)
+    for cell in constraint.cellsByPlacement[pieceIdx][oldPlacement]:
+        constraint.lastChangedCells.incl(cell)
+    for cell in constraint.cellsByPlacement[pieceIdx][newPlacement]:
+        constraint.lastChangedCells.incl(cell)
 
     # Remove coverage from old placement
     for cell in constraint.cellsByPlacement[pieceIdx][oldPlacement]:
@@ -202,6 +220,31 @@ proc getAffectedPositions*[T](constraint: GeostConstraint[T]): PackedSet[int] =
     return constraint.lastAffectedPositions
 
 
+proc getAffectedDomainValues*[T](constraint: GeostConstraint[T], position: int): seq[T] =
+    ## Returns placement indices that need penalty recalculation at `position`.
+    ## Only placements whose cells overlap with the last changed cells are affected.
+    if position notin constraint.positionToPiece:
+        return @[]
+    let pieceIdx = constraint.positionToPiece[position]
+
+    # If the current placement overlaps with changed cells, ALL values are affected
+    # because the baseline (removing current placement's cells) changes.
+    let curPlacement = constraint.currentPlacements[pieceIdx]
+    for cell in constraint.cellsByPlacement[pieceIdx][curPlacement]:
+        if cell in constraint.lastChangedCells:
+            return @[]
+
+    # Only placements overlapping changed cells need recalculation
+    result = @[]
+    var seen = initPackedSet[int]()
+    for cell in constraint.lastChangedCells.items:
+        if cell in constraint.cellToPlacementIdx[pieceIdx]:
+            for placementIdx in constraint.cellToPlacementIdx[pieceIdx][cell]:
+                if placementIdx notin seen:
+                    seen.incl(placementIdx)
+                    result.add(T(placementIdx))
+
+
 proc deepCopy*[T](constraint: GeostConstraint[T]): GeostConstraint[T] =
     # Create a deep copy for parallel search
     result = GeostConstraint[T](
@@ -210,10 +253,12 @@ proc deepCopy*[T](constraint: GeostConstraint[T]): GeostConstraint[T] =
         placementPositions: constraint.placementPositions,
         positionToPiece: constraint.positionToPiece,  # Safe to share - read-only after construction
         cellsByPlacement: constraint.cellsByPlacement,  # Safe to share - read-only after construction
+        cellToPlacementIdx: constraint.cellToPlacementIdx,  # Safe to share - read-only after construction
         currentPlacements: constraint.currentPlacements,  # seq[int] copied by value
         cellCoverage: initTable[int, int](),
         piecesAtCell: initTable[int, PackedSet[int]](),
         lastAffectedPositions: constraint.lastAffectedPositions,  # PackedSet copied by value
+        lastChangedCells: constraint.lastChangedCells,
         cost: constraint.cost
     )
     # Deep copy the mutable tables that track runtime state

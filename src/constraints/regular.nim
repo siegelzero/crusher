@@ -72,36 +72,9 @@ proc newRegularConstraint*[T](positions: openArray[int],
     for i, pos in positions:
         result.positionToIndex[pos] = i
 
-    # Pre-compute background states for column-aware recovery.
-    # Find the "neutral" (non-tile) input value by checking which value
-    # leads to the most common transition from the initial state.
-    var targetCounts: Table[int, int]
-    let sentinelVal = inputMax
-    for v in inputMin..T(int(inputMax) - 1):
-        let s = result.transition[initialState - 1][int(v) - int(inputMin)]
-        if s > 0:
-            targetCounts.mgetOrPut(s, 0) += 1
-
-    # The neutral value is the one leading to the most common target state
-    var neutralValue = inputMin
-    var maxCount = 0
-    for v in inputMin..T(int(inputMax) - 1):
-        let s = result.transition[initialState - 1][int(v) - int(inputMin)]
-        if s > 0 and targetCounts.getOrDefault(s, 0) > maxCount:
-            maxCount = targetCounts[s]
-            neutralValue = v
-
-    # Simulate the DFA with neutral values (and sentinels where fixed)
+    # Background states are computed properly in initialize() via initializeBackgroundStates()
+    # once the actual assignment (with sentinel positions) is available.
     result.backgroundState = newSeq[int](result.n)
-    var bgState = initialState
-    for i in 0..<result.n:
-        # Use sentinel value if the position is fixed to sentinel, otherwise neutral
-        let inputVal = if int(inputMax) <= int(inputMax): neutralValue else: neutralValue
-        # We don't know which positions are sentinels yet (they're determined by the assignment)
-        # So we just use the neutral value everywhere for now
-        bgState = result.transition[max(bgState - 1, 0)][int(neutralValue) - int(inputMin)]
-        if bgState <= 0: bgState = initialState  # safety fallback
-        result.backgroundState[i] = bgState
 
 ################################################################################
 # DFA simulation
@@ -245,6 +218,29 @@ proc updatePosition*[T](state: RegularConstraint[T], position: int, newValue: T)
 
 proc getAffectedPositions*[T](state: RegularConstraint[T]): PackedSet[int] =
     return state.lastChangeAffectedPositions
+
+
+proc deepCopy*[T](state: RegularConstraint[T]): RegularConstraint[T] =
+    new(result)
+    result.n = state.n
+    result.nStates = state.nStates
+    result.inputMin = state.inputMin
+    result.inputMax = state.inputMax
+    result.transition = state.transition
+    result.initialState = state.initialState
+    result.finalStates = state.finalStates
+    result.sortedPositions = state.sortedPositions
+    result.positionToIndex = state.positionToIndex
+    result.positions = state.positions
+    result.currentAssignment = initTable[int, T]()
+    for k, v in state.currentAssignment.pairs:
+        result.currentAssignment[k] = v
+    result.cost = state.cost
+    result.stateAfter = @(state.stateAfter)
+    result.failedAt = @(state.failedAt)
+    result.backgroundState = @(state.backgroundState)
+    result.lastChangeAffectedPositions = state.lastChangeAffectedPositions
+    result.lastChangeAffectedCost = state.lastChangeAffectedCost
 
 
 proc moveDelta*[T](state: RegularConstraint[T], position: int, oldValue, newValue: T): int =
