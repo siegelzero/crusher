@@ -142,6 +142,18 @@ proc main() =
   restoreStdout(savedFd)
 
   if solved:
+    # Reconstruct board values from tile placements if geost conversion was used
+    let gc = tr.geostConversion
+    if gc.tileValues.len > 0:
+      # Set sentinel positions
+      for idx in gc.sentinelBoardIndices:
+        tr.sys.assignment[gc.boardPositions[idx]] = gc.sentinelValue
+      # Set tile placements
+      for t in 0..<gc.tileValues.len:
+        let placementIdx = tr.sys.assignment[gc.tileVarPositions[t]]
+        for cellIdx in gc.allPlacements[t][placementIdx]:
+          tr.sys.assignment[gc.boardPositions[cellIdx]] = gc.tileValues[t]
+
     tr.printSolution()
     printComplete()
   else:

@@ -3,6 +3,7 @@
 import std/[tables, sequtils, strutils, strformat, packedsets, sets]
 
 import parser
+import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
 import ../constraints/[stateful, countEq]
@@ -15,6 +16,17 @@ type
     countValue*: int         # the constant value being counted
     targetVarName*: string   # name of the target variable (the count)
     arrayVarNames*: seq[string]  # names of the array variables being counted over
+
+  GeostConversion* = object
+    ## A detected pattern where multiple fzn_regular constraints over the same
+    ## variable array encode tile placements, convertible to a single geost constraint.
+    boardArrayName*: string           # FZN array name for board variables
+    boardPositions*: seq[int]         # system positions for board vars
+    tileVarPositions*: seq[int]       # system positions for tile placement vars
+    allPlacements*: seq[seq[seq[int]]]  # cellsByPlacement[tile][idx] = cell indices
+    tileValues*: seq[int]             # board value for each tile (1-indexed)
+    sentinelBoardIndices*: seq[int]   # board array indices that are sentinels
+    sentinelValue*: int               # sentinel value (ntiles+1)
 
   FznTranslator* = object
     sys*: ConstraintSystem[int]
@@ -44,6 +56,8 @@ type
     arrayElementNames*: Table[string, seq[string]]
     # Detected count_eq patterns (mapped by int_lin_eq constraint index)
     countEqPatterns*: Table[int, CountEqPattern]
+    # Geost conversion (active if tileValues.len > 0)
+    geostConversion*: GeostConversion
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -717,6 +731,9 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     case fArg.kind
     of FznSetLit:
       finalStates = fArg.setElems
+    of FznRange:
+      for i in fArg.lo..fArg.hi:
+        finalStates.add(i)
     of FznArrayLit:
       for e in fArg.elems:
         finalStates.add(tr.resolveIntArg(e))
@@ -1167,6 +1184,230 @@ proc detectCountPatterns(tr: var FznTranslator) =
 
     stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
 
+proc detectDfaGeostPattern(tr: var FznTranslator) =
+  ## Detects multiple fzn_regular constraints over the same variable array
+  ## (tiling pattern) and converts them to a single geost constraint.
+  ## Each regular constraint encodes one tile's valid placements as a DFA.
+
+  # Step 1: Find all fzn_regular constraints, verify they share the same array
+  var regularIndices: seq[int]
+  var boardArrayArg: FznExpr = nil
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "fzn_regular":
+      continue
+    if con.args.len < 6:
+      continue
+
+    let arrayArg = con.args[0]
+    if boardArrayArg == nil:
+      boardArrayArg = arrayArg
+    else:
+      # Verify same array reference
+      if arrayArg.kind != boardArrayArg.kind:
+        return
+      case arrayArg.kind
+      of FznIdent:
+        if arrayArg.ident != boardArrayArg.ident:
+          return
+      of FznArrayLit:
+        # Array literals - check same elements
+        if arrayArg.elems.len != boardArrayArg.elems.len:
+          return
+        for i in 0..<arrayArg.elems.len:
+          if arrayArg.elems[i].kind != boardArrayArg.elems[i].kind:
+            return
+          if arrayArg.elems[i].kind == FznIdent and
+             arrayArg.elems[i].ident != boardArrayArg.elems[i].ident:
+            return
+      else:
+        return
+    regularIndices.add(ci)
+
+  if regularIndices.len < 2:
+    return
+
+  # Determine board array name
+  var boardArrayName = ""
+  if boardArrayArg.kind == FznIdent:
+    boardArrayName = boardArrayArg.ident
+  else:
+    # Inline array literal - find which declared array matches
+    for decl in tr.model.variables:
+      if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+        if decl.value.elems.len == boardArrayArg.elems.len:
+          var match = true
+          for i in 0..<decl.value.elems.len:
+            if decl.value.elems[i].kind == FznIdent and
+               boardArrayArg.elems[i].kind == FznIdent and
+               decl.value.elems[i].ident != boardArrayArg.elems[i].ident:
+              match = false
+              break
+          if match:
+            boardArrayName = decl.name
+            break
+    if boardArrayName == "":
+      return
+
+  # Step 2: Determine board size and sentinel positions from the model
+  # Find board array declaration to get size
+  var boardSize = 0
+  var boardArrayDecl: FznVarDecl
+  for decl in tr.model.variables:
+    if decl.isArray and decl.name == boardArrayName:
+      boardArrayDecl = decl
+      if decl.value != nil and decl.value.kind == FznArrayLit:
+        boardSize = decl.value.elems.len
+      else:
+        boardSize = decl.arraySize
+      break
+  if boardSize == 0:
+    return
+
+  # Find sentinel positions: look for int_eq constraints that fix board vars to a constant
+  # Pattern: int_eq(board_element, constant) where constant is ntiles+1
+  var sentinelPositions = initPackedSet[int]()
+  var sentinelBoardIndices: seq[int]
+  var sentinelValue = -1
+
+  # Build a set of board element variable names for quick lookup
+  var boardElemNames: seq[string]
+  var boardElemNameSet: sets.HashSet[string] = initHashSet[string]()
+  if boardArrayDecl.value != nil and boardArrayDecl.value.kind == FznArrayLit:
+    for e in boardArrayDecl.value.elems:
+      if e.kind == FznIdent:
+        boardElemNames.add(e.ident)
+        boardElemNameSet.incl(e.ident)
+      else:
+        boardElemNames.add("")
+
+  # Map board element names to their 0-based index in the board array
+  var elemToIdx: Table[string, int] = initTable[string, int]()
+  for i, name in boardElemNames:
+    if name != "":
+      elemToIdx[name] = i
+
+  # Scan for int_eq constraints setting board vars to constants
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name == "int_eq" and con.args.len >= 2:
+      # int_eq(var, const) or int_eq(const, var)
+      var varName = ""
+      var constVal = -1
+      if con.args[0].kind == FznIdent and con.args[1].kind == FznIntLit:
+        varName = con.args[0].ident
+        constVal = con.args[1].intVal
+      elif con.args[1].kind == FznIdent and con.args[0].kind == FznIntLit:
+        varName = con.args[1].ident
+        constVal = con.args[0].intVal
+      if varName in boardElemNameSet and constVal >= 0:
+        let idx = elemToIdx[varName]
+        sentinelBoardIndices.add(idx)
+        sentinelPositions.incl(idx)
+        if sentinelValue < 0:
+          sentinelValue = constVal
+        # Mark this constraint as consumed
+        tr.definingConstraints.incl(ci)
+
+  # Also check: the board array may contain literal integers (already sentinel)
+  if boardArrayDecl.value != nil and boardArrayDecl.value.kind == FznArrayLit:
+    for i, e in boardArrayDecl.value.elems:
+      if e.kind == FznIntLit:
+        sentinelBoardIndices.add(i)
+        sentinelPositions.incl(i)
+        if sentinelValue < 0:
+          sentinelValue = e.intVal
+
+  # Scan for int_ne constraints on board vars (these will be auto-satisfied by geost)
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name == "int_ne" and con.args.len >= 2:
+      var varName = ""
+      if con.args[0].kind == FznIdent and con.args[0].ident in boardElemNameSet:
+        varName = con.args[0].ident
+      elif con.args[1].kind == FznIdent and con.args[1].ident in boardElemNameSet:
+        varName = con.args[1].ident
+      if varName != "":
+        tr.definingConstraints.incl(ci)
+
+  let ntiles = regularIndices.len
+  if sentinelValue < 0:
+    sentinelValue = ntiles + 1
+
+  # Step 3: For each regular constraint, extract placements
+  var allPlacements: seq[seq[seq[int]]]
+  var tileValues: seq[int]
+
+  for ri, ci in regularIndices:
+    let con = tr.model.constraints[ci]
+    let nStates = tr.resolveIntArg(con.args[1])
+    let nSymbols = tr.resolveIntArg(con.args[2])
+    let transFlat = tr.resolveIntArray(con.args[3])
+    let q0 = tr.resolveIntArg(con.args[4])
+    var finalStates: seq[int]
+    let fArg = con.args[5]
+    case fArg.kind
+    of FznSetLit:
+      finalStates = fArg.setElems
+    of FznRange:
+      for s in fArg.lo..fArg.hi:
+        finalStates.add(s)
+    of FznArrayLit:
+      for e in fArg.elems:
+        finalStates.add(tr.resolveIntArg(e))
+    else:
+      finalStates = tr.resolveIntArray(fArg)
+
+    # Build 2D transition table
+    var transition = newSeq[seq[int]](nStates)
+    for s in 0..<nStates:
+      transition[s] = newSeq[int](nSymbols)
+      for j in 0..<nSymbols:
+        transition[s][j] = transFlat[s * nSymbols + j]
+
+    # Identify which input is the tile
+    let tileInputIdx = identifyTileInput(transition, nStates, nSymbols)
+    if tileInputIdx < 0:
+      stderr.writeLine(&"[FZN] Geost: cannot identify tile input for regular constraint {ci}, aborting")
+      return
+
+    let tileValue = tileInputIdx + 1  # 1-indexed tile value
+
+    let placements = extractPlacementsFromDfa(
+      nStates, nSymbols, transition, q0, finalStates,
+      tileInputIdx, boardSize, sentinelPositions
+    )
+
+    if placements.len == 0:
+      stderr.writeLine(&"[FZN] Geost: tile {tileValue} has no valid placements, aborting")
+      return
+
+    allPlacements.add(placements)
+    tileValues.add(tileValue)
+
+    # Mark this regular constraint as consumed
+    tr.definingConstraints.incl(ci)
+
+  # Step 4: Store the conversion
+  tr.geostConversion = GeostConversion(
+    boardArrayName: boardArrayName,
+    allPlacements: allPlacements,
+    tileValues: tileValues,
+    sentinelBoardIndices: sentinelBoardIndices,
+    sentinelValue: sentinelValue,
+  )
+
+  stderr.writeLine(&"[FZN] Detected DFA-to-geost pattern: {ntiles} tiles, {boardSize} board cells")
+  for t in 0..<ntiles:
+    stderr.writeLine(&"[FZN]   Tile {tileValues[t]}: {allPlacements[t].len} placements, {allPlacements[t][0].len} cells")
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -1187,9 +1428,23 @@ proc translate*(model: FznModel): FznTranslator =
   result.collectDefinedVars()
   # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
   result.detectCountPatterns()
+  # Detect DFA-to-geost pattern (needs paramValues for DFA data)
+  result.detectDfaGeostPattern()
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+
+  # If geost conversion is active, record board positions and create tile variables
+  let gc = result.geostConversion
+  if gc.tileValues.len > 0:
+    if gc.boardArrayName in result.arrayPositions:
+      result.geostConversion.boardPositions = result.arrayPositions[gc.boardArrayName]
+    # Create tile placement variables
+    for t in 0..<gc.tileValues.len:
+      let pos = result.sys.baseArray.len
+      let v = result.sys.newConstrainedVariable()
+      v.setDomain(toSeq(0..<gc.allPlacements[t].len))
+      result.geostConversion.tileVarPositions.add(pos)
 
   for ci, con in model.constraints:
     if ci in result.definingConstraints:
@@ -1207,4 +1462,12 @@ proc translate*(model: FznModel): FznTranslator =
       result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
     else:
       result.translateConstraint(con)
+
+  # Add geost constraint if conversion is active
+  if result.geostConversion.tileValues.len > 0:
+    result.sys.addConstraint(geost[int](
+      result.geostConversion.tileVarPositions,
+      result.geostConversion.allPlacements
+    ))
+
   result.translateSolve()

@@ -1014,6 +1014,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.sequenceState.getAffectedPositions()
         of CountEqType:
             return constraint.countEqState.getAffectedPositions()
+        of RegularType:
+            return constraint.regularState.getAffectedPositions()
         else:
             return constraint.positions
 

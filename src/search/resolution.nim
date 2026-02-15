@@ -10,7 +10,7 @@ when compileOption("threads"):
 
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
-                scatterThreshold: int = 1,
+                scatterThreshold: int = 3,
                 parallel: bool = false,
                 populationSize: int = 32,
                 numWorkers: int = 0,
