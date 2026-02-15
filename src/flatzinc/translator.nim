@@ -850,8 +850,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       raise newException(ValueError, "fzn_count_eq requires a variable for the count argument")
 
   of "fzn_count_eq_reif":
-    # Reified form - skip for now
-    discard
+    # Reified form - not yet implemented
+    stderr.writeLine("[FZN] Warning: fzn_count_eq_reif not implemented, constraint ignored")
 
   of "fzn_at_least_int":
     # at_least(n, x, v) means at least n occurrences of v in x
@@ -1046,11 +1046,11 @@ proc detectCountPatterns(tr: var FznTranslator) =
     # int_lin_eq(coeffs, vars, rhs)
     # Pattern: coeffs = [1, -1, -1, ..., -1], rhs = 0
     # vars = [target, ind_1, ind_2, ..., ind_n]
-    let rhs = try: tr.resolveIntArg(con.args[2]) except: continue
+    let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
     if rhs != 0:
       continue
 
-    let coeffs = try: tr.resolveIntArray(con.args[0]) except: continue
+    let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
     if coeffs.len < 2:
       continue
 
@@ -1128,25 +1128,15 @@ proc detectCountPatterns(tr: var FznTranslator) =
       if eqReifCon.args[0].kind != FznIdent:
         valid = false
         break
-      if eqReifCon.args[1].kind != FznIntLit:
-        # Try param
-        let v = try: tr.resolveIntArg(eqReifCon.args[1]) except: (valid = false; 0)
-        if not valid:
-          break
-        if not countValueSet:
-          countValue = v
-          countValueSet = true
-        elif v != countValue:
-          valid = false
-          break
-      else:
-        let v = eqReifCon.args[1].intVal
-        if not countValueSet:
-          countValue = v
-          countValueSet = true
-        elif v != countValue:
-          valid = false
-          break
+      let v = try: tr.resolveIntArg(eqReifCon.args[1]) except ValueError, KeyError: (valid = false; 0)
+      if not valid:
+        break
+      if not countValueSet:
+        countValue = v
+        countValueSet = true
+      elif v != countValue:
+        valid = false
+        break
 
       arrayVarNames.add(eqReifCon.args[0].ident)
       consumedConstraints.add(b2iIdx)

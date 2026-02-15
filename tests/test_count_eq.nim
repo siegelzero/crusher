@@ -94,11 +94,11 @@ suite "CountEq Constraint Tests":
         check constraint.penalty() == 1
 
         # Test moveDelta: change pos 2 from 0 to 1 → count becomes 3, required still 3 → cost 0
-        let delta = constraint.countEqState.moveDelta(2, 0, 1)
+        let delta = constraint.moveDelta(2, 0, 1)
         check delta == -1  # cost goes from 1 to 0
 
         # Test moveDelta on target position: change target from 3 to 1 → required becomes 1, count still 2
-        let delta2 = constraint.countEqState.moveDelta(4, 3, 1)
+        let delta2 = constraint.moveDelta(4, 3, 1)
         check delta2 == 0  # cost goes from 1 to |2-1|=1, delta=0
 
     test "CountEq with value 0":

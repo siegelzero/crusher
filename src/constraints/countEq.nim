@@ -116,6 +116,8 @@ proc deepCopy*[T](state: CountEqConstraint[T]): CountEqConstraint[T] =
     result.actualCount = state.actualCount
     result.requiredCount = state.requiredCount
     result.cost = state.cost
-    result.currentAssignment = state.currentAssignment
+    result.currentAssignment = initTable[int, T]()
+    for k, v in state.currentAssignment.pairs:
+        result.currentAssignment[k] = v
     result.allPositions = state.allPositions
     result.lastChangeAffectedCost = state.lastChangeAffectedCost
