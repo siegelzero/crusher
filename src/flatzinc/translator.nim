@@ -231,25 +231,29 @@ proc buildMatrixInfos(tr: var FznTranslator) =
         let n = int(float(size).sqrt + 0.5)
         if n * n != size:
             continue
-        # Build elements array
+        # Build elements array — skip arrays containing defined variables (pos == -1)
+        # since they don't have real positions and can't be used for matrix element constraints
         var elements = newSeq[ArrayElement[int]](size)
+        var hasDefinedVar = false
         for i in 0..<size:
             let pos = positions[i]
             if pos == -1:
-                # Defined variable — treat as variable (it will be resolved at solve time)
-                continue
+                hasDefinedVar = true
+                break
             let dom = tr.sys.baseArray.domain[pos]
             if dom.len == 1:
                 elements[i] = ArrayElement[int](isConstant: true, constantValue: dom[0])
             else:
                 elements[i] = ArrayElement[int](isConstant: false, variablePosition: pos)
+        if hasDefinedVar:
+            continue
         tr.matrixInfos[name] = MatrixInfo(
             arrayName: name,
             numRows: n,
             numCols: n,
             elements: elements
         )
-        stderr.writeLine(&"[FZN] Built matrix info for '{name}': {n}x{n}")
+
 
 proc matchMatrixRow(tr: FznTranslator, inlineElems: seq[ArrayElement[int]],
                      matrixInfo: MatrixInfo): int =
