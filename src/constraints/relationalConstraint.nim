@@ -92,3 +92,55 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
 # Get the current penalty
 func penalty*[T](constraint: RelationalConstraint[T]): int =
     return constraint.cost
+
+proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
+                          currentValue: T, domain: seq[T]): seq[int] =
+    ## Compute penalty for ALL domain values at a position in a tight loop.
+    ## For linear expressions (SumExpr/ConstantExpr), avoids per-value function call overhead.
+    result = newSeq[int](domain.len)
+
+    # Extract left coefficient for this position
+    var leftCoeff: T = 0
+    var leftOk = true
+    case constraint.leftExpr.kind
+    of SumExpr:
+        let s = constraint.leftExpr.sumExpr
+        if s.evalMethod == PositionBased:
+            leftCoeff = s.coefficient.getOrDefault(position, T(0))
+        else:
+            leftOk = false
+    of ConstantExpr:
+        leftCoeff = 0
+    else:
+        leftOk = false
+
+    # Extract right coefficient for this position
+    var rightCoeff: T = 0
+    var rightOk = true
+    case constraint.rightExpr.kind
+    of SumExpr:
+        let s = constraint.rightExpr.sumExpr
+        if s.evalMethod == PositionBased:
+            rightCoeff = s.coefficient.getOrDefault(position, T(0))
+        else:
+            rightOk = false
+    of ConstantExpr:
+        rightCoeff = 0
+    else:
+        rightOk = false
+
+    if leftOk and rightOk:
+        # Batch evaluation: compute base values (with position contribution removed)
+        let leftBase = constraint.leftValue - leftCoeff * currentValue
+        let rightBase = constraint.rightValue - rightCoeff * currentValue
+        let rel = constraint.relation
+
+        for i in 0..<domain.len:
+            let v = domain[i]
+            let left = leftBase + leftCoeff * v
+            let right = rightBase + rightCoeff * v
+            result[i] = int(rel.penalty(left, right))
+    else:
+        # Fallback: individual computation
+        for i, v in domain:
+            result[i] = constraint.cost + constraint.moveDelta(position, currentValue, v)

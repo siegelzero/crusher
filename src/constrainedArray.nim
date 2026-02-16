@@ -1,10 +1,11 @@
-import std/[packedsets, sequtils, strformat, tables]
-
+import std/[packedsets, random, sequtils, strformat, tables]
 import constraints/[stateful, algebraic, ordering, types]
 import constraints/constraintNode
 import constraints/relationalConstraint
 import constraints/elementState
 import constraints/matrixElement
+import constraints/cumulative
+import constraints/diffn
 import expressions/expressions
 import expressions/stateful as exprStateful
 import expressions/sumExpression
@@ -339,7 +340,7 @@ proc evaluateExpression[T](expr: Expression[T], assignment: seq[T]): T =
 
 proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
     ## Statelessly evaluate a constraint's penalty with a raw assignment.
-    ## Returns penalty (0 = satisfied). Only supports types usable for GAC.
+    ## Returns penalty (0 = satisfied). Returns -1 for unsupported types.
     case cons.stateType
     of AlgebraicType:
         return penalty(cons.algebraicState.constraint, assignment)
@@ -347,6 +348,45 @@ proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
         let leftVal = evaluateExpression(cons.relationalState.leftExpr, assignment)
         let rightVal = evaluateExpression(cons.relationalState.rightExpr, assignment)
         return cons.relationalState.relation.penalty(leftVal, rightVal)
+    of CumulativeType:
+        let cumState = cons.cumulativeState
+        case cumState.evalMethod
+        of PositionBased:
+            # Build resource profile from scratch and count overloads
+            var profile = newSeq[T](cumState.maxTime + 1)
+            for i in 0..<cumState.originPositions.len:
+                let origin = assignment[cumState.originPositions[i]]
+                let dur = cumState.durations[i]
+                let h = cumState.heights[i]
+                let startT = int(origin)
+                let endT = int(origin + dur)
+                for t in max(0, startT) ..< min(endT, cumState.maxTime + 1):
+                    profile[t] += h
+            var cost: T = 0
+            for t in 0..cumState.maxTime:
+                if profile[t] > cumState.limit:
+                    cost += profile[t] - cumState.limit
+            return cost
+        of ExpressionBased:
+            return T(-1)
+    of DiffnType:
+        let dc = cons.diffnState
+        var cost: T = 0
+        for i in 0 ..< dc.n:
+            let xi = dc.xExprs[i].evaluate(assignment)
+            let yi = dc.yExprs[i].evaluate(assignment)
+            let dxi = dc.dxExprs[i].evaluate(assignment)
+            let dyi = dc.dyExprs[i].evaluate(assignment)
+            for j in i + 1 ..< dc.n:
+                let xj = dc.xExprs[j].evaluate(assignment)
+                let yj = dc.yExprs[j].evaluate(assignment)
+                let dxj = dc.dxExprs[j].evaluate(assignment)
+                let dyj = dc.dyExprs[j].evaluate(assignment)
+                if dxi > 0 and dyi > 0 and dxj > 0 and dyj > 0 and
+                   xi < xj + dxj and xj < xi + dxi and
+                   yi < yj + dyj and yj < yi + dyi:
+                    cost += 1
+        return cost
     else:
         return T(-1)  # sentinel: not supported
 
@@ -374,6 +414,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if carray.domain[i].len > 0:
                 tempAssignment[i] = carray.domain[i][0]
 
+        var removed = 0
         for d in carray.domain[pos]:
             tempAssignment[pos] = d
             # Test the constraint without requiring it to be initialized
@@ -385,13 +426,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     # RelationalConstraint needs to be evaluated differently
                     # Skip for now - these are typically multi-variable anyway
                     continue
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, MatrixElementType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, MatrixElementType:
                     # Skip these constraint types for domain reduction
                     continue
 
             if tempPenalty > 0:
-                # echo "Excluding ", d, " from ", pos
                 currentDomain[pos].excl(d)
+                removed += 1
 
     # Cumulative constraint domain reduction
     for cons in carray.constraints:
@@ -421,6 +462,69 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         of ExpressionBased:
             discard
+
+    # Detect int_div patterns: pairs of constraints encoding z = floor(x / c)
+    #   x - c*z >= 0     (i.e., c*z <= x)
+    #   x - c*z <= c-1   (i.e., x < c*(z+1))
+    # Applied inside the outer loop after bounds propagation.
+    type
+        DivHalf = object
+            posX, posZ: int
+            coeff: T
+            isLower: bool
+        DivPattern = object
+            posX, posZ: int
+            coeff: T
+
+    var divPatterns: seq[DivPattern]
+    block:
+        var divHalves: seq[DivHalf]
+        for cons in carray.constraints:
+            if cons.stateType != RelationalType or cons.positions.len != 2:
+                continue
+            let (success, form) = extractLinearForm(cons.relationalState)
+            if not success:
+                continue
+            let positions = toSeq(cons.positions.items)
+            if positions.len != 2:
+                continue
+            let p0 = positions[0]
+            let p1 = positions[1]
+            let c0 = form.coefficients.getOrDefault(p0, T(0))
+            let c1 = form.coefficients.getOrDefault(p1, T(0))
+
+            if form.relation == GreaterThanEq and form.constant == 0:
+                if c0 == 1 and c1 < 0:
+                    divHalves.add(DivHalf(posX: p0, posZ: p1, coeff: -c1, isLower: true))
+                elif c1 == 1 and c0 < 0:
+                    divHalves.add(DivHalf(posX: p1, posZ: p0, coeff: -c0, isLower: true))
+            elif form.relation == LessThanEq:
+                if c0 == 1 and c1 < 0:
+                    let c = -c1
+                    if -form.constant == c - 1:
+                        divHalves.add(DivHalf(posX: p0, posZ: p1, coeff: c, isLower: false))
+                elif c1 == 1 and c0 < 0:
+                    let c = -c0
+                    if -form.constant == c - 1:
+                        divHalves.add(DivHalf(posX: p1, posZ: p0, coeff: c, isLower: false))
+
+        for i in 0..<divHalves.len:
+            if not divHalves[i].isLower:
+                continue
+            for j in 0..<divHalves.len:
+                if divHalves[j].isLower:
+                    continue
+                if divHalves[i].posX == divHalves[j].posX and
+                   divHalves[i].posZ == divHalves[j].posZ and
+                   divHalves[i].coeff == divHalves[j].coeff:
+                    divPatterns.add(DivPattern(
+                        posX: divHalves[i].posX,
+                        posZ: divHalves[i].posZ,
+                        coeff: divHalves[i].coeff))
+                    break
+
+        if divPatterns.len > 0:
+            stderr.writeLine(&"[DomRed] Detected {divPatterns.len} int_div patterns")
 
     # Phase 3+4: Bounds propagation + AllDifferent, iterated to fixed point
     # Pre-extract linear forms from relational constraints
@@ -513,6 +617,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     # Collect small-arity constraints for GAC
     const MAX_GAC_ARITY = 4
+    const MAX_GAC_COMBOS = 1_000_000
     var gacConstraints: seq[int]  # indices into carray.constraints
     for i, cons in carray.constraints:
         if cons.stateType in {AlgebraicType, RelationalType}:
@@ -589,6 +694,43 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         currentDomain[pos].excl(v)
                         outerChanged = true
 
+        # Phase IntDiv: Restrict x to ∪{[c*z, c*z+c-1] : z ∈ domain(z)}
+        if divPatterns.len > 0:
+            for patIdx, pat in divPatterns:
+                let oldXSize = currentDomain[pat.posX].len
+                let oldZSize = currentDomain[pat.posZ].len
+                if oldXSize == 0 or oldZSize == 0: continue
+
+                # Find x domain bounds
+                var xMin = T.high
+                var xMax = T.low
+                for v in currentDomain[pat.posX].items:
+                    if v < xMin: xMin = v
+                    if v > xMax: xMax = v
+
+                # Prune z values whose windows don't overlap x's domain range
+                for z in toSeq(currentDomain[pat.posZ].items):
+                    let lo = pat.coeff * z
+                    let hi = lo + pat.coeff - 1
+                    if hi < xMin or lo > xMax:
+                        currentDomain[pat.posZ].excl(z)
+
+                # Build validX as union of windows from remaining z values
+                var validX = initPackedSet[T]()
+                for z in currentDomain[pat.posZ].items:
+                    let lo = max(xMin, pat.coeff * z)
+                    let hi = min(xMax, pat.coeff * z + pat.coeff - 1)
+                    for v in lo..hi:
+                        if v in currentDomain[pat.posX]:
+                            validX.incl(v)
+                currentDomain[pat.posX] = validX
+
+                let newXSize = currentDomain[pat.posX].len
+                let newZSize = currentDomain[pat.posZ].len
+                if newXSize < oldXSize or newZSize < oldZSize:
+                    outerChanged = true
+                    stderr.writeLine(&"[DomRed] IntDiv: x@{pat.posX} {oldXSize}->{newXSize}, z@{pat.posZ} {oldZSize}->{newZSize}")
+
         # Phase GAC: Generalized Arc Consistency for small-arity constraints
         # For each constraint, enumerate all value combinations and keep only
         # values that appear in at least one satisfying tuple.
@@ -613,9 +755,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         totalCombinations = 0
                         break
                     totalCombinations *= vals.len
+                    if totalCombinations > MAX_GAC_COMBOS:
+                        break
                     domains.add(vals)
 
-                if totalCombinations == 0:
+                if totalCombinations == 0 or totalCombinations > MAX_GAC_COMBOS:
                     continue
 
                 # Track which values have support (appear in a satisfying tuple)
@@ -948,7 +1092,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if not outerChanged:
             break
 
-    # Phase 5: Convert PackedSets to output sequences
+    # Convert PackedSets to output sequences
     for pos in carray.allPositions():
         reduced[pos] = toSeq(currentDomain[pos])
 

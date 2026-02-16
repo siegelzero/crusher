@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq, diffn
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -276,6 +276,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Regular Constraint"
         of CountEqType:
             return "CountEq Constraint"
+        of DiffnType:
+            return "Diffn Constraint"
         of MatrixElementType:
             return "MatrixElement Constraint"
 
@@ -325,6 +327,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.regularState.cost
         of CountEqType:
             return constraint.countEqState.cost
+        of DiffnType:
+            return constraint.diffnState.cost
         of MatrixElementType:
             return constraint.matrixElementState.cost
 
@@ -913,6 +917,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.regularState.initialize(assignment)
         of CountEqType:
             constraint.countEqState.initialize(assignment)
+        of DiffnType:
+            constraint.diffnState.initialize(assignment)
         of MatrixElementType:
             constraint.matrixElementState.initialize(assignment)
 
@@ -959,6 +965,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
             constraint.countEqState.moveDelta(position, oldValue, newValue)
+        of DiffnType:
+            constraint.diffnState.moveDelta(position, oldValue, newValue)
         of MatrixElementType:
             constraint.matrixElementState.moveDelta(position, oldValue, newValue)
 
@@ -1005,6 +1013,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.regularState.updatePosition(position, newValue)
         of CountEqType:
             constraint.countEqState.updatePosition(position, newValue)
+        of DiffnType:
+            constraint.diffnState.updatePosition(position, newValue)
         of MatrixElementType:
             constraint.matrixElementState.updatePosition(position, newValue)
 
@@ -1030,6 +1040,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.matrixElementState.getAffectedPositions()
         of ElementType:
             return constraint.elementState.getAffectedPositions()
+        of DiffnType:
+            return constraint.diffnState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1495,6 +1507,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: CountEqType,
                 countEqState: constraint.countEqState.deepCopy()
             )
+        of DiffnType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: DiffnType,
+                diffnState: constraint.diffnState.deepCopy()
+            )
         of MatrixElementType:
             result = StatefulConstraint[T](
                 positions: constraint.positions,
@@ -1635,6 +1653,23 @@ func geost*[T](placementPositions: seq[int], cellsByPlacement: seq[seq[seq[int]]
         positions: geostConstraint.positions,
         stateType: GeostType,
         geostState: geostConstraint
+    )
+
+################################################################################
+# Diffn wrapper functions
+################################################################################
+
+func diffn*[T](xExprs, yExprs, dxExprs, dyExprs: seq[AlgebraicExpression[T]]): StatefulConstraint[T] =
+    ## Creates a diffn constraint ensuring n rectangles don't overlap.
+    ## - xExprs: X positions of rectangles
+    ## - yExprs: Y positions of rectangles
+    ## - dxExprs: Widths of rectangles
+    ## - dyExprs: Heights of rectangles
+    let diffnConstraint = newDiffnConstraint[T](xExprs, yExprs, dxExprs, dyExprs)
+    return StatefulConstraint[T](
+        positions: diffnConstraint.positions,
+        stateType: DiffnType,
+        diffnState: diffnConstraint
     )
 
 ################################################################################

@@ -536,3 +536,61 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
                     costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
 
             return costDelta
+
+
+proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, currentValue: T,
+                          domain: seq[T]): seq[int] =
+    ## Compute cost + moveDelta for ALL domain values at a position using prefix sums.
+    ## O(maxTime + domainSize) instead of O(domainSize * duration).
+    result = newSeq[int](domain.len)
+
+    if state.evalMethod != PositionBased:
+        # Fallback to individual computation
+        for i, v in domain:
+            result[i] = state.cost + state.moveDelta(position, currentValue, v)
+        return
+
+    if position >= state.positionToTask.len or state.positionToTask[position] < 0:
+        # Not a task origin — penalty doesn't change
+        for i in 0..<domain.len:
+            result[i] = state.cost
+        return
+
+    let taskIdx = state.positionToTask[position]
+    let duration = int(state.durations[taskIdx])
+    let height = int(state.heights[taskIdx])
+    let limit = int(state.limit)
+    let tMax = state.maxTime + 1
+
+    # Step 1: Compute "removed profile" overuse and delta array
+    # removedProfile[t] = resourceProfile[t] - height if t is in old task range, else resourceProfile[t]
+    # delta[t] = max(0, removedProfile[t] + height - limit) - max(0, removedProfile[t] - limit)
+    #   = extra overuse at t when our task is placed there
+    let oldStart = max(0, int(currentValue))
+    let oldEnd = min(tMax, int(currentValue) + duration)
+
+    # Build prefix sum of delta values
+    var prefixDelta = newSeq[int64](tMax + 1)
+    var baseOveruse: int64 = 0
+    for t in 0..<tMax:
+        let rp = int(state.resourceProfile[t])
+        var removedP: int
+        if t >= oldStart and t < oldEnd:
+            removedP = rp - height
+        else:
+            removedP = rp
+        let overuseWithout = max(0, removedP - limit)
+        let overuseWith = max(0, removedP + height - limit)
+        baseOveruse += int64(overuseWithout)
+        prefixDelta[t + 1] = prefixDelta[t] + int64(overuseWith - overuseWithout)
+
+    # Step 2: For each candidate, compute total penalty in O(1)
+    for i, v in domain:
+        let newStart = max(0, int(v))
+        let newEnd = min(tMax, int(v) + duration)
+        if newStart >= tMax:
+            # Task entirely outside profile — penalty is just base overuse
+            result[i] = int(baseOveruse)
+        else:
+            let addedCost = prefixDelta[newEnd] - prefixDelta[newStart]
+            result[i] = int(baseOveruse + addedCost)

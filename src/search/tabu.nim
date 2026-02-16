@@ -110,6 +110,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.regularState.cost + constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
             result = constraint.countEqState.cost + constraint.countEqState.moveDelta(position, oldValue, newValue)
+        of DiffnType:
+            result = constraint.diffnState.cost + constraint.diffnState.moveDelta(position, oldValue, newValue)
         of MatrixElementType:
             result = constraint.matrixElementState.cost + constraint.matrixElementState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
@@ -132,31 +134,78 @@ proc penaltyAt*[T](state: TabuState[T], position: int, value: T): int {.inline.}
 
 proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
     ## Full rebuild of penalty map at position, including per-constraint cache.
+    ## Uses batch computation for cumulative constraints (prefix-sum approach).
     let domain = state.carray.reducedDomain[position]
-    for i in 0..<domain.len:
-        let value = domain[i]
-        var total = 0
-        for ci, constraint in state.constraintsAtPosition[position]:
-            let p = state.movePenalty(constraint, position, value)
-            state.constraintPenalties[position][ci][i] = p
-            let globalIdx = state.constraintGlobalIdx[position][ci]
-            total += p * state.constraintWeights[globalIdx]
-        state.penaltyMap[position][i] = total
+    let dLen = domain.len
+    if dLen == 0: return
+
+    # Zero out penalty map
+    for i in 0..<dLen:
+        state.penaltyMap[position][i] = 0
+
+    for ci, constraint in state.constraintsAtPosition[position]:
+        let globalIdx = state.constraintGlobalIdx[position][ci]
+        let weight = state.constraintWeights[globalIdx]
+
+        if constraint.stateType == CumulativeType and
+           constraint.cumulativeState.evalMethod == PositionBased:
+            # Batch computation via prefix sums — O(maxTime + domainSize)
+            let penalties = constraint.cumulativeState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i] * weight
+        elif constraint.stateType == RelationalType:
+            # Batch computation for relational constraints — tight arithmetic loop
+            let penalties = constraint.relationalState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i] * weight
+        else:
+            # Individual computation for other constraints
+            for i in 0..<dLen:
+                let value = domain[i]
+                let p = state.movePenalty(constraint, position, value)
+                state.constraintPenalties[position][ci][i] = p
+                state.penaltyMap[position][i] += p * weight
 
 
 proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx: int) =
     ## Incrementally update penalty map at position for a single constraint.
     ## Only recomputes that constraint's contribution and adjusts the total.
+    ## Uses batch prefix-sum method for cumulative constraints.
     let constraint = state.constraintsAtPosition[position][localIdx]
     let globalIdx = state.constraintGlobalIdx[position][localIdx]
     let weight = state.constraintWeights[globalIdx]
     let domain = state.carray.reducedDomain[position]
-    for i in 0..<domain.len:
-        let value = domain[i]
-        let newP = state.movePenalty(constraint, position, value)
-        let oldP = state.constraintPenalties[position][localIdx][i]
-        state.penaltyMap[position][i] += weight * (newP - oldP)
-        state.constraintPenalties[position][localIdx][i] = newP
+
+    if constraint.stateType == CumulativeType and
+       constraint.cumulativeState.evalMethod == PositionBased:
+        # Batch computation via prefix sums
+        let penalties = constraint.cumulativeState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == RelationalType:
+        # Batch computation for relational constraints
+        let penalties = constraint.relationalState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.constraintPenalties[position][localIdx][i] = newP
+    else:
+        for i in 0..<domain.len:
+            let value = domain[i]
+            let newP = state.movePenalty(constraint, position, value)
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.constraintPenalties[position][localIdx][i] = newP
 
 
 proc updateConstraintAtPositionValues[T](state: TabuState[T], position: int, localIdx: int, values: seq[T]) =
@@ -405,6 +454,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 ################################################################################
 
 proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
+    const MAX_CANDIDATES_PER_POS = 500
+
     var
         delta: int
         bestMoveCost = high(int)
@@ -421,18 +472,37 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             continue
 
         let domain = state.carray.reducedDomain[position]
-        for i in 0..<domain.len:
-            if i == oldIdx:
-                continue
-            inc movesEvaluated
-            delta = state.penaltyMap[position][i] - oldPenalty
-            let newWeightedCost = state.weightedCost + delta
-            if state.tabu[position][i] <= state.iteration or newWeightedCost < state.bestWeightedCost:
-                if newWeightedCost < bestMoveCost:
-                    result = @[(position, domain[i])]
-                    bestMoveCost = newWeightedCost
-                elif newWeightedCost == bestMoveCost:
-                    result.add((position, domain[i]))
+        let dLen = domain.len
+
+        if dLen <= MAX_CANDIDATES_PER_POS:
+            # Small domain: evaluate all values
+            for i in 0..<dLen:
+                if i == oldIdx:
+                    continue
+                inc movesEvaluated
+                delta = state.penaltyMap[position][i] - oldPenalty
+                let newWeightedCost = state.weightedCost + delta
+                if state.tabu[position][i] <= state.iteration or newWeightedCost < state.bestWeightedCost:
+                    if newWeightedCost < bestMoveCost:
+                        result = @[(position, domain[i])]
+                        bestMoveCost = newWeightedCost
+                    elif newWeightedCost == bestMoveCost:
+                        result.add((position, domain[i]))
+        else:
+            # Large domain: evaluate a random sample of candidates
+            for s in 0..<MAX_CANDIDATES_PER_POS:
+                let i = rand(dLen - 1)
+                if i == oldIdx:
+                    continue
+                inc movesEvaluated
+                delta = state.penaltyMap[position][i] - oldPenalty
+                let newWeightedCost = state.weightedCost + delta
+                if state.tabu[position][i] <= state.iteration or newWeightedCost < state.bestWeightedCost:
+                    if newWeightedCost < bestMoveCost:
+                        result = @[(position, domain[i])]
+                        bestMoveCost = newWeightedCost
+                    elif newWeightedCost == bestMoveCost:
+                        result.add((position, domain[i]))
 
     state.movesExplored = movesEvaluated
 

@@ -29,6 +29,8 @@ proc resolve*[T](system: ConstraintSystem[T],
     # Check for empty domains (infeasible after domain reduction)
     for pos in system.baseArray.allPositions():
         if system.baseArray.reducedDomain[pos].len == 0:
+            if verbose:
+                echo &"[Solve] Empty domain at position {pos} (original domain size: {system.baseArray.domain[pos].len})"
             raise newException(NoSolutionFoundError, "Domain reduction found infeasibility")
 
     if parallel:

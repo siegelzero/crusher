@@ -599,12 +599,21 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     tr.sys.addConstraint(m == z)
 
   of "int_div":
-    # int_div is tricky for local search - approximate with multiplication
-    # x div y = z  =>  x = z * y (approximate)
+    # int_div(x, y, z) means z = x div y (integer division, rounding towards zero)
+    # For non-negative x and positive constant y:
+    #   z * y <= x  and  x <= z * y + (y - 1)
+    # For local search with variable y, fall back to approximate equality z * y == x
     let x = tr.resolveExprArg(con.args[0])
     let y = tr.resolveExprArg(con.args[1])
     let z = tr.resolveExprArg(con.args[2])
-    tr.sys.addConstraint(z * y == x)
+    if con.args[1].kind == FznIntLit and con.args[1].intVal > 0:
+      let yVal = con.args[1].intVal
+      # z * y <= x  =>  x - z * y >= 0
+      tr.sys.addConstraint(x - z * y >= 0)
+      # x - z * y <= y - 1  =>  x - z * y - (y-1) <= 0
+      tr.sys.addConstraint(x - z * y <= yVal - 1)
+    else:
+      tr.sys.addConstraint(z * y == x)
 
   of "int_mod":
     # x mod y = z => x = y * q + z for some q, and 0 <= z < |y|
@@ -843,6 +852,14 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         limit = 10  # fallback
     tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, limit))
 
+  of "fzn_diffn":
+    # diffn(x, y, dx, dy) - non-overlapping rectangles
+    let xExprs = tr.resolveExprArray(con.args[0])
+    let yExprs = tr.resolveExprArray(con.args[1])
+    let dxExprs = tr.resolveExprArray(con.args[2])
+    let dyExprs = tr.resolveExprArray(con.args[3])
+    tr.sys.addConstraint(diffn[int](xExprs, yExprs, dxExprs, dyExprs))
+
   of "fzn_circuit":
     let exprs = tr.resolveExprArray(con.args[0])
     let (allRefs, positions) = isAllRefs(exprs)
@@ -1055,6 +1072,25 @@ proc translateSolve(tr: var FznTranslator) =
         let objName = tr.model.solve.objective.ident
         if objName in tr.varPositions:
           tr.objectivePos = tr.varPositions[objName]
+        elif objName in tr.definedVarExprs:
+          # Objective was eliminated as a defined variable — create a real position for it
+          let defExpr = tr.definedVarExprs[objName]
+          let pos = tr.sys.baseArray.len
+          let v = tr.sys.newConstrainedVariable()
+          # Find the variable declaration for domain bounds
+          for decl in tr.model.variables:
+            if not decl.isArray and decl.name == objName:
+              case decl.varType.kind
+              of FznIntRange:
+                v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
+              of FznIntSet:
+                v.setDomain(decl.varType.values)
+              else:
+                v.setDomain(toSeq(-100000..100000))
+              break
+          tr.varPositions[objName] = pos
+          tr.sys.addConstraint(tr.getExpr(pos) == defExpr)
+          tr.objectivePos = pos
         else:
           raise newException(KeyError, &"Unknown objective variable '{objName}'")
       else:
@@ -1091,77 +1127,111 @@ proc collectDefinedVars(tr: var FznTranslator) =
   for name in definedVarNames.keys:
     tr.definedVarNames.incl(name)
 
+proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
+  ## Tries to build the AlgebraicExpression for one defining constraint.
+  ## Returns true if successful, false if a dependency is not yet available.
+  let con = tr.model.constraints[ci]
+  let name = stripSolverPrefix(con.name)
+  # Only process int_lin_eq with defines_var (skip consumed count_eq intermediates)
+  if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+    return true  # not our concern, treat as done
+  var ann: FznAnnotation
+  for a in con.annotations:
+    if a.name == "defines_var":
+      ann = a
+      break
+  let definedName = ann.args[0].ident
+  if definedName in tr.definedVarExprs:
+    return true  # already built
+
+  let coeffs = tr.resolveIntArray(con.args[0])
+  let rhs = tr.resolveIntArg(con.args[2])
+  let vars = con.args[1]
+
+  if vars.kind != FznArrayLit:
+    return true  # can't process, skip
+
+  # Find the defined variable's position in the constraint
+  var definedIdx = -1
+  for vi, v in vars.elems:
+    if v.kind == FznIdent and v.ident == definedName:
+      definedIdx = vi
+      break
+
+  if definedIdx < 0:
+    return true  # can't process, skip
+
+  # Check if all dependencies are available before building
+  for vi, v in vars.elems:
+    if vi == definedIdx:
+      continue
+    if v.kind == FznIdent and v.ident in tr.definedVarNames and
+       v.ident notin tr.definedVarExprs and v.ident notin tr.varPositions and
+       v.ident notin tr.paramValues:
+      return false  # dependency not yet built
+
+  let defCoeff = coeffs[definedIdx]
+  # Constraint: defCoeff * defined + sum(other_coeffs * other_vars) = rhs
+  # defined = (rhs - sum(other_coeffs * other_vars)) / defCoeff
+  # For defCoeff = 1: defined = rhs - sum(other_coeffs * other_vars)
+  # For defCoeff = -1: defined = sum(other_coeffs * other_vars) - rhs
+
+  # Build expression: start with the constant term (rhs / defCoeff)
+  var expr: AlgebraicExpression[int]
+  let sign = if defCoeff == 1: -1 else: 1  # negate other coefficients
+
+  var first = true
+  for vi, v in vars.elems:
+    if vi == definedIdx:
+      continue
+    let otherExpr = tr.resolveExprArg(v)
+    let scaledCoeff = sign * coeffs[vi]
+    let term = scaledCoeff * otherExpr
+    if first:
+      expr = term
+      first = false
+    else:
+      expr = expr + term
+
+  # Add constant term: sign * (-rhs) = rhs/defCoeff for the constant part
+  let constTerm = if defCoeff == 1: rhs else: -rhs
+  if constTerm != 0:
+    if first:
+      expr = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
+        linear = true
+      )
+      first = false
+    else:
+      expr = expr + constTerm
+
+  if expr.isNil:
+    raise newException(ValueError, &"Failed to build expression for defined variable '{definedName}'")
+  tr.definedVarExprs[definedName] = expr
+  return true
+
 proc buildDefinedExpressions(tr: var FznTranslator) =
   ## Second pass: build AlgebraicExpressions for defined variables using the positions
   ## of non-defined variables that are already created.
+  ## Uses multiple passes to handle dependencies between defined variables.
+  var remaining: seq[int]
   for ci in tr.definingConstraints.items:
-    let con = tr.model.constraints[ci]
-    let name = stripSolverPrefix(con.name)
-    # Only process int_lin_eq with defines_var (skip consumed count_eq intermediates)
-    if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
-      continue
-    var ann: FznAnnotation
-    for a in con.annotations:
-      if a.name == "defines_var":
-        ann = a
-        break
-    let definedName = ann.args[0].ident
-    let coeffs = tr.resolveIntArray(con.args[0])
-    let rhs = tr.resolveIntArg(con.args[2])
-    let vars = con.args[1]
+    remaining.add(ci)
 
-    if vars.kind != FznArrayLit:
-      continue
-
-    # Find the defined variable's position in the constraint
-    var definedIdx = -1
-    for vi, v in vars.elems:
-      if v.kind == FznIdent and v.ident == definedName:
-        definedIdx = vi
-        break
-
-    if definedIdx < 0:
-      continue
-
-    let defCoeff = coeffs[definedIdx]
-    # Constraint: defCoeff * defined + sum(other_coeffs * other_vars) = rhs
-    # defined = (rhs - sum(other_coeffs * other_vars)) / defCoeff
-    # For defCoeff = 1: defined = rhs - sum(other_coeffs * other_vars)
-    # For defCoeff = -1: defined = sum(other_coeffs * other_vars) - rhs
-
-    # Build expression: start with the constant term (rhs / defCoeff)
-    var expr: AlgebraicExpression[int]
-    let sign = if defCoeff == 1: -1 else: 1  # negate other coefficients
-
-    var first = true
-    for vi, v in vars.elems:
-      if vi == definedIdx:
-        continue
-      let otherExpr = tr.resolveExprArg(v)
-      let scaledCoeff = sign * coeffs[vi]
-      let term = scaledCoeff * otherExpr
-      if first:
-        expr = term
-        first = false
-      else:
-        expr = expr + term
-
-    # Add constant term: sign * (-rhs) = rhs/defCoeff for the constant part
-    let constTerm = if defCoeff == 1: rhs else: -rhs
-    if constTerm != 0:
-      if first:
-        expr = newAlgebraicExpression[int](
-          positions = initPackedSet[int](),
-          node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
-          linear = true
-        )
-        first = false
-      else:
-        expr = expr + constTerm
-
-    if expr.isNil:
-      raise newException(ValueError, &"Failed to build expression for defined variable '{definedName}'")
-    tr.definedVarExprs[definedName] = expr
+  var maxPasses = remaining.len + 1
+  while remaining.len > 0 and maxPasses > 0:
+    var nextRemaining: seq[int]
+    for ci in remaining:
+      if not tr.tryBuildDefinedExpression(ci):
+        nextRemaining.add(ci)
+    if nextRemaining.len == remaining.len:
+      # No progress - break to avoid infinite loop
+      for ci in nextRemaining:
+        discard tr.tryBuildDefinedExpression(ci)  # will raise on error
+      break
+    remaining = nextRemaining
+    dec maxPasses
 
 proc detectCountPatterns(tr: var FznTranslator) =
   ## Detects int_lin_eq → bool2int → int_eq_reif chains that implement count_eq.
