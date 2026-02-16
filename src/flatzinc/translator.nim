@@ -1,12 +1,12 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets, sets]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets, math]
 
 import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq]
+import ../constraints/[stateful, countEq, matrixElement, elementState]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
 
 type
@@ -16,6 +16,12 @@ type
     countValue*: int         # the constant value being counted
     targetVarName*: string   # name of the target variable (the count)
     arrayVarNames*: seq[string]  # names of the array variables being counted over
+
+  MatrixInfo* = object
+    ## Info about a known matrix (square output array) for matrix_element detection
+    arrayName*: string
+    numRows*, numCols*: int
+    elements*: seq[ArrayElement[int]]  # flat row-major array of ArrayElements
 
   GeostConversion* = object
     ## A detected pattern where multiple fzn_regular constraints over the same
@@ -58,6 +64,8 @@ type
     countEqPatterns*: Table[int, CountEqPattern]
     # Geost conversion (active if tileValues.len > 0)
     geostConversion*: GeostConversion
+    # Matrix infos for matrix_element pattern detection
+    matrixInfos*: Table[string, MatrixInfo]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -208,6 +216,97 @@ proc resolveMixedArray*(tr: FznTranslator, arg: FznExpr): seq[ArrayElement[int]]
         raise newException(ValueError, &"Expected variable or constant, got {e.kind}")
   else:
     raise newException(ValueError, &"Expected array literal, got {arg.kind}")
+
+
+proc buildMatrixInfos(tr: var FznTranslator) =
+    ## Builds MatrixInfo entries for output arrays that are perfect squares.
+    ## These enable matrix_element pattern detection in element constraint translation.
+    for oa in tr.outputArrays:
+        let name = oa.name
+        if name notin tr.arrayPositions:
+            continue
+        let positions = tr.arrayPositions[name]
+        let size = positions.len
+        # Check for perfect square
+        let n = int(float(size).sqrt + 0.5)
+        if n * n != size:
+            continue
+        # Build elements array
+        var elements = newSeq[ArrayElement[int]](size)
+        for i in 0..<size:
+            let pos = positions[i]
+            if pos == -1:
+                # Defined variable — treat as variable (it will be resolved at solve time)
+                continue
+            let dom = tr.sys.baseArray.domain[pos]
+            if dom.len == 1:
+                elements[i] = ArrayElement[int](isConstant: true, constantValue: dom[0])
+            else:
+                elements[i] = ArrayElement[int](isConstant: false, variablePosition: pos)
+        tr.matrixInfos[name] = MatrixInfo(
+            arrayName: name,
+            numRows: n,
+            numCols: n,
+            elements: elements
+        )
+        stderr.writeLine(&"[FZN] Built matrix info for '{name}': {n}x{n}")
+
+proc matchMatrixRow(tr: FznTranslator, inlineElems: seq[ArrayElement[int]],
+                     matrixInfo: MatrixInfo): int =
+    ## Checks if inlineElems matches a specific row of the matrix.
+    ## Returns the row index if matched, -1 otherwise.
+    let numCols = matrixInfo.numCols
+    if inlineElems.len != numCols:
+        return -1
+    for r in 0..<matrixInfo.numRows:
+        var matches = true
+        for c in 0..<numCols:
+            let flatIdx = r * numCols + c
+            let me = matrixInfo.elements[flatIdx]
+            let ie = inlineElems[c]
+            if me.isConstant and ie.isConstant:
+                if me.constantValue != ie.constantValue:
+                    matches = false
+                    break
+            elif not me.isConstant and not ie.isConstant:
+                if me.variablePosition != ie.variablePosition:
+                    matches = false
+                    break
+            else:
+                matches = false
+                break
+        if matches:
+            return r
+    return -1
+
+proc matchMatrixCol(tr: FznTranslator, inlineElems: seq[ArrayElement[int]],
+                     matrixInfo: MatrixInfo): int =
+    ## Checks if inlineElems matches a specific column of the matrix.
+    ## Returns the column index if matched, -1 otherwise.
+    let numRows = matrixInfo.numRows
+    let numCols = matrixInfo.numCols
+    if inlineElems.len != numRows:
+        return -1
+    for c in 0..<numCols:
+        var matches = true
+        for r in 0..<numRows:
+            let flatIdx = r * numCols + c
+            let me = matrixInfo.elements[flatIdx]
+            let ie = inlineElems[r]
+            if me.isConstant and ie.isConstant:
+                if me.constantValue != ie.constantValue:
+                    matches = false
+                    break
+            elif not me.isConstant and not ie.isConstant:
+                if me.variablePosition != ie.variablePosition:
+                    matches = false
+                    break
+            else:
+                matches = false
+                break
+        if matches:
+            return c
+    return -1
 
 proc stripSolverPrefix(name: string): string =
   ## Strips solver-specific prefixes like gecode_, chuffed_ and maps to fzn_ equivalents.
@@ -534,8 +633,43 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     let indexExpr = tr.resolveExprArg(con.args[0])
     let valueExpr = tr.resolveExprArg(con.args[2])
     let adjustedIndex = indexExpr - 1
-    let arrayExprs = tr.resolveExprArray(con.args[1])
-    tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
+
+    # Try matrix element pattern: index is a simple RefNode and value is a simple RefNode
+    var emitted = false
+    if adjustedIndex.node.kind == RefNode and valueExpr.node.kind == RefNode and
+       tr.matrixInfos.len > 0:
+        # Resolve inline array as mixed elements for matching
+        let inlineElems = tr.resolveMixedArray(con.args[1])
+        let indexPos = adjustedIndex.node.position
+        let valuePos = valueExpr.node.position
+        for name, minfo in tr.matrixInfos:
+            # Try row match
+            let rowIdx = tr.matchMatrixRow(inlineElems, minfo)
+            if rowIdx >= 0:
+                # Constant row, variable col: matrix[rowIdx, indexPos] == valuePos
+                tr.sys.addConstraint(stateful.matrixElement[int](
+                    minfo.elements, minfo.numRows, minfo.numCols,
+                    rowIdx, indexPos, valuePos))
+                emitted = true
+                break
+            # Try column match
+            let colIdx = tr.matchMatrixCol(inlineElems, minfo)
+            if colIdx >= 0:
+                # Variable row, constant col: matrix[indexPos, colIdx] == valuePos
+                tr.sys.addConstraint(stateful.matrixElement[int](
+                    minfo.elements, minfo.numRows, minfo.numCols,
+                    indexPos, colIdx, valuePos, rowIsVariable = true))
+                emitted = true
+                break
+
+    if not emitted:
+        let arrayExprs = tr.resolveExprArray(con.args[1])
+        # Use position-based element if index is a RefNode, else expression-based
+        if adjustedIndex.node.kind == RefNode and valueExpr.node.kind == RefNode:
+            let mixedElems = tr.resolveMixedArray(con.args[1])
+            tr.sys.addConstraint(element(adjustedIndex, mixedElems, valueExpr))
+        else:
+            tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
 
   of "array_bool_element":
     # Same as array_int_element but with booleans
@@ -1420,6 +1554,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
   result.arrayElementNames = initTable[string, seq[string]]()
   result.countEqPatterns = initTable[int, CountEqPattern]()
+  result.matrixInfos = initTable[string, MatrixInfo]()
   result.objectivePos = -1
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
@@ -1433,6 +1568,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+  # Build matrix infos for matrix_element pattern detection
+  result.buildMatrixInfos()
 
   # If geost conversion is active, record board positions and create tile variables
   let gc = result.geostConversion

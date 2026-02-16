@@ -53,6 +53,7 @@ type
         currentAssignment*: Table[int, T]
         cost*: int
         positions*: PackedSet[int]
+        lastAffectedPositions*: PackedSet[int]
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 indexPosition*: int
@@ -282,16 +283,67 @@ proc initialize*[T](state: ElementState[T], assignment: seq[T]) =
 proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
     # Update state when a variable assignment changes
     if position notin state.positions:
-        return  # Position not relevant to this constraint
+        state.lastAffectedPositions = initPackedSet[int]()
+        return
 
     let oldValue = state.currentAssignment[position]
     if oldValue == newValue:
-        return  # No change
+        state.lastAffectedPositions = initPackedSet[int]()
+        return
+
+    # Compute affected positions before updating assignment
+    var affected = initPackedSet[int]()
+
+    case state.evalMethod:
+    of PositionBased:
+        if position == state.indexPosition:
+            # Index changed: value position always affected
+            affected.incl(state.valuePosition)
+            # Old indexed array element (if variable)
+            if not state.isConstantArray:
+                let arraySize = state.getArraySize()
+                if oldValue >= 0 and oldValue < arraySize:
+                    let oldElem = state.arrayElements[oldValue]
+                    if not oldElem.isConstant:
+                        affected.incl(oldElem.variablePosition)
+                if newValue >= 0 and newValue < arraySize:
+                    let newElem = state.arrayElements[newValue]
+                    if not newElem.isConstant:
+                        affected.incl(newElem.variablePosition)
+
+        elif position == state.valuePosition:
+            # Value changed: index position affected, plus current array element
+            affected.incl(state.indexPosition)
+            if not state.isConstantArray:
+                let indexValue = state.currentAssignment[state.indexPosition]
+                let arraySize = state.getArraySize()
+                if indexValue >= 0 and indexValue < arraySize:
+                    let elem = state.arrayElements[indexValue]
+                    if not elem.isConstant:
+                        affected.incl(elem.variablePosition)
+
+        else:
+            # Array variable changed — only matters if at current index
+            if not state.isConstantArray:
+                let indexValue = state.currentAssignment[state.indexPosition]
+                let arraySize = state.getArraySize()
+                if indexValue >= 0 and indexValue < arraySize:
+                    let elem = state.arrayElements[indexValue]
+                    if not elem.isConstant and elem.variablePosition == position:
+                        affected.incl(state.indexPosition)
+                        affected.incl(state.valuePosition)
+            # else: not at current index, no affected positions
+
+    of ExpressionBased:
+        # Conservative: return all positions
+        affected = state.positions
+
+    state.lastAffectedPositions = affected
 
     # Update assignment
     state.currentAssignment[position] = newValue
 
-    # Recalculate cost using helper functions (works for both position and expression based)
+    # Recalculate cost
     let indexValue = state.getIndexValue()
     let valueValue = state.getValueValue()
 
@@ -303,8 +355,10 @@ proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
         else:
             state.cost = 0
     else:
-        # Index out of bounds - constraint is violated
         state.cost = 1
+
+func getAffectedPositions*[T](state: ElementState[T]): PackedSet[int] =
+    return state.lastAffectedPositions
 
 proc moveDelta*[T](state: ElementState[T], position: int, oldValue, newValue: T): int =
     # Efficient incremental calculation of cost change

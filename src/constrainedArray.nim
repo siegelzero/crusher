@@ -3,6 +3,8 @@ import std/[packedsets, sequtils, strformat, tables]
 import constraints/[stateful, algebraic, ordering, types]
 import constraints/constraintNode
 import constraints/relationalConstraint
+import constraints/elementState
+import constraints/matrixElement
 import expressions/expressions
 import expressions/stateful as exprStateful
 import expressions/sumExpression
@@ -383,7 +385,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     # RelationalConstraint needs to be evaluated differently
                     # Skip for now - these are typically multi-variable anyway
                     continue
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, MatrixElementType:
                     # Skip these constraint types for domain reduction
                     continue
 
@@ -730,6 +732,218 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 outerChanged = true
                 if not changed:
                     break
+
+        # Phase 6: Element/MatrixElement arc consistency
+        for cons in carray.constraints:
+            if cons.stateType == ElementType:
+                let elemState = cons.elementState
+                if elemState.evalMethod == PositionBased:
+                    let idxPos = elemState.indexPosition
+                    let valPos = elemState.valuePosition
+                    let arrSize = elemState.getArraySize()
+
+                    if elemState.isConstantArray:
+                        # Constant array: array[index] == value
+                        # Index pruning: remove i from domain(index) if constantArray[i] not in domain(value)
+                        for i in toSeq(currentDomain[idxPos].items):
+                            if i >= 0 and i < arrSize:
+                                if elemState.constantArray[i] notin currentDomain[valPos]:
+                                    currentDomain[idxPos].excl(i)
+                                    outerChanged = true
+                            else:
+                                # Out of bounds index — always violated
+                                currentDomain[idxPos].excl(i)
+                                outerChanged = true
+
+                        # Value pruning: remove v from domain(value) if no i in domain(index) maps to v
+                        var reachableValues: PackedSet[T]
+                        for i in currentDomain[idxPos].items:
+                            if i >= 0 and i < arrSize:
+                                reachableValues.incl(elemState.constantArray[i])
+                        for v in toSeq(currentDomain[valPos].items):
+                            if v notin reachableValues:
+                                currentDomain[valPos].excl(v)
+                                outerChanged = true
+
+                    else:
+                        # Variable array: array[index] == value
+                        # Index pruning: remove i from domain(index) if domain(array[i]) ∩ domain(value) = ∅
+                        for i in toSeq(currentDomain[idxPos].items):
+                            if i >= 0 and i < arrSize:
+                                let elem = elemState.arrayElements[i]
+                                if elem.isConstant:
+                                    if elem.constantValue notin currentDomain[valPos]:
+                                        currentDomain[idxPos].excl(i)
+                                        outerChanged = true
+                                else:
+                                    if (currentDomain[elem.variablePosition] * currentDomain[valPos]).len == 0:
+                                        currentDomain[idxPos].excl(i)
+                                        outerChanged = true
+                            else:
+                                currentDomain[idxPos].excl(i)
+                                outerChanged = true
+
+                        # Value pruning: remove v from domain(value) if no i in domain(index) has v reachable
+                        var reachableValues: PackedSet[T]
+                        for i in currentDomain[idxPos].items:
+                            if i >= 0 and i < arrSize:
+                                let elem = elemState.arrayElements[i]
+                                if elem.isConstant:
+                                    reachableValues.incl(elem.constantValue)
+                                else:
+                                    reachableValues = reachableValues + currentDomain[elem.variablePosition]
+                        for v in toSeq(currentDomain[valPos].items):
+                            if v notin reachableValues:
+                                currentDomain[valPos].excl(v)
+                                outerChanged = true
+
+            elif cons.stateType == MatrixElementType:
+                let matState = cons.matrixElementState
+                let valPos = matState.valuePosition
+                let numRows = matState.numRows
+                let numCols = matState.numCols
+
+                if matState.rowKind == ConstantIndex and matState.colKind == VariableIndex:
+                    # Const-row variant: matrix[constRow, col] == value
+                    let constRow = matState.rowConstant
+                    let colPos = matState.colPosition
+
+                    # Col pruning: remove c from domain(col) if domain(matrix[constRow,c]) ∩ domain(value) = ∅
+                    for c in toSeq(currentDomain[colPos].items):
+                        if c >= 0 and c < numCols:
+                            let flatIdx = constRow * numCols + c
+                            let elem = matState.matrixElements[flatIdx]
+                            if elem.isConstant:
+                                if elem.constantValue notin currentDomain[valPos]:
+                                    currentDomain[colPos].excl(c)
+                                    outerChanged = true
+                            else:
+                                if (currentDomain[elem.variablePosition] * currentDomain[valPos]).len == 0:
+                                    currentDomain[colPos].excl(c)
+                                    outerChanged = true
+                        else:
+                            currentDomain[colPos].excl(c)
+                            outerChanged = true
+
+                    # Value pruning: remove v from domain(value) if unreachable
+                    var reachableValues: PackedSet[T]
+                    for c in currentDomain[colPos].items:
+                        if c >= 0 and c < numCols:
+                            let flatIdx = constRow * numCols + c
+                            let elem = matState.matrixElements[flatIdx]
+                            if elem.isConstant:
+                                reachableValues.incl(elem.constantValue)
+                            else:
+                                reachableValues = reachableValues + currentDomain[elem.variablePosition]
+                    for v in toSeq(currentDomain[valPos].items):
+                        if v notin reachableValues:
+                            currentDomain[valPos].excl(v)
+                            outerChanged = true
+
+                elif matState.rowKind == VariableIndex and matState.colKind == ConstantIndex:
+                    # Const-col variant: matrix[row, constCol] == value
+                    let constCol = matState.colConstant
+                    let rowPos = matState.rowPosition
+
+                    # Row pruning: remove r from domain(row) if domain(matrix[r,constCol]) ∩ domain(value) = ∅
+                    for r in toSeq(currentDomain[rowPos].items):
+                        if r >= 0 and r < numRows:
+                            let flatIdx = r * numCols + constCol
+                            let elem = matState.matrixElements[flatIdx]
+                            if elem.isConstant:
+                                if elem.constantValue notin currentDomain[valPos]:
+                                    currentDomain[rowPos].excl(r)
+                                    outerChanged = true
+                            else:
+                                if (currentDomain[elem.variablePosition] * currentDomain[valPos]).len == 0:
+                                    currentDomain[rowPos].excl(r)
+                                    outerChanged = true
+                        else:
+                            currentDomain[rowPos].excl(r)
+                            outerChanged = true
+
+                    # Value pruning: remove v from domain(value) if unreachable
+                    var reachableValues: PackedSet[T]
+                    for r in currentDomain[rowPos].items:
+                        if r >= 0 and r < numRows:
+                            let flatIdx = r * numCols + constCol
+                            let elem = matState.matrixElements[flatIdx]
+                            if elem.isConstant:
+                                reachableValues.incl(elem.constantValue)
+                            else:
+                                reachableValues = reachableValues + currentDomain[elem.variablePosition]
+                    for v in toSeq(currentDomain[valPos].items):
+                        if v notin reachableValues:
+                            currentDomain[valPos].excl(v)
+                            outerChanged = true
+
+                elif matState.rowKind == VariableIndex and matState.colKind == VariableIndex:
+                    # Var-var variant: matrix[row, col] == value
+                    let rowPos = matState.rowPosition
+                    let colPos = matState.colPosition
+
+                    # Row pruning: remove r if no col c has domain(matrix[r,c]) ∩ domain(value) ≠ ∅
+                    for r in toSeq(currentDomain[rowPos].items):
+                        if r >= 0 and r < numRows:
+                            var hasSupport = false
+                            for c in currentDomain[colPos].items:
+                                if c >= 0 and c < numCols:
+                                    let flatIdx = r * numCols + c
+                                    let elem = matState.matrixElements[flatIdx]
+                                    if elem.isConstant:
+                                        if elem.constantValue in currentDomain[valPos]:
+                                            hasSupport = true
+                                            break
+                                    else:
+                                        if (currentDomain[elem.variablePosition] * currentDomain[valPos]).len > 0:
+                                            hasSupport = true
+                                            break
+                            if not hasSupport:
+                                currentDomain[rowPos].excl(r)
+                                outerChanged = true
+                        else:
+                            currentDomain[rowPos].excl(r)
+                            outerChanged = true
+
+                    # Col pruning: remove c if no row r has domain(matrix[r,c]) ∩ domain(value) ≠ ∅
+                    for c in toSeq(currentDomain[colPos].items):
+                        if c >= 0 and c < numCols:
+                            var hasSupport = false
+                            for r in currentDomain[rowPos].items:
+                                if r >= 0 and r < numRows:
+                                    let flatIdx = r * numCols + c
+                                    let elem = matState.matrixElements[flatIdx]
+                                    if elem.isConstant:
+                                        if elem.constantValue in currentDomain[valPos]:
+                                            hasSupport = true
+                                            break
+                                    else:
+                                        if (currentDomain[elem.variablePosition] * currentDomain[valPos]).len > 0:
+                                            hasSupport = true
+                                            break
+                            if not hasSupport:
+                                currentDomain[colPos].excl(c)
+                                outerChanged = true
+                        else:
+                            currentDomain[colPos].excl(c)
+                            outerChanged = true
+
+                    # Value pruning: remove v from domain(value) if unreachable
+                    var reachableValues: PackedSet[T]
+                    for r in currentDomain[rowPos].items:
+                        if r >= 0 and r < numRows:
+                            for c in currentDomain[colPos].items:
+                                if c >= 0 and c < numCols:
+                                    let flatIdx = r * numCols + c
+                                    let elem = matState.matrixElements[flatIdx]
+                                    if elem.isConstant:
+                                        reachableValues.incl(elem.constantValue)
+                                    else:
+                                        reachableValues = reachableValues + currentDomain[elem.variablePosition]
+                    for v in toSeq(currentDomain[valPos].items):
+                        if v notin reachableValues:
+                            currentDomain[valPos].excl(v)
+                            outerChanged = true
 
         if not outerChanged:
             break

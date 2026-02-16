@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -276,6 +276,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Regular Constraint"
         of CountEqType:
             return "CountEq Constraint"
+        of MatrixElementType:
+            return "MatrixElement Constraint"
 
 ################################################################################
 # Evaluation
@@ -323,6 +325,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.regularState.cost
         of CountEqType:
             return constraint.countEqState.cost
+        of MatrixElementType:
+            return constraint.matrixElementState.cost
 
 ################################################################################
 # Computed Constraints
@@ -909,6 +913,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.regularState.initialize(assignment)
         of CountEqType:
             constraint.countEqState.initialize(assignment)
+        of MatrixElementType:
+            constraint.matrixElementState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -953,6 +959,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
             constraint.countEqState.moveDelta(position, oldValue, newValue)
+        of MatrixElementType:
+            constraint.matrixElementState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -997,6 +1005,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.regularState.updatePosition(position, newValue)
         of CountEqType:
             constraint.countEqState.updatePosition(position, newValue)
+        of MatrixElementType:
+            constraint.matrixElementState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1016,6 +1026,10 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.countEqState.getAffectedPositions()
         of RegularType:
             return constraint.regularState.getAffectedPositions()
+        of MatrixElementType:
+            return constraint.matrixElementState.getAffectedPositions()
+        of ElementType:
+            return constraint.elementState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1481,6 +1495,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: CountEqType,
                 countEqState: constraint.countEqState.deepCopy()
             )
+        of MatrixElementType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: MatrixElementType,
+                matrixElementState: constraint.matrixElementState.deepCopy()
+            )
 
 
 
@@ -1833,6 +1853,48 @@ func countEq*[T](arrayPositions: openArray[int], countValue: T, targetPosition: 
         positions: constraint.allPositions,
         stateType: CountEqType,
         countEqState: constraint
+    )
+
+################################################################################
+# MatrixElement wrapper functions
+################################################################################
+
+func matrixElement*[T](matrixElements: seq[ArrayElement[T]], numRows, numCols: int,
+                        rowConstant: int, colPosition: int, valuePosition: int): StatefulConstraint[T] =
+    ## Creates a matrix element constraint with constant row, variable col.
+    ## Enforces: matrixElements[rowConstant * numCols + col] == value
+    let state = newMatrixElementState[T](matrixElements, numRows, numCols,
+                                          rowConstant, colPosition, valuePosition)
+    return StatefulConstraint[T](
+        positions: state.positions,
+        stateType: MatrixElementType,
+        matrixElementState: state
+    )
+
+func matrixElement*[T](matrixElements: seq[ArrayElement[T]], numRows, numCols: int,
+                        rowPosition: int, colConstant: int, valuePosition: int,
+                        rowIsVariable: bool): StatefulConstraint[T] =
+    ## Creates a matrix element constraint with variable row, constant col.
+    ## The rowIsVariable parameter disambiguates from the constant-row overload.
+    ## Enforces: matrixElements[row * numCols + colConstant] == value
+    let state = newMatrixElementStateRowVar[T](matrixElements, numRows, numCols,
+                                                rowPosition, colConstant, valuePosition)
+    return StatefulConstraint[T](
+        positions: state.positions,
+        stateType: MatrixElementType,
+        matrixElementState: state
+    )
+
+func matrixElementVarVar*[T](matrixElements: seq[ArrayElement[T]], numRows, numCols: int,
+                              rowPosition, colPosition, valuePosition: int): StatefulConstraint[T] =
+    ## Creates a matrix element constraint with variable row and variable col.
+    ## Enforces: matrixElements[row * numCols + col] == value
+    let state = newMatrixElementStateVarVar[T](matrixElements, numRows, numCols,
+                                                rowPosition, colPosition, valuePosition)
+    return StatefulConstraint[T](
+        positions: state.positions,
+        stateType: MatrixElementType,
+        matrixElementState: state
     )
 
 ################################################################################

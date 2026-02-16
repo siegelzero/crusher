@@ -1,7 +1,7 @@
 import std/packedsets
 
 import constrainedArray
-import constraints/[algebraic, stateful, elementState, types]
+import constraints/[algebraic, stateful, elementState, matrixElement, types]
 export elementState.ArrayElement
 import expressions/[algebraic, sumExpression, maxExpression, minExpression]
 
@@ -403,6 +403,34 @@ proc elementExpr*[T](indexExpr: AlgebraicExpression[T], sequence: ConstrainedSeq
         arrayExprs.add(sequence[i])
 
     return elementExpr(indexExpr, arrayExprs, valueVar)
+
+################################################################################
+# MatrixElement constraint functions
+################################################################################
+
+proc matrixElement*[T](matrix: ConstrainedMatrix[T], row: int,
+                        colExpr: AlgebraicExpression[T],
+                        valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    ## Creates matrix element constraint: matrix[row, colExpr] = valueExpr
+    ## Row is constant, col is a variable expression.
+    var elements: seq[ArrayElement[T]] = @[]
+    for i in 0..<matrix.size:
+        elements.add(ArrayElement[T](isConstant: false, variablePosition: matrix.offset + i))
+    let colPos = colExpr.node.position
+    let valuePos = valueExpr.node.position
+    return stateful.matrixElement[T](elements, matrix.m, matrix.n, row, colPos, valuePos)
+
+proc matrixElement*[T](matrix: ConstrainedMatrix[T],
+                        rowExpr: AlgebraicExpression[T], col: int,
+                        valueExpr: AlgebraicExpression[T]): StatefulConstraint[T] =
+    ## Creates matrix element constraint: matrix[rowExpr, col] = valueExpr
+    ## Row is a variable expression, col is constant.
+    var elements: seq[ArrayElement[T]] = @[]
+    for i in 0..<matrix.size:
+        elements.add(ArrayElement[T](isConstant: false, variablePosition: matrix.offset + i))
+    let rowPos = rowExpr.node.position
+    let valuePos = valueExpr.node.position
+    return stateful.matrixElement[T](elements, matrix.m, matrix.n, rowPos, col, valuePos, rowIsVariable = true)
 
 ################################################################################
 # Deep copy for ConstraintSystem

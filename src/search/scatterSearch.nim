@@ -46,8 +46,8 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
             let pos = moves[mi]
             let targetVal = targetAssignment[pos]
             let oldVal = state.assignment[pos]
-            let oldPenalty = state.penaltyMap[pos].getOrDefault(oldVal, 0)
-            let newPenalty = state.penaltyMap[pos].getOrDefault(targetVal, 0)
+            let oldPenalty = state.penaltyAt(pos, oldVal)
+            let newPenalty = state.penaltyAt(pos, targetVal)
             let delta = newPenalty - oldPenalty
 
             if delta < bestDelta:

@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq
 
 ################################################################################
 # Shared constraint type definitions
@@ -28,7 +28,8 @@ type
         LexOrderType,
         TableConstraintType,
         RegularType,
-        CountEqType
+        CountEqType,
+        MatrixElementType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -101,3 +102,5 @@ type
                 regularState*: RegularConstraint[T]
             of CountEqType:
                 countEqState*: CountEqConstraint[T]
+            of MatrixElementType:
+                matrixElementState*: MatrixElementState[T]
