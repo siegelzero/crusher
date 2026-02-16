@@ -155,38 +155,53 @@ proc moveDelta*[T](constraint: DiffnConstraint[T], position: int, oldValue, newV
 
     return newOverlaps - oldOverlaps
 
+proc addRectPositions[T](constraint: DiffnConstraint[T], dest: var PackedSet[int], rectIdx: int) {.inline.} =
+    for pos in constraint.xExprs[rectIdx].positions.items:
+        dest.incl(pos)
+    for pos in constraint.yExprs[rectIdx].positions.items:
+        dest.incl(pos)
+    for pos in constraint.dxExprs[rectIdx].positions.items:
+        dest.incl(pos)
+    for pos in constraint.dyExprs[rectIdx].positions.items:
+        dest.incl(pos)
+
 proc updatePosition*[T](constraint: DiffnConstraint[T], position: int, newValue: T) =
     ## Update assignment and recompute cost
-    constraint.currentAssignment[position] = newValue
-    let newCost = countOverlaps(constraint, constraint.currentAssignment)
-
-    # Build affected positions: positions of rectangles that could change overlap status
     constraint.lastAffectedPositions = initPackedSet[int]()
+
     if position in constraint.posToRects:
         let affectedRects = constraint.posToRects[position]
+
+        # Collect overlap neighbors BEFORE the change
+        var neighborRects: PackedSet[int]
         for i in affectedRects:
-            # Add positions of this rectangle
-            for pos in constraint.xExprs[i].positions.items:
-                constraint.lastAffectedPositions.incl(pos)
-            for pos in constraint.yExprs[i].positions.items:
-                constraint.lastAffectedPositions.incl(pos)
-            for pos in constraint.dxExprs[i].positions.items:
-                constraint.lastAffectedPositions.incl(pos)
-            for pos in constraint.dyExprs[i].positions.items:
-                constraint.lastAffectedPositions.incl(pos)
-            # Add positions of rectangles that overlap with this one
+            neighborRects.incl(i)
             let (xi, yi, dxi, dyi) = constraint.evalRect(i, constraint.currentAssignment)
             for j in 0 ..< constraint.n:
-                if j == i:
-                    continue
+                if j == i: continue
                 let (xj, yj, dxj, dyj) = constraint.evalRect(j, constraint.currentAssignment)
                 if rectsOverlap(xi, yi, dxi, dyi, xj, yj, dxj, dyj):
-                    for pos in constraint.xExprs[j].positions.items:
-                        constraint.lastAffectedPositions.incl(pos)
-                    for pos in constraint.yExprs[j].positions.items:
-                        constraint.lastAffectedPositions.incl(pos)
+                    neighborRects.incl(j)
 
-    constraint.cost = newCost
+        # Apply the change
+        constraint.currentAssignment[position] = newValue
+
+        # Collect overlap neighbors AFTER the change
+        for i in affectedRects:
+            let (xi, yi, dxi, dyi) = constraint.evalRect(i, constraint.currentAssignment)
+            for j in 0 ..< constraint.n:
+                if j == i: continue
+                let (xj, yj, dxj, dyj) = constraint.evalRect(j, constraint.currentAssignment)
+                if rectsOverlap(xi, yi, dxi, dyi, xj, yj, dxj, dyj):
+                    neighborRects.incl(j)
+
+        # Add positions of all affected + neighbor rectangles
+        for r in neighborRects.items:
+            constraint.addRectPositions(constraint.lastAffectedPositions, r)
+    else:
+        constraint.currentAssignment[position] = newValue
+
+    constraint.cost = countOverlaps(constraint, constraint.currentAssignment)
 
 func getAffectedPositions*[T](constraint: DiffnConstraint[T]): PackedSet[int] =
     ## Return positions that need penalty recalculation after last update
