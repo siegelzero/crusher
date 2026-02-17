@@ -19,14 +19,10 @@ help:
 	@echo "  all          - Run all targets (currently just test)"
 	@echo ""
 
-test: clean
-	@echo "🚀 Auto-discovering and running all test files..."
-	@echo "================================================"
-	@for test_file in $$(find tests -name 'test_*.nim' | sort); do \
-		echo "Running $$test_file..."; \
-		nim c -r --threads:on --mm:arc --deepcopy:on -d:release $$test_file || exit 1; \
-		echo ""; \
-	done
+test:
+	@echo "🚀 Running all tests (combined binary)..."
+	@echo "==========================================="
+	nim c -r --threads:on --mm:arc --deepcopy:on -d:release tests/test_all.nim
 	@echo "✅ All tests completed successfully!"
 
 csplib: clean
