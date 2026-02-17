@@ -42,7 +42,6 @@ type
         bestCost*: int
 
         iteration*: int
-        tenure*: int
 
         # Stats tracking
         startTime*: float
@@ -481,9 +480,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.assignValue(position, newValue)
         let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
         if oldIdx >= 0:
-            # Adaptive tenure: scale with sqrt(n) for appropriate exploration
-            let base = max(7, int(sqrt(state.carray.len.float)))
-            state.tabu[position][oldIdx] = state.iteration + base + rand(base)
+            state.tabu[position][oldIdx] = state.iteration + 1 + state.iteration mod 10
 
 
 proc logProgress[T](state: TabuState[T], lastImprovement: int) =
