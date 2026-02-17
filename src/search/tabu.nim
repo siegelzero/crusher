@@ -51,12 +51,6 @@ type
         movesExplored*: int  # Track number of moves explored per iteration
         verbose*: bool
 
-        # Constraint weighting (breakout method)
-        constraintWeights*: seq[int]        # [globalConstraintIdx] -> weight (starts at 1)
-        constraintGlobalIdx*: seq[seq[int]] # [position][localConstraintIdx] -> global index
-        weightedCost*: int                  # weighted sum for move selection
-        bestWeightedCost*: int              # best weighted cost (for aspiration)
-
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -144,9 +138,6 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
         state.penaltyMap[position][i] = 0
 
     for ci, constraint in state.constraintsAtPosition[position]:
-        let globalIdx = state.constraintGlobalIdx[position][ci]
-        let weight = state.constraintWeights[globalIdx]
-
         if constraint.stateType == CumulativeType and
            constraint.cumulativeState.evalMethod == PositionBased:
             # Batch computation via prefix sums — O(maxTime + domainSize)
@@ -154,21 +145,21 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
-                state.penaltyMap[position][i] += penalties[i] * weight
+                state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == RelationalType:
             # Batch computation for relational constraints — tight arithmetic loop
             let penalties = constraint.relationalState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
-                state.penaltyMap[position][i] += penalties[i] * weight
+                state.penaltyMap[position][i] += penalties[i]
         else:
             # Individual computation for other constraints
             for i in 0..<dLen:
                 let value = domain[i]
                 let p = state.movePenalty(constraint, position, value)
                 state.constraintPenalties[position][ci][i] = p
-                state.penaltyMap[position][i] += p * weight
+                state.penaltyMap[position][i] += p
 
 
 proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx: int) =
@@ -176,8 +167,6 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     ## Only recomputes that constraint's contribution and adjusts the total.
     ## Uses batch prefix-sum method for cumulative constraints.
     let constraint = state.constraintsAtPosition[position][localIdx]
-    let globalIdx = state.constraintGlobalIdx[position][localIdx]
-    let weight = state.constraintWeights[globalIdx]
     let domain = state.carray.reducedDomain[position]
 
     if constraint.stateType == CumulativeType and
@@ -188,7 +177,7 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
         for i in 0..<domain.len:
             let newP = penalties[i]
             let oldP = state.constraintPenalties[position][localIdx][i]
-            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.penaltyMap[position][i] += newP - oldP
             state.constraintPenalties[position][localIdx][i] = newP
     elif constraint.stateType == RelationalType:
         # Batch computation for relational constraints
@@ -197,14 +186,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
         for i in 0..<domain.len:
             let newP = penalties[i]
             let oldP = state.constraintPenalties[position][localIdx][i]
-            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.penaltyMap[position][i] += newP - oldP
             state.constraintPenalties[position][localIdx][i] = newP
     else:
         for i in 0..<domain.len:
             let value = domain[i]
             let newP = state.movePenalty(constraint, position, value)
             let oldP = state.constraintPenalties[position][localIdx][i]
-            state.penaltyMap[position][i] += weight * (newP - oldP)
+            state.penaltyMap[position][i] += newP - oldP
             state.constraintPenalties[position][localIdx][i] = newP
 
 
@@ -212,15 +201,13 @@ proc updateConstraintAtPositionValues[T](state: TabuState[T], position: int, loc
     ## Incrementally update penalty map for specific domain values at position for a single constraint.
     ## Only updates values that exist in the domain index.
     let constraint = state.constraintsAtPosition[position][localIdx]
-    let globalIdx = state.constraintGlobalIdx[position][localIdx]
-    let weight = state.constraintWeights[globalIdx]
     for value in values:
         let idx = state.domainIndex[position].getOrDefault(value, -1)
         if idx < 0:
             continue
         let newP = state.movePenalty(constraint, position, value)
         let oldP = state.constraintPenalties[position][localIdx][idx]
-        state.penaltyMap[position][idx] += weight * (newP - oldP)
+        state.penaltyMap[position][idx] += newP - oldP
         state.constraintPenalties[position][localIdx][idx] = newP
 
 
@@ -312,22 +299,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for i, c in state.constraintsAtPosition[pos]:
             state.constraintIdxAt[pos][cast[pointer](c)] = i
 
-    # Build constraint global index mapping
-    var constraintToGlobal = initTable[pointer, int]()
-    for gi, c in state.constraints:
-        constraintToGlobal[cast[pointer](c)] = gi
-
-    state.constraintGlobalIdx = newSeq[seq[int]](carray.len)
-    for pos in carray.allPositions():
-        state.constraintGlobalIdx[pos] = newSeq[int](state.constraintsAtPosition[pos].len)
-        for ci, c in state.constraintsAtPosition[pos]:
-            state.constraintGlobalIdx[pos][ci] = constraintToGlobal[cast[pointer](c)]
-
-    # Initialize constraint weights to 1
-    state.constraintWeights = newSeq[int](state.constraints.len)
-    for i in 0..<state.constraintWeights.len:
-        state.constraintWeights[i] = 1
-
     if verbose and id == 0:
         echo "[Init] Built constraintsAtPosition in " & $(epochTime() - initStart) & "s"
         var maxPositions = 0
@@ -370,13 +341,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         echo "[Init] Initialized constraints in " & $(epochTime() - initStart) & "s"
         initStart = epochTime()
 
-    for i, cons in state.constraints:
-        let p = cons.penalty()
-        state.cost += p
-        state.weightedCost += p * state.constraintWeights[i]
+    for cons in state.constraints:
+        state.cost += cons.penalty()
 
     state.bestCost = state.cost
-    state.bestWeightedCost = state.weightedCost
     state.bestAssignment = state.assignment
 
     # Build domain index: value -> local array index
@@ -440,11 +408,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Recompute true cost from constraint penalties (avoids accumulated moveDelta errors
     # with expression-based constraints where multiple expressions share a position)
     state.cost = 0
-    state.weightedCost = 0
-    for i, constraint in state.constraints:
-        let p = constraint.penalty()
-        state.cost += p
-        state.weightedCost += p * state.constraintWeights[i]
+    for constraint in state.constraints:
+        state.cost += constraint.penalty()
 
     state.updatePenaltiesForPosition(position)
     state.updateNeighborPenalties(position)
@@ -481,12 +446,12 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     continue
                 inc movesEvaluated
                 delta = state.penaltyMap[position][i] - oldPenalty
-                let newWeightedCost = state.weightedCost + delta
-                if state.tabu[position][i] <= state.iteration or newWeightedCost < state.bestWeightedCost:
-                    if newWeightedCost < bestMoveCost:
+                let newCost = state.cost + delta
+                if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                    if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
-                        bestMoveCost = newWeightedCost
-                    elif newWeightedCost == bestMoveCost:
+                        bestMoveCost = newCost
+                    elif newCost == bestMoveCost:
                         result.add((position, domain[i]))
         else:
             # Large domain: evaluate a random sample of candidates
@@ -496,12 +461,12 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     continue
                 inc movesEvaluated
                 delta = state.penaltyMap[position][i] - oldPenalty
-                let newWeightedCost = state.weightedCost + delta
-                if state.tabu[position][i] <= state.iteration or newWeightedCost < state.bestWeightedCost:
-                    if newWeightedCost < bestMoveCost:
+                let newCost = state.cost + delta
+                if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                    if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
-                        bestMoveCost = newWeightedCost
-                    elif newWeightedCost == bestMoveCost:
+                        bestMoveCost = newCost
+                    elif newCost == bestMoveCost:
                         result.add((position, domain[i]))
 
     state.movesExplored = movesEvaluated
@@ -528,11 +493,7 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
     let overallRate = if totalElapsed > 0: state.iteration.float / totalElapsed else: 0.0
     let stagnation = state.iteration - lastImprovement
 
-    var maxW = 0
-    for w in state.constraintWeights:
-        if w > maxW: maxW = w
     echo &"[Tabu S{state.id}] iter={state.iteration:>7} cost={state.bestCost:>5} " &
-         &"wcost={state.weightedCost:>5} maxW={maxW} " &
          &"rate={overallRate:>7.0f}/s stag={stagnation:>5} elapsed={totalElapsed:>5.1f}s"
 
     state.lastLogTime = now
@@ -540,9 +501,7 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil): TabuState[T] =
-    var lastUnweightedImprovement = 0
-    var lastWeightedImprovement = 0
-    let boostInterval = max(1000, threshold div 10)
+    var lastImprovement = 0
 
     # Reset timing for this run
     state.startTime = epochTime()
@@ -550,18 +509,17 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     state.lastLogIteration = 0
 
     if state.verbose:
-        echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost} boostInterval={boostInterval}"
+        echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}"
 
-    while state.iteration - lastUnweightedImprovement < threshold:
+    while state.iteration - lastImprovement < threshold:
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
             return state
 
         state.applyBestMove()
 
-        # Track unweighted improvement (external best)
         if state.cost < state.bestCost:
-            lastUnweightedImprovement = state.iteration
+            lastImprovement = state.iteration
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
             if state.cost == 0:
@@ -571,34 +529,11 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     echo &"[Tabu S{state.id}] Solution found at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
                 return state
 
-        # Track weighted improvement (aspiration)
-        if state.weightedCost < state.bestWeightedCost:
-            lastWeightedImprovement = state.iteration
-            state.bestWeightedCost = state.weightedCost
-
-        # Weight boosting when stuck in weighted landscape
-        if state.iteration - lastWeightedImprovement >= boostInterval:
-            for i, constraint in state.constraints:
-                if constraint.penalty() > 0:
-                    state.constraintWeights[i] += 1
-            state.rebuildPenaltyMap()
-            # Recompute weighted cost
-            state.weightedCost = 0
-            for i, constraint in state.constraints:
-                state.weightedCost += constraint.penalty() * state.constraintWeights[i]
-            state.bestWeightedCost = state.weightedCost
-            lastWeightedImprovement = state.iteration
-            if state.verbose:
-                var maxW = 0
-                for w in state.constraintWeights:
-                    if w > maxW: maxW = w
-                echo &"[Tabu S{state.id}] Boosted weights: maxW={maxW} weightedCost={state.weightedCost} cost={state.cost}"
-
         state.iteration += 1
 
         # Periodic logging
         if state.verbose and state.iteration mod LogInterval == 0:
-            state.logProgress(lastUnweightedImprovement)
+            state.logProgress(lastImprovement)
 
     if state.verbose:
         let elapsed = epochTime() - state.startTime
