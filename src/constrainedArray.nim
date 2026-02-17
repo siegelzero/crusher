@@ -15,12 +15,20 @@ import expressions/sumExpression
 ################################################################################
 
 type
+    ChannelBinding*[T] = object
+        channelPosition*: int                # Position of the channel variable
+        indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
+        arrayElements*: seq[ArrayElement[T]] # The array (constants and/or variable positions)
+
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
         domain*: seq[seq[T]]
         reducedDomain*: seq[seq[T]]
         entries*: seq[AlgebraicExpression[T]]
+        channelPositions*: PackedSet[int]
+        channelBindings*: seq[ChannelBinding[T]]
+        channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
 
 ################################################################################
 # Value Extraction
@@ -30,6 +38,12 @@ func `[]`*[T](arr: ConstrainedArray[T], idx: int): AlgebraicExpression[T] {.inli
 
 iterator allPositions*[T](arr: ConstrainedArray[T]): int =
     for i in 0..<arr.len: yield int(i)
+
+iterator allSearchPositions*[T](arr: ConstrainedArray[T]): int =
+    ## Iterates over all positions that are not channel variables.
+    for i in 0..<arr.len:
+        if i notin arr.channelPositions:
+            yield int(i)
 
 func `$`*[T](arr: ConstrainedArray[T]): string =
     return fmt"ConstrainedArray of size {arr.len}"
@@ -1126,4 +1140,9 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     result.constraints = newSeq[StatefulConstraint[T]](arr.constraints.len)
     for i, constraint in arr.constraints:
         result.constraints[i] = constraint.deepCopy()
+
+    # Shallow copy channel data (structurally immutable)
+    result.channelPositions = arr.channelPositions
+    result.channelBindings = arr.channelBindings
+    result.channelsAtPosition = arr.channelsAtPosition
 

@@ -529,3 +529,8 @@ proc hasAnnotation*(con: FznConstraint, name: string): bool =
   for ann in con.annotations:
     if ann.name == name: return true
   false
+
+proc getAnnotation*(con: FznConstraint, name: string): FznAnnotation =
+  for ann in con.annotations:
+    if ann.name == name: return ann
+  raise newException(KeyError, &"Annotation '{name}' not found on constraint")

@@ -3,7 +3,7 @@
   "name": "Crusher",
   "version": "1.0.0",
   "mznlib": "mznlib",
-  "executable": "../fzcrusher",
+  "executable": "/Users/ken/dev_old/crusher/src/fzcrusher",
   "tags": ["cp", "int"],
   "stdFlags": ["-a", "-s", "-v", "-p"],
   "inputType": "FZN",

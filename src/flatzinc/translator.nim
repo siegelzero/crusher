@@ -66,6 +66,10 @@ type
     geostConversion*: GeostConversion
     # Matrix infos for matrix_element pattern detection
     matrixInfos*: Table[string, MatrixInfo]
+    # Channel variable names (element defines_var outputs that should be computed, not searched)
+    channelVarNames*: HashSet[string]
+    # Maps constraint index -> channel var name for element constraints with defines_var
+    channelConstraints*: Table[int, string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -214,6 +218,31 @@ proc resolveMixedArray*(tr: FznTranslator, arg: FznExpr): seq[ArrayElement[int]]
         result[i] = ArrayElement[int](isConstant: true, constantValue: if e.boolVal: 1 else: 0)
       else:
         raise newException(ValueError, &"Expected variable or constant, got {e.kind}")
+  of FznIdent:
+    if arg.ident in tr.arrayPositions:
+      let positions = tr.arrayPositions[arg.ident]
+      result = newSeq[ArrayElement[int]](positions.len)
+      for i, pos in positions:
+        if pos == -1:
+          # Defined variable - treat as constant if we can resolve it
+          if arg.ident in tr.arrayElementNames:
+            let elemName = tr.arrayElementNames[arg.ident][i]
+            if elemName in tr.paramValues:
+              result[i] = ArrayElement[int](isConstant: true, constantValue: tr.paramValues[elemName])
+              continue
+          raise newException(ValueError, &"Array '{arg.ident}' element {i} has no position or constant value")
+        let dom = tr.sys.baseArray.domain[pos]
+        if dom.len == 1:
+          result[i] = ArrayElement[int](isConstant: true, constantValue: dom[0])
+        else:
+          result[i] = ArrayElement[int](isConstant: false, variablePosition: pos)
+    elif arg.ident in tr.arrayValues:
+      let vals = tr.arrayValues[arg.ident]
+      result = newSeq[ArrayElement[int]](vals.len)
+      for i, v in vals:
+        result[i] = ArrayElement[int](isConstant: true, constantValue: v)
+    else:
+      raise newException(KeyError, &"Unknown array '{arg.ident}'")
   else:
     raise newException(ValueError, &"Expected array literal, got {arg.kind}")
 
@@ -1127,6 +1156,24 @@ proc collectDefinedVars(tr: var FznTranslator) =
   for name in definedVarNames.keys:
     tr.definedVarNames.incl(name)
 
+  # Second loop: identify element constraints with defines_var annotations
+  # These define channel variables that should be computed, not searched
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name in ["array_var_int_element", "array_var_int_element_nonshifted",
+                "array_int_element", "array_int_element_nonshifted"] and
+       con.hasAnnotation("defines_var"):
+      # Extract the defined variable name from the 3rd argument
+      if con.args[2].kind == FznIdent:
+        let definedName = con.args[2].ident
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len > 0 and ann.args[0].kind == FznIdent and
+           ann.args[0].ident == definedName:
+          tr.channelVarNames.incl(definedName)
+          tr.channelConstraints[ci] = definedName
+          # DO NOT add to definedVarNames (channel vars need positions)
+          # DO NOT add to definingConstraints (constraint still needs translation)
+
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   ## Tries to build the AlgebraicExpression for one defining constraint.
   ## Returns true if successful, false if a dependency is not yet available.
@@ -1616,6 +1663,58 @@ proc detectDfaGeostPattern(tr: var FznTranslator) =
   for t in 0..<ntiles:
     stderr.writeLine(&"[FZN]   Tile {tileValues[t]}: {allPlacements[t].len} placements, {allPlacements[t][0].len} cells")
 
+proc buildChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings from element constraints with defines_var annotations.
+  ## Must be called after all constraints are translated and all positions are known.
+  for ci, definedName in tr.channelConstraints:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+
+    # The defined variable must have a position (it was NOT added to definedVarNames)
+    if definedName notin tr.varPositions:
+      continue
+
+    let channelPos = tr.varPositions[definedName]
+
+    # Build the adjusted index expression (0-based)
+    let indexExpr = tr.resolveExprArg(con.args[0])
+    let adjustedIndex = indexExpr - 1
+
+    # Build the array elements
+    var arrayElems: seq[ArrayElement[int]]
+    if name in ["array_var_int_element", "array_var_int_element_nonshifted"]:
+      arrayElems = tr.resolveMixedArray(con.args[1])
+    else:
+      # array_int_element: constant array
+      let constArray = tr.resolveIntArray(con.args[1])
+      for v in constArray:
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+    let binding = ChannelBinding[int](
+      channelPosition: channelPos,
+      indexExpression: adjustedIndex,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(channelPos)
+
+    # Map source positions to this binding
+    for pos in adjustedIndex.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+    for elem in arrayElems:
+      if not elem.isConstant:
+        if elem.variablePosition notin tr.sys.baseArray.channelsAtPosition:
+          tr.sys.baseArray.channelsAtPosition[elem.variablePosition] = @[bindingIdx]
+        else:
+          tr.sys.baseArray.channelsAtPosition[elem.variablePosition].add(bindingIdx)
+
+  if tr.sys.baseArray.channelBindings.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -1629,6 +1728,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.arrayElementNames = initTable[string, seq[string]]()
   result.countEqPatterns = initTable[int, CountEqPattern]()
   result.matrixInfos = initTable[string, MatrixInfo]()
+  result.channelVarNames = initHashSet[string]()
+  result.channelConstraints = initTable[int, string]()
   result.objectivePos = -1
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
@@ -1680,5 +1781,8 @@ proc translate*(model: FznModel): FznTranslator =
       result.geostConversion.tileVarPositions,
       result.geostConversion.allPlacements
     ))
+
+  # Build channel bindings for element defines_var
+  result.buildChannelBindings()
 
   result.translateSolve()

@@ -1,4 +1,4 @@
-import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
+import std/[math, hashes, packedsets, random, sequtils, sets, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost]
@@ -53,6 +53,9 @@ type
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
+
+        # Swap neighborhoods: groups of search positions in the same AllDifferent
+        swapGroups*: seq[seq[int]]
 
 ################################################################################
 # Penalty Routines
@@ -330,8 +333,20 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for pos in carray.allPositions():
         if initialAssignment.len > 0:
             state.assignment[pos] = initialAssignment[pos]
+        elif pos in carray.channelPositions:
+            # Channel variables get a placeholder; computed below
+            state.assignment[pos] = carray.reducedDomain[pos][0]
         else:
             state.assignment[pos] = sample(carray.reducedDomain[pos])
+
+    # Compute channel variable initial values from their defining element constraints
+    for binding in carray.channelBindings:
+        let idxVal = binding.indexExpression.evaluate(state.assignment)
+        if idxVal >= 0 and idxVal < binding.arrayElements.len:
+            let elem = binding.arrayElements[idxVal]
+            state.assignment[binding.channelPosition] =
+                if elem.isConstant: elem.constantValue
+                else: state.assignment[elem.variablePosition]
 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
@@ -385,6 +400,39 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.logProfileStats()
         state.resetProfileStats()
 
+    # Build swap groups from AllDifferent constraints
+    # Only create swap groups when ALL constraints on the group's positions are
+    # AllDifferent, Element, Relational, or Algebraic (swap-friendly types).
+    # Skip when positions participate in Circuit, Regular, etc. where swaps hurt.
+    # Also skip channel positions and singleton-domain positions (constants).
+    for constraint in state.constraints:
+        if constraint.stateType == AllDifferentType and
+           constraint.allDifferentState.evalMethod == PositionBased:
+            var positions: seq[int]
+            for pos in constraint.positions.items:
+                if pos notin carray.channelPositions and
+                   carray.reducedDomain[pos].len > 1:
+                    positions.add(pos)
+            if positions.len >= 2:
+                # Check that no position in this group is in a swap-unfriendly constraint
+                var swapSafe = true
+                for pos in positions:
+                    for c in state.constraintsAtPosition[pos]:
+                        if c.stateType notin {AllDifferentType, ElementType,
+                                              AlgebraicType, RelationalType,
+                                              BooleanType, MatrixElementType,
+                                              AtLeastType, AtMostType,
+                                              GlobalCardinalityType, CountEqType}:
+                            swapSafe = false
+                            break
+                    if not swapSafe:
+                        break
+                if swapSafe:
+                    state.swapGroups.add(positions)
+
+    if verbose and id == 0 and state.swapGroups.len > 0:
+        echo "[Init] Built " & $state.swapGroups.len & " swap groups"
+
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
@@ -398,11 +446,36 @@ proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: 
 # Value Assignment
 ################################################################################
 
+proc propagateChannels[T](state: TabuState[T], position: int) =
+    ## Propagate channel variable values after a change at `position`.
+    if position notin state.carray.channelsAtPosition:
+        return
+    for bi in state.carray.channelsAtPosition[position]:
+        let binding = state.carray.channelBindings[bi]
+        let idxVal = binding.indexExpression.evaluate(state.assignment)
+        var newVal: T
+        if idxVal >= 0 and idxVal < binding.arrayElements.len:
+            let elem = binding.arrayElements[idxVal]
+            newVal = if elem.isConstant: elem.constantValue
+                     else: state.assignment[elem.variablePosition]
+        else:
+            continue  # out of bounds, leave as-is
+
+        if newVal != state.assignment[binding.channelPosition]:
+            state.assignment[binding.channelPosition] = newVal
+            for c in state.constraintsAtPosition[binding.channelPosition]:
+                c.updatePosition(binding.channelPosition, newVal)
+            state.updatePenaltiesForPosition(binding.channelPosition)
+            state.updateNeighborPenalties(binding.channelPosition)
+
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
         constraint.updatePosition(position, value)
+
+    # Propagate channel variables affected by this position change
+    state.propagateChannels(position)
 
     # Recompute true cost from constraint penalties (avoids accumulated moveDelta errors
     # with expression-based constraints where multiple expressions share a position)
@@ -412,6 +485,111 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 
     state.updatePenaltiesForPosition(position)
     state.updateNeighborPenalties(position)
+
+################################################################################
+# Swap Move Infrastructure
+################################################################################
+
+proc swapMoveDelta[T](state: TabuState[T], posA, posB: int): int =
+    ## Compute the cost delta for swapping values at posA and posB.
+    let valA = state.assignment[posA]
+    let valB = state.assignment[posB]
+    if valA == valB: return 0
+
+    var delta = 0
+    var seen: HashSet[pointer]
+
+    # Constraints involving posA
+    for c in state.constraintsAtPosition[posA]:
+        seen.incl(cast[pointer](c))
+        if posB in c.positions:
+            # Constraint covers both — need swap-aware eval
+            if c.stateType == AllDifferentType:
+                delta += 0  # swap preserves allDifferent cost
+            else:
+                let oldP = c.penalty()
+                c.updatePosition(posA, valB)
+                c.updatePosition(posB, valA)
+                delta += c.penalty() - oldP
+                c.updatePosition(posB, valB)
+                c.updatePosition(posA, valA)
+        else:
+            delta += c.moveDelta(posA, valA, valB)
+
+    # Constraints involving only posB
+    for c in state.constraintsAtPosition[posB]:
+        if cast[pointer](c) notin seen:
+            delta += c.moveDelta(posB, valB, valA)
+
+    return delta
+
+
+proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int)] =
+    ## Find the best swap moves across all swap groups.
+    var bestDelta = high(int)
+
+    for group in state.swapGroups:
+        for i in 0..<group.len:
+            let posA = group[i]
+            let valA = state.assignment[posA]
+            for j in (i+1)..<group.len:
+                let posB = group[j]
+                let valB = state.assignment[posB]
+                if valA == valB:
+                    continue
+
+                # Domain check: only swap if each value is in the other's domain
+                let idxA = state.domainIndex[posA].getOrDefault(valB, -1)
+                let idxB = state.domainIndex[posB].getOrDefault(valA, -1)
+                if idxA < 0 or idxB < 0:
+                    continue  # swap would place out-of-domain value
+
+                let delta = state.swapMoveDelta(posA, posB)
+                let newCost = state.cost + delta
+
+                # Tabu check: a swap is tabu only if BOTH positions are tabu for their new values
+                var isTabu = state.tabu[posA][idxA] > state.iteration and
+                             state.tabu[posB][idxB] > state.iteration
+
+                if isTabu and newCost >= state.bestCost:
+                    continue
+
+                if newCost < bestDelta:
+                    result = @[(posA, posB)]
+                    bestDelta = newCost
+                elif newCost == bestDelta:
+                    result.add((posA, posB))
+
+
+proc assignSwap[T](state: TabuState[T], posA, posB: int) =
+    ## Swap the values at posA and posB and update all constraint states.
+    let valA = state.assignment[posA]
+    let valB = state.assignment[posB]
+
+    state.assignment[posA] = valB
+    state.assignment[posB] = valA
+
+    # Update constraint states for both positions
+    for constraint in state.constraintsAtPosition[posA]:
+        constraint.updatePosition(posA, valB)
+    for constraint in state.constraintsAtPosition[posB]:
+        constraint.updatePosition(posB, valA)
+
+    # Propagate channel variables affected by both positions
+    state.propagateChannels(posA)
+    state.propagateChannels(posB)
+
+    # Recompute true cost
+    state.cost = 0
+    for constraint in state.constraints:
+        state.cost += constraint.penalty()
+
+    # Update penalty maps for both positions and their neighbors
+    state.updatePenaltiesForPosition(posA)
+    state.updatePenaltiesForPosition(posB)
+    state.updateNeighborPenalties(posA)
+    state.updateNeighborPenalties(posB)
+
 
 ################################################################################
 # Search Algorithm Implementation
@@ -427,6 +605,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         movesEvaluated = 0
 
     for position in state.carray.allPositions():
+        if position in state.carray.channelPositions:
+            continue
         let oldValue = state.assignment[position]
         let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
         if oldIdx < 0:
@@ -472,6 +652,23 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
 
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
+    # Alternate between swap and regular moves when swap groups exist
+    if state.swapGroups.len > 0 and state.iteration mod 2 == 0:
+        let swaps = state.bestSwapMoves()
+        if swaps.len > 0:
+            let (posA, posB) = sample(swaps)
+            let oldValA = state.assignment[posA]
+            let oldValB = state.assignment[posB]
+            state.assignSwap(posA, posB)
+            # Set tabu on old values
+            let oldIdxA = state.domainIndex[posA].getOrDefault(oldValA, -1)
+            if oldIdxA >= 0:
+                state.tabu[posA][oldIdxA] = state.iteration + 1 + state.iteration mod 10
+            let oldIdxB = state.domainIndex[posB].getOrDefault(oldValB, -1)
+            if oldIdxB >= 0:
+                state.tabu[posB][oldIdxB] = state.iteration + 1 + state.iteration mod 10
+            return
+
     let moves = state.bestMoves()
 
     if moves.len > 0:
