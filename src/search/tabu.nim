@@ -448,25 +448,36 @@ proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: 
 
 proc propagateChannels[T](state: TabuState[T], position: int) =
     ## Propagate channel variable values after a change at `position`.
-    if position notin state.carray.channelsAtPosition:
-        return
-    for bi in state.carray.channelsAtPosition[position]:
-        let binding = state.carray.channelBindings[bi]
-        let idxVal = binding.indexExpression.evaluate(state.assignment)
-        var newVal: T
-        if idxVal >= 0 and idxVal < binding.arrayElements.len:
-            let elem = binding.arrayElements[idxVal]
-            newVal = if elem.isConstant: elem.constantValue
-                     else: state.assignment[elem.variablePosition]
-        else:
-            continue  # out of bounds, leave as-is
+    ## Uses a worklist to handle transitive channel dependencies.
+    var worklist = @[position]
+    var visited: PackedSet[int]
+    visited.incl(position)
 
-        if newVal != state.assignment[binding.channelPosition]:
-            state.assignment[binding.channelPosition] = newVal
-            for c in state.constraintsAtPosition[binding.channelPosition]:
-                c.updatePosition(binding.channelPosition, newVal)
-            state.updatePenaltiesForPosition(binding.channelPosition)
-            state.updateNeighborPenalties(binding.channelPosition)
+    while worklist.len > 0:
+        let pos = worklist.pop()
+        if pos notin state.carray.channelsAtPosition:
+            continue
+        for bi in state.carray.channelsAtPosition[pos]:
+            let binding = state.carray.channelBindings[bi]
+            let idxVal = binding.indexExpression.evaluate(state.assignment)
+            var newVal: T
+            if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                let elem = binding.arrayElements[idxVal]
+                newVal = if elem.isConstant: elem.constantValue
+                         else: state.assignment[elem.variablePosition]
+            else:
+                continue  # out of bounds, leave as-is
+
+            if newVal != state.assignment[binding.channelPosition]:
+                state.assignment[binding.channelPosition] = newVal
+                for c in state.constraintsAtPosition[binding.channelPosition]:
+                    c.updatePosition(binding.channelPosition, newVal)
+                state.updatePenaltiesForPosition(binding.channelPosition)
+                state.updateNeighborPenalties(binding.channelPosition)
+                # If this channel position triggers further channels, enqueue it
+                if binding.channelPosition notin visited:
+                    visited.incl(binding.channelPosition)
+                    worklist.add(binding.channelPosition)
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     state.assignment[position] = value
@@ -503,9 +514,11 @@ proc swapMoveDelta[T](state: TabuState[T], posA, posB: int): int =
     for c in state.constraintsAtPosition[posA]:
         seen.incl(cast[pointer](c))
         if posB in c.positions:
-            # Constraint covers both — need swap-aware eval
+            # Constraint covers both — need swap-aware eval.
+            # We temporarily apply the swap via updatePosition and restore afterward.
+            # This assumes updatePosition is fully reversible for all swap-safe types.
             if c.stateType == AllDifferentType:
-                delta += 0  # swap preserves allDifferent cost
+                discard  # swap preserves allDifferent cost
             else:
                 let oldP = c.penalty()
                 c.updatePosition(posA, valB)
@@ -526,7 +539,7 @@ proc swapMoveDelta[T](state: TabuState[T], posA, posB: int): int =
 
 proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int)] =
     ## Find the best swap moves across all swap groups.
-    var bestDelta = high(int)
+    var bestMoveCost = high(int)
 
     for group in state.swapGroups:
         for i in 0..<group.len:
@@ -554,10 +567,10 @@ proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int)] =
                 if isTabu and newCost >= state.bestCost:
                     continue
 
-                if newCost < bestDelta:
+                if newCost < bestMoveCost:
                     result = @[(posA, posB)]
-                    bestDelta = newCost
-                elif newCost == bestDelta:
+                    bestMoveCost = newCost
+                elif newCost == bestMoveCost:
                     result.add((posA, posB))
 
 
@@ -604,9 +617,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         oldPenalty: int
         movesEvaluated = 0
 
-    for position in state.carray.allPositions():
-        if position in state.carray.channelPositions:
-            continue
+    for position in state.carray.allSearchPositions():
         let oldValue = state.assignment[position]
         let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
         if oldIdx < 0:
