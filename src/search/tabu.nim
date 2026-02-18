@@ -50,6 +50,9 @@ type
         movesExplored*: int  # Track number of moves explored per iteration
         verbose*: bool
 
+        # Per-position count of violated constraints (penalty > 0)
+        violationCount*: seq[int]
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -359,6 +362,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for cons in state.constraints:
         state.cost += cons.penalty()
 
+    # Build violation count: for each position, how many touching constraints have penalty > 0
+    state.violationCount = newSeq[int](carray.len)
+    for constraint in state.constraints:
+        if constraint.penalty() > 0:
+            for pos in constraint.positions.items:
+                state.violationCount[pos] += 1
+
     state.bestCost = state.cost
     state.bestAssignment = state.assignment
 
@@ -441,7 +451,14 @@ proc propagateChannels[T](state: TabuState[T], position: int) =
                 for c in state.constraintsAtPosition[binding.channelPosition]:
                     let oldPenalty = c.penalty()
                     c.updatePosition(binding.channelPosition, newVal)
-                    state.cost += c.penalty() - oldPenalty
+                    let newPenalty = c.penalty()
+                    state.cost += newPenalty - oldPenalty
+                    if oldPenalty > 0 and newPenalty == 0:
+                        for pos in c.positions.items:
+                            state.violationCount[pos] -= 1
+                    elif oldPenalty == 0 and newPenalty > 0:
+                        for pos in c.positions.items:
+                            state.violationCount[pos] += 1
                 state.updatePenaltiesForPosition(binding.channelPosition)
                 state.updateNeighborPenalties(binding.channelPosition)
                 # If this channel position triggers further channels, enqueue it
@@ -455,7 +472,15 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     for constraint in state.constraintsAtPosition[position]:
         let oldPenalty = constraint.penalty()
         constraint.updatePosition(position, value)
-        state.cost += constraint.penalty() - oldPenalty
+        let newPenalty = constraint.penalty()
+        state.cost += newPenalty - oldPenalty
+        # Update violation count for transitions to/from zero
+        if oldPenalty > 0 and newPenalty == 0:
+            for pos in constraint.positions.items:
+                state.violationCount[pos] -= 1
+        elif oldPenalty == 0 and newPenalty > 0:
+            for pos in constraint.positions.items:
+                state.violationCount[pos] += 1
 
     # Propagate channel variables affected by this position change
     state.propagateChannels(position)
@@ -482,13 +507,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             continue
 
         # Skip positions where all constraints are satisfied — any move can only worsen.
-        # We check constraint costs directly since penaltyMap stores deltas (not absolute costs).
-        var hasViolation = false
-        for c in state.constraintsAtPosition[position]:
-            if c.penalty() > 0:
-                hasViolation = true
-                break
-        if not hasViolation:
+        if state.violationCount[position] == 0:
             continue
 
         let domain = state.carray.reducedDomain[position]
