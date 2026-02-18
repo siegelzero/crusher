@@ -134,13 +134,14 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         let leftBase = constraint.leftValue - leftCoeff * currentValue
         let rightBase = constraint.rightValue - rightCoeff * currentValue
         let rel = constraint.relation
+        let currentCost = constraint.cost
 
         for i in 0..<domain.len:
             let v = domain[i]
             let left = leftBase + leftCoeff * v
             let right = rightBase + rightCoeff * v
-            result[i] = int(rel.penalty(left, right))
+            result[i] = int(rel.penalty(left, right)) - currentCost
     else:
         # Fallback: individual computation
         for i, v in domain:
-            result[i] = constraint.cost + constraint.moveDelta(position, currentValue, v)
+            result[i] = constraint.moveDelta(position, currentValue, v)

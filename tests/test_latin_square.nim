@@ -45,6 +45,35 @@ proc validateLatinSquare(matrix: seq[seq[int]], n: int): bool =
 
     return true
 
+proc validateLatinSquareNoCanonical(matrix: seq[seq[int]], n: int): bool =
+    ## Validates that the given matrix is a valid n×n latin square (no canonical form requirement)
+    if matrix.len != n:
+        echo "❌ Invalid number of rows: expected ", n, ", got ", matrix.len
+        return false
+
+    for i, row in matrix:
+        if row.len != n:
+            echo "❌ Invalid number of columns in row ", i, ": expected ", n, ", got ", row.len
+            return false
+
+    for i, row in matrix:
+        let rowSet = row.toHashSet()
+        let expectedSet = toSeq(0..<n).toHashSet()
+        if rowSet != expectedSet:
+            echo "❌ Row ", i, " does not contain all values 0..<", n, ": ", row
+            return false
+
+    for j in 0..<n:
+        var colSet = initHashSet[int]()
+        for i in 0..<n:
+            colSet.incl(matrix[i][j])
+        let expectedSet = toSeq(0..<n).toHashSet()
+        if colSet != expectedSet:
+            echo "❌ Column ", j, " does not contain all values 0..<", n
+            return false
+
+    return true
+
 suite "Latin Square Tests":
     test "4x4 Latin Square generation":
         # Create constraint system (based on models/latinSquare.nim)
@@ -75,3 +104,20 @@ suite "Latin Square Tests":
 
         # Validate the solution
         check validateLatinSquare(solution, 4)
+
+    test "30x30 Latin Square generation":
+        let n = 30
+        var sys = initConstraintSystem[int]()
+        var X = sys.newConstrainedMatrix(n, n)
+        X.setDomain(toSeq(0..<n))
+
+        for row in X.rows():
+            sys.addConstraint(allDifferent(row))
+
+        for col in X.columns():
+            sys.addConstraint(allDifferent(col))
+
+        sys.resolve(tabuThreshold = 100000)
+
+        let solution = X.assignment
+        check validateLatinSquareNoCanonical(solution, n)

@@ -540,20 +540,18 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
 
 proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, currentValue: T,
                           domain: seq[T]): seq[int] =
-    ## Compute cost + moveDelta for ALL domain values at a position using prefix sums.
+    ## Compute moveDelta for ALL domain values at a position using prefix sums.
     ## O(maxTime + domainSize) instead of O(domainSize * duration).
     result = newSeq[int](domain.len)
 
     if state.evalMethod != PositionBased:
         # Fallback to individual computation
         for i, v in domain:
-            result[i] = state.cost + state.moveDelta(position, currentValue, v)
+            result[i] = state.moveDelta(position, currentValue, v)
         return
 
     if position >= state.positionToTask.len or state.positionToTask[position] < 0:
-        # Not a task origin — penalty doesn't change
-        for i in 0..<domain.len:
-            result[i] = state.cost
+        # Not a task origin — moveDelta is 0 for all values
         return
 
     let taskIdx = state.positionToTask[position]
@@ -585,12 +583,13 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
         prefixDelta[t + 1] = prefixDelta[t] + int64(overuseWith - overuseWithout)
 
     # Step 2: For each candidate, compute total penalty in O(1)
+    let currentCost = int64(state.cost)
     for i, v in domain:
         let newStart = max(0, int(v))
         let newEnd = min(tMax, int(v) + duration)
         if newStart >= tMax:
             # Task entirely outside profile — penalty is just base overuse
-            result[i] = int(baseOveruse)
+            result[i] = int(baseOveruse - currentCost)
         else:
             let addedCost = prefixDelta[newEnd] - prefixDelta[newStart]
-            result[i] = int(baseOveruse + addedCost)
+            result[i] = int(baseOveruse + addedCost - currentCost)

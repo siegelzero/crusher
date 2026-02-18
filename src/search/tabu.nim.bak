@@ -60,57 +60,54 @@ type
 ################################################################################
 
 proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], position: int, newValue: T): int {.inline.} =
-    ## Returns the moveDelta for assigning newValue at position under this constraint.
-    ## The penalty map caches these deltas (not absolute costs) so that targeted
-    ## neighbor updates remain correct when a constraint's base cost changes.
     let oldValue = state.assignment[position]
     when ProfileMoveDelta:
         let startT = cpuTime()
     case constraint.stateType:
         of AllDifferentType:
-            result = constraint.allDifferentState.moveDelta(position, oldValue, newValue)
+            result = constraint.allDifferentState.cost + constraint.allDifferentState.moveDelta(position, oldValue, newValue)
         of AtLeastType:
-            result = constraint.atLeastState.moveDelta(position, oldValue, newValue)
+            result = constraint.atLeastState.cost + constraint.atLeastState.moveDelta(position, oldValue, newValue)
         of AtMostType:
-            result = constraint.atMostState.moveDelta(position, oldValue, newValue)
+            result = constraint.atMostState.cost + constraint.atMostState.moveDelta(position, oldValue, newValue)
         of ElementType:
-            result = constraint.elementState.moveDelta(position, oldValue, newValue)
+            result = constraint.elementState.cost + constraint.elementState.moveDelta(position, oldValue, newValue)
         of AlgebraicType:
-            result = constraint.algebraicState.moveDelta(position, oldValue, newValue)
+            result = constraint.algebraicState.cost + constraint.algebraicState.moveDelta(position, oldValue, newValue)
         of RelationalType:
-            result = constraint.relationalState.moveDelta(position, oldValue, newValue)
+            result = constraint.relationalState.cost + constraint.relationalState.moveDelta(position, oldValue, newValue)
         of OrderingType:
-            result = constraint.orderingState.moveDelta(position, oldValue, newValue)
+            result = constraint.orderingState.cost + constraint.orderingState.moveDelta(position, oldValue, newValue)
         of GlobalCardinalityType:
-            result = constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
+            result = constraint.globalCardinalityState.cost + constraint.globalCardinalityState.moveDelta(position, oldValue, newValue)
         of MultiknapsackType:
-            result = constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
+            result = constraint.multiknapsackState.cost + constraint.multiknapsackState.moveDelta(position, oldValue, newValue)
         of SequenceType:
-            result = constraint.sequenceState.moveDelta(position, oldValue, newValue)
+            result = constraint.sequenceState.cost + constraint.sequenceState.moveDelta(position, oldValue, newValue)
         of BooleanType:
-            result = constraint.booleanState.moveDelta(position, oldValue, newValue)
+            result = constraint.booleanState.cost + constraint.booleanState.moveDelta(position, oldValue, newValue)
         of CumulativeType:
-            result = constraint.cumulativeState.moveDelta(position, oldValue, newValue)
+            result = constraint.cumulativeState.cost + constraint.cumulativeState.moveDelta(position, oldValue, newValue)
         of GeostType:
-            result = constraint.geostState.moveDelta(position, oldValue, newValue)
+            result = constraint.geostState.cost + constraint.geostState.moveDelta(position, oldValue, newValue)
         of IrdcsType:
-            result = constraint.irdcsState.moveDelta(position, oldValue, newValue)
+            result = constraint.irdcsState.cost + constraint.irdcsState.moveDelta(position, oldValue, newValue)
         of CircuitType:
-            result = constraint.circuitState.moveDelta(position, oldValue, newValue)
+            result = constraint.circuitState.cost + constraint.circuitState.moveDelta(position, oldValue, newValue)
         of AllDifferentExcept0Type:
-            result = constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
+            result = constraint.allDifferentExcept0State.cost + constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
         of LexOrderType:
-            result = constraint.lexOrderState.moveDelta(position, oldValue, newValue)
+            result = constraint.lexOrderState.cost + constraint.lexOrderState.moveDelta(position, oldValue, newValue)
         of TableConstraintType:
-            result = constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
+            result = constraint.tableConstraintState.cost + constraint.tableConstraintState.moveDelta(position, oldValue, newValue)
         of RegularType:
-            result = constraint.regularState.moveDelta(position, oldValue, newValue)
+            result = constraint.regularState.cost + constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
-            result = constraint.countEqState.moveDelta(position, oldValue, newValue)
+            result = constraint.countEqState.cost + constraint.countEqState.moveDelta(position, oldValue, newValue)
         of DiffnType:
-            result = constraint.diffnState.moveDelta(position, oldValue, newValue)
+            result = constraint.diffnState.cost + constraint.diffnState.moveDelta(position, oldValue, newValue)
         of MatrixElementType:
-            result = constraint.matrixElementState.moveDelta(position, oldValue, newValue)
+            result = constraint.matrixElementState.cost + constraint.matrixElementState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -439,9 +436,7 @@ proc propagateChannels[T](state: TabuState[T], position: int) =
             if newVal != state.assignment[binding.channelPosition]:
                 state.assignment[binding.channelPosition] = newVal
                 for c in state.constraintsAtPosition[binding.channelPosition]:
-                    let oldPenalty = c.penalty()
                     c.updatePosition(binding.channelPosition, newVal)
-                    state.cost += c.penalty() - oldPenalty
                 state.updatePenaltiesForPosition(binding.channelPosition)
                 state.updateNeighborPenalties(binding.channelPosition)
                 # If this channel position triggers further channels, enqueue it
@@ -453,12 +448,16 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
-        let oldPenalty = constraint.penalty()
         constraint.updatePosition(position, value)
-        state.cost += constraint.penalty() - oldPenalty
 
     # Propagate channel variables affected by this position change
     state.propagateChannels(position)
+
+    # Recompute true cost from constraint penalties (avoids accumulated moveDelta errors
+    # with expression-based constraints where multiple expressions share a position)
+    state.cost = 0
+    for constraint in state.constraints:
+        state.cost += constraint.penalty()
 
     state.updatePenaltiesForPosition(position)
     state.updateNeighborPenalties(position)
@@ -472,7 +471,9 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     const MAX_CANDIDATES_PER_POS = 500
 
     var
+        delta: int
         bestMoveCost = high(int)
+        oldPenalty: int
         movesEvaluated = 0
 
     for position in state.carray.allSearchPositions():
@@ -480,15 +481,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
         let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
         if oldIdx < 0:
             continue
-
-        # Skip positions where all constraints are satisfied — any move can only worsen.
-        # We check constraint costs directly since penaltyMap stores deltas (not absolute costs).
-        var hasViolation = false
-        for c in state.constraintsAtPosition[position]:
-            if c.penalty() > 0:
-                hasViolation = true
-                break
-        if not hasViolation:
+        oldPenalty = state.penaltyMap[position][oldIdx]
+        if oldPenalty == 0:
             continue
 
         let domain = state.carray.reducedDomain[position]
@@ -500,7 +494,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                 if i == oldIdx:
                     continue
                 inc movesEvaluated
-                let newCost = state.cost + state.penaltyMap[position][i]
+                delta = state.penaltyMap[position][i] - oldPenalty
+                let newCost = state.cost + delta
                 if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
                     if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
@@ -514,7 +509,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                 if i == oldIdx:
                     continue
                 inc movesEvaluated
-                let newCost = state.cost + state.penaltyMap[position][i]
+                delta = state.penaltyMap[position][i] - oldPenalty
+                let newCost = state.cost + delta
                 if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
                     if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
