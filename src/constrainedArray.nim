@@ -639,6 +639,44 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if arity >= 2 and arity <= MAX_GAC_ARITY:
                 gacConstraints.add(i)
 
+    # Step A: Group matrixElement constraints by shared matrix + constant index
+    # for cross-constraint backward propagation (Phase 6b)
+    type
+        MatrixGroupEntry = object
+            indexPos: int    # colPos (const-row) or rowPos (const-col)
+            valPos: int
+            matState: MatrixElementState[T]
+        MatrixGroupKey = tuple[matrixOffset: int, constIdx: int, isConstRow: bool]
+
+    var matrixGroups: Table[MatrixGroupKey, seq[MatrixGroupEntry]]
+    for cons in carray.constraints:
+        if cons.stateType != MatrixElementType:
+            continue
+        let ms = cons.matrixElementState
+        if ms.matrixElements.len == 0:
+            continue
+        # Find the matrix offset from the first variable element
+        var matOffset = -1
+        for elem in ms.matrixElements:
+            if not elem.isConstant:
+                matOffset = elem.variablePosition
+                break
+        if matOffset < 0:
+            continue  # all-constant matrix, skip
+
+        if ms.rowKind == ConstantIndex and ms.colKind == VariableIndex:
+            let key: MatrixGroupKey = (matrixOffset: matOffset, constIdx: ms.rowConstant, isConstRow: true)
+            if key notin matrixGroups:
+                matrixGroups[key] = @[]
+            matrixGroups[key].add(MatrixGroupEntry(
+                indexPos: ms.colPosition, valPos: ms.valuePosition, matState: ms))
+        elif ms.rowKind == VariableIndex and ms.colKind == ConstantIndex:
+            let key: MatrixGroupKey = (matrixOffset: matOffset, constIdx: ms.colConstant, isConstRow: false)
+            if key notin matrixGroups:
+                matrixGroups[key] = @[]
+            matrixGroups[key].add(MatrixGroupEntry(
+                indexPos: ms.rowPosition, valPos: ms.valuePosition, matState: ms))
+
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
     for outerIter in 0..<20:
         var outerChanged = false
@@ -998,6 +1036,21 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[valPos].excl(v)
                             outerChanged = true
 
+                    # Backward propagation to matrix cells
+                    # When col is singleton {c}: domain(Z[constRow, c]) ∩= domain(value)
+                    if currentDomain[colPos].len == 1:
+                        var singleCol: T
+                        for v in currentDomain[colPos].items: singleCol = v
+                        if singleCol >= 0 and singleCol < numCols:
+                            let flatIdx = constRow * numCols + singleCol
+                            let elem = matState.matrixElements[flatIdx]
+                            if not elem.isConstant:
+                                let mPos = elem.variablePosition
+                                let intersection = currentDomain[mPos] * currentDomain[valPos]
+                                if intersection.len < currentDomain[mPos].len:
+                                    currentDomain[mPos] = intersection
+                                    outerChanged = true
+
                 elif matState.rowKind == VariableIndex and matState.colKind == ConstantIndex:
                     # Const-col variant: matrix[row, constCol] == value
                     let constCol = matState.colConstant
@@ -1034,6 +1087,21 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if v notin reachableValues:
                             currentDomain[valPos].excl(v)
                             outerChanged = true
+
+                    # Backward propagation to matrix cells
+                    # When row is singleton {r}: domain(Z[r, constCol]) ∩= domain(value)
+                    if currentDomain[rowPos].len == 1:
+                        var singleRow: T
+                        for v in currentDomain[rowPos].items: singleRow = v
+                        if singleRow >= 0 and singleRow < numRows:
+                            let flatIdx = singleRow * numCols + constCol
+                            let elem = matState.matrixElements[flatIdx]
+                            if not elem.isConstant:
+                                let mPos = elem.variablePosition
+                                let intersection = currentDomain[mPos] * currentDomain[valPos]
+                                if intersection.len < currentDomain[mPos].len:
+                                    currentDomain[mPos] = intersection
+                                    outerChanged = true
 
                 elif matState.rowKind == VariableIndex and matState.colKind == VariableIndex:
                     # Var-var variant: matrix[row, col] == value
@@ -1101,6 +1169,60 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     for v in toSeq(currentDomain[valPos].items):
                         if v notin reachableValues:
                             currentDomain[valPos].excl(v)
+                            outerChanged = true
+
+        # Phase 6b: Cross-constraint backward propagation to matrix cells
+        # For each group of matrixElement constraints sharing the same matrix row/col,
+        # restrict each matrix cell to the union of value domains that could reach it.
+        for key in matrixGroups.keys:
+            let group = matrixGroups[key]
+            if group.len == 0:
+                continue
+            let ms0 = group[0].matState
+            let numCols = ms0.numCols
+            let numRows = ms0.numRows
+
+            if key.isConstRow:
+                let constRow = key.constIdx
+                # For each column c in the matrix row:
+                # allowedValues = union of domain(valPos) for all constraints where c ∈ domain(colPos)
+                for c in 0..<numCols:
+                    let flatIdx = constRow * numCols + c
+                    let elem = ms0.matrixElements[flatIdx]
+                    if elem.isConstant:
+                        continue
+                    let mPos = elem.variablePosition
+
+                    var allowedValues = initPackedSet[T]()
+                    for entry in group:
+                        if T(c) in currentDomain[entry.indexPos]:
+                            allowedValues = allowedValues + currentDomain[entry.valPos]
+
+                    if allowedValues.len > 0:
+                        let intersection = currentDomain[mPos] * allowedValues
+                        if intersection.len < currentDomain[mPos].len:
+                            currentDomain[mPos] = intersection
+                            outerChanged = true
+            else:
+                let constCol = key.constIdx
+                # For each row r in the matrix column:
+                # allowedValues = union of domain(valPos) for all constraints where r ∈ domain(rowPos)
+                for r in 0..<numRows:
+                    let flatIdx = r * numCols + constCol
+                    let elem = ms0.matrixElements[flatIdx]
+                    if elem.isConstant:
+                        continue
+                    let mPos = elem.variablePosition
+
+                    var allowedValues = initPackedSet[T]()
+                    for entry in group:
+                        if T(r) in currentDomain[entry.indexPos]:
+                            allowedValues = allowedValues + currentDomain[entry.valPos]
+
+                    if allowedValues.len > 0:
+                        let intersection = currentDomain[mPos] * allowedValues
+                        if intersection.len < currentDomain[mPos].len:
+                            currentDomain[mPos] = intersection
                             outerChanged = true
 
         if not outerChanged:

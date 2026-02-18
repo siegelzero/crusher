@@ -313,6 +313,110 @@ proc moveDelta*[T](state: MatrixElementState[T], position: int, oldValue, newVal
     return (if newSatisfied: 0 else: 1) - (if oldSatisfied: 0 else: 1)
 
 ################################################################################
+# Batch penalty computation
+################################################################################
+
+proc batchMovePenalty*[T](state: MatrixElementState[T], position: int,
+                          currentValue: T, domain: seq[T]): seq[int] =
+    ## Compute moveDelta for ALL domain values at a position in a tight loop.
+    ## Avoids per-value dispatch overhead by precomputing shared state.
+    result = newSeq[int](domain.len)
+
+    if position notin state.positions:
+        return  # all zeros
+
+    let curRow = state.getRow()
+    let curCol = state.getCol()
+    let curValue = state.currentAssignment[state.valuePosition]
+
+    # Compute current cost (baseline)
+    var oldCost = 1  # default: violated (OOB)
+    if state.inBounds(curRow, curCol):
+        let oldFlatIdx = state.flatIndex(curRow, curCol)
+        if state.getMatrixValue(oldFlatIdx) == curValue:
+            oldCost = 0
+
+    if state.rowKind == ConstantIndex and state.colKind == VariableIndex:
+        # Const-row variant
+        let constRow = state.rowConstant
+
+        if position == state.colPosition:
+            # Col changes: for each candidate c, check matrix[constRow, c] == curValue
+            for i in 0..<domain.len:
+                let c = domain[i]
+                var newCost = 1
+                if c >= 0 and c < state.numCols:
+                    let flatIdx = state.flatIndex(constRow, c)
+                    if state.getMatrixValue(flatIdx) == curValue:
+                        newCost = 0
+                result[i] = newCost - oldCost
+
+        elif position == state.valuePosition:
+            # Value changes: matrix lookup doesn't change, compare each candidate to matrixVal
+            if state.inBounds(curRow, curCol):
+                let flatIdx = state.flatIndex(curRow, curCol)
+                let matVal = state.getMatrixValue(flatIdx)
+                for i in 0..<domain.len:
+                    let newCost = if domain[i] == matVal: 0 else: 1
+                    result[i] = newCost - oldCost
+            else:
+                # OOB: all candidates yield cost 1, same as oldCost (also 1)
+                discard  # all zeros
+
+        else:
+            # Matrix cell: only matters if this is Z[constRow, curCol]
+            if state.inBounds(curRow, curCol):
+                let flatIdx = state.flatIndex(curRow, curCol)
+                let elem = state.matrixElements[flatIdx]
+                if not elem.isConstant and elem.variablePosition == position:
+                    # This is the active matrix cell: for each candidate, check == curValue
+                    for i in 0..<domain.len:
+                        let newCost = if domain[i] == curValue: 0 else: 1
+                        result[i] = newCost - oldCost
+                # else: not the active cell, all zeros
+
+    elif state.rowKind == VariableIndex and state.colKind == ConstantIndex:
+        # Const-col variant
+        let constCol = state.colConstant
+
+        if position == state.rowPosition:
+            # Row changes: for each candidate r, check matrix[r, constCol] == curValue
+            for i in 0..<domain.len:
+                let r = domain[i]
+                var newCost = 1
+                if r >= 0 and r < state.numRows:
+                    let flatIdx = state.flatIndex(r, constCol)
+                    if state.getMatrixValue(flatIdx) == curValue:
+                        newCost = 0
+                result[i] = newCost - oldCost
+
+        elif position == state.valuePosition:
+            # Value changes: matrix lookup doesn't change
+            if state.inBounds(curRow, curCol):
+                let flatIdx = state.flatIndex(curRow, curCol)
+                let matVal = state.getMatrixValue(flatIdx)
+                for i in 0..<domain.len:
+                    let newCost = if domain[i] == matVal: 0 else: 1
+                    result[i] = newCost - oldCost
+            else:
+                discard  # all zeros
+
+        else:
+            # Matrix cell: only matters if this is Z[curRow, constCol]
+            if state.inBounds(curRow, curCol):
+                let flatIdx = state.flatIndex(curRow, curCol)
+                let elem = state.matrixElements[flatIdx]
+                if not elem.isConstant and elem.variablePosition == position:
+                    for i in 0..<domain.len:
+                        let newCost = if domain[i] == curValue: 0 else: 1
+                        result[i] = newCost - oldCost
+
+    else:
+        # Var-var variant: fallback to individual moveDelta calls
+        for i in 0..<domain.len:
+            result[i] = state.moveDelta(position, currentValue, domain[i])
+
+################################################################################
 # Affected positions (for neighbor penalty updates)
 ################################################################################
 

@@ -87,51 +87,45 @@ proc validateMOLS(X: seq[seq[int]], Y: seq[seq[int]], n: int): bool =
     return true
 
 proc solveMOLS(n: int, parallel: bool = false): (seq[seq[int]], seq[seq[int]]) =
-    ## Solves MOLS problem for given n, returns (X, Y) matrices
+    ## Solves MOLS problem for given n using matrixElement formulation.
+    ## Orthogonality is modeled via a third Latin square Z where Z[i, X[i,j]] == Y[i,j].
     var sys = initConstraintSystem[int]()
     var X = sys.newConstrainedMatrix(n, n)
     var Y = sys.newConstrainedMatrix(n, n)
+    var Z = sys.newConstrainedMatrix(n, n)
 
-    # Set up each of X and Y to be latin squares
-    # Set domain of each entry to 0..<n
     X.setDomain(toSeq(0..<n))
     Y.setDomain(toSeq(0..<n))
+    Z.setDomain(toSeq(0..<n))
 
-    # Each row has to be a permutation of 0, 1, .., n
+    # X, Y, Z are all Latin squares
     for row in X.rows():
         sys.addConstraint(allDifferent(row))
-
     for row in Y.rows():
         sys.addConstraint(allDifferent(row))
-
-    # Each col has to be a permutation of 0, 1, .., n
+    for row in Z.rows():
+        sys.addConstraint(allDifferent(row))
     for col in X.columns():
         sys.addConstraint(allDifferent(col))
-
     for col in Y.columns():
         sys.addConstraint(allDifferent(col))
+    for col in Z.columns():
+        sys.addConstraint(allDifferent(col))
 
-    # First row in order 0 1 2... in first square
+    # Symmetry breaking
     for i in 0..<n:
         sys.addConstraint(X[0, i] == i)
         sys.addConstraint(X[i, 0] == i)
-
-    # First col in order 0 1 2... in both squares
-    for i in 0..<n:
         sys.addConstraint(Y[0, i] == i)
-
     for i in 1..<n:
         sys.addConstraint(Y[i, 0] <= i + 1)
         sys.addConstraint(Y[i, 0] != i)
 
-    # Mutual orthogonality condition
-    var pairs: seq[AlgebraicExpression[int]] = @[]
+    # Orthogonality via matrixElement: Z[i, X[i,j]] == Y[i,j]
     for i in 0..<n:
         for j in 0..<n:
-            pairs.add(X[i, j] + n*Y[i, j])
-    sys.addConstraint(allDifferent(pairs))
+            sys.addConstraint(matrixElement(Z, i, X[i, j], Y[i, j]))
 
-    # Solve with specified mode
     sys.resolve(10000, parallel=parallel, verbose=false)
 
     return (X.assignment(), Y.assignment())
