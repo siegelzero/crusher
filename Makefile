@@ -25,14 +25,10 @@ test:
 	nim c -r --threads:on --mm:arc --deepcopy:on -d:release tests/test_all.nim
 	@echo "✅ All tests completed successfully!"
 
-csplib: clean
-	@echo "🚀 Running CSPLib benchmark tests..."
-	@echo "====================================="
-	@for test_file in $$(find csplib -name 'test_*.nim' | sort); do \
-		echo "Running $$test_file..."; \
-		nim c -r --threads:on --mm:arc --deepcopy:on -d:release $$test_file || exit 1; \
-		echo ""; \
-	done
+csplib:
+	@echo "🚀 Running CSPLib benchmark tests (combined binary)..."
+	@echo "======================================================="
+	nim c -r --threads:on --mm:arc --deepcopy:on -d:release csplib/test_all.nim
 	@echo "✅ All CSPLib tests completed successfully!"
 
 test-parallel: clean
