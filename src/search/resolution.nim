@@ -17,7 +17,7 @@ proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
                 scatterThreshold: int = 5,
                 parallel: bool = false,
-                populationSize: int = 32,
+                populationSize: int = 16,
                 numWorkers: int = 0,
                 scatterStrategy: ScatterStrategy = PathRelinking,
                 verbose: bool = true) =

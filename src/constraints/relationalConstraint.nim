@@ -17,6 +17,10 @@ type
         # Cache for expression values
         leftValue*: T
         rightValue*: T
+        # Track which positions were affected by last updatePosition
+        lastAffectedPositions*: PackedSet[int]
+        lastOldLeftValue*: T
+        lastOldRightValue*: T
 
 # Create a new RelationalConstraint with Expression wrappers
 func newRelationalConstraint*[T](leftExpr, rightExpr: Expression[T],
@@ -73,6 +77,10 @@ func moveDelta*[T](constraint: RelationalConstraint[T],
 # Update a position with a new value
 func updatePosition*[T](constraint: RelationalConstraint[T],
                         position: int, newValue: T) =
+    # Save old values for getAffectedPositions/getAffectedDomainValues
+    constraint.lastOldLeftValue = constraint.leftValue
+    constraint.lastOldRightValue = constraint.rightValue
+
     # Update expressions incrementally and get their new values directly
     # The expressions maintain their own values, so we don't need getValue()
 
@@ -89,9 +97,26 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
     # Update cost based on new cached values
     constraint.cost = constraint.relation.penalty(constraint.leftValue, constraint.rightValue)
 
+    # Track affected positions: only positions in expressions whose values changed
+    constraint.lastAffectedPositions = initPackedSet[int]()
+    if constraint.leftValue != constraint.lastOldLeftValue:
+        constraint.lastAffectedPositions.incl(constraint.leftExpr.positions)
+    if constraint.rightValue != constraint.lastOldRightValue:
+        constraint.lastAffectedPositions.incl(constraint.rightExpr.positions)
+
 # Get the current penalty
 func penalty*[T](constraint: RelationalConstraint[T]): int =
     return constraint.cost
+
+func getAffectedPositions*[T](constraint: RelationalConstraint[T]): PackedSet[int] =
+    ## Returns positions affected by the last updatePosition call.
+    ## Only includes positions of expressions whose values actually changed.
+    return constraint.lastAffectedPositions
+
+func getAffectedDomainValues*[T](constraint: RelationalConstraint[T], position: int): seq[T] =
+    ## Returns empty (all values need recalculation) since expression-based
+    ## constraints can have complex dependencies.
+    return @[]
 
 proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                           currentValue: T, domain: seq[T]): seq[int] =

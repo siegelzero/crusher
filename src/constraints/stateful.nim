@@ -1042,6 +1042,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.elementState.getAffectedPositions()
         of DiffnType:
             return constraint.diffnState.getAffectedPositions()
+        of RelationalType:
+            return constraint.relationalState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1064,6 +1066,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.countEqState.getAffectedDomainValues(position)
         of GeostType:
             return constraint.geostState.getAffectedDomainValues(position)
+        of RelationalType:
+            return constraint.relationalState.getAffectedDomainValues(position)
         else:
             return @[]
 
