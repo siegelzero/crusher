@@ -1107,27 +1107,55 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         allDifferentState: newAllDifferentConstraint[T](copiedExpressions)
                     )
         of AtLeastType:
-            # Create fresh AtLeast constraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: AtLeastType,
-                atLeastState: newAtLeastConstraint[T](
-                    constraint.positions.toSeq(),
-                    constraint.atLeastState.targetValue,
-                    constraint.atLeastState.minOccurrences
-                )
-            )
+            case constraint.atLeastState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AtLeastType,
+                        atLeastState: newAtLeastConstraint[T](
+                            constraint.positions.toSeq(),
+                            constraint.atLeastState.targetValue,
+                            constraint.atLeastState.minOccurrences
+                        )
+                    )
+                of ExpressionBased:
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.atLeastState.expressions.len)
+                    for i, expr in constraint.atLeastState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AtLeastType,
+                        atLeastState: newAtLeastConstraint[T](
+                            copiedExpressions,
+                            constraint.atLeastState.targetValue,
+                            constraint.atLeastState.minOccurrences
+                        )
+                    )
         of AtMostType:
-            # Create fresh AtMost constraint (initialize with cost: 0)
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: AtMostType,
-                atMostState: newAtMostConstraint[T](
-                    constraint.positions.toSeq(),
-                    constraint.atMostState.targetValue,
-                    constraint.atMostState.maxOccurrences
-                )
-            )
+            case constraint.atMostState.evalMethod:
+                of PositionBased:
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AtMostType,
+                        atMostState: newAtMostConstraint[T](
+                            constraint.positions.toSeq(),
+                            constraint.atMostState.targetValue,
+                            constraint.atMostState.maxOccurrences
+                        )
+                    )
+                of ExpressionBased:
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.atMostState.expressions.len)
+                    for i, expr in constraint.atMostState.expressions:
+                        copiedExpressions[i] = expr.deepCopy()
+                    result = StatefulConstraint[T](
+                        positions: constraint.positions,
+                        stateType: AtMostType,
+                        atMostState: newAtMostConstraint[T](
+                            copiedExpressions,
+                            constraint.atMostState.targetValue,
+                            constraint.atMostState.maxOccurrences
+                        )
+                    )
         of ElementType:
             # Create fresh Element constraint (initialize with cost: 0)
             case constraint.elementState.evalMethod:
