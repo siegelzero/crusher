@@ -1255,16 +1255,24 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     else:
         result.reducedDomain = @[]
 
-    # Deep copy entries - AlgebraicExpression[T] are functionally immutable but we copy the seq
-    result.entries = arr.entries  # seq itself is copied by assignment
+    # Deep copy entries - AlgebraicExpression[T] are ref objects, must deep copy for ARC thread safety
+    result.entries = newSeq[AlgebraicExpression[T]](arr.entries.len)
+    for i, expr in arr.entries:
+        result.entries[i] = expr.deepCopy()
 
     # Deep copy all stateful constraints
     result.constraints = newSeq[StatefulConstraint[T]](arr.constraints.len)
     for i, constraint in arr.constraints:
         result.constraints[i] = constraint.deepCopy()
 
-    # Shallow copy channel data (structurally immutable)
+    # Deep copy channel data - channelBindings contains AlgebraicExpression refs
     result.channelPositions = arr.channelPositions
-    result.channelBindings = arr.channelBindings
+    result.channelBindings = newSeq[ChannelBinding[T]](arr.channelBindings.len)
+    for i, binding in arr.channelBindings:
+        result.channelBindings[i] = ChannelBinding[T](
+            channelPosition: binding.channelPosition,
+            indexExpression: binding.indexExpression.deepCopy(),
+            arrayElements: binding.arrayElements
+        )
     result.channelsAtPosition = arr.channelsAtPosition
 
