@@ -1026,6 +1026,10 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
     case constraint.stateType:
         of AllDifferentType:
             return constraint.allDifferentState.getAffectedPositions()
+        of AtLeastType:
+            return constraint.atLeastState.getAffectedPositions()
+        of AtMostType:
+            return constraint.atMostState.getAffectedPositions()
         of CumulativeType:
             return constraint.cumulativeState.getAffectedPositions()
         of GeostType:
@@ -1056,6 +1060,10 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
     case constraint.stateType:
         of AllDifferentType:
             return constraint.allDifferentState.getAffectedDomainValues(position)
+        of AtLeastType:
+            return constraint.atLeastState.getAffectedDomainValues(position)
+        of AtMostType:
+            return constraint.atMostState.getAffectedDomainValues(position)
         of CumulativeType:
             return constraint.cumulativeState.getAffectedDomainValues(position)
         of GlobalCardinalityType:

@@ -929,6 +929,42 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 if not changed:
                     break
 
+        # Phase 5b: AtMost/AtLeast domain reduction
+        for cons in carray.constraints:
+            if cons.stateType == AtMostType and
+               cons.atMostState.evalMethod == PositionBased:
+                let maxOcc = cons.atMostState.maxOccurrences
+                let target = cons.atMostState.targetValue
+                # Count positions forced to targetValue (singleton domain)
+                var forced = 0
+                for pos in cons.positions.items:
+                    if currentDomain[pos].len == 1 and T(target) in currentDomain[pos]:
+                        forced += 1
+                if forced >= maxOcc:
+                    # Remove targetValue from all non-singleton positions
+                    for pos in cons.positions.items:
+                        if currentDomain[pos].len > 1 and T(target) in currentDomain[pos]:
+                            currentDomain[pos].excl(T(target))
+                            outerChanged = true
+
+            elif cons.stateType == AtLeastType and
+                 cons.atLeastState.evalMethod == PositionBased:
+                let minOcc = cons.atLeastState.minOccurrences
+                let target = cons.atLeastState.targetValue
+                # Count positions that CAN take targetValue
+                var possible = 0
+                var possiblePositions: seq[int]
+                for pos in cons.positions.items:
+                    if T(target) in currentDomain[pos]:
+                        possible += 1
+                        possiblePositions.add(pos)
+                if possible == minOcc:
+                    # All positions that can take targetValue must take it
+                    for pos in possiblePositions:
+                        if currentDomain[pos].len > 1:
+                            currentDomain[pos] = toPackedSet[T]([T(target)])
+                            outerChanged = true
+
         # Phase 6: Element/MatrixElement arc consistency
         for cons in carray.constraints:
             if cons.stateType == ElementType:

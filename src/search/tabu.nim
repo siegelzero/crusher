@@ -10,6 +10,7 @@ randomize()
 # Logging configuration
 const LogInterval* = 50000  # Log every N iterations
 const ProfileMoveDelta* = false  # Enable moveDelta profiling (disable for performance)
+const ProfileIteration* = false  # Enable per-iteration phase profiling
 
 ################################################################################
 # Type definitions
@@ -56,6 +57,17 @@ type
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
+
+        # Iteration phase profiling
+        when ProfileIteration:
+            timeBestMoves*: float
+            timeAssignConstraints*: float
+            timeUpdatePenalties*: float
+            timeNeighborPenalties*: float
+            neighborUpdates*: int64
+            neighborBatchCalls*: int64
+            affectedPosTotal*: int64
+            affectedPosSkipped*: int64
 
 
 ################################################################################
@@ -248,9 +260,13 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
         for pos in affectedPositions.items:
             if pos == position:
                 continue
+            when ProfileIteration:
+                state.neighborUpdates += 1
             let localIdx = state.findLocalConstraintIdx(pos, constraint)
             let affectedVals = constraint.getAffectedDomainValues(pos)
             if affectedVals.len == 0:
+                when ProfileIteration:
+                    state.neighborBatchCalls += 1
                 state.updateConstraintAtPosition(pos, localIdx)
             else:
                 state.updateConstraintAtPositionValues(pos, localIdx, affectedVals)
@@ -483,6 +499,9 @@ proc propagateChannels[T](state: TabuState[T], position: int) =
                     worklist.add(binding.channelPosition)
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
+    when ProfileIteration:
+        let t0 = epochTime()
+
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
@@ -501,8 +520,20 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Propagate channel variables affected by this position change
     state.propagateChannels(position)
 
+    when ProfileIteration:
+        let t1 = epochTime()
+        state.timeAssignConstraints += t1 - t0
+
     state.updatePenaltiesForPosition(position)
+
+    when ProfileIteration:
+        let t2 = epochTime()
+        state.timeUpdatePenalties += t2 - t1
+
     state.updateNeighborPenalties(position)
+
+    when ProfileIteration:
+        state.timeNeighborPenalties += epochTime() - t2
 
 
 ################################################################################
@@ -561,7 +592,11 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
 
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
+    when ProfileIteration:
+        let tBM = epochTime()
     let moves = state.bestMoves()
+    when ProfileIteration:
+        state.timeBestMoves += epochTime() - tBM
 
     if moves.len > 0:
         let (position, newValue) = sample(moves)
@@ -617,6 +652,14 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     let elapsed = epochTime() - state.startTime
                     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
                     echo &"[Tabu S{state.id}] Solution found at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
+                    when ProfileIteration:
+                        let iters = max(1, state.iteration).float
+                        echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
+                             &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
+                             &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
+                             &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
+                        echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
+                             &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter)"
                 return state
 
         state.iteration += 1
@@ -629,6 +672,14 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         let elapsed = epochTime() - state.startTime
         let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
         echo &"[Tabu S{state.id}] Exhausted: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+        when ProfileIteration:
+            let iters = max(1, state.iteration).float
+            echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/elapsed*100:.1f}%) " &
+                 &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/elapsed*100:.1f}%) " &
+                 &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/elapsed*100:.1f}%) " &
+                 &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/elapsed*100:.1f}%)"
+            echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
+                 &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter)"
         state.logProfileStats()
 
     return state

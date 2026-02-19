@@ -37,6 +37,8 @@ type
         maxOccurrences*: int
         actualOccurrences: int
         cost*: int
+        lastOldOccurrences*: int
+        lastNewOccurrences*: int
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 positions: PackedSet[int]
@@ -107,6 +109,7 @@ proc initialize*[T](state: AtMostConstraint[T], assignment: seq[T]) =
 proc updatePosition*[T](state: AtMostConstraint[T], position: int, newValue: T) =
     # State Update assigning newValue to position
     let oldValue = state.currentAssignment[position]
+    state.lastOldOccurrences = state.actualOccurrences
     if oldValue != newValue:
         case state.evalMethod:
             of PositionBased:
@@ -138,6 +141,7 @@ proc updatePosition*[T](state: AtMostConstraint[T], position: int, newValue: T) 
 
                 state.actualOccurrences += totalOccurrenceDelta
                 state.cost = max(0, state.actualOccurrences - state.maxOccurrences)
+    state.lastNewOccurrences = state.actualOccurrences
 
 proc moveDelta*[T](state: AtMostConstraint[T], position: int, oldValue, newValue: T): int =
     if oldValue == newValue:
@@ -173,3 +177,40 @@ proc moveDelta*[T](state: AtMostConstraint[T], position: int, oldValue, newValue
     let newCost = max(0, newActualOccurrences - state.maxOccurrences)
 
     return newCost - state.cost
+
+proc getAffectedPositions*[T](state: AtMostConstraint[T]): PackedSet[int] =
+    ## Returns positions needing penalty map updates after the last updatePosition.
+    ## If occurrence count didn't cross a critical boundary, no neighbor's moveDelta
+    ## will return different values, so return empty set.
+    let old = state.lastOldOccurrences
+    let new2 = state.lastNewOccurrences
+    if old == new2:
+        return initPackedSet[int]()
+    let maxOcc = state.maxOccurrences
+    # Adding target value becomes costly when count crosses from < maxOcc to >= maxOcc
+    let addMarginalChanged = (old < maxOcc) != (new2 < maxOcc)
+    # Removing target value becomes beneficial when count crosses from > maxOcc to <= maxOcc
+    let removeMarginalChanged = (old <= maxOcc) != (new2 <= maxOcc)
+    if not addMarginalChanged and not removeMarginalChanged:
+        return initPackedSet[int]()
+    case state.evalMethod:
+        of PositionBased:
+            return state.positions
+        of ExpressionBased:
+            var allPos = initPackedSet[int]()
+            for exp in state.expressions:
+                allPos.incl(exp.positions)
+            return allPos
+
+proc getAffectedDomainValues*[T](state: AtMostConstraint[T], position: int): seq[T] =
+    ## Returns domain values needing recalculation at a neighbor position.
+    ## If current value is NOT the target, only flipping TO target changes occurrence count.
+    ## If current value IS the target, any non-target value changes it, so return all.
+    case state.evalMethod:
+        of PositionBased:
+            if state.currentAssignment[position] != state.targetValue:
+                return @[state.targetValue]
+            else:
+                return @[]  # all values
+        of ExpressionBased:
+            return @[]  # all values for expression-based
