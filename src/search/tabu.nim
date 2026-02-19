@@ -586,7 +586,7 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
     state.lastLogIteration = state.iteration
 
 
-proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil): TabuState[T] =
+proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     var lastImprovement = 0
 
     # Reset timing for this run
@@ -600,6 +600,10 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     while state.iteration - lastImprovement < threshold:
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
+            return state
+
+        # Check deadline every 1024 iterations
+        if deadline > 0 and (state.iteration and 0x3FF) == 0 and epochTime() > deadline:
             return state
 
         state.applyBestMove()
@@ -630,6 +634,6 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     return state
 
 
-proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int, verbose: bool = false): TabuState[T] =
+proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int, verbose: bool = false, deadline: float = 0.0): TabuState[T] =
     var state = newTabuState[T](carray, verbose)
-    return state.tabuImprove(threshold)
+    return state.tabuImprove(threshold, deadline = deadline)

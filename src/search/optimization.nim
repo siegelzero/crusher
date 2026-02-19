@@ -1,5 +1,6 @@
 
 import resolution
+from std/times import epochTime
 import ../expressions/expressions
 import ../expressions/stateful
 import ../expressions/sumExpression
@@ -24,12 +25,14 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       multiplier=2,  # deprecated, ignored
                       lowerBound=low(int),
                       upperBound=high(int),
+                      deadline: float = 0.0,
                       ) =
-        # Find initial solution
+        # Find initial solution (if this times out, re-raise — no feasible solution)
         system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
                       scatterThreshold=scatterThreshold,
                       populationSize=populationSize, numWorkers=numWorkers,
-                      scatterStrategy=scatterStrategy, verbose=verbose)
+                      scatterStrategy=scatterStrategy, verbose=verbose,
+                      deadline=deadline)
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
@@ -48,6 +51,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             echo "[Opt] Binary search: [", lo, ", ", hi, "]"
 
         while lo <= hi:
+            # Check deadline before each binary search iteration
+            if deadline > 0 and epochTime() > deadline:
+                system.searchCompleted = false
+                break
+
             let bestSolution = system.assignment
             let target = lo + (hi - lo) div 2
 
@@ -72,6 +80,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
+                    deadline=deadline,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
@@ -82,6 +91,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = currentCost - 1
                 else:
                     lo = currentCost + 1
+            except TimeLimitExceededError:
+                # Time limit hit during optimization — keep best known solution
+                system.searchCompleted = false
+                system.initialize(bestSolution)
+                objective.initialize(system.assignment)
+                break
             except NoSolutionFoundError:
                 when direction == Minimize:
                     lo = target + 1
@@ -123,6 +138,7 @@ template algebraicWrapper(procName: untyped) =
                       multiplier=6,  # deprecated, ignored
                       lowerBound=low(int),
                       upperBound=high(int),
+                      deadline: float = 0.0,
                       ) =
         if objective.linear:
             # Automatically linearize for O(1) incremental updates
@@ -131,14 +147,16 @@ template algebraicWrapper(procName: untyped) =
                     scatterThreshold=scatterThreshold,
                     populationSize=populationSize, numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy, verbose=verbose,
-                    lowerBound=lowerBound, upperBound=upperBound)
+                    lowerBound=lowerBound, upperBound=upperBound,
+                    deadline=deadline)
         else:
             let statefulObjective = newStatefulAlgebraicExpression(objective)
             procName(system, statefulObjective, parallel=parallel, tabuThreshold=tabuThreshold,
                     scatterThreshold=scatterThreshold,
                     populationSize=populationSize, numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy, verbose=verbose,
-                    lowerBound=lowerBound, upperBound=upperBound)
+                    lowerBound=lowerBound, upperBound=upperBound,
+                    deadline=deadline)
 
 # Generate AlgebraicExpression wrappers
 algebraicWrapper(minimize)

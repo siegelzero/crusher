@@ -57,6 +57,9 @@ proc printSolution*(tr: FznTranslator) =
 proc printUnsatisfiable*() =
   echo "=====UNSATISFIABLE====="
 
+proc printUnknown*() =
+  echo "=====UNKNOWN====="
+
 proc printComplete*() =
   ## Printed after all solutions (or after optimization completes).
   echo "=========="

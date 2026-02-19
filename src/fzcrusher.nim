@@ -6,7 +6,9 @@
 ##   -p <N>        number of parallel workers (0 = auto)
 ##   -v            verbose output
 ##   -s            print statistics
-##   -t <N>        tabu threshold (default 10000)
+##   -t <ms>       time limit in milliseconds (MiniZinc standard flag)
+##   --time-limit <ms>  alias for -t
+##   --tabu <N>    tabu threshold (default 10000)
 ##   -f            fast mode (lower tabu threshold)
 
 import std/[os, strutils, strformat, times, posix]
@@ -31,6 +33,7 @@ proc main() =
   var tabuThreshold = 10000
   var numWorkers = 0
   var allSolutions = false
+  var timeLimitMs = 0
 
   # Parse command line arguments
   var i = 1
@@ -47,7 +50,11 @@ proc main() =
       verbose = true
     of "-s":
       stats = true
-    of "-t":
+    of "-t", "--time-limit":
+      inc i
+      if i <= paramCount():
+        timeLimitMs = parseInt(paramStr(i))
+    of "--tabu":
       inc i
       if i <= paramCount():
         tabuThreshold = parseInt(paramStr(i))
@@ -63,12 +70,14 @@ proc main() =
   if filename == "":
     stderr.writeLine("Usage: fzcrusher [options] <file.fzn>")
     stderr.writeLine("Options:")
-    stderr.writeLine("  -a          all solutions")
-    stderr.writeLine("  -p <N>      parallel workers (0=auto)")
-    stderr.writeLine("  -v          verbose")
-    stderr.writeLine("  -s          statistics")
-    stderr.writeLine("  -t <N>      tabu threshold (default 10000)")
-    stderr.writeLine("  -f          fast mode")
+    stderr.writeLine("  -a              all solutions")
+    stderr.writeLine("  -p <N>          parallel workers (0=auto)")
+    stderr.writeLine("  -v              verbose")
+    stderr.writeLine("  -s              statistics")
+    stderr.writeLine("  -t <ms>         time limit in milliseconds")
+    stderr.writeLine("  --time-limit <ms>  alias for -t")
+    stderr.writeLine("  --tabu <N>      tabu threshold (default 10000)")
+    stderr.writeLine("  -f              fast mode")
     quit(1)
 
   if not fileExists(filename):
@@ -91,6 +100,9 @@ proc main() =
   if verbose:
     stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
 
+  # Compute deadline from time limit
+  let deadline = if timeLimitMs > 0: epochTime() + timeLimitMs.float / 1000.0 else: 0.0
+
   # Redirect stdout to stderr during solving (solver echo goes to stderr)
   let savedFd = dup(stdout.getFileHandle())
   redirectStdoutToStderr()
@@ -98,6 +110,7 @@ proc main() =
   # Solve
   let solveStart = cpuTime()
   var solved = false
+  var timedOut = false
   case model.solve.kind
   of Satisfy:
     try:
@@ -105,9 +118,12 @@ proc main() =
         parallel = parallel,
         tabuThreshold = tabuThreshold,
         numWorkers = numWorkers,
-        verbose = verbose
+        verbose = verbose,
+        deadline = deadline
       )
       solved = true
+    except TimeLimitExceededError:
+      timedOut = true
     except NoSolutionFoundError:
       discard
 
@@ -118,9 +134,12 @@ proc main() =
         parallel = parallel,
         tabuThreshold = tabuThreshold,
         numWorkers = numWorkers,
-        verbose = verbose
+        verbose = verbose,
+        deadline = deadline
       )
       solved = true
+    except TimeLimitExceededError:
+      timedOut = true
     except NoSolutionFoundError:
       discard
 
@@ -131,9 +150,12 @@ proc main() =
         parallel = parallel,
         tabuThreshold = tabuThreshold,
         numWorkers = numWorkers,
-        verbose = verbose
+        verbose = verbose,
+        deadline = deadline
       )
       solved = true
+    except TimeLimitExceededError:
+      timedOut = true
     except NoSolutionFoundError:
       discard
 
@@ -155,7 +177,10 @@ proc main() =
           tr.sys.assignment[gc.boardPositions[cellIdx]] = gc.tileValues[t]
 
     tr.printSolution()
-    printComplete()
+    if tr.sys.searchCompleted:
+      printComplete()
+  elif timedOut:
+    printUnknown()
   else:
     printUnsatisfiable()
 

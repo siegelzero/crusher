@@ -23,6 +23,7 @@ type
         nextTaskIndex*: Atomic[int]  # Index of next state to assign
         solutionFound*: Atomic[bool]  # Global solution flag
         tabuThreshold*: int
+        deadline*: float
         verbose*: bool
         results*: seq[BatchResult[T]]  # Collected results
         resultsLock*: Lock  # Protect results array
@@ -53,7 +54,7 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
 
             let state = pool.states[taskIndex]
             let startTime = epochTime()
-            let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound)
+            let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound, pool.deadline)
             let endTime = epochTime()
 
             let result = BatchResult[T](
@@ -82,7 +83,8 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
 iterator improveStates*[T](population: seq[TabuState[T]],
                            numWorkers: int = 0,
                            tabuThreshold: int = 10000,
-                           verbose: bool = false): BatchResult[T] =
+                           verbose: bool = false,
+                           deadline: float = 0.0): BatchResult[T] =
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
 
     discard
@@ -92,7 +94,7 @@ iterator improveStates*[T](population: seq[TabuState[T]],
         if population.len == 1 or actualWorkers == 1:
             for i, state in population:
                 let startTime = epochTime()
-                let improved = state.tabuImprove(tabuThreshold)
+                let improved = state.tabuImprove(tabuThreshold, deadline = deadline)
                 let endTime = epochTime()
                 let result = BatchResult[T](
                     found: improved.bestCost == 0,
@@ -111,6 +113,7 @@ iterator improveStates*[T](population: seq[TabuState[T]],
             var pool = StatePool[T](
                 states: population,
                 tabuThreshold: tabuThreshold,
+                deadline: deadline,
                 verbose: verbose,
                 results: newSeq[BatchResult[T]]()
             )
@@ -154,6 +157,11 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 if yieldedResults >= population.len or pool.solutionFound.load():
                     break
 
+                # Check deadline in monitor loop
+                if deadline > 0 and epochTime() > deadline:
+                    pool.solutionFound.store(true)
+                    break
+
                 sleep(1)  # Small delay to avoid busy waiting
 
             # Signal all workers to stop if not already done
@@ -189,7 +197,8 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
                         numWorkers: int = 0,
                         tabuThreshold: int = 10000,
                         verbose: bool = false,
-                        failedPool: var CandidatePool[T]): bool =
+                        failedPool: var CandidatePool[T],
+                        deadline: float = 0.0): bool =
     ## Run parallel tabu search. Returns true if solution found (system initialized).
     ## On failure, populates failedPool with best results for scatter search continuation.
     let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
@@ -218,7 +227,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Collect all results from parallel tabu improvement
     var allResults: seq[PoolEntry[T]] = @[]
 
-    for result in improveStates(population, numWorkers, tabuThreshold, verbose = false):
+    for result in improveStates(population, numWorkers, tabuThreshold, verbose = false, deadline = deadline):
         if result.found:
             if verbose:
                 let elapsed = result.endTime - result.startTime

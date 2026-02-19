@@ -149,7 +149,8 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                         tabuThreshold: int = 10000,
                         relinkThreshold: int = 5000,
                         numWorkers: int = 0,
-                        verbose: bool = true): bool =
+                        verbose: bool = true,
+                        deadline: float = 0.0): bool =
     ## Run scatter search iterations on an existing pool.
     ## Returns true if solution found (system is initialized).
     ## Returns false after scatterThreshold iterations without improvement.
@@ -161,6 +162,10 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
     var iter = 0
 
     while itersSinceImprovement < scatterThreshold:
+        # Check deadline at start of each iteration
+        if deadline > 0 and epochTime() > deadline:
+            return false
+
         let iterStart = currentTime()
         let prevBestCost = pool.minCost
         inc iter
@@ -237,7 +242,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 let sc = system.deepCopy()
                 toImprove[pi] = newTabuState[T](sc.baseArray, promising[pi].assignment, verbose = false, id = pi)
 
-            for batchResult in improveStates(toImprove, actualWorkers, relinkThreshold, verbose = false):
+            for batchResult in improveStates(toImprove, actualWorkers, relinkThreshold, verbose = false, deadline = deadline):
                 inc improvedCount
                 if batchResult.found:
                     system.initialize(batchResult.assignment)
@@ -284,7 +289,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             let sc = system.deepCopy()
             freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
 
-        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false):
+        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
@@ -309,7 +314,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             intensifyPop[i] = newTabuState[T](sc.baseArray, pool.entries[i].assignment, verbose = false, id = i)
 
         var newEntries: seq[PoolEntry[T]] = @[]
-        for batchResult in improveStates(intensifyPop, actualWorkers, tabuThreshold, verbose = false):
+        for batchResult in improveStates(intensifyPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
@@ -348,7 +353,8 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
                     scatterThreshold: int = 3,
                     tabuThreshold: int = 10000,
                     numWorkers: int = 0,
-                    verbose: bool = true): bool =
+                    verbose: bool = true,
+                    deadline: float = 0.0): bool =
     ## Constraint-Group LNS: destroy positions covered by random compact constraints,
     ## then repair with tabu search. O(poolSize) per iteration instead of O(poolSize^2).
     ## Returns true if solution found (system is initialized).
@@ -378,6 +384,10 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
     var destroyCount = 1  # Start by destroying 1 constraint group
 
     while itersSinceImprovement < scatterThreshold:
+        # Check deadline at start of each iteration
+        if deadline > 0 and epochTime() > deadline:
+            return false
+
         let iterStart = currentTime()
         let prevBestCost = pool.minCost
         inc iter
@@ -429,7 +439,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
             let sc = system.deepCopy()
             toRepair[pi] = newTabuState[T](sc.baseArray, perturbed[pi], verbose = false, id = pi)
 
-        for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false):
+        for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
             inc repairedCount
             if batchResult.found:
                 system.initialize(batchResult.assignment)
@@ -477,7 +487,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
             let sc = system.deepCopy()
             freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
 
-        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false):
+        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:

@@ -5,7 +5,7 @@
   "mznlib": "mznlib",
   "executable": "../fzcrusher",
   "tags": ["cp", "int"],
-  "stdFlags": ["-a", "-s", "-v", "-p"],
+  "stdFlags": ["-a", "-s", "-v", "-p", "-t"],
   "inputType": "FZN",
   "needsSolns2Out": true
 }

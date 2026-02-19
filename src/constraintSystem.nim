@@ -11,6 +11,7 @@ import expressions/[algebraic, sumExpression, maxExpression, minExpression]
 
 type
     NoSolutionFoundError* = object of CatchableError
+    TimeLimitExceededError* = object of CatchableError
     VariableContainer[T] = ref object of RootObj
         system: ConstraintSystem[T]
         offset: int
@@ -30,6 +31,7 @@ type
         baseArray*: ConstrainedArray[T]
         assignment*: seq[T]
         lastIterations*: int
+        searchCompleted*: bool
 
 ################################################################################
 # ConstraintSystem creation
@@ -42,7 +44,8 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
         baseArray: initConstrainedArray[T](0),
         variables: newSeq[VariableContainer[T]](),
         assignment: newSeq[T](),
-        lastIterations: 0
+        lastIterations: 0,
+        searchCompleted: true
     )
 
 ################################################################################
