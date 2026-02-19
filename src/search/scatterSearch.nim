@@ -1,4 +1,4 @@
-import std/[random, math, sequtils, strformat, algorithm, atomics, tables]
+import std/[random, math, sequtils, strformat, algorithm, atomics, tables, packedsets]
 import std/times
 
 proc currentTime*(): float {.inline.} = epochTime()
@@ -340,6 +340,173 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
     # No solution found
     if verbose:
         echo &"[Scatter] No solution after {iter} iterations (stale={scatterThreshold}): best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
+    return false
+
+
+proc lnsImprove*[T](system: ConstraintSystem[T],
+                    pool: var CandidatePool[T],
+                    scatterThreshold: int = 3,
+                    tabuThreshold: int = 10000,
+                    numWorkers: int = 0,
+                    verbose: bool = true): bool =
+    ## Constraint-Group LNS: destroy positions covered by random compact constraints,
+    ## then repair with tabu search. O(poolSize) per iteration instead of O(poolSize^2).
+    ## Returns true if solution found (system is initialized).
+
+    let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
+    let totalStart = currentTime()
+    let poolSize = pool.entries.len
+    let totalPositions = system.baseArray.len
+    let maxCompactSize = totalPositions div 3  # 33% threshold
+
+    # Identify compact constraints (those spanning ≤33% of positions)
+    var compactIndices: seq[int] = @[]
+    for ci, c in system.baseArray.constraints:
+        if c.positions.len <= maxCompactSize and c.positions.len > 0:
+            compactIndices.add(ci)
+
+    if verbose:
+        echo &"[LNS] Compact constraints: {compactIndices.len}/{system.baseArray.constraints.len} (max size={maxCompactSize}/{totalPositions})"
+
+    if compactIndices.len == 0:
+        if verbose:
+            echo &"[LNS] No compact constraints found, falling back to random perturbation"
+        return false
+
+    var itersSinceImprovement = 0
+    var iter = 0
+    var destroyCount = 1  # Start by destroying 1 constraint group
+
+    while itersSinceImprovement < scatterThreshold:
+        let iterStart = currentTime()
+        let prevBestCost = pool.minCost
+        inc iter
+        if verbose:
+            echo &"[LNS] === Iteration {iter} (stale={itersSinceImprovement}/{scatterThreshold}, destroy={destroyCount}) ==="
+
+        # a. PERTURB: For each pool entry, create 3 variants with increasing destruction
+        let perturbStart = currentTime()
+        var perturbed: seq[seq[T]] = @[]
+
+        for ei in 0..<poolSize:
+            let baseAssignment = pool.entries[ei].assignment
+
+            for sizeOffset in 0..2:
+                let numDestroy = destroyCount + sizeOffset
+                var destroyed: PackedSet[int]
+
+                # Pick random compact constraints to destroy
+                var chosen: seq[int] = @[]
+                var candidates = compactIndices
+                for d in 0..<min(numDestroy, candidates.len):
+                    let idx = rand(candidates.len - 1)
+                    chosen.add(candidates[idx])
+                    candidates.del(idx)
+
+                # Collect all positions from chosen constraints
+                for ci in chosen:
+                    for pos in system.baseArray.constraints[ci].positions.items:
+                        destroyed.incl(pos)
+
+                # Create perturbed assignment: randomize destroyed positions
+                var newAssignment = baseAssignment
+                for pos in destroyed.items:
+                    if pos notin system.baseArray.channelPositions:
+                        newAssignment[pos] = sample(system.baseArray.reducedDomain[pos])
+
+                perturbed.add(newAssignment)
+
+        if verbose:
+            echo &"[LNS] Created {perturbed.len} perturbed states in {currentTime() - perturbStart:.2f}s"
+
+        # b. REPAIR: Tabu-improve all perturbed states
+        let repairStart = currentTime()
+        var improvements: seq[PoolEntry[T]] = @[]
+        var repairedCount = 0
+
+        var toRepair = newSeq[TabuState[T]](perturbed.len)
+        for pi in 0..<perturbed.len:
+            let sc = system.deepCopy()
+            toRepair[pi] = newTabuState[T](sc.baseArray, perturbed[pi], verbose = false, id = pi)
+
+        for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false):
+            inc repairedCount
+            if batchResult.found:
+                system.initialize(batchResult.assignment)
+                if verbose:
+                    echo &"[LNS] Solution found during repair (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                return true
+            if batchResult.cost < pool.maxCost:
+                improvements.add(PoolEntry[T](
+                    assignment: batchResult.assignment,
+                    cost: batchResult.cost
+                ))
+
+        if verbose:
+            let repairElapsed = currentTime() - repairStart
+            echo &"[LNS] Repaired {repairedCount} states in {repairElapsed:.2f}s, {improvements.len} better than pool max={pool.maxCost}"
+            if improvements.len > 0:
+                let impCosts = improvements.mapIt(it.cost).sorted()
+                echo &"[LNS] Improvement costs: min={impCosts[0]} max={impCosts[^1]}"
+
+        # Update pool with improvements
+        if improvements.len > 0:
+            improvements.sort(proc(a, b: PoolEntry[T]): int = cmp(a.cost, b.cost))
+            for imp in improvements:
+                pool.replaceMaxCost(imp)
+            if verbose:
+                pool.poolStatistics()
+
+        # Check for solution
+        if pool.minCost == 0:
+            for entry in pool.entries:
+                if entry.cost == 0:
+                    system.initialize(entry.assignment)
+                    if verbose:
+                        echo &"[LNS] Solution found after pool update (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                    return true
+
+        # c. DIVERSIFY: Fresh random states
+        let diversifyCount = max(poolSize div 2, 2)
+        let divStart = currentTime()
+        if verbose:
+            echo &"[LNS] Diversifying with {diversifyCount} fresh states"
+
+        var freshPop = newSeq[TabuState[T]](diversifyCount)
+        for i in 0..<diversifyCount:
+            let sc = system.deepCopy()
+            freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
+
+        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false):
+            if batchResult.found:
+                system.initialize(batchResult.assignment)
+                if verbose:
+                    echo &"[LNS] Solution found during diversification (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                return true
+            pool.replaceMaxCost(PoolEntry[T](
+                assignment: batchResult.assignment,
+                cost: batchResult.cost
+            ))
+
+        if verbose:
+            echo &"[LNS] Diversification took {currentTime() - divStart:.2f}s"
+
+        # Track improvement and adapt destroy count
+        if pool.minCost < prevBestCost:
+            itersSinceImprovement = 0
+            destroyCount = 1  # Reset on improvement
+        else:
+            inc itersSinceImprovement
+            destroyCount = min(destroyCount + 1, compactIndices.len div 2)  # Escalate
+
+        if verbose:
+            let iterElapsed = currentTime() - iterStart
+            pool.poolStatistics()
+            echo &"[LNS] Iteration {iter} completed in {iterElapsed:.1f}s ({currentTime() - totalStart:.1f}s total)"
+
+    # No solution found
+    if verbose:
+        echo &"[LNS] No solution after {iter} iterations (stale={scatterThreshold}): best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
     return false
 
 

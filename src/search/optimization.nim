@@ -19,6 +19,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       scatterThreshold=1,
                       populationSize=8,
                       numWorkers=0,
+                      scatterStrategy: ScatterStrategy = PathRelinking,
                       verbose=false,
                       multiplier=2,  # deprecated, ignored
                       lowerBound=low(int),
@@ -27,7 +28,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Find initial solution
         system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
                       scatterThreshold=scatterThreshold,
-                      populationSize=populationSize, numWorkers=numWorkers, verbose=verbose)
+                      populationSize=populationSize, numWorkers=numWorkers,
+                      scatterStrategy=scatterStrategy, verbose=verbose)
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
@@ -68,6 +70,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     scatterThreshold=scatterThreshold,
                     populationSize=populationSize,
                     numWorkers=numWorkers,
+                    scatterStrategy=scatterStrategy,
                     verbose=verbose,
                 )
                 objective.initialize(system.assignment)
@@ -115,6 +118,7 @@ template algebraicWrapper(procName: untyped) =
                       scatterThreshold=1,
                       populationSize=32,
                       numWorkers=0,
+                      scatterStrategy: ScatterStrategy = PathRelinking,
                       verbose=false,
                       multiplier=6,  # deprecated, ignored
                       lowerBound=low(int),
@@ -125,13 +129,15 @@ template algebraicWrapper(procName: untyped) =
             let linearizedObjective = linearize(objective)
             procName(system, linearizedObjective, parallel=parallel, tabuThreshold=tabuThreshold,
                     scatterThreshold=scatterThreshold,
-                    populationSize=populationSize, numWorkers=numWorkers, verbose=verbose,
+                    populationSize=populationSize, numWorkers=numWorkers,
+                    scatterStrategy=scatterStrategy, verbose=verbose,
                     lowerBound=lowerBound, upperBound=upperBound)
         else:
             let statefulObjective = newStatefulAlgebraicExpression(objective)
             procName(system, statefulObjective, parallel=parallel, tabuThreshold=tabuThreshold,
                     scatterThreshold=scatterThreshold,
-                    populationSize=populationSize, numWorkers=numWorkers, verbose=verbose,
+                    populationSize=populationSize, numWorkers=numWorkers,
+                    scatterStrategy=scatterStrategy, verbose=verbose,
                     lowerBound=lowerBound, upperBound=upperBound)
 
 # Generate AlgebraicExpression wrappers

@@ -8,12 +8,18 @@ when compileOption("threads"):
     import parallelResolution  # also exports candidatePool
     import scatterSearch
 
+type
+    ScatterStrategy* = enum
+        PathRelinking,  ## Current approach: pairwise path relinking between pool members
+        LNS             ## Constraint-group LNS: targeted perturbation guided by constraint topology
+
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
                 scatterThreshold: int = 5,
                 parallel: bool = false,
                 populationSize: int = 32,
                 numWorkers: int = 0,
+                scatterStrategy: ScatterStrategy = PathRelinking,
                 verbose: bool = true) =
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
@@ -42,9 +48,14 @@ proc resolve*[T](system: ConstraintSystem[T],
         if pool.entries.len > 0:
             let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
             if verbose:
-                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost})"
+                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy})"
                 pool.poolStatistics()
-            if scatterImprove(system, pool, scatterThreshold, tabuThreshold, tabuThreshold, actualWorkers, verbose):
+            let improved = case scatterStrategy:
+                of PathRelinking:
+                    scatterImprove(system, pool, scatterThreshold, tabuThreshold, tabuThreshold, actualWorkers, verbose)
+                of LNS:
+                    lnsImprove(system, pool, scatterThreshold, tabuThreshold, actualWorkers, verbose)
+            if improved:
                 return
 
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
