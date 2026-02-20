@@ -1143,7 +1143,7 @@ proc translateSolve(tr: var FznTranslator) =
       else:
         raise newException(ValueError, "Objective must be a variable identifier")
   of Satisfy:
-    tr.objectivePos = -1
+    tr.objectivePos = -2  # distinct from -1 (defined-var objective)
 
 proc collectDefinedVars(tr: var FznTranslator) =
   ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
@@ -1907,7 +1907,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.matrixInfos = initTable[string, MatrixInfo]()
   result.channelVarNames = initHashSet[string]()
   result.channelConstraints = initTable[int, string]()
-  result.objectivePos = -1
+  result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()

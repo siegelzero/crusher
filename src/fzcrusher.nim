@@ -130,7 +130,8 @@ proc main() =
   of Minimize:
     try:
       let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                    else: tr.objectiveDefExpr
+                    elif tr.objectivePos == -1: tr.objectiveDefExpr
+                    else: raise newException(ValueError, "No objective expression for minimize")
       minimize(tr.sys, objExpr,
         parallel = parallel,
         tabuThreshold = tabuThreshold,
@@ -147,7 +148,8 @@ proc main() =
   of Maximize:
     try:
       let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                    else: tr.objectiveDefExpr
+                    elif tr.objectivePos == -1: tr.objectiveDefExpr
+                    else: raise newException(ValueError, "No objective expression for maximize")
       maximize(tr.sys, objExpr,
         parallel = parallel,
         tabuThreshold = tabuThreshold,

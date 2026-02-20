@@ -676,19 +676,21 @@ type
         pos: int            # original position (edge variable)
         newVal: int         # value to assign (0 or 1) when using this edge
 
-proc findNegativeCycle[T](state: TabuState[T]): seq[(int, T)] =
+proc findNegativeCycle[T](state: TabuState[T]): (seq[(int, T)], int) =
     ## Find a negative-cost cycle in the residual flow graph using Bellman-Ford.
+    ## Returns (chain, cycleCost) where chain is a list of (position, newValue)
+    ## flips and cycleCost is the sum of residual edge costs in the cycle.
     ## Each binary edge variable maps to a residual edge:
     ##   - Currently ON (1): reverse edge with cost = -weight (removing saves weight)
     ##   - Currently OFF (0): forward edge with cost = +weight (adding costs weight)
     ## A negative cycle corresponds to a set of edge flips that improve the objective
     ## while maintaining flow conservation.
     if state.edgeObjectiveWeight.len == 0:
-        return @[]
+        return (@[], 0)
 
     let n = state.flowNodePositions.len  # number of flow nodes
     if n == 0:
-        return @[]
+        return (@[], 0)
 
     # Build residual edges
     var edges: seq[ResidualEdge] = @[]
@@ -716,7 +718,7 @@ proc findNegativeCycle[T](state: TabuState[T]): seq[(int, T)] =
             edges.add(ResidualEdge(src: srcNode, dst: dstNode, cost: w, pos: pos, newVal: 1))
 
     if edges.len == 0:
-        return @[]
+        return (@[], 0)
 
     # Bellman-Ford: detect negative-cost cycle
     var dist = newSeq[int](n)
@@ -737,7 +739,7 @@ proc findNegativeCycle[T](state: TabuState[T]): seq[(int, T)] =
                 lastRelaxed = e.dst
 
     if lastRelaxed < 0:
-        return @[]  # No negative cycle
+        return (@[], 0)  # No negative cycle
 
     # Trace back to find the cycle
     var node = lastRelaxed
@@ -753,21 +755,25 @@ proc findNegativeCycle[T](state: TabuState[T]): seq[(int, T)] =
     while true:
         let ei = pred[current]
         if ei < 0:
-            return @[]  # broken chain
+            return (@[], 0)  # broken chain
         cycle.add(edges[ei])
         visited.incl(current)
         current = edges[ei].src
         if current == cycleStart:
             break
         if current in visited:
-            return @[]  # unexpected loop structure
+            return (@[], 0)  # unexpected loop structure
 
     if cycle.len < 2:
-        return @[]
+        return (@[], 0)
 
-    # Convert cycle to position flips
+    # Compute cycle cost and convert to position flips
+    var cycleCost = 0
+    var chain: seq[(int, T)] = @[]
     for e in cycle:
-        result.add((e.pos, T(e.newVal)))
+        cycleCost += e.cost
+        chain.add((e.pos, T(e.newVal)))
+    return (chain, cycleCost)
 
 
 proc tryChainMoves*[T](state: TabuState[T]): bool =
@@ -776,11 +782,17 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
     if not state.flowEnabled:
         return false
 
-    let chain = state.findNegativeCycle()
+    let (chain, cycleCost) = state.findNegativeCycle()
     if chain.len < 2:
         return false
 
-    # Evaluate: apply chain, measure delta, restore
+    # Skip cycles that aren't negative in the flow subproblem — these can't
+    # improve the full cost and applying+restoring them wastes penalty rebuilds.
+    if cycleCost >= 0:
+        return false
+
+    # Apply chain and measure actual delta (may differ from cycleCost due to
+    # non-flow constraints like cardinality bounds or side constraints).
     let costBefore = state.cost
     var oldValues: seq[T] = @[]
     for (pos, newVal) in chain:
@@ -790,7 +802,7 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
 
     if delta < 0:
         if state.verbose:
-            echo &"[Chain S{state.id}] Applying negative cycle: len={chain.len} delta={delta} (cost {costBefore} -> {costBefore + delta})"
+            echo &"[Chain S{state.id}] Applying negative cycle: len={chain.len} delta={delta} cycleCost={cycleCost} (cost {costBefore} -> {costBefore + delta})"
         # Set tabu for all flipped positions
         for i in 0..<chain.len:
             let (pos, _) = chain[i]
@@ -802,7 +814,7 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
     else:
         # Restore — cycle wasn't actually improving (due to non-flow constraints)
         if state.verbose:
-            echo &"[Chain S{state.id}] Negative cycle not improving: len={chain.len} delta={delta}"
+            echo &"[Chain S{state.id}] Negative cycle not improving: len={chain.len} delta={delta} cycleCost={cycleCost}"
         for i in countdown(chain.len - 1, 0):
             state.assignValue(chain[i][0], oldValues[i])
         return false
@@ -1093,19 +1105,21 @@ proc swapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
             result += jointDelta - indep1 - indep2
 
 
-proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int, T, T)] =
+proc bestSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], int) =
     ## Find the best swap move among binary variable pairs.
-    ## Returns list of equally-best (p1, p2, newVal1, newVal2) tuples.
+    ## Returns (moves, bestCost) where moves is a list of equally-best
+    ## (p1, p2, newVal1, newVal2) tuples and bestCost is the projected cost.
     ## Only active when flow structure is detected (swap moves are designed for
     ## network flow problems; for non-flow binary variables like channeling
     ## indicators, swapping without coordinating linked variables is counterproductive).
     if not state.flowEnabled:
-        return @[]
+        return (@[], high(int))
 
     const MAX_SWAP_EVALUATIONS = 2000
 
     var
         bestSwapCost = high(int)
+        moves: seq[(int, int, T, T)] = @[]
         swapsEvaluated = 0
 
     # Iterate binary positions, prefer violated ones
@@ -1147,19 +1161,19 @@ proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int, T, T)] =
                 continue
 
             if newCost < bestSwapCost:
-                result = @[(p1, p2, newVal1, newVal2)]
+                moves = @[(p1, p2, newVal1, newVal2)]
                 bestSwapCost = newCost
             elif newCost == bestSwapCost:
-                result.add((p1, p2, newVal1, newVal2))
+                moves.add((p1, p2, newVal1, newVal2))
 
             if swapsEvaluated >= MAX_SWAP_EVALUATIONS:
-                return result
+                return (moves, bestSwapCost)
 
             # Early exit on improvement
             if bestSwapCost < state.cost:
-                return result
+                return (moves, bestSwapCost)
 
-    return result
+    return (moves, bestSwapCost)
 
 
 ################################################################################
@@ -1170,7 +1184,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         let tBM = epochTime()
     let moves = state.bestMoves()
-    let swapMoves = state.bestSwapMoves()
+    let (swapMoves, swapCost) = state.bestSwapMoves()
     when ProfileIteration:
         state.timeBestMoves += epochTime() - tBM
 
@@ -1181,12 +1195,6 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let idx = state.domainIndex[pos].getOrDefault(val, -1)
         if idx >= 0:
             singleCost = state.cost + state.penaltyMap[pos][idx]
-
-    # Determine best swap move cost
-    var swapCost = high(int)
-    if swapMoves.len > 0:
-        let (p1, p2, nv1, nv2) = swapMoves[0]
-        swapCost = state.cost + state.swapDelta(p1, p2, nv1, nv2)
 
     if swapMoves.len > 0 and swapCost < singleCost:
         # Apply swap move
