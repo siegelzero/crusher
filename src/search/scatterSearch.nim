@@ -213,7 +213,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 echo &"[Scatter] Path entry costs: min={pathCosts[0]} p25={p25} p50={p50} p75={p75} max={pathCosts[^1]}"
 
         # Select promising entries: best K by cost, where K scales with pool size
-        let maxPromising = max(poolSize, allPathEntries.len div 4)
+        let maxPromising = min(max(poolSize, allPathEntries.len div 4), 100)
         allPathEntries.sort(proc(a, b: PathEntry[T]): int = cmp(a.cost, b.cost))
         var promising: seq[PathEntry[T]] = @[]
         for pe in allPathEntries:

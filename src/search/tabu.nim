@@ -54,6 +54,10 @@ type
         # Per-position count of violated constraints (penalty > 0)
         violationCount*: seq[int]
 
+        # Cached search metadata
+        searchPositions*: seq[int]  # Non-channel positions (precomputed)
+        totalDomainSize*: int  # Sum of domain sizes across search positions
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -66,6 +70,7 @@ type
             timeNeighborPenalties*: float
             neighborUpdates*: int64
             neighborBatchCalls*: int64
+            positionsScanned*: int64
             affectedPosTotal*: int64
             affectedPosSkipped*: int64
 
@@ -404,6 +409,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.bestCost = state.cost
     state.bestAssignment = state.assignment
 
+    # Cache search positions and total domain size
+    state.searchPositions = @[]
+    state.totalDomainSize = 0
+    for pos in carray.allSearchPositions():
+        state.searchPositions.add(pos)
+        state.totalDomainSize += carray.reducedDomain[pos].len
+
     # Build domain index: value -> local array index
     state.domainIndex = newSeq[Table[T, int]](carray.len)
     for pos in carray.allPositions():
@@ -542,40 +554,43 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 
 proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     const MAX_CANDIDATES_PER_POS = 500
+    const FIRST_IMPROVEMENT_THRESHOLD = 100_000
 
     var
         bestMoveCost = high(int)
         movesEvaluated = 0
 
-    for position in state.carray.allSearchPositions():
-        let oldValue = state.assignment[position]
-        let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
-        if oldIdx < 0:
-            continue
+    # For large search spaces, use first-improvement: pick a small random
+    # subset of violated positions and accept the first improving move.
+    let useFirstImprovement = state.totalDomainSize > FIRST_IMPROVEMENT_THRESHOLD
 
-        # Skip positions where all constraints are satisfied — any move can only worsen.
-        if state.violationCount[position] == 0:
-            continue
+    if useFirstImprovement:
+        # First-improvement: check a limited number of random violated positions,
+        # sample domain values randomly, and accept the first improving move.
+        # Random sampling adds diversity that helps escape local optima.
+        shuffle(state.searchPositions)
+        var positionsChecked = 0
+        const MAX_POS_FIRST_IMPROVEMENT = 30
 
-        let domain = state.carray.reducedDomain[position]
-        let dLen = domain.len
+        for position in state.searchPositions:
+            when ProfileIteration:
+                state.positionsScanned += 1
 
-        if dLen <= MAX_CANDIDATES_PER_POS:
-            # Small domain: evaluate all values
-            for i in 0..<dLen:
-                if i == oldIdx:
-                    continue
-                inc movesEvaluated
-                let newCost = state.cost + state.penaltyMap[position][i]
-                if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
-                    if newCost < bestMoveCost:
-                        result = @[(position, domain[i])]
-                        bestMoveCost = newCost
-                    elif newCost == bestMoveCost:
-                        result.add((position, domain[i]))
-        else:
-            # Large domain: evaluate a random sample of candidates
-            for s in 0..<MAX_CANDIDATES_PER_POS:
+            let oldValue = state.assignment[position]
+            let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
+            if oldIdx < 0:
+                continue
+
+            if state.violationCount[position] == 0:
+                continue
+
+            inc positionsChecked
+
+            let domain = state.carray.reducedDomain[position]
+            let dLen = domain.len
+
+            # Sample random domain values, break on first improving move
+            for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
                 let i = rand(dLen - 1)
                 if i == oldIdx:
                     continue
@@ -585,8 +600,55 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
                         bestMoveCost = newCost
-                    elif newCost == bestMoveCost:
-                        result.add((position, domain[i]))
+                    if bestMoveCost < state.cost:
+                        break  # Found improving value, stop domain scan
+
+            # Stop after finding an improving move or checking enough positions
+            if bestMoveCost < state.cost:
+                break
+            if positionsChecked >= MAX_POS_FIRST_IMPROVEMENT:
+                break
+    else:
+        for position in state.searchPositions:
+            when ProfileIteration:
+                state.positionsScanned += 1
+
+            let oldValue = state.assignment[position]
+            let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
+            if oldIdx < 0:
+                continue
+
+            if state.violationCount[position] == 0:
+                continue
+
+            let domain = state.carray.reducedDomain[position]
+            let dLen = domain.len
+
+            if dLen <= MAX_CANDIDATES_PER_POS:
+                for i in 0..<dLen:
+                    if i == oldIdx:
+                        continue
+                    inc movesEvaluated
+                    let newCost = state.cost + state.penaltyMap[position][i]
+                    if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                        if newCost < bestMoveCost:
+                            result = @[(position, domain[i])]
+                            bestMoveCost = newCost
+                        elif newCost == bestMoveCost:
+                            result.add((position, domain[i]))
+            else:
+                for s in 0..<MAX_CANDIDATES_PER_POS:
+                    let i = rand(dLen - 1)
+                    if i == oldIdx:
+                        continue
+                    inc movesEvaluated
+                    let newCost = state.cost + state.penaltyMap[position][i]
+                    if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                        if newCost < bestMoveCost:
+                            result = @[(position, domain[i])]
+                            bestMoveCost = newCost
+                        elif newCost == bestMoveCost:
+                            result.add((position, domain[i]))
 
     state.movesExplored = movesEvaluated
 
@@ -616,6 +678,16 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
 
     echo &"[Tabu S{state.id}] iter={state.iteration:>7} cost={state.bestCost:>5} " &
          &"rate={overallRate:>7.0f}/s stag={stagnation:>5} elapsed={totalElapsed:>5.1f}s"
+
+    when ProfileIteration:
+        let iters = max(1, state.iteration).float
+        echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(totalElapsed,0.001)*100:.1f}%) " &
+             &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(totalElapsed,0.001)*100:.1f}%) " &
+             &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(totalElapsed,0.001)*100:.1f}%) " &
+             &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(totalElapsed,0.001)*100:.1f}%)"
+        echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
+             &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter) " &
+             &"posScanned={state.positionsScanned} ({state.positionsScanned.float/iters:.1f}/iter)"
 
     state.lastLogTime = now
     state.lastLogIteration = state.iteration
