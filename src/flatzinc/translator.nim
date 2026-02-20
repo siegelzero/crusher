@@ -505,8 +505,35 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     let coeffs = tr.resolveIntArray(con.args[0])
     let exprs = tr.resolveExprArray(con.args[1])
     let rhs = tr.resolveIntArg(con.args[2])
-    let sp = scalarProduct[int](coeffs, exprs)
-    tr.sys.addConstraint(sp <= rhs)
+
+    # Check for unit-coefficient pattern on binary variables → atMost/atLeast
+    var emittedUnitCoeff = false
+    let (allRefsLe, positionsLe) = isAllRefs(exprs)
+    if allRefsLe:
+      var allPosOne = true
+      var allNegOne = true
+      for c in coeffs:
+        if c != 1: allPosOne = false
+        if c != -1: allNegOne = false
+      if allPosOne or allNegOne:
+        var allBinary = true
+        for pos in positionsLe:
+          let dom = tr.sys.baseArray.domain[pos]
+          if dom.len != 2 or dom[0] != 0 or dom[1] != 1:
+            allBinary = false
+            break
+        if allBinary:
+          if allPosOne:
+            # sum([1,1,...,1], x) <= rhs  →  atMost(rhs, x, 1)
+            tr.sys.addConstraint(atMost[int](positionsLe, 1, rhs))
+          else:
+            # sum([-1,-1,...,-1], x) <= rhs  →  -sum(x) <= rhs  →  sum(x) >= -rhs
+            tr.sys.addConstraint(atLeast[int](positionsLe, 1, -rhs))
+          emittedUnitCoeff = true
+
+    if not emittedUnitCoeff:
+      let sp = scalarProduct[int](coeffs, exprs)
+      tr.sys.addConstraint(sp <= rhs)
 
   of "int_lin_ne":
     let coeffs = tr.resolveIntArray(con.args[0])
@@ -1761,7 +1788,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     var coeffs: seq[int]
     try:
       coeffs = tr.resolveIntArray(con.args[0])
-    except:
+    except CatchableError:
       continue
     if coeffs != @[1, -1]:
       continue
@@ -1769,7 +1796,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     var rhs: int
     try:
       rhs = tr.resolveIntArg(con.args[2])
-    except:
+    except CatchableError:
       continue
     if rhs != 0:
       continue

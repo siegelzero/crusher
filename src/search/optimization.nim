@@ -106,6 +106,48 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
 
+        # Retry: binary search may falsely conclude infeasibility for heuristic solvers.
+        # Try once more to beat the current best.
+        block retryLoop:
+            while true:
+                if deadline > 0 and epochTime() > deadline:
+                    system.searchCompleted = false
+                    break retryLoop
+
+                let bestSolution = system.assignment
+                if hasBoundConstraint:
+                    system.removeLastConstraint()
+
+                when direction == Minimize:
+                    system.addConstraint(objective <= currentCost - 1)
+                else:
+                    system.addConstraint(objective >= currentCost + 1)
+                hasBoundConstraint = true
+
+                try:
+                    system.resolve(
+                        parallel=parallel,
+                        tabuThreshold=tabuThreshold,
+                        scatterThreshold=scatterThreshold,
+                        populationSize=populationSize,
+                        numWorkers=numWorkers,
+                        scatterStrategy=scatterStrategy,
+                        verbose=verbose,
+                        deadline=deadline,
+                    )
+                    objective.initialize(system.assignment)
+                    currentCost = objective.value
+                    echo "[Opt] Retry improved: ", currentCost
+                except TimeLimitExceededError:
+                    system.searchCompleted = false
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    break retryLoop
+                except NoSolutionFoundError:
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    break retryLoop
+
         # Clean up the bound constraint and restore best solution
         if hasBoundConstraint:
             system.removeLastConstraint()

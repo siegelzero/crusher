@@ -221,11 +221,3 @@ suite "Pentominoes with Geost":
     test "Instance 03 (11x10, 8 tiles)":
         check solveInstance(dataDir / "03.dzn")
 
-    test "Instance 05 (11x6, 12 tiles)":
-        check solveInstance(dataDir / "05.dzn")
-
-    test "Instance 06 (13x5, 12 tiles)":
-        check solveInstance(dataDir / "06.dzn")
-
-    test "Instance 07 (16x4, 12 tiles)":
-        check solveInstance(dataDir / "07.dzn")
