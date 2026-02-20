@@ -79,6 +79,9 @@ func newAtMostConstraint*[T](expressions: seq[AlgebraicExpression[T]], targetVal
 
     result.expressionsAtPosition = buildExpressionPositionMap(expressions)
 
+proc getExpressions*[T](state: AtMostConstraint[T]): seq[AlgebraicExpression[T]] =
+    state.expressions
+
 ################################################################################
 # AtMostConstraint initialization and updates
 ################################################################################

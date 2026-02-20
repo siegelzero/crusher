@@ -1119,8 +1119,9 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         )
                     )
                 of ExpressionBased:
-                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.atLeastState.expressions.len)
-                    for i, expr in constraint.atLeastState.expressions:
+                    let srcExprs = constraint.atLeastState.getExpressions()
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](srcExprs.len)
+                    for i, expr in srcExprs:
                         copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,
@@ -1144,8 +1145,9 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                         )
                     )
                 of ExpressionBased:
-                    var copiedExpressions = newSeq[AlgebraicExpression[T]](constraint.atMostState.expressions.len)
-                    for i, expr in constraint.atMostState.expressions:
+                    let srcExprs = constraint.atMostState.getExpressions()
+                    var copiedExpressions = newSeq[AlgebraicExpression[T]](srcExprs.len)
+                    for i, expr in srcExprs:
                         copiedExpressions[i] = expr.deepCopy()
                     result = StatefulConstraint[T](
                         positions: constraint.positions,

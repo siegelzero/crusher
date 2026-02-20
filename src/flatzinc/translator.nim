@@ -1,6 +1,6 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets, sets, math]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm]
 
 import parser
 import dfaExtract
@@ -70,6 +70,8 @@ type
     channelVarNames*: HashSet[string]
     # Maps constraint index -> channel var name for element constraints with defines_var
     channelConstraints*: Table[int, string]
+    # Set of constraint indices that are redundant ordering constraints (transitively implied)
+    redundantOrderings*: PackedSet[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -503,35 +505,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     let coeffs = tr.resolveIntArray(con.args[0])
     let exprs = tr.resolveExprArray(con.args[1])
     let rhs = tr.resolveIntArg(con.args[2])
-
-    # Check for unit-coefficient pattern on binary variables → atMost/atLeast
-    var emittedUnitCoeff = false
-    let (allRefsLe, positionsLe) = isAllRefs(exprs)
-    if allRefsLe:
-      var allPosOne = true
-      var allNegOne = true
-      for c in coeffs:
-        if c != 1: allPosOne = false
-        if c != -1: allNegOne = false
-      if allPosOne or allNegOne:
-        var allBinary = true
-        for pos in positionsLe:
-          let dom = tr.sys.baseArray.domain[pos]
-          if dom.len != 2 or dom[0] != 0 or dom[1] != 1:
-            allBinary = false
-            break
-        if allBinary:
-          if allPosOne:
-            # sum([1,1,...,1], x) <= rhs  →  atMost(rhs, x, 1)
-            tr.sys.addConstraint(atMost[int](positionsLe, 1, rhs))
-          else:
-            # sum([-1,-1,...,-1], x) <= rhs  →  -sum(x) <= rhs  →  sum(x) >= -rhs
-            tr.sys.addConstraint(atLeast[int](positionsLe, 1, -rhs))
-          emittedUnitCoeff = true
-
-    if not emittedUnitCoeff:
-      let sp = scalarProduct[int](coeffs, exprs)
-      tr.sys.addConstraint(sp <= rhs)
+    let sp = scalarProduct[int](coeffs, exprs)
+    tr.sys.addConstraint(sp <= rhs)
 
   of "int_lin_ne":
     let coeffs = tr.resolveIntArray(con.args[0])
@@ -1742,6 +1717,165 @@ proc buildChannelBindings(tr: var FznTranslator) =
   if tr.sys.baseArray.channelBindings.len > 0:
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
+proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
+  ## Resolves a FznExpr to variable names (for ordering detection).
+  ## Only handles inline array literals since this runs before translateVariables.
+  case arg.kind
+  of FznArrayLit:
+    for e in arg.elems:
+      if e.kind == FznIdent:
+        result.add(e.ident)
+      else:
+        return @[]  # non-variable element, bail out
+  else:
+    return @[]
+
+proc detectRedundantOrderings(tr: var FznTranslator) =
+  ## Detects transitively redundant ordering constraints.
+  ## For int_lin_le([1,-1], [a, b], 0) meaning a <= b, identifies edges
+  ## implied by transitivity (e.g., a<=c is redundant if a<=b and b<=c).
+  type OrderEdge = object
+    constraintIdx: int
+    fromVar, toVar: string
+
+  var edges: seq[OrderEdge]
+  var nameToId: Table[string, int]
+  var idToName: seq[string]
+  var nextId = 0
+
+  proc getId(name: string): int =
+    if name in nameToId:
+      return nameToId[name]
+    result = nextId
+    nameToId[name] = nextId
+    idToName.add(name)
+    inc nextId
+
+  # Collect ordering edges: int_lin_le([1,-1], [a, b], 0) means a <= b
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    if con.name != "int_lin_le":
+      continue
+    # Resolve coefficients
+    var coeffs: seq[int]
+    try:
+      coeffs = tr.resolveIntArray(con.args[0])
+    except:
+      continue
+    if coeffs != @[1, -1]:
+      continue
+    # Resolve RHS
+    var rhs: int
+    try:
+      rhs = tr.resolveIntArg(con.args[2])
+    except:
+      continue
+    if rhs != 0:
+      continue
+    # Resolve variable names
+    let varNames = tr.resolveVarNames(con.args[1])
+    if varNames.len != 2:
+      continue
+    # Skip if either variable is defined (will be replaced by expression)
+    if varNames[0] in tr.definedVarNames or varNames[1] in tr.definedVarNames:
+      continue
+    let fromId = getId(varNames[0])
+    let toId = getId(varNames[1])
+    edges.add(OrderEdge(constraintIdx: ci, fromVar: varNames[0], toVar: varNames[1]))
+
+  if edges.len == 0:
+    return
+
+  let n = nextId
+
+  # Build adjacency using PackedSets
+  var succ = newSeq[PackedSet[int]](n)
+  for i in 0..<n:
+    succ[i] = initPackedSet[int]()
+  # Map edge to constraint index for lookup
+  var edgeConstraints: Table[(int, int), seq[int]]
+  for e in edges:
+    let fromId = nameToId[e.fromVar]
+    let toId = nameToId[e.toVar]
+    succ[fromId].incl(toId)
+    let key = (fromId, toId)
+    if key notin edgeConstraints:
+      edgeConstraints[key] = @[]
+    edgeConstraints[key].add(e.constraintIdx)
+
+  # Compute in-degree for topological sort (Kahn's algorithm)
+  var inDeg = newSeq[int](n)
+  for i in 0..<n:
+    for j in succ[i].items:
+      inDeg[j] += 1
+
+  var queue: seq[int]
+  for i in 0..<n:
+    if inDeg[i] == 0:
+      queue.add(i)
+
+  var topoOrder: seq[int]
+  var qi = 0
+  while qi < queue.len:
+    let u = queue[qi]
+    inc qi
+    topoOrder.add(u)
+    for v in succ[u].items:
+      inDeg[v] -= 1
+      if inDeg[v] == 0:
+        queue.add(v)
+
+  if topoOrder.len != n:
+    # Graph has cycles — can't do transitive reduction, skip
+    return
+
+  # Compute topological index for each node
+  var topoIdx = newSeq[int](n)
+  for i, node in topoOrder:
+    topoIdx[node] = i
+
+  # Compute reachable sets bottom-up (reverse topological order)
+  var reachable = newSeq[PackedSet[int]](n)
+  for i in 0..<n:
+    reachable[i] = initPackedSet[int]()
+
+  for i in countdown(topoOrder.len - 1, 0):
+    let u = topoOrder[i]
+    for v in succ[u].items:
+      reachable[u].incl(v)
+      reachable[u] = reachable[u] + reachable[v]
+
+  # Compute transitive reduction: for each node, keep only immediate successors
+  var reducedSucc = newSeq[PackedSet[int]](n)
+  for i in 0..<n:
+    reducedSucc[i] = succ[i]  # start with all direct successors
+
+  for u in topoOrder:
+    # Process successors in topological order (nearest first)
+    var sortedSucc: seq[int]
+    for v in succ[u].items:
+      sortedSucc.add(v)
+    sortedSucc.sort(proc(a, b: int): int = cmp(topoIdx[a], topoIdx[b]))
+
+    for v in sortedSucc:
+      if v in reducedSucc[u]:
+        # Keep v, but remove everything reachable from v
+        reducedSucc[u] = reducedSucc[u] - reachable[v]
+        reducedSucc[u].incl(v)  # re-include v itself
+
+  # Mark redundant edges
+  var redundantCount = 0
+  for e in edges:
+    let fromId = nameToId[e.fromVar]
+    let toId = nameToId[e.toVar]
+    if toId notin reducedSucc[fromId]:
+      tr.redundantOrderings.incl(e.constraintIdx)
+      inc redundantCount
+
+  if redundantCount > 0:
+    stderr.writeLine(&"[FZN] Ordering reduction: {edges.len} -> {edges.len - redundantCount} constraints ({redundantCount} redundant)")
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -1767,6 +1901,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCountPatterns()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
+  # Detect redundant ordering constraints (transitive reduction)
+  result.detectRedundantOrderings()
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
@@ -1787,6 +1923,8 @@ proc translate*(model: FznModel): FznTranslator =
 
   for ci, con in model.constraints:
     if ci in result.definingConstraints:
+      continue
+    if ci in result.redundantOrderings:
       continue
     if ci in result.countEqPatterns:
       # Emit count_eq for detected pattern
