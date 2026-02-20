@@ -92,8 +92,8 @@ proc solveEmployeeScheduling(): int =
     let zObjective = diffs.sum()
 
     # Use parallel search with population to reliably find optimal
-    sys.minimize(zObjective, verbose=true, parallel=true, populationSize=32,
-                 tabuThreshold=40000, multiplier=12)
+    sys.minimize(zObjective, verbose=true, parallel=true,
+                 tabuThreshold=10000, scatterThreshold=3)
 
     # Calculate actual Z from solution
     var pointsVals: array[NumPeople, int]

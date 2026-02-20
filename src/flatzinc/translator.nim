@@ -52,6 +52,8 @@ type
     model*: FznModel
     # Objective expression position (for minimize/maximize)
     objectivePos*: int
+    # Direct objective expression (for defined-variable objectives, avoids indirection)
+    objectiveDefExpr*: AlgebraicExpression[int]
     # Set of variable names that will be replaced by defining expressions
     definedVarNames*: HashSet[string]
     # Maps defined variable name -> defining AlgebraicExpression (for defines_var elimination)
@@ -1131,24 +1133,11 @@ proc translateSolve(tr: var FznTranslator) =
         if objName in tr.varPositions:
           tr.objectivePos = tr.varPositions[objName]
         elif objName in tr.definedVarExprs:
-          # Objective was eliminated as a defined variable — create a real position for it
-          let defExpr = tr.definedVarExprs[objName]
-          let pos = tr.sys.baseArray.len
-          let v = tr.sys.newConstrainedVariable()
-          # Find the variable declaration for domain bounds
-          for decl in tr.model.variables:
-            if not decl.isArray and decl.name == objName:
-              case decl.varType.kind
-              of FznIntRange:
-                v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
-              of FznIntSet:
-                v.setDomain(decl.varType.values)
-              else:
-                v.setDomain(toSeq(-100000..100000))
-              break
-          tr.varPositions[objName] = pos
-          tr.sys.addConstraint(tr.getExpr(pos) == defExpr)
-          tr.objectivePos = pos
+          # Objective was eliminated as a defined variable — use its defining expression directly.
+          # This avoids an intermediate position + binary-penalty linking constraint,
+          # which would hide objective gradient from compound moves (ejection chains).
+          tr.objectiveDefExpr = tr.definedVarExprs[objName]
+          tr.objectivePos = -1
         else:
           raise newException(KeyError, &"Unknown objective variable '{objName}'")
       else:

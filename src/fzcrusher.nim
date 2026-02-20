@@ -129,7 +129,8 @@ proc main() =
 
   of Minimize:
     try:
-      let objExpr = tr.getExpr(tr.objectivePos)
+      let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                    else: tr.objectiveDefExpr
       minimize(tr.sys, objExpr,
         parallel = parallel,
         tabuThreshold = tabuThreshold,
@@ -145,7 +146,8 @@ proc main() =
 
   of Maximize:
     try:
-      let objExpr = tr.getExpr(tr.objectivePos)
+      let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                    else: tr.objectiveDefExpr
       maximize(tr.sys, objExpr,
         parallel = parallel,
         tabuThreshold = tabuThreshold,

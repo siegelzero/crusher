@@ -97,7 +97,7 @@ suite "Knapsack Problem Tests":
         let linearObjective = linearize(profitSum)
 
         # Solve using maximization
-        sys.maximize(linearObjective, parallel=true, tabuThreshold=10000, verbose=false, multiplier=6)
+        sys.maximize(linearObjective, parallel=true, tabuThreshold=1000, verbose=false)
 
         # Verify the solution
         let solution = x.assignment

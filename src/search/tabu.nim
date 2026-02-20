@@ -1,7 +1,7 @@
 import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -58,6 +58,19 @@ type
         searchPositions*: seq[int]  # Non-channel positions (precomputed)
         totalDomainSize*: int  # Sum of domain sizes across search positions
 
+        # Swap move structures for binary variables
+        swapEnabled*: bool
+        binaryPositions*: seq[int]           # positions with domain {0,1}
+        binaryPosIndex*: Table[int, int]     # position -> index in binaryPositions
+        swapNeighbors*: seq[seq[int]]        # [binaryIdx] -> neighbor binary indices (by binaryIdx)
+        sharedConstraints*: Table[(int,int), seq[StatefulConstraint[T]]]  # (min_pos,max_pos) -> shared constraints
+
+        # Ejection chain / flow network structure
+        flowEnabled*: bool
+        flowNodePositions*: seq[seq[(int, int)]]  # [flowNodeIdx] -> [(position, coeff)]
+        posFlowNodes*: seq[seq[(int, int)]]       # [position] -> [(flowNodeIdx, coeff)]
+        edgeObjectiveWeight*: Table[int, int]     # position -> objective coefficient for guided chains
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -74,6 +87,11 @@ type
             affectedPosTotal*: int64
             affectedPosSkipped*: int64
 
+
+# Forward declarations
+proc initSwapStructures[T](state: TabuState[T])
+proc initFlowStructure[T](state: TabuState[T])
+proc assignValue*[T](state: TabuState[T], position: int, value: T)
 
 ################################################################################
 # Penalty Routines
@@ -455,6 +473,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.logProfileStats()
         state.resetProfileStats()
 
+    # Initialize swap move structures for binary variables
+    state.initSwapStructures()
+    state.initFlowStructure()
+
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
@@ -463,6 +485,328 @@ proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: in
 proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
     result.init(carray, verbose, id, initialAssignment = assignment)
+
+################################################################################
+# Swap Move Initialization
+################################################################################
+
+proc initSwapStructures[T](state: TabuState[T]) =
+    ## Detect binary (0/1) positions and build swap neighbor adjacency.
+    ## Two binary positions are swap neighbors if they share at least one constraint.
+    state.swapEnabled = false
+    state.binaryPositions = @[]
+    state.binaryPosIndex = initTable[int, int]()
+    state.swapNeighbors = @[]
+    state.sharedConstraints = initTable[(int,int), seq[StatefulConstraint[T]]]()
+
+    # Find all search positions with domain exactly {0, 1}
+    for pos in state.searchPositions:
+        let domain = state.carray.reducedDomain[pos]
+        if domain.len == 2 and
+           ((domain[0] == 0 and domain[1] == 1) or (domain[0] == 1 and domain[1] == 0)):
+            state.binaryPosIndex[pos] = state.binaryPositions.len
+            state.binaryPositions.add(pos)
+
+    if state.binaryPositions.len < 2:
+        return
+
+    # For each constraint, collect binary positions it covers
+    # Then build swap neighbor pairs from positions sharing a constraint
+    let binaryPosSet = block:
+        var s = initPackedSet[int]()
+        for p in state.binaryPositions: s.incl(p)
+        s
+
+    state.swapNeighbors = newSeq[seq[int]](state.binaryPositions.len)
+
+    # Use a set per binary index to avoid duplicate neighbors
+    var neighborSets = newSeq[PackedSet[int]](state.binaryPositions.len)
+    for i in 0..<state.binaryPositions.len:
+        neighborSets[i] = initPackedSet[int]()
+
+    for constraint in state.constraints:
+        # Collect binary positions in this constraint
+        var binaryInConstraint: seq[int] = @[]
+        for pos in constraint.positions.items:
+            if pos in binaryPosSet:
+                binaryInConstraint.add(pos)
+
+        if binaryInConstraint.len < 2:
+            continue
+
+        # Add all pairs as swap neighbors and record shared constraints
+        for i in 0..<binaryInConstraint.len:
+            for j in (i+1)..<binaryInConstraint.len:
+                let p1 = binaryInConstraint[i]
+                let p2 = binaryInConstraint[j]
+                let bi1 = state.binaryPosIndex[p1]
+                let bi2 = state.binaryPosIndex[p2]
+                neighborSets[bi1].incl(bi2)
+                neighborSets[bi2].incl(bi1)
+
+                let key = if p1 < p2: (p1, p2) else: (p2, p1)
+                if key notin state.sharedConstraints:
+                    state.sharedConstraints[key] = @[constraint]
+                else:
+                    state.sharedConstraints[key].add(constraint)
+
+    # Convert neighbor sets to seqs
+    var totalPairs = 0
+    for bi in 0..<state.binaryPositions.len:
+        state.swapNeighbors[bi] = @[]
+        for nbi in neighborSets[bi].items:
+            state.swapNeighbors[bi].add(nbi)
+        totalPairs += state.swapNeighbors[bi].len
+
+    totalPairs = totalPairs div 2  # each pair counted twice
+
+    if totalPairs > 0:
+        state.swapEnabled = true
+        if state.verbose and state.id == 0:
+            echo "[Init] Swap moves: " & $state.binaryPositions.len & " binary positions, " & $totalPairs & " swap pairs"
+
+
+################################################################################
+# Flow Structure Initialization
+################################################################################
+
+proc initFlowStructure[T](state: TabuState[T]) =
+    ## Detect flow network structure for ejection chain moves.
+    ## A "flow node" is an EqualTo RelationalConstraint with PositionBased SumExpr
+    ## where all coefficients are ±1 and all positions are binary.
+    state.flowEnabled = false
+    state.flowNodePositions = @[]
+    state.posFlowNodes = newSeq[seq[(int, int)]](state.carray.len)
+
+    if not state.swapEnabled:
+        return
+
+    let binaryPosSet = block:
+        var s = initPackedSet[int]()
+        for p in state.binaryPositions: s.incl(p)
+        s
+
+    for constraint in state.constraints:
+        if constraint.stateType != RelationalType:
+            continue
+        let rc = constraint.relationalState
+        if rc.relation != EqualTo:
+            continue
+        if rc.leftExpr.kind != SumExpr:
+            continue
+        let sumExpr = rc.leftExpr.sumExpr
+        if sumExpr.evalMethod != PositionBased:
+            continue
+        if rc.rightExpr.kind != ConstantExpr:
+            continue
+
+        # Check all coefficients are ±1 and all positions are binary
+        var allValid = true
+        var posCoeffs: seq[(int, int)] = @[]
+        for pos, coeff in sumExpr.coefficient.pairs:
+            if (coeff != 1 and coeff != -1) or pos notin binaryPosSet:
+                allValid = false
+                break
+            posCoeffs.add((pos, coeff))
+
+        if not allValid or posCoeffs.len < 2:
+            continue
+
+        # This is a flow node
+        let fnIdx = state.flowNodePositions.len
+        state.flowNodePositions.add(posCoeffs)
+        for (pos, coeff) in posCoeffs:
+            state.posFlowNodes[pos].add((fnIdx, coeff))
+
+    if state.flowNodePositions.len > 0:
+        var flowEdgeCount = 0
+        for pos in state.binaryPositions:
+            if state.posFlowNodes[pos].len >= 2:
+                flowEdgeCount += 1
+        if flowEdgeCount > 0:
+            state.flowEnabled = true
+            if state.verbose and state.id == 0:
+                echo "[Init] Flow structure: " & $state.flowNodePositions.len &
+                     " flow nodes, " & $flowEdgeCount & " flow edges"
+
+    # Extract objective coefficients for guided chain construction.
+    # Look for LessThanEq/GreaterThanEq RelationalConstraint with PositionBased SumExpr
+    # covering many binary positions — this is the objective bound constraint.
+    state.edgeObjectiveWeight = initTable[int, int]()
+    if state.flowEnabled:
+        var bestObjConstraint: RelationalConstraint[T] = nil
+        var bestObjCoverage = 0
+        for constraint in state.constraints:
+            if constraint.stateType != RelationalType:
+                continue
+            let rc = constraint.relationalState
+            if rc.relation notin {LessThanEq, GreaterThanEq}:
+                continue
+            if rc.leftExpr.kind != SumExpr:
+                continue
+            let sumExpr = rc.leftExpr.sumExpr
+            if sumExpr.evalMethod != PositionBased:
+                continue
+            # Count how many binary positions this constraint covers
+            var coverage = 0
+            for pos in sumExpr.coefficient.keys:
+                if pos in binaryPosSet:
+                    coverage += 1
+            if coverage > bestObjCoverage:
+                bestObjCoverage = coverage
+                bestObjConstraint = rc
+        if bestObjConstraint != nil and bestObjCoverage >= 4:
+            let sumExpr = bestObjConstraint.leftExpr.sumExpr
+            for pos, coeff in sumExpr.coefficient.pairs:
+                if pos in binaryPosSet:
+                    state.edgeObjectiveWeight[pos] = coeff
+            if state.verbose and state.id == 0:
+                echo "[Init] Objective weights: " & $state.edgeObjectiveWeight.len &
+                     " binary edges with objective coefficients"
+
+
+################################################################################
+# Negative-Cost Cycle Detection (Bellman-Ford on Residual Graph)
+################################################################################
+
+type
+    ResidualEdge = object
+        src, dst: int       # flow node indices
+        cost: int           # residual cost (negative = improving)
+        pos: int            # original position (edge variable)
+        newVal: int         # value to assign (0 or 1) when using this edge
+
+proc findNegativeCycle[T](state: TabuState[T]): seq[(int, T)] =
+    ## Find a negative-cost cycle in the residual flow graph using Bellman-Ford.
+    ## Each binary edge variable maps to a residual edge:
+    ##   - Currently ON (1): reverse edge with cost = -weight (removing saves weight)
+    ##   - Currently OFF (0): forward edge with cost = +weight (adding costs weight)
+    ## A negative cycle corresponds to a set of edge flips that improve the objective
+    ## while maintaining flow conservation.
+    if state.edgeObjectiveWeight.len == 0:
+        return @[]
+
+    let n = state.flowNodePositions.len  # number of flow nodes
+    if n == 0:
+        return @[]
+
+    # Build residual edges
+    var edges: seq[ResidualEdge] = @[]
+    for pos in state.binaryPositions:
+        let flowNodes = state.posFlowNodes[pos]
+        if flowNodes.len != 2:
+            continue
+        let w = state.edgeObjectiveWeight.getOrDefault(pos, 0)
+        let val = int(state.assignment[pos])
+
+        # Determine direction: +1 coeff = outgoing from that node, -1 = incoming
+        var srcNode, dstNode: int
+        if flowNodes[0][1] > 0:
+            srcNode = flowNodes[0][0]
+            dstNode = flowNodes[1][0]
+        else:
+            srcNode = flowNodes[1][0]
+            dstNode = flowNodes[0][0]
+
+        if val == 1:
+            # ON edge: residual goes backward (dst→src) with negative cost
+            edges.add(ResidualEdge(src: dstNode, dst: srcNode, cost: -w, pos: pos, newVal: 0))
+        else:
+            # OFF edge: residual goes forward (src→dst) with positive cost
+            edges.add(ResidualEdge(src: srcNode, dst: dstNode, cost: w, pos: pos, newVal: 1))
+
+    if edges.len == 0:
+        return @[]
+
+    # Bellman-Ford: detect negative-cost cycle
+    var dist = newSeq[int](n)
+    var pred = newSeq[int](n)    # predecessor edge index
+    for i in 0..<n:
+        dist[i] = 0
+        pred[i] = -1
+
+    # Relax edges n times; on the n-th pass, any relaxation indicates a negative cycle
+    var lastRelaxed = -1
+    for iter in 0..<n:
+        lastRelaxed = -1
+        for ei in 0..<edges.len:
+            let e = edges[ei]
+            if dist[e.src] + e.cost < dist[e.dst]:
+                dist[e.dst] = dist[e.src] + e.cost
+                pred[e.dst] = ei
+                lastRelaxed = e.dst
+
+    if lastRelaxed < 0:
+        return @[]  # No negative cycle
+
+    # Trace back to find the cycle
+    var node = lastRelaxed
+    # Walk back n steps to ensure we're in the cycle
+    for i in 0..<n:
+        node = edges[pred[node]].src
+
+    # Now trace the cycle from this node
+    let cycleStart = node
+    var cycle: seq[ResidualEdge] = @[]
+    var current = cycleStart
+    var visited = initPackedSet[int]()
+    while true:
+        let ei = pred[current]
+        if ei < 0:
+            return @[]  # broken chain
+        cycle.add(edges[ei])
+        visited.incl(current)
+        current = edges[ei].src
+        if current == cycleStart:
+            break
+        if current in visited:
+            return @[]  # unexpected loop structure
+
+    if cycle.len < 2:
+        return @[]
+
+    # Convert cycle to position flips
+    for e in cycle:
+        result.add((e.pos, T(e.newVal)))
+
+
+proc tryChainMoves*[T](state: TabuState[T]): bool =
+    ## Find and apply negative-cost cycles in the flow residual graph.
+    ## Returns true if an improving cycle was applied.
+    if not state.flowEnabled:
+        return false
+
+    let chain = state.findNegativeCycle()
+    if chain.len < 2:
+        return false
+
+    # Evaluate: apply chain, measure delta, restore
+    let costBefore = state.cost
+    var oldValues: seq[T] = @[]
+    for (pos, newVal) in chain:
+        oldValues.add(state.assignment[pos])
+        state.assignValue(pos, newVal)
+    let delta = state.cost - costBefore
+
+    if delta < 0:
+        if state.verbose:
+            echo &"[Chain S{state.id}] Applying negative cycle: len={chain.len} delta={delta} (cost {costBefore} -> {costBefore + delta})"
+        # Set tabu for all flipped positions
+        for i in 0..<chain.len:
+            let (pos, _) = chain[i]
+            let oldVal = oldValues[i]
+            let oldIdx = state.domainIndex[pos].getOrDefault(oldVal, -1)
+            if oldIdx >= 0:
+                state.tabu[pos][oldIdx] = state.iteration + 1 + state.iteration mod 10
+        return true
+    else:
+        # Restore — cycle wasn't actually improving (due to non-flow constraints)
+        if state.verbose:
+            echo &"[Chain S{state.id}] Negative cycle not improving: len={chain.len} delta={delta}"
+        for i in countdown(chain.len - 1, 0):
+            state.assignValue(chain[i][0], oldValues[i])
+        return false
+
 
 ################################################################################
 # Value Assignment
@@ -653,14 +997,212 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     state.movesExplored = movesEvaluated
 
 
+################################################################################
+# Swap Move Evaluation
+################################################################################
+
+proc swapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
+    ## Compute the cost delta for simultaneously assigning p1→newVal1 and p2→newVal2.
+    ## Uses penalty maps for independent contributions and corrects for shared constraints.
+    let newIdx1 = state.domainIndex[p1].getOrDefault(newVal1, -1)
+    let newIdx2 = state.domainIndex[p2].getOrDefault(newVal2, -1)
+    if newIdx1 < 0 or newIdx2 < 0:
+        return high(int)
+
+    # Start with sum of independent single-move deltas from penalty maps
+    result = state.penaltyMap[p1][newIdx1] + state.penaltyMap[p2][newIdx2]
+
+    # Correct for shared constraints where independent deltas double-count
+    let key = if p1 < p2: (p1, p2) else: (p2, p1)
+    if key in state.sharedConstraints:
+        for constraint in state.sharedConstraints[key]:
+            # Get independent deltas from per-constraint penalty cache
+            let localIdx1 = state.findLocalConstraintIdx(p1, constraint)
+            let localIdx2 = state.findLocalConstraintIdx(p2, constraint)
+            let indep1 = state.constraintPenalties[p1][localIdx1][newIdx1]
+            let indep2 = state.constraintPenalties[p2][localIdx2][newIdx2]
+
+            # Compute joint delta for both changes simultaneously
+            var jointDelta: int
+            if constraint.stateType == RelationalType:
+                let rc = constraint.relationalState
+                # Fast path for relational constraints with linear expressions
+                var leftOk = true
+                var rightOk = true
+                var leftCoeff1, leftCoeff2, rightCoeff1, rightCoeff2: T
+
+                case rc.leftExpr.kind
+                of SumExpr:
+                    let s = rc.leftExpr.sumExpr
+                    if s.evalMethod == PositionBased:
+                        leftCoeff1 = s.coefficient.getOrDefault(p1, T(0))
+                        leftCoeff2 = s.coefficient.getOrDefault(p2, T(0))
+                    else:
+                        leftOk = false
+                of ConstantExpr:
+                    leftCoeff1 = 0
+                    leftCoeff2 = 0
+                else:
+                    leftOk = false
+
+                case rc.rightExpr.kind
+                of SumExpr:
+                    let s = rc.rightExpr.sumExpr
+                    if s.evalMethod == PositionBased:
+                        rightCoeff1 = s.coefficient.getOrDefault(p1, T(0))
+                        rightCoeff2 = s.coefficient.getOrDefault(p2, T(0))
+                    else:
+                        rightOk = false
+                of ConstantExpr:
+                    rightCoeff1 = 0
+                    rightCoeff2 = 0
+                else:
+                    rightOk = false
+
+                if leftOk and rightOk:
+                    let oldVal1 = state.assignment[p1]
+                    let oldVal2 = state.assignment[p2]
+                    let newLeft = rc.leftValue + leftCoeff1 * (newVal1 - oldVal1) + leftCoeff2 * (newVal2 - oldVal2)
+                    let newRight = rc.rightValue + rightCoeff1 * (newVal1 - oldVal1) + rightCoeff2 * (newVal2 - oldVal2)
+                    jointDelta = rc.relation.penalty(newLeft, newRight) - rc.cost
+                else:
+                    # Fallback: simulate both changes
+                    let oldVal1 = state.assignment[p1]
+                    let oldVal2 = state.assignment[p2]
+                    let delta1 = constraint.relationalState.moveDelta(p1, oldVal1, newVal1)
+                    # Temporarily apply first change to get joint delta
+                    constraint.relationalState.updatePosition(p1, newVal1)
+                    let delta2 = constraint.relationalState.moveDelta(p2, oldVal2, newVal2)
+                    # Restore
+                    constraint.relationalState.updatePosition(p1, oldVal1)
+                    jointDelta = delta1 + delta2
+            else:
+                # Generic fallback: simulate and restore
+                let oldVal1 = state.assignment[p1]
+                let oldVal2 = state.assignment[p2]
+                let costBefore = constraint.penalty()
+                constraint.updatePosition(p1, newVal1)
+                constraint.updatePosition(p2, newVal2)
+                let costAfter = constraint.penalty()
+                # Restore original state
+                constraint.updatePosition(p2, oldVal2)
+                constraint.updatePosition(p1, oldVal1)
+                jointDelta = costAfter - costBefore
+
+            # Correction: replace independent sum with joint delta
+            result += jointDelta - indep1 - indep2
+
+
+proc bestSwapMoves[T](state: TabuState[T]): seq[(int, int, T, T)] =
+    ## Find the best swap move among binary variable pairs.
+    ## Returns list of equally-best (p1, p2, newVal1, newVal2) tuples.
+    ## Only active when flow structure is detected (swap moves are designed for
+    ## network flow problems; for non-flow binary variables like channeling
+    ## indicators, swapping without coordinating linked variables is counterproductive).
+    if not state.flowEnabled:
+        return @[]
+
+    const MAX_SWAP_EVALUATIONS = 2000
+
+    var
+        bestSwapCost = high(int)
+        swapsEvaluated = 0
+
+    # Iterate binary positions, prefer violated ones
+    for bi1 in 0..<state.binaryPositions.len:
+        let p1 = state.binaryPositions[bi1]
+        if state.violationCount[p1] == 0:
+            continue
+
+        let val1 = state.assignment[p1]
+        let newVal1 = 1 - val1  # flip: 0→1 or 1→0
+
+        for bi2 in state.swapNeighbors[bi1]:
+            let p2 = state.binaryPositions[bi2]
+            let val2 = state.assignment[p2]
+
+            # Only swap if they have different values (one 0→1, one 1→0)
+            if val1 == val2:
+                continue
+
+            # Avoid evaluating (p2,p1) when we already evaluated (p1,p2)
+            if p2 < p1:
+                continue
+
+            let newVal2 = 1 - val2
+
+            let delta = state.swapDelta(p1, p2, newVal1, newVal2)
+            let newCost = state.cost + delta
+            inc swapsEvaluated
+
+            # Tabu check: swap is tabu only if BOTH legs are tabu AND no aspiration
+            let newIdx1 = state.domainIndex[p1].getOrDefault(newVal1, -1)
+            let newIdx2 = state.domainIndex[p2].getOrDefault(newVal2, -1)
+            let tabu1 = newIdx1 >= 0 and state.tabu[p1][newIdx1] > state.iteration
+            let tabu2 = newIdx2 >= 0 and state.tabu[p2][newIdx2] > state.iteration
+            let isTabu = tabu1 and tabu2
+            let aspiration = newCost < state.bestCost
+
+            if isTabu and not aspiration:
+                continue
+
+            if newCost < bestSwapCost:
+                result = @[(p1, p2, newVal1, newVal2)]
+                bestSwapCost = newCost
+            elif newCost == bestSwapCost:
+                result.add((p1, p2, newVal1, newVal2))
+
+            if swapsEvaluated >= MAX_SWAP_EVALUATIONS:
+                return result
+
+            # Early exit on improvement
+            if bestSwapCost < state.cost:
+                return result
+
+    return result
+
+
+################################################################################
+# Move Application
+################################################################################
+
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         let tBM = epochTime()
     let moves = state.bestMoves()
+    let swapMoves = state.bestSwapMoves()
     when ProfileIteration:
         state.timeBestMoves += epochTime() - tBM
 
+    # Determine best single move cost
+    var singleCost = high(int)
     if moves.len > 0:
+        let (pos, val) = moves[0]
+        let idx = state.domainIndex[pos].getOrDefault(val, -1)
+        if idx >= 0:
+            singleCost = state.cost + state.penaltyMap[pos][idx]
+
+    # Determine best swap move cost
+    var swapCost = high(int)
+    if swapMoves.len > 0:
+        let (p1, p2, nv1, nv2) = swapMoves[0]
+        swapCost = state.cost + state.swapDelta(p1, p2, nv1, nv2)
+
+    if swapMoves.len > 0 and swapCost < singleCost:
+        # Apply swap move
+        let (p1, p2, newVal1, newVal2) = sample(swapMoves)
+        let oldVal1 = state.assignment[p1]
+        let oldVal2 = state.assignment[p2]
+        state.assignValue(p1, newVal1)
+        state.assignValue(p2, newVal2)
+        let tabuTenure = state.iteration + 1 + state.iteration mod 10
+        let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
+        if oldIdx1 >= 0:
+            state.tabu[p1][oldIdx1] = tabuTenure
+        let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
+        if oldIdx2 >= 0:
+            state.tabu[p2][oldIdx2] = tabuTenure
+    elif moves.len > 0:
         let (position, newValue) = sample(moves)
         let oldValue = state.assignment[position]
         state.assignValue(position, newValue)
@@ -733,6 +1275,22 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
                              &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter)"
                 return state
+
+        # Try ejection chain moves periodically during stagnation
+        if state.flowEnabled and
+           state.iteration - lastImprovement >= 50 and
+           (state.iteration - lastImprovement) mod 50 == 0:
+            if state.tryChainMoves():
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            let elapsed = epochTime() - state.startTime
+                            let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
+                            echo &"[Tabu S{state.id}] Solution found via chain at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
+                        return state
 
         state.iteration += 1
 

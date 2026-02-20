@@ -61,7 +61,7 @@ proc solveMovieScheduling(): tuple[z: int, selected: seq[int]] =
     # Objective: maximize sum of X (number of selected movies)
     let objective = X.sum()
 
-    sys.maximize(objective, verbose=false, parallel=true, populationSize=16, tabuThreshold=10000)
+    sys.maximize(objective, verbose=false, parallel=true, tabuThreshold=1000)
 
     let assignment = X.assignment()
     var selected: seq[int] = @[]
@@ -97,7 +97,7 @@ proc solveMovieSchedulingWithExplicitReification(): tuple[z: int, selected: seq[
             # else: movies don't overlap, no constraint needed (B = 1, implication trivially true)
 
     let objective = X.sum()
-    sys.maximize(objective, verbose=false, parallel=true, populationSize=16, tabuThreshold=10000)
+    sys.maximize(objective, verbose=false, parallel=true, tabuThreshold=1000)
 
     let assignment = X.assignment()
     var selected: seq[int] = @[]
