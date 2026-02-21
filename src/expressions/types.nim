@@ -12,7 +12,9 @@ type
     BinaryOperation* = enum
         Addition,
         Subtraction,
-        Multiplication
+        Multiplication,
+        Maximum,
+        Minimum
 
     NodeType* = enum
         LiteralNode,
@@ -70,9 +72,33 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                     return left - right
                 of Multiplication:
                     return left * right
+                of Maximum:
+                    return max(left, right)
+                of Minimum:
+                    return min(left, right)
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     expression.node.evaluate(assignment)
+
+################################################################################
+# Additive term extraction for partial evaluation optimization
+################################################################################
+
+proc extractAdditiveTerms*[T](node: ExpressionNode[T]): seq[ExpressionNode[T]] =
+    ## Flatten top-level additions into a list of terms.
+    ## E.g., ((A + B) + C) → [A, B, C]
+    if node.kind == BinaryOpNode and node.binaryOp == Addition:
+        result = extractAdditiveTerms(node.left) & extractAdditiveTerms(node.right)
+    else:
+        result = @[node]
+
+proc collectPositions*[T](node: ExpressionNode[T]): PackedSet[int] =
+    ## Collect all RefNode positions referenced by this subtree.
+    case node.kind:
+        of LiteralNode: discard
+        of RefNode: result.incl(node.position)
+        of UnaryOpNode: result = collectPositions(node.target)
+        of BinaryOpNode: result = collectPositions(node.left) + collectPositions(node.right)
 
 ################################################################################
 # Helper Functions for Expression Analysis

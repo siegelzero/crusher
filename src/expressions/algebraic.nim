@@ -27,6 +27,26 @@ func abs*[T](expression: AlgebraicExpression[T]): AlgebraicExpression[T] {.inlin
         linear=false
     )
 
+func binaryMax*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
+    newAlgebraicExpression[T](
+        positions=left.positions + right.positions,
+        node=ExpressionNode[T](
+            kind: BinaryOpNode, binaryOp: Maximum,
+            left: left.node, right: right.node
+        ),
+        linear=false
+    )
+
+func binaryMin*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
+    newAlgebraicExpression[T](
+        positions=left.positions + right.positions,
+        node=ExpressionNode[T](
+            kind: BinaryOpNode, binaryOp: Minimum,
+            left: left.node, right: right.node
+        ),
+        linear=false
+    )
+
 # Binary (Expression, Expression) Operations
 func `+`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
     # (X - k) + k → X  (when right is literal matching left's subtraction)

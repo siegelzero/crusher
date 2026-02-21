@@ -399,6 +399,8 @@ proc translateVariables(tr: var FznTranslator) =
       continue
     # Skip variables that will be replaced by defining expressions
     if decl.name in tr.definedVarNames:
+      if decl.hasAnnotation("output_var"):
+        tr.outputVars.add(decl.name)
       continue
     let pos = tr.sys.baseArray.len
     let v = tr.sys.newConstrainedVariable()
@@ -1145,6 +1147,16 @@ proc translateSolve(tr: var FznTranslator) =
   of Satisfy:
     tr.objectivePos = -2  # distinct from -1 (defined-var objective)
 
+proc resolveVarArrayElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
+  ## Resolves a variable array argument to its elements, from inline literal or named declaration.
+  if arg.kind == FznArrayLit:
+    return arg.elems
+  elif arg.kind == FznIdent:
+    for decl in tr.model.variables:
+      if decl.isArray and decl.name == arg.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+        return decl.value.elems
+  return @[]
+
 proc collectDefinedVars(tr: var FznTranslator) =
   ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
   ## These variables will be replaced by their defining expressions instead of being created as positions.
@@ -1163,13 +1175,28 @@ proc collectDefinedVars(tr: var FznTranslator) =
         # Check: the defined var must be one of the variables in the constraint,
         # and its coefficient must be 1 or -1 for exact integer arithmetic
         let coeffs = tr.resolveIntArray(con.args[0])
-        let vars = con.args[1]
-        if vars.kind == FznArrayLit:
-          for vi, v in vars.elems:
-            if v.kind == FznIdent and v.ident == definedName and (coeffs[vi] == 1 or coeffs[vi] == -1):
-              definedVarNames[definedName] = true
-              tr.definingConstraints.incl(ci)
-              break
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        for vi, v in varElems:
+          if v.kind == FznIdent and v.ident == definedName and (coeffs[vi] == 1 or coeffs[vi] == -1):
+            definedVarNames[definedName] = true
+            tr.definingConstraints.incl(ci)
+            break
+  # Third loop: identify int_abs, int_max, int_min with defines_var annotations
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name in ["int_abs", "int_max", "int_min"] and con.hasAnnotation("defines_var"):
+      let ann = con.getAnnotation("defines_var")
+      if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+        let definedName = ann.args[0].ident
+        # int_abs(a, b) :: defines_var(b) → b is args[1]
+        # int_max(a, b, c) :: defines_var(c) → c is args[2]
+        # int_min(a, b, c) :: defines_var(c) → c is args[2]
+        let expectedIdx = if name == "int_abs": 1 else: 2
+        if con.args[expectedIdx].kind == FznIdent and
+           con.args[expectedIdx].ident == definedName:
+          definedVarNames[definedName] = true
+          tr.definingConstraints.incl(ci)
+
   # Store the set of defined variable names for use in translateVariables
   for name in definedVarNames.keys:
     tr.definedVarNames.incl(name)
@@ -1197,8 +1224,9 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   ## Returns true if successful, false if a dependency is not yet available.
   let con = tr.model.constraints[ci]
   let name = stripSolverPrefix(con.name)
-  # Only process int_lin_eq with defines_var (skip consumed count_eq intermediates)
-  if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+  # Only process defining constraints with defines_var
+  if name notin ["int_lin_eq", "int_abs", "int_max", "int_min"] or
+     not con.hasAnnotation("defines_var"):
     return true  # not our concern, treat as done
   var ann: FznAnnotation
   for a in con.annotations:
@@ -1209,16 +1237,51 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   if definedName in tr.definedVarExprs:
     return true  # already built
 
+  # Handle int_abs, int_max, int_min
+  if name == "int_abs":
+    # int_abs(a, b) :: defines_var(b) → b = abs(a)
+    let a = con.args[0]
+    if a.kind == FznIdent and a.ident in tr.definedVarNames and
+       a.ident notin tr.definedVarExprs and a.ident notin tr.varPositions and
+       a.ident notin tr.paramValues:
+      return false  # dependency not yet built
+    tr.definedVarExprs[definedName] = abs(tr.resolveExprArg(a))
+    return true
+
+  if name == "int_max":
+    # int_max(a, b, c) :: defines_var(c) → c = max(a, b)
+    let a = con.args[0]
+    let b = con.args[1]
+    for operand in [a, b]:
+      if operand.kind == FznIdent and operand.ident in tr.definedVarNames and
+         operand.ident notin tr.definedVarExprs and operand.ident notin tr.varPositions and
+         operand.ident notin tr.paramValues:
+        return false
+    tr.definedVarExprs[definedName] = binaryMax(tr.resolveExprArg(a), tr.resolveExprArg(b))
+    return true
+
+  if name == "int_min":
+    # int_min(a, b, c) :: defines_var(c) → c = min(a, b)
+    let a = con.args[0]
+    let b = con.args[1]
+    for operand in [a, b]:
+      if operand.kind == FznIdent and operand.ident in tr.definedVarNames and
+         operand.ident notin tr.definedVarExprs and operand.ident notin tr.varPositions and
+         operand.ident notin tr.paramValues:
+        return false
+    tr.definedVarExprs[definedName] = binaryMin(tr.resolveExprArg(a), tr.resolveExprArg(b))
+    return true
+
   let coeffs = tr.resolveIntArray(con.args[0])
   let rhs = tr.resolveIntArg(con.args[2])
-  let vars = con.args[1]
+  let varElems = tr.resolveVarArrayElems(con.args[1])
 
-  if vars.kind != FznArrayLit:
+  if varElems.len == 0:
     return true  # can't process, skip
 
   # Find the defined variable's position in the constraint
   var definedIdx = -1
-  for vi, v in vars.elems:
+  for vi, v in varElems:
     if v.kind == FznIdent and v.ident == definedName:
       definedIdx = vi
       break
@@ -1227,7 +1290,7 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     return true  # can't process, skip
 
   # Check if all dependencies are available before building
-  for vi, v in vars.elems:
+  for vi, v in varElems:
     if vi == definedIdx:
       continue
     if v.kind == FznIdent and v.ident in tr.definedVarNames and
@@ -1246,7 +1309,7 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   let sign = if defCoeff == 1: -1 else: 1  # negate other coefficients
 
   var first = true
-  for vi, v in vars.elems:
+  for vi, v in varElems:
     if vi == definedIdx:
       continue
     let otherExpr = tr.resolveExprArg(v)

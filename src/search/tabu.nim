@@ -190,7 +190,7 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
         elif constraint.stateType == RelationalType:
             # Batch computation for relational constraints — tight arithmetic loop
             let penalties = constraint.relationalState.batchMovePenalty(
-                position, state.assignment[position], domain)
+                position, state.assignment[position], domain, state.assignment)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
                 state.penaltyMap[position][i] += penalties[i]
@@ -230,7 +230,7 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     elif constraint.stateType == RelationalType:
         # Batch computation for relational constraints
         let penalties = constraint.relationalState.batchMovePenalty(
-            position, state.assignment[position], domain)
+            position, state.assignment[position], domain, state.assignment)
         for i in 0..<domain.len:
             let newP = penalties[i]
             let oldP = state.constraintPenalties[position][localIdx][i]
