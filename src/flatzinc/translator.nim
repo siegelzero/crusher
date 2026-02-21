@@ -1068,9 +1068,78 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             # sum(indicators) == countExprs[i]
             tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
-  of "fzn_global_cardinality_closed", "fzn_global_cardinality_low_up_closed":
-    # TODO: closed cardinality variants
-    discard
+  of "fzn_global_cardinality_closed":
+    # global_cardinality_closed(x, cover, counts)
+    # Same as open variant but domains are restricted to cover set
+    let exprs = tr.resolveExprArray(con.args[0])
+    let cover = tr.resolveIntArray(con.args[1])
+    let coverSet = cover.toHashSet()
+    # Restrict domains to cover set
+    for e in exprs:
+      if e.node.kind == RefNode:
+        let pos = e.node.position
+        tr.sys.baseArray.domain[pos] = tr.sys.baseArray.domain[pos].filterIt(it in coverSet)
+    var constantCounts = true
+    var counts: seq[int]
+    try:
+      counts = tr.resolveIntArray(con.args[2])
+    except KeyError:
+      constantCounts = false
+    if constantCounts:
+      tr.sys.addConstraint(globalCardinality[int](exprs, cover, counts))
+    else:
+      let countExprs = tr.resolveExprArray(con.args[2])
+      var allSingleton = true
+      var inferredCounts = newSeq[int](countExprs.len)
+      for i, ce in countExprs:
+        if ce.node.kind == RefNode:
+          let dom = tr.sys.baseArray.domain[ce.node.position]
+          if dom.len == 1:
+            inferredCounts[i] = dom[0]
+          else:
+            allSingleton = false; break
+        else:
+          allSingleton = false; break
+      if allSingleton:
+        tr.sys.addConstraint(globalCardinality[int](exprs, cover, inferredCounts))
+      else:
+        # Fallback: decompose with indicators (same as open variant)
+        for i, v in cover:
+          var indicators: seq[AlgebraicExpression[int]]
+          for xExpr in exprs:
+            let pos = tr.sys.baseArray.len
+            let indicatorVar = tr.sys.newConstrainedVariable()
+            indicatorVar.setDomain(@[0, 1])
+            let indicatorExpr = tr.getExpr(pos)
+            indicators.add(indicatorExpr)
+            let litV = newAlgebraicExpression[int](
+              positions = initPackedSet[int](),
+              node = ExpressionNode[int](kind: LiteralNode, value: v),
+              linear = true
+            )
+            tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
+          tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
+
+  of "fzn_global_cardinality_low_up_closed":
+    # global_cardinality_low_up_closed(x, cover, lbound, ubound)
+    # Same as open variant but domains are restricted to cover set
+    let exprs = tr.resolveExprArray(con.args[0])
+    let cover = tr.resolveIntArray(con.args[1])
+    let lbound = tr.resolveIntArray(con.args[2])
+    let ubound = tr.resolveIntArray(con.args[3])
+    let n = exprs.len
+    let coverSet = cover.toHashSet()
+    # Restrict domains to cover set
+    for e in exprs:
+      if e.node.kind == RefNode:
+        let pos = e.node.position
+        tr.sys.baseArray.domain[pos] = tr.sys.baseArray.domain[pos].filterIt(it in coverSet)
+    # Same cardinality logic as open variant
+    for i in 0..<cover.len:
+      if lbound[i] > 0:
+        tr.sys.addConstraint(atLeast[int](exprs, cover[i], lbound[i]))
+      if ubound[i] < n:
+        tr.sys.addConstraint(atMost[int](exprs, cover[i], ubound[i]))
 
   of "fzn_global_cardinality_low_up":
     # global_cardinality_low_up(x, cover, lbound, ubound)
@@ -1206,7 +1275,7 @@ proc collectDefinedVars(tr: var FznTranslator) =
   # Third loop: identify int_abs, int_max, int_min with defines_var annotations
   for ci, con in tr.model.constraints:
     let name = stripSolverPrefix(con.name)
-    if name in ["int_abs", "int_max", "int_min"] and con.hasAnnotation("defines_var"):
+    if name in ["int_abs", "int_max", "int_min", "int_times"] and con.hasAnnotation("defines_var"):
       let ann = con.getAnnotation("defines_var")
       if ann.args.len > 0 and ann.args[0].kind == FznIdent:
         let definedName = ann.args[0].ident
@@ -1247,7 +1316,7 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   let con = tr.model.constraints[ci]
   let name = stripSolverPrefix(con.name)
   # Only process defining constraints with defines_var
-  if name notin ["int_lin_eq", "int_abs", "int_max", "int_min"] or
+  if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times"] or
      not con.hasAnnotation("defines_var"):
     return true  # not our concern, treat as done
   var ann: FznAnnotation
@@ -1292,6 +1361,18 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
          operand.ident notin tr.paramValues:
         return false
     tr.definedVarExprs[definedName] = binaryMin(tr.resolveExprArg(a), tr.resolveExprArg(b))
+    return true
+
+  if name == "int_times":
+    # int_times(a, b, c) :: defines_var(c) → c = a * b
+    let a = con.args[0]
+    let b = con.args[1]
+    for operand in [a, b]:
+      if operand.kind == FznIdent and operand.ident in tr.definedVarNames and
+         operand.ident notin tr.definedVarExprs and operand.ident notin tr.varPositions and
+         operand.ident notin tr.paramValues:
+        return false
+    tr.definedVarExprs[definedName] = tr.resolveExprArg(a) * tr.resolveExprArg(b)
     return true
 
   let coeffs = tr.resolveIntArray(con.args[0])
