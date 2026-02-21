@@ -33,6 +33,8 @@ type
         cachedGroupMin*: seq[Table[T, int]]
         # Count of tuples at the minimum distance for each group
         cachedGroupMinCount*: seq[Table[T, int]]
+        # Incremental zero-distance count for TableNotIn mode
+        zeroCount*: int
         # Positions affected by the last updatePosition call
         lastAffectedPositions*: PackedSet[int]
 
@@ -81,22 +83,6 @@ proc computeHammingDistances[T](state: TableConstraint[T]) =
                 dist += 1
         state.hammingDistances[t] = dist
 
-proc computePenalty[T](state: TableConstraint[T]): int =
-    case state.mode:
-        of TableIn:
-            # Minimum Hamming distance to any allowed tuple
-            result = state.sortedPositions.len + 1  # max possible + 1
-            for dist in state.hammingDistances:
-                if dist < result:
-                    result = dist
-        of TableNotIn:
-            # 1 if any forbidden tuple is an exact match, else 0
-            result = 0
-            for dist in state.hammingDistances:
-                if dist == 0:
-                    result = 1
-                    return
-
 ################################################################################
 # Initialization and updates
 ################################################################################
@@ -137,7 +123,11 @@ proc initialize*[T](state: TableConstraint[T], assignment: seq[T]) =
         state.buildGroupMinCache()
         state.cost = state.computeCostFromGroupMin()
     else:
-        state.cost = state.computePenalty()
+        state.zeroCount = 0
+        for dist in state.hammingDistances:
+            if dist == 0:
+                state.zeroCount += 1
+        state.cost = if state.zeroCount > 0: 1 else: 0
 
 
 proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
@@ -178,7 +168,7 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
         # Track already-dirty (col, val) to skip further processing
         var isDirty = initTable[(int, T), bool]()
         # Track which columns had their groupMin modified
-        var dirtyColumns: set[0..63]
+        var dirtyColumns: PackedSet[int]
 
         for change in changes:
             let (tupleIdx, oldDist, newDist) = change
@@ -235,15 +225,19 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
                 state.lastAffectedPositions.incl(state.sortedPositions[col])
 
     of TableNotIn:
-        # Only update affected tuples
+        # Only update affected tuples, maintaining zeroCount incrementally
         if oldValue in state.tuplesByColumnValue[idx]:
             for t in state.tuplesByColumnValue[idx][oldValue]:
+                if state.hammingDistances[t] == 0:
+                    state.zeroCount -= 1  # was zero, becoming 1
                 state.hammingDistances[t] += 1
         if newValue in state.tuplesByColumnValue[idx]:
             for t in state.tuplesByColumnValue[idx][newValue]:
                 state.hammingDistances[t] -= 1
+                if state.hammingDistances[t] == 0:
+                    state.zeroCount += 1  # became zero
         let oldCost = state.cost
-        state.cost = state.computePenalty()
+        state.cost = if state.zeroCount > 0: 1 else: 0
         if state.cost != oldCost:
             state.lastAffectedPositions = state.positions
         else:
@@ -260,32 +254,42 @@ proc moveDelta*[T](state: TableConstraint[T], position: int, oldValue, newValue:
 
     let idx = state.positionToIndex[position]
 
-    # Temporarily update Hamming distances
-    var tempDistances = newSeq[int](state.tuples.len)
-    for t in 0..<state.tuples.len:
-        tempDistances[t] = state.hammingDistances[t]
-        let tupleVal = state.tuples[t][idx]
-        if oldValue == tupleVal and newValue != tupleVal:
-            tempDistances[t] += 1
-        elif oldValue != tupleVal and newValue == tupleVal:
-            tempDistances[t] -= 1
-
-    # Compute new penalty from temp distances
-    var newCost: int
     case state.mode:
-        of TableIn:
-            newCost = state.sortedPositions.len + 1
-            for dist in tempDistances:
-                if dist < newCost:
-                    newCost = dist
-        of TableNotIn:
-            newCost = 0
-            for dist in tempDistances:
-                if dist == 0:
-                    newCost = 1
-                    break
+    of TableIn:
+        # Use cachedGroupMin for O(1) evaluation (same logic as batchMovePenalty)
+        let groupMin = state.cachedGroupMin[idx]
+        let maxPossible = state.sortedPositions.len + 1
 
-    return newCost - state.cost
+        # term1: tuples matching oldValue at idx now have dist+1
+        let term1 = if oldValue in groupMin: groupMin[oldValue] + 1 else: high(int)
+        # term2: tuples matching newValue at idx now have dist-1
+        let term2 = if newValue in groupMin: groupMin[newValue] - 1 else: maxPossible
+        # term3: min of groupMin[val] for val not in {oldValue, newValue}
+        var term3 = maxPossible
+        for val, minDist in groupMin.pairs:
+            if val != oldValue and val != newValue and minDist < term3:
+                term3 = minDist
+
+        let newCost = min(term1, min(term2, term3))
+        return newCost - state.cost
+
+    of TableNotIn:
+        # Use zeroCount + tuplesByColumnValue for O(affected) evaluation
+        # Zeros in oldValue group at idx: they had dist=0, will become dist=1
+        var zerosLost = 0
+        if oldValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][oldValue]:
+                if state.hammingDistances[t] == 0:
+                    zerosLost += 1
+        # Dist-1 tuples in newValue group at idx: they will become dist=0
+        var zerosGained = 0
+        if newValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][newValue]:
+                if state.hammingDistances[t] == 1:
+                    zerosGained += 1
+        let newZeroCount = state.zeroCount - zerosLost + zerosGained
+        let newCost = if newZeroCount > 0: 1 else: 0
+        return newCost - state.cost
 
 
 ################################################################################

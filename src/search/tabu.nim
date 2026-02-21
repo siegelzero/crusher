@@ -1275,6 +1275,22 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
     state.lastLogIteration = state.iteration
 
 
+proc logExitStats[T](state: TabuState[T], label: string) =
+    let elapsed = epochTime() - state.startTime
+    let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
+    echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+    when ProfileIteration:
+        let iters = max(1, state.iteration).float
+        echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
+             &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
+             &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
+             &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
+        echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
+             &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter) " &
+             &"posScanned={state.positionsScanned} ({state.positionsScanned.float/iters:.1f}/iter)"
+    state.logProfileStats()
+
+
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     var lastImprovement = 0
 
@@ -1290,33 +1306,13 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
             if state.verbose:
-                let elapsed = epochTime() - state.startTime
-                let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-                echo &"[Tabu S{state.id}] Stopped: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
-                when ProfileIteration:
-                    echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
-                         &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
-                         &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
-                         &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
-                    echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/max(1,state.iteration).float:.1f}/iter) " &
-                         &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/max(1,state.iteration).float:.1f}/iter)"
-                state.logProfileStats()
+                state.logExitStats("Stopped")
             return state
 
         # Check deadline every 1024 iterations
         if deadline > 0 and (state.iteration and 0x3FF) == 0 and epochTime() > deadline:
             if state.verbose:
-                let elapsed = epochTime() - state.startTime
-                let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-                echo &"[Tabu S{state.id}] Deadline: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
-                when ProfileIteration:
-                    echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
-                         &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
-                         &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
-                         &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
-                    echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/max(1,state.iteration).float:.1f}/iter) " &
-                         &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/max(1,state.iteration).float:.1f}/iter)"
-                state.logProfileStats()
+                state.logExitStats("Deadline")
             return state
 
         state.applyBestMove()
@@ -1327,17 +1323,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.bestAssignment = state.assignment
             if state.cost == 0:
                 if state.verbose:
-                    let elapsed = epochTime() - state.startTime
-                    let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-                    echo &"[Tabu S{state.id}] Solution found at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
-                    when ProfileIteration:
-                        let iters = max(1, state.iteration).float
-                        echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
-                             &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
-                             &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
-                             &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
-                        echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
-                             &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter)"
+                    state.logExitStats("Solution found")
                 return state
 
         # Try ejection chain moves periodically during stagnation
@@ -1351,9 +1337,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     state.bestAssignment = state.assignment
                     if state.cost == 0:
                         if state.verbose:
-                            let elapsed = epochTime() - state.startTime
-                            let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-                            echo &"[Tabu S{state.id}] Solution found via chain at iter={state.iteration} elapsed={elapsed:.2f}s rate={rate:.0f}/s"
+                            state.logExitStats("Solution found via chain")
                         return state
 
         state.iteration += 1
@@ -1363,18 +1347,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.logProgress(lastImprovement)
 
     if state.verbose:
-        let elapsed = epochTime() - state.startTime
-        let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-        echo &"[Tabu S{state.id}] Exhausted: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
-        when ProfileIteration:
-            let iters = max(1, state.iteration).float
-            echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/elapsed*100:.1f}%) " &
-                 &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/elapsed*100:.1f}%) " &
-                 &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/elapsed*100:.1f}%) " &
-                 &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/elapsed*100:.1f}%)"
-            echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/iters:.1f}/iter) " &
-                 &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/iters:.1f}/iter)"
-        state.logProfileStats()
+        state.logExitStats("Exhausted")
 
     return state
 

@@ -85,10 +85,13 @@ func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[i
 ################################################################################
 
 proc extractAdditiveTerms*[T](node: ExpressionNode[T]): seq[ExpressionNode[T]] =
-    ## Flatten top-level additions into a list of terms.
-    ## E.g., ((A + B) + C) → [A, B, C]
+    ## Flatten top-level additions and subtractions into a list of additive terms.
+    ## E.g., ((A + B) - C) → [A, B, Neg(C)]
     if node.kind == BinaryOpNode and node.binaryOp == Addition:
         result = extractAdditiveTerms(node.left) & extractAdditiveTerms(node.right)
+    elif node.kind == BinaryOpNode and node.binaryOp == Subtraction:
+        let negRight = ExpressionNode[T](kind: UnaryOpNode, unaryOp: Negation, target: node.right)
+        result = extractAdditiveTerms(node.left) & extractAdditiveTerms(negRight)
     else:
         result = @[node]
 
