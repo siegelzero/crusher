@@ -29,6 +29,10 @@ type
         hammingDistances*: seq[int]
         # Precomputed index: [colIdx][value] -> tuple indices with that value at that column
         tuplesByColumnValue*: seq[Table[T, seq[int]]]
+        # Cached groupMin: [col][val] -> min Hamming distance among tuples where tuples[t][col] == val
+        cachedGroupMin*: seq[Table[T, int]]
+        # Count of tuples at the minimum distance for each group
+        cachedGroupMinCount*: seq[Table[T, int]]
 
 ################################################################################
 # Constructor
@@ -95,11 +99,43 @@ proc computePenalty[T](state: TableConstraint[T]): int =
 # Initialization and updates
 ################################################################################
 
+proc buildGroupMinCache[T](state: TableConstraint[T]) =
+    ## Build cachedGroupMin and cachedGroupMinCount from current Hamming distances.
+    let nCols = state.sortedPositions.len
+    state.cachedGroupMin = newSeq[Table[T, int]](nCols)
+    state.cachedGroupMinCount = newSeq[Table[T, int]](nCols)
+    for col in 0..<nCols:
+        state.cachedGroupMin[col] = initTable[T, int]()
+        state.cachedGroupMinCount[col] = initTable[T, int]()
+        for val, tupleIndices in state.tuplesByColumnValue[col].pairs:
+            var minDist = high(int)
+            var count = 0
+            for t in tupleIndices:
+                let d = state.hammingDistances[t]
+                if d < minDist:
+                    minDist = d
+                    count = 1
+                elif d == minDist:
+                    count += 1
+            state.cachedGroupMin[col][val] = minDist
+            state.cachedGroupMinCount[col][val] = count
+
+proc computeCostFromGroupMin[T](state: TableConstraint[T]): int =
+    ## Compute cost as min over cachedGroupMin[0] values.
+    result = state.sortedPositions.len + 1
+    for val, minDist in state.cachedGroupMin[0].pairs:
+        if minDist < result:
+            result = minDist
+
 proc initialize*[T](state: TableConstraint[T], assignment: seq[T]) =
     for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
     state.computeHammingDistances()
-    state.cost = state.computePenalty()
+    if state.mode == TableIn:
+        state.buildGroupMinCache()
+        state.cost = state.computeCostFromGroupMin()
+    else:
+        state.cost = state.computePenalty()
 
 
 proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
@@ -109,15 +145,89 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
     let idx = state.positionToIndex[position]
     state.currentAssignment[position] = newValue
 
-    # Incrementally update Hamming distances
-    for t in 0..<state.tuples.len:
-        let tupleVal = state.tuples[t][idx]
-        if oldValue == tupleVal and newValue != tupleVal:
-            state.hammingDistances[t] += 1
-        elif oldValue != tupleVal and newValue == tupleVal:
-            state.hammingDistances[t] -= 1
+    case state.mode:
+    of TableIn:
+        let nCols = state.sortedPositions.len
 
-    state.cost = state.computePenalty()
+        # Phase 1: Update only affected Hamming distances via tuplesByColumnValue[idx]
+        # Collect (tupleIdx, oldDist, newDist) for Phase 2
+        type ChangeRecord = tuple[tupleIdx: int, oldDist: int, newDist: int]
+        var changes: seq[ChangeRecord] = @[]
+
+        # Group 1: tuples where tuples[t][idx] == oldValue → distance += 1
+        if oldValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][oldValue]:
+                let oldDist = state.hammingDistances[t]
+                let newDist = oldDist + 1
+                state.hammingDistances[t] = newDist
+                changes.add((t, oldDist, newDist))
+
+        # Group 2: tuples where tuples[t][idx] == newValue → distance -= 1
+        if newValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][newValue]:
+                let oldDist = state.hammingDistances[t]
+                let newDist = oldDist - 1
+                state.hammingDistances[t] = newDist
+                changes.add((t, oldDist, newDist))
+
+        # Phase 2: Incremental groupMin maintenance
+        # Track dirty (col, val) groups that need full rescan
+        var dirtyGroups: seq[(int, T)] = @[]
+        # Track already-dirty (col, val) to skip further processing
+        var isDirty = initTable[(int, T), bool]()
+
+        for change in changes:
+            let (tupleIdx, oldDist, newDist) = change
+            for col in 0..<nCols:
+                let val = state.tuples[tupleIdx][col]
+                let key = (col, val)
+                if key in isDirty:
+                    continue  # Already dirty, will be rescanned
+
+                if newDist > oldDist:
+                    # Distance increased
+                    if oldDist == state.cachedGroupMin[col][val]:
+                        let newCount = state.cachedGroupMinCount[col][val] - 1
+                        if newCount <= 0:
+                            dirtyGroups.add(key)
+                            isDirty[key] = true
+                        else:
+                            state.cachedGroupMinCount[col][val] = newCount
+                elif newDist < oldDist:
+                    # Distance decreased
+                    let curMin = state.cachedGroupMin[col][val]
+                    if newDist < curMin:
+                        state.cachedGroupMin[col][val] = newDist
+                        state.cachedGroupMinCount[col][val] = 1
+                    elif newDist == curMin:
+                        state.cachedGroupMinCount[col][val] += 1
+
+        # Rescan dirty groups
+        for (col, val) in dirtyGroups:
+            var minDist = high(int)
+            var count = 0
+            for t in state.tuplesByColumnValue[col][val]:
+                let d = state.hammingDistances[t]
+                if d < minDist:
+                    minDist = d
+                    count = 1
+                elif d == minDist:
+                    count += 1
+            state.cachedGroupMin[col][val] = minDist
+            state.cachedGroupMinCount[col][val] = count
+
+        # Phase 3: Recompute cost from cachedGroupMin[0]
+        state.cost = state.computeCostFromGroupMin()
+
+    of TableNotIn:
+        # Only update affected tuples
+        if oldValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][oldValue]:
+                state.hammingDistances[t] += 1
+        if newValue in state.tuplesByColumnValue[idx]:
+            for t in state.tuplesByColumnValue[idx][newValue]:
+                state.hammingDistances[t] -= 1
+        state.cost = state.computePenalty()
 
 
 proc moveDelta*[T](state: TableConstraint[T], position: int, oldValue, newValue: T): int =
@@ -172,14 +282,8 @@ proc batchMovePenalty*[T](state: TableConstraint[T], position: int,
 
     case state.mode:
     of TableIn:
-        # Compute groupMin[val] = min Hamming distance over tuples where tuples[t][idx] == val
-        var groupMin = initTable[T, int]()
-        for val, tupleIndices in state.tuplesByColumnValue[idx].pairs:
-            var minDist = high(int)
-            for t in tupleIndices:
-                if state.hammingDistances[t] < minDist:
-                    minDist = state.hammingDistances[t]
-            groupMin[val] = minDist
+        # Use cached groupMin instead of scanning all tuples
+        let groupMin = state.cachedGroupMin[idx]
 
         # Track top-3 smallest groupMin values (value, minDist) for fast "min excluding keys"
         # We need: min of groupMin[val] for val not in {currentValue, candidateValue}
