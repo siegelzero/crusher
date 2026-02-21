@@ -498,6 +498,28 @@ proc translateVariables(tr: var FznTranslator) =
           hi = indexRanges.elems[0].hi
       tr.outputArrays.add((name: decl.name, lo: lo, hi: hi))
 
+proc decomposeWithIndicators(tr: var FznTranslator,
+    exprs: seq[AlgebraicExpression[int]],
+    cover: seq[int],
+    countExprs: seq[AlgebraicExpression[int]]) =
+  ## Decompose a global cardinality constraint into indicator variables.
+  ## For each cover value v, creates: sum_j (x_j == v ? 1 : 0) == counts[i]
+  for i, v in cover:
+    var indicators: seq[AlgebraicExpression[int]]
+    for xExpr in exprs:
+      let pos = tr.sys.baseArray.len
+      let indicatorVar = tr.sys.newConstrainedVariable()
+      indicatorVar.setDomain(@[0, 1])
+      let indicatorExpr = tr.getExpr(pos)
+      indicators.add(indicatorExpr)
+      let litV = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: v),
+        linear = true
+      )
+      tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
+    tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
+
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
   ## Translates a single FlatZinc constraint to a Crusher constraint.
   let name = stripSolverPrefix(con.name)
@@ -1048,25 +1070,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
           tr.sys.addConstraint(globalCardinality[int](exprs, cover, targets))
           tr.sys.baseArray.domain[countPos] = @[target]
         else:
-          # Fallback: decompose into indicator variables + linear constraints
-          # For each cover value v, create: sum_j (x_j == v ? 1 : 0) == counts[i]
-          for i, v in cover:
-            var indicators: seq[AlgebraicExpression[int]]
-            for xExpr in exprs:
-              let pos = tr.sys.baseArray.len
-              let indicatorVar = tr.sys.newConstrainedVariable()
-              indicatorVar.setDomain(@[0, 1])
-              let indicatorExpr = tr.getExpr(pos)
-              indicators.add(indicatorExpr)
-              # (x_j == v) <-> (indicator == 1)
-              let litV = newAlgebraicExpression[int](
-                positions = initPackedSet[int](),
-                node = ExpressionNode[int](kind: LiteralNode, value: v),
-                linear = true
-              )
-              tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
-            # sum(indicators) == countExprs[i]
-            tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
+          tr.decomposeWithIndicators(exprs, cover, countExprs)
 
   of "fzn_global_cardinality_closed":
     # global_cardinality_closed(x, cover, counts)
@@ -1103,22 +1107,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       if allSingleton:
         tr.sys.addConstraint(globalCardinality[int](exprs, cover, inferredCounts))
       else:
-        # Fallback: decompose with indicators (same as open variant)
-        for i, v in cover:
-          var indicators: seq[AlgebraicExpression[int]]
-          for xExpr in exprs:
-            let pos = tr.sys.baseArray.len
-            let indicatorVar = tr.sys.newConstrainedVariable()
-            indicatorVar.setDomain(@[0, 1])
-            let indicatorExpr = tr.getExpr(pos)
-            indicators.add(indicatorExpr)
-            let litV = newAlgebraicExpression[int](
-              positions = initPackedSet[int](),
-              node = ExpressionNode[int](kind: LiteralNode, value: v),
-              linear = true
-            )
-            tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
-          tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
+        tr.decomposeWithIndicators(exprs, cover, countExprs)
 
   of "fzn_global_cardinality_low_up_closed":
     # global_cardinality_low_up_closed(x, cover, lbound, ubound)
