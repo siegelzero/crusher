@@ -1,7 +1,7 @@
 import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -201,6 +201,13 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
                 state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == TableConstraintType:
+            # Batch computation for table constraints — O(nTuples + domainSize)
+            let penalties = constraint.tableConstraintState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
         else:
             # Individual computation for other constraints
             for i in 0..<dLen:
@@ -239,6 +246,15 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     elif constraint.stateType == MatrixElementType:
         # Batch computation for matrixElement constraints
         let penalties = constraint.matrixElementState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == TableConstraintType:
+        # Batch computation for table constraints
+        let penalties = constraint.tableConstraintState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
