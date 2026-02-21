@@ -32,6 +32,7 @@ type
         assignment*: seq[T]
         lastIterations*: int
         searchCompleted*: bool
+        hasFeasibleSolution*: bool
 
 ################################################################################
 # ConstraintSystem creation

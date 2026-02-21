@@ -161,7 +161,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
     var itersSinceImprovement = 0
     var iter = 0
 
-    while itersSinceImprovement < scatterThreshold:
+    while itersSinceImprovement < scatterThreshold or (deadline > 0 and epochTime() < deadline):
         # Check deadline at start of each iteration
         if deadline > 0 and epochTime() > deadline:
             return false
@@ -383,7 +383,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
     var iter = 0
     var destroyCount = 1  # Start by destroying 1 constraint group
 
-    while itersSinceImprovement < scatterThreshold:
+    while itersSinceImprovement < scatterThreshold or (deadline > 0 and epochTime() < deadline):
         # Check deadline at start of each iteration
         if deadline > 0 and epochTime() > deadline:
             return false

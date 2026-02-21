@@ -16,6 +16,18 @@ import std/[os, strutils, strformat, times, posix]
 import crusher
 import flatzinc/[parser, translator, output]
 
+# Global state for SIGTERM handler — allows graceful output on MiniZinc kill
+var gSavedFd: cint = -1
+var gTranslator: ptr FznTranslator = nil
+var gHasSolution: ptr bool = nil
+
+proc sigTermHandler(sig: cint) {.noconv.} =
+  if gSavedFd >= 0 and gTranslator != nil and gHasSolution != nil and gHasSolution[]:
+    flushFile(stdout)
+    discard dup2(gSavedFd, stdout.getFileHandle())
+    gTranslator[].printSolution()
+  quit(0)
+
 proc redirectStdoutToStderr() =
   ## Redirect stdout to stderr so solver internal output doesn't corrupt FZN output.
   discard dup2(stderr.getFileHandle(), stdout.getFileHandle())
@@ -85,6 +97,7 @@ proc main() =
     quit(1)
 
   let startTime = cpuTime()
+  let wallStart = epochTime()
 
   # Parse the FlatZinc file
   if verbose:
@@ -100,12 +113,20 @@ proc main() =
   if verbose:
     stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
 
-  # Compute deadline from time limit
-  let deadline = if timeLimitMs > 0: epochTime() + timeLimitMs.float / 1000.0 else: 0.0
+  # MiniZinc's --time-limit includes its own compilation time (before we start).
+  # Anchor to process start and subtract a small margin. If our deadline doesn't
+  # fire in time, the SIGTERM handler will output the best solution.
+  let deadline = if timeLimitMs > 0: wallStart + timeLimitMs.float / 1000.0 - 2.0 else: 0.0
 
   # Redirect stdout to stderr during solving (solver echo goes to stderr)
   let savedFd = dup(stdout.getFileHandle())
   redirectStdoutToStderr()
+
+  # Install SIGTERM handler for graceful shutdown when MiniZinc kills us
+  gSavedFd = savedFd
+  gTranslator = addr tr
+  gHasSolution = addr tr.sys.hasFeasibleSolution
+  discard signal(SIGTERM, sigTermHandler)
 
   # Solve
   let solveStart = cpuTime()
@@ -122,6 +143,7 @@ proc main() =
         deadline = deadline
       )
       solved = true
+      tr.sys.hasFeasibleSolution = true
     except TimeLimitExceededError:
       timedOut = true
     except NoSolutionFoundError:
@@ -141,6 +163,7 @@ proc main() =
       )
       solved = true
     except TimeLimitExceededError:
+      # Initial resolve timed out before finding any feasible solution
       timedOut = true
     except NoSolutionFoundError:
       discard
@@ -159,6 +182,7 @@ proc main() =
       )
       solved = true
     except TimeLimitExceededError:
+      # Initial resolve timed out before finding any feasible solution
       timedOut = true
     except NoSolutionFoundError:
       discard
@@ -181,12 +205,11 @@ proc main() =
           tr.sys.assignment[gc.boardPositions[cellIdx]] = gc.tileValues[t]
 
     tr.printSolution()
-    if tr.sys.searchCompleted:
-      printComplete()
-  elif timedOut:
-    printUnknown()
+    # Crusher uses local search and cannot prove optimality or completeness,
+    # so never print "==========" (which claims proved optimal / all solutions).
   else:
-    printUnsatisfiable()
+    # Crusher cannot prove unsatisfiability either, so always report UNKNOWN.
+    printUnknown()
 
   if stats:
     let totalTime = cpuTime() - startTime

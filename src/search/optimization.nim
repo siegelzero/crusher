@@ -36,6 +36,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
+        system.hasFeasibleSolution = true
 
         echo "[Opt] Initial solution: ", currentCost
 
@@ -146,6 +147,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 except NoSolutionFoundError:
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
+                    if deadline > 0 and epochTime() < deadline:
+                        continue  # keep trying — scatter may have given up too early
                     break retryLoop
 
         # Clean up the bound constraint and restore best solution
