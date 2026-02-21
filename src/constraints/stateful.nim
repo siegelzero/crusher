@@ -1048,6 +1048,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.diffnState.getAffectedPositions()
         of RelationalType:
             return constraint.relationalState.getAffectedPositions()
+        of TableConstraintType:
+            return constraint.tableConstraintState.getAffectedPositions()
         else:
             return constraint.positions
 

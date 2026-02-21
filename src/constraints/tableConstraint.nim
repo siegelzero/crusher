@@ -33,6 +33,8 @@ type
         cachedGroupMin*: seq[Table[T, int]]
         # Count of tuples at the minimum distance for each group
         cachedGroupMinCount*: seq[Table[T, int]]
+        # Positions affected by the last updatePosition call
+        lastAffectedPositions*: PackedSet[int]
 
 ################################################################################
 # Constructor
@@ -175,6 +177,8 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
         var dirtyGroups: seq[(int, T)] = @[]
         # Track already-dirty (col, val) to skip further processing
         var isDirty = initTable[(int, T), bool]()
+        # Track which columns had their groupMin modified
+        var dirtyColumns: set[0..63]
 
         for change in changes:
             let (tupleIdx, oldDist, newDist) = change
@@ -191,6 +195,7 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
                         if newCount <= 0:
                             dirtyGroups.add(key)
                             isDirty[key] = true
+                            dirtyColumns.incl(col)
                         else:
                             state.cachedGroupMinCount[col][val] = newCount
                 elif newDist < oldDist:
@@ -199,6 +204,7 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
                     if newDist < curMin:
                         state.cachedGroupMin[col][val] = newDist
                         state.cachedGroupMinCount[col][val] = 1
+                        dirtyColumns.incl(col)
                     elif newDist == curMin:
                         state.cachedGroupMinCount[col][val] += 1
 
@@ -217,7 +223,16 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
             state.cachedGroupMinCount[col][val] = count
 
         # Phase 3: Recompute cost from cachedGroupMin[0]
+        let oldCost = state.cost
         state.cost = state.computeCostFromGroupMin()
+
+        # Track affected positions for getAffectedPositions
+        if state.cost != oldCost:
+            state.lastAffectedPositions = state.positions
+        else:
+            state.lastAffectedPositions = initPackedSet[int]()
+            for col in dirtyColumns:
+                state.lastAffectedPositions.incl(state.sortedPositions[col])
 
     of TableNotIn:
         # Only update affected tuples
@@ -227,7 +242,16 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
         if newValue in state.tuplesByColumnValue[idx]:
             for t in state.tuplesByColumnValue[idx][newValue]:
                 state.hammingDistances[t] -= 1
+        let oldCost = state.cost
         state.cost = state.computePenalty()
+        if state.cost != oldCost:
+            state.lastAffectedPositions = state.positions
+        else:
+            state.lastAffectedPositions = initPackedSet[int]()
+
+
+func getAffectedPositions*[T](state: TableConstraint[T]): PackedSet[int] =
+    state.lastAffectedPositions
 
 
 proc moveDelta*[T](state: TableConstraint[T], position: int, oldValue, newValue: T): int =
