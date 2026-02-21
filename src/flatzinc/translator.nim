@@ -68,12 +68,17 @@ type
     geostConversion*: GeostConversion
     # Matrix infos for matrix_element pattern detection
     matrixInfos*: Table[string, MatrixInfo]
+    # Domain bounds for defined variables (lo, hi) — used to add domain constraints on their expressions
+    definedVarBounds*: Table[string, (int, int)]
     # Channel variable names (element defines_var outputs that should be computed, not searched)
     channelVarNames*: HashSet[string]
     # Maps constraint index -> channel var name for element constraints with defines_var
     channelConstraints*: Table[int, string]
     # Set of constraint indices that are redundant ordering constraints (transitively implied)
     redundantOrderings*: PackedSet[int]
+    # Reification channel patterns: constraint index for int_eq_reif/bool2int with defines_var
+    reifChannelDefs*: seq[int]      # int_eq_reif constraint indices (ordered first)
+    bool2intChannelDefs*: seq[int]  # bool2int constraint indices (ordered after reif)
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -401,6 +406,9 @@ proc translateVariables(tr: var FznTranslator) =
     if decl.name in tr.definedVarNames:
       if decl.hasAnnotation("output_var"):
         tr.outputVars.add(decl.name)
+      # Record domain bounds for later constraint generation
+      if decl.varType.kind == FznIntRange:
+        tr.definedVarBounds[decl.name] = (decl.varType.lo, decl.varType.hi)
       continue
     let pos = tr.sys.baseArray.len
     let v = tr.sys.newConstrainedVariable()
@@ -1060,10 +1068,24 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             # sum(indicators) == countExprs[i]
             tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
-  of "fzn_global_cardinality_closed", "fzn_global_cardinality_low_up",
-     "fzn_global_cardinality_low_up_closed":
-    # TODO: bounded cardinality variants
+  of "fzn_global_cardinality_closed", "fzn_global_cardinality_low_up_closed":
+    # TODO: closed cardinality variants
     discard
+
+  of "fzn_global_cardinality_low_up":
+    # global_cardinality_low_up(x, cover, lbound, ubound)
+    # For each i: lbound[i] <= count(x, cover[i]) <= ubound[i]
+    # Skip trivial bounds; emit atLeast/atMost for non-trivial ones.
+    let exprs = tr.resolveExprArray(con.args[0])
+    let cover = tr.resolveIntArray(con.args[1])
+    let lbound = tr.resolveIntArray(con.args[2])
+    let ubound = tr.resolveIntArray(con.args[3])
+    let n = exprs.len
+    for i in 0..<cover.len:
+      if lbound[i] > 0:
+        tr.sys.addConstraint(atLeast[int](exprs, cover[i], lbound[i]))
+      if ubound[i] < n:
+        tr.sys.addConstraint(atMost[int](exprs, cover[i], ubound[i]))
 
   of "fzn_count_eq":
     # count_eq(x, y, c) means count(x, y) == c
@@ -1520,6 +1542,217 @@ proc detectCountPatterns(tr: var FznTranslator) =
 
     stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
 
+proc detectReifChannels(tr: var FznTranslator) =
+  ## Detects int_eq_reif(x, val, b) :: defines_var(b) and bool2int(b, i) :: defines_var(i)
+  ## patterns and marks the defined variables as channel variables.
+  ## Channel variables get positions but are not searched; their values are computed
+  ## from decision variables via element-style lookups.
+  ##
+  ## Handles two int_eq_reif variants:
+  ##   - Constant val: b = (x == val) ? 1 : 0 → element lookup on x's domain
+  ##   - Variable val: b = (x == y) ? 1 : 0 → 2D element lookup on (x,y) domains
+
+  # First pass: find int_eq_reif with defines_var, not already consumed
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_eq_reif" or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent:
+      continue
+
+    let bName = con.args[2].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName:
+      continue
+
+    # Don't channel if already handled by another optimization
+    if bName in tr.definedVarNames or bName in tr.channelVarNames:
+      continue
+
+    # Verify args[0] is a variable (not a constant) — we need a position for the index
+    let xArg = con.args[0]
+    if xArg.kind != FznIdent:
+      continue
+    # x must resolve to a position (not a defined variable with no position)
+    if xArg.ident in tr.definedVarNames:
+      continue
+
+    # For var-to-var case, verify args[1] is also a positioned variable
+    let valArg = con.args[1]
+    if valArg.kind == FznIdent and valArg.ident in tr.definedVarNames:
+      continue
+
+    tr.channelVarNames.incl(bName)
+    tr.definingConstraints.incl(ci)
+    tr.reifChannelDefs.add(ci)
+
+  # Second pass: find bool2int with defines_var, not already consumed
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool2int" or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 2 or con.args[1].kind != FznIdent:
+      continue
+
+    let iName = con.args[1].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != iName:
+      continue
+
+    if iName in tr.definedVarNames or iName in tr.channelVarNames:
+      continue
+
+    # b must be a variable with a position (either search or channel)
+    let bArg = con.args[0]
+    if bArg.kind != FznIdent:
+      continue
+    if bArg.ident in tr.definedVarNames:
+      continue
+
+    tr.channelVarNames.incl(iName)
+    tr.definingConstraints.incl(ci)
+    tr.bool2intChannelDefs.add(ci)
+
+  if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq_reif, {tr.bool2intChannelDefs.len} bool2int")
+
+
+proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
+  ## Look up a variable's domain from the FznModel declarations.
+  for decl in tr.model.variables:
+    if decl.isArray: continue
+    if decl.name == varName:
+      case decl.varType.kind
+      of FznIntRange:
+        return toSeq(decl.varType.lo..decl.varType.hi)
+      of FznIntSet:
+        return decl.varType.values
+      of FznBool:
+        return @[0, 1]
+      else:
+        return @[]
+  return @[]
+
+
+proc buildReifChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings for int_eq_reif and bool2int patterns detected
+  ## by detectReifChannels. Must be called after translateVariables.
+  ##
+  ## int_eq_reif(x, val, b): b = element(x - lo, [1 if v==val else 0 for v in domain])
+  ## int_eq_reif(x, y, b):   b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
+  ## bool2int(b, i):          i = element(b, [0, 1])
+
+  # Process int_eq_reif channels first (bool2int depends on these)
+  for ci in tr.reifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let bName = con.args[2].ident
+    if bName notin tr.varPositions:
+      continue
+
+    let bPos = tr.varPositions[bName]
+    let xArg = con.args[0]
+    let valArg = con.args[1]
+
+    var indexExpr: AlgebraicExpression[int]
+    var arrayElems: seq[ArrayElement[int]]
+
+    if valArg.kind == FznIntLit or (valArg.kind == FznIdent and valArg.ident in tr.paramValues):
+      # Constant val: b = element(x - lo, [1 if v==val else 0])
+      let val = if valArg.kind == FznIntLit: valArg.intVal
+                else: tr.paramValues[valArg.ident]
+      let xExpr = tr.resolveExprArg(xArg)
+      let domain = tr.lookupVarDomain(xArg.ident)
+      if domain.len == 0:
+        continue
+      let lo = domain[0]  # domain is sorted
+
+      indexExpr = xExpr - lo
+      for v in domain:
+        arrayElems.add(ArrayElement[int](isConstant: true,
+            constantValue: if v == val: 1 else: 0))
+
+    elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
+      # Variable val: b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
+      let xExpr = tr.resolveExprArg(xArg)
+      let yExpr = tr.resolveExprArg(valArg)
+      let domainX = tr.lookupVarDomain(xArg.ident)
+      let domainY = tr.lookupVarDomain(valArg.ident)
+      if domainX.len == 0 or domainY.len == 0:
+        continue
+      let loX = domainX[0]
+      let loY = domainY[0]
+      let sizeY = domainY.len
+
+      # index = (x - lo_x) * size_y + (y - lo_y)
+      indexExpr = (xExpr - loX) * sizeY + (yExpr - loY)
+
+      # Build 2D equality table (row-major: x varies in outer loop, y in inner)
+      for vx in domainX:
+        for vy in domainY:
+          arrayElems.add(ArrayElement[int](isConstant: true,
+              constantValue: if vx == vy: 1 else: 0))
+    else:
+      continue
+
+    let binding = ChannelBinding[int](
+      channelPosition: bPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(bPos)
+
+    # Map source positions to this binding (for channel propagation triggers)
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  # Process bool2int channels (after reif channels so b positions are set up)
+  for ci in tr.bool2intChannelDefs:
+    let con = tr.model.constraints[ci]
+    let iName = con.args[1].ident
+    let bArg = con.args[0]
+
+    if iName notin tr.varPositions:
+      continue
+    let iPos = tr.varPositions[iName]
+
+    let bExpr = tr.resolveExprArg(bArg)
+
+    # i = element(b, [0, 1])  — identity mapping for domain {0, 1}
+    let arrayElems = @[
+      ArrayElement[int](isConstant: true, constantValue: 0),
+      ArrayElement[int](isConstant: true, constantValue: 1)
+    ]
+
+    let binding = ChannelBinding[int](
+      channelPosition: iPos,
+      indexExpression: bExpr,  # b is 0-based (domain {0,1})
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(iPos)
+
+    for pos in bExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len
+  if totalReifChannels > 0:
+    stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
+                     &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
 proc detectDfaGeostPattern(tr: var FznTranslator) =
   ## Detects multiple fzn_regular constraints over the same variable array
   ## (tiling pattern) and converts them to a single geost constraint.
@@ -1968,6 +2201,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.arrayElementNames = initTable[string, seq[string]]()
   result.countEqPatterns = initTable[int, CountEqPattern]()
   result.matrixInfos = initTable[string, MatrixInfo]()
+  result.definedVarBounds = initTable[string, (int, int)]()
   result.channelVarNames = initHashSet[string]()
   result.channelConstraints = initTable[int, string]()
   result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
@@ -1978,6 +2212,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.collectDefinedVars()
   # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
   result.detectCountPatterns()
+  # Detect int_eq_reif/bool2int defines_var patterns → channel variables
+  result.detectReifChannels()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
   # Detect redundant ordering constraints (transitive reduction)
@@ -1985,6 +2221,15 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+  # Add domain constraints for defined variables with finite bounds
+  for varName, bounds in result.definedVarBounds:
+    if varName in result.definedVarExprs:
+      let expr = result.definedVarExprs[varName]
+      let (lo, hi) = bounds
+      if lo > low(int):
+        result.sys.addConstraint(expr >= lo)
+      if hi < high(int):
+        result.sys.addConstraint(expr <= hi)
   # Build matrix infos for matrix_element pattern detection
   result.buildMatrixInfos()
 
@@ -2028,5 +2273,7 @@ proc translate*(model: FznModel): FznTranslator =
 
   # Build channel bindings for element defines_var
   result.buildChannelBindings()
+  # Build channel bindings for int_eq_reif/bool2int reification channels
+  result.buildReifChannelBindings()
 
   result.translateSolve()
