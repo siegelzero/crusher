@@ -165,6 +165,70 @@ proc addRectPositions[T](constraint: DiffnConstraint[T], dest: var PackedSet[int
     for pos in constraint.dyExprs[rectIdx].positions.items:
         dest.incl(pos)
 
+proc batchMovePenalty*[T](constraint: DiffnConstraint[T], position: int,
+                          currentValue: T, domain: seq[T]): seq[int] =
+    ## Compute moveDelta for all domain values at once.
+    ## Pre-evaluates fixed rectangle coords to avoid redundant expression evaluation.
+    let dLen = domain.len
+    result = newSeq[int](dLen)
+
+    if position notin constraint.posToRects:
+        return
+
+    let affectedRects = constraint.posToRects[position]
+    let n = constraint.n
+
+    # Pre-evaluate all rectangle coordinates with current assignment
+    var rects = newSeq[(T, T, T, T)](n)
+    for i in 0 ..< n:
+        rects[i] = constraint.evalRect(i, constraint.currentAssignment)
+
+    # Build affected set for O(1) membership check
+    var affectedSet: PackedSet[int]
+    for r in affectedRects:
+        affectedSet.incl(r)
+
+    # Count current overlaps involving affected rects (computed once)
+    var oldOverlaps = 0
+    for i in affectedRects:
+        let (xi, yi, dxi, dyi) = rects[i]
+        for j in 0 ..< n:
+            if j == i: continue
+            if j in affectedSet and j < i: continue
+            let (xj, yj, dxj, dyj) = rects[j]
+            if rectsOverlap(xi, yi, dxi, dyi, xj, yj, dxj, dyj):
+                inc oldOverlaps
+
+    # For each candidate value, re-evaluate affected rects and count overlaps
+    for di in 0 ..< dLen:
+        let v = domain[di]
+        if v == currentValue:
+            continue  # result[di] already 0
+
+        # Set candidate value temporarily
+        constraint.currentAssignment[position] = v
+
+        # Re-evaluate only affected rects (non-affected use pre-cached coords)
+        for r in affectedRects:
+            rects[r] = constraint.evalRect(r, constraint.currentAssignment)
+
+        # Count new overlaps involving affected rects
+        var newOverlaps = 0
+        for i in affectedRects:
+            let (xi, yi, dxi, dyi) = rects[i]
+            for j in 0 ..< n:
+                if j == i: continue
+                if j in affectedSet and j < i: continue
+                let (xj, yj, dxj, dyj) = rects[j]
+                if rectsOverlap(xi, yi, dxi, dyi, xj, yj, dxj, dyj):
+                    inc newOverlaps
+
+        result[di] = newOverlaps - oldOverlaps
+
+    # Restore original value
+    constraint.currentAssignment[position] = currentValue
+
+
 proc updatePosition*[T](constraint: DiffnConstraint[T], position: int, newValue: T) =
     ## Update assignment and recompute cost
     constraint.lastAffectedPositions = initPackedSet[int]()

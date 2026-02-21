@@ -1,7 +1,7 @@
 import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -208,6 +208,13 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
                 state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == DiffnType:
+            # Batch computation for diffn — pre-caches fixed rect coords
+            let penalties = constraint.diffnState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
         else:
             # Individual computation for other constraints
             for i in 0..<dLen:
@@ -255,6 +262,15 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     elif constraint.stateType == TableConstraintType:
         # Batch computation for table constraints
         let penalties = constraint.tableConstraintState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == DiffnType:
+        # Batch computation for diffn — pre-caches fixed rect coords
+        let penalties = constraint.diffnState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
@@ -1273,10 +1289,34 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     while state.iteration - lastImprovement < threshold:
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
+            if state.verbose:
+                let elapsed = epochTime() - state.startTime
+                let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
+                echo &"[Tabu S{state.id}] Stopped: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+                when ProfileIteration:
+                    echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
+                         &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
+                         &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
+                         &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
+                    echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/max(1,state.iteration).float:.1f}/iter) " &
+                         &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/max(1,state.iteration).float:.1f}/iter)"
+                state.logProfileStats()
             return state
 
         # Check deadline every 1024 iterations
         if deadline > 0 and (state.iteration and 0x3FF) == 0 and epochTime() > deadline:
+            if state.verbose:
+                let elapsed = epochTime() - state.startTime
+                let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
+                echo &"[Tabu S{state.id}] Deadline: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+                when ProfileIteration:
+                    echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
+                         &"assignConstr={state.timeAssignConstraints:.3f}s ({state.timeAssignConstraints/max(elapsed,0.001)*100:.1f}%) " &
+                         &"updatePen={state.timeUpdatePenalties:.3f}s ({state.timeUpdatePenalties/max(elapsed,0.001)*100:.1f}%) " &
+                         &"neighborPen={state.timeNeighborPenalties:.3f}s ({state.timeNeighborPenalties/max(elapsed,0.001)*100:.1f}%)"
+                    echo &"[Profile S{state.id}] neighborUpdates={state.neighborUpdates} ({state.neighborUpdates.float/max(1,state.iteration).float:.1f}/iter) " &
+                         &"batchCalls={state.neighborBatchCalls} ({state.neighborBatchCalls.float/max(1,state.iteration).float:.1f}/iter)"
+                state.logProfileStats()
             return state
 
         state.applyBestMove()
