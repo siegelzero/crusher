@@ -61,6 +61,12 @@ type
         # Per-constraint search position cache (excludes channel positions)
         constraintSearchPos*: Table[pointer, PackedSet[int]]
 
+        # Channel-dependent constraint support
+        hasChannelDeps*: bool
+        channelDepConstraints*: seq[StatefulConstraint[T]]
+        channelDepPenalties*: seq[seq[int]]  # [position][domainIdx] -> channel-dep delta
+        channelDepSearchPositions*: seq[int]  # search positions with channel bindings
+
         # Swap move structures for binary variables
         swapEnabled*: bool
         binaryPositions*: seq[int]           # positions with domain {0,1}
@@ -95,6 +101,7 @@ type
 proc initSwapStructures[T](state: TabuState[T])
 proc initFlowStructure[T](state: TabuState[T])
 proc assignValue*[T](state: TabuState[T], position: int, value: T)
+proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int
 
 ################################################################################
 # Penalty Routines
@@ -138,6 +145,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.irdcsState.moveDelta(position, oldValue, newValue)
         of CircuitType:
             result = constraint.circuitState.moveDelta(position, oldValue, newValue)
+        of SubcircuitType:
+            result = constraint.subcircuitState.moveDelta(position, oldValue, newValue)
         of AllDifferentExcept0Type:
             result = constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
         of LexOrderType:
@@ -170,8 +179,11 @@ proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
     ## Compute the total cost change for assigning newValue at position by
     ## summing moveDelta across all constraints. O(constraints_at_pos) but
     ## doesn't require penalty maps to be up-to-date.
+    ## Includes indirect cost changes through channel propagation.
     for constraint in state.constraintsAtPosition[position]:
         result += state.movePenalty(constraint, position, newValue)
+    if state.hasChannelDeps:
+        result += state.computeChannelDepDelta(position, newValue)
 
 ################################################################################
 # Penalty Map Routines
@@ -232,6 +244,11 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 let p = state.movePenalty(constraint, position, value)
                 state.constraintPenalties[position][ci][i] = p
                 state.penaltyMap[position][i] += p
+
+    # Add channel-dep penalties (indirect cost through channel propagation)
+    if state.hasChannelDeps and state.channelDepPenalties[position].len > 0:
+        for i in 0..<dLen:
+            state.penaltyMap[position][i] += state.channelDepPenalties[position][i]
 
 
 proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx: int) =
@@ -376,6 +393,134 @@ proc resetProfileStats*[T](state: TabuState[T]) =
             state.profileByType[ctype].totalTime = 0.0
 
 ################################################################################
+# Channel-Dependent Constraint Penalty Routines
+################################################################################
+
+proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int =
+    ## Compute the total penalty delta from channel-dep constraints if we were
+    ## to assign candidateValue at pos. Simulates channel propagation via worklist,
+    ## then uses fast arithmetic for RelationalConstraint+SumExpr, falling back
+    ## to simulate-restore for other constraint types.
+    if pos notin state.carray.channelsAtPosition:
+        return 0
+
+    # Simulate channel propagation from pos with candidateValue
+    var changes: seq[(int, T, T)] = @[]  # (chanPos, oldVal, newVal)
+    var worklist = @[pos]
+    var visited: PackedSet[int]
+    visited.incl(pos)
+
+    let savedPos = state.assignment[pos]
+    state.assignment[pos] = candidateValue
+
+    while worklist.len > 0:
+        let p = worklist.pop()
+        if p notin state.carray.channelsAtPosition:
+            continue
+        for bi in state.carray.channelsAtPosition[p]:
+            let binding = state.carray.channelBindings[bi]
+            let idxVal = binding.indexExpression.evaluate(state.assignment)
+            if idxVal < 0 or idxVal >= binding.arrayElements.len:
+                continue
+            let elem = binding.arrayElements[idxVal]
+            let newChanVal = if elem.isConstant: elem.constantValue
+                             else: state.assignment[elem.variablePosition]
+            let chanPos = binding.channelPosition
+            if newChanVal != state.assignment[chanPos]:
+                changes.add((chanPos, state.assignment[chanPos], newChanVal))
+                state.assignment[chanPos] = newChanVal  # propagate for transitive deps
+                if chanPos notin visited:
+                    visited.incl(chanPos)
+                    worklist.add(chanPos)
+
+    # Restore all modified assignment values
+    state.assignment[pos] = savedPos
+    for (chanPos, oldVal, _) in changes:
+        state.assignment[chanPos] = oldVal
+
+    if changes.len == 0:
+        return 0
+
+    # Compute penalty delta for each channel-dep constraint
+    for c in state.channelDepConstraints:
+        # Check if this constraint is affected by any channel changes
+        var affected = false
+        for (chanPos, _, _) in changes:
+            if chanPos in c.positions:
+                affected = true
+                break
+        if not affected: continue
+
+        # Fast path: RelationalConstraint with SumExpr/ConstantExpr
+        if c.stateType == RelationalType:
+            let rc = c.relationalState
+            var newLeft = rc.leftValue
+            var newRight = rc.rightValue
+            var canFastPath = true
+
+            case rc.leftExpr.kind
+            of SumExpr:
+                if rc.leftExpr.sumExpr.evalMethod == PositionBased:
+                    for (chanPos, oldV, newV) in changes:
+                        let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
+                        if coeff != 0:
+                            newLeft += coeff * (newV - oldV)
+                else: canFastPath = false
+            of ConstantExpr: discard
+            else: canFastPath = false
+
+            if canFastPath:
+                case rc.rightExpr.kind
+                of SumExpr:
+                    if rc.rightExpr.sumExpr.evalMethod == PositionBased:
+                        for (chanPos, oldV, newV) in changes:
+                            let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
+                            if coeff != 0:
+                                newRight += coeff * (newV - oldV)
+                    else: canFastPath = false
+                of ConstantExpr: discard
+                else: canFastPath = false
+
+            if canFastPath:
+                result += rc.relation.penalty(newLeft, newRight) - rc.cost
+                continue
+
+        # Fallback: simulate-restore on the constraint
+        let oldPenalty = c.penalty()
+        for (chanPos, _, newV) in changes:
+            if chanPos in c.positions:
+                c.updatePosition(chanPos, newV)
+        let newPenalty = c.penalty()
+        # Restore in reverse order
+        for j in countdown(changes.len - 1, 0):
+            let (chanPos, oldV, _) = changes[j]
+            if chanPos in c.positions:
+                c.updatePosition(chanPos, oldV)
+        result += newPenalty - oldPenalty
+
+
+proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
+    ## Compute channelDepPenalties[pos] for all domain values.
+    let domain = state.carray.reducedDomain[pos]
+    for i in 0..<domain.len:
+        state.channelDepPenalties[pos][i] = state.computeChannelDepDelta(pos, domain[i])
+
+
+proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
+    ## Recompute channel-dep penalties at all relevant search positions and
+    ## adjust penaltyMap by the delta (new - old). Called after propagateChannels
+    ## when channel-dep constraint state has changed.
+    for pos in state.channelDepSearchPositions:
+        let domain = state.carray.reducedDomain[pos]
+        for i in 0..<domain.len:
+            let newDep = state.computeChannelDepDelta(pos, domain[i])
+            let oldDep = state.channelDepPenalties[pos][i]
+            if newDep != oldDep:
+                state.penaltyMap[pos][i] += newDep - oldDep
+                state.channelDepPenalties[pos][i] = newDep
+
+
+################################################################################
 # TabuState creation
 ################################################################################
 
@@ -493,6 +638,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 searchPos.incl(pos)
         state.constraintSearchPos[cast[pointer](c)] = searchPos
 
+    # Identify channel-dep constraints (those with no search positions)
+    state.hasChannelDeps = false
+    state.channelDepConstraints = @[]
+    state.channelDepSearchPositions = @[]
+    for c in state.constraints:
+        let cptr = cast[pointer](c)
+        let searchPos = state.constraintSearchPos.getOrDefault(cptr)
+        if searchPos.len == 0:
+            state.channelDepConstraints.add(c)
+    if state.channelDepConstraints.len > 0:
+        state.hasChannelDeps = true
+        # Find search positions that have channel bindings (can affect channel-dep constraints)
+        for pos in state.searchPositions:
+            if pos in carray.channelsAtPosition:
+                state.channelDepSearchPositions.add(pos)
+        if verbose and id == 0:
+            echo "[Init] Channel-dep constraints: " & $state.channelDepConstraints.len &
+                 " (reachable through " & $state.channelDepSearchPositions.len & " search positions)"
+
     # Build domain index: value -> local array index
     state.domainIndex = newSeq[Table[T, int]](carray.len)
     for pos in carray.allPositions():
@@ -504,6 +668,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.penaltyMap = newSeq[seq[int]](carray.len)
     state.constraintPenalties = newSeq[seq[seq[int]]](carray.len)
     state.tabu = newSeq[seq[int]](carray.len)
+    state.channelDepPenalties = newSeq[seq[int]](carray.len)
     for pos in carray.allPositions():
         if pos in carray.channelPositions:
             continue
@@ -513,6 +678,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.constraintPenalties[pos] = newSeq[seq[int]](state.constraintsAtPosition[pos].len)
         for ci in 0..<state.constraintsAtPosition[pos].len:
             state.constraintPenalties[pos][ci] = newSeq[int](dsize)
+        if state.hasChannelDeps:
+            state.channelDepPenalties[pos] = newSeq[int](dsize)
+
+    # Compute initial channel-dep penalties (before penalty map build)
+    if state.hasChannelDeps:
+        for pos in state.channelDepSearchPositions:
+            state.computeChannelDepPenaltiesAt(pos)
 
     if verbose and id == 0:
         let searchCount = state.searchPositions.len
@@ -996,6 +1168,11 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 
     # Propagate channel variables affected by this position change
     state.propagateChannels(position)
+
+    # Recompute channel-dep penalties at all affected search positions
+    # (channel-dep constraint state changed during propagation)
+    if state.hasChannelDeps:
+        state.recomputeAllChannelDepPenalties()
 
     when ProfileIteration:
         let t1 = epochTime()

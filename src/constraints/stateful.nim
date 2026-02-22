@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, lexOrder, tableConstraint, regular, countEq, diffn
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -266,6 +266,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "IRDCS Constraint"
         of CircuitType:
             return "Circuit Constraint"
+        of SubcircuitType:
+            return "Subcircuit Constraint"
         of AllDifferentExcept0Type:
             return "AllDifferentExcept0 Constraint"
         of LexOrderType:
@@ -317,6 +319,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.irdcsState.cost
         of CircuitType:
             return constraint.circuitState.cost
+        of SubcircuitType:
+            return constraint.subcircuitState.cost
         of AllDifferentExcept0Type:
             return constraint.allDifferentExcept0State.cost
         of LexOrderType:
@@ -907,6 +911,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.irdcsState.initialize(assignment)
         of CircuitType:
             constraint.circuitState.initialize(assignment)
+        of SubcircuitType:
+            constraint.subcircuitState.initialize(assignment)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.initialize(assignment)
         of LexOrderType:
@@ -955,6 +961,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.irdcsState.moveDelta(position, oldValue, newValue)
         of CircuitType:
             constraint.circuitState.moveDelta(position, oldValue, newValue)
+        of SubcircuitType:
+            constraint.subcircuitState.moveDelta(position, oldValue, newValue)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
         of LexOrderType:
@@ -1003,6 +1011,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.irdcsState.updatePosition(position, newValue)
         of CircuitType:
             constraint.circuitState.updatePosition(position, newValue)
+        of SubcircuitType:
+            constraint.subcircuitState.updatePosition(position, newValue)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.updatePosition(position, newValue)
         of LexOrderType:
@@ -1511,6 +1521,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: CircuitType,
                 circuitState: constraint.circuitState.deepCopy()
             )
+        of SubcircuitType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: SubcircuitType,
+                subcircuitState: constraint.subcircuitState.deepCopy()
+            )
         of AllDifferentExcept0Type:
             case constraint.allDifferentExcept0State.evalMethod:
                 of PositionBased:
@@ -1781,6 +1797,27 @@ func circuit*[T](positions: openArray[int]): StatefulConstraint[T] =
         positions: circuitConstraint.positions,
         stateType: CircuitType,
         circuitState: circuitConstraint
+    )
+
+################################################################################
+# Subcircuit wrapper functions
+################################################################################
+
+func subcircuit*[T](positions: openArray[int]): StatefulConstraint[T] =
+    ## Creates a Subcircuit constraint ensuring variables form at most one circuit.
+    ## Uses 1-based convention: value j at position i means "from node i, go to node j."
+    ## Self-loops (i -> i) indicate nodes NOT part of the subcircuit.
+    ##
+    ## **Note**: Does NOT enforce allDifferent. Add both constraints:
+    ##   sys.addConstraint(allDifferent(x))
+    ##   sys.addConstraint(subcircuit(x))
+    ##
+    ## **Violation Cost**: max(0, numNonTrivialCycles - 1) + numTailNodes
+    let subcircuitConstraint = newSubcircuitConstraint[T](positions)
+    return StatefulConstraint[T](
+        positions: subcircuitConstraint.positions,
+        stateType: SubcircuitType,
+        subcircuitState: subcircuitConstraint
     )
 
 ################################################################################

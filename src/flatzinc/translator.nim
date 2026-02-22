@@ -958,12 +958,38 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     if allRefs:
       tr.sys.addConstraint(circuit[int](positions))
     else:
-      # Circuit requires position-based - extract from expressions
+      # Circuit/subcircuit need ALL nodes including constants (fixed vars).
+      # Constants get a singleton-domain position so node indexing stays correct.
       var positions2: seq[int]
       for e in exprs:
         if e.node.kind == RefNode:
           positions2.add(e.node.position)
+        elif e.node.kind == LiteralNode:
+          let pos = tr.sys.baseArray.len
+          let v = tr.sys.newConstrainedVariable()
+          v.setDomain(@[int(e.node.value)])
+          positions2.add(pos)
       tr.sys.addConstraint(circuit[int](positions2))
+
+  of "fzn_subcircuit":
+    let exprs = tr.resolveExprArray(con.args[0])
+    let (allRefs, positions) = isAllRefs(exprs)
+    if allRefs:
+      tr.sys.addConstraint(subcircuit[int](positions))
+      tr.sys.addConstraint(allDifferent[int](positions))
+    else:
+      # Constants get a singleton-domain position so node indexing stays correct.
+      var positions2: seq[int]
+      for e in exprs:
+        if e.node.kind == RefNode:
+          positions2.add(e.node.position)
+        elif e.node.kind == LiteralNode:
+          let pos = tr.sys.baseArray.len
+          let v = tr.sys.newConstrainedVariable()
+          v.setDomain(@[int(e.node.value)])
+          positions2.add(pos)
+      tr.sys.addConstraint(subcircuit[int](positions2))
+      tr.sys.addConstraint(allDifferent[int](positions2))
 
   of "fzn_regular":
     # regular(x, Q, S, d, q0, F)
@@ -1627,7 +1653,7 @@ proc detectReifChannels(tr: var FznTranslator) =
     if ci in tr.definingConstraints:
       continue
     let name = stripSolverPrefix(con.name)
-    if name != "int_eq_reif" or not con.hasAnnotation("defines_var"):
+    if (name != "int_eq_reif" and name != "int_ne_reif") or not con.hasAnnotation("defines_var"):
       continue
     if con.args.len < 3 or con.args[2].kind != FznIdent:
       continue
@@ -1688,7 +1714,7 @@ proc detectReifChannels(tr: var FznTranslator) =
     tr.bool2intChannelDefs.add(ci)
 
   if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq_reif, {tr.bool2intChannelDefs.len} bool2int")
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -1713,6 +1739,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
   ## by detectReifChannels. Must be called after translateVariables.
   ##
   ## int_eq_reif(x, val, b): b = element(x - lo, [1 if v==val else 0 for v in domain])
+  ## int_ne_reif(x, val, b): b = element(x - lo, [0 if v==val else 1 for v in domain])
   ## int_eq_reif(x, y, b):   b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
   ## bool2int(b, i):          i = element(b, [0, 1])
 
@@ -1730,8 +1757,10 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
     var indexExpr: AlgebraicExpression[int]
     var arrayElems: seq[ArrayElement[int]]
 
+    let isEq = stripSolverPrefix(con.name) == "int_eq_reif"
+
     if valArg.kind == FznIntLit or (valArg.kind == FznIdent and valArg.ident in tr.paramValues):
-      # Constant val: b = element(x - lo, [1 if v==val else 0])
+      # Constant val: b = element(x - lo, [1 if v==val else 0]) (inverted for ne)
       let val = if valArg.kind == FznIntLit: valArg.intVal
                 else: tr.paramValues[valArg.ident]
       let xExpr = tr.resolveExprArg(xArg)
@@ -1743,7 +1772,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       indexExpr = xExpr - lo
       for v in domain:
         arrayElems.add(ArrayElement[int](isConstant: true,
-            constantValue: if v == val: 1 else: 0))
+            constantValue: if (v == val) == isEq: 1 else: 0))
 
     elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
       # Variable val: b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
@@ -1764,7 +1793,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       for vx in domainX:
         for vy in domainY:
           arrayElems.add(ArrayElement[int](isConstant: true,
-              constantValue: if vx == vy: 1 else: 0))
+              constantValue: if (vx == vy) == isEq: 1 else: 0))
     else:
       continue
 

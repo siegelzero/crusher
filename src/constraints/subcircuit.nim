@@ -1,16 +1,17 @@
-# Circuit Constraint Implementation
+# Subcircuit Constraint Implementation
 #
-# Ensures a list of n decision variables forms a single Hamiltonian circuit.
+# Ensures a list of n decision variables forms at most one circuit (subcircuit).
 # Uses 1-based convention: value j at position i means "from node i, go to node j."
+# Self-loops (i -> i) indicate a node is NOT part of the subcircuit.
 #
-# Penalty formula: max(0, numCycles - 1) + numTailNodes
-# - numCycles: distinct cycles found by traversing the functional graph
+# Penalty formula: max(0, numNonTrivialCycles - 1) + numTailNodes
+# - numNonTrivialCycles: cycles of length >= 2 (self-loops are NOT counted)
 # - numTailNodes: nodes not on any cycle (happens when assignment is not a permutation)
-# - Valid single circuit: 1 cycle, 0 tails -> penalty = 0
+# - Valid subcircuit: 0 or 1 non-trivial cycles, 0 tails -> penalty = 0
 #
 # This constraint does NOT implicitly enforce allDifferent. Users must add both:
 #   sys.addConstraint(allDifferent(x))
-#   sys.addConstraint(circuit(x))
+#   sys.addConstraint(subcircuit(x))
 
 import std/[tables, packedsets, algorithm]
 
@@ -22,7 +23,7 @@ type
     NodeColor = enum
         White, Gray, Black
 
-    CircuitConstraint*[T] = ref object
+    SubcircuitConstraint*[T] = ref object
         n*: int                              # number of nodes
         positions*: PackedSet[int]           # all variable positions
         sortedPositions*: seq[int]           # sorted positions array
@@ -34,7 +35,7 @@ type
         # Incremental tracking
         componentId: seq[int]        # which component each node belongs to
         cycleId: seq[int]            # which cycle each node is on (-1 if tail)
-        numCycles: int               # global cycle count
+        numCycles: int               # global non-trivial cycle count
         numTailNodes: int            # global tail node count
         nextComponentId: int         # monotonic counter for assigning component IDs
         nextCycleId: int             # monotonic counter for assigning cycle IDs
@@ -48,9 +49,10 @@ type
 # Cycle counting algorithm (three-color traversal) - used for full recomputation
 ################################################################################
 
-proc computePenalty*[T](constraint: CircuitConstraint[T]): int =
-    ## Counts cycles and tail nodes via three-color traversal.
+proc computePenalty*[T](constraint: SubcircuitConstraint[T]): int =
+    ## Counts non-trivial cycles and tail nodes via three-color traversal.
     ## Returns max(0, numCycles - 1) + numTailNodes.
+    ## Self-loops (cycles of length 1) are NOT counted as cycles.
     let n = constraint.n
     var color = newSeq[NodeColor](n)
     var numCycles = 0
@@ -78,13 +80,16 @@ proc computePenalty*[T](constraint: CircuitConstraint[T]): int =
 
         if current >= 0 and current < n and color[current] == Gray:
             # We hit a Gray node - found a cycle
-            numCycles += 1
             # Find where the cycle starts in the path
             var cycleStart = 0
             for i in 0..<path.len:
                 if path[i] == current:
                     cycleStart = i
                     break
+            let cycleLen = path.len - cycleStart
+            # Only count non-trivial cycles (length >= 2)
+            if cycleLen >= 2:
+                numCycles += 1
             # Nodes before cycle start are tail nodes
             numTailNodes += cycleStart
             # Mark cycle nodes as Black
@@ -105,10 +110,9 @@ proc computePenalty*[T](constraint: CircuitConstraint[T]): int =
 # Component/cycle metadata traversal
 ################################################################################
 
-proc computeMetadata[T](constraint: CircuitConstraint[T]) =
+proc computeMetadata[T](constraint: SubcircuitConstraint[T]) =
     ## Full O(n) traversal to populate componentId, cycleId, numCycles, numTailNodes.
-    ## Components are weakly connected components: tail nodes inherit the componentId
-    ## of the node they eventually reach.
+    ## Self-loops (cycles of length 1) are NOT counted as cycles.
     let n = constraint.n
     constraint.numCycles = 0
     constraint.numTailNodes = 0
@@ -138,14 +142,18 @@ proc computeMetadata[T](constraint: CircuitConstraint[T]) =
             # Found a cycle - assign a new component for this cycle + its tails
             let compId = constraint.nextComponentId
             constraint.nextComponentId += 1
-            constraint.numCycles += 1
-            let cId = constraint.nextCycleId
-            constraint.nextCycleId += 1
             var cycleStart = 0
             for i in 0..<path.len:
                 if path[i] == current:
                     cycleStart = i
                     break
+            let cycleLen = path.len - cycleStart
+            # Only count non-trivial cycles (length >= 2)
+            var cId = -1
+            if cycleLen >= 2:
+                constraint.numCycles += 1
+                cId = constraint.nextCycleId
+                constraint.nextCycleId += 1
             constraint.numTailNodes += cycleStart
             for i in cycleStart..<path.len:
                 color[path[i]] = Black
@@ -177,11 +185,12 @@ proc computeMetadata[T](constraint: CircuitConstraint[T]) =
 # Incremental helper: count cycles and tails among affected nodes
 ################################################################################
 
-proc countCyclesAndTails[T](constraint: CircuitConstraint[T],
+proc countCyclesAndTails[T](constraint: SubcircuitConstraint[T],
                             affectedNodes: openArray[int],
                             affectedCount: int): (int, int) =
     ## Mini-traverse only the affected nodes using scratchColor.
     ## Returns (newCycles, newTails) among just these nodes.
+    ## Self-loops (cycles of length 1) are NOT counted as cycles.
     let n = constraint.n
     var newCycles = 0
     var newTails = 0
@@ -216,12 +225,15 @@ proc countCyclesAndTails[T](constraint: CircuitConstraint[T],
 
         if current >= 0 and current < n and constraint.scratchColor[current] == Gray:
             # Found a cycle within affected set
-            newCycles += 1
             var cycleStart = 0
             for j in 0..<constraint.scratchPath.len:
                 if constraint.scratchPath[j] == current:
                     cycleStart = j
                     break
+            let cycleLen = constraint.scratchPath.len - cycleStart
+            # Only count non-trivial cycles (length >= 2)
+            if cycleLen >= 2:
+                newCycles += 1
             newTails += cycleStart
             for j in cycleStart..<constraint.scratchPath.len:
                 constraint.scratchColor[constraint.scratchPath[j]] = Black
@@ -239,7 +251,7 @@ proc countCyclesAndTails[T](constraint: CircuitConstraint[T],
 # Constructor
 ################################################################################
 
-proc newCircuitConstraint*[T](positions: openArray[int]): CircuitConstraint[T] =
+proc newSubcircuitConstraint*[T](positions: openArray[int]): SubcircuitConstraint[T] =
     new(result)
     result.n = positions.len
     result.sortedPositions = @positions  # Keep input order — node i = positions[i]
@@ -269,7 +281,7 @@ proc newCircuitConstraint*[T](positions: openArray[int]): CircuitConstraint[T] =
 # Initialize
 ################################################################################
 
-proc initialize*[T](constraint: CircuitConstraint[T], assignment: seq[T]) =
+proc initialize*[T](constraint: SubcircuitConstraint[T], assignment: seq[T]) =
     ## Build successor array from assignment and compute initial cost + metadata.
     for i, pos in constraint.sortedPositions:
         let value = assignment[pos]
@@ -287,7 +299,7 @@ proc initialize*[T](constraint: CircuitConstraint[T], assignment: seq[T]) =
 # moveDelta (incremental)
 ################################################################################
 
-proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, newValue: T): int =
+proc moveDelta*[T](constraint: SubcircuitConstraint[T], position: int, oldValue, newValue: T): int =
     ## Incremental moveDelta: only re-traverses affected components.
     if position notin constraint.positionToIndex:
         return 0
@@ -296,8 +308,6 @@ proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, ne
     let n = constraint.n
 
     # Identify affected components: comp1 (moved node) and comp2 (new successor).
-    # The OLD successor doesn't need a separate lookup because nodeIdx → oldSucc
-    # is an edge, so oldSucc is already in comp1 by definition.
     let comp1 = constraint.componentId[nodeIdx]
     let oldSucc = constraint.successorArray[nodeIdx]
     assert oldSucc < 0 or oldSucc >= n or constraint.componentId[oldSucc] == comp1
@@ -364,7 +374,7 @@ proc moveDelta*[T](constraint: CircuitConstraint[T], position: int, oldValue, ne
 # updatePosition (incremental)
 ################################################################################
 
-proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValue: T) =
+proc updatePosition*[T](constraint: SubcircuitConstraint[T], position: int, newValue: T) =
     ## Apply a move and incrementally update metadata.
     if position notin constraint.positionToIndex:
         return
@@ -374,8 +384,7 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
 
     constraint.currentAssignment[position] = newValue
 
-    # Identify affected components: comp1 (moved node) and comp2 (new successor).
-    # The OLD successor is already in comp1 (nodeIdx → oldSucc is an edge).
+    # Identify affected components
     let comp1 = constraint.componentId[nodeIdx]
     let oldSucc = constraint.successorArray[nodeIdx]
     assert oldSucc < 0 or oldSucc >= n or constraint.componentId[oldSucc] == comp1
@@ -418,7 +427,6 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
     constraint.successorArray[nodeIdx] = newSucc
 
     # Mini-traverse to get new cycle/tail counts and update metadata
-    # We do the traversal inline here so we can update componentId/cycleId
     var newCycles = 0
     var newTails = 0
 
@@ -455,14 +463,18 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
             # Found a cycle within affected set
             let compId = constraint.nextComponentId
             constraint.nextComponentId += 1
-            newCycles += 1
-            let cId = constraint.nextCycleId
-            constraint.nextCycleId += 1
             var cycleStart = 0
             for j in 0..<constraint.scratchPath.len:
                 if constraint.scratchPath[j] == current:
                     cycleStart = j
                     break
+            let cycleLen = constraint.scratchPath.len - cycleStart
+            # Only count non-trivial cycles (length >= 2)
+            var cId = -1
+            if cycleLen >= 2:
+                newCycles += 1
+                cId = constraint.nextCycleId
+                constraint.nextCycleId += 1
             newTails += cycleStart
             for j in cycleStart..<constraint.scratchPath.len:
                 let node = constraint.scratchPath[j]
@@ -477,13 +489,10 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
         else:
             # All path nodes are tails - inherit component from target
             let compId = if joinNode >= 0:
-                # Exited to non-affected node, inherit its component
                 constraint.componentId[joinNode]
             elif current >= 0 and current < n and constraint.scratchColor[current] == Black:
-                # Hit a Black (already processed) affected node, inherit its component
                 constraint.componentId[current]
             else:
-                # Out of bounds - new component
                 let c = constraint.nextComponentId
                 constraint.nextComponentId += 1
                 c
@@ -497,16 +506,18 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
     for i in 0..<affectedCount:
         constraint.scratchInAffected[affectedNodes[i]] = false
 
-    # Update global counts
-    constraint.numCycles = constraint.numCycles - oldAffectedCycles + newCycles
-    constraint.numTailNodes = constraint.numTailNodes - oldAffectedTails + newTails
+    # Full recompute of metadata — the incremental tracking has edge cases
+    # where numTailNodes can drift. O(n) is fast enough for typical subcircuit sizes.
+    constraint.nextComponentId = 0
+    constraint.nextCycleId = 0
+    constraint.computeMetadata()
     constraint.cost = max(0, constraint.numCycles - 1) + constraint.numTailNodes
 
 ################################################################################
 # Deep copy
 ################################################################################
 
-proc deepCopy*[T](constraint: CircuitConstraint[T]): CircuitConstraint[T] =
+proc deepCopy*[T](constraint: SubcircuitConstraint[T]): SubcircuitConstraint[T] =
     ## Creates a deep copy for parallel search.
     new(result)
     result.n = constraint.n

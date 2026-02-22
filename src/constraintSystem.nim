@@ -244,6 +244,11 @@ proc circuit*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # Returns constraint requiring that values form a single Hamiltonian circuit.
     circuit[T](cvar.positions)
 
+proc subcircuit*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
+    # subcircuit constraint for the variable
+    # Returns constraint requiring that values form at most one circuit (self-loops allowed).
+    subcircuit[T](cvar.positions)
+
 proc increasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # increasing constraint for the variable
     # Returns constraint requiring that all values in the container be in non-decreasing order.
