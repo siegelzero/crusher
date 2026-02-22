@@ -66,6 +66,19 @@ type
         channelDepConstraints*: seq[StatefulConstraint[T]]
         channelDepPenalties*: seq[seq[int]]  # [position][domainIdx] -> channel-dep delta
         channelDepSearchPositions*: seq[int]  # search positions with channel bindings
+        channelDepConstraintsForPos*: Table[int, seq[StatefulConstraint[T]]]  # pos -> relevant channel-dep constraints
+        # One-hot channel fast path: maps source position to array of change entries.
+        # For each domain value (array index = value - lo), stores which channel positions
+        # change and what their transitions are when the source enters/leaves that value.
+        # Each entry: (channelPos, valueWhenActive) — valueWhenActive=1 for eq_reif, 0 for ne_reif
+        oneHotChanges*: Table[int, seq[seq[tuple[chanPos: int, activeVal: int]]]]
+        oneHotLo*: Table[int, int]  # source pos -> lo offset from index expression
+        # Reusable buffers for computeChannelDepDelta (avoid per-call heap allocation)
+        cdChanges: seq[(int, T, T)]
+        cdWorklist: seq[int]
+        changedChannelsBuf: seq[int]  # buffer for propagateChannels output
+        # Reverse index: channel position → which search positions' channel-dep penalties are affected
+        channelDepPosForChannel: Table[int, seq[int]]
 
         # Swap move structures for binary variables
         swapEnabled*: bool
@@ -404,48 +417,104 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     if pos notin state.carray.channelsAtPosition:
         return 0
 
-    # Simulate channel propagation from pos with candidateValue
-    var changes: seq[(int, T, T)] = @[]  # (chanPos, oldVal, newVal)
-    var worklist = @[pos]
-    var visited: PackedSet[int]
-    visited.incl(pos)
-
+    state.cdChanges.setLen(0)
     let savedPos = state.assignment[pos]
     state.assignment[pos] = candidateValue
 
-    while worklist.len > 0:
-        let p = worklist.pop()
-        if p notin state.carray.channelsAtPosition:
-            continue
-        for bi in state.carray.channelsAtPosition[p]:
-            let binding = state.carray.channelBindings[bi]
-            let idxVal = binding.indexExpression.evaluate(state.assignment)
-            if idxVal < 0 or idxVal >= binding.arrayElements.len:
-                continue
-            let elem = binding.arrayElements[idxVal]
-            let newChanVal = if elem.isConstant: elem.constantValue
-                             else: state.assignment[elem.variablePosition]
-            let chanPos = binding.channelPosition
-            if newChanVal != state.assignment[chanPos]:
-                changes.add((chanPos, state.assignment[chanPos], newChanVal))
-                state.assignment[chanPos] = newChanVal  # propagate for transitive deps
-                if chanPos notin visited:
-                    visited.incl(chanPos)
-                    worklist.add(chanPos)
+    # Fast path for one-hot source positions: directly compute the few changes
+    # instead of evaluating all bindings through the worklist
+    if pos in state.oneHotChanges:
+        let changes = state.oneHotChanges[pos]
+        let lo = state.oneHotLo[pos]
+        let oldIdx = savedPos - lo
+        let newIdx = candidateValue - lo
+
+        if oldIdx == newIdx:
+            state.assignment[pos] = savedPos
+            return 0
+
+        # Source leaving oldIdx: channels at oldIdx transition away from their active value
+        if oldIdx >= 0 and oldIdx < changes.len:
+            for (chanPos, activeVal) in changes[oldIdx]:
+                # Was at activeVal (source matched), now goes to 1-activeVal (source no longer matches)
+                let toVal = T(1 - activeVal)
+                if state.assignment[chanPos] != toVal:
+                    state.cdChanges.add((chanPos, state.assignment[chanPos], toVal))
+                    state.assignment[chanPos] = toVal
+        # Source entering newIdx: channels at newIdx transition to their active value
+        if newIdx >= 0 and newIdx < changes.len:
+            for (chanPos, activeVal) in changes[newIdx]:
+                # Source now matches, so channel goes to activeVal
+                let toVal = T(activeVal)
+                if state.assignment[chanPos] != toVal:
+                    state.cdChanges.add((chanPos, state.assignment[chanPos], toVal))
+                    state.assignment[chanPos] = toVal
+
+        # Propagate downstream from the 2 changed channel positions
+        state.cdWorklist.setLen(0)
+        for (chanPos, _, _) in state.cdChanges:
+            state.cdWorklist.add(chanPos)
+        var visited: PackedSet[int]
+        visited.incl(pos)
+        for (chanPos, _, _) in state.cdChanges:
+            visited.incl(chanPos)
+
+        while state.cdWorklist.len > 0:
+            let p = state.cdWorklist.pop()
+            if p notin state.carray.channelsAtPosition: continue
+            for bi in state.carray.channelsAtPosition[p]:
+                let binding = state.carray.channelBindings[bi]
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
+                let elem = binding.arrayElements[idxVal]
+                let newChanVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition]
+                let chanPos = binding.channelPosition
+                if newChanVal != state.assignment[chanPos]:
+                    state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                    state.assignment[chanPos] = newChanVal
+                    if chanPos notin visited:
+                        visited.incl(chanPos)
+                        state.cdWorklist.add(chanPos)
+    else:
+        # General worklist propagation
+        state.cdWorklist.setLen(0)
+        state.cdWorklist.add(pos)
+        var visited: PackedSet[int]
+        visited.incl(pos)
+
+        while state.cdWorklist.len > 0:
+            let p = state.cdWorklist.pop()
+            if p notin state.carray.channelsAtPosition: continue
+            for bi in state.carray.channelsAtPosition[p]:
+                let binding = state.carray.channelBindings[bi]
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
+                let elem = binding.arrayElements[idxVal]
+                let newChanVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition]
+                let chanPos = binding.channelPosition
+                if newChanVal != state.assignment[chanPos]:
+                    state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                    state.assignment[chanPos] = newChanVal
+                    if chanPos notin visited:
+                        visited.incl(chanPos)
+                        state.cdWorklist.add(chanPos)
 
     # Restore all modified assignment values
     state.assignment[pos] = savedPos
-    for (chanPos, oldVal, _) in changes:
+    for (chanPos, oldVal, _) in state.cdChanges:
         state.assignment[chanPos] = oldVal
 
-    if changes.len == 0:
+    if state.cdChanges.len == 0:
         return 0
 
-    # Compute penalty delta for each channel-dep constraint
-    for c in state.channelDepConstraints:
-        # Check if this constraint is affected by any channel changes
+    # Compute penalty delta for relevant channel-dep constraints only
+    let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
+    for c in relevantConstraints:
+        # Check if this constraint is affected by actual channel changes
         var affected = false
-        for (chanPos, _, _) in changes:
+        for (chanPos, _, _) in state.cdChanges:
             if chanPos in c.positions:
                 affected = true
                 break
@@ -461,7 +530,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             case rc.leftExpr.kind
             of SumExpr:
                 if rc.leftExpr.sumExpr.evalMethod == PositionBased:
-                    for (chanPos, oldV, newV) in changes:
+                    for (chanPos, oldV, newV) in state.cdChanges:
                         let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
                         if coeff != 0:
                             newLeft += coeff * (newV - oldV)
@@ -473,7 +542,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 case rc.rightExpr.kind
                 of SumExpr:
                     if rc.rightExpr.sumExpr.evalMethod == PositionBased:
-                        for (chanPos, oldV, newV) in changes:
+                        for (chanPos, oldV, newV) in state.cdChanges:
                             let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
                             if coeff != 0:
                                 newRight += coeff * (newV - oldV)
@@ -487,13 +556,13 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
         # Fallback: simulate-restore on the constraint
         let oldPenalty = c.penalty()
-        for (chanPos, _, newV) in changes:
+        for (chanPos, _, newV) in state.cdChanges:
             if chanPos in c.positions:
                 c.updatePosition(chanPos, newV)
         let newPenalty = c.penalty()
         # Restore in reverse order
-        for j in countdown(changes.len - 1, 0):
-            let (chanPos, oldV, _) = changes[j]
+        for j in countdown(state.cdChanges.len - 1, 0):
+            let (chanPos, oldV, _) = state.cdChanges[j]
             if chanPos in c.positions:
                 c.updatePosition(chanPos, oldV)
         result += newPenalty - oldPenalty
@@ -511,6 +580,23 @@ proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
     ## adjust penaltyMap by the delta (new - old). Called after propagateChannels
     ## when channel-dep constraint state has changed.
     for pos in state.channelDepSearchPositions:
+        let domain = state.carray.reducedDomain[pos]
+        for i in 0..<domain.len:
+            let newDep = state.computeChannelDepDelta(pos, domain[i])
+            let oldDep = state.channelDepPenalties[pos][i]
+            if newDep != oldDep:
+                state.penaltyMap[pos][i] += newDep - oldDep
+                state.channelDepPenalties[pos][i] = newDep
+
+proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannels: seq[int]) =
+    ## Targeted recomputation: only update channel-dep penalties at search positions
+    ## affected by the given changed channel positions.
+    var affectedPositions: PackedSet[int]
+    for chanPos in changedChannels:
+        if chanPos in state.channelDepPosForChannel:
+            for pos in state.channelDepPosForChannel[chanPos]:
+                affectedPositions.incl(pos)
+    for pos in affectedPositions.items:
         let domain = state.carray.reducedDomain[pos]
         for i in 0..<domain.len:
             let newDep = state.computeChannelDepDelta(pos, domain[i])
@@ -653,9 +739,167 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for pos in state.searchPositions:
             if pos in carray.channelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
+
+        # Build inverse index: channel position -> channel-dep constraints at that position
+        var channelDepAtPos = initTable[int, seq[StatefulConstraint[T]]]()
+        for c in state.channelDepConstraints:
+            for p in c.positions.items:
+                if p in carray.channelPositions:
+                    if p notin channelDepAtPos:
+                        channelDepAtPos[p] = @[c]
+                    else:
+                        channelDepAtPos[p].add(c)
+
+        # Precompute per search-position: which channel-dep constraints can it affect?
+        # Simulate channel propagation topology (value-independent) from each position
+        state.channelDepConstraintsForPos = initTable[int, seq[StatefulConstraint[T]]]()
+        state.channelDepPosForChannel = initTable[int, seq[int]]()
+        for pos in state.channelDepSearchPositions:
+            var reachable: PackedSet[int]
+            var worklist = @[pos]
+            var visited: PackedSet[int]
+            visited.incl(pos)
+            while worklist.len > 0:
+                let p = worklist.pop()
+                if p notin carray.channelsAtPosition: continue
+                for bi in carray.channelsAtPosition[p]:
+                    let binding = carray.channelBindings[bi]
+                    let chanPos = binding.channelPosition
+                    reachable.incl(chanPos)
+                    if chanPos notin visited:
+                        visited.incl(chanPos)
+                        worklist.add(chanPos)
+            # Collect channel-dep constraints reachable from this position
+            var seen: PackedSet[int]  # dedup by constraint pointer
+            var relevant: seq[StatefulConstraint[T]] = @[]
+            for chanPos in reachable.items:
+                if chanPos in channelDepAtPos:
+                    for c in channelDepAtPos[chanPos]:
+                        let cid = cast[int](cast[pointer](c))
+                        if cid notin seen:
+                            seen.incl(cid)
+                            relevant.add(c)
+            state.channelDepConstraintsForPos[pos] = relevant
+            # Build reverse index: channel pos -> affected search positions
+            for chanPos in reachable.items:
+                if chanPos in channelDepAtPos:  # only channels with channel-dep constraints
+                    if chanPos notin state.channelDepPosForChannel:
+                        state.channelDepPosForChannel[chanPos] = @[]
+                    state.channelDepPosForChannel[chanPos].add(pos)
+
         if verbose and id == 0:
+            var totalRelevant = 0
+            var maxRelevant = 0
+            for pos in state.channelDepSearchPositions:
+                let n = state.channelDepConstraintsForPos[pos].len
+                totalRelevant += n
+                if n > maxRelevant: maxRelevant = n
             echo "[Init] Channel-dep constraints: " & $state.channelDepConstraints.len &
-                 " (reachable through " & $state.channelDepSearchPositions.len & " search positions)"
+                 " (reachable through " & $state.channelDepSearchPositions.len & " search positions" &
+                 ", avg=" & $(totalRelevant div max(1, state.channelDepSearchPositions.len)) &
+                 " max=" & $maxRelevant & " per pos)"
+
+    # Build one-hot value→channel mapping for fast channel-dep propagation.
+    # For positions where all channel bindings are one-hot (constant element arrays
+    # with exactly one 1 and rest 0), precompute an array mapping:
+    #   oneHotChanges[pos][arrayIdx] = [(chanPos, activeVal), ...]
+    # This avoids evaluating all bindings during channel-dep delta — only the 2 that change.
+    state.oneHotChanges = initTable[int, seq[seq[tuple[chanPos: int, activeVal: int]]]]()
+    state.oneHotLo = initTable[int, int]()
+    if state.hasChannelDeps:
+        for pos in state.channelDepSearchPositions:
+            if pos notin carray.channelsAtPosition: continue
+            let bindingIndices = carray.channelsAtPosition[pos]
+            if bindingIndices.len < 3: continue  # Only worth optimizing for large sets
+
+            # All bindings must share the same index expression (pos - lo) or just (pos)
+            # Extract lo from the first binding's indexExpression
+            let firstBinding = carray.channelBindings[bindingIndices[0]]
+            let node = firstBinding.indexExpression.node
+            var lo = 0
+            if node.kind == RefNode and node.position == pos:
+                lo = 0
+            elif node.kind == BinaryOpNode and node.binaryOp == Subtraction and
+               node.left.kind == RefNode and node.left.position == pos and
+               node.right.kind == LiteralNode:
+                lo = node.right.value
+            else:
+                continue  # Not a simple pos or pos - lo pattern
+
+            # Build: for each binding, check it's one-hot or inverted one-hot
+            # Normal one-hot: exactly one 1, rest 0 → key = position of the 1, activeVal=1
+            # Inverted one-hot: exactly one 0, rest 1 → key = position of the 0, activeVal=0
+            let arrayLen = firstBinding.arrayElements.len
+            var changesByIdx = newSeq[seq[tuple[chanPos: int, activeVal: int]]](arrayLen)
+
+            var isOneHot = true
+            for bi in bindingIndices:
+                let binding = carray.channelBindings[bi]
+                if binding.arrayElements.len != arrayLen:
+                    isOneHot = false
+                    break
+                var oneCount = 0
+                var zeroCount = 0
+                var firstOneIdx = -1
+                var firstZeroIdx = -1
+                var valid = true
+                for j, elem in binding.arrayElements:
+                    if not elem.isConstant:
+                        valid = false
+                        break
+                    if elem.constantValue == 1:
+                        oneCount += 1
+                        if firstOneIdx < 0: firstOneIdx = j
+                    elif elem.constantValue == 0:
+                        zeroCount += 1
+                        if firstZeroIdx < 0: firstZeroIdx = j
+                    else:
+                        valid = false
+                        break
+                if not valid:
+                    isOneHot = false
+                    break
+                if oneCount == 1 and zeroCount == arrayLen - 1:
+                    # Normal one-hot: when source == (key+lo), channel = 1
+                    changesByIdx[firstOneIdx].add((binding.channelPosition, 1))
+                elif zeroCount == 1 and oneCount == arrayLen - 1:
+                    # Inverted one-hot: when source == (key+lo), channel = 0
+                    changesByIdx[firstZeroIdx].add((binding.channelPosition, 0))
+                else:
+                    isOneHot = false
+                    break
+
+            if isOneHot:
+                state.oneHotChanges[pos] = changesByIdx
+                state.oneHotLo[pos] = lo
+
+        if verbose and id == 0:
+            var failNoChannels = 0
+            var failFewBindings = 0
+            var failIndexExpr = 0
+            var failArrayCheck = 0
+            for pos in state.channelDepSearchPositions:
+                if pos in state.oneHotChanges: continue
+                if pos notin carray.channelsAtPosition:
+                    failNoChannels += 1
+                    continue
+                let bi0 = carray.channelsAtPosition[pos]
+                if bi0.len < 3:
+                    failFewBindings += 1
+                    continue
+                let fb = carray.channelBindings[bi0[0]]
+                let n = fb.indexExpression.node
+                if not (n.kind == BinaryOpNode and n.binaryOp == Subtraction and
+                        n.left.kind == RefNode and n.left.position == pos and
+                        n.right.kind == LiteralNode) and
+                   not (n.kind == RefNode and n.position == pos):
+                    failIndexExpr += 1
+                    continue
+                failArrayCheck += 1
+
+            echo "[Init] One-hot fast path: " & $state.oneHotChanges.len & " source positions" &
+                 " (noCh=" & $failNoChannels & " fewBind=" & $failFewBindings &
+                 " badIdx=" & $failIndexExpr & " badArr=" & $failArrayCheck & ")"
 
     # Build domain index: value -> local array index
     state.domainIndex = newSeq[Table[T, int]](carray.len)
@@ -683,8 +927,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     # Compute initial channel-dep penalties (before penalty map build)
     if state.hasChannelDeps:
+        let cdStart = epochTime()
+        var cdBinaryCount = 0
+        var cdLargeCount = 0
+        var cdTotalEvals = 0
         for pos in state.channelDepSearchPositions:
+            let dlen = carray.reducedDomain[pos].len
+            cdTotalEvals += dlen
+            if dlen <= 2: cdBinaryCount += 1
+            else: cdLargeCount += 1
             state.computeChannelDepPenaltiesAt(pos)
+        if verbose and id == 0:
+            echo "[Init] Channel-dep penalties computed in " & $(epochTime() - cdStart) & "s" &
+                 " (binary=" & $cdBinaryCount & " large=" & $cdLargeCount & " totalEvals=" & $cdTotalEvals & ")"
 
     if verbose and id == 0:
         let searchCount = state.searchPositions.len
@@ -1057,10 +1312,12 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
 # Value Assignment
 ################################################################################
 
-proc propagateChannels[T](state: TabuState[T], position: int): bool =
+proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: var seq[int]): bool =
     ## Propagate channel variable values after a change at `position`.
     ## Uses a worklist to handle transitive channel dependencies.
     ## Returns true if any channel values actually changed.
+    ## Populates changedChannels with positions of channels whose values changed.
+    changedChannels.setLen(0)
     var worklist = @[position]
     var visited: PackedSet[int]
     visited.incl(position)
@@ -1082,6 +1339,7 @@ proc propagateChannels[T](state: TabuState[T], position: int): bool =
 
             if newVal != state.assignment[binding.channelPosition]:
                 result = true
+                changedChannels.add(binding.channelPosition)
                 state.assignment[binding.channelPosition] = newVal
                 for c in state.constraintsAtPosition[binding.channelPosition]:
                     let oldPenalty = c.penalty()
@@ -1169,11 +1427,11 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 state.violationCount[pos] += 1
 
     # Propagate channel variables affected by this position change
-    let channelsChanged = state.propagateChannels(position)
+    let channelsChanged = state.propagateChannels(position, state.changedChannelsBuf)
 
-    # Recompute channel-dep penalties only if channel propagation changed values
+    # Recompute channel-dep penalties only for affected search positions
     if state.hasChannelDeps and channelsChanged:
-        state.recomputeAllChannelDepPenalties()
+        state.recomputeAffectedChannelDepPenalties(state.changedChannelsBuf)
 
     when ProfileIteration:
         let t1 = epochTime()

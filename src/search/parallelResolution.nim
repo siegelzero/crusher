@@ -36,6 +36,21 @@ proc getOptimalWorkerCount*(): int =
     # Use CPU count, but cap at reasonable maximum
     min(countProcessors(), 8)
 
+# Parallel state initialization
+type
+    StateInitData[T] = object
+        carray: ConstrainedArray[T]
+        result: ptr TabuState[T]
+        id: int
+        verbose: bool
+
+proc initStateWorker[T](data: StateInitData[T]) {.thread.} =
+    {.cast(gcsafe).}:
+        try:
+            data.result[] = newTabuState[T](data.carray, verbose = data.verbose, id = data.id)
+        except CatchableError:
+            discard
+
 proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
     try:
         randomize()
@@ -77,8 +92,9 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
             if result.found:
                 break
 
-    except CatchableError:
-        discard  # Worker error handled gracefully
+    except CatchableError as e:
+        echo "[Worker " & $data.workerId & "] Error: " & e.msg
+        echo "[Worker " & $data.workerId & "] Stack: " & e.getStackTrace()
 
 iterator improveStates*[T](population: seq[TabuState[T]],
                            numWorkers: int = 0,
@@ -213,12 +229,32 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
             let reducedTime = epochTime() - reducedDomainStart
             echo &"[Solve] Domain reduction: {reducedTime:.3f}s"
 
-    # Create population of TabuStates from deepCopies
+    # Create population: deepCopy sequentially (safe), init in parallel (fast)
     let populationStartTime = epochTime()
     var population = newSeq[TabuState[T]](populationSize)
+    var carrays = newSeq[ConstrainedArray[T]](populationSize)
     for i in 0..<populationSize:
-        let systemCopy = system.deepCopy()
-        population[i] = newTabuState[T](systemCopy.baseArray, verbose = (verbose and i == 0), id=i)
+        carrays[i] = system.deepCopy().baseArray
+
+    # Initialize TabuStates in parallel batches
+    let batchSize = min(actualWorkers, populationSize)
+    var createdCount = 0
+    while createdCount < populationSize:
+        let batchEnd = min(createdCount + batchSize, populationSize)
+        let thisBatch = batchEnd - createdCount
+        var threads = newSeq[Thread[StateInitData[T]]](thisBatch)
+        var workerDatas = newSeq[StateInitData[T]](thisBatch)
+        for j in 0..<thisBatch:
+            let idx = createdCount + j
+            workerDatas[j] = StateInitData[T](
+                carray: carrays[idx],
+                result: addr population[idx],
+                id: idx,
+                verbose: verbose and idx == 0
+            )
+            createThread(threads[j], initStateWorker[T], workerDatas[j])
+        joinThreads(threads)
+        createdCount = batchEnd
 
     if verbose:
         let populationTime = epochTime() - populationStartTime

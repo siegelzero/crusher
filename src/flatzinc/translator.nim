@@ -83,6 +83,8 @@ type
     implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
     # One-hot channel defs: indicator vars to convert to channels of integer vars
     oneHotChannelDefs*: seq[tuple[indicatorVar, intVar: string, value: int]]
+    # Boundary B vars that are always 0 (from int_eq_reif(bVar, 1, false))
+    constantZeroChannels*: seq[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -1876,6 +1878,8 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
   var neReifDefines: Table[string, (string, int)]           # result → (source, value)
   var linLeReifDefines: Table[string, int]                  # result → ci
   var eqReifDefinesBySource: Table[string, string]          # source → result (value=1 only)
+  var notOneVars: HashSet[string]                           # vars where int_eq_reif(var, 1, false) exists
+  var notOneConstraints: Table[string, int]                  # var → constraint index for int_eq_reif(var, 1, false)
 
   # Pre-build set of bool/0..1 variable names for fast one-hot validation
   var boolVarNames: HashSet[string]
@@ -1897,7 +1901,16 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
       let srcArg = con.args[0]
       let valArg = con.args[1]
       let resultArg = con.args[2]
-      if srcArg.kind != FznIdent or resultArg.kind != FznIdent: continue
+      if srcArg.kind != FznIdent: continue
+      # Check for bool literal result: int_eq_reif(bVar, 1, false) → boundary indicator
+      if resultArg.kind == FznBoolLit:
+        if not resultArg.boolVal:
+          let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
+          if val == 1:
+            notOneVars.incl(srcArg.ident)
+            notOneConstraints[srcArg.ident] = ci
+        continue
+      if resultArg.kind != FznIdent: continue
       let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
       if con.hasAnnotation("defines_var"):
         eqReifDefines[resultArg.ident] = (srcArg.ident, val)
@@ -1925,6 +1938,8 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
   # Implication detection — scan bool_clause constraints
   var implicationGroups: Table[(string, string), seq[(int, int)]]
   var nConsumed = 0
+  var nVacuous = 0
+  var nStay = 0
 
   for ci, con in tr.model.constraints:
     if ci in tr.definingConstraints: continue
@@ -1941,82 +1956,120 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
     let lit1 = posArg.elems[1]
     if lit0.kind != FznIdent or lit1.kind != FznIdent: continue
 
-    # Identify which literal is neReif and which is linLeReif
-    var neReifLit, linLeReifLit: string
-    if lit0.ident in neReifDefines and lit1.ident in linLeReifDefines:
+    # Identify which literal is neReif
+    var neReifLit, otherLit: string
+    if lit0.ident in neReifDefines and lit1.ident notin neReifDefines:
       neReifLit = lit0.ident
-      linLeReifLit = lit1.ident
-    elif lit1.ident in neReifDefines and lit0.ident in linLeReifDefines:
+      otherLit = lit1.ident
+    elif lit1.ident in neReifDefines and lit0.ident notin neReifDefines:
       neReifLit = lit1.ident
-      linLeReifLit = lit0.ident
+      otherLit = lit0.ident
+    elif lit0.ident in neReifDefines and lit1.ident in neReifDefines:
+      # Both are neReif — try both orders for [neReif, linLeReif] or [neReif, eqReif]
+      if lit0.ident in linLeReifDefines or lit0.ident in eqReifDefines:
+        neReifLit = lit1.ident
+        otherLit = lit0.ident
+      elif lit1.ident in linLeReifDefines or lit1.ident in eqReifDefines:
+        neReifLit = lit0.ident
+        otherLit = lit1.ident
+      else:
+        continue
     else:
       continue
 
-    # Trace neReif literal → integer variable
-    let (bVar, neVal) = neReifDefines[neReifLit]
-    if neVal != 1: continue
-    if bVar notin eqReifDefinesBySource: continue
-    let channelVar = eqReifDefinesBySource[bVar]
-    if channelVar notin eqReifNoDefines: continue
-    let (condVar, condValue, _) = eqReifNoDefines[channelVar]
+    # Case 1: [ne_reif, lin_le_reif] — transition pattern (agent moves to neighbor)
+    if otherLit in linLeReifDefines:
+      let (bVar, neVal) = neReifDefines[neReifLit]
+      if neVal != 1: continue
 
-    # Check int_lin_le_reif: all coefficients = -1, rhs = -1 (encoding sum >= 1)
-    let linLeIdx = linLeReifDefines[linLeReifLit]
-    let linLeCon = tr.model.constraints[linLeIdx]
-    let coeffs = try: tr.resolveIntArray(linLeCon.args[0]) except ValueError, KeyError: continue
-    let rhs = try: tr.resolveIntArg(linLeCon.args[2]) except ValueError, KeyError: continue
-    if rhs != -1: continue
+      # Trace neReif through indicator chain → integer variable
+      if bVar notin eqReifDefinesBySource:
+        # Check vacuous boundary: bVar can never be 1 → implication is vacuously true
+        if bVar in notOneVars:
+          let linLeIdx = linLeReifDefines[otherLit]
+          tr.definingConstraints.incl(ci)        # bool_clause
+          tr.definingConstraints.incl(linLeIdx)  # int_lin_le_reif
+          tr.definedVarNames.incl(otherLit)      # result var of linLeReif
+          nConsumed += 2
+          nVacuous += 1
+        continue
+      let channelVar = eqReifDefinesBySource[bVar]
+      if channelVar notin eqReifNoDefines: continue
+      let (condVar, condValue, _) = eqReifNoDefines[channelVar]
 
-    var allNegOne = true
-    for c in coeffs:
-      if c != -1:
-        allNegOne = false
-        break
-    if not allNegOne: continue
+      # Check int_lin_le_reif: all coefficients = -1, rhs = -1 (encoding sum >= 1)
+      let linLeIdx = linLeReifDefines[otherLit]
+      let linLeCon = tr.model.constraints[linLeIdx]
+      let coeffs = try: tr.resolveIntArray(linLeCon.args[0]) except ValueError, KeyError: continue
+      let rhs = try: tr.resolveIntArg(linLeCon.args[2]) except ValueError, KeyError: continue
+      if rhs != -1: continue
 
-    let varElems = tr.resolveVarArrayElems(linLeCon.args[1])
-    if varElems.len != coeffs.len or varElems.len == 0: continue
+      var allNegOne = true
+      for c in coeffs:
+        if c != -1:
+          allNegOne = false
+          break
+      if not allNegOne: continue
 
-    # Trace each indicator variable → target integer variable
-    var targetVar = ""
-    var targetValues: seq[int]
-    var valid = true
+      let varElems = tr.resolveVarArrayElems(linLeCon.args[1])
+      if varElems.len != coeffs.len or varElems.len == 0: continue
 
-    for yi in varElems:
-      if yi.kind != FznIdent:
-        valid = false
-        break
-      if yi.ident notin eqReifDefinesBySource:
-        valid = false
-        break
-      let chVarI = eqReifDefinesBySource[yi.ident]
-      if chVarI notin eqReifNoDefines:
-        valid = false
-        break
-      let (tVar, tValue, _) = eqReifNoDefines[chVarI]
+      # Trace each indicator variable → target integer variable
+      var targetVar = ""
+      var targetValues: seq[int]
+      var valid = true
 
-      if targetVar == "":
-        targetVar = tVar
-      elif tVar != targetVar:
-        valid = false
-        break
+      for yi in varElems:
+        if yi.kind != FznIdent:
+          valid = false
+          break
+        if yi.ident notin eqReifDefinesBySource:
+          valid = false
+          break
+        let chVarI = eqReifDefinesBySource[yi.ident]
+        if chVarI notin eqReifNoDefines:
+          valid = false
+          break
+        let (tVar, tValue, _) = eqReifNoDefines[chVarI]
 
-      targetValues.add(tValue)
+        if targetVar == "":
+          targetVar = tVar
+        elif tVar != targetVar:
+          valid = false
+          break
 
-    if not valid or targetVar == "": continue
+        targetValues.add(tValue)
 
-    # Record: (condVar == condValue) → (targetVar in targetValues)
-    let key = (condVar, targetVar)
-    if key notin implicationGroups:
-      implicationGroups[key] = @[]
-    for tv in targetValues:
-      implicationGroups[key].add((condValue, tv))
+      if not valid or targetVar == "": continue
 
-    # Mark consumed
-    tr.definingConstraints.incl(ci)        # bool_clause
-    tr.definingConstraints.incl(linLeIdx)  # int_lin_le_reif
-    tr.definedVarNames.incl(linLeReifLit)  # result var of linLeReif
-    nConsumed += 2
+      # Record: (condVar == condValue) → (targetVar in targetValues)
+      let key = (condVar, targetVar)
+      if key notin implicationGroups:
+        implicationGroups[key] = @[]
+      for tv in targetValues:
+        implicationGroups[key].add((condValue, tv))
+
+      # Mark consumed
+      tr.definingConstraints.incl(ci)        # bool_clause
+      tr.definingConstraints.incl(linLeIdx)  # int_lin_le_reif
+      tr.definedVarNames.incl(otherLit)      # result var of linLeReif
+      nConsumed += 2
+
+    # Case 2: [ne_reif, eq_reif] — direct implication (stay at destination)
+    elif otherLit in eqReifDefines:
+      let (condVar, condValue) = neReifDefines[neReifLit]
+      let (targetVar, targetValue) = eqReifDefines[otherLit]
+
+      # Record: (condVar == condValue) → (targetVar == targetValue)
+      let key = (condVar, targetVar)
+      if key notin implicationGroups:
+        implicationGroups[key] = @[]
+      implicationGroups[key].add((condValue, targetValue))
+
+      # Only consume the bool_clause — ne_reif and eq_reif already consumed by detectReifChannels
+      tr.definingConstraints.incl(ci)
+      nConsumed += 1
+      nStay += 1
 
   # Build table constraints from grouped implications
   for key, tuples in implicationGroups:
@@ -2040,10 +2093,21 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
     tr.definingConstraints.incl(ci)
     tr.channelVarNames.incl(bV)
 
+  # Constant-zero channel detection — boundary B vars that are always 0
+  for bVar in notOneVars:
+    if bVar in tr.channelVarNames or bVar in tr.definedVarNames: continue
+    if bVar notin boolVarNames: continue
+    tr.constantZeroChannels.add(bVar)
+    tr.channelVarNames.incl(bVar)
+    if bVar in notOneConstraints:
+      tr.definingConstraints.incl(notOneConstraints[bVar])
+
   if tr.implicationTables.len > 0:
-    stderr.writeLine(&"[FZN] Detected implication table patterns: {tr.implicationTables.len} tables, {nConsumed} constraints consumed")
+    stderr.writeLine(&"[FZN] Detected implication table patterns: {tr.implicationTables.len} tables, {nConsumed} constraints consumed (stay={nStay}, vacuous={nVacuous}, notOneVars={notOneVars.len})")
   if tr.oneHotChannelDefs.len > 0:
     stderr.writeLine(&"[FZN] Detected one-hot channels: {tr.oneHotChannelDefs.len} indicator variables")
+  if tr.constantZeroChannels.len > 0:
+    stderr.writeLine(&"[FZN] Detected constant-zero channels: {tr.constantZeroChannels.len} boundary indicator variables")
 
 
 proc buildOneHotChannelBindings(tr: var FznTranslator) =
@@ -2090,6 +2154,32 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
 
   if tr.oneHotChannelDefs.len > 0:
     stderr.writeLine(&"[FZN] Built {tr.oneHotChannelDefs.len} one-hot channel bindings " &
+                     &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+  # Build constant-zero channel bindings for boundary indicator variables
+  var nConstZero = 0
+  for bVar in tr.constantZeroChannels:
+    if bVar notin tr.varPositions: continue
+    let bPos = tr.varPositions[bVar]
+
+    # Constant binding: element(0, [0]) — always evaluates to 0
+    let indexExpr = newAlgebraicExpression[int](
+      positions = initPackedSet[int](),
+      node = ExpressionNode[int](kind: LiteralNode, value: 0),
+      linear = true
+    )
+    let binding = ChannelBinding[int](
+      channelPosition: bPos,
+      indexExpression: indexExpr,
+      arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 0)]
+    )
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(bPos)
+    # No entries in channelsAtPosition — no source positions, binding is constant
+    nConstZero += 1
+
+  if nConstZero > 0:
+    stderr.writeLine(&"[FZN] Built {nConstZero} constant-zero channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
