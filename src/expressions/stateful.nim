@@ -177,21 +177,6 @@ func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
     of ConstantExpr:
         discard  # Constants don't change
 
-func getAffectedPositions*[T](expression: Expression[T], changedPosition: int): PackedSet[int] =
-    ## Returns positions whose moveDelta may change when changedPosition changes.
-    ## For SumExpr with ExpressionBased eval, only returns positions of terms
-    ## that reference changedPosition (much smaller than all positions).
-    case expression.kind
-    of SumExpr:
-        if expression.sumExpr.evalMethod == ExpressionBased:
-            for termIdx in expression.sumExpr.expressionsAtPosition.getOrDefault(changedPosition, @[]):
-                result.incl(expression.sumExpr.expressions[termIdx].positions)
-        else:
-            # PositionBased: only this position's coefficient matters
-            if changedPosition in expression.sumExpr.coefficient:
-                result.incl(changedPosition)
-    else:
-        result = expression.positions
 
 func moveDelta*[T](expression: Expression[T], position: int,
                    oldValue, newValue: T): T =
