@@ -18,12 +18,13 @@ type
 
 proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntry[T]] =
     ## Path relinking: greedy walk from state's current assignment toward targetAssignment.
-    ## The state is mutated during relinking via assignValue (incremental updates).
-    ## Samples every sampleInterval steps plus tracks the best intermediate state.
+    ## Uses lean assignment (no penalty map updates) and computes cost deltas
+    ## directly from constraint moveDelta for fast traversal.
 
-    # Collect positions where source and target differ
+    # Collect search positions where source and target differ
+    # (channel positions auto-update and have no penalty maps)
     var moves: seq[int] = @[]
-    for pos in state.carray.allPositions():
+    for pos in state.carray.allSearchPositions():
         if state.assignment[pos] != targetAssignment[pos]:
             moves.add(pos)
 
@@ -37,7 +38,7 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
     var bestAssignment = state.assignment
 
     while moves.len > 0:
-        # Evaluate all remaining moves, pick the best
+        # Evaluate all remaining moves using direct costDelta (no penalty maps needed)
         var
             bestDelta = high(int)
             bestMoveIndices: seq[int] = @[]
@@ -45,10 +46,7 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
         for mi in 0..<moves.len:
             let pos = moves[mi]
             let targetVal = targetAssignment[pos]
-            let oldVal = state.assignment[pos]
-            let oldPenalty = state.penaltyAt(pos, oldVal)
-            let newPenalty = state.penaltyAt(pos, targetVal)
-            let delta = newPenalty - oldPenalty
+            let delta = state.costDelta(pos, targetVal)
 
             if delta < bestDelta:
                 bestDelta = delta
@@ -56,11 +54,11 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
             elif delta == bestDelta:
                 bestMoveIndices.add(mi)
 
-        # Apply the best move
+        # Apply the best move (lean: no penalty map updates)
         let chosenIdx = sample(bestMoveIndices)
         let pos = moves[chosenIdx]
         let targetVal = targetAssignment[pos]
-        state.assignValue(pos, targetVal)
+        state.assignValueLean(pos, targetVal)
         moves.del(chosenIdx)
         inc stepCount
 

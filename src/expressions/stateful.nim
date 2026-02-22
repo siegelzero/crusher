@@ -47,6 +47,9 @@ func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: in
 func moveDelta*[T](expression: StatefulAlgebraicExpression[T],
                    position: int,
                    oldValue, newValue: T): T =
+    # Fast exit: if position isn't in this expression, no change
+    if position notin expression.positions:
+        return 0
     let currentValue = expression.value
     # Temporarily update and evaluate using table-based evaluation
     let savedValue = expression.currentAssignment[position]
@@ -94,8 +97,33 @@ proc newExpression*[T](expression: AlgebraicExpression[T]): Expression[T] =
         let linearized = linearize(expression)
         Expression[T](kind: SumExpr, sumExpr: linearized, positions: linearized.positions)
     else:
-        let statefulExpression = newStatefulAlgebraicExpression(expression)
-        Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: statefulExpression, positions: expression.positions)
+        # Try to decompose top-level additions into independent terms
+        # This converts O(all_nodes) moveDelta into O(relevant_term_nodes) moveDelta
+        let terms = extractAdditiveTerms(expression.node)
+        if terms.len > 1:
+            var algTerms: seq[AlgebraicExpression[T]]
+            var constant: T = 0
+            for term in terms:
+                if term.kind == LiteralNode:
+                    constant += term.value
+                else:
+                    let positions = collectPositions(term)
+                    let algExpr = AlgebraicExpression[T](
+                        positions: positions,
+                        node: term,
+                        linear: false
+                    )
+                    algTerms.add(algExpr)
+
+            if algTerms.len > 0:
+                var sumExpr = newSumExpression[T](algTerms)
+                sumExpr.constant = constant
+                Expression[T](kind: SumExpr, sumExpr: sumExpr, positions: sumExpr.positions)
+            else:
+                Expression[T](kind: ConstantExpr, constantValue: constant, positions: initPackedSet[int]())
+        else:
+            let statefulExpression = newStatefulAlgebraicExpression(expression)
+            Expression[T](kind: StatefulAlgebraicExpr, algebraicExpr: statefulExpression, positions: expression.positions)
 
 proc newExpression*[T](expression: SumExpression[T]): Expression[T] =
     Expression[T](kind: SumExpr, sumExpr: expression, positions: expression.positions)
@@ -148,6 +176,22 @@ func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
         expression.maxExpr.updatePosition(position, newValue)
     of ConstantExpr:
         discard  # Constants don't change
+
+func getAffectedPositions*[T](expression: Expression[T], changedPosition: int): PackedSet[int] =
+    ## Returns positions whose moveDelta may change when changedPosition changes.
+    ## For SumExpr with ExpressionBased eval, only returns positions of terms
+    ## that reference changedPosition (much smaller than all positions).
+    case expression.kind
+    of SumExpr:
+        if expression.sumExpr.evalMethod == ExpressionBased:
+            for termIdx in expression.sumExpr.expressionsAtPosition.getOrDefault(changedPosition, @[]):
+                result.incl(expression.sumExpr.expressions[termIdx].positions)
+        else:
+            # PositionBased: only this position's coefficient matters
+            if changedPosition in expression.sumExpr.coefficient:
+                result.incl(changedPosition)
+    else:
+        result = expression.positions
 
 func moveDelta*[T](expression: Expression[T], position: int,
                    oldValue, newValue: T): T =

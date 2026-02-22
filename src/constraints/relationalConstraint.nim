@@ -284,6 +284,26 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         else:
             # Mixed path: PL for compiled terms, tree eval for the rest
             let savedValue = assignment[position]
+
+            # Pre-compute old term sums for ExpressionBased SumExpr (evaluated once, not per value)
+            let leftIsSumEB = not hasLeftTerms and leftInPos and
+                constraint.leftExpr.kind == SumExpr and
+                constraint.leftExpr.sumExpr.evalMethod == ExpressionBased
+            var leftOldTermSum: T = 0
+            if leftIsSumEB:
+                let s = constraint.leftExpr.sumExpr
+                for idx in s.expressionsAtPosition.getOrDefault(position, @[]):
+                    leftOldTermSum += s.expressions[idx].evaluate(assignment)
+
+            let rightIsSumEB = not hasRightTerms and rightInPos and
+                constraint.rightExpr.kind == SumExpr and
+                constraint.rightExpr.sumExpr.evalMethod == ExpressionBased
+            var rightOldTermSum: T = 0
+            if rightIsSumEB:
+                let s = constraint.rightExpr.sumExpr
+                for idx in s.expressionsAtPosition.getOrDefault(position, @[]):
+                    rightOldTermSum += s.expressions[idx].evaluate(assignment)
+
             for i in 0..<domain.len:
                 let v = domain[i]
                 assignment[position] = v
@@ -293,6 +313,13 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                     for ti in leftTreeTerms:
                         total += constraint.leftTerms[ti].node.evaluate(assignment)
                     total
+                elif leftIsSumEB:
+                    # Fast: only evaluate terms at this position using seq-based assignment
+                    let s = constraint.leftExpr.sumExpr
+                    var newTermSum: T = 0
+                    for idx in s.expressionsAtPosition.getOrDefault(position, @[]):
+                        newTermSum += s.expressions[idx].evaluate(assignment)
+                    constraint.leftValue + newTermSum - leftOldTermSum
                 elif leftInPos and constraint.leftExpr.kind == StatefulAlgebraicExpr:
                     constraint.leftExpr.algebraicExpr.algebraicExpr.node.evaluate(assignment)
                 elif leftInPos:
@@ -305,6 +332,12 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                     for ti in rightTreeTerms:
                         total += constraint.rightTerms[ti].node.evaluate(assignment)
                     total
+                elif rightIsSumEB:
+                    let s = constraint.rightExpr.sumExpr
+                    var newTermSum: T = 0
+                    for idx in s.expressionsAtPosition.getOrDefault(position, @[]):
+                        newTermSum += s.expressions[idx].evaluate(assignment)
+                    constraint.rightValue + newTermSum - rightOldTermSum
                 elif rightInPos and constraint.rightExpr.kind == StatefulAlgebraicExpr:
                     constraint.rightExpr.algebraicExpr.algebraicExpr.node.evaluate(assignment)
                 elif rightInPos:

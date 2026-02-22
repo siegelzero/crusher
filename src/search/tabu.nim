@@ -58,6 +58,9 @@ type
         searchPositions*: seq[int]  # Non-channel positions (precomputed)
         totalDomainSize*: int  # Sum of domain sizes across search positions
 
+        # Per-constraint search position cache (excludes channel positions)
+        constraintSearchPos*: Table[pointer, PackedSet[int]]
+
         # Swap move structures for binary variables
         swapEnabled*: bool
         binaryPositions*: seq[int]           # positions with domain {0,1}
@@ -162,6 +165,13 @@ proc penaltyAt*[T](state: TabuState[T], position: int, value: T): int {.inline.}
     ## Look up penalty for a (position, value) pair using dense arrays.
     let idx = state.domainIndex[position].getOrDefault(value, -1)
     if idx >= 0: state.penaltyMap[position][idx] else: 0
+
+proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
+    ## Compute the total cost change for assigning newValue at position by
+    ## summing moveDelta across all constraints. O(constraints_at_pos) but
+    ## doesn't require penalty maps to be up-to-date.
+    for constraint in state.constraintsAtPosition[position]:
+        result += state.movePenalty(constraint, position, newValue)
 
 ################################################################################
 # Penalty Map Routines
@@ -309,11 +319,19 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     ## Update penalty map for positions affected by a change at `position`.
     ## Only recomputes the specific constraint(s) that changed at each neighbor,
     ## not all constraints at that position.
+    ## Uses precomputed search-only positions to skip channels efficiently.
 
     for constraint in state.constraintsAtPosition[position]:
+        let cptr = cast[pointer](constraint)
+        let searchPos = state.constraintSearchPos.getOrDefault(cptr)
+        if searchPos.len == 0:
+            continue  # Constraint has no search positions — skip entirely
         let affectedPositions = constraint.getAffectedPositions()
-        for pos in affectedPositions.items:
+        # Iterate the smaller set (search positions) and check membership in affected set
+        for pos in searchPos.items:
             if pos == position:
+                continue
+            if pos notin affectedPositions:
                 continue
             when ProfileIteration:
                 state.neighborUpdates += 1
@@ -328,7 +346,7 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
 
 
 proc rebuildPenaltyMap*[T](state: TabuState[T]) =
-    for position in state.carray.allPositions():
+    for position in state.carray.allSearchPositions():
         state.updatePenaltiesForPosition(position)
 
 
@@ -466,6 +484,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.searchPositions.add(pos)
         state.totalDomainSize += carray.reducedDomain[pos].len
 
+    # Precompute search-only positions per constraint (excluding channels)
+    state.constraintSearchPos = initTable[pointer, PackedSet[int]]()
+    for c in state.constraints:
+        var searchPos: PackedSet[int]
+        for pos in c.positions.items:
+            if pos notin carray.channelPositions:
+                searchPos.incl(pos)
+        state.constraintSearchPos[cast[pointer](c)] = searchPos
+
     # Build domain index: value -> local array index
     state.domainIndex = newSeq[Table[T, int]](carray.len)
     for pos in carray.allPositions():
@@ -473,11 +500,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for i, v in carray.reducedDomain[pos]:
             state.domainIndex[pos][v] = i
 
-    # Initialize dense penalty arrays
+    # Initialize dense penalty arrays — only for search positions (not channels)
     state.penaltyMap = newSeq[seq[int]](carray.len)
     state.constraintPenalties = newSeq[seq[seq[int]]](carray.len)
     state.tabu = newSeq[seq[int]](carray.len)
     for pos in carray.allPositions():
+        if pos in carray.channelPositions:
+            continue
         let dsize = carray.reducedDomain[pos].len
         state.penaltyMap[pos] = newSeq[int](dsize)
         state.tabu[pos] = newSeq[int](dsize)
@@ -486,19 +515,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.constraintPenalties[pos][ci] = newSeq[int](dsize)
 
     if verbose and id == 0:
-        var totalDomainSize = 0
-        for pos in carray.allPositions():
-            totalDomainSize += carray.reducedDomain[pos].len
-        echo "[Init] Building penalty map: " & $carray.len & " positions, " & $totalDomainSize & " domain values"
+        let searchCount = state.searchPositions.len
+        echo "[Init] Building penalty map: " & $searchCount & " search positions (skipping " & $(carray.len - searchCount) & " channels)"
 
     var penaltyStart = epochTime()
-    for pos in carray.allPositions():
+    var penaltyCount = 0
+    for pos in carray.allSearchPositions():
         state.updatePenaltiesForPosition(pos)
-        if verbose and id == 0 and pos mod 500 == 0 and pos > 0:
+        penaltyCount += 1
+        if verbose and id == 0 and penaltyCount mod 500 == 0:
             let elapsed = epochTime() - penaltyStart
-            let rate = pos.float / max(elapsed, 0.001)
-            let eta = (carray.len - pos).float / max(rate, 0.001)
-            echo "[Init] Penalties: " & $pos & "/" & $carray.len & " rate=" & $rate.int & "/s eta=" & $eta.int & "s"
+            let rate = penaltyCount.float / max(elapsed, 0.001)
+            let eta = (state.searchPositions.len - penaltyCount).float / max(rate, 0.001)
+            echo "[Init] Penalties: " & $penaltyCount & "/" & $state.searchPositions.len & " rate=" & $rate.int & "/s eta=" & $eta.int & "s"
 
     if verbose and id == 0:
         echo "[Init] Built penalty map in " & $(epochTime() - initStart) & "s"
@@ -891,12 +920,60 @@ proc propagateChannels[T](state: TabuState[T], position: int) =
                     elif oldPenalty == 0 and newPenalty > 0:
                         for pos in c.positions.items:
                             state.violationCount[pos] += 1
-                state.updatePenaltiesForPosition(binding.channelPosition)
+                # Don't rebuild the channel's own penalty map (never searched).
+                # But DO update neighbor penalties so search positions sharing
+                # constraints with this channel get correct penalty maps.
                 state.updateNeighborPenalties(binding.channelPosition)
                 # If this channel position triggers further channels, enqueue it
                 if binding.channelPosition notin visited:
                     visited.incl(binding.channelPosition)
                     worklist.add(binding.channelPosition)
+
+proc propagateChannelsLean[T](state: TabuState[T], position: int) =
+    ## Lightweight channel propagation: updates constraint state and cost
+    ## but skips penalty map updates entirely. For use during path relinking.
+    var worklist = @[position]
+    var visited: PackedSet[int]
+    visited.incl(position)
+
+    while worklist.len > 0:
+        let pos = worklist.pop()
+        if pos notin state.carray.channelsAtPosition:
+            continue
+        for bi in state.carray.channelsAtPosition[pos]:
+            let binding = state.carray.channelBindings[bi]
+            let idxVal = binding.indexExpression.evaluate(state.assignment)
+            var newVal: T
+            if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                let elem = binding.arrayElements[idxVal]
+                newVal = if elem.isConstant: elem.constantValue
+                         else: state.assignment[elem.variablePosition]
+            else:
+                continue
+            if newVal != state.assignment[binding.channelPosition]:
+                state.assignment[binding.channelPosition] = newVal
+                for c in state.constraintsAtPosition[binding.channelPosition]:
+                    let oldPenalty = c.penalty()
+                    c.updatePosition(binding.channelPosition, newVal)
+                    let newPenalty = c.penalty()
+                    state.cost += newPenalty - oldPenalty
+                # No penalty map or neighbor updates — lean mode
+                if binding.channelPosition notin visited:
+                    visited.incl(binding.channelPosition)
+                    worklist.add(binding.channelPosition)
+
+proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
+    ## Lightweight assignment: updates constraint state and cost but skips
+    ## penalty map updates. Used during path relinking for fast traversal.
+    state.assignment[position] = value
+
+    for constraint in state.constraintsAtPosition[position]:
+        let oldPenalty = constraint.penalty()
+        constraint.updatePosition(position, value)
+        let newPenalty = constraint.penalty()
+        state.cost += newPenalty - oldPenalty
+
+    state.propagateChannelsLean(position)
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     when ProfileIteration:
