@@ -26,7 +26,7 @@ type
     SubcircuitConstraint*[T] = ref object
         n*: int                              # number of nodes
         positions*: PackedSet[int]           # all variable positions
-        sortedPositions*: seq[int]           # sorted positions array
+        positionArray*: seq[int]             # position per node index (input order)
         positionToIndex*: Table[int, int]    # position -> 0-based node index
         successorArray*: seq[int]            # 0-based successors (working copy)
         cost*: int                           # cached penalty
@@ -254,7 +254,7 @@ proc countCyclesAndTails[T](constraint: SubcircuitConstraint[T],
 proc newSubcircuitConstraint*[T](positions: openArray[int]): SubcircuitConstraint[T] =
     new(result)
     result.n = positions.len
-    result.sortedPositions = @positions  # Keep input order — node i = positions[i]
+    result.positionArray = @positions  # Keep input order — node i = positions[i]
     result.positions = toPackedSet[int](positions)
     result.positionToIndex = initTable[int, int]()
     result.currentAssignment = initTable[int, T]()
@@ -274,7 +274,7 @@ proc newSubcircuitConstraint*[T](positions: openArray[int]): SubcircuitConstrain
     result.scratchInAffected = newSeq[bool](result.n)
     result.scratchPath = newSeqOfCap[int](result.n)
 
-    for i, pos in result.sortedPositions:
+    for i, pos in result.positionArray:
         result.positionToIndex[pos] = i
 
 ################################################################################
@@ -283,7 +283,7 @@ proc newSubcircuitConstraint*[T](positions: openArray[int]): SubcircuitConstrain
 
 proc initialize*[T](constraint: SubcircuitConstraint[T], assignment: seq[T]) =
     ## Build successor array from assignment and compute initial cost + metadata.
-    for i, pos in constraint.sortedPositions:
+    for i, pos in constraint.positionArray:
         let value = assignment[pos]
         constraint.currentAssignment[pos] = value
         # Convert 1-based value to 0-based index
@@ -375,139 +375,15 @@ proc moveDelta*[T](constraint: SubcircuitConstraint[T], position: int, oldValue,
 ################################################################################
 
 proc updatePosition*[T](constraint: SubcircuitConstraint[T], position: int, newValue: T) =
-    ## Apply a move and incrementally update metadata.
+    ## Apply a move and recompute metadata. O(n) full recompute is fast enough
+    ## for typical subcircuit sizes.
     if position notin constraint.positionToIndex:
         return
     let nodeIdx = constraint.positionToIndex[position]
-    let newSucc = int(newValue) - 1
-    let n = constraint.n
 
     constraint.currentAssignment[position] = newValue
+    constraint.successorArray[nodeIdx] = int(newValue) - 1
 
-    # Identify affected components
-    let comp1 = constraint.componentId[nodeIdx]
-    let oldSucc = constraint.successorArray[nodeIdx]
-    assert oldSucc < 0 or oldSucc >= n or constraint.componentId[oldSucc] == comp1
-    var comp2 = -1
-    if newSucc >= 0 and newSucc < n:
-        comp2 = constraint.componentId[newSucc]
-
-    # Gather affected nodes, count old cycles/tails
-    var affectedCount = 0
-    var oldAffectedCycles = 0
-    var oldAffectedTails = 0
-    var seenCycleIds: seq[int] = @[]
-
-    for i in 0..<n:
-        if constraint.componentId[i] == comp1 or
-           (comp2 >= 0 and constraint.componentId[i] == comp2):
-            constraint.scratchInAffected[i] = true
-            affectedCount += 1
-            if constraint.cycleId[i] == -1:
-                oldAffectedTails += 1
-            else:
-                var found = false
-                for cid in seenCycleIds:
-                    if cid == constraint.cycleId[i]:
-                        found = true
-                        break
-                if not found:
-                    seenCycleIds.add(constraint.cycleId[i])
-        else:
-            constraint.scratchInAffected[i] = false
-
-    oldAffectedCycles = seenCycleIds.len
-
-    var affectedNodes = newSeqOfCap[int](affectedCount)
-    for i in 0..<n:
-        if constraint.scratchInAffected[i]:
-            affectedNodes.add(i)
-
-    # Apply the change
-    constraint.successorArray[nodeIdx] = newSucc
-
-    # Mini-traverse to get new cycle/tail counts and update metadata
-    var newCycles = 0
-    var newTails = 0
-
-    # Reset scratch color for affected nodes
-    for i in 0..<affectedCount:
-        constraint.scratchColor[affectedNodes[i]] = White
-
-    for i in 0..<affectedCount:
-        let startNode = affectedNodes[i]
-        if constraint.scratchColor[startNode] != White:
-            continue
-
-        constraint.scratchPath.setLen(0)
-        var current = startNode
-        var joinNode = -1  # node whose component to inherit (-1 = none)
-
-        while true:
-            if constraint.scratchColor[current] != White:
-                break
-            constraint.scratchColor[current] = Gray
-            constraint.scratchPath.add(current)
-            let succ = constraint.successorArray[current]
-            if succ < 0 or succ >= n:
-                current = succ
-                break
-            if not constraint.scratchInAffected[succ]:
-                # Successor is outside affected set - inherit its component
-                joinNode = succ
-                current = -1
-                break
-            current = succ
-
-        if current >= 0 and current < n and constraint.scratchColor[current] == Gray:
-            # Found a cycle within affected set
-            let compId = constraint.nextComponentId
-            constraint.nextComponentId += 1
-            var cycleStart = 0
-            for j in 0..<constraint.scratchPath.len:
-                if constraint.scratchPath[j] == current:
-                    cycleStart = j
-                    break
-            let cycleLen = constraint.scratchPath.len - cycleStart
-            # Only count non-trivial cycles (length >= 2)
-            var cId = -1
-            if cycleLen >= 2:
-                newCycles += 1
-                cId = constraint.nextCycleId
-                constraint.nextCycleId += 1
-            newTails += cycleStart
-            for j in cycleStart..<constraint.scratchPath.len:
-                let node = constraint.scratchPath[j]
-                constraint.scratchColor[node] = Black
-                constraint.componentId[node] = compId
-                constraint.cycleId[node] = cId
-            for j in 0..<cycleStart:
-                let node = constraint.scratchPath[j]
-                constraint.scratchColor[node] = Black
-                constraint.componentId[node] = compId
-                constraint.cycleId[node] = -1
-        else:
-            # All path nodes are tails - inherit component from target
-            let compId = if joinNode >= 0:
-                constraint.componentId[joinNode]
-            elif current >= 0 and current < n and constraint.scratchColor[current] == Black:
-                constraint.componentId[current]
-            else:
-                let c = constraint.nextComponentId
-                constraint.nextComponentId += 1
-                c
-            newTails += constraint.scratchPath.len
-            for node in constraint.scratchPath:
-                constraint.scratchColor[node] = Black
-                constraint.componentId[node] = compId
-                constraint.cycleId[node] = -1
-
-    # Clean scratch
-    for i in 0..<affectedCount:
-        constraint.scratchInAffected[affectedNodes[i]] = false
-
-    # Full recompute of metadata — the incremental tracking has edge cases
-    # where numTailNodes can drift. O(n) is fast enough for typical subcircuit sizes.
     constraint.nextComponentId = 0
     constraint.nextCycleId = 0
     constraint.computeMetadata()
@@ -522,7 +398,7 @@ proc deepCopy*[T](constraint: SubcircuitConstraint[T]): SubcircuitConstraint[T] 
     new(result)
     result.n = constraint.n
     result.positions = constraint.positions  # PackedSet is value type
-    result.sortedPositions = constraint.sortedPositions  # Read-only after construction
+    result.positionArray = constraint.positionArray  # Read-only after construction
     result.positionToIndex = constraint.positionToIndex  # Read-only after construction
     result.cost = constraint.cost
 

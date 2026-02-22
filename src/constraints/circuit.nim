@@ -25,7 +25,7 @@ type
     CircuitConstraint*[T] = ref object
         n*: int                              # number of nodes
         positions*: PackedSet[int]           # all variable positions
-        sortedPositions*: seq[int]           # sorted positions array
+        positionArray*: seq[int]             # position per node index (input order)
         positionToIndex*: Table[int, int]    # position -> 0-based node index
         successorArray*: seq[int]            # 0-based successors (working copy)
         cost*: int                           # cached penalty
@@ -242,7 +242,7 @@ proc countCyclesAndTails[T](constraint: CircuitConstraint[T],
 proc newCircuitConstraint*[T](positions: openArray[int]): CircuitConstraint[T] =
     new(result)
     result.n = positions.len
-    result.sortedPositions = @positions  # Keep input order — node i = positions[i]
+    result.positionArray = @positions  # Keep input order — node i = positions[i]
     result.positions = toPackedSet[int](positions)
     result.positionToIndex = initTable[int, int]()
     result.currentAssignment = initTable[int, T]()
@@ -262,7 +262,7 @@ proc newCircuitConstraint*[T](positions: openArray[int]): CircuitConstraint[T] =
     result.scratchInAffected = newSeq[bool](result.n)
     result.scratchPath = newSeqOfCap[int](result.n)
 
-    for i, pos in result.sortedPositions:
+    for i, pos in result.positionArray:
         result.positionToIndex[pos] = i
 
 ################################################################################
@@ -271,7 +271,7 @@ proc newCircuitConstraint*[T](positions: openArray[int]): CircuitConstraint[T] =
 
 proc initialize*[T](constraint: CircuitConstraint[T], assignment: seq[T]) =
     ## Build successor array from assignment and compute initial cost + metadata.
-    for i, pos in constraint.sortedPositions:
+    for i, pos in constraint.positionArray:
         let value = assignment[pos]
         constraint.currentAssignment[pos] = value
         # Convert 1-based value to 0-based index
@@ -511,7 +511,7 @@ proc deepCopy*[T](constraint: CircuitConstraint[T]): CircuitConstraint[T] =
     new(result)
     result.n = constraint.n
     result.positions = constraint.positions  # PackedSet is value type
-    result.sortedPositions = constraint.sortedPositions  # Read-only after construction
+    result.positionArray = constraint.positionArray  # Read-only after construction
     result.positionToIndex = constraint.positionToIndex  # Read-only after construction
     result.cost = constraint.cost
 

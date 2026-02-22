@@ -969,6 +969,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
           let v = tr.sys.newConstrainedVariable()
           v.setDomain(@[int(e.node.value)])
           positions2.add(pos)
+        else:
+          raise newException(ValueError, "fzn_circuit: unsupported expression node kind " & $e.node.kind)
       tr.sys.addConstraint(circuit[int](positions2))
 
   of "fzn_subcircuit":
@@ -988,6 +990,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
           let v = tr.sys.newConstrainedVariable()
           v.setDomain(@[int(e.node.value)])
           positions2.add(pos)
+        else:
+          raise newException(ValueError, "fzn_subcircuit: unsupported expression node kind " & $e.node.kind)
       tr.sys.addConstraint(subcircuit[int](positions2))
       tr.sys.addConstraint(allDifferent[int](positions2))
 

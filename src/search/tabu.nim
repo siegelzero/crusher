@@ -1057,9 +1057,10 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
 # Value Assignment
 ################################################################################
 
-proc propagateChannels[T](state: TabuState[T], position: int) =
+proc propagateChannels[T](state: TabuState[T], position: int): bool =
     ## Propagate channel variable values after a change at `position`.
     ## Uses a worklist to handle transitive channel dependencies.
+    ## Returns true if any channel values actually changed.
     var worklist = @[position]
     var visited: PackedSet[int]
     visited.incl(position)
@@ -1080,6 +1081,7 @@ proc propagateChannels[T](state: TabuState[T], position: int) =
                 continue  # out of bounds, leave as-is
 
             if newVal != state.assignment[binding.channelPosition]:
+                result = true
                 state.assignment[binding.channelPosition] = newVal
                 for c in state.constraintsAtPosition[binding.channelPosition]:
                     let oldPenalty = c.penalty()
@@ -1167,11 +1169,10 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 state.violationCount[pos] += 1
 
     # Propagate channel variables affected by this position change
-    state.propagateChannels(position)
+    let channelsChanged = state.propagateChannels(position)
 
-    # Recompute channel-dep penalties at all affected search positions
-    # (channel-dep constraint state changed during propagation)
-    if state.hasChannelDeps:
+    # Recompute channel-dep penalties only if channel propagation changed values
+    if state.hasChannelDeps and channelsChanged:
         state.recomputeAllChannelDepPenalties()
 
     when ProfileIteration:
