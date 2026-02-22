@@ -79,6 +79,10 @@ type
     # Reification channel patterns: constraint index for int_eq_reif/bool2int with defines_var
     reifChannelDefs*: seq[int]      # int_eq_reif constraint indices (ordered first)
     bool2intChannelDefs*: seq[int]  # bool2int constraint indices (ordered after reif)
+    # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
+    implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
+    # One-hot channel defs: indicator vars to convert to channels of integer vars
+    oneHotChannelDefs*: seq[tuple[indicatorVar, intVar: string, value: int]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -1856,6 +1860,239 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc detectImplicationPatterns(tr: var FznTranslator) =
+  ## Detects boolean implication patterns encoded as:
+  ##   bool_clause([neg_b, r], [])
+  ## where neg_b = int_ne_reif(B_var, 1, neg_b) :: defines_var(neg_b)
+  ##   and r = int_lin_le_reif([-1,...], [Y_1,...], -1, r) :: defines_var(r)
+  ##
+  ## Traces through reification chains to find the underlying integer variables,
+  ## builds table constraints for valid transitions, and detects one-hot channel
+  ## variables for indicator-to-integer channeling.
+
+  # Build indexes — single pass over all constraints (including consumed ones for tracing)
+  var eqReifDefines: Table[string, (string, int)]          # result → (source, value)
+  var eqReifNoDefines: Table[string, (string, int, int)]   # result → (source, value, ci)
+  var neReifDefines: Table[string, (string, int)]           # result → (source, value)
+  var linLeReifDefines: Table[string, int]                  # result → ci
+  var eqReifDefinesBySource: Table[string, string]          # source → result (value=1 only)
+
+  # Pre-build set of bool/0..1 variable names for fast one-hot validation
+  var boolVarNames: HashSet[string]
+  for decl in tr.model.variables:
+    if decl.isArray: continue
+    case decl.varType.kind
+    of FznBool:
+      boolVarNames.incl(decl.name)
+    of FznIntRange:
+      if decl.varType.lo == 0 and decl.varType.hi == 1:
+        boolVarNames.incl(decl.name)
+    else: discard
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    case name
+    of "int_eq_reif":
+      if con.args.len < 3: continue
+      let srcArg = con.args[0]
+      let valArg = con.args[1]
+      let resultArg = con.args[2]
+      if srcArg.kind != FznIdent or resultArg.kind != FznIdent: continue
+      let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
+      if con.hasAnnotation("defines_var"):
+        eqReifDefines[resultArg.ident] = (srcArg.ident, val)
+        if val == 1:
+          eqReifDefinesBySource[srcArg.ident] = resultArg.ident
+      else:
+        eqReifNoDefines[resultArg.ident] = (srcArg.ident, val, ci)
+    of "int_ne_reif":
+      if con.args.len < 3: continue
+      let srcArg = con.args[0]
+      let valArg = con.args[1]
+      let resultArg = con.args[2]
+      if srcArg.kind != FznIdent or resultArg.kind != FznIdent: continue
+      let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
+      if con.hasAnnotation("defines_var"):
+        neReifDefines[resultArg.ident] = (srcArg.ident, val)
+    of "int_lin_le_reif":
+      if con.args.len < 4: continue
+      let resultArg = con.args[3]
+      if resultArg.kind != FznIdent: continue
+      if con.hasAnnotation("defines_var"):
+        linLeReifDefines[resultArg.ident] = ci
+    else: discard
+
+  # Implication detection — scan bool_clause constraints
+  var implicationGroups: Table[(string, string), seq[(int, int)]]
+  var nConsumed = 0
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+
+    let posArg = con.args[0]
+    let negArg = con.args[1]
+    if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+    if posArg.elems.len != 2 or negArg.elems.len != 0: continue
+
+    let lit0 = posArg.elems[0]
+    let lit1 = posArg.elems[1]
+    if lit0.kind != FznIdent or lit1.kind != FznIdent: continue
+
+    # Identify which literal is neReif and which is linLeReif
+    var neReifLit, linLeReifLit: string
+    if lit0.ident in neReifDefines and lit1.ident in linLeReifDefines:
+      neReifLit = lit0.ident
+      linLeReifLit = lit1.ident
+    elif lit1.ident in neReifDefines and lit0.ident in linLeReifDefines:
+      neReifLit = lit1.ident
+      linLeReifLit = lit0.ident
+    else:
+      continue
+
+    # Trace neReif literal → integer variable
+    let (bVar, neVal) = neReifDefines[neReifLit]
+    if neVal != 1: continue
+    if bVar notin eqReifDefinesBySource: continue
+    let channelVar = eqReifDefinesBySource[bVar]
+    if channelVar notin eqReifNoDefines: continue
+    let (condVar, condValue, _) = eqReifNoDefines[channelVar]
+
+    # Check int_lin_le_reif: all coefficients = -1, rhs = -1 (encoding sum >= 1)
+    let linLeIdx = linLeReifDefines[linLeReifLit]
+    let linLeCon = tr.model.constraints[linLeIdx]
+    let coeffs = try: tr.resolveIntArray(linLeCon.args[0]) except ValueError, KeyError: continue
+    let rhs = try: tr.resolveIntArg(linLeCon.args[2]) except ValueError, KeyError: continue
+    if rhs != -1: continue
+
+    var allNegOne = true
+    for c in coeffs:
+      if c != -1:
+        allNegOne = false
+        break
+    if not allNegOne: continue
+
+    let varElems = tr.resolveVarArrayElems(linLeCon.args[1])
+    if varElems.len != coeffs.len or varElems.len == 0: continue
+
+    # Trace each indicator variable → target integer variable
+    var targetVar = ""
+    var targetValues: seq[int]
+    var valid = true
+
+    for yi in varElems:
+      if yi.kind != FznIdent:
+        valid = false
+        break
+      if yi.ident notin eqReifDefinesBySource:
+        valid = false
+        break
+      let chVarI = eqReifDefinesBySource[yi.ident]
+      if chVarI notin eqReifNoDefines:
+        valid = false
+        break
+      let (tVar, tValue, _) = eqReifNoDefines[chVarI]
+
+      if targetVar == "":
+        targetVar = tVar
+      elif tVar != targetVar:
+        valid = false
+        break
+
+      targetValues.add(tValue)
+
+    if not valid or targetVar == "": continue
+
+    # Record: (condVar == condValue) → (targetVar in targetValues)
+    let key = (condVar, targetVar)
+    if key notin implicationGroups:
+      implicationGroups[key] = @[]
+    for tv in targetValues:
+      implicationGroups[key].add((condValue, tv))
+
+    # Mark consumed
+    tr.definingConstraints.incl(ci)        # bool_clause
+    tr.definingConstraints.incl(linLeIdx)  # int_lin_le_reif
+    tr.definedVarNames.incl(linLeReifLit)  # result var of linLeReif
+    nConsumed += 2
+
+  # Build table constraints from grouped implications
+  for key, tuples in implicationGroups:
+    let (condVar, targetVar) = key
+    var tableTuples: seq[seq[int]]
+    for (cv, tv) in tuples:
+      tableTuples.add(@[cv, tv])
+    tr.implicationTables.add((condVar: condVar, targetVar: targetVar, tuples: tableTuples))
+
+  # One-hot channel detection — convert indicator vars to channels of integer vars
+  for channel, entry in eqReifNoDefines.pairs:
+    let (intVar, v, ci) = entry
+    if ci in tr.definingConstraints: continue
+    if channel notin eqReifDefines: continue
+    let (bV, eqVal) = eqReifDefines[channel]
+    if eqVal != 1: continue
+    if bV in tr.channelVarNames or bV in tr.definedVarNames: continue
+    if bV notin boolVarNames: continue
+
+    tr.oneHotChannelDefs.add((indicatorVar: bV, intVar: intVar, value: v))
+    tr.definingConstraints.incl(ci)
+    tr.channelVarNames.incl(bV)
+
+  if tr.implicationTables.len > 0:
+    stderr.writeLine(&"[FZN] Detected implication table patterns: {tr.implicationTables.len} tables, {nConsumed} constraints consumed")
+  if tr.oneHotChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected one-hot channels: {tr.oneHotChannelDefs.len} indicator variables")
+
+
+proc buildOneHotChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings for one-hot indicator variables detected by
+  ## detectImplicationPatterns. Each indicator B_v = (intVar == value) becomes
+  ## a channel: B_v = element(intVar - lo, [1 if v==value else 0 for v in domain])
+
+  for def in tr.oneHotChannelDefs:
+    let indicatorVar = def.indicatorVar
+    let intVar = def.intVar
+    let value = def.value
+
+    if indicatorVar notin tr.varPositions: continue
+    if intVar notin tr.varPositions: continue
+
+    let indicatorPos = tr.varPositions[indicatorVar]
+    let intPos = tr.varPositions[intVar]
+    let intExpr = tr.getExpr(intPos)
+    let domain = tr.lookupVarDomain(intVar)
+    if domain.len == 0: continue
+
+    let lo = domain[0]
+    let indexExpr = intExpr - lo
+
+    var arrayElems: seq[ArrayElement[int]]
+    for v in domain:
+      arrayElems.add(ArrayElement[int](isConstant: true,
+          constantValue: if v == value: 1 else: 0))
+
+    let binding = ChannelBinding[int](
+      channelPosition: indicatorPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(indicatorPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  if tr.oneHotChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Built {tr.oneHotChannelDefs.len} one-hot channel bindings " &
+                     &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
 proc detectDfaGeostPattern(tr: var FznTranslator) =
   ## Detects multiple fzn_regular constraints over the same variable array
   ## (tiling pattern) and converts them to a single geost constraint.
@@ -2317,6 +2554,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCountPatterns()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
+  # Detect implication-to-table and one-hot channel patterns
+  result.detectImplicationPatterns()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
   # Detect redundant ordering constraints (transitive reduction)
@@ -2367,6 +2606,13 @@ proc translate*(model: FznModel): FznTranslator =
     else:
       result.translateConstraint(con)
 
+  # Add table constraints for detected implication patterns
+  for tbl in result.implicationTables:
+    if tbl.condVar in result.varPositions and tbl.targetVar in result.varPositions:
+      let condPos = result.varPositions[tbl.condVar]
+      let targetPos = result.varPositions[tbl.targetVar]
+      result.sys.addConstraint(tableIn[int](@[condPos, targetPos], tbl.tuples))
+
   # Add geost constraint if conversion is active
   if result.geostConversion.tileValues.len > 0:
     result.sys.addConstraint(geost[int](
@@ -2378,5 +2624,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildChannelBindings()
   # Build channel bindings for int_eq_reif/bool2int reification channels
   result.buildReifChannelBindings()
+  # Build channel bindings for one-hot indicator variables
+  result.buildOneHotChannelBindings()
 
   result.translateSolve()
