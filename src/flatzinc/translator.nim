@@ -1875,7 +1875,7 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
   # Build indexes — single pass over all constraints (including consumed ones for tracing)
   var eqReifDefines: Table[string, (string, int)]          # result → (source, value)
   var eqReifNoDefines: Table[string, (string, int, int)]   # result → (source, value, ci)
-  var neReifDefines: Table[string, (string, int)]           # result → (source, value)
+  var neReifDefines: Table[string, (string, int, int)]       # result → (source, value, ci)
   var linLeReifDefines: Table[string, int]                  # result → ci
   var eqReifDefinesBySource: Table[string, string]          # source → result (value=1 only)
   var notOneVars: HashSet[string]                           # vars where int_eq_reif(var, 1, false) exists
@@ -1926,7 +1926,7 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
       if srcArg.kind != FznIdent or resultArg.kind != FznIdent: continue
       let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
       if con.hasAnnotation("defines_var"):
-        neReifDefines[resultArg.ident] = (srcArg.ident, val)
+        neReifDefines[resultArg.ident] = (srcArg.ident, val, ci)
     of "int_lin_le_reif":
       if con.args.len < 4: continue
       let resultArg = con.args[3]
@@ -1979,7 +1979,7 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
 
     # Case 1: [ne_reif, lin_le_reif] — transition pattern (agent moves to neighbor)
     if otherLit in linLeReifDefines:
-      let (bVar, neVal) = neReifDefines[neReifLit]
+      let (bVar, neVal, neReifCi) = neReifDefines[neReifLit]
       if neVal != 1: continue
 
       # Trace neReif through indicator chain → integer variable
@@ -1989,8 +1989,10 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
           let linLeIdx = linLeReifDefines[otherLit]
           tr.definingConstraints.incl(ci)        # bool_clause
           tr.definingConstraints.incl(linLeIdx)  # int_lin_le_reif
+          tr.definingConstraints.incl(neReifCi)  # int_ne_reif (trivially satisfied)
+          tr.definedVarNames.incl(neReifLit)     # result var of neReif
           tr.definedVarNames.incl(otherLit)      # result var of linLeReif
-          nConsumed += 2
+          nConsumed += 3
           nVacuous += 1
         continue
       let channelVar = eqReifDefinesBySource[bVar]
@@ -2056,8 +2058,11 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
       nConsumed += 2
 
     # Case 2: [ne_reif, eq_reif] — direct implication (stay at destination)
+    # Unlike Case 1, no neVal==1 guard needed: here the ne_reif directly references
+    # an integer variable (e.g., int_ne_reif(agentPos, value, B)), so condValue is
+    # the actual integer value, not a boolean indicator.
     elif otherLit in eqReifDefines:
-      let (condVar, condValue) = neReifDefines[neReifLit]
+      let (condVar, condValue, _) = neReifDefines[neReifLit]
       let (targetVar, targetValue) = eqReifDefines[otherLit]
 
       # Record: (condVar == condValue) → (targetVar == targetValue)
@@ -2724,7 +2729,7 @@ proc translate*(model: FznModel): FznTranslator =
             for v in currentDom:
               if v in allowed:
                 newDom.add(v)
-            if newDom.len < currentDom.len:
+            if newDom.len > 0 and newDom.len < currentDom.len:
               result.sys.baseArray.setDomain(targetPos, newDom)
               inc nTableDomainRestrictions
     elif condHasPos and not targetHasPos:
@@ -2745,7 +2750,7 @@ proc translate*(model: FznModel): FznTranslator =
             for v in currentDom:
               if v in allowed:
                 newDom.add(v)
-            if newDom.len < currentDom.len:
+            if newDom.len > 0 and newDom.len < currentDom.len:
               result.sys.baseArray.setDomain(condPos, newDom)
               inc nTableDomainRestrictions
   if nTableDomainRestrictions > 0:
@@ -2759,7 +2764,6 @@ proc translate*(model: FznModel): FznTranslator =
   block:
     # Build adjacency from tables: condPos → targetPos → tuples
     var tableGraph: Table[int, Table[int, seq[seq[int]]]]
-    var allTablePositions: PackedSet[int]
     for cons in result.sys.baseArray.constraints:
       if cons.stateType != TableConstraintType: continue
       let tbl = cons.tableConstraintState
@@ -2767,8 +2771,6 @@ proc translate*(model: FznModel): FznTranslator =
       if tbl.tuples.len < 50: continue  # Skip small (non-transition) tables
       let p0 = tbl.sortedPositions[0]
       let p1 = tbl.sortedPositions[1]
-      allTablePositions.incl(p0)
-      allTablePositions.incl(p1)
       if p0 notin tableGraph:
         tableGraph[p0] = initTable[int, seq[seq[int]]]()
       tableGraph[p0][p1] = tbl.tuples
@@ -2817,6 +2819,19 @@ proc translate*(model: FznModel): FznTranslator =
           let totalSteps = arrPositions.len div stride
           if totalSteps < 3: continue
           if stride * totalSteps != arrPositions.len: continue
+
+          # Validate this is actually a transition chain: check that consecutive
+          # timestep positions for the first agent have table constraints between them.
+          # This prevents false matches on non-transition arrays that happen to have
+          # leading singletons and pass the length divisibility check.
+          var isChain = true
+          for t in 0..<totalSteps - 1:
+            let p0 = arrPositions[t * stride]
+            let p1 = arrPositions[(t + 1) * stride]
+            if p0 notin tableGraph or p1 notin tableGraph[p0]:
+              isChain = false
+              break
+          if not isChain: continue
 
           # Extract start and end values per agent
           var startValues: seq[int]

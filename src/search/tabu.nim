@@ -73,10 +73,14 @@ type
         # Each entry: (channelPos, valueWhenActive) — valueWhenActive=1 for eq_reif, 0 for ne_reif
         oneHotChanges*: Table[int, seq[seq[tuple[chanPos: int, activeVal: int]]]]
         oneHotLo*: Table[int, int]  # source pos -> lo offset from index expression
-        # Reusable buffers for computeChannelDepDelta (avoid per-call heap allocation)
+        # Reusable buffers for computeChannelDepDelta (avoid per-call heap allocation).
+        # NOTE: these make computeChannelDepDelta non-reentrant within a single state.
         cdChanges: seq[(int, T, T)]
         cdWorklist: seq[int]
+        cdVisited: PackedSet[int]  # reusable visited set for worklist propagation
+        cdProcessed: PackedSet[int]  # reusable dedup set for constraint penalty loop
         changedChannelsBuf: seq[int]  # buffer for propagateChannels output
+        cdTargetedUpdates: Table[int, PackedSet[int]]  # reusable buffer for recomputeAffectedChannelDepPenalties
         # Reverse index: channel position → which search positions' channel-dep penalties are affected
         channelDepPosForChannel: Table[int, seq[int]]
         # Two-level reverse index for targeted channel-dep recomputation:
@@ -419,6 +423,54 @@ proc resetProfileStats*[T](state: TabuState[T]) =
 # Channel-Dependent Constraint Penalty Routines
 ################################################################################
 
+proc channelDepConstraintDelta[T](c: StatefulConstraint[T], cdChanges: seq[(int, T, T)]): int =
+    ## Compute the penalty delta for a single channel-dep constraint given a set of
+    ## channel value changes. Uses fast arithmetic for RelationalConstraint+SumExpr,
+    ## falls back to simulate-restore for other constraint types.
+    if c.stateType == RelationalType:
+        let rc = c.relationalState
+        var newLeft = rc.leftValue
+        var newRight = rc.rightValue
+        var canFastPath = true
+
+        case rc.leftExpr.kind
+        of SumExpr:
+            if rc.leftExpr.sumExpr.evalMethod == PositionBased:
+                for (cp, oldV, newV) in cdChanges:
+                    let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
+                    if coeff != 0:
+                        newLeft += coeff * (newV - oldV)
+            else: canFastPath = false
+        of ConstantExpr: discard
+        else: canFastPath = false
+
+        if canFastPath:
+            case rc.rightExpr.kind
+            of SumExpr:
+                if rc.rightExpr.sumExpr.evalMethod == PositionBased:
+                    for (cp, oldV, newV) in cdChanges:
+                        let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
+                        if coeff != 0:
+                            newRight += coeff * (newV - oldV)
+                else: canFastPath = false
+            of ConstantExpr: discard
+            else: canFastPath = false
+
+        if canFastPath:
+            return rc.relation.penalty(newLeft, newRight) - rc.cost
+
+    # Fallback: simulate-restore on the constraint
+    let oldPenalty = c.penalty()
+    for (cp, _, newV) in cdChanges:
+        if cp in c.positions:
+            c.updatePosition(cp, newV)
+    let newPenalty = c.penalty()
+    for j in countdown(cdChanges.len - 1, 0):
+        let (cp, oldV, _) = cdChanges[j]
+        if cp in c.positions:
+            c.updatePosition(cp, oldV)
+    return newPenalty - oldPenalty
+
 proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int =
     ## Compute the total penalty delta from channel-dep constraints if we were
     ## to assign candidateValue at pos. Simulates channel propagation via worklist,
@@ -427,6 +479,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     if pos notin state.carray.channelsAtPosition:
         return 0
 
+    # Clear reusable buffers from previous call
+    state.cdVisited.clear()
     state.cdChanges.setLen(0)
     let savedPos = state.assignment[pos]
     state.assignment[pos] = candidateValue
@@ -460,14 +514,13 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     state.cdChanges.add((chanPos, state.assignment[chanPos], toVal))
                     state.assignment[chanPos] = toVal
 
-        # Propagate downstream from the 2 changed channel positions
+        # Propagate downstream from the changed channel positions
         state.cdWorklist.setLen(0)
         for (chanPos, _, _) in state.cdChanges:
             state.cdWorklist.add(chanPos)
-        var visited: PackedSet[int]
-        visited.incl(pos)
+        state.cdVisited.incl(pos)
         for (chanPos, _, _) in state.cdChanges:
-            visited.incl(chanPos)
+            state.cdVisited.incl(chanPos)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
@@ -483,15 +536,14 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 if newChanVal != state.assignment[chanPos]:
                     state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
                     state.assignment[chanPos] = newChanVal
-                    if chanPos notin visited:
-                        visited.incl(chanPos)
+                    if chanPos notin state.cdVisited:
+                        state.cdVisited.incl(chanPos)
                         state.cdWorklist.add(chanPos)
     else:
         # General worklist propagation
         state.cdWorklist.setLen(0)
         state.cdWorklist.add(pos)
-        var visited: PackedSet[int]
-        visited.incl(pos)
+        state.cdVisited.incl(pos)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
@@ -507,8 +559,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 if newChanVal != state.assignment[chanPos]:
                     state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
                     state.assignment[chanPos] = newChanVal
-                    if chanPos notin visited:
-                        visited.incl(chanPos)
+                    if chanPos notin state.cdVisited:
+                        state.cdVisited.incl(chanPos)
                         state.cdWorklist.add(chanPos)
 
     # Restore all modified assignment values
@@ -524,59 +576,14 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     # iterating all relevant constraints (O(cdChanges * constraints_per_channel)
     # instead of O(all_relevant_constraints * cdChanges)).
     if state.chanPosToDepConstraintIdx.len > 0:
-        var processedConstraints: PackedSet[int]
+        # Clear reusable dedup set
+        state.cdProcessed.clear()
         for (chanPos, _, _) in state.cdChanges:
             if chanPos in state.chanPosToDepConstraintIdx:
                 for ci in state.chanPosToDepConstraintIdx[chanPos]:
-                    if ci in processedConstraints: continue
-                    processedConstraints.incl(ci)
-                    let c = state.channelDepConstraints[ci]
-
-                    # Fast path: RelationalConstraint with SumExpr/ConstantExpr
-                    if c.stateType == RelationalType:
-                        let rc = c.relationalState
-                        var newLeft = rc.leftValue
-                        var newRight = rc.rightValue
-                        var canFastPath = true
-
-                        case rc.leftExpr.kind
-                        of SumExpr:
-                            if rc.leftExpr.sumExpr.evalMethod == PositionBased:
-                                for (cp, oldV, newV) in state.cdChanges:
-                                    let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
-                                    if coeff != 0:
-                                        newLeft += coeff * (newV - oldV)
-                            else: canFastPath = false
-                        of ConstantExpr: discard
-                        else: canFastPath = false
-
-                        if canFastPath:
-                            case rc.rightExpr.kind
-                            of SumExpr:
-                                if rc.rightExpr.sumExpr.evalMethod == PositionBased:
-                                    for (cp, oldV, newV) in state.cdChanges:
-                                        let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
-                                        if coeff != 0:
-                                            newRight += coeff * (newV - oldV)
-                                else: canFastPath = false
-                            of ConstantExpr: discard
-                            else: canFastPath = false
-
-                        if canFastPath:
-                            result += rc.relation.penalty(newLeft, newRight) - rc.cost
-                            continue
-
-                    # Fallback: simulate-restore on the constraint
-                    let oldPenalty = c.penalty()
-                    for (cp, _, newV) in state.cdChanges:
-                        if cp in c.positions:
-                            c.updatePosition(cp, newV)
-                    let newPenalty = c.penalty()
-                    for j in countdown(state.cdChanges.len - 1, 0):
-                        let (cp, oldV, _) = state.cdChanges[j]
-                        if cp in c.positions:
-                            c.updatePosition(cp, oldV)
-                    result += newPenalty - oldPenalty
+                    if ci in state.cdProcessed: continue
+                    state.cdProcessed.incl(ci)
+                    result += channelDepConstraintDelta(state.channelDepConstraints[ci], state.cdChanges)
     else:
         # Fallback: iterate all relevant constraints (no reverse index)
         let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
@@ -587,50 +594,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     affected = true
                     break
             if not affected: continue
-
-            if c.stateType == RelationalType:
-                let rc = c.relationalState
-                var newLeft = rc.leftValue
-                var newRight = rc.rightValue
-                var canFastPath = true
-
-                case rc.leftExpr.kind
-                of SumExpr:
-                    if rc.leftExpr.sumExpr.evalMethod == PositionBased:
-                        for (chanPos, oldV, newV) in state.cdChanges:
-                            let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
-                            if coeff != 0:
-                                newLeft += coeff * (newV - oldV)
-                    else: canFastPath = false
-                of ConstantExpr: discard
-                else: canFastPath = false
-
-                if canFastPath:
-                    case rc.rightExpr.kind
-                    of SumExpr:
-                        if rc.rightExpr.sumExpr.evalMethod == PositionBased:
-                            for (chanPos, oldV, newV) in state.cdChanges:
-                                let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(chanPos, T(0))
-                                if coeff != 0:
-                                    newRight += coeff * (newV - oldV)
-                        else: canFastPath = false
-                    of ConstantExpr: discard
-                    else: canFastPath = false
-
-                if canFastPath:
-                    result += rc.relation.penalty(newLeft, newRight) - rc.cost
-                    continue
-
-            let oldPenalty = c.penalty()
-            for (chanPos, _, newV) in state.cdChanges:
-                if chanPos in c.positions:
-                    c.updatePosition(chanPos, newV)
-            let newPenalty = c.penalty()
-            for j in countdown(state.cdChanges.len - 1, 0):
-                let (chanPos, oldV, _) = state.cdChanges[j]
-                if chanPos in c.positions:
-                    c.updatePosition(chanPos, oldV)
-            result += newPenalty - oldPenalty
+            result += channelDepConstraintDelta(c, state.cdChanges)
 
 
 proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
@@ -671,15 +635,15 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
 
         # Collect targeted (pos, domainIdx) pairs from affected constraints
         # This finds ALL one-hot positions sharing constraints with changed channels
-        var targetedUpdates: Table[int, PackedSet[int]]  # pos -> domainIdx set
+        state.cdTargetedUpdates.clear()
         for ci in affectedConstraintIds.items:
             for entry in state.depConstraintOneHotEntries[ci]:
                 if entry.pos == movedPosition: continue
-                if entry.pos notin targetedUpdates:
-                    targetedUpdates[entry.pos] = initPackedSet[int]()
-                targetedUpdates[entry.pos].incl(entry.domainIdx)
+                if entry.pos notin state.cdTargetedUpdates:
+                    state.cdTargetedUpdates[entry.pos] = initPackedSet[int]()
+                state.cdTargetedUpdates[entry.pos].incl(entry.domainIdx)
 
-        for pos, affectedIndices in targetedUpdates.pairs:
+        for pos, affectedIndices in state.cdTargetedUpdates.pairs:
             # Check if current value is among affected indices
             # (leaving cost baseline changed → all candidates affected)
             let currentVal = state.assignment[pos]
@@ -712,7 +676,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for chanPos in changedChannels:
             if chanPos in state.channelDepPosForChannel:
                 for pos in state.channelDepPosForChannel[chanPos]:
-                    if pos != movedPosition and pos notin targetedUpdates:
+                    if pos != movedPosition and pos notin state.cdTargetedUpdates:
                         nonOneHotPositions.incl(pos)
         for pos in nonOneHotPositions.items:
             when ProfileIteration: state.cdNonOneHotPos += 1
@@ -970,6 +934,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var isOneHot = true
             for bi in bindingIndices:
                 let binding = carray.channelBindings[bi]
+                # Verify this binding uses the same index expression (same lo) as the first
+                let bNode = binding.indexExpression.node
+                var bLo = -1  # sentinel: doesn't match
+                if bNode.kind == RefNode and bNode.position == pos:
+                    bLo = 0
+                elif bNode.kind == BinaryOpNode and bNode.binaryOp == Subtraction and
+                   bNode.left.kind == RefNode and bNode.left.position == pos and
+                   bNode.right.kind == LiteralNode:
+                    bLo = bNode.right.value
+                if bLo != lo:
+                    isOneHot = false
+                    break
                 if binding.arrayElements.len != arrayLen:
                     isOneHot = false
                     break

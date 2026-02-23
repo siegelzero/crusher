@@ -46,6 +46,7 @@ type
 
 proc initStateWorker[T](data: StateInitData[T]) {.thread.} =
     {.cast(gcsafe).}:
+        randomize()
         try:
             data.result[] = newTabuState[T](data.carray, verbose = data.verbose, id = data.id)
         except CatchableError as e:
@@ -94,8 +95,8 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
                 break
 
     except CatchableError as e:
-        echo "[Worker " & $data.workerId & "] Error: " & e.msg
-        echo "[Worker " & $data.workerId & "] Stack: " & e.getStackTrace()
+        stderr.writeLine("[Worker " & $data.workerId & "] Error: " & e.msg)
+        stderr.writeLine("[Worker " & $data.workerId & "] Stack: " & e.getStackTrace())
 
 iterator improveStates*[T](population: seq[TabuState[T]],
                            numWorkers: int = 0,
@@ -237,7 +238,9 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     for i in 0..<populationSize:
         carrays[i] = system.deepCopy().baseArray
 
-    # Initialize TabuStates in parallel batches
+    # Initialize TabuStates in parallel batches.
+    # SAFETY: population is pre-allocated to final size above and never resized,
+    # so `addr population[idx]` remains valid through joinThreads.
     let batchSize = min(actualWorkers, populationSize)
     var createdCount = 0
     while createdCount < populationSize:
@@ -270,7 +273,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
 
     if verbose:
         let populationTime = epochTime() - populationStartTime
-        echo &"[Solve] Created {populationSize} states in {populationTime:.3f}s"
+        echo &"[Solve] Created {population.len} states in {populationTime:.3f}s"
 
     # Collect all results from parallel tabu improvement
     var allResults: seq[PoolEntry[T]] = @[]
