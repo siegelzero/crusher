@@ -1261,6 +1261,46 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[mPos] = intersection
                             outerChanged = true
 
+        # Phase 7: Table constraint arc consistency
+        # For each TableIn constraint, remove domain values that have no support
+        # (no tuple where all other columns' values are in their domains).
+        # Tables may be partial (from implications): values not appearing in any
+        # tuple are unconstrained by this table and are skipped. Only values that
+        # DO appear but have no supported tuple are pruned.
+        for cons in carray.constraints:
+            if cons.stateType != TableConstraintType:
+                continue
+            let tbl = cons.tableConstraintState
+            if tbl.mode != TableIn:
+                continue
+            # Only apply AC to large tables (e.g., transition tables with full graph
+            # adjacency). Small tables from implications may be partial — they encode
+            # one-directional constraints where not all valid combinations are listed.
+            if tbl.tuples.len < 50:
+                continue
+            let nCols = tbl.sortedPositions.len
+            for col in 0..<nCols:
+                let pos = tbl.sortedPositions[col]
+                for v in toSeq(currentDomain[pos].items):
+                    if v notin tbl.tuplesByColumnValue[col]:
+                        continue  # Not mentioned in table — unconstrained
+                    # Check if any tuple with this value has support in all other columns
+                    var hasSupport = false
+                    for t in tbl.tuplesByColumnValue[col][v]:
+                        var supported = true
+                        for otherCol in 0..<nCols:
+                            if otherCol == col:
+                                continue
+                            let otherPos = tbl.sortedPositions[otherCol]
+                            if tbl.tuples[t][otherCol] notin currentDomain[otherPos]:
+                                supported = false
+                                break
+                        if supported:
+                            hasSupport = true
+                            break
+                    if not hasSupport:
+                        currentDomain[pos].excl(v)
+                        outerChanged = true
         if not outerChanged:
             break
 

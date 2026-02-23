@@ -230,28 +230,33 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             else:
                 echo &"[Scatter] No promising entries to improve"
 
-        # Tabu-improve promising entries
+        # Tabu-improve promising entries in batches to limit memory usage
         let improveStart = currentTime()
         var improvements: seq[PoolEntry[T]] = @[]
         var improvedCount = 0
         if promising.len > 0:
-            var toImprove = newSeq[TabuState[T]](promising.len)
-            for pi in 0..<promising.len:
-                let sc = system.deepCopy()
-                toImprove[pi] = newTabuState[T](sc.baseArray, promising[pi].assignment, verbose = false, id = pi)
+            let batchSize = actualWorkers
+            for batchStart in countup(0, promising.len - 1, batchSize):
+                if deadline > 0 and epochTime() > deadline:
+                    break
+                let batchEnd = min(batchStart + batchSize, promising.len)
+                var toImprove = newSeq[TabuState[T]](batchEnd - batchStart)
+                for pi in batchStart..<batchEnd:
+                    let sc = system.deepCopy()
+                    toImprove[pi - batchStart] = newTabuState[T](sc.baseArray, promising[pi].assignment, verbose = false, id = pi)
 
-            for batchResult in improveStates(toImprove, actualWorkers, relinkThreshold, verbose = false, deadline = deadline):
-                inc improvedCount
-                if batchResult.found:
-                    system.initialize(batchResult.assignment)
-                    if verbose:
-                        echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
-                    return true
-                if batchResult.cost < pool.minCost:
-                    improvements.add(PoolEntry[T](
-                        assignment: batchResult.assignment,
-                        cost: batchResult.cost
-                    ))
+                for batchResult in improveStates(toImprove, actualWorkers, relinkThreshold, verbose = false, deadline = deadline):
+                    inc improvedCount
+                    if batchResult.found:
+                        system.initialize(batchResult.assignment)
+                        if verbose:
+                            echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                        return true
+                    if batchResult.cost < pool.minCost:
+                        improvements.add(PoolEntry[T](
+                            assignment: batchResult.assignment,
+                            cost: batchResult.cost
+                        ))
 
         if verbose:
             let improveElapsed = currentTime() - improveStart
@@ -427,28 +432,33 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[LNS] Created {perturbed.len} perturbed states in {currentTime() - perturbStart:.2f}s"
 
-        # b. REPAIR: Tabu-improve all perturbed states
+        # b. REPAIR: Tabu-improve perturbed states in batches to limit memory usage
         let repairStart = currentTime()
         var improvements: seq[PoolEntry[T]] = @[]
         var repairedCount = 0
 
-        var toRepair = newSeq[TabuState[T]](perturbed.len)
-        for pi in 0..<perturbed.len:
-            let sc = system.deepCopy()
-            toRepair[pi] = newTabuState[T](sc.baseArray, perturbed[pi], verbose = false, id = pi)
+        let batchSize = actualWorkers
+        for batchStart in countup(0, perturbed.len - 1, batchSize):
+            if deadline > 0 and epochTime() > deadline:
+                break
+            let batchEnd = min(batchStart + batchSize, perturbed.len)
+            var toRepair = newSeq[TabuState[T]](batchEnd - batchStart)
+            for pi in batchStart..<batchEnd:
+                let sc = system.deepCopy()
+                toRepair[pi - batchStart] = newTabuState[T](sc.baseArray, perturbed[pi], verbose = false, id = pi)
 
-        for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
-            inc repairedCount
-            if batchResult.found:
-                system.initialize(batchResult.assignment)
-                if verbose:
-                    echo &"[LNS] Solution found during repair (iter {iter}, {currentTime() - totalStart:.2f}s total)"
-                return true
-            if batchResult.cost < pool.maxCost:
-                improvements.add(PoolEntry[T](
-                    assignment: batchResult.assignment,
-                    cost: batchResult.cost
-                ))
+            for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
+                inc repairedCount
+                if batchResult.found:
+                    system.initialize(batchResult.assignment)
+                    if verbose:
+                        echo &"[LNS] Solution found during repair (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                    return true
+                if batchResult.cost < pool.maxCost:
+                    improvements.add(PoolEntry[T](
+                        assignment: batchResult.assignment,
+                        cost: batchResult.cost
+                    ))
 
         if verbose:
             let repairElapsed = currentTime() - repairStart

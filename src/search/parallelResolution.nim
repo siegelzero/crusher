@@ -1,4 +1,4 @@
-import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random, algorithm]
+import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random, algorithm, sequtils]
 
 import tabu
 import candidatePool
@@ -48,8 +48,9 @@ proc initStateWorker[T](data: StateInitData[T]) {.thread.} =
     {.cast(gcsafe).}:
         try:
             data.result[] = newTabuState[T](data.carray, verbose = data.verbose, id = data.id)
-        except CatchableError:
-            discard
+        except CatchableError as e:
+            stderr.writeLine("[InitWorker " & $data.id & "] Error: " & e.msg)
+            stderr.writeLine("[InitWorker " & $data.id & "] Stack: " & e.getStackTrace())
 
 proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
     try:
@@ -255,6 +256,17 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
             createThread(threads[j], initStateWorker[T], workerDatas[j])
         joinThreads(threads)
         createdCount = batchEnd
+
+    # Check for failed initializations (nil states from worker exceptions)
+    var failedStates: seq[int]
+    for i in 0..<populationSize:
+        if population[i].isNil:
+            failedStates.add(i)
+    if failedStates.len > 0:
+        stderr.writeLine(&"[Solve] WARNING: {failedStates.len}/{populationSize} states failed to initialize")
+        population.keepItIf(not it.isNil)
+        if population.len == 0:
+            raise newException(CatchableError, "All TabuState initializations failed")
 
     if verbose:
         let populationTime = epochTime() - populationStartTime

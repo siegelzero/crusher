@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
 
 type
@@ -2697,11 +2697,194 @@ proc translate*(model: FznModel): FznTranslator =
       result.translateConstraint(con)
 
   # Add table constraints for detected implication patterns
+  var nTableDomainRestrictions = 0
   for tbl in result.implicationTables:
-    if tbl.condVar in result.varPositions and tbl.targetVar in result.varPositions:
+    let condHasPos = tbl.condVar in result.varPositions
+    let targetHasPos = tbl.targetVar in result.varPositions
+    if condHasPos and targetHasPos:
       let condPos = result.varPositions[tbl.condVar]
       let targetPos = result.varPositions[tbl.targetVar]
       result.sys.addConstraint(tableIn[int](@[condPos, targetPos], tbl.tuples))
+    elif not condHasPos and targetHasPos:
+      # condVar was eliminated — check if it's a constant
+      if tbl.condVar in result.definedVarExprs:
+        let expr = result.definedVarExprs[tbl.condVar]
+        if expr.node.kind == LiteralNode:
+          let constVal = expr.node.value
+          let targetPos = result.varPositions[tbl.targetVar]
+          # Filter tuples to those matching the constant condVar value
+          var allowed: PackedSet[int]
+          for t in tbl.tuples:
+            if t[0] == constVal:
+              allowed.incl(t[1])
+          if allowed.len > 0:
+            # Restrict targetVar's domain to intersection with allowed values
+            let currentDom = result.sys.baseArray.domain[targetPos]
+            var newDom: seq[int]
+            for v in currentDom:
+              if v in allowed:
+                newDom.add(v)
+            if newDom.len < currentDom.len:
+              result.sys.baseArray.setDomain(targetPos, newDom)
+              inc nTableDomainRestrictions
+    elif condHasPos and not targetHasPos:
+      # targetVar was eliminated — check if it's a constant
+      if tbl.targetVar in result.definedVarExprs:
+        let expr = result.definedVarExprs[tbl.targetVar]
+        if expr.node.kind == LiteralNode:
+          let constVal = expr.node.value
+          let condPos = result.varPositions[tbl.condVar]
+          # Filter tuples to those matching the constant targetVar value
+          var allowed: PackedSet[int]
+          for t in tbl.tuples:
+            if t[1] == constVal:
+              allowed.incl(t[0])
+          if allowed.len > 0:
+            let currentDom = result.sys.baseArray.domain[condPos]
+            var newDom: seq[int]
+            for v in currentDom:
+              if v in allowed:
+                newDom.add(v)
+            if newDom.len < currentDom.len:
+              result.sys.baseArray.setDomain(condPos, newDom)
+              inc nTableDomainRestrictions
+  if nTableDomainRestrictions > 0:
+    stderr.writeLine(&"[FZN] Table domain restrictions from eliminated variables: {nTableDomainRestrictions}")
+
+  # Detect transition table chains and apply bidirectional multi-hop reachability
+  # domain reduction. MiniZinc may eliminate boundary variables (e.g., agentAtTimeT[1,a]=58
+  # becomes a constant). We extract the graph from transition tables, identify the chain
+  # structure from the output array, and compute forward/backward BFS to restrict all
+  # timestep variables — not just the ones adjacent to boundaries.
+  block:
+    # Build adjacency from tables: condPos → targetPos → tuples
+    var tableGraph: Table[int, Table[int, seq[seq[int]]]]
+    var allTablePositions: PackedSet[int]
+    for cons in result.sys.baseArray.constraints:
+      if cons.stateType != TableConstraintType: continue
+      let tbl = cons.tableConstraintState
+      if tbl.mode != TableIn or tbl.sortedPositions.len != 2: continue
+      if tbl.tuples.len < 50: continue  # Skip small (non-transition) tables
+      let p0 = tbl.sortedPositions[0]
+      let p1 = tbl.sortedPositions[1]
+      allTablePositions.incl(p0)
+      allTablePositions.incl(p1)
+      if p0 notin tableGraph:
+        tableGraph[p0] = initTable[int, seq[seq[int]]]()
+      tableGraph[p0][p1] = tbl.tuples
+
+    if tableGraph.len > 0:
+      # Extract graph adjacency as union across ALL transition tables
+      var graphAdj: Table[int, PackedSet[int]]  # node -> forward neighbors
+      var reverseAdj: Table[int, PackedSet[int]]  # node -> backward neighbors
+      for condPos, targets in tableGraph:
+        for targetPos, tuples in targets:
+          for t in tuples:
+            if t[0] notin graphAdj:
+              graphAdj[t[0]] = initPackedSet[int]()
+            graphAdj[t[0]].incl(t[1])
+            if t[1] notin reverseAdj:
+              reverseAdj[t[1]] = initPackedSet[int]()
+            reverseAdj[t[1]].incl(t[0])
+
+      if graphAdj.len > 0:
+        # Find chain structure from output arrays
+        for arrName, arrPositions in result.arrayPositions:
+          if arrPositions.len < 20: continue
+          # Detect stride from initial singletons (eliminated boundary variables)
+          var startSingletons = 0
+          for i in 0..<arrPositions.len:
+            if result.sys.baseArray.domain[arrPositions[i]].len == 1:
+              inc startSingletons
+            else:
+              break
+          if startSingletons == 0: continue
+          let stride = startSingletons
+
+          # Verify first row of variables exists
+          if arrPositions.len <= stride: continue
+          if result.sys.baseArray.domain[arrPositions[stride]].len <= 1: continue
+
+          # Detect end singletons
+          var endSingletons = 0
+          for i in countdown(arrPositions.len - 1, 0):
+            if result.sys.baseArray.domain[arrPositions[i]].len == 1:
+              inc endSingletons
+            else:
+              break
+
+          # Compute number of timesteps: total array / stride
+          let totalSteps = arrPositions.len div stride
+          if totalSteps < 3: continue
+          if stride * totalSteps != arrPositions.len: continue
+
+          # Extract start and end values per agent
+          var startValues: seq[int]
+          var endValues: seq[int]
+          var hasStart = true
+          var hasEnd = (endSingletons == stride)
+          for a in 0..<stride:
+            let sPos = arrPositions[a]
+            if result.sys.baseArray.domain[sPos].len != 1:
+              hasStart = false
+              break
+            startValues.add(result.sys.baseArray.domain[sPos][0])
+          if not hasStart: continue
+
+          if hasEnd:
+            for a in 0..<stride:
+              let ePos = arrPositions[(totalSteps - 1) * stride + a]
+              if result.sys.baseArray.domain[ePos].len != 1:
+                hasEnd = false
+                break
+              endValues.add(result.sys.baseArray.domain[ePos][0])
+
+          # Bidirectional BFS: compute reachable sets per agent per timestep
+          var nChainRestrictions = 0
+          for a in 0..<stride:
+            # Forward BFS from start node
+            var forward: seq[PackedSet[int]]
+            forward.setLen(totalSteps)
+            forward[0].incl(startValues[a])
+            for t in 1..<totalSteps:
+              for node in forward[t-1].items:
+                if node in graphAdj:
+                  forward[t] = forward[t] + graphAdj[node]
+
+            # Backward BFS from end node (if known)
+            var backward: seq[PackedSet[int]]
+            if hasEnd:
+              backward.setLen(totalSteps)
+              backward[totalSteps - 1].incl(endValues[a])
+              for t in countdown(totalSteps - 2, 0):
+                for node in backward[t+1].items:
+                  if node in reverseAdj:
+                    backward[t] = backward[t] + reverseAdj[node]
+
+            # Restrict domains at each non-boundary timestep
+            for t in 1..<totalSteps - (if hasEnd: 1 else: 0):
+              let pos = arrPositions[t * stride + a]
+              let currentDom = result.sys.baseArray.domain[pos]
+              if currentDom.len <= 1: continue
+
+              # Intersect with forward reachability
+              var reachable = forward[t]
+              # Intersect with backward reachability if available
+              if hasEnd and backward[t].len > 0:
+                reachable = reachable * backward[t]
+
+              if reachable.len == 0: continue  # Safety: don't empty a domain
+
+              var newDom: seq[int]
+              for v in currentDom:
+                if v in reachable:
+                  newDom.add(v)
+              if newDom.len > 0 and newDom.len < currentDom.len:
+                result.sys.baseArray.setDomain(pos, newDom)
+                inc nChainRestrictions
+
+          if nChainRestrictions > 0:
+            stderr.writeLine(&"[FZN] Bidirectional reachability restrictions: {nChainRestrictions} positions ({stride} agents, {totalSteps} timesteps)")
 
   # Add geost constraint if conversion is active
   if result.geostConversion.tileValues.len > 0:
