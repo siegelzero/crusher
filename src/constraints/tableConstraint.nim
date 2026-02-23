@@ -8,6 +8,11 @@
 
 import std/[packedsets, tables]
 
+const MinTransitionTableSize* = 50
+  ## Tables with fewer tuples than this are considered partial (e.g., from
+  ## implication patterns) and skipped for arc consistency and transition chain
+  ## detection. Large tables (transition graphs) have full adjacency.
+
 ################################################################################
 # Type definitions
 ################################################################################

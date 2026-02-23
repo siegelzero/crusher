@@ -1,5 +1,5 @@
 import std/[packedsets, random, sequtils, strformat, tables]
-import constraints/[stateful, algebraic, ordering, types]
+import constraints/[stateful, algebraic, ordering, types, tableConstraint]
 import constraints/constraintNode
 import constraints/relationalConstraint
 import constraints/elementState
@@ -1276,7 +1276,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             # Only apply AC to large tables (e.g., transition tables with full graph
             # adjacency). Small tables from implications may be partial — they encode
             # one-directional constraints where not all valid combinations are listed.
-            if tbl.tuples.len < 50:
+            if tbl.tuples.len < MinTransitionTableSize:
                 continue
             let nCols = tbl.sortedPositions.len
             for col in 0..<nCols:

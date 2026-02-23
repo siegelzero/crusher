@@ -224,6 +224,10 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             if promising.len >= maxPromising:
                 break
 
+        # Free path entries — promising has been extracted, allPathEntries is no longer needed.
+        # This can reclaim >1 GB for large problems before batch improvement allocates new states.
+        allPathEntries.setLen(0)
+
         if verbose:
             if promising.len > 0:
                 echo &"[Scatter] Improving {promising.len} promising entries (best={promising[0].cost}, worst={promising[^1].cost})"

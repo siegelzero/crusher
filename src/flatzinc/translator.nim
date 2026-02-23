@@ -2768,7 +2768,7 @@ proc translate*(model: FznModel): FznTranslator =
       if cons.stateType != TableConstraintType: continue
       let tbl = cons.tableConstraintState
       if tbl.mode != TableIn or tbl.sortedPositions.len != 2: continue
-      if tbl.tuples.len < 50: continue  # Skip small (non-transition) tables
+      if tbl.tuples.len < MinTransitionTableSize: continue  # Skip small (non-transition) tables
       let p0 = tbl.sortedPositions[0]
       let p1 = tbl.sortedPositions[1]
       if p0 notin tableGraph:
@@ -2821,16 +2821,18 @@ proc translate*(model: FznModel): FznTranslator =
           if stride * totalSteps != arrPositions.len: continue
 
           # Validate this is actually a transition chain: check that consecutive
-          # timestep positions for the first agent have table constraints between them.
+          # timestep positions for ALL agents have table constraints between them.
           # This prevents false matches on non-transition arrays that happen to have
           # leading singletons and pass the length divisibility check.
           var isChain = true
-          for t in 0..<totalSteps - 1:
-            let p0 = arrPositions[t * stride]
-            let p1 = arrPositions[(t + 1) * stride]
-            if p0 notin tableGraph or p1 notin tableGraph[p0]:
-              isChain = false
-              break
+          for a in 0..<stride:
+            for t in 0..<totalSteps - 1:
+              let p0 = arrPositions[t * stride + a]
+              let p1 = arrPositions[(t + 1) * stride + a]
+              if p0 notin tableGraph or p1 notin tableGraph[p0]:
+                isChain = false
+                break
+            if not isChain: break
           if not isChain: continue
 
           # Extract start and end values per agent

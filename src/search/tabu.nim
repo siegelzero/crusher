@@ -75,6 +75,7 @@ type
         oneHotLo*: Table[int, int]  # source pos -> lo offset from index expression
         # Reusable buffers for computeChannelDepDelta (avoid per-call heap allocation).
         # NOTE: these make computeChannelDepDelta non-reentrant within a single state.
+        cdInUse: bool  # debug guard against reentrant calls
         cdChanges: seq[(int, T, T)]
         cdWorklist: seq[int]
         cdVisited: PackedSet[int]  # reusable visited set for worklist propagation
@@ -478,6 +479,10 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     ## to simulate-restore for other constraint types.
     if pos notin state.carray.channelsAtPosition:
         return 0
+
+    assert not state.cdInUse, "computeChannelDepDelta is not reentrant"
+    state.cdInUse = true
+    defer: state.cdInUse = false
 
     # Clear reusable buffers from previous call
     state.cdVisited.clear()
@@ -1075,6 +1080,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.channelDepPenalties[pos] = newSeq[int](dsize)
 
     # Compute initial channel-dep penalties (before penalty map build)
+    state.cdInUse = false
     if state.hasChannelDeps:
         let cdStart = epochTime()
         var cdBinaryCount = 0
