@@ -14,6 +14,7 @@ type
         assignment*: seq[T]  # Safe copy of solution values
         workerId*: int
         iterations*: int
+        lastImprovement*: int  # Iteration of last bestCost improvement
         startTime*: float
         endTime*: float
 
@@ -36,22 +37,33 @@ proc getOptimalWorkerCount*(): int =
     # Use CPU count, but cap at reasonable maximum
     min(countProcessors(), 8)
 
-# Parallel state initialization
+# Parallel state initialization (work-stealing pool)
 type
-    StateInitData[T] = object
-        carray: ConstrainedArray[T]
-        result: ptr TabuState[T]
-        id: int
+    InitPool[T] = object
+        carrays: ptr UncheckedArray[ConstrainedArray[T]]
+        results: ptr UncheckedArray[TabuState[T]]
+        nextTaskIndex: Atomic[int]
+        totalTasks: int
         verbose: bool
 
-proc initStateWorker[T](data: StateInitData[T]) {.thread.} =
+    InitWorkerData[T] = object
+        workerId: int
+        pool: ptr InitPool[T]
+
+proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
     {.cast(gcsafe).}:
         randomize()
-        try:
-            data.result[] = newTabuState[T](data.carray, verbose = data.verbose, id = data.id)
-        except CatchableError as e:
-            stderr.writeLine("[InitWorker " & $data.id & "] Error: " & e.msg)
-            stderr.writeLine("[InitWorker " & $data.id & "] Stack: " & e.getStackTrace())
+        let pool = data.pool
+        while true:
+            let idx = pool.nextTaskIndex.fetchAdd(1)
+            if idx >= pool.totalTasks:
+                break
+            try:
+                pool.results[idx] = newTabuState[T](pool.carrays[idx],
+                    verbose = pool.verbose and idx == 0, id = idx)
+            except CatchableError as e:
+                stderr.writeLine("[InitWorker " & $data.workerId & "] Error on state " & $idx & ": " & e.msg)
+                stderr.writeLine("[InitWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
 
 proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
     try:
@@ -80,6 +92,7 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
                 assignment: improved.assignment,
                 workerId: data.workerId,
                 iterations: improved.iteration,
+                lastImprovement: improved.lastImprovementIter,
                 startTime: startTime,
                 endTime: endTime
             )
@@ -120,6 +133,7 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                     assignment: improved.assignment,
                     workerId: 0,
                     iterations: improved.iteration,
+                    lastImprovement: improved.lastImprovementIter,
                     startTime: startTime,
                     endTime: endTime
                 )
@@ -210,13 +224,186 @@ iterator improveStates*[T](population: seq[TabuState[T]],
             for i in 0..<workerData.len:
                 workerData[i].pool = nil
 
+# Combined init+improve work-stealing pool — no batch boundaries.
+# Workers grab a task, create TabuState from pre-deepCopied array + assignment,
+# run tabuImprove, and store the result. Results stream in as they complete.
+type
+    AssignmentPool*[T] = object
+        carrays*: ptr UncheckedArray[ConstrainedArray[T]]
+        assignments*: ptr UncheckedArray[seq[T]]
+        nextTaskIndex*: Atomic[int]
+        solutionFound*: Atomic[bool]
+        totalTasks*: int
+        tabuThreshold*: int
+        deadline*: float
+        results*: seq[BatchResult[T]]
+        resultsLock*: Lock
+
+    AssignmentWorkerData*[T] = object
+        workerId*: int
+        pool*: ptr AssignmentPool[T]
+
+proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
+    try:
+        randomize()
+        let pool = data.pool
+
+        while not pool.solutionFound.load():
+            let idx = pool.nextTaskIndex.fetchAdd(1)
+            if idx >= pool.totalTasks:
+                break
+            if pool.solutionFound.load():
+                break
+
+            # Create TabuState from pre-deepCopied array + assignment, then improve
+            let state = newTabuState[T](pool.carrays[idx], pool.assignments[idx],
+                verbose = false, id = idx)
+            let startTime = epochTime()
+            let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound, pool.deadline)
+            let endTime = epochTime()
+
+            let result = BatchResult[T](
+                found: improved.bestCost == 0,
+                cost: improved.bestCost,
+                assignment: improved.assignment,
+                workerId: data.workerId,
+                iterations: improved.iteration,
+                lastImprovement: improved.lastImprovementIter,
+                startTime: startTime,
+                endTime: endTime
+            )
+
+            if result.found:
+                pool.solutionFound.store(true)
+
+            withLock pool.resultsLock:
+                pool.results.add(result)
+
+            if result.found:
+                break
+
+    except CatchableError as e:
+        stderr.writeLine("[AssignmentWorker " & $data.workerId & "] Error: " & e.msg)
+        stderr.writeLine("[AssignmentWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
+
+iterator improveFromAssignments*[T](system: ConstraintSystem[T],
+                                     assignments: seq[seq[T]],
+                                     numWorkers: int = 0,
+                                     tabuThreshold: int = 10000,
+                                     deadline: float = 0.0): BatchResult[T] =
+    ## Work-stealing iterator: pre-deepCopies arrays sequentially, then workers
+    ## each grab a task, create TabuState + improve, yielding results as they complete.
+    ## No batch boundaries — eliminates idle gaps and missed results at deadline.
+    let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers
+
+    if assignments.len > 0:
+        if assignments.len == 1 or actualWorkers == 1:
+            # Sequential fallback
+            for i in 0..<assignments.len:
+                let sc = system.deepCopy()
+                let state = newTabuState[T](sc.baseArray, assignments[i], verbose = false, id = i)
+                let startTime = epochTime()
+                let improved = state.tabuImprove(tabuThreshold, deadline = deadline)
+                let endTime = epochTime()
+                let result = BatchResult[T](
+                    found: improved.bestCost == 0,
+                    cost: improved.bestCost,
+                    assignment: improved.assignment,
+                    workerId: 0,
+                    iterations: improved.iteration,
+                    lastImprovement: improved.lastImprovementIter,
+                    startTime: startTime,
+                    endTime: endTime
+                )
+                yield result
+                if result.found:
+                    break
+        else:
+            # Pre-deepCopy all arrays sequentially (ARC thread safety)
+            var carrays = newSeq[ConstrainedArray[T]](assignments.len)
+            for i in 0..<assignments.len:
+                carrays[i] = system.deepCopy().baseArray
+
+            # Set up work-stealing pool
+            var assignmentsCopy = assignments  # Local copy for addr stability
+            var pool = AssignmentPool[T](
+                carrays: cast[ptr UncheckedArray[ConstrainedArray[T]]](addr carrays[0]),
+                assignments: cast[ptr UncheckedArray[seq[T]]](addr assignmentsCopy[0]),
+                totalTasks: assignments.len,
+                tabuThreshold: tabuThreshold,
+                deadline: deadline,
+                results: newSeq[BatchResult[T]]()
+            )
+            pool.nextTaskIndex.store(0)
+            pool.solutionFound.store(false)
+            initLock(pool.resultsLock)
+
+            # Start workers
+            let workerCount = min(actualWorkers, assignments.len)
+            var workers = newSeq[Thread[AssignmentWorkerData[T]]](workerCount)
+            var workerDatas = newSeq[AssignmentWorkerData[T]](workerCount)
+            for i in 0..<workerCount:
+                workerDatas[i] = AssignmentWorkerData[T](workerId: i, pool: addr pool)
+                createThread(workers[i], assignmentWorker[T], workerDatas[i])
+
+            # Monitor and yield results as they become available
+            var yieldedResults = 0
+            var lastResultCount = 0
+
+            while yieldedResults < assignments.len and not pool.solutionFound.load():
+                var currentResults: seq[BatchResult[T]]
+                withLock pool.resultsLock:
+                    currentResults = pool.results
+
+                for i in lastResultCount..<currentResults.len:
+                    let result = currentResults[i]
+                    yield result
+                    inc yieldedResults
+                    if result.found:
+                        pool.solutionFound.store(true)
+                        break
+
+                lastResultCount = currentResults.len
+
+                if yieldedResults >= assignments.len or pool.solutionFound.load():
+                    break
+
+                if deadline > 0 and epochTime() > deadline:
+                    pool.solutionFound.store(true)
+                    break
+
+                sleep(1)
+
+            if not pool.solutionFound.load():
+                pool.solutionFound.store(true)
+
+            for i in 0..<workerCount:
+                joinThread(workers[i])
+
+            sleep(10)
+
+            # Yield any remaining results after workers complete
+            withLock pool.resultsLock:
+                for i in lastResultCount..<pool.results.len:
+                    if yieldedResults < assignments.len:
+                        yield pool.results[i]
+                        inc yieldedResults
+
+            withLock pool.resultsLock:
+                pool.results.setLen(0)
+            deinitLock(pool.resultsLock)
+
+            for i in 0..<workerDatas.len:
+                workerDatas[i].pool = nil
+
 proc parallelResolve*[T](system: ConstraintSystem[T],
                         populationSize: int = 16,
                         numWorkers: int = 0,
                         tabuThreshold: int = 10000,
                         verbose: bool = false,
                         failedPool: var CandidatePool[T],
-                        deadline: float = 0.0): bool =
+                        deadline: float = 0.0,
+                        adaptedThreshold: var int): bool =
     ## Run parallel tabu search. Returns true if solution found (system initialized).
     ## On failure, populates failedPool with best results for scatter search continuation.
     let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
@@ -238,27 +425,25 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     for i in 0..<populationSize:
         carrays[i] = system.deepCopy().baseArray
 
-    # Initialize TabuStates in parallel batches.
-    # SAFETY: population is pre-allocated to final size above and never resized,
-    # so `addr population[idx]` remains valid through joinThreads.
-    let batchSize = min(actualWorkers, populationSize)
-    var createdCount = 0
-    while createdCount < populationSize:
-        let batchEnd = min(createdCount + batchSize, populationSize)
-        let thisBatch = batchEnd - createdCount
-        var threads = newSeq[Thread[StateInitData[T]]](thisBatch)
-        var workerDatas = newSeq[StateInitData[T]](thisBatch)
-        for j in 0..<thisBatch:
-            let idx = createdCount + j
-            workerDatas[j] = StateInitData[T](
-                carray: carrays[idx],
-                result: addr population[idx],
-                id: idx,
-                verbose: verbose and idx == 0
-            )
-            createThread(threads[j], initStateWorker[T], workerDatas[j])
-        joinThreads(threads)
-        createdCount = batchEnd
+    # Initialize TabuStates in parallel using work-stealing pool.
+    # Workers grab the next state to init via atomic counter — no batch boundaries.
+    # SAFETY: population and carrays are pre-allocated to final size above and never
+    # resized, so UncheckedArray access via indices remains valid through joinThreads.
+    var initPool = InitPool[T](
+        carrays: cast[ptr UncheckedArray[ConstrainedArray[T]]](addr carrays[0]),
+        results: cast[ptr UncheckedArray[TabuState[T]]](addr population[0]),
+        totalTasks: populationSize,
+        verbose: verbose
+    )
+    initPool.nextTaskIndex.store(0)
+
+    let initWorkerCount = min(actualWorkers, populationSize)
+    var initThreads = newSeq[Thread[InitWorkerData[T]]](initWorkerCount)
+    var initWorkerDatas = newSeq[InitWorkerData[T]](initWorkerCount)
+    for i in 0..<initWorkerCount:
+        initWorkerDatas[i] = InitWorkerData[T](workerId: i, pool: addr initPool)
+        createThread(initThreads[i], initPoolWorker[T], initWorkerDatas[i])
+    joinThreads(initThreads)
 
     # Check for failed initializations (nil states from worker exceptions)
     var failedStates: seq[int]
@@ -277,8 +462,10 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
 
     # Collect all results from parallel tabu improvement
     var allResults: seq[PoolEntry[T]] = @[]
+    var maxLastImp = 0
 
     for result in improveStates(population, numWorkers, tabuThreshold, verbose = false, deadline = deadline):
+        maxLastImp = max(maxLastImp, result.lastImprovement)
         if result.found:
             if verbose:
                 let elapsed = result.endTime - result.startTime
@@ -291,6 +478,12 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
             assignment: result.assignment,
             cost: result.cost
         ))
+
+    # Set adapted threshold based on observed search depth
+    if maxLastImp > 0:
+        adaptedThreshold = max(maxLastImp, 500)
+    else:
+        adaptedThreshold = tabuThreshold
 
     # No solution found — build pool from results for scatter continuation
     if allResults.len > 0:

@@ -39,28 +39,37 @@ proc resolve*[T](system: ConstraintSystem[T],
         if system.baseArray.reducedDomain[pos].len == 0:
             if verbose:
                 echo &"[Solve] Empty domain at position {pos} (original domain size: {system.baseArray.domain[pos].len})"
-            raise newException(NoSolutionFoundError, "Domain reduction found infeasibility")
+            raise newException(InfeasibleError, "Domain reduction found infeasibility")
 
     if parallel:
+        # Use persisted adapted threshold if available, otherwise caller's value
+        let effectiveThreshold = if system.adaptedTabuThreshold > 0: system.adaptedTabuThreshold
+                                 else: tabuThreshold
+        if verbose and effectiveThreshold != tabuThreshold:
+            echo &"[Solve] Using adapted threshold: {effectiveThreshold} (original: {tabuThreshold})"
         var pool: CandidatePool[T]
-        if parallelResolve(system, populationSize, numWorkers, tabuThreshold, verbose, pool, deadline):
+        var adaptedThreshold = effectiveThreshold
+        if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, deadline, adaptedThreshold):
+            system.adaptedTabuThreshold = adaptedThreshold
             return
 
         # Check deadline before continuing with scatter search
         if deadline > 0 and epochTime() > deadline:
+            system.adaptedTabuThreshold = adaptedThreshold
             raise newException(TimeLimitExceededError, "Time limit exceeded")
 
         # Parallel tabu failed — continue with scatter search using collected results
         if pool.entries.len > 0:
             let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
             if verbose:
-                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy})"
+                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy}, adaptedThreshold={adaptedThreshold})"
                 pool.poolStatistics()
             let improved = case scatterStrategy:
                 of PathRelinking:
-                    scatterImprove(system, pool, scatterThreshold, tabuThreshold, tabuThreshold, actualWorkers, verbose, deadline)
+                    scatterImprove(system, pool, scatterThreshold, adaptedThreshold, adaptedThreshold, actualWorkers, verbose, deadline)
                 of LNS:
-                    lnsImprove(system, pool, scatterThreshold, tabuThreshold, actualWorkers, verbose, deadline)
+                    lnsImprove(system, pool, scatterThreshold, adaptedThreshold, actualWorkers, verbose, deadline)
+            # scatter/lns write final adaptedThreshold to system.adaptedTabuThreshold directly
             if improved:
                 return
 

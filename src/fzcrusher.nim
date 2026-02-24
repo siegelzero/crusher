@@ -122,11 +122,12 @@ proc main() =
   let savedFd = dup(stdout.getFileHandle())
   redirectStdoutToStderr()
 
-  # Install SIGTERM handler for graceful shutdown when MiniZinc kills us
+  # Install signal handlers for graceful shutdown (output best solution found so far)
   gSavedFd = savedFd
   gTranslator = addr tr
   gHasSolution = addr tr.sys.hasFeasibleSolution
   discard signal(SIGTERM, sigTermHandler)
+  discard signal(SIGINT, sigTermHandler)
 
   # Solve
   let solveStart = cpuTime()
@@ -205,8 +206,8 @@ proc main() =
           tr.sys.assignment[gc.boardPositions[cellIdx]] = gc.tileValues[t]
 
     tr.printSolution()
-    # Crusher uses local search and cannot prove optimality or completeness,
-    # so never print "==========" (which claims proved optimal / all solutions).
+    if tr.sys.optimalityProven:
+      printComplete()  # Domain reduction proved no better solution exists
   else:
     # Crusher cannot prove unsatisfiability either, so always report UNKNOWN.
     printUnknown()

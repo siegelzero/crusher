@@ -92,7 +92,8 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
                                 size: int,
                                 tabuThreshold: int,
                                 numWorkers: int,
-                                verbose: bool): CandidatePool[T] =
+                                verbose: bool,
+                                maxLastImprovement: var int): CandidatePool[T] =
     ## Create random states, parallel tabu-improve, return best `size` as pool
     let createSize = size * 2
 
@@ -118,11 +119,13 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
 
     # Parallel tabu-improve all
     var results: seq[PoolEntry[T]] = @[]
+    maxLastImprovement = 0
     for batchResult in improveStates(population, numWorkers, tabuThreshold, verbose = false):
         results.add(PoolEntry[T](
             assignment: batchResult.assignment,
             cost: batchResult.cost
         ))
+        maxLastImprovement = max(maxLastImprovement, batchResult.lastImprovement)
         if batchResult.found:
             break
 
@@ -158,10 +161,14 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
     let poolSize = pool.entries.len
     var itersSinceImprovement = 0
     var iter = 0
+    var effectiveThreshold = tabuThreshold
+    template saveThreshold() =
+        system.adaptedTabuThreshold = effectiveThreshold
 
     while itersSinceImprovement < scatterThreshold or (deadline > 0 and epochTime() < deadline):
         # Check deadline at start of each iteration
         if deadline > 0 and epochTime() > deadline:
+            saveThreshold()
             return false
 
         let iterStart = currentTime()
@@ -219,6 +226,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 system.initialize(pe.assignment)
                 if verbose:
                     echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                saveThreshold()
                 return true
             promising.add(pe)
             if promising.len >= maxPromising:
@@ -234,33 +242,27 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             else:
                 echo &"[Scatter] No promising entries to improve"
 
-        # Tabu-improve promising entries in batches to limit memory usage
+        # Tabu-improve promising entries — streaming via work-stealing pool (no batching)
         let improveStart = currentTime()
         var improvements: seq[PoolEntry[T]] = @[]
         var improvedCount = 0
+        var maxLastImp = 0
         if promising.len > 0:
-            let batchSize = actualWorkers
-            for batchStart in countup(0, promising.len - 1, batchSize):
-                if deadline > 0 and epochTime() > deadline:
-                    break
-                let batchEnd = min(batchStart + batchSize, promising.len)
-                var toImprove = newSeq[TabuState[T]](batchEnd - batchStart)
-                for pi in batchStart..<batchEnd:
-                    let sc = system.deepCopy()
-                    toImprove[pi - batchStart] = newTabuState[T](sc.baseArray, promising[pi].assignment, verbose = false, id = pi)
-
-                for batchResult in improveStates(toImprove, actualWorkers, relinkThreshold, verbose = false, deadline = deadline):
-                    inc improvedCount
-                    if batchResult.found:
-                        system.initialize(batchResult.assignment)
-                        if verbose:
-                            echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
-                        return true
-                    if batchResult.cost < pool.minCost:
-                        improvements.add(PoolEntry[T](
-                            assignment: batchResult.assignment,
-                            cost: batchResult.cost
-                        ))
+            let promisingAssignments = promising.mapIt(it.assignment)
+            for batchResult in improveFromAssignments(system, promisingAssignments, actualWorkers, relinkThreshold, deadline = deadline):
+                inc improvedCount
+                maxLastImp = max(maxLastImp, batchResult.lastImprovement)
+                if batchResult.found:
+                    system.initialize(batchResult.assignment)
+                    if verbose:
+                        echo &"[Scatter] Solution found during path relinking (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                    saveThreshold()
+                    return true
+                if batchResult.cost < pool.minCost:
+                    improvements.add(PoolEntry[T](
+                        assignment: batchResult.assignment,
+                        cost: batchResult.cost
+                    ))
 
         if verbose:
             let improveElapsed = currentTime() - improveStart
@@ -283,6 +285,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                     system.initialize(entry.assignment)
                     if verbose:
                         echo &"[Scatter] Solution found after pool update (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                    saveThreshold()
                     return true
 
         # c. DIVERSIFY: Generate fresh random tabu-improved states
@@ -296,12 +299,14 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             let sc = system.deepCopy()
             freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
 
-        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
+        for batchResult in improveStates(freshPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
                     echo &"[Scatter] Solution found during diversification (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                saveThreshold()
                 return true
+            maxLastImp = max(maxLastImp, batchResult.lastImprovement)
             pool.replaceMaxCost(PoolEntry[T](
                 assignment: batchResult.assignment,
                 cost: batchResult.cost
@@ -321,12 +326,14 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             intensifyPop[i] = newTabuState[T](sc.baseArray, pool.entries[i].assignment, verbose = false, id = i)
 
         var newEntries: seq[PoolEntry[T]] = @[]
-        for batchResult in improveStates(intensifyPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
+        for batchResult in improveStates(intensifyPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
                     echo &"[Scatter] Solution found during intensification (iter {iter + 1}, {currentTime() - totalStart:.2f}s total)"
+                saveThreshold()
                 return true
+            maxLastImp = max(maxLastImp, batchResult.lastImprovement)
             newEntries.add(PoolEntry[T](
                 assignment: batchResult.assignment,
                 cost: batchResult.cost
@@ -337,6 +344,13 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
 
         if verbose:
             echo &"[Scatter] Intensification took {currentTime() - intStart:.2f}s"
+
+        # Adapt threshold based on observed search depth (only increases)
+        let prevThreshold = effectiveThreshold
+        if maxLastImp > 0:
+            effectiveThreshold = max(effectiveThreshold, max(maxLastImp, 500))
+        if verbose and effectiveThreshold != prevThreshold:
+            echo &"[Scatter] Adaptive threshold: {prevThreshold} -> {effectiveThreshold} (maxLastImp={maxLastImp})"
 
         # Track improvement
         if pool.minCost < prevBestCost:
@@ -352,6 +366,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
     # No solution found
     if verbose:
         echo &"[Scatter] No solution after {iter} iterations (stale={scatterThreshold}): best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
+    saveThreshold()
     return false
 
 
@@ -389,10 +404,14 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
     var itersSinceImprovement = 0
     var iter = 0
     var destroyCount = 1  # Start by destroying 1 constraint group
+    var effectiveThreshold = tabuThreshold
+    template saveLnsThreshold() =
+        system.adaptedTabuThreshold = effectiveThreshold
 
     while itersSinceImprovement < scatterThreshold or (deadline > 0 and epochTime() < deadline):
         # Check deadline at start of each iteration
         if deadline > 0 and epochTime() > deadline:
+            saveLnsThreshold()
             return false
 
         let iterStart = currentTime()
@@ -436,27 +455,21 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[LNS] Created {perturbed.len} perturbed states in {currentTime() - perturbStart:.2f}s"
 
-        # b. REPAIR: Tabu-improve perturbed states in batches to limit memory usage
+        # b. REPAIR: Tabu-improve perturbed states — streaming via work-stealing pool
         let repairStart = currentTime()
         var improvements: seq[PoolEntry[T]] = @[]
         var repairedCount = 0
+        var maxLastImp = 0
 
-        let batchSize = actualWorkers
-        for batchStart in countup(0, perturbed.len - 1, batchSize):
-            if deadline > 0 and epochTime() > deadline:
-                break
-            let batchEnd = min(batchStart + batchSize, perturbed.len)
-            var toRepair = newSeq[TabuState[T]](batchEnd - batchStart)
-            for pi in batchStart..<batchEnd:
-                let sc = system.deepCopy()
-                toRepair[pi - batchStart] = newTabuState[T](sc.baseArray, perturbed[pi], verbose = false, id = pi)
-
-            for batchResult in improveStates(toRepair, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
+        if perturbed.len > 0:
+            for batchResult in improveFromAssignments(system, perturbed, actualWorkers, effectiveThreshold, deadline = deadline):
                 inc repairedCount
+                maxLastImp = max(maxLastImp, batchResult.lastImprovement)
                 if batchResult.found:
                     system.initialize(batchResult.assignment)
                     if verbose:
                         echo &"[LNS] Solution found during repair (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                    saveLnsThreshold()
                     return true
                 if batchResult.cost < pool.maxCost:
                     improvements.add(PoolEntry[T](
@@ -486,6 +499,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
                     system.initialize(entry.assignment)
                     if verbose:
                         echo &"[LNS] Solution found after pool update (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                    saveLnsThreshold()
                     return true
 
         # c. DIVERSIFY: Fresh random states
@@ -499,12 +513,14 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
             let sc = system.deepCopy()
             freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
 
-        for batchResult in improveStates(freshPop, actualWorkers, tabuThreshold, verbose = false, deadline = deadline):
+        for batchResult in improveStates(freshPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
                     echo &"[LNS] Solution found during diversification (iter {iter}, {currentTime() - totalStart:.2f}s total)"
+                saveLnsThreshold()
                 return true
+            maxLastImp = max(maxLastImp, batchResult.lastImprovement)
             pool.replaceMaxCost(PoolEntry[T](
                 assignment: batchResult.assignment,
                 cost: batchResult.cost
@@ -512,6 +528,13 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
 
         if verbose:
             echo &"[LNS] Diversification took {currentTime() - divStart:.2f}s"
+
+        # Adapt threshold based on observed search depth (only increases)
+        let prevThreshold = effectiveThreshold
+        if maxLastImp > 0:
+            effectiveThreshold = max(effectiveThreshold, max(maxLastImp, 500))
+        if verbose and effectiveThreshold != prevThreshold:
+            echo &"[LNS] Adaptive threshold: {prevThreshold} -> {effectiveThreshold} (maxLastImp={maxLastImp})"
 
         # Track improvement and adapt destroy count
         if pool.minCost < prevBestCost:
@@ -529,6 +552,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
     # No solution found
     if verbose:
         echo &"[LNS] No solution after {iter} iterations (stale={scatterThreshold}): best cost={pool.minCost} ({currentTime() - totalStart:.1f}s total)"
+    saveLnsThreshold()
     return false
 
 
@@ -553,7 +577,8 @@ proc scatterResolve*[T](system: ConstraintSystem[T],
 
     # 1. Build initial population
     let buildStart = currentTime()
-    var pool = buildInitialPopulation[T](system, poolSize, tabuThreshold, actualWorkers, verbose)
+    var maxLastImp = 0
+    var pool = buildInitialPopulation[T](system, poolSize, tabuThreshold, actualWorkers, verbose, maxLastImp)
 
     if verbose:
         echo &"[Scatter] Initial population built in {currentTime() - buildStart:.2f}s"

@@ -98,6 +98,14 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 break
+            except InfeasibleError:
+                # Domain reduction proved this bound infeasible
+                when direction == Minimize:
+                    lo = target + 1
+                else:
+                    hi = target - 1
+                system.initialize(bestSolution)
+                objective.initialize(system.assignment)
             except NoSolutionFoundError:
                 when direction == Minimize:
                     lo = target + 1
@@ -144,6 +152,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
                     break retryLoop
+                except InfeasibleError:
+                    # Domain reduction proved no better solution exists — provably optimal
+                    system.optimalityProven = true
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    break retryLoop
                 except NoSolutionFoundError:
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
@@ -156,7 +170,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             system.removeLastConstraint()
         system.initialize(system.assignment)
         objective.initialize(system.assignment)
-        echo "[Opt] Done: ", objective.value
+        if system.optimalityProven:
+            echo "[Opt] Proven optimal: ", objective.value
+        else:
+            echo "[Opt] Done: ", objective.value
 
 # Generate minimize and maximize procedures for all stateful expression types
 optimizeImpl(SumExpression, Minimize, minimize)

@@ -11,6 +11,7 @@ import expressions/[algebraic, sumExpression, maxExpression, minExpression]
 
 type
     NoSolutionFoundError* = object of CatchableError
+    InfeasibleError* = object of NoSolutionFoundError  ## Domain reduction proved infeasibility — retrying won't help
     TimeLimitExceededError* = object of CatchableError
     VariableContainer[T] = ref object of RootObj
         system: ConstraintSystem[T]
@@ -33,6 +34,8 @@ type
         lastIterations*: int
         searchCompleted*: bool
         hasFeasibleSolution*: bool
+        optimalityProven*: bool  # Domain reduction proved no better solution exists
+        adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
 
 ################################################################################
 # ConstraintSystem creation

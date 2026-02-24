@@ -43,6 +43,7 @@ type
         bestCost*: int
 
         iteration*: int
+        lastImprovementIter*: int  # Iteration of last bestCost improvement
 
         # Stats tracking
         startTime*: float
@@ -1985,12 +1986,14 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         if shouldStop != nil and shouldStop[].load():
             if state.verbose:
                 state.logExitStats("Stopped")
+            state.lastImprovementIter = lastImprovement
             return state
 
         # Check deadline every 1024 iterations
         if deadline > 0 and (state.iteration and 0x3FF) == 0 and epochTime() > deadline:
             if state.verbose:
                 state.logExitStats("Deadline")
+            state.lastImprovementIter = lastImprovement
             return state
 
         state.applyBestMove()
@@ -2002,6 +2005,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             if state.cost == 0:
                 if state.verbose:
                     state.logExitStats("Solution found")
+                state.lastImprovementIter = lastImprovement
                 return state
 
         # Try ejection chain moves periodically during stagnation
@@ -2016,6 +2020,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via chain")
+                        state.lastImprovementIter = lastImprovement
                         return state
 
         state.iteration += 1
@@ -2027,6 +2032,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     if state.verbose:
         state.logExitStats("Exhausted")
 
+    state.lastImprovementIter = lastImprovement
     return state
 
 

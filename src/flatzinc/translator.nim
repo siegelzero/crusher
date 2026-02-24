@@ -2793,6 +2793,13 @@ proc translate*(model: FznModel): FznTranslator =
         # Find chain structure from output arrays
         for arrName, arrPositions in result.arrayPositions:
           if arrPositions.len < 20: continue
+          # Skip arrays with eliminated variables (position=-1 sentinel from defined var elimination)
+          var hasEliminatedVars = false
+          for pos in arrPositions:
+            if pos < 0:
+              hasEliminatedVars = true
+              break
+          if hasEliminatedVars: continue
           # Detect stride from initial singletons (eliminated boundary variables)
           var startSingletons = 0
           for i in 0..<arrPositions.len:

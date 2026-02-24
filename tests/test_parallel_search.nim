@@ -64,7 +64,8 @@ proc testParallelResolve() =
     # Test parallelResolve directly
     echo "Testing parallelResolve with verbose logging:"
     var pool: CandidatePool[int]
-    discard parallelResolve(system, populationSize=8, numWorkers=2, tabuThreshold=1000, verbose=true, failedPool=pool)
+    var adaptedThreshold = 1000
+    discard parallelResolve(system, populationSize=8, numWorkers=2, tabuThreshold=1000, verbose=true, failedPool=pool, adaptedThreshold=adaptedThreshold)
 
     # Check that a solution was found
     check(system.assignment.len == 4)
