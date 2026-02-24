@@ -373,7 +373,82 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
         if searchPos.len == 0:
             continue  # Constraint has no search positions — skip entirely
         let affectedPositions = constraint.getAffectedPositions()
-        # Iterate the smaller set (search positions) and check membership in affected set
+
+        # Fast path: binary broadcast for PositionBased SumExpr + ConstantExpr
+        # For binary domains {0,1}, the flip penalty at every neighbor can be computed
+        # with a single computeCost call per distinct coefficient, instead of calling
+        # batchMovePenalty (which allocates a seq and does per-value computation).
+        if constraint.stateType == RelationalType:
+            let rc = constraint.relationalState
+            var canBroadcast = false
+            var sumOnLeft = false
+            var sumRef: SumExpression[T]
+            if rc.leftExpr.kind == SumExpr and
+               rc.leftExpr.sumExpr.evalMethod == PositionBased and
+               rc.rightExpr.kind == ConstantExpr:
+                canBroadcast = true
+                sumOnLeft = true
+                sumRef = rc.leftExpr.sumExpr
+            elif rc.rightExpr.kind == SumExpr and
+                 rc.rightExpr.sumExpr.evalMethod == PositionBased and
+                 rc.leftExpr.kind == ConstantExpr:
+                canBroadcast = true
+                sumOnLeft = false
+                sumRef = rc.rightExpr.sumExpr
+
+            if canBroadcast and affectedPositions.len > 0:
+                let currentCost = rc.cost
+                let leftV = rc.leftValue
+                let rightV = rc.rightValue
+
+                for pos in searchPos.items:
+                    if pos == position:
+                        continue
+                    # For EqualTo with PositionBased SumExpr + ConstantExpr:
+                    # when leftValue changed, ALL positions in leftExpr are affected.
+                    # For inequality relations, slack-based skip may reduce this set,
+                    # so we still need the check for non-EqualTo.
+                    if rc.relation != EqualTo and pos notin affectedPositions:
+                        continue
+
+                    let domain = state.carray.reducedDomain[pos]
+                    if domain.len != 2 or domain[0] != T(0) or domain[1] != T(1):
+                        # Non-binary: fall back to standard update
+                        if pos notin affectedPositions:
+                            continue
+                        when ProfileIteration:
+                            state.neighborUpdates += 1
+                            state.neighborBatchCalls += 1
+                        let localIdx = state.findLocalConstraintIdx(pos, constraint)
+                        state.updateConstraintAtPosition(pos, localIdx)
+                        continue
+
+                    when ProfileIteration:
+                        state.neighborUpdates += 1
+                    let localIdx = state.findLocalConstraintIdx(pos, constraint)
+                    let x = int(state.assignment[pos])
+                    let coeff = sumRef.coefficient.getOrDefault(pos, T(0))
+
+                    # For binary domain: keeping current value always gives moveDelta = 0.
+                    # Flip penalty: computeCost(leftV + flipDelta, rightV) - currentCost
+                    let flipDelta = if x == 0: coeff else: -coeff
+                    let newFlip = if sumOnLeft:
+                        rc.computeCost(leftV + flipDelta, rightV) - currentCost
+                    else:
+                        rc.computeCost(leftV, rightV + flipDelta) - currentCost
+
+                    # Binary domain sorted [0,1]: domainIndex maps 0→0, 1→1
+                    # keepIdx = x, flipIdx = 1-x
+                    let oldKeep = state.constraintPenalties[pos][localIdx][x]
+                    let oldFlip = state.constraintPenalties[pos][localIdx][1-x]
+                    state.penaltyMap[pos][x] -= oldKeep  # newKeep = 0
+                    state.penaltyMap[pos][1-x] += newFlip - oldFlip
+                    state.constraintPenalties[pos][localIdx][x] = 0
+                    state.constraintPenalties[pos][localIdx][1-x] = newFlip
+
+                continue  # Done with this constraint via broadcast
+
+        # Standard path
         for pos in searchPos.items:
             if pos == position:
                 continue
@@ -715,6 +790,71 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
 # TabuState creation
 ################################################################################
 
+proc balanceBinarySums[T](state: TabuState[T]) =
+    ## Adjusts initial assignment for binary variables to match equality-sum targets.
+    ## For constraints of the form sum(binary_vars) == target, randomly flips
+    ## variables so the sum matches the target exactly. Runs before constraint
+    ## initialization so no state corruption.
+    var fixed = initPackedSet[int]()  # positions already adjusted by earlier constraints
+
+    for constraint in state.constraints:
+        if constraint.stateType != RelationalType:
+            continue
+        let rc = constraint.relationalState
+        if rc.relation != EqualTo:
+            continue
+        # Left must be a position-based sum, right must be a constant
+        if rc.leftExpr.kind != SumExpr or rc.rightExpr.kind != ConstantExpr:
+            continue
+        let s = rc.leftExpr.sumExpr
+        if s.evalMethod != PositionBased:
+            continue
+        let target = rc.rightExpr.constantValue
+
+        # Check all positions are binary {0,1} with coefficient 1
+        var allBinaryUnitCoeff = true
+        var positions: seq[int] = @[]
+        for pos in s.positions.items:
+            let dom = state.carray.reducedDomain[pos]
+            let coeff = s.coefficient.getOrDefault(pos, T(0))
+            if coeff != 1 or dom.len != 2 or dom[0] != 0 or dom[1] != 1:
+                allBinaryUnitCoeff = false
+                break
+            positions.add(pos)
+        if not allBinaryUnitCoeff or positions.len == 0:
+            continue
+
+        # Count current ones (only among unfixed positions)
+        var currentOnes = 0
+        var unfixedPositions: seq[int] = @[]
+        for pos in positions:
+            if pos in fixed:
+                currentOnes += int(state.assignment[pos])
+            else:
+                unfixedPositions.add(pos)
+                currentOnes += int(state.assignment[pos])
+
+        # Compute how many ones we need among unfixed positions
+        let fixedOnes = currentOnes - (block:
+            var cnt = 0
+            for pos in unfixedPositions:
+                cnt += int(state.assignment[pos])
+            cnt)
+        let neededOnes = target - fixedOnes
+        let n = unfixedPositions.len
+
+        if neededOnes < 0 or neededOnes > n:
+            continue  # infeasible given fixed positions, skip
+
+        # Shuffle unfixed positions and assign exactly neededOnes ones
+        shuffle(unfixedPositions)
+        for i in 0..<n:
+            state.assignment[unfixedPositions[i]] = if i < neededOnes: T(1) else: T(0)
+
+        # Mark these positions as fixed for subsequent constraints
+        for pos in positions:
+            fixed.incl(pos)
+
 proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[]) =
     state.id = id
     state.carray = carray
@@ -734,6 +874,24 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     for constraint in carray.constraints:
         state.constraints.add(constraint)
+
+    # Auto-detect graduated equality: if the system has inequality constraints
+    # (which use graduated penalties) but no boolean constraints (which use binary
+    # penalties), enable graduated penalty on EqualTo constraints so they compete
+    # on the same scale as the inequalities.
+    block:
+        var hasInequality = false
+        var hasBoolean = false
+        for c in state.constraints:
+            if c.stateType == RelationalType and
+               c.relationalState.relation in {LessThan, LessThanEq, GreaterThan, GreaterThanEq}:
+                hasInequality = true
+            if c.stateType == BooleanType:
+                hasBoolean = true
+        if hasInequality and not hasBoolean:
+            for c in state.constraints:
+                if c.stateType == RelationalType and c.relationalState.relation == EqualTo:
+                    c.relationalState.graduated = true
 
     for constraint in state.constraints:
         for pos in constraint.positions.items:
@@ -783,6 +941,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.assignment[pos] = carray.reducedDomain[pos][0]
         else:
             state.assignment[pos] = sample(carray.reducedDomain[pos])
+
+    # Balance binary sums to match equality targets (before channel propagation)
+    if initialAssignment.len == 0:
+        state.balanceBinarySums()
 
     # Compute channel variable initial values from their defining element constraints
     for binding in carray.channelBindings:
@@ -1168,6 +1330,7 @@ proc initSwapStructures[T](state: TabuState[T]) =
     for i in 0..<state.binaryPositions.len:
         neighborSets[i] = initPackedSet[int]()
 
+    const maxBinaryPerConstraint = 350  # skip constraints with too many binary positions
     for constraint in state.constraints:
         # Collect binary positions in this constraint
         var binaryInConstraint: seq[int] = @[]
@@ -1176,6 +1339,10 @@ proc initSwapStructures[T](state: TabuState[T]) =
                 binaryInConstraint.add(pos)
 
         if binaryInConstraint.len < 2:
+            continue
+
+        # Skip constraints with too many binary positions (O(n^2) pair explosion)
+        if binaryInConstraint.len > maxBinaryPerConstraint:
             continue
 
         # Add all pairs as swap neighbors and record shared constraints

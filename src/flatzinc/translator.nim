@@ -2623,6 +2623,42 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
   if redundantCount > 0:
     stderr.writeLine(&"[FZN] Ordering reduction: {edges.len} -> {edges.len - redundantCount} constraints ({redundantCount} redundant)")
 
+proc estimateRange(tr: FznTranslator, node: ExpressionNode[int]): (int, int) =
+  ## Conservative interval arithmetic to estimate the range of an expression.
+  ## Returns (min, max) values the expression can take.
+  case node.kind
+  of LiteralNode:
+    return (node.value, node.value)
+  of RefNode:
+    let dom = tr.sys.baseArray.domain[node.position]
+    if dom.len > 0:
+      return (dom[0], dom[^1])
+    return (low(int), high(int))
+  of UnaryOpNode:
+    let (cMin, cMax) = tr.estimateRange(node.target)
+    case node.unaryOp
+    of Negation:
+      return (-cMax, -cMin)
+    of AbsoluteValue:
+      if cMin >= 0: return (cMin, cMax)
+      elif cMax <= 0: return (-cMax, -cMin)
+      else: return (0, max(-cMin, cMax))
+  of BinaryOpNode:
+    let (lMin, lMax) = tr.estimateRange(node.left)
+    let (rMin, rMax) = tr.estimateRange(node.right)
+    case node.binaryOp
+    of Addition:
+      return (lMin + rMin, lMax + rMax)
+    of Subtraction:
+      return (lMin - rMax, lMax - rMin)
+    of Multiplication:
+      let products = [lMin*rMin, lMin*rMax, lMax*rMin, lMax*rMax]
+      return (min(products), max(products))
+    of Maximum:
+      return (max(lMin, rMin), max(lMax, rMax))
+    of Minimum:
+      return (min(lMin, rMin), min(lMax, rMax))
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -2658,15 +2694,24 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
-  # Add domain constraints for defined variables with finite bounds
+  # Add domain constraints for defined variables with finite bounds,
+  # but skip bounds that are naturally satisfied by the expression's range
+  var nBoundsSkipped = 0
   for varName, bounds in result.definedVarBounds:
     if varName in result.definedVarExprs:
       let expr = result.definedVarExprs[varName]
       let (lo, hi) = bounds
-      if lo > low(int):
+      let (exprMin, exprMax) = result.estimateRange(expr.node)
+      if lo > low(int) and lo > exprMin:
         result.sys.addConstraint(expr >= lo)
-      if hi < high(int):
+      else:
+        inc nBoundsSkipped
+      if hi < high(int) and hi < exprMax:
         result.sys.addConstraint(expr <= hi)
+      else:
+        inc nBoundsSkipped
+  if nBoundsSkipped > 0:
+    stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped} redundant defined-var bounds constraints")
   # Build matrix infos for matrix_element pattern detection
   result.buildMatrixInfos()
 

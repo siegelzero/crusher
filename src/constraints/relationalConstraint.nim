@@ -26,6 +26,12 @@ type
         lastAffectedPositions*: PackedSet[int]
         lastOldLeftValue*: T
         lastOldRightValue*: T
+        # Max |leftDelta - rightDelta| from any single position change.
+        # Used for slack-based optimization: if both old and new slack >= maxNetDelta,
+        # penalty map entries are unchanged and updates can be skipped.
+        # Defaults to high(int) (optimization disabled). Set via setMaxNetDelta()
+        # when domain ranges are known.
+        maxNetDelta*: int
         # Additive term decomposition for fast partial evaluation (non-linear only)
         leftTerms*: seq[ExprTerm[T]]
         rightTerms*: seq[ExprTerm[T]]
@@ -34,6 +40,14 @@ type
         leftConstantIdx*: Table[int, seq[int]]
         rightVaryingIdx*: Table[int, seq[int]]
         rightConstantIdx*: Table[int, seq[int]]
+        graduated*: bool  # When true, EqualTo uses abs(left-right) instead of binary 0/1
+
+func computeCost*[T](c: RelationalConstraint[T], left, right: T): int {.inline.} =
+    ## Compute penalty, using graduated abs(left-right) for EqualTo when enabled.
+    if c.graduated and c.relation == EqualTo:
+        return int(abs(left - right))
+    else:
+        return int(c.relation.penalty(left, right))
 
 # Create a new RelationalConstraint with Expression wrappers
 func newRelationalConstraint*[T](leftExpr, rightExpr: Expression[T],
@@ -43,6 +57,7 @@ func newRelationalConstraint*[T](leftExpr, rightExpr: Expression[T],
         rightExpr: rightExpr,
         relation: relation,
         cost: 0,
+        maxNetDelta: high(int),
         positions: leftExpr.positions + rightExpr.positions
     )
     # Extract additive terms for partial evaluation optimization (non-linear only)
@@ -96,7 +111,7 @@ func initialize*[T](constraint: RelationalConstraint[T], assignment: seq[T]) =
     constraint.rightValue = constraint.rightExpr.getValue()
 
     # Calculate initial cost
-    constraint.cost = constraint.relation.penalty(constraint.leftValue, constraint.rightValue)
+    constraint.cost = constraint.computeCost(constraint.leftValue, constraint.rightValue)
 
 # Calculate the change in penalty for a position change
 func moveDelta*[T](constraint: RelationalConstraint[T],
@@ -118,7 +133,7 @@ func moveDelta*[T](constraint: RelationalConstraint[T],
         newRightValue = constraint.rightValue + rightDelta
 
     # Return the change in penalty
-    let newCost = constraint.relation.penalty(newLeftValue, newRightValue)
+    let newCost = constraint.computeCost(newLeftValue, newRightValue)
     return newCost - constraint.cost
 
 # Update a position with a new value
@@ -142,14 +157,47 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
         constraint.rightValue = constraint.rightExpr.getValue()
 
     # Update cost based on new cached values
-    constraint.cost = constraint.relation.penalty(constraint.leftValue, constraint.rightValue)
+    constraint.cost = constraint.computeCost(constraint.leftValue, constraint.rightValue)
 
     # Track affected positions: only positions in expressions whose values changed
     constraint.lastAffectedPositions = initPackedSet[int]()
-    if constraint.leftValue != constraint.lastOldLeftValue:
-        constraint.lastAffectedPositions.incl(constraint.leftExpr.positions)
-    if constraint.rightValue != constraint.lastOldRightValue:
-        constraint.lastAffectedPositions.incl(constraint.rightExpr.positions)
+    let leftChanged = constraint.leftValue != constraint.lastOldLeftValue
+    let rightChanged = constraint.rightValue != constraint.lastOldRightValue
+
+    if leftChanged or rightChanged:
+        # For inequality constraints (≤/≥) that remain satisfied with sufficient slack,
+        # no penalty map entries change. For the cached moveDelta values at all other
+        # positions to remain correct, both old and new slack must be >= maxNetDelta,
+        # where maxNetDelta is the maximum |leftDelta - rightDelta| from any single
+        # position change across the entire domain.
+        var canSkip = false
+        if constraint.cost == 0 and constraint.maxNetDelta < high(int):
+            let threshold = constraint.maxNetDelta
+            case constraint.relation
+            of LessThanEq:
+                let oldSlack = constraint.lastOldRightValue - constraint.lastOldLeftValue
+                let newSlack = constraint.rightValue - constraint.leftValue
+                canSkip = oldSlack >= threshold and newSlack >= threshold
+            of GreaterThanEq:
+                let oldSlack = constraint.lastOldLeftValue - constraint.lastOldRightValue
+                let newSlack = constraint.leftValue - constraint.rightValue
+                canSkip = oldSlack >= threshold and newSlack >= threshold
+            of LessThan:
+                let oldSlack = constraint.lastOldRightValue - constraint.lastOldLeftValue
+                let newSlack = constraint.rightValue - constraint.leftValue
+                canSkip = oldSlack >= threshold + 1 and newSlack >= threshold + 1
+            of GreaterThan:
+                let oldSlack = constraint.lastOldLeftValue - constraint.lastOldRightValue
+                let newSlack = constraint.leftValue - constraint.rightValue
+                canSkip = oldSlack >= threshold + 1 and newSlack >= threshold + 1
+            else:
+                discard
+
+        if not canSkip:
+            if leftChanged:
+                constraint.lastAffectedPositions.incl(constraint.leftExpr.positions)
+            if rightChanged:
+                constraint.lastAffectedPositions.incl(constraint.rightExpr.positions)
 
 # Get the current penalty
 func penalty*[T](constraint: RelationalConstraint[T]): int =
@@ -208,21 +256,19 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         # Batch evaluation: compute base values (with position contribution removed)
         let leftBase = constraint.leftValue - leftCoeff * currentValue
         let rightBase = constraint.rightValue - rightCoeff * currentValue
-        let rel = constraint.relation
         let currentCost = constraint.cost
 
         for i in 0..<domain.len:
             let v = domain[i]
             let left = leftBase + leftCoeff * v
             let right = rightBase + rightCoeff * v
-            result[i] = int(rel.penalty(left, right)) - currentCost
+            result[i] = constraint.computeCost(left, right) - currentCost
     else:
         # Non-linear fallback: use term-based partial evaluation when available.
         # Splits expression into additive terms, precomputes constant terms once,
         # and only re-evaluates terms that depend on the varying position.
         # For varying terms, tries to compile piecewise-linear (PL) representations
         # for O(1) per-candidate evaluation instead of O(tree_depth).
-        let rel = constraint.relation
         let currentCost = constraint.cost
         let leftInPos = position in constraint.leftExpr.positions
         let rightInPos = position in constraint.rightExpr.positions
@@ -230,16 +276,20 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         let hasLeftTerms = leftInPos and constraint.leftTerms.len > 0
         let hasRightTerms = rightInPos and constraint.rightTerms.len > 0
 
-        # Precompute constant parts using prebuilt index arrays
+        # Compute constant part as: cachedValue - varyingPart (O(k) instead of O(n-k))
         var leftConstPart: T = 0
         if hasLeftTerms:
-            for ti in constraint.leftConstantIdx[position]:
-                leftConstPart += constraint.leftTerms[ti].node.evaluate(assignment)
+            var varyingPart: T = 0
+            for ti in constraint.leftVaryingIdx[position]:
+                varyingPart += constraint.leftTerms[ti].node.evaluate(assignment)
+            leftConstPart = constraint.leftValue - varyingPart
 
         var rightConstPart: T = 0
         if hasRightTerms:
-            for ti in constraint.rightConstantIdx[position]:
-                rightConstPart += constraint.rightTerms[ti].node.evaluate(assignment)
+            var varyingPart: T = 0
+            for ti in constraint.rightVaryingIdx[position]:
+                varyingPart += constraint.rightTerms[ti].node.evaluate(assignment)
+            rightConstPart = constraint.rightValue - varyingPart
 
         # Cache varying term references
         let leftVarying = if hasLeftTerms: constraint.leftVaryingIdx[position] else: @[]
@@ -280,7 +330,7 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                               else: constraint.leftValue
                 let newRight = if hasRightTerms: rightConstPart + plEval(rightPL, v)
                                else: constraint.rightValue
-                result[i] = int(rel.penalty(newLeft, newRight)) - currentCost
+                result[i] = constraint.computeCost(newLeft, newRight) - currentCost
         else:
             # Mixed path: PL for compiled terms, tree eval for the rest
             let savedValue = assignment[position]
@@ -345,6 +395,6 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                 else:
                     constraint.rightValue
 
-                result[i] = int(rel.penalty(newLeft, newRight)) - currentCost
+                result[i] = constraint.computeCost(newLeft, newRight) - currentCost
 
             assignment[position] = savedValue
