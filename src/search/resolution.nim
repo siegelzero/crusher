@@ -21,7 +21,7 @@ proc resolve*[T](system: ConstraintSystem[T],
                 populationSize: int = 16,
                 numWorkers: int = 0,
                 scatterStrategy: ScatterStrategy = PathRelinking,
-                verbose: bool = true,
+                verbose: bool = false,
                 deadline: float = 0.0) =
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:

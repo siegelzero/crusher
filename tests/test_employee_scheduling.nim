@@ -92,7 +92,7 @@ proc solveEmployeeScheduling(): int =
     let zObjective = diffs.sum()
 
     # Use parallel search with population to reliably find optimal
-    sys.minimize(zObjective, verbose=true, parallel=true,
+    sys.minimize(zObjective, verbose=false, parallel=true,
                  tabuThreshold=10000, scatterThreshold=3)
 
     # Calculate actual Z from solution
