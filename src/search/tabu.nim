@@ -1947,7 +1947,7 @@ proc swapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
                     let oldVal2 = state.assignment[p2]
                     let newLeft = rc.leftValue + leftCoeff1 * (newVal1 - oldVal1) + leftCoeff2 * (newVal2 - oldVal2)
                     let newRight = rc.rightValue + rightCoeff1 * (newVal1 - oldVal1) + rightCoeff2 * (newVal2 - oldVal2)
-                    jointDelta = rc.relation.penalty(newLeft, newRight) - rc.cost
+                    jointDelta = rc.computeCost(newLeft, newRight) - rc.cost
                 else:
                     # Fallback: simulate both changes
                     let oldVal1 = state.assignment[p1]
