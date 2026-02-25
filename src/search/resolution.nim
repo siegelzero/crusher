@@ -1,5 +1,4 @@
-import std/[os, strformat]
-from std/times import epochTime
+import std/[os, strformat, times]
 
 import tabu
 import ../constraintSystem
@@ -25,8 +24,11 @@ proc resolve*[T](system: ConstraintSystem[T],
                 deadline: float = 0.0) =
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
+        let drStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
         if verbose:
+            let drElapsed = epochTime() - drStart
+            echo &"[Solve] Domain reduction took {drElapsed:.3f}s"
             var totalOriginal, totalReduced: int
             for pos in system.baseArray.allPositions():
                 totalOriginal += system.baseArray.domain[pos].len
@@ -40,6 +42,12 @@ proc resolve*[T](system: ConstraintSystem[T],
             if verbose:
                 echo &"[Solve] Empty domain at position {pos} (original domain size: {system.baseArray.domain[pos].len})"
             raise newException(InfeasibleError, "Domain reduction found infeasibility")
+
+    # Shrink channel position domains to avoid expensive deepCopy of million-element seqs.
+    # Channel positions are never searched, so their full domains are never needed again.
+    for pos in system.baseArray.channelPositions.items:
+        if system.baseArray.domain[pos].len > 1000:
+            system.baseArray.domain[pos] = system.baseArray.reducedDomain[pos]
 
     if parallel:
         # Use persisted adapted threshold if available, otherwise caller's value

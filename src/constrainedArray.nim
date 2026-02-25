@@ -20,6 +20,12 @@ type
         indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
         arrayElements*: seq[ArrayElement[T]] # The array (constants and/or variable positions)
 
+    MinMaxChannelBinding*[T] = object
+        channelPosition*: int                # Position of the min/max channel variable
+        isMin*: bool                         # true = min, false = max
+        inputExprs*: seq[AlgebraicExpression[T]]  # Input expressions to take min/max of
+        inputPositions*: PackedSet[int]      # Union of all input expression positions
+
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
@@ -29,6 +35,8 @@ type
         channelPositions*: PackedSet[int]
         channelBindings*: seq[ChannelBinding[T]]
         channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
+        minMaxChannelBindings*: seq[MinMaxChannelBinding[T]]
+        minMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [minMax binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -142,6 +150,31 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.channelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.channelsAtPosition[pos].add(bindingIdx)
+
+proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
+                                  channelPos: int,
+                                  isMin: bool,
+                                  inputExprs: seq[AlgebraicExpression[T]]) =
+    ## Register a min/max channel: channelPos = min/max(inputExprs).
+    ## The channel position is added to channelPositions (not searched).
+    ## Source positions are mapped in minMaxChannelsAtPosition.
+    var allPositions: PackedSet[int]
+    for expr in inputExprs:
+        for pos in expr.positions.items:
+            allPositions.incl(pos)
+    let bindingIdx = arr.minMaxChannelBindings.len
+    arr.minMaxChannelBindings.add(MinMaxChannelBinding[T](
+        channelPosition: channelPos,
+        isMin: isMin,
+        inputExprs: inputExprs,
+        inputPositions: allPositions
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in allPositions.items:
+        if pos notin arr.minMaxChannelsAtPosition:
+            arr.minMaxChannelsAtPosition[pos] = @[bindingIdx]
+        else:
+            arr.minMaxChannelsAtPosition[pos].add(bindingIdx)
 
 ################################################################################
 # Bounds propagation helpers
@@ -466,8 +499,25 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         reduced = newSeq[seq[T]](carray.len)
         currentDomain = newSeq[PackedSet[T]](carray.len)
 
+    # Channel positions with large domains skip expensive PackedSet creation.
+    # They're never searched, so domain reduction is pointless. We just need
+    # their min/max for bounds propagation (computed from sorted domain endpoints).
+    const LargeDomainThreshold = 1000
+    var skippedPositions: PackedSet[int]
+    var nSkipped, nNormal, maxDomainSize: int
     for pos in carray.allPositions():
-        currentDomain[pos] = toPackedSet[T](carray.domain[pos])
+        if pos in carray.channelPositions and carray.domain[pos].len > LargeDomainThreshold:
+            # Don't copy the million-element domain; channel propagation will set the
+            # correct value anyway. Store a 1-element placeholder for random init.
+            reduced[pos] = @[carray.domain[pos][0]]
+            skippedPositions.incl(pos)
+            inc nSkipped
+        else:
+            if carray.domain[pos].len > maxDomainSize:
+                maxDomainSize = carray.domain[pos].len
+            currentDomain[pos] = toPackedSet[T](carray.domain[pos])
+            inc nNormal
+    discard (nSkipped, nNormal, maxDomainSize)  # used only for debug logging
 
     # First examine any single-variable constraints to reduce domains
     for cons in carray.constraints:
@@ -734,6 +784,15 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     var domainMin = newSeq[T](carray.len)
     var domainMax = newSeq[T](carray.len)
 
+    # Precompute positions involved in bounds propagation (for targeted application)
+    var boundsPositions: PackedSet[int]
+    for form in normalizedForms:
+        for pos in form.coefficients.keys:
+            boundsPositions.incl(pos)
+    for dp in carray.disjunctivePairs:
+        for pos in dp.positions1: boundsPositions.incl(pos)
+        for pos in dp.positions2: boundsPositions.incl(pos)
+
     for outerIter in 0..<20:
         var outerChanged = false
 
@@ -741,12 +800,21 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if normalizedForms.len > 0 or carray.disjunctivePairs.len > 0:
             # Compute domainMin/domainMax from current PackedSets
             for pos in carray.allPositions():
-                if currentDomain[pos].len > 0:
-                    domainMin[pos] = T.high
-                    domainMax[pos] = T.low
-                    for v in currentDomain[pos].items:
-                        if v < domainMin[pos]: domainMin[pos] = v
-                        if v > domainMax[pos]: domainMax[pos] = v
+                if pos in skippedPositions:
+                    # Large-domain channel: use original domain endpoints
+                    domainMin[pos] = carray.domain[pos][0]
+                    domainMax[pos] = carray.domain[pos][^1]
+                elif currentDomain[pos].len > 0:
+                    # For channel positions not in any bounds constraint, use domain endpoints
+                    if pos in carray.channelPositions and pos notin boundsPositions:
+                        domainMin[pos] = carray.domain[pos][0]
+                        domainMax[pos] = carray.domain[pos][^1]
+                    else:
+                        domainMin[pos] = T.high
+                        domainMax[pos] = T.low
+                        for v in currentDomain[pos].items:
+                            if v < domainMin[pos]: domainMin[pos] = v
+                            if v > domainMax[pos]: domainMax[pos] = v
                 else:
                     domainMin[pos] = T(0)
                     domainMax[pos] = T(0)
@@ -787,15 +855,15 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         break
 
                     var infeasible = false
-                    for pos in carray.allPositions():
+                    for pos in boundsPositions.items:
                         if domainMin[pos] > domainMax[pos]:
                             infeasible = true
                             break
                     if infeasible:
                         break
 
-            # Apply tightened bounds to PackedSets
-            for pos in carray.allPositions():
+            # Apply tightened bounds to PackedSets (only positions in bounds constraints)
+            for pos in boundsPositions.items:
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
@@ -1066,8 +1134,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     # Disjunct 2 cannot be satisfied → force disjunct 1: coeffs1 · vars <= rhs1
                     tightenFromLe(domainMin, domainMax, dp.coeffs1, dp.positions1, dp.rhs1)
 
-            # Apply tightened bounds to PackedSets
-            for pos in carray.allPositions():
+            # Apply tightened bounds to PackedSets (only positions in bounds constraints)
+            for pos in boundsPositions.items:
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
@@ -1414,6 +1482,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     # Convert PackedSets to output sequences
     for pos in carray.allPositions():
+        if pos in skippedPositions:
+            continue  # already set above
         reduced[pos] = toSeq(currentDomain[pos])
 
     return reduced
@@ -1459,4 +1529,18 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             arrayElements: binding.arrayElements
         )
     result.channelsAtPosition = arr.channelsAtPosition
+
+    # Deep copy min/max channel bindings - AlgebraicExpression refs need deep copy
+    result.minMaxChannelBindings = newSeq[MinMaxChannelBinding[T]](arr.minMaxChannelBindings.len)
+    for i, binding in arr.minMaxChannelBindings:
+        var exprs = newSeq[AlgebraicExpression[T]](binding.inputExprs.len)
+        for j, expr in binding.inputExprs:
+            exprs[j] = expr.deepCopy()
+        result.minMaxChannelBindings[i] = MinMaxChannelBinding[T](
+            channelPosition: binding.channelPosition,
+            isMin: binding.isMin,
+            inputExprs: exprs,
+            inputPositions: binding.inputPositions
+        )
+    result.minMaxChannelsAtPosition = arr.minMaxChannelsAtPosition
 

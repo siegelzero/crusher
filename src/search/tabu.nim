@@ -22,6 +22,21 @@ type
         calls*: int64
         totalTime*: float  # in seconds
 
+    FlatMinMaxBinding*[T] = object
+        channelPosition*: int
+        isMin*: bool
+        # All inputs stored as linear terms: value = sum(coeffs[j] * assignment[positions[j]]) + offsets[j]
+        # positions/coeffs/offsets have one entry per ref, inputBounds marks input boundaries
+        linearPositions*: seq[int]   # concatenated positions for all inputs
+        linearCoeffs*: seq[T]        # concatenated coefficients
+        linearOffsets*: seq[T]       # one offset per input
+        inputBounds*: seq[int]       # inputBounds[i] = start index into linearPositions for input i
+        # Pre-evaluated constant: min/max of all constant inputs (inputs with 0 positions)
+        constantVal*: T
+        hasConstant*: bool
+        # Complex inputs requiring expression evaluation (fallback, should be rare)
+        complexExprs*: seq[AlgebraicExpression[T]]
+
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
         carray*: ConstrainedArray[T]
@@ -103,6 +118,9 @@ type
         flowNodePositions*: seq[seq[(int, int)]]  # [flowNodeIdx] -> [(position, coeff)]
         posFlowNodes*: seq[seq[(int, int)]]       # [position] -> [(flowNodeIdx, coeff)]
         edgeObjectiveWeight*: Table[int, int]     # position -> objective coefficient for guided chains
+
+        # Flat min/max channel bindings for fast evaluation (avoids DAG expression tree traversal)
+        flatMinMaxBindings*: seq[FlatMinMaxBinding[T]]
 
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
@@ -548,12 +566,107 @@ proc channelDepConstraintDelta[T](c: StatefulConstraint[T], cdChanges: seq[(int,
             c.updatePosition(cp, oldV)
     return newPenalty - oldPenalty
 
+type LinearTerm[T] = tuple[pos: int, coeff: T]
+
+proc tryExtractLinear[T](node: ExpressionNode[T], assignment: seq[T],
+                          nlCache: var Table[pointer, T]): tuple[ok: bool, terms: seq[LinearTerm[T]], offset: T] =
+    ## Recursively decompose an expression tree into sum(coeff_i * assignment[pos_i]) + offset.
+    ## Non-linear subtrees (min/max/abs) are evaluated once and cached by pointer.
+    case node.kind
+    of LiteralNode:
+        return (true, @[], node.value)
+    of RefNode:
+        return (true, @[(pos: node.position, coeff: T(1))], T(0))
+    of BinaryOpNode:
+        case node.binaryOp
+        of Addition:
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            if not lok: return (false, @[], T(0))
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            if not rok: return (false, @[], T(0))
+            return (true, lterms & rterms, loff + roff)
+        of Subtraction:
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            if not lok: return (false, @[], T(0))
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            if not rok: return (false, @[], T(0))
+            var negTerms = newSeq[LinearTerm[T]](rterms.len)
+            for i, t in rterms: negTerms[i] = (pos: t.pos, coeff: -t.coeff)
+            return (true, lterms & negTerms, loff - roff)
+        of Multiplication:
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            if not lok: return (false, @[], T(0))
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            if not rok: return (false, @[], T(0))
+            if lterms.len == 0 and rterms.len == 0:
+                return (true, @[], loff * roff)
+            if lterms.len == 0:
+                var scaled = newSeq[LinearTerm[T]](rterms.len)
+                for i, t in rterms: scaled[i] = (pos: t.pos, coeff: loff * t.coeff)
+                return (true, scaled, loff * roff)
+            if rterms.len == 0:
+                var scaled = newSeq[LinearTerm[T]](lterms.len)
+                for i, t in lterms: scaled[i] = (pos: t.pos, coeff: roff * t.coeff)
+                return (true, scaled, roff * loff)
+            return (false, @[], T(0))
+        of Maximum, Minimum:
+            let key = cast[pointer](node)
+            if key in nlCache:
+                return (true, @[], nlCache[key])
+            let v = node.evaluate(assignment)
+            nlCache[key] = v
+            return (true, @[], v)
+    of UnaryOpNode:
+        if node.unaryOp == Negation:
+            let (ok, terms, off) = tryExtractLinear[T](node.target, assignment, nlCache)
+            if ok:
+                var negTerms = newSeq[LinearTerm[T]](terms.len)
+                for i, t in terms: negTerms[i] = (pos: t.pos, coeff: -t.coeff)
+                return (true, negTerms, -off)
+        elif node.unaryOp == AbsoluteValue:
+            let key = cast[pointer](node)
+            if key in nlCache:
+                return (true, @[], nlCache[key])
+            let v = node.evaluate(assignment)
+            nlCache[key] = v
+            return (true, @[], v)
+        return (false, @[], T(0))
+
+proc evaluateFlatMinMax[T](fb: FlatMinMaxBinding[T], assignment: seq[T]): T {.inline.} =
+    ## Evaluate a min/max channel binding using flat data (no tree traversal).
+    let nInputs = fb.linearOffsets.len
+    if fb.isMin:
+        result = if fb.hasConstant: fb.constantVal else: high(T)
+        for i in 0..<nInputs:
+            var v = fb.linearOffsets[i]
+            let start = fb.inputBounds[i]
+            let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
+            for j in start..<stop:
+                v += fb.linearCoeffs[j] * assignment[fb.linearPositions[j]]
+            if v < result: result = v
+        for expr in fb.complexExprs:
+            let v = expr.evaluate(assignment)
+            if v < result: result = v
+    else:
+        result = if fb.hasConstant: fb.constantVal else: low(T)
+        for i in 0..<nInputs:
+            var v = fb.linearOffsets[i]
+            let start = fb.inputBounds[i]
+            let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
+            for j in start..<stop:
+                v += fb.linearCoeffs[j] * assignment[fb.linearPositions[j]]
+            if v > result: result = v
+        for expr in fb.complexExprs:
+            let v = expr.evaluate(assignment)
+            if v > result: result = v
+
 proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int =
     ## Compute the total penalty delta from channel-dep constraints if we were
     ## to assign candidateValue at pos. Simulates channel propagation via worklist,
     ## then uses fast arithmetic for RelationalConstraint+SumExpr, falling back
     ## to simulate-restore for other constraint types.
-    if pos notin state.carray.channelsAtPosition:
+    if pos notin state.carray.channelsAtPosition and
+       pos notin state.carray.minMaxChannelsAtPosition:
         return 0
 
     assert not state.cdInUse, "computeChannelDepDelta is not reentrant"
@@ -605,21 +718,32 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
-            if p notin state.carray.channelsAtPosition: continue
-            for bi in state.carray.channelsAtPosition[p]:
-                let binding = state.carray.channelBindings[bi]
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
-                if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
-                let elem = binding.arrayElements[idxVal]
-                let newChanVal = if elem.isConstant: elem.constantValue
-                                 else: state.assignment[elem.variablePosition]
-                let chanPos = binding.channelPosition
-                if newChanVal != state.assignment[chanPos]:
-                    state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                    state.assignment[chanPos] = newChanVal
-                    if chanPos notin state.cdVisited:
-                        state.cdVisited.incl(chanPos)
-                        state.cdWorklist.add(chanPos)
+            if p in state.carray.channelsAtPosition:
+                for bi in state.carray.channelsAtPosition[p]:
+                    let binding = state.carray.channelBindings[bi]
+                    let idxVal = binding.indexExpression.evaluate(state.assignment)
+                    if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
+                    let elem = binding.arrayElements[idxVal]
+                    let newChanVal = if elem.isConstant: elem.constantValue
+                                     else: state.assignment[elem.variablePosition]
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                        state.assignment[chanPos] = newChanVal
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            if p in state.carray.minMaxChannelsAtPosition:
+                for bi in state.carray.minMaxChannelsAtPosition[p]:
+                    let fb = state.flatMinMaxBindings[bi]
+                    let newChanVal = evaluateFlatMinMax(fb, state.assignment)
+                    let chanPos = fb.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                        state.assignment[chanPos] = newChanVal
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
     else:
         # General worklist propagation
         state.cdWorklist.setLen(0)
@@ -628,21 +752,32 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
-            if p notin state.carray.channelsAtPosition: continue
-            for bi in state.carray.channelsAtPosition[p]:
-                let binding = state.carray.channelBindings[bi]
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
-                if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
-                let elem = binding.arrayElements[idxVal]
-                let newChanVal = if elem.isConstant: elem.constantValue
-                                 else: state.assignment[elem.variablePosition]
-                let chanPos = binding.channelPosition
-                if newChanVal != state.assignment[chanPos]:
-                    state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                    state.assignment[chanPos] = newChanVal
-                    if chanPos notin state.cdVisited:
-                        state.cdVisited.incl(chanPos)
-                        state.cdWorklist.add(chanPos)
+            if p in state.carray.channelsAtPosition:
+                for bi in state.carray.channelsAtPosition[p]:
+                    let binding = state.carray.channelBindings[bi]
+                    let idxVal = binding.indexExpression.evaluate(state.assignment)
+                    if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
+                    let elem = binding.arrayElements[idxVal]
+                    let newChanVal = if elem.isConstant: elem.constantValue
+                                     else: state.assignment[elem.variablePosition]
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                        state.assignment[chanPos] = newChanVal
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            if p in state.carray.minMaxChannelsAtPosition:
+                for bi in state.carray.minMaxChannelsAtPosition[p]:
+                    let fb = state.flatMinMaxBindings[bi]
+                    let newChanVal = evaluateFlatMinMax(fb, state.assignment)
+                    let chanPos = fb.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
+                        state.assignment[chanPos] = newChanVal
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
 
     # Restore all modified assignment values
     state.assignment[pos] = savedPos
@@ -954,6 +1089,124 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if elem.isConstant: elem.constantValue
                 else: state.assignment[elem.variablePosition]
 
+    # Build flat min/max bindings: decompose expression trees into flat operations.
+    # Expression trees can be DAGs (shared subtrees) causing exponential re-evaluation.
+    # Flat bindings use O(1) position lookups and pre-evaluated constants instead.
+    if carray.minMaxChannelBindings.len > 0:
+        if verbose and id == 0:
+            var totalInputs = 0
+            var maxInputs = 0
+            for binding in carray.minMaxChannelBindings:
+                totalInputs += binding.inputExprs.len
+                if binding.inputExprs.len > maxInputs:
+                    maxInputs = binding.inputExprs.len
+            echo "[Init] Min/max bindings: " & $carray.minMaxChannelBindings.len &
+                 " total inputs=" & $totalInputs & " max=" & $maxInputs &
+                 " avg=" & $(totalInputs div carray.minMaxChannelBindings.len)
+            echo "[Init] Pre min/max: assignment+elem took " & $(epochTime() - initStart) & "s"
+            initStart = epochTime()
+
+        state.flatMinMaxBindings = newSeq[FlatMinMaxBinding[T]](carray.minMaxChannelBindings.len)
+        let buildStart = epochTime()
+        var nComplex = 0
+        var nlCache = initTable[pointer, T]()
+        for i, binding in carray.minMaxChannelBindings:
+            state.flatMinMaxBindings[i].channelPosition = binding.channelPosition
+            state.flatMinMaxBindings[i].isMin = binding.isMin
+            state.flatMinMaxBindings[i].hasConstant = false
+            for expr in binding.inputExprs:
+                let (ok, terms, offset) = tryExtractLinear[T](expr.node, state.assignment, nlCache)
+                if ok and terms.len > 0:
+                    # Linear combination: sum(coeff_i * assignment[pos_i]) + offset
+                    state.flatMinMaxBindings[i].inputBounds.add(state.flatMinMaxBindings[i].linearPositions.len)
+                    state.flatMinMaxBindings[i].linearOffsets.add(offset)
+                    for t in terms:
+                        state.flatMinMaxBindings[i].linearPositions.add(t.pos)
+                        state.flatMinMaxBindings[i].linearCoeffs.add(t.coeff)
+                elif ok:
+                    # Pure constant (pos == -1)
+                    let v = offset
+                    if not state.flatMinMaxBindings[i].hasConstant:
+                        state.flatMinMaxBindings[i].constantVal = v
+                        state.flatMinMaxBindings[i].hasConstant = true
+                    elif binding.isMin:
+                        if v < state.flatMinMaxBindings[i].constantVal:
+                            state.flatMinMaxBindings[i].constantVal = v
+                    else:
+                        if v > state.flatMinMaxBindings[i].constantVal:
+                            state.flatMinMaxBindings[i].constantVal = v
+                else:
+                    # Can't decompose — keep expression for runtime evaluation
+                    state.flatMinMaxBindings[i].complexExprs.add(expr)
+                    inc nComplex
+
+        if verbose and id == 0:
+            let buildElapsed = epochTime() - buildStart
+            var totalLinear, totalConstants: int
+            for fb in state.flatMinMaxBindings:
+                totalLinear += fb.linearOffsets.len
+                if fb.hasConstant: inc totalConstants
+            echo "[Init] Min/max flat: " & $totalConstants & " constant, " &
+                 $totalLinear & " linear, " & $nComplex & " complex (built in " &
+                 $buildElapsed & "s)"
+            initStart = epochTime()
+
+        # Worklist-based fixed-point for chained min/max dependencies.
+        var worklist: seq[int]  # indices into flatMinMaxBindings
+        for i in 0..<state.flatMinMaxBindings.len:
+            worklist.add(i)
+        var inWorklist = newSeq[bool](state.flatMinMaxBindings.len)
+        for i in 0..<inWorklist.len: inWorklist[i] = true
+
+        # Build reverse index: position → binding indices that use this position as input
+        var posToBindings = initTable[int, seq[int]]()
+        for bi, fb in state.flatMinMaxBindings:
+            for j in 0..<fb.linearPositions.len:
+                let pos = fb.linearPositions[j]
+                if pos notin posToBindings:
+                    posToBindings[pos] = @[]
+                posToBindings[pos].add(bi)
+
+        var fpEvals = 0
+        while worklist.len > 0:
+            let bi = worklist.pop()
+            inWorklist[bi] = false
+            inc fpEvals
+            let fb = state.flatMinMaxBindings[bi]
+            # Evaluate only linear inputs + constant (complex already folded in)
+            let nInputs = fb.linearOffsets.len
+            var newVal: T
+            if fb.isMin:
+                newVal = if fb.hasConstant: fb.constantVal else: high(T)
+                for i in 0..<nInputs:
+                    var v = fb.linearOffsets[i]
+                    let start = fb.inputBounds[i]
+                    let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
+                    for j in start..<stop:
+                        v += fb.linearCoeffs[j] * state.assignment[fb.linearPositions[j]]
+                    if v < newVal: newVal = v
+            else:
+                newVal = if fb.hasConstant: fb.constantVal else: low(T)
+                for i in 0..<nInputs:
+                    var v = fb.linearOffsets[i]
+                    let start = fb.inputBounds[i]
+                    let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
+                    for j in start..<stop:
+                        v += fb.linearCoeffs[j] * state.assignment[fb.linearPositions[j]]
+                    if v > newVal: newVal = v
+            if newVal != state.assignment[fb.channelPosition]:
+                state.assignment[fb.channelPosition] = newVal
+                # Enqueue downstream bindings that use this channel as input
+                if fb.channelPosition in posToBindings:
+                    for downstream in posToBindings[fb.channelPosition]:
+                        if not inWorklist[downstream]:
+                            inWorklist[downstream] = true
+                            worklist.add(downstream)
+        if verbose and id == 0:
+            echo "[Init] Min/max channel fixed-point: " & $fpEvals & " evals, " &
+                 $carray.minMaxChannelBindings.len & " bindings, took " & $(epochTime() - initStart) & "s"
+            initStart = epochTime()
+
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
@@ -1003,7 +1256,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.hasChannelDeps = true
         # Find search positions that have channel bindings (can affect channel-dep constraints)
         for pos in state.searchPositions:
-            if pos in carray.channelsAtPosition:
+            if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -1027,14 +1280,24 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             visited.incl(pos)
             while worklist.len > 0:
                 let p = worklist.pop()
-                if p notin carray.channelsAtPosition: continue
-                for bi in carray.channelsAtPosition[p]:
-                    let binding = carray.channelBindings[bi]
-                    let chanPos = binding.channelPosition
-                    reachable.incl(chanPos)
-                    if chanPos notin visited:
-                        visited.incl(chanPos)
-                        worklist.add(chanPos)
+                # Element channel bindings
+                if p in carray.channelsAtPosition:
+                    for bi in carray.channelsAtPosition[p]:
+                        let binding = carray.channelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
+                # Min/max channel bindings
+                if p in carray.minMaxChannelsAtPosition:
+                    for bi in carray.minMaxChannelsAtPosition[p]:
+                        let binding = carray.minMaxChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
             # Collect channel-dep constraints reachable from this position
             var seen: PackedSet[int]  # dedup by constraint pointer
             var relevant: seq[StatefulConstraint[T]] = @[]
@@ -1646,42 +1909,62 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
 
     while worklist.len > 0:
         let pos = worklist.pop()
-        if pos notin state.carray.channelsAtPosition:
-            continue
-        for bi in state.carray.channelsAtPosition[pos]:
-            let binding = state.carray.channelBindings[bi]
-            let idxVal = binding.indexExpression.evaluate(state.assignment)
-            var newVal: T
-            if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                let elem = binding.arrayElements[idxVal]
-                newVal = if elem.isConstant: elem.constantValue
-                         else: state.assignment[elem.variablePosition]
-            else:
-                continue  # out of bounds, leave as-is
+        # Element channel bindings
+        if pos in state.carray.channelsAtPosition:
+            for bi in state.carray.channelsAtPosition[pos]:
+                let binding = state.carray.channelBindings[bi]
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                var newVal: T
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    newVal = if elem.isConstant: elem.constantValue
+                             else: state.assignment[elem.variablePosition]
+                else:
+                    continue  # out of bounds, leave as-is
 
-            if newVal != state.assignment[binding.channelPosition]:
-                result = true
-                changedChannels.add(binding.channelPosition)
-                state.assignment[binding.channelPosition] = newVal
-                for c in state.constraintsAtPosition[binding.channelPosition]:
-                    let oldPenalty = c.penalty()
-                    c.updatePosition(binding.channelPosition, newVal)
-                    let newPenalty = c.penalty()
-                    state.cost += newPenalty - oldPenalty
-                    if oldPenalty > 0 and newPenalty == 0:
-                        for pos in c.positions.items:
-                            state.violationCount[pos] -= 1
-                    elif oldPenalty == 0 and newPenalty > 0:
-                        for pos in c.positions.items:
-                            state.violationCount[pos] += 1
-                # Don't rebuild the channel's own penalty map (never searched).
-                # But DO update neighbor penalties so search positions sharing
-                # constraints with this channel get correct penalty maps.
-                state.updateNeighborPenalties(binding.channelPosition)
-                # If this channel position triggers further channels, enqueue it
-                if binding.channelPosition notin visited:
-                    visited.incl(binding.channelPosition)
-                    worklist.add(binding.channelPosition)
+                if newVal != state.assignment[binding.channelPosition]:
+                    result = true
+                    changedChannels.add(binding.channelPosition)
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    state.updateNeighborPenalties(binding.channelPosition)
+                    if binding.channelPosition notin visited:
+                        visited.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
+        # Min/max channel bindings
+        if pos in state.carray.minMaxChannelsAtPosition:
+            for bi in state.carray.minMaxChannelsAtPosition[pos]:
+                let fb = state.flatMinMaxBindings[bi]
+                let newVal = evaluateFlatMinMax(fb, state.assignment)
+                if newVal != state.assignment[fb.channelPosition]:
+                    result = true
+                    changedChannels.add(fb.channelPosition)
+                    state.assignment[fb.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[fb.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(fb.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    state.updateNeighborPenalties(fb.channelPosition)
+                    if fb.channelPosition notin visited:
+                        visited.incl(fb.channelPosition)
+                        worklist.add(fb.channelPosition)
 
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
@@ -1692,29 +1975,43 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
 
     while worklist.len > 0:
         let pos = worklist.pop()
-        if pos notin state.carray.channelsAtPosition:
-            continue
-        for bi in state.carray.channelsAtPosition[pos]:
-            let binding = state.carray.channelBindings[bi]
-            let idxVal = binding.indexExpression.evaluate(state.assignment)
-            var newVal: T
-            if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                let elem = binding.arrayElements[idxVal]
-                newVal = if elem.isConstant: elem.constantValue
-                         else: state.assignment[elem.variablePosition]
-            else:
-                continue
-            if newVal != state.assignment[binding.channelPosition]:
-                state.assignment[binding.channelPosition] = newVal
-                for c in state.constraintsAtPosition[binding.channelPosition]:
-                    let oldPenalty = c.penalty()
-                    c.updatePosition(binding.channelPosition, newVal)
-                    let newPenalty = c.penalty()
-                    state.cost += newPenalty - oldPenalty
-                # No penalty map or neighbor updates — lean mode
-                if binding.channelPosition notin visited:
-                    visited.incl(binding.channelPosition)
-                    worklist.add(binding.channelPosition)
+        # Element channel bindings
+        if pos in state.carray.channelsAtPosition:
+            for bi in state.carray.channelsAtPosition[pos]:
+                let binding = state.carray.channelBindings[bi]
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                var newVal: T
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    newVal = if elem.isConstant: elem.constantValue
+                             else: state.assignment[elem.variablePosition]
+                else:
+                    continue
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if binding.channelPosition notin visited:
+                        visited.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
+        # Min/max channel bindings
+        if pos in state.carray.minMaxChannelsAtPosition:
+            for bi in state.carray.minMaxChannelsAtPosition[pos]:
+                let fb = state.flatMinMaxBindings[bi]
+                let newVal = evaluateFlatMinMax(fb, state.assignment)
+                if newVal != state.assignment[fb.channelPosition]:
+                    state.assignment[fb.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[fb.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(fb.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if fb.channelPosition notin visited:
+                        visited.incl(fb.channelPosition)
+                        worklist.add(fb.channelPosition)
 
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## Lightweight assignment: updates constraint state and cost but skips

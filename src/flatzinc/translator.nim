@@ -89,6 +89,8 @@ type
     disjunctivePairs*: seq[tuple[
       coeffs1: seq[int], varNames1: seq[string], rhs1: int,
       coeffs2: seq[int], varNames2: seq[string], rhs2: int]]
+    # Min/max channel defs: array_int_minimum/maximum with defines_var → channel variables
+    minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -1301,7 +1303,9 @@ proc collectDefinedVars(tr: var FznTranslator) =
             definedVarNames[definedName] = true
             tr.definingConstraints.incl(ci)
             break
-  # Third loop: identify int_abs, int_max, int_min with defines_var annotations
+  # Third loop: identify int_abs, int_max, int_min, int_times with defines_var annotations
+  # int_min/int_max become channel variables (like array_int_minimum/maximum) to avoid
+  # deep expression tree inlining that creates exponentially large DAGs.
   for ci, con in tr.model.constraints:
     let name = stripSolverPrefix(con.name)
     if name in ["int_abs", "int_max", "int_min", "int_times"] and con.hasAnnotation("defines_var"):
@@ -1311,11 +1315,30 @@ proc collectDefinedVars(tr: var FznTranslator) =
         # int_abs(a, b) :: defines_var(b) → b is args[1]
         # int_max(a, b, c) :: defines_var(c) → c is args[2]
         # int_min(a, b, c) :: defines_var(c) → c is args[2]
+        # int_times(a, b, c) :: defines_var(c) → c is args[2]
         let expectedIdx = if name == "int_abs": 1 else: 2
         if con.args[expectedIdx].kind == FznIdent and
            con.args[expectedIdx].ident == definedName:
-          definedVarNames[definedName] = true
+          if name in ["int_min", "int_max"]:
+            # Make int_min/int_max into channel variables to avoid deep expression DAGs
+            let isMin = name == "int_min"
+            tr.channelVarNames.incl(definedName)
+            tr.definingConstraints.incl(ci)
+            tr.minMaxChannelDefs.add((ci: ci, varName: definedName, isMin: isMin))
+          else:
+            definedVarNames[definedName] = true
+            tr.definingConstraints.incl(ci)
+    # array_int_minimum(m, array) :: defines_var(m) → channel variable (not searched)
+    # array_int_maximum(m, array) :: defines_var(m) → channel variable (not searched)
+    elif name in ["array_int_minimum", "array_int_maximum"] and con.hasAnnotation("defines_var"):
+      let ann = con.getAnnotation("defines_var")
+      if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+        let definedName = ann.args[0].ident
+        if con.args[0].kind == FznIdent and con.args[0].ident == definedName:
+          let isMin = name == "array_int_minimum"
+          tr.channelVarNames.incl(definedName)
           tr.definingConstraints.incl(ci)
+          tr.minMaxChannelDefs.add((ci: ci, varName: definedName, isMin: isMin))
 
   # Store the set of defined variable names for use in translateVariables
   for name in definedVarNames.keys:
@@ -1345,7 +1368,8 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   let con = tr.model.constraints[ci]
   let name = stripSolverPrefix(con.name)
   # Only process defining constraints with defines_var
-  if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times"] or
+  if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times",
+                  "array_int_minimum", "array_int_maximum"] or
      not con.hasAnnotation("defines_var"):
     return true  # not our concern, treat as done
   var ann: FznAnnotation
@@ -1354,6 +1378,9 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
       ann = a
       break
   let definedName = ann.args[0].ident
+  # Min/max channel vars get positions and channel bindings, not expressions
+  if definedName in tr.channelVarNames:
+    return true
   if definedName in tr.definedVarExprs:
     return true  # already built
 
@@ -2596,6 +2623,30 @@ proc buildChannelBindings(tr: var FznTranslator) =
   if tr.sys.baseArray.channelBindings.len > 0:
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
+proc buildMinMaxChannelBindings(tr: var FznTranslator) =
+  ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
+  ## constraints with defines_var annotations. Must be called after buildDefinedExpressions
+  ## so that defined-var inputs can be resolved.
+  for def in tr.minMaxChannelDefs:
+    let con = tr.model.constraints[def.ci]
+    if def.varName notin tr.varPositions:
+      continue
+    let channelPos = tr.varPositions[def.varName]
+    let name = stripSolverPrefix(con.name)
+    var inputExprs: seq[AlgebraicExpression[int]]
+    if name in ["int_min", "int_max"]:
+      # int_min(a, b, c) / int_max(a, b, c) → inputs are [a, b]
+      inputExprs = @[tr.resolveExprArg(con.args[0]), tr.resolveExprArg(con.args[1])]
+    else:
+      # array_int_minimum(m, array) / array_int_maximum(m, array) → inputs are array
+      inputExprs = tr.resolveExprArray(con.args[1])
+    if inputExprs.len == 0:
+      continue
+    tr.sys.baseArray.addMinMaxChannelBinding(channelPos, def.isMin, inputExprs)
+
+  if tr.sys.baseArray.minMaxChannelBindings.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
+
 proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
   ## Resolves a FznExpr to variable names (for ordering detection).
   ## Only handles inline array literals since this runs before translateVariables.
@@ -2755,41 +2806,54 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
   if redundantCount > 0:
     stderr.writeLine(&"[FZN] Ordering reduction: {edges.len} -> {edges.len - redundantCount} constraints ({redundantCount} redundant)")
 
-proc estimateRange(tr: FznTranslator, node: ExpressionNode[int]): (int, int) =
+proc estimateRangeImpl(tr: FznTranslator, node: ExpressionNode[int],
+                       cache: var Table[pointer, (int, int)]): (int, int) =
   ## Conservative interval arithmetic to estimate the range of an expression.
   ## Returns (min, max) values the expression can take.
+  ## Uses memoization cache to avoid exponential re-traversal of shared DAG nodes.
+  let key = cast[pointer](node)
+  if key in cache:
+    return cache[key]
+  var result: (int, int)
   case node.kind
   of LiteralNode:
-    return (node.value, node.value)
+    result = (node.value, node.value)
   of RefNode:
     let dom = tr.sys.baseArray.domain[node.position]
     if dom.len > 0:
-      return (dom[0], dom[^1])
-    return (low(int), high(int))
+      result = (dom[0], dom[^1])
+    else:
+      result = (low(int), high(int))
   of UnaryOpNode:
-    let (cMin, cMax) = tr.estimateRange(node.target)
+    let (cMin, cMax) = tr.estimateRangeImpl(node.target, cache)
     case node.unaryOp
     of Negation:
-      return (-cMax, -cMin)
+      result = (-cMax, -cMin)
     of AbsoluteValue:
-      if cMin >= 0: return (cMin, cMax)
-      elif cMax <= 0: return (-cMax, -cMin)
-      else: return (0, max(-cMin, cMax))
+      if cMin >= 0: result = (cMin, cMax)
+      elif cMax <= 0: result = (-cMax, -cMin)
+      else: result = (0, max(-cMin, cMax))
   of BinaryOpNode:
-    let (lMin, lMax) = tr.estimateRange(node.left)
-    let (rMin, rMax) = tr.estimateRange(node.right)
+    let (lMin, lMax) = tr.estimateRangeImpl(node.left, cache)
+    let (rMin, rMax) = tr.estimateRangeImpl(node.right, cache)
     case node.binaryOp
     of Addition:
-      return (lMin + rMin, lMax + rMax)
+      result = (lMin + rMin, lMax + rMax)
     of Subtraction:
-      return (lMin - rMax, lMax - rMin)
+      result = (lMin - rMax, lMax - rMin)
     of Multiplication:
       let products = [lMin*rMin, lMin*rMax, lMax*rMin, lMax*rMax]
-      return (min(products), max(products))
+      result = (min(products), max(products))
     of Maximum:
-      return (max(lMin, rMin), max(lMax, rMax))
+      result = (max(lMin, rMin), max(lMax, rMax))
     of Minimum:
-      return (min(lMin, rMin), min(lMax, rMax))
+      result = (min(lMin, rMin), min(lMax, rMax))
+  cache[key] = result
+  return result
+
+proc estimateRange(tr: FznTranslator, node: ExpressionNode[int]): (int, int) =
+  var cache = initTable[pointer, (int, int)]()
+  tr.estimateRangeImpl(node, cache)
 
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
@@ -2828,12 +2892,63 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+  # Build set of variable names that are inputs to min/max channels.
+  # Bounds on these intermediate variables are MiniZinc domain analysis artifacts,
+  # not problem constraints. The min/max channel propagation maintains correct values
+  # regardless of whether intermediate inputs are within their declared domains.
+  var minMaxInputNames: HashSet[string]
+  for def in result.minMaxChannelDefs:
+    let con = result.model.constraints[def.ci]
+    # Extract input array variable names
+    let inputArg = con.args[1]
+    case inputArg.kind
+    of FznArrayLit:
+      for elem in inputArg.elems:
+        if elem.kind == FznIdent:
+          minMaxInputNames.incl(elem.ident)
+    else:
+      # Named array reference — resolve through resolveVarArrayElems
+      let resolved = result.resolveVarArrayElems(inputArg)
+      for elem in resolved:
+        if elem.kind == FznIdent:
+          minMaxInputNames.incl(elem.ident)
+  # Also add transitive inputs: if a min/max input is itself a defined variable
+  # whose expression references other defined variables, those are also safe to skip
+  if minMaxInputNames.len > 0:
+    var changed = true
+    while changed:
+      changed = false
+      for ci in result.definingConstraints.items:
+        let con = result.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+          continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent:
+          continue
+        let definedName = ann.args[0].ident
+        if definedName notin minMaxInputNames:
+          continue
+        # This defined variable is a min/max input — add all its dependencies too
+        let varElems = result.resolveVarArrayElems(con.args[1])
+        for v in varElems:
+          if v.kind == FznIdent and v.ident in result.definedVarNames and
+             v.ident notin minMaxInputNames:
+            minMaxInputNames.incl(v.ident)
+            changed = true
   # Add domain constraints for defined variables with finite bounds,
   # but skip bounds that are naturally satisfied by the expression's range
+  # or where the variable is an input to a min/max channel (bounds are MiniZinc
+  # domain artifacts, not problem constraints)
   var nBoundsSkipped = 0
+  var nChannelBoundsSkipped = 0
   for varName, bounds in result.definedVarBounds:
     if varName in result.definedVarExprs:
       let expr = result.definedVarExprs[varName]
+      # Skip bounds on min/max channel input variables
+      if varName in minMaxInputNames:
+        nChannelBoundsSkipped += 2
+        continue
       let (lo, hi) = bounds
       let (exprMin, exprMax) = result.estimateRange(expr.node)
       if lo > low(int) and lo > exprMin:
@@ -2844,8 +2959,8 @@ proc translate*(model: FznModel): FznTranslator =
         result.sys.addConstraint(expr <= hi)
       else:
         inc nBoundsSkipped
-  if nBoundsSkipped > 0:
-    stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped} redundant defined-var bounds constraints")
+  if nBoundsSkipped > 0 or nChannelBoundsSkipped > 0:
+    stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped} redundant defined-var bounds constraints (range={nBoundsSkipped} channel={nChannelBoundsSkipped})")
   # Build matrix infos for matrix_element pattern detection
   result.buildMatrixInfos()
 
@@ -3158,5 +3273,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildReifChannelBindings()
   # Build channel bindings for one-hot indicator variables
   result.buildOneHotChannelBindings()
+  # Build channel bindings for array_int_minimum/maximum defines_var
+  result.buildMinMaxChannelBindings()
 
   result.translateSolve()
