@@ -48,17 +48,21 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
+        # Phase 1: Linear descent with per-probe time budgets
         if verbose:
-            echo "[Opt] Binary search: [", lo, ", ", hi, "]"
+            echo "[Opt] Linear descent from ", hi
 
         while lo <= hi:
-            # Check deadline before each binary search iteration
             if deadline > 0 and epochTime() > deadline:
                 system.searchCompleted = false
                 break
 
             let bestSolution = system.assignment
-            let target = lo + (hi - lo) div 2
+            # Linear descent: try the next value down (minimize) or up (maximize)
+            when direction == Minimize:
+                let target = hi
+            else:
+                let target = lo
 
             if hasBoundConstraint:
                 system.removeLastConstraint()
@@ -72,6 +76,15 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
 
+            # Per-probe time budget: fraction of remaining time, leaving room for deep retry
+            var probeDeadline = 0.0
+            if deadline > 0:
+                let remaining = deadline - epochTime()
+                if remaining < 5.0:
+                    system.searchCompleted = false
+                    break
+                probeDeadline = min(epochTime() + max(remaining * 0.15, 5.0), deadline)
+
             try:
                 system.resolve(
                     parallel=parallel,
@@ -81,7 +94,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
-                    deadline=deadline,
+                    deadline=probeDeadline,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
@@ -93,27 +106,22 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     lo = currentCost + 1
             except TimeLimitExceededError:
-                # Time limit hit during optimization — keep best known solution
-                system.searchCompleted = false
+                # Probe budget exhausted — target might still be reachable with more time
+                # Break to retry loop which gets the remaining time
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 break
             except InfeasibleError:
-                # Domain reduction proved this bound infeasible
-                when direction == Minimize:
-                    lo = target + 1
-                else:
-                    hi = target - 1
+                # Domain reduction proved no solution at this bound — optimal found
+                system.optimalityProven = true
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
+                break
             except NoSolutionFoundError:
-                when direction == Minimize:
-                    lo = target + 1
-                else:
-                    hi = target - 1
-                # Restore best known solution
+                # Quick probe couldn't find it — break to retry loop for deep attempt
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
+                break
 
         # Retry: binary search may falsely conclude infeasibility for heuristic solvers.
         # Try once more to beat the current best.

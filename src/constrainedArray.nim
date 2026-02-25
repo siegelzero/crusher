@@ -29,6 +29,9 @@ type
         channelPositions*: PackedSet[int]
         channelBindings*: seq[ChannelBinding[T]]
         channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
+        disjunctivePairs*: seq[tuple[
+            coeffs1: seq[T], positions1: seq[int], rhs1: T,
+            coeffs2: seq[T], positions2: seq[int], rhs2: T]]
 
 ################################################################################
 # Value Extraction
@@ -136,6 +139,39 @@ func floorDivPositive[T](a, b: T): T =
     ## floor(a / b) for b > 0
     if a >= 0: a div b
     else: -((-a + b - 1) div b)
+
+proc tightenFromLe[T](domainMin, domainMax: var seq[T],
+                       coeffs: seq[T], positions: seq[int], rhs: T) =
+    ## For constraint coeffs · vars <= rhs, tighten domainMin/domainMax bounds.
+    for j in 0..<positions.len:
+        let pos_j = positions[j]
+        let a_j = coeffs[j]
+        if a_j == 0: continue
+
+        # Compute restMin: minimum possible sum of all other terms
+        var restMin: T = 0
+        for i in 0..<positions.len:
+            if i == j: continue
+            let a_i = coeffs[i]
+            let pos_i = positions[i]
+            if a_i > 0:
+                restMin += a_i * domainMin[pos_i]
+            else:
+                restMin += a_i * domainMax[pos_i]
+
+        # From a_j * x_j + restMin <= rhs  =>  a_j * x_j <= rhs - restMin
+        let slack = rhs - restMin
+        if a_j > 0:
+            # x_j <= floor(slack / a_j)
+            let newMax = floorDivPositive(slack, a_j)
+            if newMax < domainMax[pos_j]:
+                domainMax[pos_j] = newMax
+        else:
+            # a_j < 0, divide flips: x_j >= ceil(slack / a_j)
+            # ceil(slack / a_j) = -floor(-slack / |a_j|) = -floorDivPositive(-slack, -a_j)
+            let newMin = -floorDivPositive(-slack, -a_j)
+            if newMin > domainMin[pos_j]:
+                domainMin[pos_j] = newMin
 
 type
     LinearForm[T] = object
@@ -678,14 +714,15 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 indexPos: ms.rowPosition, valPos: ms.valuePosition, matState: ms))
 
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
+    var domainMin = newSeq[T](carray.len)
+    var domainMax = newSeq[T](carray.len)
+
     for outerIter in 0..<20:
         var outerChanged = false
 
         # Phase 3: Bounds propagation
-        if normalizedForms.len > 0:
+        if normalizedForms.len > 0 or carray.disjunctivePairs.len > 0:
             # Compute domainMin/domainMax from current PackedSets
-            var domainMin = newSeq[T](carray.len)
-            var domainMax = newSeq[T](carray.len)
             for pos in carray.allPositions():
                 if currentDomain[pos].len > 0:
                     domainMin[pos] = T.high
@@ -697,47 +734,48 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     domainMin[pos] = T(0)
                     domainMax[pos] = T(0)
 
-            # Inner fixed-point loop for bounds propagation
-            for iteration in 0..<100:
-                var changed = false
+            if normalizedForms.len > 0:
+                # Inner fixed-point loop for bounds propagation
+                for iteration in 0..<100:
+                    var changed = false
 
-                for form in normalizedForms:
-                    for pos_j in form.coefficients.keys:
-                        let a_j = form.coefficients[pos_j]
-                        if a_j == 0: continue
+                    for form in normalizedForms:
+                        for pos_j in form.coefficients.keys:
+                            let a_j = form.coefficients[pos_j]
+                            if a_j == 0: continue
 
-                        var restMax: T = 0
-                        for pos_i in form.coefficients.keys:
-                            if pos_i == pos_j: continue
-                            let a_i = form.coefficients[pos_i]
-                            if a_i > 0:
-                                restMax += a_i * domainMax[pos_i]
+                            var restMax: T = 0
+                            for pos_i in form.coefficients.keys:
+                                if pos_i == pos_j: continue
+                                let a_i = form.coefficients[pos_i]
+                                if a_i > 0:
+                                    restMax += a_i * domainMax[pos_i]
+                                else:
+                                    restMax += a_i * domainMin[pos_i]
+
+                            let bound = -form.constant - restMax
+
+                            if a_j > 0:
+                                let newMin = ceilDivPositive(bound, a_j)
+                                if newMin > domainMin[pos_j]:
+                                    domainMin[pos_j] = newMin
+                                    changed = true
                             else:
-                                restMax += a_i * domainMin[pos_i]
+                                let newMax = floorDivPositive(-bound, -a_j)
+                                if newMax < domainMax[pos_j]:
+                                    domainMax[pos_j] = newMax
+                                    changed = true
 
-                        let bound = -form.constant - restMax
-
-                        if a_j > 0:
-                            let newMin = ceilDivPositive(bound, a_j)
-                            if newMin > domainMin[pos_j]:
-                                domainMin[pos_j] = newMin
-                                changed = true
-                        else:
-                            let newMax = floorDivPositive(-bound, -a_j)
-                            if newMax < domainMax[pos_j]:
-                                domainMax[pos_j] = newMax
-                                changed = true
-
-                if not changed:
-                    break
-
-                var infeasible = false
-                for pos in carray.allPositions():
-                    if domainMin[pos] > domainMax[pos]:
-                        infeasible = true
+                    if not changed:
                         break
-                if infeasible:
-                    break
+
+                    var infeasible = false
+                    for pos in carray.allPositions():
+                        if domainMin[pos] > domainMax[pos]:
+                            infeasible = true
+                            break
+                    if infeasible:
+                        break
 
             # Apply tightened bounds to PackedSets
             for pos in carray.allPositions():
@@ -964,6 +1002,58 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if currentDomain[pos].len > 1:
                             currentDomain[pos] = toPackedSet[T]([T(target)])
                             outerChanged = true
+
+        # Phase: Disjunctive pair propagation
+        if carray.disjunctivePairs.len > 0:
+            # Recompute domainMin/domainMax from current PackedSets
+            for pos in carray.allPositions():
+                if currentDomain[pos].len > 0:
+                    domainMin[pos] = T.high
+                    domainMax[pos] = T.low
+                    for v in currentDomain[pos].items:
+                        if v < domainMin[pos]: domainMin[pos] = v
+                        if v > domainMax[pos]: domainMax[pos] = v
+
+            for dp in carray.disjunctivePairs:
+                # Compute min/max of each linear expression: coeffs · vars - rhs
+                # Disjunct is satisfied when coeffs · vars - rhs <= 0, i.e. coeffs · vars <= rhs
+                var minE1, maxE1, minE2, maxE2: T = 0
+                for i, pos in dp.positions1:
+                    if dp.coeffs1[i] > 0:
+                        minE1 += dp.coeffs1[i] * domainMin[pos]
+                        maxE1 += dp.coeffs1[i] * domainMax[pos]
+                    else:
+                        minE1 += dp.coeffs1[i] * domainMax[pos]
+                        maxE1 += dp.coeffs1[i] * domainMin[pos]
+                minE1 -= dp.rhs1
+                maxE1 -= dp.rhs1
+                for i, pos in dp.positions2:
+                    if dp.coeffs2[i] > 0:
+                        minE2 += dp.coeffs2[i] * domainMin[pos]
+                        maxE2 += dp.coeffs2[i] * domainMax[pos]
+                    else:
+                        minE2 += dp.coeffs2[i] * domainMax[pos]
+                        maxE2 += dp.coeffs2[i] * domainMin[pos]
+                minE2 -= dp.rhs2
+                maxE2 -= dp.rhs2
+
+                # If max of expression <= 0, disjunct is always satisfiable — skip
+                if maxE1 <= 0 or maxE2 <= 0:
+                    continue
+
+                if minE1 > 0:
+                    # Disjunct 1 cannot be satisfied → force disjunct 2: coeffs2 · vars <= rhs2
+                    tightenFromLe(domainMin, domainMax, dp.coeffs2, dp.positions2, dp.rhs2)
+                elif minE2 > 0:
+                    # Disjunct 2 cannot be satisfied → force disjunct 1: coeffs1 · vars <= rhs1
+                    tightenFromLe(domainMin, domainMax, dp.coeffs1, dp.positions1, dp.rhs1)
+
+            # Apply tightened bounds to PackedSets
+            for pos in carray.allPositions():
+                for v in toSeq(currentDomain[pos].items):
+                    if v < domainMin[pos] or v > domainMax[pos]:
+                        currentDomain[pos].excl(v)
+                        outerChanged = true
 
         # Phase 6: Element/MatrixElement arc consistency
         for cons in carray.constraints:

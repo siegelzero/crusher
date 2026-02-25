@@ -85,6 +85,10 @@ type
     oneHotChannelDefs*: seq[tuple[indicatorVar, intVar: string, value: int]]
     # Boundary B vars that are always 0 (from int_eq_reif(bVar, 1, false))
     constantZeroChannels*: seq[string]
+    # Disjunctive pair patterns: bool_clause([b1,b2],[]) where b1,b2 come from int_lin_le_reif
+    disjunctivePairs*: seq[tuple[
+      coeffs1: seq[int], varNames1: seq[string], rhs1: int,
+      coeffs2: seq[int], varNames2: seq[string], rhs2: int]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -2188,6 +2192,134 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc detectDisjunctivePairs(tr: var FznTranslator) =
+  ## Detects disjunctive pair patterns:
+  ##   int_lin_le_reif(coeffs1, vars1, rhs1, b1) :: defines_var(b1)
+  ##   int_lin_le_reif(coeffs2, vars2, rhs2, b2) :: defines_var(b2)
+  ##   bool_clause([b1, b2], [])
+  ## Where b1, b2 are bool variables only used in this one clause.
+  ## Replaces all 3 constraints + 2 bool variables with:
+  ##   min(max(0, expr1), max(0, expr2)) == 0
+  ## where expr_i = scalar_product(coeffs_i, vars_i) - rhs_i.
+
+  # Step 1: Build mapping from result var name → constraint index for
+  # all int_lin_le_reif with defines_var annotation
+  var linLeReifDefines: Table[string, int]  # result var name → constraint index
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_le_reif": continue
+    if con.args.len < 4: continue
+    if not con.hasAnnotation("defines_var"): continue
+    let resultArg = con.args[3]
+    if resultArg.kind != FznIdent: continue
+    linLeReifDefines[resultArg.ident] = ci
+
+  if linLeReifDefines.len == 0: return
+
+  # Step 2: Count references to each bool var in non-defining constraints.
+  # We only count references in bool_clause positive/negative literal lists.
+  var varRefCount: Table[string, int]
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    # Count each literal mentioned in positive and negative arrays
+    for argIdx in 0..1:
+      let arr = con.args[argIdx]
+      if arr.kind != FznArrayLit: continue
+      for elem in arr.elems:
+        if elem.kind == FznIdent:
+          varRefCount.mgetOrPut(elem.ident, 0) += 1
+
+  # Step 3: Scan bool_clause([b1, b2], []) constraints
+  var nConsumed = 0
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    let posArg = con.args[0]
+    let negArg = con.args[1]
+    if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+    # Pattern: exactly 2 positive literals, no negative literals
+    if posArg.elems.len != 2 or negArg.elems.len != 0: continue
+    let b1 = posArg.elems[0]
+    let b2 = posArg.elems[1]
+    if b1.kind != FznIdent or b2.kind != FznIdent: continue
+    # Check both are defined by int_lin_le_reif
+    if b1.ident notin linLeReifDefines or b2.ident notin linLeReifDefines: continue
+    # Check both are only used in this one clause
+    if varRefCount.getOrDefault(b1.ident) != 1 or varRefCount.getOrDefault(b2.ident) != 1: continue
+
+    # Extract coefficients, variables, and RHS from both reif constraints
+    let reifIdx1 = linLeReifDefines[b1.ident]
+    let reifIdx2 = linLeReifDefines[b2.ident]
+    let reifCon1 = tr.model.constraints[reifIdx1]
+    let reifCon2 = tr.model.constraints[reifIdx2]
+
+    let coeffs1 = try: tr.resolveIntArray(reifCon1.args[0]) except ValueError, KeyError: continue
+    let coeffs2 = try: tr.resolveIntArray(reifCon2.args[0]) except ValueError, KeyError: continue
+    let rhs1 = try: tr.resolveIntArg(reifCon1.args[2]) except ValueError, KeyError: continue
+    let rhs2 = try: tr.resolveIntArg(reifCon2.args[2]) except ValueError, KeyError: continue
+
+    # Resolve variable names from the args
+    var varNames1: seq[string]
+    var varNames2: seq[string]
+    let varArr1 = reifCon1.args[1]
+    let varArr2 = reifCon2.args[1]
+
+    block extractVars1:
+      case varArr1.kind
+      of FznArrayLit:
+        for e in varArr1.elems:
+          if e.kind == FznIdent:
+            varNames1.add(e.ident)
+          else:
+            break extractVars1
+      of FznIdent:
+        if varArr1.ident in tr.arrayElementNames:
+          varNames1 = tr.arrayElementNames[varArr1.ident]
+        else:
+          continue
+      else: continue
+
+    block extractVars2:
+      case varArr2.kind
+      of FznArrayLit:
+        for e in varArr2.elems:
+          if e.kind == FznIdent:
+            varNames2.add(e.ident)
+          else:
+            break extractVars2
+      of FznIdent:
+        if varArr2.ident in tr.arrayElementNames:
+          varNames2 = tr.arrayElementNames[varArr2.ident]
+        else:
+          continue
+      else: continue
+
+    if varNames1.len != coeffs1.len or varNames2.len != coeffs2.len: continue
+
+    # Consume all 3 constraints and both bool variables
+    tr.definingConstraints.incl(ci)        # bool_clause
+    tr.definingConstraints.incl(reifIdx1)  # int_lin_le_reif for b1
+    tr.definingConstraints.incl(reifIdx2)  # int_lin_le_reif for b2
+    tr.definedVarNames.incl(b1.ident)
+    tr.definedVarNames.incl(b2.ident)
+
+    tr.disjunctivePairs.add((
+      coeffs1: coeffs1, varNames1: varNames1, rhs1: rhs1,
+      coeffs2: coeffs2, varNames2: varNames2, rhs2: rhs2))
+    nConsumed += 3
+
+  if tr.disjunctivePairs.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.disjunctivePairs.len} disjunctive pairs, " &
+                     &"{nConsumed} constraints consumed, " &
+                     &"{tr.disjunctivePairs.len * 2} bool variables eliminated")
+
+
 proc detectDfaGeostPattern(tr: var FznTranslator) =
   ## Detects multiple fzn_regular constraints over the same variable array
   ## (tiling pattern) and converts them to a single geost constraint.
@@ -2687,6 +2819,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectReifChannels()
   # Detect implication-to-table and one-hot channel patterns
   result.detectImplicationPatterns()
+  # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
+  result.detectDisjunctivePairs()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
   # Detect redundant ordering constraints (transitive reduction)
@@ -2800,6 +2934,62 @@ proc translate*(model: FznModel): FznTranslator =
               inc nTableDomainRestrictions
   if nTableDomainRestrictions > 0:
     stderr.writeLine(&"[FZN] Table domain restrictions from eliminated variables: {nTableDomainRestrictions}")
+
+  # Add disjunctive pair constraints: min(max(0, expr1), max(0, expr2)) == 0
+  for pair in result.disjunctivePairs:
+    var exprs1 = newSeq[AlgebraicExpression[int]](pair.varNames1.len)
+    for i, vn in pair.varNames1:
+      exprs1[i] = result.resolveExprArg(FznExpr(kind: FznIdent, ident: vn))
+    var exprs2 = newSeq[AlgebraicExpression[int]](pair.varNames2.len)
+    for i, vn in pair.varNames2:
+      exprs2[i] = result.resolveExprArg(FznExpr(kind: FznIdent, ident: vn))
+    # Build: coeffs[0]*vars[0] + coeffs[1]*vars[1] + ... - rhs
+    var linExpr1 = newAlgebraicExpression[int](
+      positions = initPackedSet[int](),
+      node = ExpressionNode[int](kind: LiteralNode, value: -pair.rhs1),
+      linear = true)
+    for i in 0..<pair.coeffs1.len:
+      linExpr1 = linExpr1 + pair.coeffs1[i] * exprs1[i]
+    var linExpr2 = newAlgebraicExpression[int](
+      positions = initPackedSet[int](),
+      node = ExpressionNode[int](kind: LiteralNode, value: -pair.rhs2),
+      linear = true)
+    for i in 0..<pair.coeffs2.len:
+      linExpr2 = linExpr2 + pair.coeffs2[i] * exprs2[i]
+    let zero = newAlgebraicExpression[int](
+      positions = initPackedSet[int](),
+      node = ExpressionNode[int](kind: LiteralNode, value: 0),
+      linear = true)
+    let viol1 = binaryMax(zero, linExpr1)
+    let viol2 = binaryMax(zero, linExpr2)
+    let disjPenalty = binaryMin(viol1, viol2)
+    result.sys.addConstraint(disjPenalty == 0)
+
+    # Populate domain reduction metadata (positions instead of var names)
+    block:
+      var positions1: seq[int]
+      var skip = false
+      for vn in pair.varNames1:
+        if vn in result.varPositions:
+          positions1.add(result.varPositions[vn])
+        else:
+          skip = true
+          break
+      if not skip:
+        var positions2: seq[int]
+        for vn in pair.varNames2:
+          if vn in result.varPositions:
+            positions2.add(result.varPositions[vn])
+          else:
+            skip = true
+            break
+        if not skip:
+          result.sys.baseArray.disjunctivePairs.add((
+            coeffs1: pair.coeffs1, positions1: positions1, rhs1: pair.rhs1,
+            coeffs2: pair.coeffs2, positions2: positions2, rhs2: pair.rhs2))
+
+  if result.sys.baseArray.disjunctivePairs.len > 0:
+    stderr.writeLine(&"[FZN] Disjunctive pairs for domain reduction: {result.sys.baseArray.disjunctivePairs.len}")
 
   # Detect transition table chains and apply bidirectional multi-hop reachability
   # domain reduction. MiniZinc may eliminate boundary variables (e.g., agentAtTimeT[1,a]=58
