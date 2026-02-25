@@ -1,9 +1,10 @@
-import std/packedsets
+import std/[packedsets, tables]
 
 import constrainedArray
-import constraints/[algebraic, stateful, elementState, matrixElement, types]
+import constraints/[algebraic, constraintNode, relationalConstraint, stateful, elementState, matrixElement, types]
 export elementState.ArrayElement
 import expressions/[algebraic, sumExpression, maxExpression, minExpression]
+import expressions/stateful as exprStateful
 
 ################################################################################
 # Type definitions
@@ -272,8 +273,138 @@ proc strictlyDecreasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # Returns constraint requiring that all values in the container be in strictly decreasing order.
     strictlyDecreasing[T](cvar.positions)
 
+proc tryConvertBiconditionalToChannel[T](system: ConstraintSystem[T],
+    leftChild, rightChild: StatefulConstraint[T]): bool =
+    ## Tries to convert (A == constA) <-> (B == constB) to a channel binding.
+    ## Returns true if conversion succeeded (constraint absorbed), false to fall through.
+
+    # Both children must be RelationalType
+    if leftChild.stateType != RelationalType or rightChild.stateType != RelationalType:
+        return false
+
+    let leftRel = leftChild.relationalState
+    let rightRel = rightChild.relationalState
+
+    # Both must have EqualTo or NotEqualTo relation
+    if leftRel.relation notin {EqualTo, NotEqualTo} or
+       rightRel.relation notin {EqualTo, NotEqualTo}:
+        return false
+
+    # Both must be simple: single-position PositionBased SumExpr on left, ConstantExpr on right
+    # Check left child structure
+    if leftRel.leftExpr.kind != SumExpr or leftRel.rightExpr.kind != ConstantExpr:
+        return false
+    let leftSum = leftRel.leftExpr.sumExpr
+    if leftSum.evalMethod != PositionBased or leftSum.coefficient.len != 1:
+        return false
+    # Get position and verify coefficient is 1
+    var leftPos: int
+    var leftCoeff: T
+    for pos in leftSum.coefficient.keys:
+        leftPos = pos
+        leftCoeff = leftSum.coefficient[pos]
+    if leftCoeff != T(1):
+        return false
+    if leftSum.constant != T(0):
+        return false
+    let leftConst = leftRel.rightExpr.constantValue
+
+    # Check right child structure
+    if rightRel.leftExpr.kind != SumExpr or rightRel.rightExpr.kind != ConstantExpr:
+        return false
+    let rightSum = rightRel.leftExpr.sumExpr
+    if rightSum.evalMethod != PositionBased or rightSum.coefficient.len != 1:
+        return false
+    var rightPos: int
+    var rightCoeff: T
+    for pos in rightSum.coefficient.keys:
+        rightPos = pos
+        rightCoeff = rightSum.coefficient[pos]
+    if rightCoeff != T(1):
+        return false
+    if rightSum.constant != T(0):
+        return false
+    let rightConst = rightRel.rightExpr.constantValue
+
+    # Exactly one side must have binary domain {0,1} with EqualTo — that's the channel variable
+    let leftDomain = system.baseArray.domain[leftPos]
+    let rightDomain = system.baseArray.domain[rightPos]
+
+    let leftIsBinary = leftDomain.len == 2 and T(0) in leftDomain and T(1) in leftDomain and
+                       leftRel.relation == EqualTo
+    let rightIsBinary = rightDomain.len == 2 and T(0) in rightDomain and T(1) in rightDomain and
+                        rightRel.relation == EqualTo
+
+    # Exactly one side must be the binary channel variable
+    if leftIsBinary == rightIsBinary:
+        return false  # Both binary or neither — not a valid channeling pattern
+
+    var channelPos, sourcePos: int
+    var channelConst: T
+    var sourceConst: T
+    var sourceRelation: BinaryRelation
+    var sourceDomain: seq[T]
+
+    if leftIsBinary:
+        channelPos = leftPos
+        channelConst = leftConst
+        sourcePos = rightPos
+        sourceConst = rightConst
+        sourceRelation = rightRel.relation
+        sourceDomain = rightDomain
+    else:
+        channelPos = rightPos
+        channelConst = rightConst
+        sourcePos = leftPos
+        sourceConst = leftConst
+        sourceRelation = leftRel.relation
+        sourceDomain = leftDomain
+
+    # Source domain must be non-empty
+    if sourceDomain.len == 0:
+        return false
+
+    # Build the array elements: for each value in source domain, determine channel value
+    var arrayElems: seq[ArrayElement[T]] = @[]
+    for v in sourceDomain:
+        let matchesSource = (sourceRelation == EqualTo) == (v == sourceConst)
+        arrayElems.add(ArrayElement[T](
+            isConstant: true,
+            constantValue: if matchesSource: channelConst else: T(1) - channelConst
+        ))
+
+    # Build index expression: sourcePos - lo (where lo is first element of sorted domain)
+    let lo = sourceDomain[0]
+    var indexExpr: AlgebraicExpression[T]
+    if lo == T(0):
+        indexExpr = newAlgebraicExpression[T](
+            positions = toPackedSet[int]([sourcePos]),
+            node = ExpressionNode[T](kind: RefNode, position: sourcePos),
+            linear = true
+        )
+    else:
+        indexExpr = newAlgebraicExpression[T](
+            positions = toPackedSet[int]([sourcePos]),
+            node = ExpressionNode[T](
+                kind: BinaryOpNode,
+                binaryOp: Subtraction,
+                left: ExpressionNode[T](kind: RefNode, position: sourcePos),
+                right: ExpressionNode[T](kind: LiteralNode, value: lo)
+            ),
+            linear = true
+        )
+
+    # Register the channel binding
+    system.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
+    return true
+
 proc addConstraint*[T](system: ConstraintSystem[T], constraint: StatefulConstraint[T]) =
-    # adds constraint to the system
+    # Check for biconditional channeling pattern: (B == 1) <-> (X == val)
+    if constraint.stateType == BooleanType:
+        let bs = constraint.booleanState
+        if not bs.isUnary and bs.booleanOp == Iff:
+            if system.tryConvertBiconditionalToChannel(bs.leftConstraint, bs.rightConstraint):
+                return
     system.baseArray.addBaseConstraint(constraint)
 
 proc addConstraint*[T](system: ConstraintSystem[T], constraint: AlgebraicConstraint[T]) =

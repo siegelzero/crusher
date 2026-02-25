@@ -194,10 +194,10 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
                 discard
 
         if not canSkip:
-            if leftChanged:
-                constraint.lastAffectedPositions.incl(constraint.leftExpr.positions)
-            if rightChanged:
-                constraint.lastAffectedPositions.incl(constraint.rightExpr.positions)
+            if leftChanged or rightChanged:
+                # When either expression value changes, penalty at ALL positions is affected
+                # because movePenalty(P) = f(leftValue, rightValue, P) depends on both values
+                constraint.lastAffectedPositions = constraint.positions
 
 # Get the current penalty
 func penalty*[T](constraint: RelationalConstraint[T]): int =

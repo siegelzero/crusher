@@ -534,7 +534,7 @@ proc channelDepConstraintDelta[T](c: StatefulConstraint[T], cdChanges: seq[(int,
             else: canFastPath = false
 
         if canFastPath:
-            return rc.relation.penalty(newLeft, newRight) - rc.cost
+            return rc.computeCost(newLeft, newRight) - rc.cost
 
     # Fallback: simulate-restore on the constraint
     let oldPenalty = c.penalty()
@@ -876,19 +876,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.constraints.add(constraint)
 
     # Auto-detect graduated equality: if the system has inequality constraints
-    # (which use graduated penalties) but no boolean constraints (which use binary
-    # penalties), enable graduated penalty on EqualTo constraints so they compete
-    # on the same scale as the inequalities.
+    # (which use graduated penalties), enable graduated penalty on EqualTo
+    # constraints so they compete on the same scale as the inequalities.
+    # This is especially important when channels are present, as the solver
+    # needs smooth gradient to navigate through channel-mediated effects.
     block:
         var hasInequality = false
-        var hasBoolean = false
         for c in state.constraints:
             if c.stateType == RelationalType and
                c.relationalState.relation in {LessThan, LessThanEq, GreaterThan, GreaterThanEq}:
                 hasInequality = true
-            if c.stateType == BooleanType:
-                hasBoolean = true
-        if hasInequality and not hasBoolean:
+                break
+        if hasInequality:
             for c in state.constraints:
                 if c.stateType == RelationalType and c.relationalState.relation == EqualTo:
                     c.relationalState.graduated = true

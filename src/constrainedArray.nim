@@ -126,6 +126,23 @@ proc removeLastConstraint*[T](arr: var ConstrainedArray[T]) {.inline.} =
     arr.constraints.setLen(arr.constraints.len - 1)
     arr.reducedDomain = @[]
 
+proc addChannelBinding*[T](arr: var ConstrainedArray[T],
+                           channelPos: int,
+                           indexExpr: AlgebraicExpression[T],
+                           arrayElems: seq[ArrayElement[T]]) =
+    let bindingIdx = arr.channelBindings.len
+    arr.channelBindings.add(ChannelBinding[T](
+        channelPosition: channelPos,
+        indexExpression: indexExpr,
+        arrayElements: arrayElems
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in indexExpr.positions.items:
+        if pos notin arr.channelsAtPosition:
+            arr.channelsAtPosition[pos] = @[bindingIdx]
+        else:
+            arr.channelsAtPosition[pos].add(bindingIdx)
+
 ################################################################################
 # Bounds propagation helpers
 ################################################################################
@@ -437,18 +454,6 @@ proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
                    yi < yj + dyj and yj < yi + dyi:
                     cost += 1
         return cost
-    of BooleanType:
-        let boolState = cons.booleanState
-        if boolState.isUnary:
-            let targetPen = evaluateConstraint(boolState.targetConstraint, assignment)
-            if targetPen < 0: return T(-1)
-            return calculateUnaryPenalty[T](boolState.unaryOp, targetPen)
-        else:
-            let leftPen = evaluateConstraint(boolState.leftConstraint, assignment)
-            if leftPen < 0: return T(-1)
-            let rightPen = evaluateConstraint(boolState.rightConstraint, assignment)
-            if rightPen < 0: return T(-1)
-            return calculateBooleanPenalty[T](boolState.booleanOp, leftPen, rightPen)
     else:
         return T(-1)  # sentinel: not supported
 
@@ -682,7 +687,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     const MAX_GAC_COMBOS = 1_000_000
     var gacConstraints: seq[int]  # indices into carray.constraints
     for i, cons in carray.constraints:
-        if cons.stateType in {AlgebraicType, RelationalType, BooleanType}:
+        if cons.stateType in {AlgebraicType, RelationalType}:
             let arity = cons.positions.len
             if arity >= 2 and arity <= MAX_GAC_ARITY:
                 gacConstraints.add(i)
