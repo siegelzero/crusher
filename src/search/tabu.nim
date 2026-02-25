@@ -568,10 +568,12 @@ proc channelDepConstraintDelta[T](c: StatefulConstraint[T], cdChanges: seq[(int,
 
 type LinearTerm[T] = tuple[pos: int, coeff: T]
 
-proc tryExtractLinear[T](node: ExpressionNode[T], assignment: seq[T],
-                          nlCache: var Table[pointer, T]): tuple[ok: bool, terms: seq[LinearTerm[T]], offset: T] =
+proc tryExtractLinear[T](node: ExpressionNode[T]): tuple[ok: bool, terms: seq[LinearTerm[T]], offset: T] =
     ## Recursively decompose an expression tree into sum(coeff_i * assignment[pos_i]) + offset.
-    ## Non-linear subtrees (min/max/abs) are evaluated once and cached by pointer.
+    ## Non-linear subtrees (min/max/abs) are only treated as constants when their
+    ## children are purely constant (no variable references). If they depend on
+    ## variables, we return ok=false so the entire input expression falls through
+    ## to complexExprs for correct runtime evaluation.
     case node.kind
     of LiteralNode:
         return (true, @[], node.value)
@@ -580,23 +582,23 @@ proc tryExtractLinear[T](node: ExpressionNode[T], assignment: seq[T],
     of BinaryOpNode:
         case node.binaryOp
         of Addition:
-            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left)
             if not lok: return (false, @[], T(0))
-            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right)
             if not rok: return (false, @[], T(0))
             return (true, lterms & rterms, loff + roff)
         of Subtraction:
-            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left)
             if not lok: return (false, @[], T(0))
-            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right)
             if not rok: return (false, @[], T(0))
             var negTerms = newSeq[LinearTerm[T]](rterms.len)
             for i, t in rterms: negTerms[i] = (pos: t.pos, coeff: -t.coeff)
             return (true, lterms & negTerms, loff - roff)
         of Multiplication:
-            let (lok, lterms, loff) = tryExtractLinear[T](node.left, assignment, nlCache)
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left)
             if not lok: return (false, @[], T(0))
-            let (rok, rterms, roff) = tryExtractLinear[T](node.right, assignment, nlCache)
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right)
             if not rok: return (false, @[], T(0))
             if lterms.len == 0 and rterms.len == 0:
                 return (true, @[], loff * roff)
@@ -610,26 +612,28 @@ proc tryExtractLinear[T](node: ExpressionNode[T], assignment: seq[T],
                 return (true, scaled, roff * loff)
             return (false, @[], T(0))
         of Maximum, Minimum:
-            let key = cast[pointer](node)
-            if key in nlCache:
-                return (true, @[], nlCache[key])
-            let v = node.evaluate(assignment)
-            nlCache[key] = v
-            return (true, @[], v)
+            # Only fold as constant if both children are purely constant (no terms).
+            # Otherwise the result depends on variable values and would go stale.
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left)
+            if not lok: return (false, @[], T(0))
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right)
+            if not rok: return (false, @[], T(0))
+            if lterms.len == 0 and rterms.len == 0:
+                let v = if node.binaryOp == Maximum: max(loff, roff) else: min(loff, roff)
+                return (true, @[], v)
+            return (false, @[], T(0))
     of UnaryOpNode:
         if node.unaryOp == Negation:
-            let (ok, terms, off) = tryExtractLinear[T](node.target, assignment, nlCache)
+            let (ok, terms, off) = tryExtractLinear[T](node.target)
             if ok:
                 var negTerms = newSeq[LinearTerm[T]](terms.len)
                 for i, t in terms: negTerms[i] = (pos: t.pos, coeff: -t.coeff)
                 return (true, negTerms, -off)
         elif node.unaryOp == AbsoluteValue:
-            let key = cast[pointer](node)
-            if key in nlCache:
-                return (true, @[], nlCache[key])
-            let v = node.evaluate(assignment)
-            nlCache[key] = v
-            return (true, @[], v)
+            # Only fold as constant if the child is purely constant (no terms).
+            let (ok, terms, off) = tryExtractLinear[T](node.target)
+            if ok and terms.len == 0:
+                return (true, @[], abs(off))
         return (false, @[], T(0))
 
 proc evaluateFlatMinMax[T](fb: FlatMinMaxBinding[T], assignment: seq[T]): T {.inline.} =
@@ -1109,13 +1113,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.flatMinMaxBindings = newSeq[FlatMinMaxBinding[T]](carray.minMaxChannelBindings.len)
         let buildStart = epochTime()
         var nComplex = 0
-        var nlCache = initTable[pointer, T]()
         for i, binding in carray.minMaxChannelBindings:
             state.flatMinMaxBindings[i].channelPosition = binding.channelPosition
             state.flatMinMaxBindings[i].isMin = binding.isMin
             state.flatMinMaxBindings[i].hasConstant = false
             for expr in binding.inputExprs:
-                let (ok, terms, offset) = tryExtractLinear[T](expr.node, state.assignment, nlCache)
+                let (ok, terms, offset) = tryExtractLinear[T](expr.node)
                 if ok and terms.len > 0:
                     # Linear combination: sum(coeff_i * assignment[pos_i]) + offset
                     state.flatMinMaxBindings[i].inputBounds.add(state.flatMinMaxBindings[i].linearPositions.len)
