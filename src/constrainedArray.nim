@@ -437,6 +437,18 @@ proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
                    yi < yj + dyj and yj < yi + dyi:
                     cost += 1
         return cost
+    of BooleanType:
+        let boolState = cons.booleanState
+        if boolState.isUnary:
+            let targetPen = evaluateConstraint(boolState.targetConstraint, assignment)
+            if targetPen < 0: return T(-1)
+            return calculateUnaryPenalty[T](boolState.unaryOp, targetPen)
+        else:
+            let leftPen = evaluateConstraint(boolState.leftConstraint, assignment)
+            if leftPen < 0: return T(-1)
+            let rightPen = evaluateConstraint(boolState.rightConstraint, assignment)
+            if rightPen < 0: return T(-1)
+            return calculateBooleanPenalty[T](boolState.booleanOp, leftPen, rightPen)
     else:
         return T(-1)  # sentinel: not supported
 
@@ -670,7 +682,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     const MAX_GAC_COMBOS = 1_000_000
     var gacConstraints: seq[int]  # indices into carray.constraints
     for i, cons in carray.constraints:
-        if cons.stateType in {AlgebraicType, RelationalType}:
+        if cons.stateType in {AlgebraicType, RelationalType, BooleanType}:
             let arity = cons.positions.len
             if arity >= 2 and arity <= MAX_GAC_ARITY:
                 gacConstraints.add(i)
@@ -889,6 +901,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[pos].excl(v)
                             outerChanged = true
                             pruned += 1
+
 
         # Phase 4: Geost pairwise arc consistency
         for cons in carray.constraints:

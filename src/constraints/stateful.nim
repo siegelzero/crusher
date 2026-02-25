@@ -52,13 +52,13 @@ func moveDelta*[T](state: StatefulAlgebraicConstraint[T], position: int, oldValu
 ################################################################################
 
 # Helper functions for penalty calculation
-func calculateUnaryPenalty[T](op: UnaryRelation, targetPenalty: T): T {.inline.} =
+func calculateUnaryPenalty*[T](op: UnaryRelation, targetPenalty: T): T {.inline.} =
     ## Calculates penalty for unary operations
     case op:
     of Not:
         return if targetPenalty == 0: 1 else: 0
 
-func calculateBooleanPenalty[T](op: BooleanOperation, leftPenalty, rightPenalty: T): T {.inline.} =
+func calculateBooleanPenalty*[T](op: BooleanOperation, leftPenalty, rightPenalty: T): T {.inline.} =
     ## Calculates penalty for boolean operations based on child constraint penalties.
     ## Uses graduated penalties where possible to give the tabu search gradient information.
     case op:
