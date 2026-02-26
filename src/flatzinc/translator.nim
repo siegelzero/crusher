@@ -34,6 +34,15 @@ type
     sentinelBoardIndices*: seq[int]   # board array indices that are sentinels
     sentinelValue*: int               # sentinel value (ntiles+1)
 
+  CaseAnalysisDef* = object
+    ## A detected case-analysis channel: target variable fully determined by
+    ## source variables via exhaustive bool_clause case analysis.
+    targetVarName*: string
+    sourceVarNames*: seq[string]     # ultimate source variable names (search positions)
+    lookupTable*: seq[int]           # flat constant lookup table
+    domainOffsets*: seq[int]         # min value per source (for index computation)
+    domainSizes*: seq[int]          # domain size per source (hi - lo + 1)
+
   FznTranslator* = object
     sys*: ConstraintSystem[int]
     # Maps FZN variable name -> position in the ConstrainedArray
@@ -91,6 +100,8 @@ type
       coeffs2: seq[int], varNames2: seq[string], rhs2: int]]
     # Min/max channel defs: array_int_minimum/maximum with defines_var → channel variables
     minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
+    # Case-analysis channel defs: bool_clause case analysis → constant lookup channel
+    caseAnalysisDefs*: seq[CaseAnalysisDef]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -1893,6 +1904,416 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Table[string, int] =
+  ## Given values for source (search) variables, evaluates all channel and reification
+  ## variables to constants via fixed-point iteration. Used to resolve test values in
+  ## case-analysis channel detection.
+  result = initTable[string, int]()
+  for name, val in sourceValues:
+    result[name] = val
+  for name, val in tr.paramValues:
+    result[name] = val
+  var changed = true
+  while changed:
+    changed = false
+    # Evaluate element channel constraints
+    for ci, definedName in tr.channelConstraints:
+      if definedName in result: continue
+      let con = tr.model.constraints[ci]
+      let idxArg = con.args[0]
+      var idx: int
+      case idxArg.kind
+      of FznIntLit: idx = idxArg.intVal
+      of FznIdent:
+        if idxArg.ident in result: idx = result[idxArg.ident]
+        else: continue
+      else: continue
+      let arr = try: tr.resolveIntArray(con.args[1])
+               except ValueError, KeyError: continue
+      let i = idx - 1  # FZN 1-based to 0-based
+      if i < 0 or i >= arr.len: continue
+      result[definedName] = arr[i]
+      changed = true
+    # Evaluate reification channels (int_eq_reif / int_ne_reif)
+    for ci in tr.reifChannelDefs:
+      let con = tr.model.constraints[ci]
+      let name = stripSolverPrefix(con.name)
+      if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+      let resultVar = con.args[2].ident
+      if resultVar in result: continue
+      var xVal: int
+      case con.args[0].kind
+      of FznIdent:
+        if con.args[0].ident in result: xVal = result[con.args[0].ident]
+        else: continue
+      of FznIntLit: xVal = con.args[0].intVal
+      else: continue
+      var testVal: int
+      case con.args[1].kind
+      of FznIntLit: testVal = con.args[1].intVal
+      of FznBoolLit: testVal = if con.args[1].boolVal: 1 else: 0
+      of FznIdent:
+        if con.args[1].ident in result: testVal = result[con.args[1].ident]
+        else: continue
+      else: continue
+      if name == "int_eq_reif":
+        result[resultVar] = if xVal == testVal: 1 else: 0
+      elif name == "int_ne_reif":
+        result[resultVar] = if xVal != testVal: 1 else: 0
+      changed = true
+    # Evaluate bool2int channels
+    for ci in tr.bool2intChannelDefs:
+      let con = tr.model.constraints[ci]
+      if con.args.len < 2: continue
+      if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+      let iName = con.args[1].ident
+      if iName in result: continue
+      let bName = con.args[0].ident
+      if bName notin result: continue
+      result[iName] = result[bName]
+      changed = true
+    # Evaluate int_lin_eq with defines_var (for compound index expressions)
+    for ci, con in tr.model.constraints:
+      let cname = stripSolverPrefix(con.name)
+      if cname != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+      var ann: FznAnnotation
+      for a in con.annotations:
+        if a.name == "defines_var":
+          ann = a
+          break
+      if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+      let definedName = ann.args[0].ident
+      if definedName in result: continue
+      let coeffs = try: tr.resolveIntArray(con.args[0])
+                   except ValueError, KeyError: continue
+      let varElems = tr.resolveVarArrayElems(con.args[1])
+      let rhs = try: tr.resolveIntArg(con.args[2])
+                except ValueError, KeyError: continue
+      # Find the defined variable's index and check all others are resolved
+      var defIdx = -1
+      var allOthersResolved = true
+      for vi, v in varElems:
+        if v.kind == FznIdent and v.ident == definedName:
+          if coeffs[vi] == 1 or coeffs[vi] == -1:
+            defIdx = vi
+        elif v.kind == FznIdent:
+          if v.ident notin result:
+            allOthersResolved = false
+            break
+      if defIdx < 0 or not allOthersResolved: continue
+      # Solve: coeffs[defIdx] * defVal + sum(coeffs[j] * vals[j]) = rhs
+      var sumOthers = 0
+      for vi, v in varElems:
+        if vi == defIdx: continue
+        let val = case v.kind
+          of FznIntLit: v.intVal
+          of FznBoolLit: (if v.boolVal: 1 else: 0)
+          of FznIdent: result[v.ident]
+          else: 0
+        sumOthers += coeffs[vi] * val
+      let defVal = (rhs - sumOthers) div coeffs[defIdx]
+      result[definedName] = defVal
+      changed = true
+    # Evaluate all array_int_element constraints (including non-defines_var)
+    for ci, con in tr.model.constraints:
+      let cname = stripSolverPrefix(con.name)
+      if cname != "array_int_element": continue
+      if con.args.len < 3: continue
+      let resultArg = con.args[2]
+      if resultArg.kind != FznIdent: continue
+      if resultArg.ident in result: continue
+      let idxArg = con.args[0]
+      var idx: int
+      case idxArg.kind
+      of FznIntLit: idx = idxArg.intVal
+      of FznIdent:
+        if idxArg.ident in result: idx = result[idxArg.ident]
+        else: continue
+      else: continue
+      let arr = try: tr.resolveIntArray(con.args[1])
+               except ValueError, KeyError: continue
+      let i = idx - 1  # FZN 1-based to 0-based
+      if i < 0 or i >= arr.len: continue
+      result[resultArg.ident] = arr[i]
+      changed = true
+
+
+proc detectCaseAnalysisChannels(tr: var FznTranslator) =
+  ## Detects case-analysis patterns in bool_clause constraints where a target variable's
+  ## value is fully determined by condition variables through exhaustive case analysis.
+  ## Converts target variables to channel variables with constant lookup tables.
+  ##
+  ## Pattern (2-literal, first/last round):
+  ##   int_eq_reif(target, val, B) :: defines_var(B)
+  ##   int_ne_reif(condVar, condVal, C) :: defines_var(C)
+  ##   bool_clause([B, C], [])  — condVar==condVal → target==val
+  ##
+  ## Pattern (3-literal, middle rounds):
+  ##   bool_clause([B, C1, C2], [])  — condVar1==v1 AND condVar2==v2 → target==val
+  ##
+  ## When all condition value combinations are covered, the target becomes a channel
+  ## with a precomputed constant lookup table indexed by source variable values.
+
+  # Step 1: Build reverse index from reifChannelDefs
+  var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
+  var neReifMap: Table[string, tuple[condVar: string, condVal: int]]
+
+  for ci in tr.reifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+    let resultVar = con.args[2].ident
+    if name == "int_eq_reif":
+      if con.args[0].kind != FznIdent: continue
+      eqReifMap[resultVar] = (sourceVar: con.args[0].ident, testVal: con.args[1])
+    elif name == "int_ne_reif":
+      if con.args[0].kind != FznIdent: continue
+      let condVal = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+      neReifMap[resultVar] = (condVar: con.args[0].ident, condVal: condVal)
+
+  if eqReifMap.len == 0 or neReifMap.len == 0: return
+
+  # Step 2: Scan non-consumed bool_clause constraints with 2-3 positive literals
+  type CaseEntry = object
+    condVarVals: seq[(string, int)]
+    testVal: FznExpr
+    boolClauseIdx: int
+
+  var casesByTarget: Table[string, seq[CaseEntry]]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    let posArg = con.args[0]
+    let negArg = con.args[1]
+    if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+    if negArg.elems.len != 0: continue
+    let nLits = posArg.elems.len
+    if nLits < 2 or nLits > 3: continue
+
+    # Classify literals: exactly 1 eq_reif + rest ne_reif
+    var eqLitVar = ""
+    var eqSourceVar = ""
+    var eqTestVal: FznExpr
+    var neLits: seq[(string, int)]
+    var allValid = true
+
+    for elem in posArg.elems:
+      if elem.kind != FznIdent:
+        allValid = false
+        break
+      if elem.ident in eqReifMap and eqLitVar == "":
+        eqLitVar = elem.ident
+        eqSourceVar = eqReifMap[elem.ident].sourceVar
+        eqTestVal = eqReifMap[elem.ident].testVal
+      elif elem.ident in neReifMap:
+        let info = neReifMap[elem.ident]
+        neLits.add((info.condVar, info.condVal))
+      else:
+        allValid = false
+        break
+
+    if not allValid or eqLitVar == "": continue
+    if neLits.len != nLits - 1: continue
+
+    casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
+      condVarVals: neLits,
+      testVal: eqTestVal,
+      boolClauseIdx: ci
+    ))
+
+  if casesByTarget.len == 0: return
+
+  # Step 3: Build reverse map for channel constraints (var name → constraint index)
+  var channelByName: Table[string, int]
+  for ci, defName in tr.channelConstraints:
+    channelByName[defName] = ci
+
+  var nTargets = 0
+  var nConsumed = 0
+
+  for targetVar, entries in casesByTarget:
+    # All entries must have same set of condition variables
+    var condVarNames: seq[string]
+    for (cv, _) in entries[0].condVarVals:
+      condVarNames.add(cv)
+    condVarNames.sort()
+
+    var valid = true
+    for e in entries:
+      var evNames: seq[string]
+      for (cv, _) in e.condVarVals:
+        evNames.add(cv)
+      evNames.sort()
+      if evNames != condVarNames:
+        valid = false
+        break
+    if not valid: continue
+
+    # Look up condition variable domains
+    var condDomains: seq[seq[int]]
+    for cv in condVarNames:
+      let dom = tr.lookupVarDomain(cv)
+      if dom.len == 0:
+        valid = false
+        break
+      condDomains.add(dom)
+    if not valid: continue
+
+    # Check completeness: number of cases == product of condition domain sizes
+    var expectedCases = 1
+    for dom in condDomains:
+      expectedCases *= dom.len
+    if entries.len != expectedCases: continue
+
+    # Build case map (condValues → testVal)
+    var caseMap: Table[seq[int], FznExpr]
+    for e in entries:
+      var combo: seq[int]
+      var byName: Table[string, int]
+      for (cv, val) in e.condVarVals:
+        byName[cv] = val
+      for cv in condVarNames:
+        if cv notin byName:
+          valid = false
+          break
+        combo.add(byName[cv])
+      if not valid: break
+      if combo in caseMap:
+        valid = false
+        break
+      caseMap[combo] = e.testVal
+    if not valid or caseMap.len != expectedCases: continue
+
+    # Step 4: Trace condition variables to source variables via element channels
+    var sourceVarNames: seq[string]
+    var sourceArrays: seq[seq[int]]
+    for cv in condVarNames:
+      if cv notin channelByName:
+        valid = false
+        break
+      let ci = channelByName[cv]
+      let con = tr.model.constraints[ci]
+      if con.args.len < 3:
+        valid = false
+        break
+      let idxArg = con.args[0]
+      if idxArg.kind != FznIdent:
+        valid = false
+        break
+      let srcVar = idxArg.ident
+      if srcVar in tr.definedVarNames or srcVar in tr.channelVarNames:
+        valid = false
+        break
+      let constArr = try: tr.resolveIntArray(con.args[1])
+                     except ValueError, KeyError:
+                       valid = false
+                       @[]
+      if not valid: break
+      sourceVarNames.add(srcVar)
+      sourceArrays.add(constArr)
+    if not valid: continue
+
+    # Validate source variables are unique
+    block uniqueCheck:
+      for i in 0..<sourceVarNames.len:
+        for j in i+1..<sourceVarNames.len:
+          if sourceVarNames[i] == sourceVarNames[j]:
+            valid = false
+            break uniqueCheck
+    if not valid: continue
+
+    # Get source variable domains
+    var sourceDomains: seq[seq[int]]
+    for sv in sourceVarNames:
+      let dom = tr.lookupVarDomain(sv)
+      if dom.len == 0:
+        valid = false
+        break
+      sourceDomains.add(dom)
+    if not valid: continue
+
+    # Step 5: Build constant lookup table
+    var domainOffsets: seq[int]
+    var domainSizes: seq[int]
+    for dom in sourceDomains:
+      domainOffsets.add(dom[0])
+      domainSizes.add(dom[^1] - dom[0] + 1)
+
+    var tableSize = 1
+    for ds in domainSizes:
+      tableSize *= ds
+
+    var lookupTable = newSeq[int](tableSize)
+    var allResolved = true
+
+    for flatIdx in 0..<tableSize:
+      # Decode flat index to source values (row-major: first dim varies slowest)
+      var sourceValues = initTable[string, int]()
+      var remaining = flatIdx
+      for i in countdown(sourceVarNames.len - 1, 0):
+        let localIdx = remaining mod domainSizes[i]
+        remaining = remaining div domainSizes[i]
+        sourceValues[sourceVarNames[i]] = localIdx + domainOffsets[i]
+
+      # Compute condition values via element lookup
+      var condValues: seq[int]
+      var condOk = true
+      for i, cv in condVarNames:
+        let srcVal = sourceValues[sourceVarNames[i]]
+        let arrIdx = srcVal - 1  # FZN 1-based to 0-based
+        if arrIdx < 0 or arrIdx >= sourceArrays[i].len:
+          condOk = false
+          break
+        condValues.add(sourceArrays[i][arrIdx])
+      if not condOk or condValues notin caseMap:
+        lookupTable[flatIdx] = 0  # dummy for out-of-domain values
+        continue
+
+      # Resolve test value to constant
+      let testValExpr = caseMap[condValues]
+      case testValExpr.kind
+      of FznIntLit:
+        lookupTable[flatIdx] = testValExpr.intVal
+      of FznBoolLit:
+        lookupTable[flatIdx] = if testValExpr.boolVal: 1 else: 0
+      of FznIdent:
+        if testValExpr.ident in tr.paramValues:
+          lookupTable[flatIdx] = tr.paramValues[testValExpr.ident]
+        else:
+          let mapping = tr.buildValueMapping(sourceValues)
+          if testValExpr.ident in mapping:
+            lookupTable[flatIdx] = mapping[testValExpr.ident]
+          else:
+            allResolved = false
+            break
+      else:
+        allResolved = false
+        break
+
+    if not allResolved: continue
+
+    # Step 6: Register channel and consume constraints
+    tr.channelVarNames.incl(targetVar)
+    for e in entries:
+      tr.definingConstraints.incl(e.boolClauseIdx)
+      inc nConsumed
+
+    tr.caseAnalysisDefs.add(CaseAnalysisDef(
+      targetVarName: targetVar,
+      sourceVarNames: sourceVarNames,
+      lookupTable: lookupTable,
+      domainOffsets: domainOffsets,
+      domainSizes: domainSizes
+    ))
+    inc nTargets
+
+  if nTargets > 0:
+    stderr.writeLine(&"[FZN] Detected case-analysis channels: {nTargets} target variables, {nConsumed} bool_clause constraints consumed")
+
+
 proc detectImplicationPatterns(tr: var FznTranslator) =
   ## Detects boolean implication patterns encoded as:
   ##   bool_clause([neg_b, r], [])
@@ -2647,6 +3068,58 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
   if tr.sys.baseArray.minMaxChannelBindings.len > 0:
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
 
+proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings for case-analysis patterns detected by
+  ## detectCaseAnalysisChannels. Each target variable becomes a channel
+  ## with a constant lookup table indexed by source variable positions.
+  var nBuilt = 0
+  for def in tr.caseAnalysisDefs:
+    if def.targetVarName notin tr.varPositions: continue
+    let channelPos = tr.varPositions[def.targetVarName]
+
+    # Build array elements (all constants from precomputed lookup table)
+    var arrayElems: seq[ArrayElement[int]]
+    for v in def.lookupTable:
+      arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+    # Build index expression from source positions
+    # Row-major: index = (src0 - off0) * size1 * ... * sizeN + ... + (srcN - offN)
+    var indexExpr: AlgebraicExpression[int]
+    var valid = true
+    for i, srcName in def.sourceVarNames:
+      if srcName notin tr.varPositions:
+        valid = false
+        break
+      let srcPos = tr.varPositions[srcName]
+      let srcExpr = tr.getExpr(srcPos)
+      let termExpr = srcExpr - def.domainOffsets[i]
+      if i == 0:
+        indexExpr = termExpr
+      else:
+        indexExpr = indexExpr * def.domainSizes[i] + termExpr
+    if not valid: continue
+
+    # Create and register channel binding
+    let binding = ChannelBinding[int](
+      channelPosition: channelPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(channelPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+    inc nBuilt
+
+  if nBuilt > 0:
+    stderr.writeLine(&"[FZN] Built {nBuilt} case-analysis channel bindings " &
+                     &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
 proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
   ## Resolves a FznExpr to variable names (for ordering detection).
   ## Only handles inline array literals since this runs before translateVariables.
@@ -2659,6 +3132,132 @@ proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
         return @[]  # non-variable element, bail out
   else:
     return @[]
+
+proc detectInversePatterns(tr: var FznTranslator) =
+  ## Detects involution patterns from array_var_int_element constraints.
+  ## Pattern: for an n-element array A, n constraints of the form
+  ##   array_var_int_element(A[i], A, i)  for i in 1..n
+  ## encode the involution A[A[i]] = i. These are replaced by an InverseGroup
+  ## that maintains the invariant via compound moves.
+  ## Also removes matching fzn_all_different_int constraints (implied by involution).
+
+  # Step 1: Group array_var_int_element constraints by their array argument
+  var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
+      continue
+    if con.hasAnnotation("defines_var"):
+      continue
+    # Array argument is arg[1]
+    let arrArg = con.args[1]
+    if arrArg.kind != FznIdent:
+      continue
+    let arrName = arrArg.ident
+    if arrName notin arrayGroups:
+      arrayGroups[arrName] = @[]
+    arrayGroups[arrName].add(ci)
+
+  # Step 2: For each group, check if it forms an involution pattern
+  for arrName, ciList in arrayGroups:
+    # Get the element names for this array
+    if arrName notin tr.arrayElementNames:
+      continue
+    let elemNames = tr.arrayElementNames[arrName]
+    let n = elemNames.len
+    if ciList.len != n:
+      continue  # must have exactly one constraint per element
+
+    # Build map: element name -> 0-based index in the array
+    var nameToIdx: Table[string, int]
+    for i, name in elemNames:
+      nameToIdx[name] = i
+
+    # Check each constraint: arg[0] must be one of the array elements,
+    # arg[2] must be the constant (1-based index) of that element
+    var matched = newSeq[bool](n)
+    var allMatch = true
+    for ci in ciList:
+      let con = tr.model.constraints[ci]
+      # arg[0] = index (should be one of the array's element variables)
+      if con.args[0].kind != FznIdent:
+        allMatch = false
+        break
+      let indexName = con.args[0].ident
+      # The index might be a defined variable — resolve through definedVarNames
+      # But for the involution, the index should be one of the array elements directly
+      if indexName notin nameToIdx:
+        allMatch = false
+        break
+      let elemIdx = nameToIdx[indexName]  # 0-based
+
+      # arg[2] = value (should be constant = elemIdx + 1, i.e., 1-based)
+      if con.args[2].kind != FznIntLit:
+        allMatch = false
+        break
+      let constVal = con.args[2].intVal
+      if constVal != elemIdx + 1:
+        allMatch = false
+        break
+
+      if matched[elemIdx]:
+        allMatch = false  # duplicate
+        break
+      matched[elemIdx] = true
+
+    if not allMatch:
+      continue
+    # Verify all elements matched
+    var complete = true
+    for m in matched:
+      if not m:
+        complete = false
+        break
+    if not complete:
+      continue
+
+    # All checks passed — this is an involution group!
+    # Get positions for all elements
+    if arrName notin tr.arrayPositions:
+      continue
+    let positions = tr.arrayPositions[arrName]
+    if positions.len != n:
+      continue
+
+    # Mark all element constraints as consumed
+    for ci in ciList:
+      tr.definingConstraints.incl(ci)
+
+    # Find and mark matching fzn_all_different_int constraints on the same positions
+    let posSet = toPackedSet(positions)
+    var nAllDiffRemoved = 0
+    for ci2, con2 in tr.model.constraints:
+      if ci2 in tr.definingConstraints:
+        continue
+      let cname = stripSolverPrefix(con2.name)
+      if cname notin ["fzn_all_different_int", "all_different_int"]:
+        continue
+      # Check if the constraint's variable set matches our positions
+      let varElems = tr.resolveVarArrayElems(con2.args[0])
+      if varElems.len != n:
+        continue
+      var allInGroup = true
+      for elem in varElems:
+        if elem.kind != FznIdent or elem.ident notin nameToIdx:
+          allInGroup = false
+          break
+      if allInGroup:
+        tr.definingConstraints.incl(ci2)
+        inc nAllDiffRemoved
+
+    # Register the inverse group (valueOffset = -1 for 1-based FlatZinc indexing)
+    tr.sys.baseArray.addInverseGroup(positions, -1)
+
+    stderr.writeLine(&"[FZN] Detected involution on array '{arrName}': {n} positions, " &
+                     &"{ciList.len} element + {nAllDiffRemoved} all_different constraints consumed")
+
 
 proc detectRedundantOrderings(tr: var FznTranslator) =
   ## Detects transitively redundant ordering constraints.
@@ -2881,6 +3480,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCountPatterns()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
+  # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
+  result.detectCaseAnalysisChannels()
   # Detect implication-to-table and one-hot channel patterns
   result.detectImplicationPatterns()
   # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
@@ -2963,6 +3564,9 @@ proc translate*(model: FznModel): FznTranslator =
     stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped} redundant defined-var bounds constraints (range={nBoundsSkipped} channel={nChannelBoundsSkipped})")
   # Build matrix infos for matrix_element pattern detection
   result.buildMatrixInfos()
+
+  # Detect involution patterns (array_var_int_element groups encoding A[A[i]]=i)
+  result.detectInversePatterns()
 
   # If geost conversion is active, record board positions and create tile variables
   let gc = result.geostConversion
@@ -3275,5 +3879,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildOneHotChannelBindings()
   # Build channel bindings for array_int_minimum/maximum defines_var
   result.buildMinMaxChannelBindings()
+  # Build channel bindings for case-analysis channels (constant lookup tables)
+  result.buildCaseAnalysisChannelBindings()
 
   result.translateSolve()

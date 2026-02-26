@@ -26,6 +26,13 @@ type
         inputExprs*: seq[AlgebraicExpression[T]]  # Input expressions to take min/max of
         inputPositions*: PackedSet[int]      # Union of all input expression positions
 
+    InverseGroup*[T] = object
+        ## A group of positions forming an involution (self-inverse permutation).
+        ## position[i] holds the opponent for team (i + valueOffset).
+        ## The involution invariant is: assignment[positions[assignment[positions[i]] + valueOffset]] == i - valueOffset
+        positions*: seq[int]   # System positions [index 0 = team 0+offset, etc.]
+        valueOffset*: int      # group_index = value + valueOffset (e.g., -1 for 1-based teams)
+
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
@@ -40,6 +47,7 @@ type
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
+        inverseGroups*: seq[InverseGroup[T]]
 
 ################################################################################
 # Value Extraction
@@ -175,6 +183,16 @@ proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.minMaxChannelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.minMaxChannelsAtPosition[pos].add(bindingIdx)
+
+proc addInverseGroup*[T](arr: var ConstrainedArray[T],
+                          positions: seq[int],
+                          valueOffset: int) =
+    ## Register an inverse group: positions form an involution where
+    ## assignment[positions[assignment[positions[i]] + valueOffset]] == i - valueOffset.
+    arr.inverseGroups.add(InverseGroup[T](
+        positions: positions,
+        valueOffset: valueOffset
+    ))
 
 ################################################################################
 # Bounds propagation helpers
@@ -1606,4 +1624,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             inputPositions: binding.inputPositions
         )
     result.minMaxChannelsAtPosition = arr.minMaxChannelsAtPosition
+
+    # Inverse groups are all value types — shallow copy is fine
+    result.inverseGroups = arr.inverseGroups
 

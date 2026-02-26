@@ -129,6 +129,14 @@ type
         elementImpliedDiscount*: Table[int, seq[int]]
             # index position -> per-domainIdx discount from implied fixes
 
+        # Inverse group compound move structures
+        inverseEnabled*: bool
+        inverseGroups*: seq[InverseGroup[int]]
+        posToInverseGroup*: Table[int, int]       # position -> group index
+        posToGroupLocalIdx*: Table[int, int]      # position -> local index within group
+        inverseDelta*: seq[seq[int]]              # [pos][domainIdx] -> compound delta from forced changes
+        inverseForcedChanges*: seq[(int, int, int)]  # buffer: (pos, oldVal, newVal)
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -155,8 +163,12 @@ type
 proc initSwapStructures[T](state: TabuState[T])
 proc initFlowStructure[T](state: TabuState[T])
 proc initElementImpliedStructures[T](state: TabuState[T])
+proc initInverseStructures[T](state: TabuState[T])
 proc assignValue*[T](state: TabuState[T], position: int, value: T)
 proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int
+proc computeInverseForcedChanges[T](state: TabuState[T], position: int, newValue: T, oldValue: T = T(0), oldValueProvided: bool = false)
+proc computeInverseDeltaAt[T](state: TabuState[T], position: int, candidateValue: T): int
+proc recomputeAllInverseDeltas[T](state: TabuState[T])
 
 ################################################################################
 # Penalty Routines
@@ -234,11 +246,13 @@ proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
     ## Compute the total cost change for assigning newValue at position by
     ## summing moveDelta across all constraints. O(constraints_at_pos) but
     ## doesn't require penalty maps to be up-to-date.
-    ## Includes indirect cost changes through channel propagation.
+    ## Includes indirect cost changes through channel propagation and inverse group moves.
     for constraint in state.constraintsAtPosition[position]:
         result += state.movePenalty(constraint, position, newValue)
     if state.hasChannelDeps:
         result += state.computeChannelDepDelta(position, newValue)
+    if state.inverseEnabled and position in state.posToInverseGroup:
+        result += state.computeInverseDeltaAt(position, newValue)
 
 ################################################################################
 # Penalty Map Routines
@@ -766,6 +780,14 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     let savedPos = state.assignment[pos]
     state.assignment[pos] = candidateValue
 
+    # Apply inverse group forced changes for simulation
+    var inverseSaved: seq[(int, T)]
+    if state.inverseEnabled and pos in state.posToInverseGroup:
+        state.computeInverseForcedChanges(pos, candidateValue, savedPos, oldValueProvided = true)
+        for (fPos, fOld, fNew) in state.inverseForcedChanges:
+            inverseSaved.add((fPos, state.assignment[fPos]))
+            state.assignment[fPos] = T(fNew)
+
     # Fast path for one-hot source positions: directly compute the few changes
     # instead of evaluating all bindings through the worklist
     if pos in state.oneHotChanges:
@@ -802,6 +824,11 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         state.cdVisited.incl(pos)
         for (chanPos, _, _) in state.cdChanges:
             state.cdVisited.incl(chanPos)
+        # Add inverse forced positions to the worklist for channel propagation
+        for (fPos, savedVal) in inverseSaved:
+            if fPos notin state.cdVisited:
+                state.cdVisited.incl(fPos)
+                state.cdWorklist.add(fPos)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
@@ -836,6 +863,11 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         state.cdWorklist.setLen(0)
         state.cdWorklist.add(pos)
         state.cdVisited.incl(pos)
+        # Add inverse forced positions to the worklist for channel propagation
+        for (fPos, savedVal) in inverseSaved:
+            if fPos notin state.cdVisited:
+                state.cdVisited.incl(fPos)
+                state.cdWorklist.add(fPos)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
@@ -866,9 +898,15 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
 
-    # Restore all modified assignment values
+    # Restore all modified assignment values (reverse order for cdChanges because a
+    # channel position can be modified multiple times when it depends on both the
+    # primary position and an inverse forced position — only the first entry has
+    # the true original value).
     state.assignment[pos] = savedPos
-    for (chanPos, oldVal, _) in state.cdChanges:
+    for (fPos, savedVal) in inverseSaved:
+        state.assignment[fPos] = savedVal
+    for i in countdown(state.cdChanges.len - 1, 0):
+        let (chanPos, oldVal, _) = state.cdChanges[i]
         state.assignment[chanPos] = oldVal
 
     if state.cdChanges.len == 0:
@@ -1154,14 +1192,90 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         initStart = epochTime()
 
     state.assignment = newSeq[T](carray.len)
+
+    # Collect positions belonging to inverse groups so we skip them in normal random init
+    var inverseGroupPositions: PackedSet[int]
+    for group in carray.inverseGroups:
+        for pos in group.positions:
+            inverseGroupPositions.incl(pos)
+
     for pos in carray.allPositions():
         if initialAssignment.len > 0:
             state.assignment[pos] = initialAssignment[pos]
         elif pos in carray.channelPositions:
             # Channel variables get a placeholder; computed below
             state.assignment[pos] = carray.reducedDomain[pos][0]
+        elif pos in inverseGroupPositions:
+            # Inverse group positions are initialized below as involutions
+            state.assignment[pos] = carray.reducedDomain[pos][0]
         else:
             state.assignment[pos] = sample(carray.reducedDomain[pos])
+
+    # Generate random involutions for inverse group positions
+    if initialAssignment.len == 0 and carray.inverseGroups.len > 0:
+        for group in carray.inverseGroups:
+            let n = group.positions.len
+            let offset = group.valueOffset
+            # Generate a random involution (self-inverse permutation) via shuffle+pair
+            # Retry until we get a valid involution that respects all domains
+            var valid = false
+            for attempt in 0..<1000:
+                var perm = newSeq[int](n)
+                var indices = toSeq(0..<n)
+                shuffle(indices)
+                var used = newSeq[bool](n)
+                var ok = true
+                var j = 0
+                while j < n:
+                    if used[indices[j]]:
+                        j += 1
+                        continue
+                    # Try to pair indices[j] with next unpaired index
+                    var paired = false
+                    for k in (j+1)..<n:
+                        if not used[indices[k]]:
+                            let a = indices[j]
+                            let b = indices[k]
+                            # Check domain compatibility:
+                            # position[a] must accept value (b - offset) and
+                            # position[b] must accept value (a - offset)
+                            let valA = T(b - offset)  # value at position a = b's 1-based index
+                            let valB = T(a - offset)  # value at position b = a's 1-based index
+                            let domA = carray.reducedDomain[group.positions[a]]
+                            let domB = carray.reducedDomain[group.positions[b]]
+                            if valA in domA and valB in domB:
+                                perm[a] = b
+                                perm[b] = a
+                                used[a] = true
+                                used[b] = true
+                                paired = true
+                                break
+                    if not paired:
+                        # If n is odd, the last element is a fixed point
+                        let a = indices[j]
+                        let valA = T(a - offset)
+                        let domA = carray.reducedDomain[group.positions[a]]
+                        if valA in domA:
+                            perm[a] = a
+                            used[a] = true
+                        else:
+                            ok = false
+                            break
+                    j += 1
+                if ok:
+                    # Verify all paired
+                    var allUsed = true
+                    for u in used:
+                        if not u:
+                            allUsed = false
+                            break
+                    if allUsed:
+                        for i in 0..<n:
+                            state.assignment[group.positions[i]] = T(perm[i] - offset)
+                        valid = true
+                        break
+            if not valid and verbose and id == 0:
+                echo "[Init] Warning: could not generate valid involution for group of size " & $n
 
     # Balance binary sums to match equality targets (before channel propagation)
     if initialAssignment.len == 0:
@@ -1634,6 +1748,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Initialize swap move structures for binary variables
     state.initSwapStructures()
     state.initFlowStructure()
+    state.initInverseStructures()
 
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
@@ -1826,6 +1941,150 @@ proc initFlowStructure[T](state: TabuState[T]) =
             if state.verbose and state.id == 0:
                 echo "[Init] Objective weights: " & $state.edgeObjectiveWeight.len &
                      " binary edges with objective coefficients"
+
+
+################################################################################
+# Inverse Group Compound Move Support
+################################################################################
+
+proc computeInverseForcedChanges[T](state: TabuState[T], position: int, newValue: T, oldValue: T = T(0), oldValueProvided: bool = false) =
+    ## Compute the 3 forced changes for assigning newValue at position within an inverse group.
+    ## Populates state.inverseForcedChanges with (pos, oldVal, newVal) triples.
+    ## Does NOT modify the assignment.
+    ## If oldValueProvided is true, uses oldValue instead of reading assignment[position].
+    state.inverseForcedChanges.setLen(0)
+    let gi = state.posToInverseGroup[position]
+    let group = state.inverseGroups[gi]
+    let offset = group.valueOffset
+    let localIdx = state.posToGroupLocalIdx[position]  # i
+
+    let prevValue = if oldValueProvided: oldValue else: state.assignment[position]
+    let newJ = int(newValue) + offset   # new partner local index
+    let oldJ = int(prevValue) + offset   # old partner local index
+
+    if newJ == localIdx:
+        # Assigning self-match (fixed point). Old partner becomes unpaired.
+        # Old partner oldJ needs a new value. Set it to itself (fixed point).
+        if oldJ != localIdx and oldJ >= 0 and oldJ < group.positions.len:
+            let partnerPos = group.positions[oldJ]
+            let partnerOld = state.assignment[partnerPos]
+            let partnerNew = T(oldJ - offset)  # self-match
+            if partnerOld != partnerNew:
+                state.inverseForcedChanges.add((partnerPos, int(partnerOld), int(partnerNew)))
+    elif oldJ == localIdx:
+        # Was a fixed point, now pairing with newJ.
+        # newJ's old partner needs to become a fixed point.
+        if newJ >= 0 and newJ < group.positions.len:
+            let newPartnerPos = group.positions[newJ]
+            let newPartnerOld = state.assignment[newPartnerPos]
+            # Set newJ to point back to us
+            let newPartnerNew = T(localIdx - offset)
+            if newPartnerOld != newPartnerNew:
+                state.inverseForcedChanges.add((newPartnerPos, int(newPartnerOld), int(newPartnerNew)))
+                # newJ's old partner (if not us and not itself) becomes a fixed point
+                let newPartnerOldIdx = int(newPartnerOld) + offset
+                if newPartnerOldIdx != newJ and newPartnerOldIdx != localIdx and
+                   newPartnerOldIdx >= 0 and newPartnerOldIdx < group.positions.len:
+                    let thirdPos = group.positions[newPartnerOldIdx]
+                    let thirdOld = state.assignment[thirdPos]
+                    let thirdNew = T(newPartnerOldIdx - offset)  # self-match
+                    if thirdOld != thirdNew:
+                        state.inverseForcedChanges.add((thirdPos, int(thirdOld), int(thirdNew)))
+    else:
+        # General case: was paired with oldJ, now pairing with newJ.
+        # Need: position[newJ] → localIdx, position[oldJ] → old_partner_of_newJ
+        if newJ >= 0 and newJ < group.positions.len and
+           oldJ >= 0 and oldJ < group.positions.len:
+            let newPartnerPos = group.positions[newJ]
+            let oldPartnerPos = group.positions[oldJ]
+            let newPartnerOld = state.assignment[newPartnerPos]
+            let newPartnerOldIdx = int(newPartnerOld) + offset  # who newJ was pointing to
+
+            # newJ now points to us (localIdx)
+            let newPartnerNew = T(localIdx - offset)
+            if newPartnerOld != newPartnerNew:
+                state.inverseForcedChanges.add((newPartnerPos, int(newPartnerOld), int(newPartnerNew)))
+
+            # oldJ now points to newJ's old partner (completing the swap)
+            let oldPartnerOld = state.assignment[oldPartnerPos]
+            if newPartnerOldIdx >= 0 and newPartnerOldIdx < group.positions.len and
+               newPartnerOldIdx != localIdx and newPartnerOldIdx != newJ:
+                let oldPartnerNew = T(newPartnerOldIdx - offset)
+                if oldPartnerOld != oldPartnerNew:
+                    state.inverseForcedChanges.add((oldPartnerPos, int(oldPartnerOld), int(oldPartnerNew)))
+                # newJ's old partner now points to oldJ
+                if newPartnerOldIdx != oldJ:
+                    let thirdPos = group.positions[newPartnerOldIdx]
+                    let thirdOld = state.assignment[thirdPos]
+                    let thirdNew = T(oldJ - offset)
+                    if thirdOld != thirdNew:
+                        state.inverseForcedChanges.add((thirdPos, int(thirdOld), int(thirdNew)))
+            else:
+                # newJ was pointing to localIdx (meaning newJ was our "new" partner already)
+                # oldJ just needs to become a fixed point
+                let oldPartnerNew = T(oldJ - offset)
+                if oldPartnerOld != oldPartnerNew:
+                    state.inverseForcedChanges.add((oldPartnerPos, int(oldPartnerOld), int(oldPartnerNew)))
+
+
+proc computeInverseDeltaAt[T](state: TabuState[T], position: int, candidateValue: T): int =
+    ## Compute the cost delta from the forced changes of an inverse group compound move
+    ## at the given position with candidateValue.
+    ## Uses movePenalty at each forced position (independent of primary position changes).
+    state.computeInverseForcedChanges(position, candidateValue)
+    for (fPos, fOld, fNew) in state.inverseForcedChanges:
+        for constraint in state.constraintsAtPosition[fPos]:
+            result += state.movePenalty(constraint, fPos, T(fNew))
+
+
+proc recomputeAllInverseDeltas[T](state: TabuState[T]) =
+    ## Recompute inverseDelta[pos][domainIdx] for all inverse group positions.
+    for group in state.inverseGroups:
+        for pos in group.positions:
+            if pos in state.carray.channelPositions:
+                continue
+            let domain = state.carray.reducedDomain[pos]
+            for i in 0..<domain.len:
+                state.inverseDelta[pos][i] = state.computeInverseDeltaAt(pos, domain[i])
+
+
+proc initInverseStructures[T](state: TabuState[T]) =
+    ## Initialize inverse group compound move structures.
+    state.inverseEnabled = false
+    state.inverseGroups = state.carray.inverseGroups
+    state.posToInverseGroup = initTable[int, int]()
+    state.posToGroupLocalIdx = initTable[int, int]()
+    state.inverseForcedChanges = @[]
+
+    if state.inverseGroups.len == 0:
+        return
+
+    state.inverseEnabled = true
+
+    # Build position lookup tables
+    for gi, group in state.inverseGroups:
+        for li, pos in group.positions:
+            state.posToInverseGroup[pos] = gi
+            state.posToGroupLocalIdx[pos] = li
+
+    # Allocate inverseDelta arrays for inverse group positions
+    state.inverseDelta = newSeq[seq[int]](state.carray.len)
+    for group in state.inverseGroups:
+        for pos in group.positions:
+            if pos in state.carray.channelPositions:
+                continue
+            let dsize = state.carray.reducedDomain[pos].len
+            state.inverseDelta[pos] = newSeq[int](dsize)
+
+    # Compute initial inverse deltas
+    state.recomputeAllInverseDeltas()
+
+    if state.verbose and state.id == 0:
+        var totalPositions = 0
+        for group in state.inverseGroups:
+            totalPositions += group.positions.len
+        echo "[Init] Inverse groups: " & $state.inverseGroups.len &
+             " groups, " & $totalPositions & " positions"
 
 
 ################################################################################
@@ -2172,6 +2431,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## Lightweight assignment: updates constraint state and cost but skips
     ## penalty map updates. Used during path relinking for fast traversal.
+    let oldValueLean = state.assignment[position]
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
@@ -2180,12 +2440,29 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
         let newPenalty = constraint.penalty()
         state.cost += newPenalty - oldPenalty
 
+    # Apply forced changes from inverse group compound move
+    if state.inverseEnabled and position in state.posToInverseGroup:
+        state.computeInverseForcedChanges(position, value, oldValueLean, oldValueProvided = true)
+        # Copy to local to avoid re-entrancy issues
+        var localForced: seq[(int, int, int)]
+        for fc in state.inverseForcedChanges:
+            localForced.add(fc)
+        for (fPos, fOld, fNew) in localForced:
+            state.assignment[fPos] = T(fNew)
+            for constraint in state.constraintsAtPosition[fPos]:
+                let oldPenalty = constraint.penalty()
+                constraint.updatePosition(fPos, T(fNew))
+                let newPenalty = constraint.penalty()
+                state.cost += newPenalty - oldPenalty
+            state.propagateChannelsLean(fPos)
+
     state.propagateChannelsLean(position)
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     when ProfileIteration:
         let t0 = epochTime()
 
+    let oldValueAssign = state.assignment[position]
     state.assignment[position] = value
 
     for constraint in state.constraintsAtPosition[position]:
@@ -2201,16 +2478,52 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
             for pos in constraint.positions.items:
                 state.violationCount[pos] += 1
 
+    # Apply forced changes from inverse group compound move
+    let hasInverseMove = state.inverseEnabled and position in state.posToInverseGroup
+    var localForced: seq[(int, int, int)]  # local copy to avoid re-entrancy
+    if hasInverseMove:
+        state.computeInverseForcedChanges(position, value, oldValueAssign, oldValueProvided = true)
+        for fc in state.inverseForcedChanges:
+            localForced.add(fc)
+        for (fPos, fOld, fNew) in localForced:
+            state.assignment[fPos] = T(fNew)
+            for constraint in state.constraintsAtPosition[fPos]:
+                let oldPenalty = constraint.penalty()
+                constraint.updatePosition(fPos, T(fNew))
+                let newPenalty = constraint.penalty()
+                state.cost += newPenalty - oldPenalty
+                if oldPenalty > 0 and newPenalty == 0:
+                    for p in constraint.positions.items:
+                        state.violationCount[p] -= 1
+                elif oldPenalty == 0 and newPenalty > 0:
+                    for p in constraint.positions.items:
+                        state.violationCount[p] += 1
+
     # Propagate channel variables affected by this position change
     let channelsChanged = state.propagateChannels(position, state.changedChannelsBuf)
 
+    # Also propagate channels for forced positions
+    if hasInverseMove:
+        for (fPos, fOld, fNew) in localForced:
+            var forcedChannelsBuf: seq[int]
+            let forcedChanged = state.propagateChannels(fPos, forcedChannelsBuf)
+            if forcedChanged:
+                for ch in forcedChannelsBuf:
+                    state.changedChannelsBuf.add(ch)
+
+    let anyChannelsChanged = state.changedChannelsBuf.len > 0
+
     # Recompute channel-dep penalties only for affected search positions
-    if state.hasChannelDeps and channelsChanged:
+    if state.hasChannelDeps and anyChannelsChanged:
         state.recomputeAffectedChannelDepPenalties(state.changedChannelsBuf, position)
         # Refresh moved position's channel-dep cache before updatePenaltiesForPosition reads it
         if state.channelDepPenalties[position].len > 0:
             when ProfileIteration: state.cdMovedCalls += state.carray.reducedDomain[position].len
             state.computeChannelDepPenaltiesAt(position)
+        if hasInverseMove:
+            for (fPos, fOld, fNew) in localForced:
+                if state.channelDepPenalties[fPos].len > 0:
+                    state.computeChannelDepPenaltiesAt(fPos)
 
     when ProfileIteration:
         let t1 = epochTime()
@@ -2223,11 +2536,25 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 
     state.updatePenaltiesForPosition(position)
 
+    # Also rebuild penalty maps for forced positions
+    if hasInverseMove:
+        for (fPos, fOld, fNew) in localForced:
+            state.updatePenaltiesForPosition(fPos)
+
     when ProfileIteration:
         let t2 = epochTime()
         state.timeUpdatePenalties += t2 - t1
 
     state.updateNeighborPenalties(position)
+
+    # Also update neighbor penalties for forced positions
+    if hasInverseMove:
+        for (fPos, fOld, fNew) in localForced:
+            state.updateNeighborPenalties(fPos)
+
+    # Recompute all inverse deltas after any inverse group move
+    if hasInverseMove:
+        state.recomputeAllInverseDeltas()
 
     when ProfileIteration:
         state.timeNeighborPenalties += epochTime() - t2
@@ -2275,12 +2602,15 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             let dLen = domain.len
 
             # Sample random domain values, break on first improving move
+            let hasInverse1 = state.inverseEnabled and position in state.posToInverseGroup
             for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
                 let i = rand(dLen - 1)
                 if i == oldIdx:
                     continue
                 inc movesEvaluated
-                let newCost = state.cost + state.penaltyMap[position][i]
+                var newCost = state.cost + state.penaltyMap[position][i]
+                if hasInverse1:
+                    newCost += state.inverseDelta[position][i]
                 if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
                     if newCost < bestMoveCost:
                         result = @[(position, domain[i])]
@@ -2308,13 +2638,16 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             let domain = state.carray.reducedDomain[position]
             let dLen = domain.len
+            let hasInverse2 = state.inverseEnabled and position in state.posToInverseGroup
 
             if dLen <= MAX_CANDIDATES_PER_POS:
                 for i in 0..<dLen:
                     if i == oldIdx:
                         continue
                     inc movesEvaluated
-                    let newCost = state.cost + state.penaltyMap[position][i]
+                    var newCost = state.cost + state.penaltyMap[position][i]
+                    if hasInverse2:
+                        newCost += state.inverseDelta[position][i]
                     if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
                         if newCost < bestMoveCost:
                             result = @[(position, domain[i])]
@@ -2327,7 +2660,9 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     if i == oldIdx:
                         continue
                     inc movesEvaluated
-                    let newCost = state.cost + state.penaltyMap[position][i]
+                    var newCost = state.cost + state.penaltyMap[position][i]
+                    if hasInverse2:
+                        newCost += state.inverseDelta[position][i]
                     if state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
                         if newCost < bestMoveCost:
                             result = @[(position, domain[i])]
@@ -2590,13 +2925,15 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         state.timeBestMoves += epochTime() - tBM
 
-    # Determine best single move cost
+    # Determine best single move cost (including inverse delta if applicable)
     var singleCost = high(int)
     if moves.len > 0:
         let (pos, val) = moves[0]
         let idx = state.domainIndex[pos].getOrDefault(val, -1)
         if idx >= 0:
             singleCost = state.cost + state.penaltyMap[pos][idx]
+            if state.inverseEnabled and pos in state.posToInverseGroup:
+                singleCost += state.inverseDelta[pos][idx]
 
     if swapMoves.len > 0 and swapCost < singleCost:
         # Apply swap move
@@ -2617,10 +2954,22 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     elif moves.len > 0:
         let (position, newValue) = sample(moves)
         let oldValue = state.assignment[position]
+        # Compute forced changes BEFORE assignValue to capture old values for tabu
+        var forcedOldValues: seq[(int, T)]
+        if state.inverseEnabled and position in state.posToInverseGroup:
+            state.computeInverseForcedChanges(position, newValue)
+            for (fPos, fOld, fNew) in state.inverseForcedChanges:
+                forcedOldValues.add((fPos, T(fOld)))
         state.assignValue(position, newValue)
+        let tabuTenure = state.iteration + 1 + state.iteration mod 10
         let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
         if oldIdx >= 0:
-            state.tabu[position][oldIdx] = state.iteration + 1 + state.iteration mod 10
+            state.tabu[position][oldIdx] = tabuTenure
+        # Set tabu on forced positions' old values
+        for (fPos, fOldVal) in forcedOldValues:
+            let fOldIdx = state.domainIndex[fPos].getOrDefault(fOldVal, -1)
+            if fOldIdx >= 0:
+                state.tabu[fPos][fOldIdx] = tabuTenure
         state.applyElementImpliedMoves(position)
 
 
