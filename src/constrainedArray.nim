@@ -514,12 +514,9 @@ proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
 ################################################################################
 
 proc tryExtractAbsLinearNode[T](node: ExpressionNode[T]): (bool, Table[int, T], T) =
-    ## If node is abs(linear) or constant*abs(linear), extract inner linear coefficients.
+    ## If node is abs(linear) or constant*abs(linear), extract the inner linear form.
     ## Returns (success, innerCoeffs, innerConstant).
-    ## For constant*abs(linear), the constant multiplier is folded into coefficients.
-    ## For bare abs(linear), coefficients are the inner expression's coefficients.
-    ## NOTE: The caller must handle the outer scaling separately if needed.
-    ## This proc returns the RAW inner linear form (without outer scaling).
+    ## The outer scaling constant is NOT folded in — use getAbsOuterScale() separately.
 
     var absTarget: ExpressionNode[T]
 
@@ -776,6 +773,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     # Phase: Sum-of-abs bound decomposition
     # Detect constraints of the form sum(scale_i * abs(linear_i)) <= bound
     # and decompose into per-term linear bounds: -bound/scale_i <= linear_i <= bound/scale_i
+    type AbsTermInfo = tuple[coeffs: Table[int, T], constant: T, scale: T]
     var sumAbsDecomposed = 0
     for cons in carray.constraints:
         if cons.stateType != RelationalType:
@@ -795,7 +793,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if rel.leftExpr.kind == StatefulAlgebraicExpr:
             let terms = extractAdditiveTerms(rel.leftExpr.algebraicExpr.algebraicExpr.node)
             var allAbsLinear = true
-            type AbsTermInfo = tuple[coeffs: Table[int, T], constant: T, scale: T]
             var termInfos: seq[AbsTermInfo]
             for term in terms:
                 if term.kind == LiteralNode:
@@ -840,8 +837,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if sumExpr.evalMethod == ExpressionBased:
                 var adjustedBound = bound - sumExpr.constant
                 var allAbsLinear = true
-                type AbsTermInfoB = tuple[coeffs: Table[int, T], constant: T, scale: T]
-                var termInfos: seq[AbsTermInfoB]
+                var termInfos: seq[AbsTermInfo]
                 for expr in sumExpr.expressions:
                     let (ok, coeffs, innerConst) = tryExtractAbsLinearNode[T](expr.node)
                     if ok:
@@ -921,61 +917,34 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 channelLinearForms += 1
             else:
                 # Try abs(linear) pattern: common for int_abs defined variables
-                let node = inputExpr.node
-                if node.kind == UnaryOpNode and node.unaryOp == AbsoluteValue:
-                    let innerPositions = collectPositions(node.target)
-                    if innerPositions.len == 0:
-                        continue
-                    let innerAlg = AlgebraicExpression[T](
-                        positions: innerPositions,
-                        node: node.target,
-                        linear: true
-                    )
-                    let linearized = linearize(innerAlg)
-                    if linearized.evalMethod != PositionBased:
-                        continue
-                    # Verify linearity
-                    var testAssignment: Table[int, T]
-                    for pos in innerPositions.items:
-                        testAssignment[pos] = T(0)
-                    var linearOk = true
-                    for pos in innerPositions.items:
-                        testAssignment[pos] = T(2)
-                        let actual = node.target.evaluate(testAssignment)
-                        let expected = T(2) * linearized.coefficient.getOrDefault(pos, T(0)) + linearized.constant
-                        if actual != expected:
-                            linearOk = false
-                            break
-                        testAssignment[pos] = T(0)
-                    if not linearOk:
-                        continue
-
+                let (ok, innerCoeffs, innerConst) = tryExtractAbsLinearNode[T](inputExpr.node)
+                if ok:
                     if not binding.isMin:
                         # Max: ch >= abs(inner) → ch >= inner AND ch >= -inner
                         # Form 1: ch - inner >= 0
                         var coeffs1: Table[int, T]
                         coeffs1[chPos] = T(1)
-                        for pos in linearized.coefficient.keys:
+                        for pos in innerCoeffs.keys:
                             if pos in coeffs1:
-                                coeffs1[pos] = coeffs1[pos] - linearized.coefficient[pos]
+                                coeffs1[pos] = coeffs1[pos] - innerCoeffs[pos]
                             else:
-                                coeffs1[pos] = -linearized.coefficient[pos]
+                                coeffs1[pos] = -innerCoeffs[pos]
                         linearForms.add(LinearForm[T](
                             coefficients: coeffs1,
-                            constant: -linearized.constant,
+                            constant: -innerConst,
                             relation: GreaterThanEq
                         ))
                         # Form 2: ch + inner >= 0
                         var coeffs2: Table[int, T]
                         coeffs2[chPos] = T(1)
-                        for pos in linearized.coefficient.keys:
+                        for pos in innerCoeffs.keys:
                             if pos in coeffs2:
-                                coeffs2[pos] = coeffs2[pos] + linearized.coefficient[pos]
+                                coeffs2[pos] = coeffs2[pos] + innerCoeffs[pos]
                             else:
-                                coeffs2[pos] = linearized.coefficient[pos]
+                                coeffs2[pos] = innerCoeffs[pos]
                         linearForms.add(LinearForm[T](
                             coefficients: coeffs2,
-                            constant: linearized.constant,
+                            constant: innerConst,
                             relation: GreaterThanEq
                         ))
                         channelLinearForms += 2
