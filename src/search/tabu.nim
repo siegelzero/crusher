@@ -132,10 +132,12 @@ type
         # Inverse group compound move structures
         inverseEnabled*: bool
         inverseGroups*: seq[InverseGroup[int]]
-        posToInverseGroup*: Table[int, int]       # position -> group index
-        posToGroupLocalIdx*: Table[int, int]      # position -> local index within group
+        posToInverseGroup*: seq[int]              # [position] -> group index (-1 if not in any group)
+        posToGroupLocalIdx*: seq[int]             # [position] -> local index within group (-1 if not in any group)
         inverseDelta*: seq[seq[int]]              # [pos][domainIdx] -> compound delta from forced changes
         inverseForcedChanges*: seq[(int, int, int)]  # buffer: (pos, oldVal, newVal)
+        inverseSavedBuf*: seq[(int, T)]           # reusable buffer for computeChannelDepDelta
+        forcedChannelsBuf2*: seq[int]             # reusable buffer for forced position channel propagation
 
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
@@ -251,7 +253,7 @@ proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
         result += state.movePenalty(constraint, position, newValue)
     if state.hasChannelDeps:
         result += state.computeChannelDepDelta(position, newValue)
-    if state.inverseEnabled and position in state.posToInverseGroup:
+    if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
         result += state.computeInverseDeltaAt(position, newValue)
 
 ################################################################################
@@ -781,11 +783,11 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     state.assignment[pos] = candidateValue
 
     # Apply inverse group forced changes for simulation
-    var inverseSaved: seq[(int, T)]
-    if state.inverseEnabled and pos in state.posToInverseGroup:
+    state.inverseSavedBuf.setLen(0)
+    if state.inverseEnabled and state.posToInverseGroup[pos] >= 0:
         state.computeInverseForcedChanges(pos, candidateValue, savedPos, oldValueProvided = true)
         for (fPos, fOld, fNew) in state.inverseForcedChanges:
-            inverseSaved.add((fPos, state.assignment[fPos]))
+            state.inverseSavedBuf.add((fPos, state.assignment[fPos]))
             state.assignment[fPos] = T(fNew)
 
     # Fast path for one-hot source positions: directly compute the few changes
@@ -825,7 +827,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         for (chanPos, _, _) in state.cdChanges:
             state.cdVisited.incl(chanPos)
         # Add inverse forced positions to the worklist for channel propagation
-        for (fPos, savedVal) in inverseSaved:
+        for (fPos, savedVal) in state.inverseSavedBuf:
             if fPos notin state.cdVisited:
                 state.cdVisited.incl(fPos)
                 state.cdWorklist.add(fPos)
@@ -864,7 +866,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         state.cdWorklist.add(pos)
         state.cdVisited.incl(pos)
         # Add inverse forced positions to the worklist for channel propagation
-        for (fPos, savedVal) in inverseSaved:
+        for (fPos, savedVal) in state.inverseSavedBuf:
             if fPos notin state.cdVisited:
                 state.cdVisited.incl(fPos)
                 state.cdWorklist.add(fPos)
@@ -903,7 +905,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     # primary position and an inverse forced position — only the first entry has
     # the true original value).
     state.assignment[pos] = savedPos
-    for (fPos, savedVal) in inverseSaved:
+    for (fPos, savedVal) in state.inverseSavedBuf:
         state.assignment[fPos] = savedVal
     for i in countdown(state.cdChanges.len - 1, 0):
         let (chanPos, oldVal, _) = state.cdChanges[i]
@@ -2039,6 +2041,7 @@ proc computeInverseDeltaAt[T](state: TabuState[T], position: int, candidateValue
 
 proc recomputeAllInverseDeltas[T](state: TabuState[T]) =
     ## Recompute inverseDelta[pos][domainIdx] for all inverse group positions.
+    ## Used only during initialization.
     for group in state.inverseGroups:
         for pos in group.positions:
             if pos in state.carray.channelPositions:
@@ -2048,20 +2051,66 @@ proc recomputeAllInverseDeltas[T](state: TabuState[T]) =
                 state.inverseDelta[pos][i] = state.computeInverseDeltaAt(pos, domain[i])
 
 
+proc recomputeInverseDeltasTargeted[T](state: TabuState[T],
+                                        movedPosition: int,
+                                        localForced: openArray[(int, int, int)]) =
+    ## Targeted recomputation of inverseDelta after an inverse group move.
+    ## Only recomputes entries within the moved group that could have changed:
+    ##   - Changed positions (primary + forced): full domain recompute
+    ##   - Positions whose current partner is a changed position: full recompute
+    ##   - Other positions: only domain values mapping to a changed local index
+    let gi = state.posToInverseGroup[movedPosition]
+    let group = state.inverseGroups[gi]
+    let offset = group.valueOffset
+
+    # Collect changed local indices (primary + forced positions)
+    var changedLocalIdxs: PackedSet[int]
+    changedLocalIdxs.incl(state.posToGroupLocalIdx[movedPosition])
+    for (fPos, _, _) in localForced:
+        if state.posToGroupLocalIdx[fPos] >= 0:
+            changedLocalIdxs.incl(state.posToGroupLocalIdx[fPos])
+
+    for pos in group.positions:
+        if pos in state.carray.channelPositions:
+            continue
+        let domain = state.carray.reducedDomain[pos]
+        let localIdx = state.posToGroupLocalIdx[pos]
+        let oldJ = int(state.assignment[pos]) + offset
+
+        if localIdx in changedLocalIdxs or oldJ in changedLocalIdxs:
+            # This position's assignment changed, or its partner's assignment changed
+            # → full recompute since forced changes depend on both
+            for i in 0..<domain.len:
+                state.inverseDelta[pos][i] = state.computeInverseDeltaAt(pos, domain[i])
+        else:
+            # Only recompute the few domain values whose candidate maps to a changed position.
+            # Convert changed local indices → domain values → domain indices via domainIndex.
+            for cl in changedLocalIdxs.items:
+                let targetValue = T(cl - offset)
+                let domIdx = state.domainIndex[pos].getOrDefault(targetValue, -1)
+                if domIdx >= 0:
+                    state.inverseDelta[pos][domIdx] = state.computeInverseDeltaAt(pos, targetValue)
+
+
 proc initInverseStructures[T](state: TabuState[T]) =
     ## Initialize inverse group compound move structures.
     state.inverseEnabled = false
     state.inverseGroups = state.carray.inverseGroups
-    state.posToInverseGroup = initTable[int, int]()
-    state.posToGroupLocalIdx = initTable[int, int]()
+    state.posToInverseGroup = newSeq[int](state.carray.len)
+    state.posToGroupLocalIdx = newSeq[int](state.carray.len)
+    for i in 0..<state.carray.len:
+        state.posToInverseGroup[i] = -1
+        state.posToGroupLocalIdx[i] = -1
     state.inverseForcedChanges = @[]
+    state.inverseSavedBuf = @[]
+    state.forcedChannelsBuf2 = @[]
 
     if state.inverseGroups.len == 0:
         return
 
     state.inverseEnabled = true
 
-    # Build position lookup tables
+    # Build position lookup tables (flat arrays for O(1) access in hot paths)
     for gi, group in state.inverseGroups:
         for li, pos in group.positions:
             state.posToInverseGroup[pos] = gi
@@ -2441,13 +2490,10 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
         state.cost += newPenalty - oldPenalty
 
     # Apply forced changes from inverse group compound move
-    if state.inverseEnabled and position in state.posToInverseGroup:
+    if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
         state.computeInverseForcedChanges(position, value, oldValueLean, oldValueProvided = true)
-        # Copy to local to avoid re-entrancy issues
-        var localForced: seq[(int, int, int)]
-        for fc in state.inverseForcedChanges:
-            localForced.add(fc)
-        for (fPos, fOld, fNew) in localForced:
+        # Safe to iterate inverseForcedChanges directly: propagateChannelsLean doesn't modify it
+        for (fPos, fOld, fNew) in state.inverseForcedChanges:
             state.assignment[fPos] = T(fNew)
             for constraint in state.constraintsAtPosition[fPos]:
                 let oldPenalty = constraint.penalty()
@@ -2479,7 +2525,7 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                 state.violationCount[pos] += 1
 
     # Apply forced changes from inverse group compound move
-    let hasInverseMove = state.inverseEnabled and position in state.posToInverseGroup
+    let hasInverseMove = state.inverseEnabled and state.posToInverseGroup[position] >= 0
     var localForced: seq[(int, int, int)]  # local copy to avoid re-entrancy
     if hasInverseMove:
         state.computeInverseForcedChanges(position, value, oldValueAssign, oldValueProvided = true)
@@ -2502,13 +2548,12 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Propagate channel variables affected by this position change
     let channelsChanged = state.propagateChannels(position, state.changedChannelsBuf)
 
-    # Also propagate channels for forced positions
+    # Also propagate channels for forced positions (using pre-allocated buffer)
     if hasInverseMove:
         for (fPos, fOld, fNew) in localForced:
-            var forcedChannelsBuf: seq[int]
-            let forcedChanged = state.propagateChannels(fPos, forcedChannelsBuf)
+            let forcedChanged = state.propagateChannels(fPos, state.forcedChannelsBuf2)
             if forcedChanged:
-                for ch in forcedChannelsBuf:
+                for ch in state.forcedChannelsBuf2:
                     state.changedChannelsBuf.add(ch)
 
     let anyChannelsChanged = state.changedChannelsBuf.len > 0
@@ -2552,9 +2597,9 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         for (fPos, fOld, fNew) in localForced:
             state.updateNeighborPenalties(fPos)
 
-    # Recompute all inverse deltas after any inverse group move
+    # Recompute inverse deltas for affected positions in the moved group
     if hasInverseMove:
-        state.recomputeAllInverseDeltas()
+        state.recomputeInverseDeltasTargeted(position, localForced)
 
     when ProfileIteration:
         state.timeNeighborPenalties += epochTime() - t2
@@ -2602,7 +2647,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             let dLen = domain.len
 
             # Sample random domain values, break on first improving move
-            let hasInverse1 = state.inverseEnabled and position in state.posToInverseGroup
+            let hasInverse1 = state.inverseEnabled and state.posToInverseGroup[position] >= 0
             for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
                 let i = rand(dLen - 1)
                 if i == oldIdx:
@@ -2638,7 +2683,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             let domain = state.carray.reducedDomain[position]
             let dLen = domain.len
-            let hasInverse2 = state.inverseEnabled and position in state.posToInverseGroup
+            let hasInverse2 = state.inverseEnabled and state.posToInverseGroup[position] >= 0
 
             if dLen <= MAX_CANDIDATES_PER_POS:
                 for i in 0..<dLen:
@@ -2932,7 +2977,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let idx = state.domainIndex[pos].getOrDefault(val, -1)
         if idx >= 0:
             singleCost = state.cost + state.penaltyMap[pos][idx]
-            if state.inverseEnabled and pos in state.posToInverseGroup:
+            if state.inverseEnabled and state.posToInverseGroup[pos] >= 0:
                 singleCost += state.inverseDelta[pos][idx]
 
     if swapMoves.len > 0 and swapCost < singleCost:
@@ -2956,7 +3001,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let oldValue = state.assignment[position]
         # Compute forced changes BEFORE assignValue to capture old values for tabu
         var forcedOldValues: seq[(int, T)]
-        if state.inverseEnabled and position in state.posToInverseGroup:
+        if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
             state.computeInverseForcedChanges(position, newValue)
             for (fPos, fOld, fNew) in state.inverseForcedChanges:
                 forcedOldValues.add((fPos, T(fOld)))
