@@ -732,6 +732,38 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
            cons.allDifferentState.evalMethod == PositionBased:
             allDiffGroups.add(toSeq(cons.positions.items))
 
+    # Collect ne pairs for singleton propagation (Phase 5c)
+    type NePair = object
+        posA, posB: int
+        coeffA, coeffB: T
+        constant: T
+    var nePairs: seq[NePair]
+    var neAtPos: Table[int, seq[int]]  # position -> indices into nePairs
+    for form in linearForms:
+        if form.relation == NotEqualTo and form.coefficients.len == 2:
+            let positions = toSeq(form.coefficients.keys)
+            let pair = NePair(
+                posA: positions[0], posB: positions[1],
+                coeffA: form.coefficients[positions[0]],
+                coeffB: form.coefficients[positions[1]],
+                constant: form.constant)
+            let idx = nePairs.len
+            nePairs.add(pair)
+            neAtPos.mgetOrPut(positions[0], @[]).add(idx)
+            neAtPos.mgetOrPut(positions[1], @[]).add(idx)
+    # Also handle 1-position ne constraints: coeff * x + constant != 0  →  x != -constant/coeff
+    for form in linearForms:
+        if form.relation == NotEqualTo and form.coefficients.len == 1:
+            let pos = toSeq(form.coefficients.keys)[0]
+            let coeff = form.coefficients[pos]
+            let numerator = -form.constant
+            if coeff != T(0) and numerator mod coeff == T(0):
+                let forbiddenVal = numerator div coeff
+                if forbiddenVal in currentDomain[pos]:
+                    currentDomain[pos].excl(forbiddenVal)
+    if nePairs.len > 0:
+        stderr.writeLine(&"[DomRed] Collected {nePairs.len} binary ne pairs for singleton propagation")
+
     # Collect small-arity constraints for GAC
     const MAX_GAC_ARITY = 4
     const MAX_GAC_COMBOS = 1_000_000
@@ -1048,6 +1080,37 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         for otherPos in adPositions:
                             if otherPos != pos and singletonVal in currentDomain[otherPos]:
                                 currentDomain[otherPos].excl(singletonVal)
+                                changed = true
+                                outerChanged = true
+                if not changed:
+                    break
+
+        # Phase 5c: NotEqual singleton propagation
+        # When a variable in a binary != constraint becomes singleton,
+        # remove the forbidden value from the other variable's domain.
+        if nePairs.len > 0:
+            for iteration in 0..<nePairs.len:
+                var changed = false
+                for pos, pairIndices in neAtPos.pairs:
+                    if currentDomain[pos].len != 1:
+                        continue
+                    var singletonVal: T
+                    for v in currentDomain[pos].items:
+                        singletonVal = v
+                    for idx in pairIndices:
+                        let pair = nePairs[idx]
+                        let (myCoeff, otherPos, otherCoeff) =
+                            if pair.posA == pos:
+                                (pair.coeffA, pair.posB, pair.coeffB)
+                            else:
+                                (pair.coeffB, pair.posA, pair.coeffA)
+                        # myCoeff * singletonVal + otherCoeff * y + constant != 0
+                        # → y != -(myCoeff * singletonVal + constant) / otherCoeff
+                        let numerator = -(myCoeff * singletonVal + pair.constant)
+                        if otherCoeff != T(0) and numerator mod otherCoeff == T(0):
+                            let forbiddenVal = numerator div otherCoeff
+                            if forbiddenVal in currentDomain[otherPos]:
+                                currentDomain[otherPos].excl(forbiddenVal)
                                 changed = true
                                 outerChanged = true
                 if not changed:
