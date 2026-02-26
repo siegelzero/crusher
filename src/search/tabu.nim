@@ -1375,27 +1375,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             inWorklist[bi] = false
             inc fpEvals
             let fb = state.flatMinMaxBindings[bi]
-            # Evaluate only linear inputs + constant (complex already folded in)
-            let nInputs = fb.linearOffsets.len
-            var newVal: T
-            if fb.isMin:
-                newVal = if fb.hasConstant: fb.constantVal else: high(T)
-                for i in 0..<nInputs:
-                    var v = fb.linearOffsets[i]
-                    let start = fb.inputBounds[i]
-                    let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
-                    for j in start..<stop:
-                        v += fb.linearCoeffs[j] * state.assignment[fb.linearPositions[j]]
-                    if v < newVal: newVal = v
-            else:
-                newVal = if fb.hasConstant: fb.constantVal else: low(T)
-                for i in 0..<nInputs:
-                    var v = fb.linearOffsets[i]
-                    let start = fb.inputBounds[i]
-                    let stop = if i + 1 < nInputs: fb.inputBounds[i + 1] else: fb.linearPositions.len
-                    for j in start..<stop:
-                        v += fb.linearCoeffs[j] * state.assignment[fb.linearPositions[j]]
-                    if v > newVal: newVal = v
+            let newVal = evaluateFlatMinMax(fb, state.assignment)
             if newVal != state.assignment[fb.channelPosition]:
                 state.assignment[fb.channelPosition] = newVal
                 # Enqueue downstream bindings that use this channel as input
