@@ -80,6 +80,7 @@ type
         # Channel-dependent constraint support
         hasChannelDeps*: bool
         channelDepConstraints*: seq[StatefulConstraint[T]]
+        channelDepConstraintActive*: seq[bool]  # per-constraint: false if tautological (penalty always 0)
         channelDepPenalties*: seq[seq[int]]  # [position][domainIdx] -> channel-dep delta
         channelDepSearchPositions*: seq[int]  # search positions with channel bindings
         channelDepConstraintsForPos*: Table[int, seq[StatefulConstraint[T]]]  # pos -> relevant channel-dep constraints
@@ -92,6 +93,8 @@ type
         # Reusable buffers for computeChannelDepDelta (avoid per-call heap allocation).
         # NOTE: these make computeChannelDepDelta non-reentrant within a single state.
         cdInUse: bool  # debug guard against reentrant calls
+        cdTrackPerConstraint: bool  # when true, track per-constraint max delta during init
+        cdPerConstraintMaxDelta: seq[int]  # [constraintIdx] -> max |delta| seen during init
         cdChanges: seq[(int, T, T)]
         cdWorklist: seq[int]
         cdVisited: PackedSet[int]  # reusable visited set for worklist propagation
@@ -926,7 +929,11 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 for ci in state.chanPosToDepConstraintIdx[chanPos]:
                     if ci in state.cdProcessed: continue
                     state.cdProcessed.incl(ci)
-                    result += channelDepConstraintDelta(state.channelDepConstraints[ci], state.cdChanges)
+                    if not state.channelDepConstraintActive[ci]: continue
+                    let delta = channelDepConstraintDelta(state.channelDepConstraints[ci], state.cdChanges)
+                    result += delta
+                    if state.cdTrackPerConstraint and delta != 0:
+                        state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
     else:
         # Fallback: iterate all relevant constraints (no reverse index)
         let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
@@ -1434,6 +1441,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         let searchPos = state.constraintSearchPos.getOrDefault(cptr)
         if searchPos.len == 0:
             state.channelDepConstraints.add(c)
+    state.channelDepConstraintActive = newSeq[bool](state.channelDepConstraints.len)
+    for i in 0..<state.channelDepConstraintActive.len:
+        state.channelDepConstraintActive[i] = true
     if state.channelDepConstraints.len > 0:
         state.hasChannelDeps = true
         # Find search positions that have channel bindings (can affect channel-dep constraints)
@@ -1689,6 +1699,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Compute initial channel-dep penalties (before penalty map build)
     state.cdInUse = false
     if state.hasChannelDeps:
+        # Enable per-constraint delta tracking during initialization
+        state.cdTrackPerConstraint = true
+        state.cdPerConstraintMaxDelta = newSeq[int](state.channelDepConstraints.len)
+
         let cdStart = epochTime()
         var cdBinaryCount = 0
         var cdLargeCount = 0
@@ -1699,9 +1713,39 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if dlen <= 2: cdBinaryCount += 1
             else: cdLargeCount += 1
             state.computeChannelDepPenaltiesAt(pos)
+
+        state.cdTrackPerConstraint = false
         if verbose and id == 0:
             echo "[Init] Channel-dep penalties computed in " & $(epochTime() - cdStart) & "s" &
                  " (binary=" & $cdBinaryCount & " large=" & $cdLargeCount & " totalEvals=" & $cdTotalEvals & ")"
+
+        # Check if all channel-dep penalties are zero (tautological constraints).
+        block tautologyCheck:
+            for pos in state.channelDepSearchPositions:
+                for i in 0..<carray.reducedDomain[pos].len:
+                    if state.channelDepPenalties[pos][i] != 0:
+                        break tautologyCheck
+            # All zero — disable channel-dep overhead entirely
+            if verbose and id == 0:
+                echo "[Init] All channel-dep penalties are zero — disabling (tautological constraints)"
+            state.hasChannelDeps = false
+
+        # Per-constraint tautological filtering: disable constraints that never
+        # contributed non-zero delta across ALL (position, domainValue) evaluations.
+        # Unlike checking penalty()==0 (which only reflects the current state),
+        # this verifies that NO possible move could violate the constraint.
+        if state.hasChannelDeps:
+            var tautCount = 0
+            for ci in 0..<state.channelDepConstraints.len:
+                if state.cdPerConstraintMaxDelta[ci] == 0:
+                    state.channelDepConstraintActive[ci] = false
+                    tautCount += 1
+            if tautCount > 0:
+                if verbose and id == 0:
+                    echo "[Init] Disabled " & $tautCount & "/" & $state.channelDepConstraints.len &
+                         " tautological channel-dep constraints (zero delta across all moves)"
+                if tautCount == state.channelDepConstraints.len:
+                    state.hasChannelDeps = false
 
     # Initialize element implied structures before penalty map so discounts are included
     state.initElementImpliedStructures()
@@ -2565,6 +2609,7 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     if hasInverseMove:
         for (fPos, fOld, fNew) in localForced:
             state.updatePenaltiesForPosition(fPos)
+
 
     when ProfileIteration:
         let t2 = epochTime()

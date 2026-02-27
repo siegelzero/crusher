@@ -1176,27 +1176,44 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       if e.node.kind == RefNode:
         let pos = e.node.position
         tr.sys.baseArray.domain[pos] = tr.sys.baseArray.domain[pos].filterIt(it in coverSet)
-    # Same cardinality logic as open variant
+    # Pigeon-hole tightening: derive effective bounds from total item count
+    # If n items must be distributed across cover.len slots with bounds [lb, ub],
+    # then each slot i must have at least n - sum(ub[j] for j != i) items
+    # and at most n - sum(lb[j] for j != i) items.
+    let sumLbound = lbound.foldl(a + b, 0)
+    let sumUbound = ubound.foldl(a + b, 0)
+    var effectiveLbound = newSeq[int](cover.len)
+    var effectiveUbound = newSeq[int](cover.len)
     for i in 0..<cover.len:
-      if lbound[i] > 0:
-        tr.sys.addConstraint(atLeast[int](exprs, cover[i], lbound[i]))
-      if ubound[i] < n:
-        tr.sys.addConstraint(atMost[int](exprs, cover[i], ubound[i]))
+      effectiveLbound[i] = max(lbound[i], n - (sumUbound - ubound[i]))
+      effectiveUbound[i] = min(ubound[i], n - (sumLbound - lbound[i]))
+    # Same cardinality logic as open variant, using tightened bounds
+    for i in 0..<cover.len:
+      if effectiveLbound[i] > 0:
+        tr.sys.addConstraint(atLeast[int](exprs, cover[i], effectiveLbound[i]))
+      if effectiveUbound[i] < n:
+        tr.sys.addConstraint(atMost[int](exprs, cover[i], effectiveUbound[i]))
 
   of "fzn_global_cardinality_low_up":
     # global_cardinality_low_up(x, cover, lbound, ubound)
     # For each i: lbound[i] <= count(x, cover[i]) <= ubound[i]
     # Skip trivial bounds; emit atLeast/atMost for non-trivial ones.
+    # Note: open variant — items can take values outside cover set,
+    # so pigeon-hole lower bound tightening does NOT apply (items can
+    # escape to uncovered values). Upper bound tightening is still valid.
     let exprs = tr.resolveExprArray(con.args[0])
     let cover = tr.resolveIntArray(con.args[1])
     let lbound = tr.resolveIntArray(con.args[2])
     let ubound = tr.resolveIntArray(con.args[3])
     let n = exprs.len
+    # Upper bound tightening: count[i] <= n - sum(lbound[j] for j != i)
+    let sumLbound = lbound.foldl(a + b, 0)
     for i in 0..<cover.len:
       if lbound[i] > 0:
         tr.sys.addConstraint(atLeast[int](exprs, cover[i], lbound[i]))
-      if ubound[i] < n:
-        tr.sys.addConstraint(atMost[int](exprs, cover[i], ubound[i]))
+      let effectiveUbound = min(ubound[i], n - (sumLbound - lbound[i]))
+      if effectiveUbound < n:
+        tr.sys.addConstraint(atMost[int](exprs, cover[i], effectiveUbound))
 
   of "fzn_count_eq":
     # count_eq(x, y, c) means count(x, y) == c
