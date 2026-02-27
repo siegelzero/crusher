@@ -108,6 +108,9 @@ type
     setInReifChannelDefs*: seq[int]
     # array_bool_and/array_bool_or with defines_var → channel variables
     boolAndOrChannelDefs*: seq[int]
+    # Tracks which output variables/arrays are boolean (for true/false formatting)
+    outputBoolVars*: HashSet[string]
+    outputBoolArrays*: HashSet[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -435,6 +438,8 @@ proc translateVariables(tr: var FznTranslator) =
     if decl.name in tr.definedVarNames:
       if decl.hasAnnotation("output_var"):
         tr.outputVars.add(decl.name)
+        if decl.varType.kind == FznBool:
+          tr.outputBoolVars.incl(decl.name)
       # Record domain bounds for later constraint generation
       if decl.varType.kind == FznIntRange:
         tr.definedVarBounds[decl.name] = (decl.varType.lo, decl.varType.hi)
@@ -460,6 +465,8 @@ proc translateVariables(tr: var FznTranslator) =
     # Check for output annotations
     if decl.hasAnnotation("output_var"):
       tr.outputVars.add(decl.name)
+      if decl.varType.kind == FznBool:
+        tr.outputBoolVars.incl(decl.name)
 
   # Second pass: process variable arrays (they reference already-created variables)
   for decl in tr.model.variables:
@@ -526,6 +533,8 @@ proc translateVariables(tr: var FznTranslator) =
           lo = indexRanges.elems[0].lo
           hi = indexRanges.elems[0].hi
       tr.outputArrays.add((name: decl.name, lo: lo, hi: hi))
+      if decl.varType.kind == FznBool:
+        tr.outputBoolArrays.incl(decl.name)
 
 proc decomposeWithIndicators(tr: var FznTranslator,
     exprs: seq[AlgebraicExpression[int]],

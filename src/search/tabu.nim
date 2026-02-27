@@ -1124,7 +1124,7 @@ proc balanceBinarySums[T](state: TabuState[T]) =
         for pos in positions:
             fixed.incl(pos)
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[]) =
+proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], forRelinking: bool = false) =
     state.id = id
     state.carray = carray
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
@@ -1653,7 +1653,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     state.chanPosToDepConstraintIdx[p].add(ci)
 
     # Build level-2 reverse index for targeted channel-dep recomputation
-    if state.hasChannelDeps and state.oneHotChanges.len > 0:
+    if not forRelinking and state.hasChannelDeps and state.oneHotChanges.len > 0:
         # For each constraint, which one-hot (pos, domainIdx) entries touch it
         state.depConstraintOneHotEntries = newSeq[seq[tuple[pos: int, domainIdx: int]]](state.channelDepConstraints.len)
         for pos in state.channelDepSearchPositions:
@@ -1678,6 +1678,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             echo "[Init] Channel-dep reverse index: " & $state.chanPosToDepConstraintIdx.len &
                  " channel positions, " & $state.depConstraintOneHotEntries.len &
                  " constraints, " & $totalEntries & " one-hot entries"
+
+    # Skip penalty maps, channel-dep penalties, and element implied structures for relinking
+    if forRelinking:
+        # Minimal structures needed for costDelta/assignValueLean
+        state.initSwapStructures()
+        state.initFlowStructure()
+        state.initInverseStructures()
+        return
 
     # Initialize dense penalty arrays — only for search positions (not channels)
     state.penaltyMap = newSeq[seq[int]](carray.len)
@@ -1784,6 +1792,12 @@ proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: in
 proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
     result.init(carray, verbose, id, initialAssignment = assignment)
+
+proc newRelinkState*[T](carray: ConstrainedArray[T], assignment: seq[T], id: int = 0): TabuState[T] =
+    ## Create a lean TabuState for path relinking: skips penalty maps and
+    ## channel-dep penalties (only costDelta/assignValueLean are needed).
+    new(result)
+    result.init(carray, verbose = false, id = id, initialAssignment = assignment, forRelinking = true)
 
 ################################################################################
 # Swap Move Initialization

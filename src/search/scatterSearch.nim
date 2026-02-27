@@ -1,4 +1,4 @@
-import std/[random, math, sequtils, strformat, algorithm, atomics, tables, packedsets]
+import std/[random, math, sequtils, strformat, algorithm, atomics, tables, packedsets, typedthreads, locks, os]
 import std/times
 
 proc currentTime*(): float {.inline.} = epochTime()
@@ -15,6 +15,29 @@ type
     PathEntry*[T] = object
         assignment*: seq[T]
         cost*: int
+
+    RelinkTask*[T] = object
+        sourceAssignment*: seq[T]
+        targetAssignment*: seq[T]
+
+    RelinkResult*[T] = object
+        pathEntries*: seq[PathEntry[T]]
+        taskIndex*: int
+
+    RelinkPool*[T] = object
+        carrays*: ptr UncheckedArray[ConstrainedArray[T]]
+        tasks*: ptr UncheckedArray[RelinkTask[T]]
+        nextTaskIndex*: Atomic[int]
+        createdUpTo*: Atomic[int]
+        solutionFound*: Atomic[bool]
+        totalTasks*: int
+        deadline*: float
+        results*: seq[RelinkResult[T]]
+        resultsLock*: Lock
+
+    RelinkWorkerData*[T] = object
+        workerId*: int
+        pool*: ptr RelinkPool[T]
 
 proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntry[T]] =
     ## Path relinking: greedy walk from state's current assignment toward targetAssignment.
@@ -67,6 +90,14 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
             bestCost = state.cost
             bestAssignment = state.assignment
 
+        # Early exit on solution
+        if state.cost == 0:
+            result.add(PathEntry[T](
+                assignment: state.assignment,
+                cost: 0
+            ))
+            return
+
         # Sample at regular intervals
         if stepCount mod sampleInterval == 0:
             result.add(PathEntry[T](
@@ -86,6 +117,47 @@ proc relinkPath*[T](state: TabuState[T], targetAssignment: seq[T]): seq[PathEntr
             assignment: bestAssignment,
             cost: bestCost
         ))
+
+
+proc relinkWorker*[T](data: RelinkWorkerData[T]) {.thread.} =
+    try:
+        randomize()
+        let pool = data.pool
+
+        while not pool.solutionFound.load():
+            let idx = pool.nextTaskIndex.fetchAdd(1)
+            if idx >= pool.totalTasks:
+                break
+            if pool.solutionFound.load():
+                break
+
+            # Wait for main thread to create this carray (lazy creation)
+            while pool.createdUpTo.load() <= idx:
+                if pool.solutionFound.load(): return
+                sleep(1)
+
+            let task = pool.tasks[idx]
+            var relinkState = newRelinkState[T](pool.carrays[idx], task.sourceAssignment, id = idx)
+            let pathEntries = relinkPath(relinkState, task.targetAssignment)
+
+            let result = RelinkResult[T](
+                pathEntries: pathEntries,
+                taskIndex: idx
+            )
+
+            # Check for solution
+            if pathEntries.len > 0 and pathEntries[^1].cost == 0:
+                pool.solutionFound.store(true)
+
+            withLock pool.resultsLock:
+                pool.results.add(result)
+
+            if pool.solutionFound.load():
+                break
+
+    except CatchableError as e:
+        stderr.writeLine("[RelinkWorker " & $data.workerId & "] Error: " & e.msg)
+        stderr.writeLine("[RelinkWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
 
 
 proc buildInitialPopulation*[T](system: ConstraintSystem[T],
@@ -178,34 +250,137 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[Scatter] === Iteration {iter} (stale={itersSinceImprovement}/{scatterThreshold}) ==="
 
-        # a. PATH RELINKING: For each pair, relink both directions
+        # a. PATH RELINKING: For each pair, relink both directions (parallel)
         let relinkStart = currentTime()
         var allPathEntries: seq[PathEntry[T]] = @[]
         var pairCount = 0
         var totalDiffPositions = 0
 
-        var relinkTemplate = system.baseArray.deepCopy()
+        # Pre-generate all relinking tasks
+        var relinkTasks: seq[RelinkTask[T]] = @[]
         for (i, j) in pool.pairs():
             pairCount += 1
             let entryA = pool.entries[i]
             let entryB = pool.entries[j]
-
             let dist = distance(entryA, entryB)
             totalDiffPositions += dist
-
             # A -> B
-            block:
-                var relinkArray = relinkTemplate.deepCopy()
-                var relinkState = newTabuState[T](relinkArray, entryA.assignment, verbose = false)
-                let pathEntries = relinkPath(relinkState, entryB.assignment)
-                allPathEntries.add(pathEntries)
-
+            relinkTasks.add(RelinkTask[T](
+                sourceAssignment: entryA.assignment,
+                targetAssignment: entryB.assignment
+            ))
             # B -> A
-            block:
-                var relinkArray = relinkTemplate.deepCopy()
-                var relinkState = newTabuState[T](relinkArray, entryB.assignment, verbose = false)
-                let pathEntries = relinkPath(relinkState, entryA.assignment)
-                allPathEntries.add(pathEntries)
+            relinkTasks.add(RelinkTask[T](
+                sourceAssignment: entryB.assignment,
+                targetAssignment: entryA.assignment
+            ))
+
+        if relinkTasks.len > 0:
+            if actualWorkers <= 1 or relinkTasks.len == 1:
+                # Sequential fallback
+                var relinkTemplate = system.baseArray.deepCopy()
+                for task in relinkTasks:
+                    var relinkArray = relinkTemplate.deepCopy()
+                    var relinkState = newRelinkState[T](relinkArray, task.sourceAssignment)
+                    let pathEntries = relinkPath(relinkState, task.targetAssignment)
+                    allPathEntries.add(pathEntries)
+                    if pathEntries.len > 0 and pathEntries[^1].cost == 0:
+                        break
+                    if deadline > 0 and epochTime() > deadline:
+                        break
+            else:
+                # Parallel path relinking with work-stealing pool
+                var carrays = newSeq[ConstrainedArray[T]](relinkTasks.len)
+                var templateArray = system.baseArray.deepCopy()
+                let bufferAhead = actualWorkers * 2
+                let initialBatch = min(bufferAhead, relinkTasks.len)
+                for i in 0..<initialBatch:
+                    carrays[i] = templateArray.deepCopy()
+                var createdSoFar = initialBatch
+
+                var relinkPool = RelinkPool[T](
+                    carrays: cast[ptr UncheckedArray[ConstrainedArray[T]]](addr carrays[0]),
+                    tasks: cast[ptr UncheckedArray[RelinkTask[T]]](addr relinkTasks[0]),
+                    totalTasks: relinkTasks.len,
+                    deadline: deadline,
+                    results: newSeq[RelinkResult[T]]()
+                )
+                relinkPool.nextTaskIndex.store(0)
+                relinkPool.createdUpTo.store(createdSoFar)
+                relinkPool.solutionFound.store(false)
+                initLock(relinkPool.resultsLock)
+
+                let workerCount = min(actualWorkers, relinkTasks.len)
+                var workers = newSeq[Thread[RelinkWorkerData[T]]](workerCount)
+                var workerDatas = newSeq[RelinkWorkerData[T]](workerCount)
+                for i in 0..<workerCount:
+                    workerDatas[i] = RelinkWorkerData[T](workerId: i, pool: addr relinkPool)
+                    createThread(workers[i], relinkWorker[T], workerDatas[i])
+
+                var threadsJoined = false
+                defer:
+                    if not threadsJoined:
+                        if not relinkPool.solutionFound.load():
+                            relinkPool.solutionFound.store(true)
+                        for i in 0..<workerCount:
+                            joinThread(workers[i])
+                        threadsJoined = true
+                    deinitLock(relinkPool.resultsLock)
+                    for i in 0..<workerDatas.len:
+                        workerDatas[i].pool = nil
+
+                # Monitor and collect results
+                var collectedResults = 0
+                var lastResultCount = 0
+
+                while collectedResults < relinkTasks.len and not relinkPool.solutionFound.load():
+                    # Create more carrays ahead of workers (lazy, bounded buffer)
+                    let nextTask = relinkPool.nextTaskIndex.load()
+                    let target = min(nextTask + bufferAhead, relinkTasks.len)
+                    while createdSoFar < target and not relinkPool.solutionFound.load():
+                        carrays[createdSoFar] = templateArray.deepCopy()
+                        createdSoFar += 1
+                        relinkPool.createdUpTo.store(createdSoFar)
+
+                    var currentResults: seq[RelinkResult[T]]
+                    withLock relinkPool.resultsLock:
+                        currentResults = relinkPool.results
+
+                    for i in lastResultCount..<currentResults.len:
+                        let res = currentResults[i]
+                        allPathEntries.add(res.pathEntries)
+                        reset(carrays[res.taskIndex])
+                        inc collectedResults
+                        if res.pathEntries.len > 0 and res.pathEntries[^1].cost == 0:
+                            relinkPool.solutionFound.store(true)
+                            break
+
+                    lastResultCount = currentResults.len
+
+                    if collectedResults >= relinkTasks.len or relinkPool.solutionFound.load():
+                        break
+
+                    if deadline > 0 and epochTime() > deadline:
+                        relinkPool.solutionFound.store(true)
+                        break
+
+                    sleep(1)
+
+                if not relinkPool.solutionFound.load():
+                    relinkPool.solutionFound.store(true)
+
+                for i in 0..<workerCount:
+                    joinThread(workers[i])
+                threadsJoined = true
+
+                # Collect any remaining results
+                withLock relinkPool.resultsLock:
+                    for i in lastResultCount..<relinkPool.results.len:
+                        allPathEntries.add(relinkPool.results[i].pathEntries)
+                        reset(carrays[relinkPool.results[i].taskIndex])
+
+                withLock relinkPool.resultsLock:
+                    relinkPool.results.setLen(0)
 
         if verbose:
             let relinkElapsed = currentTime() - relinkStart
