@@ -218,8 +218,6 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 joinThread(workers[i])
             threadsJoined = true
 
-            sleep(10)
-
             # Yield any remaining results after all workers are done
             withLock pool.resultsLock:
                 for i in lastResultCount..<pool.results.len:
@@ -424,8 +422,6 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
             for i in 0..<workerCount:
                 joinThread(workers[i])
             threadsJoined = true
-
-            sleep(10)
 
             # Yield any remaining results after workers complete
             withLock pool.resultsLock:
