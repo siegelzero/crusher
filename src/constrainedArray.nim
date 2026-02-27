@@ -1549,6 +1549,56 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 currentDomain[valPos].excl(v)
                                 outerChanged = true
 
+                elif elemState.evalMethod == ExpressionBased and elemState.isConstantArrayEB:
+                    # Expression-based with constant array: constantArrayEB[indexExpr] == valueExpr
+                    let idxExprPositions = toSeq(elemState.indexExpression.positions.items)
+                    let valExprPositions = toSeq(elemState.valueExpression.positions.items)
+                    let arrSize = elemState.getArraySize()
+
+                    # Only handle single-position expressions (most common case)
+                    if idxExprPositions.len == 1 and valExprPositions.len == 1:
+                        let idxPos = idxExprPositions[0]
+                        let valPos = valExprPositions[0]
+
+                        if idxPos != valPos and idxPos notin skippedPositions and valPos notin skippedPositions:
+                            var tempAssign = initTable[int, T]()
+
+                            # Precompute reachable value expression results for backward pruning
+                            var reachableExprValues: PackedSet[T]
+                            for w in currentDomain[valPos].items:
+                                tempAssign[valPos] = w
+                                reachableExprValues.incl(elemState.valueExpression.evaluate(tempAssign))
+
+                            # Backward: prune index domain
+                            # Remove v if constantArrayEB[indexExpr(v)] not achievable by any w in domain(valPos)
+                            for v in toSeq(currentDomain[idxPos].items):
+                                tempAssign[idxPos] = v
+                                let idx = elemState.indexExpression.evaluate(tempAssign)
+                                if idx >= 0 and idx < arrSize:
+                                    if elemState.constantArrayEB[idx] notin reachableExprValues:
+                                        currentDomain[idxPos].excl(v)
+                                        outerChanged = true
+                                else:
+                                    # Out of bounds — always violated
+                                    currentDomain[idxPos].excl(v)
+                                    outerChanged = true
+
+                            # Forward: prune value domain
+                            # Compute set of array values reachable from remaining index domain
+                            var reachableArrayValues: PackedSet[T]
+                            for v in currentDomain[idxPos].items:
+                                tempAssign[idxPos] = v
+                                let idx = elemState.indexExpression.evaluate(tempAssign)
+                                if idx >= 0 and idx < arrSize:
+                                    reachableArrayValues.incl(elemState.constantArrayEB[idx])
+                            # Remove w if valueExpr(w) not in reachable set
+                            for w in toSeq(currentDomain[valPos].items):
+                                tempAssign[valPos] = w
+                                let exprVal = elemState.valueExpression.evaluate(tempAssign)
+                                if exprVal notin reachableArrayValues:
+                                    currentDomain[valPos].excl(w)
+                                    outerChanged = true
+
             elif cons.stateType == MatrixElementType:
                 let matState = cons.matrixElementState
                 let valPos = matState.valuePosition
