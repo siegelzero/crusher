@@ -1840,6 +1840,8 @@ proc detectReifChannels(tr: var FznTranslator) =
     # Verify all inputs in pos/neg arrays are positioned variables (not defined vars)
     let posElems = tr.resolveVarArrayElems(con.args[0])
     let negElems = tr.resolveVarArrayElems(con.args[1])
+    if posElems.len == 0 and negElems.len == 0:
+      continue  # No inputs — can't build a meaningful channel binding
     var allValid = true
     for elem in posElems:
       if elem.kind != FznIdent or elem.ident in tr.definedVarNames:
@@ -2140,27 +2142,39 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
       for elem in posElems:
         if elem.kind == FznIdent:
           if elem.ident in result:
-            if result[elem.ident] >= 1: clauseTrue = true
+            if result[elem.ident] >= 1:
+              clauseTrue = true
+              break
           else:
             allResolved = false
             break
         elif elem.kind == FznIntLit:
-          if elem.intVal >= 1: clauseTrue = true
+          if elem.intVal >= 1:
+            clauseTrue = true
+            break
         elif elem.kind == FznBoolLit:
-          if elem.boolVal: clauseTrue = true
-      if allResolved and not clauseTrue:
+          if elem.boolVal:
+            clauseTrue = true
+            break
+      if not clauseTrue and allResolved:
         for elem in negElems:
           if elem.kind == FznIdent:
             if elem.ident in result:
-              if result[elem.ident] == 0: clauseTrue = true
+              if result[elem.ident] == 0:
+                clauseTrue = true
+                break
             else:
               allResolved = false
               break
           elif elem.kind == FznIntLit:
-            if elem.intVal == 0: clauseTrue = true
+            if elem.intVal == 0:
+              clauseTrue = true
+              break
           elif elem.kind == FznBoolLit:
-            if not elem.boolVal: clauseTrue = true
-      if not allResolved: continue
+            if not elem.boolVal:
+              clauseTrue = true
+              break
+      if not clauseTrue and not allResolved: continue
       result[resultVar] = if clauseTrue: 1 else: 0
       changed = true
     # Evaluate int_lin_eq with defines_var (for compound index expressions)
