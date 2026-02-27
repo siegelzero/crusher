@@ -506,6 +506,19 @@ proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
                    yi < yj + dyj and yj < yi + dyi:
                     cost += 1
         return cost
+    of BooleanType:
+        let bc = cons.booleanState
+        case bc.isUnary
+        of true:
+            let targetPen = evaluateConstraint(bc.targetConstraint, assignment)
+            if targetPen < 0: return T(-1)
+            return calculateUnaryPenalty(bc.unaryOp, targetPen)
+        of false:
+            let leftPen = evaluateConstraint(bc.leftConstraint, assignment)
+            if leftPen < 0: return T(-1)
+            let rightPen = evaluateConstraint(bc.rightConstraint, assignment)
+            if rightPen < 0: return T(-1)
+            return calculateBooleanPenalty(bc.booleanOp, leftPen, rightPen)
     else:
         return T(-1)  # sentinel: not supported
 
@@ -1040,11 +1053,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         stderr.writeLine(&"[DomRed] Collected {nePairs.len} binary ne pairs for singleton propagation")
 
     # Collect small-arity constraints for GAC
-    const MAX_GAC_ARITY = 4
+    const MAX_GAC_ARITY = 12
     const MAX_GAC_COMBOS = 1_000_000
     var gacConstraints: seq[int]  # indices into carray.constraints
     for i, cons in carray.constraints:
-        if cons.stateType in {AlgebraicType, RelationalType}:
+        if cons.stateType in {AlgebraicType, RelationalType, BooleanType}:
             let arity = cons.positions.len
             if arity >= 2 and arity <= MAX_GAC_ARITY:
                 gacConstraints.add(i)
@@ -1264,6 +1277,12 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                     # Evaluate penalty
                     let pen = evaluateConstraint(cons, tempAssignment)
+                    if pen < 0:
+                        # Constraint type not supported by evaluateConstraint — skip entirely
+                        for i in 0..<positions.len:
+                            for v in currentDomain[positions[i]].items:
+                                supported[i].incl(v)
+                        break
                     if pen == 0:
                         for i in 0..<positions.len:
                             supported[i].incl(domains[i][indices[i]])

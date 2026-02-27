@@ -102,6 +102,8 @@ type
     minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
     # Case-analysis channel defs: bool_clause case analysis → constant lookup channel
     caseAnalysisDefs*: seq[CaseAnalysisDef]
+    # bool_clause_reif with defines_var → channel variables
+    boolClauseReifChannelDefs*: seq[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -604,25 +606,43 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     let coeffs = tr.resolveIntArray(con.args[0])
     let exprs = tr.resolveExprArray(con.args[1])
     let rhs = tr.resolveIntArg(con.args[2])
-    let bExpr = tr.resolveExprArg(con.args[3])
     let sp = scalarProduct[int](coeffs, exprs)
-    tr.sys.addConstraint((sp == rhs) <-> (bExpr == 1))
+    if con.args[3].kind == FznBoolLit:
+      if con.args[3].boolVal:
+        tr.sys.addConstraint(sp == rhs)
+      else:
+        tr.sys.addConstraint(sp != rhs)
+    else:
+      let bExpr = tr.resolveExprArg(con.args[3])
+      tr.sys.addConstraint((sp == rhs) <-> (bExpr == 1))
 
   of "int_lin_le_reif":
     let coeffs = tr.resolveIntArray(con.args[0])
     let exprs = tr.resolveExprArray(con.args[1])
     let rhs = tr.resolveIntArg(con.args[2])
-    let bExpr = tr.resolveExprArg(con.args[3])
     let sp = scalarProduct[int](coeffs, exprs)
-    tr.sys.addConstraint((sp <= rhs) <-> (bExpr == 1))
+    if con.args[3].kind == FznBoolLit:
+      if con.args[3].boolVal:
+        tr.sys.addConstraint(sp <= rhs)
+      else:
+        tr.sys.addConstraint(sp > rhs)
+    else:
+      let bExpr = tr.resolveExprArg(con.args[3])
+      tr.sys.addConstraint((sp <= rhs) <-> (bExpr == 1))
 
   of "int_lin_ne_reif":
     let coeffs = tr.resolveIntArray(con.args[0])
     let exprs = tr.resolveExprArray(con.args[1])
     let rhs = tr.resolveIntArg(con.args[2])
-    let bExpr = tr.resolveExprArg(con.args[3])
     let sp = scalarProduct[int](coeffs, exprs)
-    tr.sys.addConstraint((sp != rhs) <-> (bExpr == 1))
+    if con.args[3].kind == FznBoolLit:
+      if con.args[3].boolVal:
+        tr.sys.addConstraint(sp != rhs)
+      else:
+        tr.sys.addConstraint(sp == rhs)
+    else:
+      let bExpr = tr.resolveExprArg(con.args[3])
+      tr.sys.addConstraint((sp != rhs) <-> (bExpr == 1))
 
   # ===== Integer comparison constraints =====
   of "int_eq":
@@ -894,6 +914,26 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     if allExprs.len > 0:
       let sp = scalarProduct[int](coeffs, allExprs)
       tr.sys.addConstraint(sp >= 1 - negExprs.len)
+
+  of "bool_clause_reif":
+    # bool_clause_reif(pos_lits, neg_lits, b) means b <-> (OR(pos) OR NOT(neg))
+    let posExprs = tr.resolveExprArray(con.args[0])
+    let negExprs = tr.resolveExprArray(con.args[1])
+    let bExpr = tr.resolveExprArg(con.args[2])
+    var allExprs: seq[AlgebraicExpression[int]]
+    var coeffs: seq[int]
+    for e in posExprs:
+      allExprs.add(e)
+      coeffs.add(1)
+    for e in negExprs:
+      allExprs.add(e)
+      coeffs.add(-1)
+    if allExprs.len > 0:
+      let sp = scalarProduct[int](coeffs, allExprs)
+      tr.sys.addConstraint((sp >= 1 - negExprs.len) <-> (bExpr == 1))
+    else:
+      # Empty clause is always false
+      tr.sys.addConstraint(bExpr == 0)
 
   of "array_bool_and":
     # array_bool_and(array, r) means r = AND(array)
@@ -1782,8 +1822,42 @@ proc detectReifChannels(tr: var FznTranslator) =
     tr.definingConstraints.incl(ci)
     tr.bool2intChannelDefs.add(ci)
 
-  if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int")
+  # Third pass: find bool_clause_reif with defines_var
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause_reif" or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent:
+      continue
+    let rName = con.args[2].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != rName:
+      continue
+    if rName in tr.definedVarNames or rName in tr.channelVarNames:
+      continue
+    # Verify all inputs in pos/neg arrays are positioned variables (not defined vars)
+    let posElems = tr.resolveVarArrayElems(con.args[0])
+    let negElems = tr.resolveVarArrayElems(con.args[1])
+    var allValid = true
+    for elem in posElems:
+      if elem.kind != FznIdent or elem.ident in tr.definedVarNames:
+        allValid = false
+        break
+    if allValid:
+      for elem in negElems:
+        if elem.kind != FznIdent or elem.ident in tr.definedVarNames:
+          allValid = false
+          break
+    if not allValid:
+      continue
+    tr.channelVarNames.incl(rName)
+    tr.definingConstraints.incl(ci)
+    tr.boolClauseReifChannelDefs.add(ci)
+
+  if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or tr.boolClauseReifChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -1915,7 +1989,71 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
-  let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len
+  # Process bool_clause_reif channels
+  for ci in tr.boolClauseReifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let rName = con.args[2].ident
+    if rName notin tr.varPositions:
+      continue
+    let rPos = tr.varPositions[rName]
+
+    # Build index expression: sum(pos_exprs) - sum(neg_exprs) + len(neg)
+    let posExprs = tr.resolveExprArray(con.args[0])
+    let negExprs = tr.resolveExprArray(con.args[1])
+    let n = posExprs.len + negExprs.len
+
+    var indexExpr: AlgebraicExpression[int]
+    if n == 0:
+      # Empty clause — index is always 0 (clause always false)
+      indexExpr = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: 0),
+        linear = true
+      )
+    else:
+      # Start with first positive or negative expression
+      var started = false
+      for e in posExprs:
+        if not started:
+          indexExpr = e
+          started = true
+        else:
+          indexExpr = indexExpr + e
+      for e in negExprs:
+        if not started:
+          indexExpr = 0 - e
+          started = true
+        else:
+          indexExpr = indexExpr - e
+      # Add constant offset: len(neg)
+      if negExprs.len > 0:
+        indexExpr = indexExpr + negExprs.len
+
+    # Array: [0, 1, 1, ..., 1] of length N+M+1
+    # index 0 means all pos are 0 and all neg are 1 → clause false → r=0
+    # any other index → clause true → r=1
+    var arrayElems: seq[ArrayElement[int]]
+    arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+    for i in 1..n:
+      arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+    let binding = ChannelBinding[int](
+      channelPosition: rPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(rPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
+                          tr.boolClauseReifChannelDefs.len
   if totalReifChannels > 0:
     stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
@@ -1988,6 +2126,42 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
       let bName = con.args[0].ident
       if bName notin result: continue
       result[iName] = result[bName]
+      changed = true
+    # Evaluate bool_clause_reif channels
+    for ci in tr.boolClauseReifChannelDefs:
+      let con = tr.model.constraints[ci]
+      if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+      let resultVar = con.args[2].ident
+      if resultVar in result: continue
+      let posElems = tr.resolveVarArrayElems(con.args[0])
+      let negElems = tr.resolveVarArrayElems(con.args[1])
+      var allResolved = true
+      var clauseTrue = false
+      for elem in posElems:
+        if elem.kind == FznIdent:
+          if elem.ident in result:
+            if result[elem.ident] >= 1: clauseTrue = true
+          else:
+            allResolved = false
+            break
+        elif elem.kind == FznIntLit:
+          if elem.intVal >= 1: clauseTrue = true
+        elif elem.kind == FznBoolLit:
+          if elem.boolVal: clauseTrue = true
+      if allResolved and not clauseTrue:
+        for elem in negElems:
+          if elem.kind == FznIdent:
+            if elem.ident in result:
+              if result[elem.ident] == 0: clauseTrue = true
+            else:
+              allResolved = false
+              break
+          elif elem.kind == FznIntLit:
+            if elem.intVal == 0: clauseTrue = true
+          elif elem.kind == FznBoolLit:
+            if not elem.boolVal: clauseTrue = true
+      if not allResolved: continue
+      result[resultVar] = if clauseTrue: 1 else: 0
       changed = true
     # Evaluate int_lin_eq with defines_var (for compound index expressions)
     for ci, con in tr.model.constraints:
