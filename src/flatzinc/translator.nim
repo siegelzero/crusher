@@ -106,6 +106,8 @@ type
     boolClauseReifChannelDefs*: seq[int]
     # set_in_reif with defines_var → channel variables
     setInReifChannelDefs*: seq[int]
+    # array_bool_and/array_bool_or with defines_var → channel variables
+    boolAndOrChannelDefs*: seq[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -833,6 +835,42 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       let arrayExprs = tr.resolveExprArray(con.args[1])
       tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
 
+  of "array_var_bool_element", "array_var_bool_element_nonshifted":
+    # Same as array_var_int_element but with booleans (bools are 0/1 ints)
+    let indexExpr = tr.resolveExprArg(con.args[0])
+    let valueExpr = tr.resolveExprArg(con.args[2])
+    let adjustedIndex = indexExpr - 1
+
+    var emitted = false
+    if adjustedIndex.node.kind == RefNode and valueExpr.node.kind == RefNode and
+       tr.matrixInfos.len > 0:
+        let inlineElems = tr.resolveMixedArray(con.args[1])
+        let indexPos = adjustedIndex.node.position
+        let valuePos = valueExpr.node.position
+        for name, minfo in tr.matrixInfos:
+            let rowIdx = tr.matchMatrixRow(inlineElems, minfo)
+            if rowIdx >= 0:
+                tr.sys.addConstraint(stateful.matrixElement[int](
+                    minfo.elements, minfo.numRows, minfo.numCols,
+                    rowIdx, indexPos, valuePos))
+                emitted = true
+                break
+            let colIdx = tr.matchMatrixCol(inlineElems, minfo)
+            if colIdx >= 0:
+                tr.sys.addConstraint(stateful.matrixElement[int](
+                    minfo.elements, minfo.numRows, minfo.numCols,
+                    indexPos, colIdx, valuePos, rowIsVariable = true))
+                emitted = true
+                break
+
+    if not emitted:
+        let arrayExprs = tr.resolveExprArray(con.args[1])
+        if adjustedIndex.node.kind == RefNode and valueExpr.node.kind == RefNode:
+            let mixedElems = tr.resolveMixedArray(con.args[1])
+            tr.sys.addConstraint(element(adjustedIndex, mixedElems, valueExpr))
+        else:
+            tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
+
   # ===== Array aggregate constraints =====
   of "array_int_maximum":
     # array_int_maximum(max_var, array)
@@ -1419,7 +1457,9 @@ proc collectDefinedVars(tr: var FznTranslator) =
   for ci, con in tr.model.constraints:
     let name = stripSolverPrefix(con.name)
     if name in ["array_var_int_element", "array_var_int_element_nonshifted",
-                "array_int_element", "array_int_element_nonshifted"] and
+                "array_int_element", "array_int_element_nonshifted",
+                "array_var_bool_element", "array_var_bool_element_nonshifted",
+                "array_bool_element"] and
        con.hasAnnotation("defines_var"):
       # Extract the defined variable name from the 3rd argument
       if con.args[2].kind == FznIdent:
@@ -1894,9 +1934,42 @@ proc detectReifChannels(tr: var FznTranslator) =
     tr.definingConstraints.incl(ci)
     tr.setInReifChannelDefs.add(ci)
 
+  # Fifth pass: find array_bool_and/array_bool_or with defines_var
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "array_bool_and" and name != "array_bool_or":
+      continue
+    if not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 2 or con.args[1].kind != FznIdent:
+      continue
+    let rName = con.args[1].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != rName:
+      continue
+    if rName in tr.definedVarNames or rName in tr.channelVarNames:
+      continue
+    # Verify all inputs are positioned variables (not defined vars)
+    let inputElems = tr.resolveVarArrayElems(con.args[0])
+    if inputElems.len == 0:
+      continue
+    var allValid = true
+    for elem in inputElems:
+      if elem.kind != FznIdent or elem.ident in tr.definedVarNames:
+        allValid = false
+        break
+    if not allValid:
+      continue
+    tr.channelVarNames.incl(rName)
+    tr.definingConstraints.incl(ci)
+    tr.boolAndOrChannelDefs.add(ci)
+
   if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or
-     tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif")
+     tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
+     tr.boolAndOrChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -2147,6 +2220,68 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                           tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len
   if totalReifChannels > 0:
     stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
+                     &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings for array_bool_and/array_bool_or with defines_var.
+  ## array_bool_and([a,b,...], r): r = (a AND b AND ...) = element(a+b+..., [0,..,0,1])
+  ## array_bool_or([a,b,...], r):  r = (a OR b OR ...) = element(a+b+..., [0,1,..,1])
+  for ci in tr.boolAndOrChannelDefs:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    let isAnd = (name == "array_bool_and")
+    let rName = con.args[1].ident
+    if rName notin tr.varPositions:
+      continue
+    let rPos = tr.varPositions[rName]
+
+    # Build index expression: sum of input expressions
+    let inputExprs = tr.resolveExprArray(con.args[0])
+    let n = inputExprs.len
+
+    var indexExpr: AlgebraicExpression[int]
+    if n == 0:
+      indexExpr = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: 0),
+        linear = true
+      )
+    else:
+      indexExpr = inputExprs[0]
+      for i in 1..<n:
+        indexExpr = indexExpr + inputExprs[i]
+
+    # Build lookup array of length n+1
+    var arrayElems: seq[ArrayElement[int]]
+    if isAnd:
+      # AND: only all-true (index n) maps to 1
+      for i in 0..<n:
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+      arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+    else:
+      # OR: only all-false (index 0) maps to 0
+      arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+      for i in 1..n:
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+    let binding = ChannelBinding[int](
+      channelPosition: rPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(rPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  if tr.boolAndOrChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Built {tr.boolAndOrChannelDefs.len} array_bool_and/or channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
@@ -3328,10 +3463,11 @@ proc buildChannelBindings(tr: var FznTranslator) =
 
     # Build the array elements
     var arrayElems: seq[ArrayElement[int]]
-    if name in ["array_var_int_element", "array_var_int_element_nonshifted"]:
+    if name in ["array_var_int_element", "array_var_int_element_nonshifted",
+                "array_var_bool_element", "array_var_bool_element_nonshifted"]:
       arrayElems = tr.resolveMixedArray(con.args[1])
     else:
-      # array_int_element: constant array
+      # array_int_element / array_bool_element: constant array
       let constArray = tr.resolveIntArray(con.args[1])
       for v in constArray:
         arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
@@ -3464,7 +3600,8 @@ proc detectInversePatterns(tr: var FznTranslator) =
     if ci in tr.definingConstraints:
       continue
     let name = stripSolverPrefix(con.name)
-    if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
+    if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
+                   "array_var_bool_element", "array_var_bool_element_nonshifted"]:
       continue
     if con.hasAnnotation("defines_var"):
       continue
@@ -4192,6 +4329,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildChannelBindings()
   # Build channel bindings for int_eq_reif/bool2int reification channels
   result.buildReifChannelBindings()
+  # Build channel bindings for array_bool_and/or with defines_var
+  result.buildBoolLogicChannelBindings()
   # Build channel bindings for one-hot indicator variables
   result.buildOneHotChannelBindings()
   # Build channel bindings for array_int_minimum/maximum defines_var
