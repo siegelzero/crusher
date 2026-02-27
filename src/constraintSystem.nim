@@ -588,34 +588,7 @@ proc deepCopy*[T](system: ConstraintSystem[T]): ConstraintSystem[T] =
     # Deep copy the base array with all its constraints
     result.baseArray = system.baseArray.deepCopy()
 
-    # Deep copy the variable containers (they reference the constraint system)
-    result.variables = newSeq[VariableContainer[T]](system.variables.len)
-    for i, variable in system.variables:
-        # Type-safe deep copy of variable containers
-        if variable of ConstrainedVariable[T]:
-            let var_var = ConstrainedVariable[T](variable)
-            result.variables[i] = ConstrainedVariable[T](
-                system: result,
-                offset: var_var.offset,
-                size: var_var.size
-            )
-        elif variable of ConstrainedSequence[T]:
-            let seq_var = ConstrainedSequence[T](variable)
-            result.variables[i] = ConstrainedSequence[T](
-                system: result,
-                offset: seq_var.offset,
-                size: seq_var.size,
-                n: seq_var.n
-            )
-        elif variable of ConstrainedMatrix[T]:
-            let matrix_var = ConstrainedMatrix[T](variable)
-            result.variables[i] = ConstrainedMatrix[T](
-                system: result,
-                offset: matrix_var.offset,
-                size: matrix_var.size,
-                m: matrix_var.m,
-                n: matrix_var.n
-            )
-        else:
-            # This should never happen with the current type hierarchy
-            raise newException(ValueError, "Unknown VariableContainer subtype encountered during deepCopy: " & $variable.type)
+    # Skip variable containers: they create a reference cycle
+    # (VariableContainer.system → ConstraintSystem → variables → VariableContainer)
+    # that leaks under ARC. Variables are only used during model construction,
+    # not during solving, so the deep copy doesn't need them.

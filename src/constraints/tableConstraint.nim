@@ -42,6 +42,8 @@ type
         zeroCount*: int
         # Positions affected by the last updatePosition call
         lastAffectedPositions*: PackedSet[int]
+        # When true, GAC domain reduction applies even for small tables
+        gacSafe*: bool
 
 ################################################################################
 # Constructor

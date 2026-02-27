@@ -22,10 +22,13 @@ var gTranslator: ptr FznTranslator = nil
 var gHasSolution: ptr bool = nil
 
 proc sigTermHandler(sig: cint) {.noconv.} =
-  if gSavedFd >= 0 and gTranslator != nil and gHasSolution != nil and gHasSolution[]:
-    flushFile(stdout)
+  flushFile(stdout)
+  if gSavedFd >= 0:
     discard dup2(gSavedFd, stdout.getFileHandle())
+  if gTranslator != nil and gHasSolution != nil and gHasSolution[]:
     gTranslator[].printSolution()
+  else:
+    printUnknown()
   quit(0)
 
 proc redirectStdoutToStderr() =

@@ -615,10 +615,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     discard (nSkipped, nNormal, maxDomainSize)  # used only for debug logging
 
     # First examine any single-variable constraints to reduce domains
+    var totalRemoved: int
     for cons in carray.constraints:
         if cons.positions.len != 1:
             continue
         let pos = toSeq(cons.positions)[0]
+        if pos in skippedPositions:
+            continue
         # Create a temporary assignment for testing this constraint
         var tempAssignment = newSeq[T](carray.len)
         # Initialize with first values from domains (doesn't matter, we only care about position pos)
@@ -635,9 +638,12 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 of AlgebraicType:
                     tempPenalty = penalty(cons.algebraicState.constraint, tempAssignment)
                 of RelationalType:
-                    # RelationalConstraint needs to be evaluated differently
-                    # Skip for now - these are typically multi-variable anyway
-                    continue
+                    let rc = cons.relationalState
+                    rc.leftExpr.initialize(tempAssignment)
+                    rc.rightExpr.initialize(tempAssignment)
+                    let lv = rc.leftExpr.getValue()
+                    let rv = rc.rightExpr.getValue()
+                    tempPenalty = rc.computeCost(lv, rv)
                 of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, MatrixElementType:
                     # Skip these constraint types for domain reduction
                     continue
@@ -645,6 +651,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if tempPenalty > 0:
                 currentDomain[pos].excl(d)
                 removed += 1
+        totalRemoved += removed
+    if totalRemoved > 0:
+        stderr.writeLine(&"[Solve] Single-var constraint reduction: {totalRemoved} values removed")
 
     # Cumulative constraint domain reduction
     for cons in carray.constraints:
@@ -1865,7 +1874,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             # Only apply AC to large tables (e.g., transition tables with full graph
             # adjacency). Small tables from implications may be partial — they encode
             # one-directional constraints where not all valid combinations are listed.
-            if tbl.tuples.len < MinTransitionTableSize:
+            if tbl.tuples.len < MinTransitionTableSize and not tbl.gacSafe:
                 continue
             let nCols = tbl.sortedPositions.len
             for col in 0..<nCols:

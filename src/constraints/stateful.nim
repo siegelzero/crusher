@@ -1557,14 +1557,16 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 )
             )
         of TableConstraintType:
+            let tblCopy = newTableConstraint[T](
+                constraint.tableConstraintState.sortedPositions,
+                constraint.tableConstraintState.tuples,
+                constraint.tableConstraintState.mode
+            )
+            tblCopy.gacSafe = constraint.tableConstraintState.gacSafe
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: TableConstraintType,
-                tableConstraintState: newTableConstraint[T](
-                    constraint.tableConstraintState.sortedPositions,
-                    constraint.tableConstraintState.tuples,
-                    constraint.tableConstraintState.mode
-                )
+                tableConstraintState: tblCopy
             )
         of RegularType:
             result = StatefulConstraint[T](
@@ -1901,6 +1903,17 @@ func lexLe*[T](leftExprs, rightExprs: seq[AlgebraicExpression[T]]): StatefulCons
 func tableIn*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
     ## Creates a table-in constraint: variable tuple must match one of the allowed tuples.
     let constraint = newTableConstraint[T](positions, tuples, TableIn)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: TableConstraintType,
+        tableConstraintState: constraint
+    )
+
+func tableInGacSafe*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-in constraint marked safe for GAC domain reduction.
+    ## Small tables with this flag bypass the MinTransitionTableSize threshold.
+    let constraint = newTableConstraint[T](positions, tuples, TableIn)
+    constraint.gacSafe = true
     return StatefulConstraint[T](
         positions: constraint.positions,
         stateType: TableConstraintType,

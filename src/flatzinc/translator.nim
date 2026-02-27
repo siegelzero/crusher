@@ -104,6 +104,8 @@ type
     caseAnalysisDefs*: seq[CaseAnalysisDef]
     # bool_clause_reif with defines_var → channel variables
     boolClauseReifChannelDefs*: seq[int]
+    # set_in_reif with defines_var → channel variables
+    setInReifChannelDefs*: seq[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -1858,8 +1860,43 @@ proc detectReifChannels(tr: var FznTranslator) =
     tr.definingConstraints.incl(ci)
     tr.boolClauseReifChannelDefs.add(ci)
 
-  if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or tr.boolClauseReifChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif")
+  # Fourth pass: find set_in_reif with defines_var
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "set_in_reif" or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent:
+      continue
+
+    let bName = con.args[2].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName:
+      continue
+
+    if bName in tr.definedVarNames or bName in tr.channelVarNames:
+      continue
+
+    # args[0] must be a positioned variable
+    let xArg = con.args[0]
+    if xArg.kind != FznIdent:
+      continue
+    if xArg.ident in tr.definedVarNames:
+      continue
+
+    # args[1] must be a set literal or range
+    let setArg = con.args[1]
+    if setArg.kind != FznSetLit and setArg.kind != FznRange:
+      continue
+
+    tr.channelVarNames.incl(bName)
+    tr.definingConstraints.incl(ci)
+    tr.setInReifChannelDefs.add(ci)
+
+  if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or
+     tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -2054,8 +2091,60 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
+  # Process set_in_reif channels
+  for ci in tr.setInReifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let bName = con.args[2].ident
+    if bName notin tr.varPositions:
+      continue
+
+    let bPos = tr.varPositions[bName]
+    let xArg = con.args[0]
+    let setArg = con.args[1]
+
+    # Build the set of values for membership test
+    var setValues: seq[int]
+    case setArg.kind
+    of FznRange:
+      for v in setArg.lo..setArg.hi:
+        setValues.add(v)
+    of FznSetLit:
+      setValues = setArg.setElems
+    else:
+      continue
+
+    let setAsHashSet = toHashSet(setValues)
+
+    let xExpr = tr.resolveExprArg(xArg)
+    let domain = tr.lookupVarDomain(xArg.ident)
+    if domain.len == 0:
+      continue
+    let lo = domain[0]  # domain is sorted
+
+    # b = element(x - lo, [1 if v in S else 0 for v in domain])
+    let indexExpr = xExpr - lo
+    var arrayElems: seq[ArrayElement[int]]
+    for v in domain:
+      arrayElems.add(ArrayElement[int](isConstant: true,
+          constantValue: if v in setAsHashSet: 1 else: 0))
+
+    let binding = ChannelBinding[int](
+      channelPosition: bPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(bPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
   let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
-                          tr.boolClauseReifChannelDefs.len
+                          tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len
   if totalReifChannels > 0:
     stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
@@ -2176,6 +2265,29 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
               break
       if not clauseTrue and not allResolved: continue
       result[resultVar] = if clauseTrue: 1 else: 0
+      changed = true
+    # Evaluate set_in_reif channels
+    for ci in tr.setInReifChannelDefs:
+      let con = tr.model.constraints[ci]
+      if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+      let resultVar = con.args[2].ident
+      if resultVar in result: continue
+      var xVal: int
+      case con.args[0].kind
+      of FznIdent:
+        if con.args[0].ident in result: xVal = result[con.args[0].ident]
+        else: continue
+      of FznIntLit: xVal = con.args[0].intVal
+      else: continue
+      let setArg = con.args[1]
+      var inSet = false
+      case setArg.kind
+      of FznRange:
+        inSet = xVal >= setArg.lo and xVal <= setArg.hi
+      of FznSetLit:
+        inSet = xVal in setArg.setElems
+      else: continue
+      result[resultVar] = if inSet: 1 else: 0
       changed = true
     # Evaluate int_lin_eq with defines_var (for compound index expressions)
     for ci, con in tr.model.constraints:
@@ -3812,7 +3924,7 @@ proc translate*(model: FznModel): FznTranslator =
     if condHasPos and targetHasPos:
       let condPos = result.varPositions[tbl.condVar]
       let targetPos = result.varPositions[tbl.targetVar]
-      result.sys.addConstraint(tableIn[int](@[condPos, targetPos], tbl.tuples))
+      result.sys.addConstraint(tableInGacSafe[int](@[condPos, targetPos], tbl.tuples))
     elif not condHasPos and targetHasPos:
       # condVar was eliminated — check if it's a constant
       if tbl.condVar in result.definedVarExprs:
