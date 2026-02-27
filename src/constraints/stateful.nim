@@ -1200,19 +1200,22 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             positions: constraint.positions,
                             stateType: ElementType,
                             elementState: newElementStateExprBasedConst[T](
-                                constraint.elementState.indexExpression,
+                                constraint.elementState.indexExpression.deepCopy(),
                                 constraint.elementState.constantArrayEB,
-                                constraint.elementState.valueExpression
+                                constraint.elementState.valueExpression.deepCopy()
                             )
                         )
                     else:
+                        var copiedArrayExprs = newSeq[AlgebraicExpression[T]](constraint.elementState.arrayExpressionsEB.len)
+                        for i, expr in constraint.elementState.arrayExpressionsEB:
+                            copiedArrayExprs[i] = expr.deepCopy()
                         result = StatefulConstraint[T](
                             positions: constraint.positions,
                             stateType: ElementType,
                             elementState: newElementStateExprBased[T](
-                                constraint.elementState.indexExpression,
-                                constraint.elementState.arrayExpressionsEB,
-                                constraint.elementState.valueExpression
+                                constraint.elementState.indexExpression.deepCopy(),
+                                copiedArrayExprs,
+                                constraint.elementState.valueExpression.deepCopy()
                             )
                         )
         of AlgebraicType:
@@ -1225,7 +1228,15 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 )
             )
         of RelationalType:
-            # Create deep copy preserving all runtime state including expression state
+            # Create deep copy preserving all runtime state including expression state.
+            # Deep copy ExpressionNode refs in leftTerms/rightTerms to avoid shared refs
+            # with the original (ARC refcount races under concurrent access).
+            var copiedLeftTerms = newSeq[ExprTerm[T]](constraint.relationalState.leftTerms.len)
+            for i, term in constraint.relationalState.leftTerms:
+                copiedLeftTerms[i] = ExprTerm[T](node: term.node.deepCopy(), positions: term.positions)
+            var copiedRightTerms = newSeq[ExprTerm[T]](constraint.relationalState.rightTerms.len)
+            for i, term in constraint.relationalState.rightTerms:
+                copiedRightTerms[i] = ExprTerm[T](node: term.node.deepCopy(), positions: term.positions)
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: RelationalType,
@@ -1241,8 +1252,8 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                     lastOldLeftValue: constraint.relationalState.lastOldLeftValue,
                     lastOldRightValue: constraint.relationalState.lastOldRightValue,
                     maxNetDelta: constraint.relationalState.maxNetDelta,
-                    leftTerms: constraint.relationalState.leftTerms,
-                    rightTerms: constraint.relationalState.rightTerms,
+                    leftTerms: copiedLeftTerms,
+                    rightTerms: copiedRightTerms,
                     leftVaryingIdx: constraint.relationalState.leftVaryingIdx,
                     leftConstantIdx: constraint.relationalState.leftConstantIdx,
                     rightVaryingIdx: constraint.relationalState.rightVaryingIdx,

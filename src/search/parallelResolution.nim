@@ -17,6 +17,7 @@ type
         lastImprovement*: int  # Iteration of last bestCost improvement
         startTime*: float
         endTime*: float
+        taskIndex*: int  # Index into carrays for eager slot freeing
 
     # Iterator-based approach types
     StatePool*[T] = object
@@ -164,6 +165,19 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 )
                 createThread(workers[i], iterativeWorker[T], workerData[i])
 
+            # Ensure threads are joined even if caller returns during a yield
+            var threadsJoined = false
+            defer:
+                if not threadsJoined:
+                    if not pool.solutionFound.load():
+                        pool.solutionFound.store(true)
+                    for i in 0..<actualWorkers:
+                        joinThread(workers[i])
+                    threadsJoined = true
+                deinitLock(pool.resultsLock)
+                for i in 0..<workerData.len:
+                    workerData[i].pool = nil
+
             # Monitor and yield results as they become available
             var yieldedResults = 0
             var lastResultCount = 0
@@ -200,11 +214,10 @@ iterator improveStates*[T](population: seq[TabuState[T]],
             if not pool.solutionFound.load():
                 pool.solutionFound.store(true)
 
-            # Wait for workers to complete
             for i in 0..<actualWorkers:
                 joinThread(workers[i])
+            threadsJoined = true
 
-            # Small delay to ensure all worker cleanup is complete
             sleep(10)
 
             # Yield any remaining results after all workers are done
@@ -214,15 +227,8 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                         yield pool.results[i]
                         inc yieldedResults
 
-            # Clear the results array to prevent memory issues
             withLock pool.resultsLock:
                 pool.results.setLen(0)
-
-            deinitLock(pool.resultsLock)
-
-            # Additional cleanup - ensure all worker data is cleared
-            for i in 0..<workerData.len:
-                workerData[i].pool = nil
 
 # Combined init+improve work-stealing pool — no batch boundaries.
 # Workers grab a task, create TabuState from pre-deepCopied array + assignment,
@@ -276,7 +282,8 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
                 iterations: improved.iteration,
                 lastImprovement: improved.lastImprovementIter,
                 startTime: startTime,
-                endTime: endTime
+                endTime: endTime,
+                taskIndex: idx
             )
 
             if result.found:
@@ -327,12 +334,14 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
         else:
             # Lazy creation: allocate the array but only create copies incrementally
             # to bound peak memory to ~workerCount*2 copies instead of all at once.
-            # Workers wait for their slot via createdUpTo atomic and free it after use.
+            # Workers wait for their slot via createdUpTo atomic.
             var carrays = newSeq[ConstrainedArray[T]](assignments.len)
+            # Use a single template array for all copies (avoids full system.deepCopy overhead)
+            var templateArray = system.baseArray.deepCopy()
             let bufferAhead = actualWorkers * 2
             let initialBatch = min(bufferAhead, assignments.len)
             for i in 0..<initialBatch:
-                carrays[i] = system.deepCopy().baseArray
+                carrays[i] = templateArray.deepCopy()
             var createdSoFar = initialBatch
 
             # Set up work-stealing pool
@@ -346,7 +355,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 results: newSeq[BatchResult[T]]()
             )
             pool.nextTaskIndex.store(0)
-            pool.createdUpTo.store(initialBatch)
+            pool.createdUpTo.store(createdSoFar)
             pool.solutionFound.store(false)
             initLock(pool.resultsLock)
 
@@ -358,6 +367,19 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 workerDatas[i] = AssignmentWorkerData[T](workerId: i, pool: addr pool)
                 createThread(workers[i], assignmentWorker[T], workerDatas[i])
 
+            # Ensure threads are joined even if caller returns during a yield
+            var threadsJoined = false
+            defer:
+                if not threadsJoined:
+                    if not pool.solutionFound.load():
+                        pool.solutionFound.store(true)
+                    for i in 0..<workerCount:
+                        joinThread(workers[i])
+                    threadsJoined = true
+                deinitLock(pool.resultsLock)
+                for i in 0..<workerDatas.len:
+                    workerDatas[i].pool = nil
+
             # Monitor and yield results as they become available
             var yieldedResults = 0
             var lastResultCount = 0
@@ -367,7 +389,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 let nextTask = pool.nextTaskIndex.load()
                 let target = min(nextTask + bufferAhead, assignments.len)
                 while createdSoFar < target and not pool.solutionFound.load():
-                    carrays[createdSoFar] = system.deepCopy().baseArray
+                    carrays[createdSoFar] = templateArray.deepCopy()
                     createdSoFar += 1
                     pool.createdUpTo.store(createdSoFar)
 
@@ -378,6 +400,8 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 for i in lastResultCount..<currentResults.len:
                     let result = currentResults[i]
                     yield result
+                    # Free the carray slot — worker already copied it into TabuState
+                    reset(carrays[result.taskIndex])
                     inc yieldedResults
                     if result.found:
                         pool.solutionFound.store(true)
@@ -399,6 +423,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
 
             for i in 0..<workerCount:
                 joinThread(workers[i])
+            threadsJoined = true
 
             sleep(10)
 
@@ -407,14 +432,11 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 for i in lastResultCount..<pool.results.len:
                     if yieldedResults < assignments.len:
                         yield pool.results[i]
+                        reset(carrays[pool.results[i].taskIndex])
                         inc yieldedResults
 
             withLock pool.resultsLock:
                 pool.results.setLen(0)
-            deinitLock(pool.resultsLock)
-
-            for i in 0..<workerDatas.len:
-                workerDatas[i].pool = nil
 
 proc parallelResolve*[T](system: ConstraintSystem[T],
                         populationSize: int = 16,
@@ -441,9 +463,10 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Create population: deepCopy sequentially (safe), init in parallel (fast)
     let populationStartTime = epochTime()
     var population = newSeq[TabuState[T]](populationSize)
+    var templateArray = system.baseArray.deepCopy()
     var carrays = newSeq[ConstrainedArray[T]](populationSize)
     for i in 0..<populationSize:
-        carrays[i] = system.deepCopy().baseArray
+        carrays[i] = templateArray.deepCopy()
 
     # Initialize TabuStates in parallel using work-stealing pool.
     # Workers grab the next state to init via atomic counter — no batch boundaries.
@@ -464,6 +487,9 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         initWorkerDatas[i] = InitWorkerData[T](workerId: i, pool: addr initPool)
         createThread(initThreads[i], initPoolWorker[T], initWorkerDatas[i])
     joinThreads(initThreads)
+
+    # Free carrays — consumed by initPoolWorker to create TabuStates
+    carrays.setLen(0)
 
     # Check for failed initializations (nil states from worker exceptions)
     var failedStates: seq[int]

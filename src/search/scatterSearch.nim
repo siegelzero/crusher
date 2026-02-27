@@ -107,10 +107,11 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
     let popStart = currentTime()
 
     # Create population of random TabuStates
+    var popTemplate = system.baseArray.deepCopy()
     var population = newSeq[TabuState[T]](createSize)
     for i in 0..<createSize:
-        let systemCopy = system.deepCopy()
-        population[i] = newTabuState[T](systemCopy.baseArray, verbose = false, id = i)
+        let arr = popTemplate.deepCopy()
+        population[i] = newTabuState[T](arr, verbose = false, id = i)
 
     if verbose:
         echo &"[Scatter] Created {createSize} states in {currentTime() - popStart:.2f}s"
@@ -183,6 +184,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
         var pairCount = 0
         var totalDiffPositions = 0
 
+        var relinkTemplate = system.baseArray.deepCopy()
         for (i, j) in pool.pairs():
             pairCount += 1
             let entryA = pool.entries[i]
@@ -193,15 +195,15 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
 
             # A -> B
             block:
-                let systemCopy = system.deepCopy()
-                var relinkState = newTabuState[T](systemCopy.baseArray, entryA.assignment, verbose = false)
+                var relinkArray = relinkTemplate.deepCopy()
+                var relinkState = newTabuState[T](relinkArray, entryA.assignment, verbose = false)
                 let pathEntries = relinkPath(relinkState, entryB.assignment)
                 allPathEntries.add(pathEntries)
 
             # B -> A
             block:
-                let systemCopy = system.deepCopy()
-                var relinkState = newTabuState[T](systemCopy.baseArray, entryB.assignment, verbose = false)
+                var relinkArray = relinkTemplate.deepCopy()
+                var relinkState = newTabuState[T](relinkArray, entryB.assignment, verbose = false)
                 let pathEntries = relinkPath(relinkState, entryA.assignment)
                 allPathEntries.add(pathEntries)
 
@@ -217,8 +219,15 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 let p75 = pathCosts[pathCosts.len * 3 div 4]
                 echo &"[Scatter] Path entry costs: min={pathCosts[0]} p25={p25} p50={p50} p75={p75} max={pathCosts[^1]}"
 
-        # Select promising entries: best K by cost, where K scales with pool size
-        let maxPromising = min(max(poolSize, allPathEntries.len div 4), 100)
+        # Select promising entries: best K by cost, scaled by estimated state memory
+        var totalDomainValues = 0
+        if system.baseArray.reducedDomain.len > 0:
+            for rd in system.baseArray.reducedDomain:
+                totalDomainValues += rd.len
+        # Rough estimate: penalty maps + constraint overhead ≈ 16 bytes per domain value
+        let estimatedStateMB = totalDomainValues * 16 div 1_000_000
+        let memoryBudgetStates = max(10, min(100, 2000 div max(1, estimatedStateMB)))
+        let maxPromising = min(memoryBudgetStates, max(poolSize, allPathEntries.len div 4))
         allPathEntries.sort(proc(a, b: PathEntry[T]): int = cmp(a.cost, b.cost))
         var promising: seq[PathEntry[T]] = @[]
         for pe in allPathEntries:
@@ -294,10 +303,11 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[Scatter] Diversifying with {diversifyCount} fresh states"
 
+        var freshTemplate = system.baseArray.deepCopy()
         var freshPop = newSeq[TabuState[T]](diversifyCount)
         for i in 0..<diversifyCount:
-            let sc = system.deepCopy()
-            freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
+            let arr = freshTemplate.deepCopy()
+            freshPop[i] = newTabuState[T](arr, verbose = false, id = i)
 
         for batchResult in improveStates(freshPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
@@ -320,10 +330,11 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[Scatter] Intensifying pool"
 
+        var intensifyTemplate = system.baseArray.deepCopy()
         var intensifyPop = newSeq[TabuState[T]](pool.entries.len)
         for i in 0..<pool.entries.len:
-            let sc = system.deepCopy()
-            intensifyPop[i] = newTabuState[T](sc.baseArray, pool.entries[i].assignment, verbose = false, id = i)
+            let arr = intensifyTemplate.deepCopy()
+            intensifyPop[i] = newTabuState[T](arr, pool.entries[i].assignment, verbose = false, id = i)
 
         var newEntries: seq[PoolEntry[T]] = @[]
         for batchResult in improveStates(intensifyPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
@@ -508,10 +519,11 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
         if verbose:
             echo &"[LNS] Diversifying with {diversifyCount} fresh states"
 
+        var lnsFreshTemplate = system.baseArray.deepCopy()
         var freshPop = newSeq[TabuState[T]](diversifyCount)
         for i in 0..<diversifyCount:
-            let sc = system.deepCopy()
-            freshPop[i] = newTabuState[T](sc.baseArray, verbose = false, id = i)
+            let arr = lnsFreshTemplate.deepCopy()
+            freshPop[i] = newTabuState[T](arr, verbose = false, id = i)
 
         for batchResult in improveStates(freshPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
             if batchResult.found:
