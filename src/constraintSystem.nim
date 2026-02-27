@@ -15,7 +15,8 @@ type
     InfeasibleError* = object of NoSolutionFoundError  ## Domain reduction proved infeasibility — retrying won't help
     TimeLimitExceededError* = object of CatchableError
     VariableContainer[T] = ref object of RootObj
-        system: ConstraintSystem[T]
+        systemPtr: pointer  # Raw (untracked) back-reference to ConstraintSystem[T].
+                            # Breaking the ref cycle so both ARC and ORC can free copies.
         offset: int
         size: int
 
@@ -57,8 +58,11 @@ func initConstraintSystem*[T](): ConstraintSystem[T] =
 # Constrained Variable creation
 ################################################################################
 
+func system[T](cvar: VariableContainer[T]): ConstraintSystem[T] {.inline.} =
+    cast[ConstraintSystem[T]](cvar.systemPtr)
+
 func init*[T](cvar: VariableContainer[T], system: ConstraintSystem[T]) =
-    cvar.system = system
+    cvar.systemPtr = cast[pointer](system)
     cvar.offset = system.baseArray.len
 
 func init*[T](cvar: ConstrainedVariable[T], system: ConstraintSystem[T]) =
@@ -588,7 +592,5 @@ proc deepCopy*[T](system: ConstraintSystem[T]): ConstraintSystem[T] =
     # Deep copy the base array with all its constraints
     result.baseArray = system.baseArray.deepCopy()
 
-    # Skip variable containers: they create a reference cycle
-    # (VariableContainer.system → ConstraintSystem → variables → VariableContainer)
-    # that leaks under ARC. Variables are only used during model construction,
+    # Skip variable containers — they are only used during model construction,
     # not during solving, so the deep copy doesn't need them.

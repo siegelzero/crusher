@@ -232,6 +232,7 @@ type
         carrays*: ptr UncheckedArray[ConstrainedArray[T]]
         assignments*: ptr UncheckedArray[seq[T]]
         nextTaskIndex*: Atomic[int]
+        createdUpTo*: Atomic[int]  # How many carrays have been created (lazy creation)
         solutionFound*: Atomic[bool]
         totalTasks*: int
         tabuThreshold*: int
@@ -254,6 +255,11 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
                 break
             if pool.solutionFound.load():
                 break
+
+            # Wait for main thread to create this carray (lazy creation)
+            while pool.createdUpTo.load() <= idx:
+                if pool.solutionFound.load(): return
+                sleep(1)
 
             # Create TabuState from pre-deepCopied array + assignment, then improve
             let state = newTabuState[T](pool.carrays[idx], pool.assignments[idx],
@@ -319,10 +325,15 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 if result.found:
                     break
         else:
-            # Pre-deepCopy all arrays sequentially (ARC thread safety)
+            # Lazy creation: allocate the array but only create copies incrementally
+            # to bound peak memory to ~workerCount*2 copies instead of all at once.
+            # Workers wait for their slot via createdUpTo atomic and free it after use.
             var carrays = newSeq[ConstrainedArray[T]](assignments.len)
-            for i in 0..<assignments.len:
+            let bufferAhead = actualWorkers * 2
+            let initialBatch = min(bufferAhead, assignments.len)
+            for i in 0..<initialBatch:
                 carrays[i] = system.deepCopy().baseArray
+            var createdSoFar = initialBatch
 
             # Set up work-stealing pool
             var assignmentsCopy = assignments  # Local copy for addr stability
@@ -335,6 +346,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 results: newSeq[BatchResult[T]]()
             )
             pool.nextTaskIndex.store(0)
+            pool.createdUpTo.store(initialBatch)
             pool.solutionFound.store(false)
             initLock(pool.resultsLock)
 
@@ -351,6 +363,14 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
             var lastResultCount = 0
 
             while yieldedResults < assignments.len and not pool.solutionFound.load():
+                # Create more carrays ahead of workers (lazy, bounded buffer)
+                let nextTask = pool.nextTaskIndex.load()
+                let target = min(nextTask + bufferAhead, assignments.len)
+                while createdSoFar < target and not pool.solutionFound.load():
+                    carrays[createdSoFar] = system.deepCopy().baseArray
+                    createdSoFar += 1
+                    pool.createdUpTo.store(createdSoFar)
+
                 var currentResults: seq[BatchResult[T]]
                 withLock pool.resultsLock:
                     currentResults = pool.results
