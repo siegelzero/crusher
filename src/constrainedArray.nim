@@ -1583,12 +1583,19 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let valExprPositions = toSeq(elemState.valueExpression.positions.items)
                     let arrSize = elemState.getArraySize()
 
-                    # Only handle single-position expressions (most common case)
-                    if idxExprPositions.len == 1 and valExprPositions.len == 1:
+                    # Check no positions are skipped
+                    var anySkipped = false
+                    for p in idxExprPositions:
+                        if p in skippedPositions: anySkipped = true; break
+                    if not anySkipped:
+                        for p in valExprPositions:
+                            if p in skippedPositions: anySkipped = true; break
+
+                    if not anySkipped and idxExprPositions.len == 1 and valExprPositions.len == 1:
                         let idxPos = idxExprPositions[0]
                         let valPos = valExprPositions[0]
 
-                        if idxPos != valPos and idxPos notin skippedPositions and valPos notin skippedPositions:
+                        if idxPos != valPos:
                             var tempAssign = initTable[int, T]()
 
                             # Precompute reachable value expression results for backward pruning
@@ -1626,6 +1633,118 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 if exprVal notin reachableArrayValues:
                                     currentDomain[valPos].excl(w)
                                     outerChanged = true
+
+                    elif not anySkipped and idxExprPositions.len >= 1:
+                        # Multi-position index expression with constant array.
+                        # Enumerate Cartesian product of index position domains to find
+                        # reachable array values. Guard with product size threshold.
+                        let allIdxPositions = idxExprPositions
+                        let allValPositions = valExprPositions
+
+                        # Compute product sizes and check threshold
+                        const MaxProduct = 100_000
+                        var idxProduct = 1
+                        var idxOverflow = false
+                        for p in allIdxPositions:
+                            let sz = currentDomain[p].len
+                            if sz == 0:
+                                idxProduct = 0
+                                break
+                            if idxProduct > MaxProduct div sz:
+                                idxOverflow = true
+                                break
+                            idxProduct *= sz
+
+                        var valProduct = 1
+                        var valOverflow = false
+                        for p in allValPositions:
+                            let sz = currentDomain[p].len
+                            if sz == 0:
+                                valProduct = 0
+                                break
+                            if valProduct > MaxProduct div sz:
+                                valOverflow = true
+                                break
+                            valProduct *= sz
+
+                        if not idxOverflow and not valOverflow and idxProduct > 0 and valProduct > 0:
+                            var tempAssign = initTable[int, T]()
+
+                            # Forward pass: enumerate all index-expression combinations,
+                            # collect reachable array values
+                            var reachableArrayValues: PackedSet[T]
+
+                            proc enumerateIdx(depth: int) =
+                                if depth == allIdxPositions.len:
+                                    let idx = elemState.indexExpression.evaluate(tempAssign)
+                                    if idx >= 0 and idx < arrSize:
+                                        reachableArrayValues.incl(elemState.constantArrayEB[idx])
+                                    return
+                                let pos = allIdxPositions[depth]
+                                for v in currentDomain[pos].items:
+                                    tempAssign[pos] = v
+                                    enumerateIdx(depth + 1)
+
+                            enumerateIdx(0)
+
+                            # Compute reachable value-expression results
+                            var reachableExprValues: PackedSet[T]
+
+                            proc enumerateVal(depth: int) =
+                                if depth == allValPositions.len:
+                                    reachableExprValues.incl(elemState.valueExpression.evaluate(tempAssign))
+                                    return
+                                let pos = allValPositions[depth]
+                                for v in currentDomain[pos].items:
+                                    tempAssign[pos] = v
+                                    enumerateVal(depth + 1)
+
+                            enumerateVal(0)
+
+                            # Value pruning: remove value-expression results not reachable from index side
+                            # For each value position, check if removing a value eliminates all
+                            # value-expression results that are in reachableArrayValues
+                            if allValPositions.len == 1:
+                                let valPos = allValPositions[0]
+                                for w in toSeq(currentDomain[valPos].items):
+                                    tempAssign[valPos] = w
+                                    let exprVal = elemState.valueExpression.evaluate(tempAssign)
+                                    if exprVal notin reachableArrayValues:
+                                        currentDomain[valPos].excl(w)
+                                        outerChanged = true
+
+                            # Backward pass: prune each index position
+                            for ki in 0..<allIdxPositions.len:
+                                let pk = allIdxPositions[ki]
+                                # For each value in domain(pk), check if some assignment
+                                # to other index positions produces a valid index whose
+                                # array value is in reachableExprValues
+                                for vk in toSeq(currentDomain[pk].items):
+                                    tempAssign[pk] = vk
+                                    var reachable = false
+
+                                    proc enumerateOther(depth: int) =
+                                        if reachable:
+                                            return
+                                        if depth == allIdxPositions.len:
+                                            let idx = elemState.indexExpression.evaluate(tempAssign)
+                                            if idx >= 0 and idx < arrSize:
+                                                if elemState.constantArrayEB[idx] in reachableExprValues:
+                                                    reachable = true
+                                            return
+                                        if depth == ki:
+                                            enumerateOther(depth + 1)
+                                            return
+                                        let pos = allIdxPositions[depth]
+                                        for v in currentDomain[pos].items:
+                                            if reachable: return
+                                            tempAssign[pos] = v
+                                            enumerateOther(depth + 1)
+
+                                    enumerateOther(0)
+                                    if not reachable:
+                                        currentDomain[pk].excl(vk)
+                                        outerChanged = true
 
             elif cons.stateType == MatrixElementType:
                 let matState = cons.matrixElementState
