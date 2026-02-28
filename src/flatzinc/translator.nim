@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
 
 type
@@ -42,6 +42,22 @@ type
     lookupTable*: seq[int]           # flat constant lookup table
     domainOffsets*: seq[int]         # min value per source (for index computation)
     domainSizes*: seq[int]          # domain size per source (hi - lo + 1)
+
+  NoOverlapEndpoint* = object
+    ## An endpoint in a NoOverlap pattern — either a constant or a variable name
+    isFixed*: bool
+    fixedValue*: int
+    varName*: string
+
+  NoOverlapPattern* = object
+    ## A detected NoOverlap pattern: 6-literal bool_clause encoding 3D box non-overlap
+    nodeA*: array[3, NoOverlapEndpoint]
+    nodeB*: array[3, NoOverlapEndpoint]
+    radius*: int
+    boxLower*: array[3, int]
+    boxUpper*: array[3, int]
+    consumedConstraints*: seq[int]
+    consumedBoolVars*: seq[string]
 
   FznTranslator* = object
     sys*: ConstraintSystem[int]
@@ -88,6 +104,7 @@ type
     # Reification channel patterns: constraint index for int_eq_reif/bool2int with defines_var
     reifChannelDefs*: seq[int]      # int_eq_reif constraint indices (ordered first)
     bool2intChannelDefs*: seq[int]  # bool2int constraint indices (ordered after reif)
+    leReifChannelDefs*: seq[int]    # int_le_reif/int_lt_reif channel constraint indices
     # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
     implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
     # One-hot channel defs: indicator vars to convert to channels of integer vars
@@ -108,6 +125,8 @@ type
     setInReifChannelDefs*: seq[int]
     # array_bool_and/array_bool_or with defines_var → channel variables
     boolAndOrChannelDefs*: seq[int]
+    # Detected NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
+    noOverlapPatterns*: seq[NoOverlapPattern]
     # Tracks which output variables/arrays are boolean (for true/false formatting)
     outputBoolVars*: HashSet[string]
     outputBoolArrays*: HashSet[string]
@@ -1457,6 +1476,36 @@ proc collectDefinedVars(tr: var FznTranslator) =
           tr.definingConstraints.incl(ci)
           tr.minMaxChannelDefs.add((ci: ci, varName: definedName, isMin: isMin))
 
+  # Detect int_times(a, b, c) WITHOUT defines_var where c can be treated as defined.
+  # MiniZinc sometimes doesn't annotate cube variables (x^2 * x = x^3) with defines_var
+  # even though the result is fully determined. These can have enormous domains (54M+).
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_times": continue
+    if con.hasAnnotation("defines_var"): continue  # already handled above
+    if con.args.len < 3: continue
+    # int_times(a, b, c): c = a * b
+    let cArg = con.args[2]
+    if cArg.kind != FznIdent: continue
+    let cName = cArg.ident
+    if cName in definedVarNames or cName in tr.channelVarNames: continue
+    # Check that a and b are resolvable (constants, positioned vars, or defined vars)
+    var resolvable = true
+    for idx in 0..1:
+      let arg = con.args[idx]
+      if arg.kind == FznIdent:
+        let id = arg.ident
+        if id notin tr.paramValues and id notin definedVarNames and
+           id notin tr.channelVarNames:
+          # It's a free variable — that's ok, it will get a position
+          discard
+      elif arg.kind != FznIntLit:
+        resolvable = false
+    if resolvable:
+      definedVarNames[cName] = true
+      tr.definingConstraints.incl(ci)
+
   # Store the set of defined variable names for use in translateVariables
   for name in definedVarNames.keys:
     tr.definedVarNames.incl(name)
@@ -1486,6 +1535,23 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   ## Returns true if successful, false if a dependency is not yet available.
   let con = tr.model.constraints[ci]
   let name = stripSolverPrefix(con.name)
+
+  # Handle int_times without defines_var (detected by collectDefinedVars)
+  if name == "int_times" and not con.hasAnnotation("defines_var"):
+    if con.args.len < 3 or con.args[2].kind != FznIdent: return true
+    let definedName = con.args[2].ident
+    if definedName notin tr.definedVarNames: return true
+    if definedName in tr.definedVarExprs: return true
+    let a = con.args[0]
+    let b = con.args[1]
+    for operand in [a, b]:
+      if operand.kind == FznIdent and operand.ident in tr.definedVarNames and
+         operand.ident notin tr.definedVarExprs and operand.ident notin tr.varPositions and
+         operand.ident notin tr.paramValues:
+        return false  # dependency not yet built
+    tr.definedVarExprs[definedName] = tr.resolveExprArg(a) * tr.resolveExprArg(b)
+    return true
+
   # Only process defining constraints with defines_var
   if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times",
                   "array_int_minimum", "array_int_maximum"] or
@@ -1975,10 +2041,44 @@ proc detectReifChannels(tr: var FznTranslator) =
     tr.definingConstraints.incl(ci)
     tr.boolAndOrChannelDefs.add(ci)
 
+  # Sixth pass: find int_le_reif/int_lt_reif with defines_var
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if (name != "int_le_reif" and name != "int_lt_reif") or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent:
+      continue
+
+    let bName = con.args[2].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName:
+      continue
+
+    if bName in tr.definedVarNames or bName in tr.channelVarNames:
+      continue
+
+    # Check args[0] and args[1] — at least one must be a positioned variable
+    # (not a defined variable), the other can be a constant or positioned variable
+    let arg0 = con.args[0]
+    let arg1 = con.args[1]
+
+    # Check arg0: must be constant, channel var, or positioned variable (not defined var)
+    if arg0.kind == FznIdent and arg0.ident in tr.definedVarNames:
+      continue
+    # Check arg1: must be constant, channel var, or positioned variable (not defined var)
+    if arg1.kind == FznIdent and arg1.ident in tr.definedVarNames:
+      continue
+
+    tr.channelVarNames.incl(bName)
+    tr.definingConstraints.incl(ci)
+    tr.leReifChannelDefs.add(ci)
+
   if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or
      tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
-     tr.boolAndOrChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or")
+     tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -2225,8 +2325,93 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
+  # Process int_le_reif / int_lt_reif channels
+  for ci in tr.leReifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let bName = con.args[2].ident
+    if bName notin tr.varPositions:
+      continue
+    let bPos = tr.varPositions[bName]
+    let arg0 = con.args[0]
+    let arg1 = con.args[1]
+    let name = stripSolverPrefix(con.name)
+    let isLe = (name == "int_le_reif")  # le: <=, lt: <
+
+    var indexExpr: AlgebraicExpression[int]
+    var arrayElems: seq[ArrayElement[int]]
+
+    # Determine which arg is constant and which is variable
+    let arg0IsConst = arg0.kind == FznIntLit or (arg0.kind == FznIdent and arg0.ident in tr.paramValues)
+    let arg1IsConst = arg1.kind == FznIntLit or (arg1.kind == FznIdent and arg1.ident in tr.paramValues)
+
+    if arg0IsConst and not arg1IsConst:
+      # int_le_reif(const, x, b): b = (const <= x) for le, b = (const < x) for lt
+      let c = if arg0.kind == FznIntLit: arg0.intVal
+              else: tr.paramValues[arg0.ident]
+      let xExpr = tr.resolveExprArg(arg1)
+      let domain = tr.lookupVarDomain(arg1.ident)
+      if domain.len == 0: continue
+      let lo = domain[0]
+      indexExpr = xExpr - lo
+      for v in domain:
+        let cmp = if isLe: (c <= v) else: (c < v)
+        arrayElems.add(ArrayElement[int](isConstant: true,
+            constantValue: if cmp: 1 else: 0))
+
+    elif not arg0IsConst and arg1IsConst:
+      # int_le_reif(x, const, b): b = (x <= const) for le, b = (x < const) for lt
+      let c = if arg1.kind == FznIntLit: arg1.intVal
+              else: tr.paramValues[arg1.ident]
+      let xExpr = tr.resolveExprArg(arg0)
+      let domain = tr.lookupVarDomain(arg0.ident)
+      if domain.len == 0: continue
+      let lo = domain[0]
+      indexExpr = xExpr - lo
+      for v in domain:
+        let cmp = if isLe: (v <= c) else: (v < c)
+        arrayElems.add(ArrayElement[int](isConstant: true,
+            constantValue: if cmp: 1 else: 0))
+
+    elif not arg0IsConst and not arg1IsConst:
+      # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
+      let xExpr = tr.resolveExprArg(arg0)
+      let yExpr = tr.resolveExprArg(arg1)
+      let xName = if arg0.kind == FznIdent: arg0.ident else: ""
+      let yName = if arg1.kind == FznIdent: arg1.ident else: ""
+      let domainX = if xName.len > 0: tr.lookupVarDomain(xName) else: @[]
+      let domainY = if yName.len > 0: tr.lookupVarDomain(yName) else: @[]
+      if domainX.len == 0 or domainY.len == 0: continue
+      let loX = domainX[0]
+      let loY = domainY[0]
+      let sizeY = domainY.len
+      indexExpr = (xExpr - loX) * sizeY + (yExpr - loY)
+      for vx in domainX:
+        for vy in domainY:
+          let cmp = if isLe: (vx <= vy) else: (vx < vy)
+          arrayElems.add(ArrayElement[int](isConstant: true,
+              constantValue: if cmp: 1 else: 0))
+    else:
+      # Both constant — skip
+      continue
+
+    let binding = ChannelBinding[int](
+      channelPosition: bPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(bPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
   let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
-                          tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len
+                          tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
+                          tr.leReifChannelDefs.len
   if totalReifChannels > 0:
     stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
@@ -3229,6 +3414,396 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                      &"{tr.disjunctivePairs.len * 2} bool variables eliminated")
 
 
+proc detectNoOverlapPatterns(tr: var FznTranslator) =
+  ## Detects 6-literal bool_clause patterns encoding 3D box non-overlap:
+  ##   bool_clause([b1,b2,b3,b4,b5,b6], [])
+  ## where each bi is defined by int_le_reif, and the 6 comparisons form
+  ## 3 pairs (one per dimension) checking separation between a variable
+  ## pipe leg box and a fixed obstacle box.
+  ##
+  ## Chain: bool_clause → int_le_reif → int_lin_eq → int_min/int_max → node endpoints
+  ##
+  ## Replaces 7 constraints (1 bool_clause + 6 int_le_reif) + chain intermediates
+  ## with a single NoOverlapFixedBox constraint.
+
+  # Step 1: Build reverse indices
+  # Note: leReifDefs only includes unconsumed int_le_reif constraints,
+  # but linEqDefs and minMaxDefs include ALL constraints (even already consumed ones)
+  # because we need them for tracing the chain through defined variables and channels.
+  var leReifDefs: Table[string, int]   # bool var name → int_le_reif constraint index
+  var linEqDefs: Table[string, int]    # defined var name → int_lin_eq constraint index
+  var minMaxDefs: Table[string, int]   # channel var name → int_min/int_max constraint index
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if not con.hasAnnotation("defines_var"): continue
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+    let defVar = ann.args[0].ident
+    case name
+    of "int_le_reif":
+      # Only include unconsumed int_le_reif
+      if ci notin tr.definingConstraints and con.args.len >= 3 and con.args[2].kind == FznIdent:
+        leReifDefs[defVar] = ci
+    of "int_lin_eq":
+      linEqDefs[defVar] = ci
+    of "int_min", "int_max":
+      minMaxDefs[defVar] = ci
+    else: discard
+
+  if leReifDefs.len == 0: return
+
+  type
+    LegTrace = object
+      ## Result of tracing a leg variable chain
+      epA: NoOverlapEndpoint  # first endpoint of min/max
+      epB: NoOverlapEndpoint  # second endpoint of min/max
+      isMin: bool             # true for int_min (leg lower), false for int_max (leg upper)
+      offset: int             # offset from int_lin_eq (typically -radius or +radius)
+      innerVar: string        # the int_min/int_max output variable
+      linEqCi: int            # constraint index of int_lin_eq
+      minMaxCi: int           # constraint index of int_min/int_max
+
+  proc traceLeg(tr: FznTranslator, legVarName: string): tuple[ok: bool, trace: LegTrace] =
+    ## Trace a leg variable: legVar → int_lin_eq → int_min/int_max → endpoints
+    if legVarName notin linEqDefs:
+      return (false, LegTrace())
+
+    let linCi = linEqDefs[legVarName]
+    let linCon = tr.model.constraints[linCi]
+
+    # Parse int_lin_eq(coeffs, vars, rhs)
+    let coeffsArg = linCon.args[0]
+    let varsArg = linCon.args[1]
+    let rhsArg = linCon.args[2]
+
+    var coeffs: seq[int]
+    try:
+      coeffs = tr.resolveIntArray(coeffsArg)
+    except ValueError, KeyError:
+      return (false, LegTrace())
+
+    var rhs: int
+    try:
+      rhs = tr.resolveIntArg(rhsArg)
+    except ValueError, KeyError:
+      return (false, LegTrace())
+
+    # Resolve variable names
+    var varNames: seq[string]
+    case varsArg.kind
+    of FznArrayLit:
+      for e in varsArg.elems:
+        if e.kind == FznIdent:
+          varNames.add(e.ident)
+        else:
+          return (false, LegTrace())
+    of FznIdent:
+      if varsArg.ident in tr.arrayElementNames:
+        varNames = tr.arrayElementNames[varsArg.ident]
+      else:
+        return (false, LegTrace())
+    else:
+      return (false, LegTrace())
+
+    if varNames.len != coeffs.len or varNames.len != 2:
+      return (false, LegTrace())
+
+    # Find which var is the leg var and which is the inner (min/max output)
+    var innerIdx = -1
+    var legIdx = -1
+    for i in 0..<2:
+      if varNames[i] == legVarName:
+        legIdx = i
+      else:
+        innerIdx = i
+    if innerIdx < 0 or legIdx < 0:
+      return (false, LegTrace())
+
+    let innerVarName = varNames[innerIdx]
+    let legCoeff = coeffs[legIdx]
+    let innerCoeff = coeffs[innerIdx]
+
+    # Expect coeffs like [1, -1]: legCoeff*legVar + innerCoeff*innerVar = rhs
+    # => legVar = (rhs - innerCoeff*innerVar) / legCoeff
+    # For [1,-1],[legVar,innerVar],rhs: legVar - innerVar = rhs => legVar = innerVar + rhs
+    if legCoeff != 1 and legCoeff != -1:
+      return (false, LegTrace())
+
+    # offset = rhs/legCoeff adjusted for innerCoeff
+    # legCoeff*leg + innerCoeff*inner = rhs
+    # leg = (rhs - innerCoeff*inner) / legCoeff
+    # If legCoeff=1, innerCoeff=-1: leg = rhs + inner → offset = rhs
+    # If legCoeff=1, innerCoeff=1: leg = rhs - inner (not expected)
+    let offset = if legCoeff == 1: rhs  # leg = inner*(-innerCoeff/1) + rhs
+                 else: -rhs              # leg = inner*(innerCoeff/1) - rhs
+    # Verify: legCoeff=1, innerCoeff=-1 → leg - inner = rhs → leg = inner + rhs ✓
+    # legCoeff=1, innerCoeff=-1, rhs=-2: leg = inner - 2 ✓ (legLower)
+    # legCoeff=1, innerCoeff=-1, rhs=2: leg = inner + 2 ✓ (legUpper)
+
+    # Trace inner to int_min/int_max
+    if innerVarName notin minMaxDefs:
+      return (false, LegTrace())
+
+    let mmCi = minMaxDefs[innerVarName]
+    let mmCon = tr.model.constraints[mmCi]
+    let mmName = stripSolverPrefix(mmCon.name)
+    let isMin = (mmName == "int_min")
+
+    # Parse int_min/int_max(a, b, output)
+    if mmCon.args.len < 3:
+      return (false, LegTrace())
+
+    let aArg = mmCon.args[0]
+    let bArg = mmCon.args[1]
+
+    proc makeEndpoint(arg: FznExpr): NoOverlapEndpoint =
+      if arg.kind == FznIntLit:
+        return NoOverlapEndpoint(isFixed: true, fixedValue: arg.intVal)
+      elif arg.kind == FznIdent:
+        if arg.ident in tr.paramValues:
+          return NoOverlapEndpoint(isFixed: true, fixedValue: tr.paramValues[arg.ident])
+        else:
+          return NoOverlapEndpoint(isFixed: false, varName: arg.ident)
+      return NoOverlapEndpoint(isFixed: true, fixedValue: 0)  # fallback
+
+    result = (true, LegTrace(
+      epA: makeEndpoint(aArg),
+      epB: makeEndpoint(bArg),
+      isMin: isMin,
+      offset: offset,
+      innerVar: innerVarName,
+      linEqCi: linCi,
+      minMaxCi: mmCi,
+    ))
+
+  # Step 2: Count references to each bool var in non-defining constraints
+  # Track which bool_clause constraints each bool appears in, so we can check
+  # if ALL its references are covered by NoOverlap patterns.
+  var boolVarRefClauses: Table[string, seq[int]]  # bool var → list of bool_clause constraint indices
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    for argIdx in 0..1:
+      let arr = con.args[argIdx]
+      if arr.kind != FznArrayLit: continue
+      for elem in arr.elems:
+        if elem.kind == FznIdent:
+          boolVarRefClauses.mgetOrPut(elem.ident, @[]).add(ci)
+
+  # Step 3: Scan 6-literal bool_clause constraints
+  var nConsumed = 0
+  var nSixLit = 0
+  var nFailPair = 0
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    let posArg = con.args[0]
+    let negArg = con.args[1]
+    if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+    if posArg.elems.len != 6 or negArg.elems.len != 0: continue
+    nSixLit += 1
+
+    # All 6 literals must be defined by int_le_reif
+    var lits: array[6, string]
+    var allLeReif = true
+    for i in 0..5:
+      if posArg.elems[i].kind != FznIdent:
+        allLeReif = false
+        break
+      lits[i] = posArg.elems[i].ident
+      if lits[i] notin leReifDefs:
+        allLeReif = false
+        break
+    if not allLeReif: continue
+
+    # (allExclusive check deferred to two-pass consumption below)
+
+    # For each lit, extract the int_le_reif args: (a, b, boolVar)
+    # One of a/b is a constant (box bound), the other is a defined leg var
+    type LeReifInfo = object
+      constVal: int
+      legVarName: string
+      constIsArg0: bool  # true: int_le_reif(const, legVar, b), false: int_le_reif(legVar, const, b)
+      leReifCi: int
+
+    var infos: array[6, LeReifInfo]
+    var allValid = true
+    for i in 0..5:
+      let leReifCi = leReifDefs[lits[i]]
+      let leReifCon = tr.model.constraints[leReifCi]
+      let a0 = leReifCon.args[0]
+      let a1 = leReifCon.args[1]
+      let a0IsConst = a0.kind == FznIntLit or (a0.kind == FznIdent and a0.ident in tr.paramValues)
+      let a1IsConst = a1.kind == FznIntLit or (a1.kind == FznIdent and a1.ident in tr.paramValues)
+
+      if a0IsConst and not a1IsConst and a1.kind == FznIdent:
+        let cv = if a0.kind == FznIntLit: a0.intVal else: tr.paramValues[a0.ident]
+        infos[i] = LeReifInfo(constVal: cv, legVarName: a1.ident, constIsArg0: true, leReifCi: leReifCi)
+      elif not a0IsConst and a1IsConst and a0.kind == FznIdent:
+        let cv = if a1.kind == FznIntLit: a1.intVal else: tr.paramValues[a1.ident]
+        infos[i] = LeReifInfo(constVal: cv, legVarName: a0.ident, constIsArg0: false, leReifCi: leReifCi)
+      else:
+        allValid = false
+        break
+    if not allValid: continue
+
+    # Trace each leg variable
+    var traces: array[6, LegTrace]
+    var tracesOk = true
+    for i in 0..5:
+      let (ok, trace) = traceLeg(tr, infos[i].legVarName)
+      if not ok:
+        tracesOk = false
+        break
+      traces[i] = trace
+    if not tracesOk: continue
+
+    # Group into 3 pairs by dimension.
+    # Each pair should have one isMin (leg lower) and one !isMin (leg upper)
+    # with the same endpoint variables (epA, epB).
+    # NOTE: The 6 items are NOT necessarily in consecutive dimension pairs —
+    # we must match by endpoint signature.
+    var pattern: NoOverlapPattern
+    var pairOk = true
+    var radius = 0
+
+    # Build endpoint key for matching
+    proc endpointKey(ep: NoOverlapEndpoint): string =
+      if ep.isFixed: "F" & $ep.fixedValue
+      else: "V" & ep.varName
+
+    # Match traces into pairs by (epA_key, epB_key)
+    type DimPair = object
+      minIdx, maxIdx: int
+    var pairs: seq[DimPair]
+    var used: array[6, bool]
+
+    for i in 0..5:
+      if used[i]: continue
+      let keyA = endpointKey(traces[i].epA)
+      let keyB = endpointKey(traces[i].epB)
+      var found = false
+      for j in (i+1)..5:
+        if used[j]: continue
+        if endpointKey(traces[j].epA) == keyA and endpointKey(traces[j].epB) == keyB:
+          # Found matching pair — verify one isMin and one isMax
+          if traces[i].isMin == traces[j].isMin:
+            continue  # both min or both max — not a valid pair
+          if traces[i].isMin:
+            pairs.add(DimPair(minIdx: i, maxIdx: j))
+          else:
+            pairs.add(DimPair(minIdx: j, maxIdx: i))
+          used[i] = true
+          used[j] = true
+          found = true
+          break
+      if not found:
+        pairOk = false
+        break
+
+    if pairs.len != 3:
+      pairOk = false
+
+    if pairOk:
+      for d in 0..2:
+        let tMin = traces[pairs[d].minIdx]
+        let tMax = traces[pairs[d].maxIdx]
+
+        # Verify consistent radius: offset should be -radius for min, +radius for max
+        let r = tMax.offset
+        if tMin.offset != -r:
+          pairOk = false
+          break
+        if d == 0:
+          radius = r
+        elif r != radius:
+          pairOk = false
+          break
+
+        pattern.nodeA[d] = tMin.epA
+        pattern.nodeB[d] = tMin.epB
+
+        # Extract box bounds from int_le_reif constants.
+        # overlap_d = max(0, min(legUpper, boxUpper) - max(legLower, boxLower))
+        # Zero when legLower >= boxUpper (above check) or legUpper <= boxLower (below check).
+        let infoMin = infos[pairs[d].minIdx]
+        let infoMax = infos[pairs[d].maxIdx]
+
+        if infoMin.constIsArg0:
+          # int_le_reif(C, legLower, b) → b = (C <= legLower) → boxUpper = C
+          pattern.boxUpper[d] = infoMin.constVal
+        else:
+          # int_le_reif(legLower, C, b) → b = (legLower <= C) → boxLower = C
+          pattern.boxLower[d] = infoMin.constVal
+
+        if infoMax.constIsArg0:
+          # int_le_reif(C, legUpper, b) → b = (C <= legUpper) → boxUpper = C
+          pattern.boxUpper[d] = infoMax.constVal
+        else:
+          # int_le_reif(legUpper, C, b) → b = (legUpper <= C) → boxLower = C
+          pattern.boxLower[d] = infoMax.constVal
+
+    if not pairOk:
+      nFailPair += 1
+      continue
+
+    pattern.radius = radius
+
+    # Always consume the bool_clause itself
+    pattern.consumedConstraints.add(ci)
+    # Store the bool var names and their int_le_reif indices for two-pass consumption
+    for i in 0..5:
+      pattern.consumedBoolVars.add(lits[i])
+
+    # Mark the bool_clause as consumed
+    tr.definingConstraints.incl(ci)
+
+    tr.noOverlapPatterns.add(pattern)
+    nConsumed += 1
+
+  if nSixLit > 0 and nFailPair > 0:
+    stderr.writeLine(&"[FZN] NoOverlap: {nSixLit} 6-lit clauses, {tr.noOverlapPatterns.len} matched, " &
+                     &"{nFailPair} unmatched (pair mismatch)")
+
+  # Two-pass consumption: now that ALL patterns are detected, check each bool var.
+  # A bool can be consumed if ALL bool_clause constraints referencing it are NoOverlap patterns
+  # (i.e., all their constraint indices are in definingConstraints).
+  var nBoolsConsumed = 0
+  var nLeReifConsumed = 0
+  var consumedBools: HashSet[string]
+  for pattern in tr.noOverlapPatterns:
+    for boolVar in pattern.consumedBoolVars:
+      if boolVar in consumedBools: continue
+      # Check if ALL clauses referencing this bool are consumed (= became NoOverlap patterns)
+      let refs = boolVarRefClauses.getOrDefault(boolVar, @[])
+      var allCovered = true
+      for clauseCi in refs:
+        if clauseCi notin tr.definingConstraints:
+          allCovered = false
+          break
+      if allCovered and refs.len > 0:
+        consumedBools.incl(boolVar)
+        tr.definedVarNames.incl(boolVar)
+        nBoolsConsumed += 1
+        # Also consume its defining int_le_reif constraint
+        if boolVar in leReifDefs:
+          let leReifCi = leReifDefs[boolVar]
+          if leReifCi notin tr.definingConstraints:
+            tr.definingConstraints.incl(leReifCi)
+            nLeReifConsumed += 1
+
+  nConsumed += nLeReifConsumed
+  if tr.noOverlapPatterns.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.noOverlapPatterns.len} NoOverlap patterns, " &
+                     &"{nConsumed} constraints consumed, {nBoolsConsumed} bools eliminated, " &
+                     &"{nLeReifConsumed} int_le_reif consumed")
+
+
 proc detectDfaGeostPattern(tr: var FznTranslator) =
   ## Detects multiple fzn_regular constraints over the same variable array
   ## (tiling pattern) and converts them to a single geost constraint.
@@ -3949,6 +4524,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectImplicationPatterns()
   # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
   result.detectDisjunctivePairs()
+  # Detect NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
+  result.detectNoOverlapPatterns()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
   # Detect redundant ordering constraints (transitive reduction)
@@ -4172,6 +4749,39 @@ proc translate*(model: FznModel): FznTranslator =
 
   if result.sys.baseArray.disjunctivePairs.len > 0:
     stderr.writeLine(&"[FZN] Disjunctive pairs for domain reduction: {result.sys.baseArray.disjunctivePairs.len}")
+
+  # Build NoOverlap constraints from detected patterns
+  for pattern in result.noOverlapPatterns:
+    var nodeA: array[3, FixedBoxEndpoint]
+    var nodeB: array[3, FixedBoxEndpoint]
+    var allResolved = true
+
+    for d in 0..2:
+      # Resolve endpoint A
+      if pattern.nodeA[d].isFixed:
+        nodeA[d] = FixedBoxEndpoint(isFixed: true, fixedValue: pattern.nodeA[d].fixedValue)
+      else:
+        if pattern.nodeA[d].varName notin result.varPositions:
+          allResolved = false
+          break
+        nodeA[d] = FixedBoxEndpoint(isFixed: false, position: result.varPositions[pattern.nodeA[d].varName])
+
+      # Resolve endpoint B
+      if pattern.nodeB[d].isFixed:
+        nodeB[d] = FixedBoxEndpoint(isFixed: true, fixedValue: pattern.nodeB[d].fixedValue)
+      else:
+        if pattern.nodeB[d].varName notin result.varPositions:
+          allResolved = false
+          break
+        nodeB[d] = FixedBoxEndpoint(isFixed: false, position: result.varPositions[pattern.nodeB[d].varName])
+
+    if not allResolved: continue
+
+    result.sys.addConstraint(noOverlapFixedBox[int](
+      nodeA, nodeB, pattern.radius, pattern.boxLower, pattern.boxUpper))
+
+  if result.noOverlapPatterns.len > 0:
+    stderr.writeLine(&"[FZN] Built {result.noOverlapPatterns.len} NoOverlapFixedBox constraints")
 
   # Detect transition table chains and apply bidirectional multi-hop reachability
   # domain reduction. MiniZinc may eliminate boundary variables (e.g., agentAtTimeT[1,a]=58

@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -282,6 +282,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Diffn Constraint"
         of MatrixElementType:
             return "MatrixElement Constraint"
+        of NoOverlapFixedBoxType:
+            return "NoOverlapFixedBox Constraint"
 
 ################################################################################
 # Evaluation
@@ -335,6 +337,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.diffnState.cost
         of MatrixElementType:
             return constraint.matrixElementState.cost
+        of NoOverlapFixedBoxType:
+            return constraint.noOverlapFixedBoxState.cost
 
 ################################################################################
 # Computed Constraints
@@ -927,6 +931,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.diffnState.initialize(assignment)
         of MatrixElementType:
             constraint.matrixElementState.initialize(assignment)
+        of NoOverlapFixedBoxType:
+            constraint.noOverlapFixedBoxState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -977,6 +983,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.diffnState.moveDelta(position, oldValue, newValue)
         of MatrixElementType:
             constraint.matrixElementState.moveDelta(position, oldValue, newValue)
+        of NoOverlapFixedBoxType:
+            constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1027,6 +1035,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.diffnState.updatePosition(position, newValue)
         of MatrixElementType:
             constraint.matrixElementState.updatePosition(position, newValue)
+        of NoOverlapFixedBoxType:
+            constraint.noOverlapFixedBoxState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1060,6 +1070,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.relationalState.getAffectedPositions()
         of TableConstraintType:
             return constraint.tableConstraintState.getAffectedPositions()
+        of NoOverlapFixedBoxType:
+            return constraint.noOverlapFixedBoxState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1603,6 +1615,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: MatrixElementType,
                 matrixElementState: constraint.matrixElementState.deepCopy()
             )
+        of NoOverlapFixedBoxType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: NoOverlapFixedBoxType,
+                noOverlapFixedBoxState: constraint.noOverlapFixedBoxState.deepCopy()
+            )
 
 
 
@@ -1754,6 +1772,22 @@ func diffn*[T](xExprs, yExprs, dxExprs, dyExprs: seq[AlgebraicExpression[T]]): S
         positions: diffnConstraint.positions,
         stateType: DiffnType,
         diffnState: diffnConstraint
+    )
+
+################################################################################
+# NoOverlapFixedBox wrapper functions
+################################################################################
+
+func noOverlapFixedBox*[T](nodeA, nodeB: array[3, FixedBoxEndpoint],
+                            radius: T,
+                            boxLower, boxUpper: array[3, T]): StatefulConstraint[T] =
+    ## Creates a NoOverlapFixedBox constraint ensuring a variable 3D box
+    ## (pipe leg between two nodes with radius) doesn't overlap a fixed 3D box.
+    let c = newNoOverlapFixedBoxConstraint[T](nodeA, nodeB, radius, boxLower, boxUpper)
+    return StatefulConstraint[T](
+        positions: c.positions,
+        stateType: NoOverlapFixedBoxType,
+        noOverlapFixedBoxState: c
     )
 
 ################################################################################
