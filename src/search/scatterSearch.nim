@@ -175,6 +175,7 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
     # Compute reduced domain once
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
 
     let popStart = currentTime()
 
@@ -761,6 +762,7 @@ proc scatterResolve*[T](system: ConstraintSystem[T],
     # Compute reduced domain once
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
 
     # 1. Build initial population
     let buildStart = currentTime()

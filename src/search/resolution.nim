@@ -26,6 +26,7 @@ proc resolve*[T](system: ConstraintSystem[T],
     if system.baseArray.reducedDomain.len == 0:
         let drStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
         if verbose:
             let drElapsed = epochTime() - drStart
             echo &"[Solve] Domain reduction took {drElapsed:.3f}s"
@@ -44,10 +45,12 @@ proc resolve*[T](system: ConstraintSystem[T],
             raise newException(InfeasibleError, "Domain reduction found infeasibility")
 
     # Shrink channel position domains to avoid expensive deepCopy of million-element seqs.
-    # Channel positions are never searched, so their full domains are never needed again.
-    for pos in system.baseArray.channelPositions.items:
-        if system.baseArray.domain[pos].len > 1000:
-            system.baseArray.domain[pos] = system.baseArray.reducedDomain[pos]
+    # Channel positions are never searched; for domain reduction only min/max are needed.
+    # Use reducedDomain (the search-facing domain) as the shrunk version — it's already
+    # created as @[first_value] for skipped positions. Keep the original domain intact
+    # so bounds propagation can use the correct endpoints on subsequent optimization probes.
+    # Note: reducedDomain is what gets deepCopied for each parallel state, not domain.
+    discard  # reducedDomain already shrunk by reduceDomain() for skipped channel positions
 
     if parallel:
         # Use persisted adapted threshold if available, otherwise caller's value

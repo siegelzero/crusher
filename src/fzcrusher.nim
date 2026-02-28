@@ -167,10 +167,17 @@ proc main() =
       )
       solved = true
     except TimeLimitExceededError:
-      # Initial resolve timed out before finding any feasible solution
       timedOut = true
+      if tr.sys.hasFeasibleSolution:
+        solved = true
     except NoSolutionFoundError:
-      discard
+      if tr.sys.hasFeasibleSolution:
+        solved = true
+    except CatchableError as e:
+      stderr.writeLine(&"[FZN] Unexpected error during minimize: {e.msg}")
+      stderr.writeLine(e.getStackTrace())
+      if tr.sys.hasFeasibleSolution:
+        solved = true
 
   of Maximize:
     try:
@@ -186,10 +193,17 @@ proc main() =
       )
       solved = true
     except TimeLimitExceededError:
-      # Initial resolve timed out before finding any feasible solution
       timedOut = true
+      if tr.sys.hasFeasibleSolution:
+        solved = true
     except NoSolutionFoundError:
-      discard
+      if tr.sys.hasFeasibleSolution:
+        solved = true
+    except CatchableError as e:
+      stderr.writeLine(&"[FZN] Unexpected error during maximize: {e.msg}")
+      stderr.writeLine(e.getStackTrace())
+      if tr.sys.hasFeasibleSolution:
+        solved = true
 
   # Restore stdout for solution output
   flushFile(stdout)

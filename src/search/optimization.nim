@@ -48,9 +48,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
-        # Phase 1: Linear descent with per-probe time budgets
+        # Phase 1: Binary search with per-probe time budgets
         if verbose:
-            echo "[Opt] Linear descent from ", hi
+            echo "[Opt] Binary search [", lo, "..", hi, "]"
 
         while lo <= hi:
             if deadline > 0 and epochTime() > deadline:
@@ -58,11 +58,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 break
 
             let bestSolution = system.assignment
-            # Linear descent: try the next value down (minimize) or up (maximize)
-            when direction == Minimize:
-                let target = hi
-            else:
-                let target = lo
+            # Binary search: try the midpoint
+            let target = lo + (hi - lo) div 2
 
             if hasBoundConstraint:
                 system.removeLastConstraint()
@@ -101,6 +98,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 echo "[Opt] Improved: ", objective.value
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
+                # Found solution at value currentCost — narrow toward better
                 when direction == Minimize:
                     hi = currentCost - 1
                 else:
@@ -112,18 +110,23 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 objective.initialize(system.assignment)
                 break
             except InfeasibleError:
-                # Domain reduction proved no solution at this bound — optimal found
-                system.optimalityProven = true
+                # Domain reduction proved no solution at this bound — narrow range
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
-                break
+                when direction == Minimize:
+                    lo = target + 1
+                else:
+                    hi = target - 1
             except NoSolutionFoundError:
-                # Quick probe couldn't find it — break to retry loop for deep attempt
+                # Search couldn't find this target in budget — narrow range
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
-                break
+                when direction == Minimize:
+                    lo = target + 1
+                else:
+                    hi = target - 1
 
-        # Retry: binary search may falsely conclude infeasibility for heuristic solvers.
+        # Retry: binary search narrows conservatively (NoSolutionFoundError = infeasible).
         # Try once more to beat the current best.
         block retryLoop:
             while true:

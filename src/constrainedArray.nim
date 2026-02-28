@@ -38,6 +38,7 @@ type
         constraints*: seq[StatefulConstraint[T]]
         domain*: seq[seq[T]]
         reducedDomain*: seq[seq[T]]
+        sharedDomainPtr*: ptr seq[seq[T]]  # Points to shared (non-copied) reducedDomain for parallel states
         entries*: seq[AlgebraicExpression[T]]
         channelPositions*: PackedSet[int]
         channelBindings*: seq[ChannelBinding[T]]
@@ -1198,7 +1199,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         break
 
             # Apply tightened bounds to PackedSets (only positions in bounds constraints)
+            # Skip skipped positions: their PackedSets are 1-element placeholders, not real domains
             for pos in boundsPositions.items:
+                if pos in skippedPositions: continue
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
@@ -1507,7 +1510,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     tightenFromLe(domainMin, domainMax, dp.coeffs1, dp.positions1, dp.rhs1)
 
             # Apply tightened bounds to PackedSets (only positions in bounds constraints)
+            # Skip skipped positions: their PackedSets are 1-element placeholders, not real domains
             for pos in boundsPositions.items:
+                if pos in skippedPositions: continue
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
@@ -2037,18 +2042,26 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     ## Creates a deep copy of a ConstrainedArray for thread-safe parallel processing
     result.len = arr.len
 
-    # Deep copy the domain (seq[seq[T]] requires copying both outer and inner sequences)
-    result.domain = newSeq[seq[T]](arr.domain.len)
-    for i, innerSeq in arr.domain:
-        result.domain[i] = innerSeq  # This creates a deep copy of the inner seq[T]
-
-    # Deep copy the reducedDomain if it exists
-    if arr.reducedDomain.len > 0:
-        result.reducedDomain = newSeq[seq[T]](arr.reducedDomain.len)
-        for i, innerSeq in arr.reducedDomain:
-            result.reducedDomain[i] = innerSeq  # This creates a deep copy of the inner seq[T]
-    else:
+    if arr.sharedDomainPtr != nil:
+        # Parallel search state: domain not needed (reduceDomain already ran),
+        # reducedDomain shared via pointer. Saves ~25 GB for large-domain models.
+        result.domain = @[]
         result.reducedDomain = @[]
+        result.sharedDomainPtr = arr.sharedDomainPtr
+    else:
+        # General deepCopy: preserve domain for future reduceDomain calls
+        result.domain = newSeq[seq[T]](arr.domain.len)
+        for i, innerSeq in arr.domain:
+            if i in arr.channelPositions and innerSeq.len > 1000:
+                result.domain[i] = @[innerSeq[0], innerSeq[^1]]
+            else:
+                result.domain[i] = innerSeq
+        if arr.reducedDomain.len > 0:
+            result.reducedDomain = newSeq[seq[T]](arr.reducedDomain.len)
+            for i, innerSeq in arr.reducedDomain:
+                result.reducedDomain[i] = innerSeq
+        else:
+            result.reducedDomain = @[]
 
     # Deep copy entries - AlgebraicExpression[T] are ref objects, must deep copy for ARC thread safety
     result.entries = newSeq[AlgebraicExpression[T]](arr.entries.len)

@@ -452,6 +452,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     if system.baseArray.reducedDomain.len == 0:
         let reducedDomainStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
         if verbose:
             let reducedTime = epochTime() - reducedDomainStart
             echo &"[Solve] Domain reduction: {reducedTime:.3f}s"
