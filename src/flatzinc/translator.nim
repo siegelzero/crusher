@@ -3527,19 +3527,13 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
     # Expect coeffs like [1, -1]: legCoeff*legVar + innerCoeff*innerVar = rhs
     # => legVar = (rhs - innerCoeff*innerVar) / legCoeff
     # For [1,-1],[legVar,innerVar],rhs: legVar - innerVar = rhs => legVar = innerVar + rhs
-    if legCoeff != 1 and legCoeff != -1:
+    # Only accept the standard form: legCoeff=1, innerCoeff=-1 or legCoeff=-1, innerCoeff=1
+    if not ((legCoeff == 1 and innerCoeff == -1) or (legCoeff == -1 and innerCoeff == 1)):
       return (false, LegTrace())
 
-    # offset = rhs/legCoeff adjusted for innerCoeff
-    # legCoeff*leg + innerCoeff*inner = rhs
-    # leg = (rhs - innerCoeff*inner) / legCoeff
-    # If legCoeff=1, innerCoeff=-1: leg = rhs + inner → offset = rhs
-    # If legCoeff=1, innerCoeff=1: leg = rhs - inner (not expected)
-    let offset = if legCoeff == 1: rhs  # leg = inner*(-innerCoeff/1) + rhs
-                 else: -rhs              # leg = inner*(innerCoeff/1) - rhs
-    # Verify: legCoeff=1, innerCoeff=-1 → leg - inner = rhs → leg = inner + rhs ✓
-    # legCoeff=1, innerCoeff=-1, rhs=-2: leg = inner - 2 ✓ (legLower)
-    # legCoeff=1, innerCoeff=-1, rhs=2: leg = inner + 2 ✓ (legUpper)
+    # legCoeff=1, innerCoeff=-1: leg - inner = rhs → leg = inner + rhs → offset = rhs
+    # legCoeff=-1, innerCoeff=1: -leg + inner = rhs → leg = inner - rhs → offset = -rhs
+    let offset = if legCoeff == 1: rhs else: -rhs
 
     # Trace inner to int_min/int_max
     if innerVarName notin minMaxDefs:
@@ -3729,24 +3723,38 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
         pattern.nodeB[d] = tMin.epB
 
         # Extract box bounds from int_le_reif constants.
-        # overlap_d = max(0, min(legUpper, boxUpper) - max(legLower, boxLower))
-        # Zero when legLower >= boxUpper (above check) or legUpper <= boxLower (below check).
+        # The 6 separation conditions form 3 pairs (one per dimension):
+        #   b_upper: int_le_reif(boxUpper, legLower, b) → b = (boxUpper <= legLower) → separated above
+        #   b_lower: int_le_reif(legUpper, boxLower, b) → b = (legUpper <= boxLower) → separated below
+        # So for the min trace (legLower): constIsArg0=true → constVal is boxUpper
+        # For the max trace (legUpper): constIsArg0=false → constVal is boxLower
         let infoMin = infos[pairs[d].minIdx]
         let infoMax = infos[pairs[d].maxIdx]
+
+        var gotLower = false
+        var gotUpper = false
 
         if infoMin.constIsArg0:
           # int_le_reif(C, legLower, b) → b = (C <= legLower) → boxUpper = C
           pattern.boxUpper[d] = infoMin.constVal
+          gotUpper = true
         else:
           # int_le_reif(legLower, C, b) → b = (legLower <= C) → boxLower = C
           pattern.boxLower[d] = infoMin.constVal
+          gotLower = true
 
         if infoMax.constIsArg0:
           # int_le_reif(C, legUpper, b) → b = (C <= legUpper) → boxUpper = C
           pattern.boxUpper[d] = infoMax.constVal
+          gotUpper = true
         else:
           # int_le_reif(legUpper, C, b) → b = (legUpper <= C) → boxLower = C
           pattern.boxLower[d] = infoMax.constVal
+          gotLower = true
+
+        if not gotLower or not gotUpper:
+          pairOk = false
+          break
 
     if not pairOk:
       nFailPair += 1
