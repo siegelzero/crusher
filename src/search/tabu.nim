@@ -1,7 +1,7 @@
 import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, pairwiseFairness]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -238,8 +238,6 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.matrixElementState.moveDelta(position, oldValue, newValue)
         of NoOverlapFixedBoxType:
             result = constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
-        of PairwiseFairnessType:
-            result = constraint.pairwiseFairnessState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox, pairwiseFairness
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
 
 ################################################################################
 # Shared constraint type definitions
@@ -32,8 +32,7 @@ type
         CountEqType,
         DiffnType,
         MatrixElementType,
-        NoOverlapFixedBoxType,
-        PairwiseFairnessType
+        NoOverlapFixedBoxType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -114,5 +113,3 @@ type
                 matrixElementState*: MatrixElementState[T]
             of NoOverlapFixedBoxType:
                 noOverlapFixedBoxState*: NoOverlapFixedBoxConstraint[T]
-            of PairwiseFairnessType:
-                pairwiseFairnessState*: PairwiseFairnessConstraint[T]

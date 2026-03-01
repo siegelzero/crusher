@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox, pairwiseFairness
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -284,8 +284,6 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "MatrixElement Constraint"
         of NoOverlapFixedBoxType:
             return "NoOverlapFixedBox Constraint"
-        of PairwiseFairnessType:
-            return "PairwiseFairness Constraint"
 
 ################################################################################
 # Evaluation
@@ -341,8 +339,6 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.matrixElementState.cost
         of NoOverlapFixedBoxType:
             return constraint.noOverlapFixedBoxState.cost
-        of PairwiseFairnessType:
-            return constraint.pairwiseFairnessState.cost
 
 ################################################################################
 # Computed Constraints
@@ -937,8 +933,6 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.matrixElementState.initialize(assignment)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.initialize(assignment)
-        of PairwiseFairnessType:
-            constraint.pairwiseFairnessState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -991,8 +985,6 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.matrixElementState.moveDelta(position, oldValue, newValue)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
-        of PairwiseFairnessType:
-            constraint.pairwiseFairnessState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1045,8 +1037,6 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.matrixElementState.updatePosition(position, newValue)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.updatePosition(position, newValue)
-        of PairwiseFairnessType:
-            constraint.pairwiseFairnessState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1082,8 +1072,6 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.tableConstraintState.getAffectedPositions()
         of NoOverlapFixedBoxType:
             return constraint.noOverlapFixedBoxState.getAffectedPositions()
-        of PairwiseFairnessType:
-            return constraint.pairwiseFairnessState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1112,8 +1100,6 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.geostState.getAffectedDomainValues(position)
         of RelationalType:
             return constraint.relationalState.getAffectedDomainValues(position)
-        of PairwiseFairnessType:
-            return constraint.pairwiseFairnessState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1635,12 +1621,6 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: NoOverlapFixedBoxType,
                 noOverlapFixedBoxState: constraint.noOverlapFixedBoxState.deepCopy()
             )
-        of PairwiseFairnessType:
-            result = StatefulConstraint[T](
-                positions: constraint.positions,
-                stateType: PairwiseFairnessType,
-                pairwiseFairnessState: constraint.pairwiseFairnessState.deepCopy()
-            )
 
 
 
@@ -2058,26 +2038,6 @@ func countEq*[T](arrayPositions: openArray[int], countValue: T, targetPosition: 
         positions: constraint.allPositions,
         stateType: CountEqType,
         countEqState: constraint
-    )
-
-################################################################################
-# PairwiseFairness wrapper functions
-################################################################################
-
-func pairwiseFairness*[T](pairCoeffA, pairCoeffB: seq[int],
-    pairPosA, pairPosB: seq[int],
-    btPosition: int, threshold: int): StatefulConstraint[T] =
-    ## Creates a PairwiseFairness constraint consolidating C(n,2) pairwise tolerance
-    ## constraints into a single constraint per bt variable.
-    ##
-    ## For each pair p: penalty = max(0, |coeffA[p]*countA + coeffB[p]*countB| - threshold * bt)
-    ## Total cost: sum of all pair penalties.
-    let constraint = newPairwiseFairnessConstraint[T](
-        pairCoeffA, pairCoeffB, pairPosA, pairPosB, btPosition, threshold)
-    return StatefulConstraint[T](
-        positions: constraint.allPositions,
-        stateType: PairwiseFairnessType,
-        pairwiseFairnessState: constraint
     )
 
 ################################################################################

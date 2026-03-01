@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, pairwiseFairness]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
 
 type
@@ -42,16 +42,6 @@ type
     lookupTable*: seq[int]           # flat constant lookup table
     domainOffsets*: seq[int]         # min value per source (for index computation)
     domainSizes*: seq[int]          # domain size per source (hi - lo + 1)
-
-  PairwiseFairnessGroup* = object
-    ## A detected group of pairwise fairness constraints sharing the same bt variable.
-    ## From FZN chain: int_lin_eq → int_abs → int_lin_le([1,-T], [abs_v, bt_v], 0)
-    btVarName*: string
-    threshold*: int            # multiplier T from int_lin_le coefficients
-    pairCoeffA*: seq[int]      # linear coefficient for first count var per pair
-    pairCoeffB*: seq[int]      # linear coefficient for second count var per pair
-    pairVarNameA*: seq[string] # first count variable name per pair
-    pairVarNameB*: seq[string] # second count variable name per pair
 
   NoOverlapEndpoint* = object
     ## An endpoint in a NoOverlap pattern — either a constant or a variable name
@@ -137,8 +127,6 @@ type
     boolAndOrChannelDefs*: seq[int]
     # Detected NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
     noOverlapPatterns*: seq[NoOverlapPattern]
-    # Detected pairwise fairness groups (per bt variable)
-    pairwiseFairnessGroups*: seq[PairwiseFairnessGroup]
     # Tracks which output variables/arrays are boolean (for true/false formatting)
     outputBoolVars*: HashSet[string]
     outputBoolArrays*: HashSet[string]
@@ -1875,177 +1863,6 @@ proc detectCountPatterns(tr: var FznTranslator) =
       tr.definedVarNames.incl(vn)
 
     stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
-
-proc detectPairwiseFairnessPatterns(tr: var FznTranslator) =
-  ## Detects pairwise fairness constraint chains:
-  ##   int_lin_eq([wl_i, -wl_j, -1], [count_j, count_i, inner_v], 0) :: defines_var(inner_v)
-  ##   int_abs(inner_v, abs_v)                                         :: defines_var(abs_v)
-  ##   int_lin_le([1, -T], [abs_v, bt_v], 0)                          # abs_v <= T * bt_v
-  ##
-  ## Groups chains by (bt_var, threshold) and creates a single native constraint per group.
-
-  # Step 1: Build map from defined var name -> (input var name, ci) for int_abs constraints
-  var intAbsDefs: Table[string, tuple[inputVar: string, ci: int]]
-  for ci, con in tr.model.constraints:
-    if ci notin tr.definingConstraints: continue
-    let name = stripSolverPrefix(con.name)
-    if name != "int_abs" or not con.hasAnnotation("defines_var"): continue
-    let ann = con.getAnnotation("defines_var")
-    if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
-    let absVar = ann.args[0].ident
-    if con.args[0].kind == FznIdent:
-      intAbsDefs[absVar] = (inputVar: con.args[0].ident, ci: ci)
-
-  if intAbsDefs.len == 0: return
-
-  # Step 2: Build map from defined var name -> (coeffs, varNames, ci) for int_lin_eq
-  var intLinEqDefs: Table[string, tuple[coeffs: seq[int], varNames: seq[string], ci: int]]
-  for ci, con in tr.model.constraints:
-    if ci notin tr.definingConstraints: continue
-    let name = stripSolverPrefix(con.name)
-    if name != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
-    let ann = con.getAnnotation("defines_var")
-    if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
-    let definedName = ann.args[0].ident
-
-    let coeffArg = con.args[0]
-    let varArg = con.args[1]
-    var coeffs: seq[int]
-    var varNames: seq[string]
-    if coeffArg.kind == FznArrayLit:
-      for e in coeffArg.elems:
-        if e.kind == FznIntLit: coeffs.add(e.intVal)
-        elif e.kind == FznBoolLit: coeffs.add(if e.boolVal: 1 else: 0)
-        else: break
-    elif coeffArg.kind == FznIdent:
-      if coeffArg.ident in tr.arrayValues:
-        coeffs = tr.arrayValues[coeffArg.ident]
-    if varArg.kind == FznArrayLit:
-      for e in varArg.elems:
-        if e.kind == FznIdent: varNames.add(e.ident)
-        else: break
-    if coeffs.len >= 3 and coeffs.len == varNames.len:
-      intLinEqDefs[definedName] = (coeffs: coeffs, varNames: varNames, ci: ci)
-
-  # Step 3: Scan unconsumed int_lin_le constraints for the pattern
-  type PairEntry = tuple[coeffA, coeffB: int, varNameA, varNameB: string]
-  var groups: Table[tuple[btVar: string, threshold: int],
-    tuple[pairs: seq[PairEntry], constraintIndices: seq[int]]]
-
-  for ci, con in tr.model.constraints:
-    if ci in tr.definingConstraints: continue
-    let name = stripSolverPrefix(con.name)
-    if name != "int_lin_le": continue
-    if con.args.len < 3: continue
-
-    # Resolve coefficients
-    let coeffArg = con.args[0]
-    var coeffs: seq[int]
-    if coeffArg.kind == FznArrayLit:
-      for e in coeffArg.elems:
-        if e.kind == FznIntLit: coeffs.add(e.intVal)
-        elif e.kind == FznBoolLit: coeffs.add(if e.boolVal: 1 else: 0)
-        else: break
-    elif coeffArg.kind == FznIdent:
-      if coeffArg.ident in tr.arrayValues:
-        coeffs = tr.arrayValues[coeffArg.ident]
-    if coeffs.len != 2: continue
-    if coeffs[0] != 1: continue     # first coeff must be 1 (for abs_v)
-    if coeffs[1] >= 0: continue     # second coeff must be negative (-T)
-    let threshold = -coeffs[1]
-
-    # Resolve variable names
-    let varArg = con.args[1]
-    var varNames: seq[string]
-    if varArg.kind == FznArrayLit:
-      for e in varArg.elems:
-        if e.kind == FznIdent: varNames.add(e.ident)
-        else: break
-    if varNames.len != 2: continue
-
-    # Must have rhs=0
-    let rhsArg = con.args[2]
-    if rhsArg.kind == FznIntLit:
-      if rhsArg.intVal != 0: continue
-    elif rhsArg.kind == FznIdent:
-      if rhsArg.ident notin tr.paramValues or tr.paramValues[rhsArg.ident] != 0: continue
-    else: continue
-
-    let absVarName = varNames[0]
-    let btVarName = varNames[1]
-
-    # abs_v must be a defined variable defined by int_abs
-    if absVarName notin intAbsDefs: continue
-    let (innerVarName, _) = intAbsDefs[absVarName]
-
-    # inner_v must be defined by int_lin_eq with 3 terms
-    if innerVarName notin intLinEqDefs: continue
-    let (linCoeffs, linVarNames, _) = intLinEqDefs[innerVarName]
-    if linCoeffs.len != 3: continue
-
-    # Find inner_v in the linEq variables and verify its coefficient is -1 or 1
-    var innerIdx = -1
-    for i, vn in linVarNames:
-      if vn == innerVarName:
-        innerIdx = i
-        break
-    if innerIdx < 0: continue
-    if linCoeffs[innerIdx] != -1 and linCoeffs[innerIdx] != 1: continue
-
-    # Extract the two non-inner count variables
-    var pairVars: seq[tuple[coeff: int, varName: string]]
-    for i in 0..<linVarNames.len:
-      if i != innerIdx:
-        pairVars.add((coeff: linCoeffs[i], varName: linVarNames[i]))
-    if pairVars.len != 2: continue
-
-    # bt variable should not be a defined variable
-    if btVarName in tr.definedVarNames: continue
-
-    let key = (btVar: btVarName, threshold: threshold)
-    if key notin groups:
-      groups[key] = (pairs: @[], constraintIndices: @[])
-    groups[key].pairs.add((
-      coeffA: pairVars[0].coeff, coeffB: pairVars[1].coeff,
-      varNameA: pairVars[0].varName, varNameB: pairVars[1].varName))
-    groups[key].constraintIndices.add(ci)
-
-  # Step 4: Convert groups with >= 2 pairs to PairwiseFairnessGroup objects
-  # For count variables that are defined variables, un-define them so they get positions.
-  # Their defining constraints will be translated as normal equality constraints.
-  var totalPairs = 0
-  var undefinedCount = 0
-  for key, group in groups:
-    if group.pairs.len < 2: continue  # Need at least 2 pairs to be worth it
-
-    var pg: PairwiseFairnessGroup
-    pg.btVarName = key.btVar
-    pg.threshold = key.threshold
-    for pair in group.pairs:
-      pg.pairCoeffA.add(pair.coeffA)
-      pg.pairCoeffB.add(pair.coeffB)
-      pg.pairVarNameA.add(pair.varNameA)
-      pg.pairVarNameB.add(pair.varNameB)
-      # Un-define count variables that are defined, so they get positions.
-      # Use intLinEqDefs to look up the defining constraint index directly.
-      for vn in [pair.varNameA, pair.varNameB]:
-        if vn in tr.definedVarNames:
-          tr.definedVarNames.excl(vn)
-          if vn in intLinEqDefs:
-            let defCi = intLinEqDefs[vn].ci
-            tr.definingConstraints.excl(defCi)
-            inc undefinedCount
-
-    # Mark int_lin_le constraints as consumed
-    for ci in group.constraintIndices:
-      tr.definingConstraints.incl(ci)
-
-    tr.pairwiseFairnessGroups.add(pg)
-    totalPairs += pg.pairCoeffA.len
-
-  if tr.pairwiseFairnessGroups.len > 0:
-    stderr.writeLine(&"[FZN] Detected pairwise fairness patterns: {tr.pairwiseFairnessGroups.len} groups, {totalPairs} pairs" &
-      (if undefinedCount > 0: &", un-defined {undefinedCount} count variables" else: ""))
 
 proc detectReifChannels(tr: var FznTranslator) =
   ## Detects int_eq_reif(x, val, b) :: defines_var(b) and bool2int(b, i) :: defines_var(i)
@@ -4707,11 +4524,6 @@ proc translate*(model: FznModel): FznTranslator =
   result.collectDefinedVars()
   # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
   result.detectCountPatterns()
-  # Detect pairwise fairness patterns (int_lin_eq → int_abs → int_lin_le chains)
-  # Disabled: un-defining count variables and consolidating into a single constraint
-  # produces worse search results than the decomposed relational constraints, likely
-  # because the individual constraints provide better gradient information per position.
-  # result.detectPairwiseFairnessPatterns()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
   # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
@@ -4834,26 +4646,6 @@ proc translate*(model: FznModel): FznTranslator =
       result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
     else:
       result.translateConstraint(con)
-
-  # Add pairwise fairness constraints for detected patterns
-  for pg in result.pairwiseFairnessGroups:
-    if pg.btVarName notin result.varPositions:
-      continue
-    let btPos = result.varPositions[pg.btVarName]
-    var pairPosA = newSeq[int](pg.pairCoeffA.len)
-    var pairPosB = newSeq[int](pg.pairCoeffA.len)
-    var allResolved = true
-    for p in 0..<pg.pairCoeffA.len:
-      if pg.pairVarNameA[p] notin result.varPositions or
-         pg.pairVarNameB[p] notin result.varPositions:
-        allResolved = false
-        break
-      pairPosA[p] = result.varPositions[pg.pairVarNameA[p]]
-      pairPosB[p] = result.varPositions[pg.pairVarNameB[p]]
-    if not allResolved:
-      continue
-    result.sys.addConstraint(pairwiseFairness[int](
-      pg.pairCoeffA, pg.pairCoeffB, pairPosA, pairPosB, btPos, pg.threshold))
 
   # Add table constraints for detected implication patterns
   var nTableDomainRestrictions = 0
