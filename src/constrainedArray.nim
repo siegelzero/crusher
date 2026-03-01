@@ -231,6 +231,18 @@ proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
         else:
             arr.inverseChannelsAtPosition[pos].add(gi)
 
+proc recomputeInverse*[T](group: InverseChannelGroup[T], assignment: seq[T]): seq[T] =
+    ## Compute the inverse channel values from the current forward assignments.
+    ## Returns a seq aligned with group.inversePositions.
+    result = newSeq[T](group.inversePositions.len)
+    for j in 0..<result.len:
+        result[j] = group.defaultValue
+    for i, fpos in group.forwardPositions:
+        let v = assignment[fpos]
+        let idx = v - group.inverseBase
+        if idx >= 0 and idx < group.inversePositions.len:
+            result[idx] = T(i + group.forwardBase)
+
 ################################################################################
 # Bounds propagation helpers
 ################################################################################

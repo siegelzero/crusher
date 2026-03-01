@@ -882,14 +882,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
                     let group = state.carray.inverseChannelGroups[gi]
-                    var newInverse = newSeq[T](group.inversePositions.len)
-                    for j in 0..<newInverse.len:
-                        newInverse[j] = group.defaultValue
-                    for i, fpos in group.forwardPositions:
-                        let v = state.assignment[fpos]
-                        let idx = v - group.inverseBase
-                        if idx >= 0 and idx < group.inversePositions.len:
-                            newInverse[idx] = T(i + group.forwardBase)
+                    let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
                             state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
@@ -939,14 +932,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
                     let group = state.carray.inverseChannelGroups[gi]
-                    var newInverse = newSeq[T](group.inversePositions.len)
-                    for j in 0..<newInverse.len:
-                        newInverse[j] = group.defaultValue
-                    for i, fpos in group.forwardPositions:
-                        let v = state.assignment[fpos]
-                        let idx = v - group.inverseBase
-                        if idx >= 0 and idx < group.inversePositions.len:
-                            newInverse[idx] = T(i + group.forwardBase)
+                    let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
                             state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
@@ -1362,15 +1348,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     # Compute inverse channel initial values from forward assignments
     for group in carray.inverseChannelGroups:
-        # Initialize all inverse positions to default
-        for ipos in group.inversePositions:
-            state.assignment[ipos] = group.defaultValue
-        # Set inverse[forward[i]] = i + forwardBase
-        for i, fpos in group.forwardPositions:
-            let v = state.assignment[fpos]
-            let idx = v - group.inverseBase
-            if idx >= 0 and idx < group.inversePositions.len:
-                state.assignment[group.inversePositions[idx]] = T(i + group.forwardBase)
+        let newInverse = group.recomputeInverse(state.assignment)
+        for j, ipos in group.inversePositions:
+            state.assignment[ipos] = newInverse[j]
 
     # Build flat min/max bindings: decompose expression trees into flat operations.
     # Expression trees can be DAGs (shared subtrees) causing exponential re-evaluation.
@@ -2581,16 +2561,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
                 let group = state.carray.inverseChannelGroups[gi]
-                # Recompute all inverse positions from scratch
-                var newInverse = newSeq[T](group.inversePositions.len)
-                for j in 0..<newInverse.len:
-                    newInverse[j] = group.defaultValue
-                for i, fpos in group.forwardPositions:
-                    let v = state.assignment[fpos]
-                    let idx = v - group.inverseBase
-                    if idx >= 0 and idx < group.inversePositions.len:
-                        newInverse[idx] = T(i + group.forwardBase)
-                # Apply changes
+                let newInverse = group.recomputeInverse(state.assignment)
                 for j, ipos in group.inversePositions:
                     if newInverse[j] != state.assignment[ipos]:
                         result = true
@@ -2662,14 +2633,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
                 let group = state.carray.inverseChannelGroups[gi]
-                var newInverse = newSeq[T](group.inversePositions.len)
-                for j in 0..<newInverse.len:
-                    newInverse[j] = group.defaultValue
-                for i, fpos in group.forwardPositions:
-                    let v = state.assignment[fpos]
-                    let idx = v - group.inverseBase
-                    if idx >= 0 and idx < group.inversePositions.len:
-                        newInverse[idx] = T(i + group.forwardBase)
+                let newInverse = group.recomputeInverse(state.assignment)
                 for j, ipos in group.inversePositions:
                     if newInverse[j] != state.assignment[ipos]:
                         state.assignment[ipos] = newInverse[j]
