@@ -1488,6 +1488,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             maxTime: constraint.cumulativeState.maxTime,
                             lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
                             lastOldValue: constraint.cumulativeState.lastOldValue,
+                            limitPosition: constraint.cumulativeState.limitPosition,
                             evalMethod: PositionBased,
                             originPositions: constraint.cumulativeState.originPositions,
                             durations: constraint.cumulativeState.durations,
@@ -1511,6 +1512,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             maxTime: constraint.cumulativeState.maxTime,
                             lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
                             lastOldValue: constraint.cumulativeState.lastOldValue,
+                            limitPosition: constraint.cumulativeState.limitPosition,
                             evalMethod: ExpressionBased,
                             originExpressions: copiedExpressions,
                             durationsExpr: constraint.cumulativeState.durationsExpr,
@@ -1699,36 +1701,42 @@ func sequence*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, 
 # Cumulative wrapper functions
 ################################################################################
 
-func cumulative*[T](originPositions: openArray[int], durations: openArray[T], heights: openArray[T], limit: T): StatefulConstraint[T] =
+func cumulative*[T](originPositions: openArray[int], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1): StatefulConstraint[T] =
     ## Creates a cumulative constraint for resource-constrained scheduling.
     ## - originPositions: Variable positions representing task start times
     ## - durations: Duration of each task (constant)
     ## - heights: Resource consumption of each task (constant)
-    ## - limit: Maximum resource capacity
+    ## - limit: Maximum resource capacity (initial value if limitPosition >= 0)
+    ## - limitPosition: Position of variable limit (-1 = constant limit)
     ## Example: cumulative([0,1,2,3,4], [3,9,10,6,2], [1,2,1,1,3], 8) for project scheduling
+    var positions = toPackedSet[int](originPositions)
+    if limitPosition >= 0:
+        positions.incl(limitPosition)
     return StatefulConstraint[T](
-        positions: toPackedSet[int](originPositions),
+        positions: positions,
         stateType: CumulativeType,
-        cumulativeState: newCumulativeConstraint[T](originPositions, durations, heights, limit)
+        cumulativeState: newCumulativeConstraint[T](originPositions, durations, heights, limit, limitPosition = limitPosition)
     )
 
-func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: openArray[T], heights: openArray[T], limit: T): StatefulConstraint[T] =
+func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1): StatefulConstraint[T] =
     ## Returns cumulative constraint for the given origin expressions.
     let (allRefs, positions) = isAllRefs(originExpressions)
 
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return cumulative[T](positions, durations, heights, limit)
+        return cumulative[T](positions, durations, heights, limit, limitPosition)
     else:
         # Collect all positions from expressions for the constraint positions field
         var allPositions = toPackedSet[int]([])
         for exp in originExpressions:
             allPositions.incl(exp.positions)
+        if limitPosition >= 0:
+            allPositions.incl(limitPosition)
 
         return StatefulConstraint[T](
             positions: allPositions,
             stateType: CumulativeType,
-            cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit)
+            cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit, limitPosition = limitPosition)
         )
 
 ################################################################################

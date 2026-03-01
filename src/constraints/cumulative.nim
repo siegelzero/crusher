@@ -26,6 +26,7 @@ type
         maxTime*: int                    # Maximum time value in profile
         lastChangedPosition*: int        # Track last changed position for smart affected positions
         lastOldValue*: T                 # Track old value for smart affected positions
+        limitPosition*: int              # Position of variable limit (-1 = constant limit)
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 originPositions*: seq[int]
@@ -46,16 +47,19 @@ func newCumulativeConstraint*[T](originPositions: openArray[int],
                                  durations: openArray[T],
                                  heights: openArray[T],
                                  limit: T,
-                                 maxTime: int = 500): CumulativeConstraint[T] =
+                                 maxTime: int = 500,
+                                 limitPosition: int = -1): CumulativeConstraint[T] =
     ## Creates a position-based cumulative constraint
     doAssert originPositions.len == durations.len, "originPositions and durations must have same length"
     doAssert originPositions.len == heights.len, "originPositions and heights must have same length"
 
-    # Find max position to size the positionToTask array
+    # Find max position to size the positionToTask array and currentAssignment
     var maxPos = 0
     for pos in originPositions:
         if pos > maxPos:
             maxPos = pos
+    if limitPosition > maxPos:
+        maxPos = limitPosition
 
     # Build position-to-task lookup array (-1 means not a task position)
     var posToTask = newSeq[int](maxPos + 1)
@@ -69,6 +73,7 @@ func newCumulativeConstraint*[T](originPositions: openArray[int],
         cost: 0,
         limit: limit,
         maxTime: maxTime,
+        limitPosition: limitPosition,
         evalMethod: PositionBased,
         originPositions: @originPositions,
         durations: @durations,
@@ -82,7 +87,8 @@ func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
                                  durations: openArray[T],
                                  heights: openArray[T],
                                  limit: T,
-                                 maxTime: int = 500): CumulativeConstraint[T] =
+                                 maxTime: int = 500,
+                                 limitPosition: int = -1): CumulativeConstraint[T] =
     ## Creates an expression-based cumulative constraint
     doAssert originExpressions.len == durations.len, "originExpressions and durations must have same length"
     doAssert originExpressions.len == heights.len, "originExpressions and heights must have same length"
@@ -93,12 +99,15 @@ func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
         for pos in exp.positions.items:
             if pos > maxPos:
                 maxPos = pos
+    if limitPosition > maxPos:
+        maxPos = limitPosition
 
     new(result)
     result = CumulativeConstraint[T](
         cost: 0,
         limit: limit,
         maxTime: maxTime,
+        limitPosition: limitPosition,
         evalMethod: ExpressionBased,
         originExpressions: originExpressions,
         durationsExpr: @durations,
@@ -152,6 +161,11 @@ proc calculateCostDelta[T](oldUsage, newUsage, limit: T): int {.inline.} =
 
 proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
     ## Initializes the cumulative constraint with the given assignment
+    # Update limit from variable if applicable
+    if state.limitPosition >= 0:
+        state.limit = assignment[state.limitPosition]
+        state.currentAssignment[state.limitPosition] = assignment[state.limitPosition]
+
     # Calculate required maxTime from assignment values and durations
     var requiredMaxTime = state.maxTime
     case state.evalMethod:
@@ -213,6 +227,13 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
     # Track change for getAffectedPositions
     state.lastChangedPosition = position
     state.lastOldValue = oldValue
+
+    # Handle variable limit change
+    if position == state.limitPosition:
+        state.limit = newValue
+        state.currentAssignment[position] = newValue
+        state.recalculateCost()
+        return
 
     case state.evalMethod:
         of PositionBased:
@@ -316,6 +337,18 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
     ## Returns positions of tasks that overlap in time with the last changed task.
     result = initPackedSet[int]()
 
+    # If the limit changed, all task positions and the limit position are affected
+    if state.lastChangedPosition == state.limitPosition:
+        case state.evalMethod:
+            of PositionBased:
+                for pos in state.originPositions:
+                    result.incl(pos)
+            of ExpressionBased:
+                for pos in state.expressionsAtPosition.keys:
+                    result.incl(pos)
+        result.incl(state.limitPosition)
+        return result
+
     case state.evalMethod:
         of PositionBased:
             if state.lastChangedPosition >= state.positionToTask.len or
@@ -338,14 +371,28 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
                 if taskStart < affectedEnd and taskEnd > affectedStart:
                     result.incl(pos)
 
+            # A task move affects the limit position's penalties too
+            if state.limitPosition >= 0:
+                result.incl(state.limitPosition)
+
         of ExpressionBased:
             for pos in state.expressionsAtPosition.keys:
                 result.incl(pos)
+            if state.limitPosition >= 0:
+                result.incl(state.limitPosition)
 
 proc getAffectedDomainValues*[T](state: CumulativeConstraint[T], position: int): seq[T] =
     ## Returns only the domain values that need penalty recalculation after the last change.
     ## For cumulative, only values overlapping with the changed time range are affected.
     result = @[]
+
+    # If limit changed, all domain values are affected for every position
+    if state.lastChangedPosition == state.limitPosition:
+        return result  # empty = all values
+
+    # If querying the limit position, all limit values are affected
+    if position == state.limitPosition:
+        return result  # empty = all values
 
     case state.evalMethod:
         of PositionBased:
@@ -386,6 +433,10 @@ proc getGoodStartTimes*[T](state: CumulativeConstraint[T], position: int, maxCan
     ## Uses the resource profile to find times with available capacity.
     ## Much faster than evaluating all domain values.
     result = @[]
+
+    # Limit position is not a task — no start time candidates
+    if position == state.limitPosition:
+        return result
 
     case state.evalMethod:
         of PositionBased:
@@ -452,6 +503,15 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
     ## O(min(|shift|, duration)) complexity via symmetric difference of old/new time ranges.
     if oldValue == newValue:
         return 0
+
+    # Handle variable limit change
+    if position == state.limitPosition:
+        var newCost = 0
+        for t in 0..state.maxTime:
+            let usage = state.resourceProfile[t]
+            if usage > newValue:
+                newCost += int(usage - newValue)
+        return newCost - state.cost
 
     case state.evalMethod:
         of PositionBased:
@@ -543,6 +603,17 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     ## Compute moveDelta for ALL domain values at a position using prefix sums.
     ## O(maxTime + domainSize) instead of O(domainSize * duration).
     result = newSeq[int](domain.len)
+
+    # Handle variable limit position: iterate profile for each candidate limit value
+    if position == state.limitPosition:
+        for i, v in domain:
+            var newCost = 0
+            for t in 0..state.maxTime:
+                let usage = state.resourceProfile[t]
+                if usage > v:
+                    newCost += int(usage - v)
+            result[i] = newCost - state.cost
+        return
 
     if state.evalMethod != PositionBased:
         # Fallback to individual computation

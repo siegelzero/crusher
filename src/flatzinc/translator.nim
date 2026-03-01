@@ -1059,21 +1059,21 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             heights[i] = dom[0]
           else:
             heights[i] = dom[dom.len div 2]
-    # Limit might be a variable - try constant, fall back to domain upper bound
+    # Limit might be a variable - try constant, fall back to variable limit
     var limit: int
+    var limitPos = -1
     try:
       limit = tr.resolveIntArg(con.args[3])
     except:
-      # Variable limit - use domain upper bound
+      # Variable limit - extract position, use domain upper bound as initial value
       let limitExpr = tr.resolveExprArg(con.args[3])
       if limitExpr.node.kind == RefNode:
-        let dom = tr.sys.baseArray.domain[limitExpr.node.position]
-        limit = dom[^1]  # upper bound
-        # Constrain the variable to equal the limit we're using
-        tr.sys.addConstraint(limitExpr == limit)
+        limitPos = limitExpr.node.position
+        let dom = tr.sys.baseArray.domain[limitPos]
+        limit = dom[^1]  # upper bound as initial value
       else:
         limit = 10  # fallback
-    tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, limit))
+    tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, limit, limitPos))
 
   of "fzn_diffn":
     # diffn(x, y, dx, dy) - non-overlapping rectangles
