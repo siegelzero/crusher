@@ -787,7 +787,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     ## then uses fast arithmetic for RelationalConstraint+SumExpr, falling back
     ## to simulate-restore for other constraint types.
     if pos notin state.carray.channelsAtPosition and
-       pos notin state.carray.minMaxChannelsAtPosition:
+       pos notin state.carray.minMaxChannelsAtPosition and
+       pos notin state.carray.inverseChannelsAtPosition:
         return 0
 
     assert not state.cdInUse, "computeChannelDepDelta is not reentrant"
@@ -878,6 +879,24 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            if p in state.carray.inverseChannelsAtPosition:
+                for gi in state.carray.inverseChannelsAtPosition[p]:
+                    let group = state.carray.inverseChannelGroups[gi]
+                    var newInverse = newSeq[T](group.inversePositions.len)
+                    for j in 0..<newInverse.len:
+                        newInverse[j] = group.defaultValue
+                    for i, fpos in group.forwardPositions:
+                        let v = state.assignment[fpos]
+                        let idx = v - group.inverseBase
+                        if idx >= 0 and idx < group.inversePositions.len:
+                            newInverse[idx] = T(i + group.forwardBase)
+                    for j, ipos in group.inversePositions:
+                        if newInverse[j] != state.assignment[ipos]:
+                            state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
+                            state.assignment[ipos] = newInverse[j]
+                            if ipos notin state.cdVisited:
+                                state.cdVisited.incl(ipos)
+                                state.cdWorklist.add(ipos)
     else:
         # General worklist propagation
         state.cdWorklist.setLen(0)
@@ -917,6 +936,24 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            if p in state.carray.inverseChannelsAtPosition:
+                for gi in state.carray.inverseChannelsAtPosition[p]:
+                    let group = state.carray.inverseChannelGroups[gi]
+                    var newInverse = newSeq[T](group.inversePositions.len)
+                    for j in 0..<newInverse.len:
+                        newInverse[j] = group.defaultValue
+                    for i, fpos in group.forwardPositions:
+                        let v = state.assignment[fpos]
+                        let idx = v - group.inverseBase
+                        if idx >= 0 and idx < group.inversePositions.len:
+                            newInverse[idx] = T(i + group.forwardBase)
+                    for j, ipos in group.inversePositions:
+                        if newInverse[j] != state.assignment[ipos]:
+                            state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
+                            state.assignment[ipos] = newInverse[j]
+                            if ipos notin state.cdVisited:
+                                state.cdVisited.incl(ipos)
+                                state.cdWorklist.add(ipos)
 
     # Restore all modified assignment values (reverse order for cdChanges because a
     # channel position can be modified multiple times when it depends on both the
@@ -1323,6 +1360,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if elem.isConstant: elem.constantValue
                 else: state.assignment[elem.variablePosition]
 
+    # Compute inverse channel initial values from forward assignments
+    for group in carray.inverseChannelGroups:
+        # Initialize all inverse positions to default
+        for ipos in group.inversePositions:
+            state.assignment[ipos] = group.defaultValue
+        # Set inverse[forward[i]] = i + forwardBase
+        for i, fpos in group.forwardPositions:
+            let v = state.assignment[fpos]
+            let idx = v - group.inverseBase
+            if idx >= 0 and idx < group.inversePositions.len:
+                state.assignment[group.inversePositions[idx]] = T(i + group.forwardBase)
+
     # Build flat min/max bindings: decompose expression trees into flat operations.
     # Expression trees can be DAGs (shared subtrees) causing exponential re-evaluation.
     # Flat bindings use O(1) position lookups and pre-evaluated constants instead.
@@ -1477,7 +1526,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.hasChannelDeps = true
         # Find search positions that have channel bindings (can affect channel-dep constraints)
         for pos in state.searchPositions:
-            if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition:
+            if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition or
+               pos in carray.inverseChannelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -1519,6 +1569,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             worklist.add(chanPos)
+                # Inverse channel bindings
+                if p in carray.inverseChannelsAtPosition:
+                    for gi in carray.inverseChannelsAtPosition[p]:
+                        let group = carray.inverseChannelGroups[gi]
+                        for ipos in group.inversePositions:
+                            reachable.incl(ipos)
+                            if ipos notin visited:
+                                visited.incl(ipos)
+                                worklist.add(ipos)
             # Collect channel-dep constraints reachable from this position
             var seen: PackedSet[int]  # dedup by constraint pointer
             var relevant: seq[StatefulConstraint[T]] = @[]
@@ -2518,6 +2577,40 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     if fb.channelPosition notin visited:
                         visited.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
+        # Inverse channel bindings: recompute inverse from forward assignments
+        if pos in state.carray.inverseChannelsAtPosition:
+            for gi in state.carray.inverseChannelsAtPosition[pos]:
+                let group = state.carray.inverseChannelGroups[gi]
+                # Recompute all inverse positions from scratch
+                var newInverse = newSeq[T](group.inversePositions.len)
+                for j in 0..<newInverse.len:
+                    newInverse[j] = group.defaultValue
+                for i, fpos in group.forwardPositions:
+                    let v = state.assignment[fpos]
+                    let idx = v - group.inverseBase
+                    if idx >= 0 and idx < group.inversePositions.len:
+                        newInverse[idx] = T(i + group.forwardBase)
+                # Apply changes
+                for j, ipos in group.inversePositions:
+                    if newInverse[j] != state.assignment[ipos]:
+                        result = true
+                        changedChannels.add(ipos)
+                        state.assignment[ipos] = newInverse[j]
+                        for c in state.constraintsAtPosition[ipos]:
+                            let oldPenalty = c.penalty()
+                            c.updatePosition(ipos, newInverse[j])
+                            let newPenalty = c.penalty()
+                            state.cost += newPenalty - oldPenalty
+                            if oldPenalty > 0 and newPenalty == 0:
+                                for pos in c.positions.items:
+                                    state.violationCount[pos] -= 1
+                            elif oldPenalty == 0 and newPenalty > 0:
+                                for pos in c.positions.items:
+                                    state.violationCount[pos] += 1
+                        state.updateNeighborPenalties(ipos)
+                        if ipos notin visited:
+                            visited.incl(ipos)
+                            worklist.add(ipos)
 
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
@@ -2565,6 +2658,29 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                     if fb.channelPosition notin visited:
                         visited.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
+        # Inverse channel bindings (lean: no penalty maps or violationCount)
+        if pos in state.carray.inverseChannelsAtPosition:
+            for gi in state.carray.inverseChannelsAtPosition[pos]:
+                let group = state.carray.inverseChannelGroups[gi]
+                var newInverse = newSeq[T](group.inversePositions.len)
+                for j in 0..<newInverse.len:
+                    newInverse[j] = group.defaultValue
+                for i, fpos in group.forwardPositions:
+                    let v = state.assignment[fpos]
+                    let idx = v - group.inverseBase
+                    if idx >= 0 and idx < group.inversePositions.len:
+                        newInverse[idx] = T(i + group.forwardBase)
+                for j, ipos in group.inversePositions:
+                    if newInverse[j] != state.assignment[ipos]:
+                        state.assignment[ipos] = newInverse[j]
+                        for c in state.constraintsAtPosition[ipos]:
+                            let oldPenalty = c.penalty()
+                            c.updatePosition(ipos, newInverse[j])
+                            let newPenalty = c.penalty()
+                            state.cost += newPenalty - oldPenalty
+                        if ipos notin visited:
+                            visited.incl(ipos)
+                            worklist.add(ipos)
 
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## Lightweight assignment: updates constraint state and cost but skips

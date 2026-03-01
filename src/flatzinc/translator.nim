@@ -127,6 +127,10 @@ type
     boolAndOrChannelDefs*: seq[int]
     # Detected NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
     noOverlapPatterns*: seq[NoOverlapPattern]
+    # Detected inverse channel patterns: element(person[p], seat, p) groups
+    inverseChannelPatterns*: seq[tuple[arrayName: string, elementCIs: seq[int],
+                                       indexVarNames: seq[string], resultValues: seq[int],
+                                       gccCIs: seq[int]]]
     # Tracks which output variables/arrays are boolean (for true/false formatting)
     outputBoolVars*: HashSet[string]
     outputBoolArrays*: HashSet[string]
@@ -4165,6 +4169,96 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
     stderr.writeLine(&"[FZN] Built {nBuilt} case-analysis channel bindings " &
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
+proc buildInverseChannelBindings(tr: var FznTranslator) =
+  ## Builds inverse channel groups from patterns detected by detectInverseChannelPatterns.
+  for pattern in tr.inverseChannelPatterns:
+    let arrayPositions = tr.arrayPositions[pattern.arrayName]
+    # Resolve forward (index) positions
+    var forwardPositions: seq[int]
+    for vn in pattern.indexVarNames:
+      forwardPositions.add(tr.varPositions[vn])
+
+    # Determine the forward base (minimum result value = the "name" of forwardPositions[0])
+    # and sort by result value to align positions with their result values
+    var pairs: seq[(int, int, string)]  # (resultValue, forwardPosition, varName)
+    for i in 0..<pattern.resultValues.len:
+      pairs.add((pattern.resultValues[i], forwardPositions[i], pattern.indexVarNames[i]))
+    pairs.sort(proc(a, b: (int, int, string)): int = cmp(a[0], b[0]))
+
+    var sortedForward: seq[int]
+    var sortedResults: seq[int]
+    for (rv, fp, _) in pairs:
+      sortedForward.add(fp)
+      sortedResults.add(rv)
+
+    let forwardBase = sortedResults[0]
+    # Verify result values are consecutive
+    var consecutive = true
+    for i in 1..<sortedResults.len:
+      if sortedResults[i] != sortedResults[i-1] + 1:
+        consecutive = false
+        break
+    if not consecutive:
+      stderr.writeLine(&"[FZN] Warning: inverse channel on '{pattern.arrayName}' has non-consecutive results, skipping")
+      continue
+
+    # Inverse base is 1 (FlatZinc arrays are 1-based)
+    let inverseBase = 1
+
+    # Default value: find a value in the inverse domain that is NOT in the result values
+    # Typically 0 for alldifferent_except_0 patterns
+    let resultSet = sortedResults.toHashSet()
+    var defaultValue = 0
+    if defaultValue in resultSet:
+      # Find any value not in the result set from the inverse domain
+      let dom = tr.sys.baseArray.domain[arrayPositions[0]]
+      for v in dom:
+        if v notin resultSet:
+          defaultValue = v
+          break
+
+    tr.sys.baseArray.addInverseChannelGroup(
+      sortedForward, arrayPositions, forwardBase, inverseBase, defaultValue)
+
+    # Domain reduction: if the inverse array has all-constant elements,
+    # each forward position is uniquely determined.
+    # element(forward[i], constantArray, i+forwardBase) means constantArray[forward[i]] = i+forwardBase
+    # So forward[i] = the unique index where constantArray has value (i+forwardBase).
+    var nReduced = 0
+    block:
+      # Get the array declaration elements
+      var arrayArg = FznExpr(kind: FznIdent, ident: pattern.arrayName)
+      let elems = tr.resolveVarArrayElems(arrayArg)
+      if elems.len > 0:
+        # Check if all elements are integer literals (constant array)
+        var allConstant = true
+        var constValues: seq[int]
+        for elem in elems:
+          if elem.kind == FznIntLit:
+            constValues.add(elem.intVal)
+          else:
+            allConstant = false
+            break
+
+        if allConstant:
+          # Build value -> 1-based index lookup
+          var valueToIndex: Table[int, int]
+          for idx, v in constValues:
+            valueToIndex[v] = idx + inverseBase  # 1-based FlatZinc index
+
+          # Reduce each forward position's domain to its unique value
+          for i, fpos in sortedForward:
+            let targetValue = i + forwardBase  # what constantArray[forward[i]] must equal
+            if targetValue in valueToIndex:
+              let requiredIdx = valueToIndex[targetValue]
+              tr.sys.baseArray.domain[fpos] = @[requiredIdx]
+              inc nReduced
+
+    stderr.writeLine(&"[FZN] Built inverse channel group on '{pattern.arrayName}': " &
+                     &"{sortedForward.len} forward + {arrayPositions.len} inverse positions, " &
+                     &"forwardBase={forwardBase}, defaultValue={defaultValue}" &
+                     (if nReduced > 0: &", {nReduced} forward domains fixed" else: ""))
+
 proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
   ## Resolves a FznExpr to variable names (for ordering detection).
   ## Only handles inline array literals since this runs before translateVariables.
@@ -4303,6 +4397,161 @@ proc detectInversePatterns(tr: var FznTranslator) =
 
     stderr.writeLine(&"[FZN] Detected involution on array '{arrName}': {n} positions, " &
                      &"{ciList.len} element + {nAllDiffRemoved} all_different constraints consumed")
+
+
+proc detectInverseChannelPatterns(tr: var FznTranslator) =
+  ## Detects inverse channel patterns from array_var_int_element constraints.
+  ## Pattern: for an array A of size S, P constraints of the form
+  ##   array_var_int_element(index_p, A, p)  for p in 1..P
+  ## where index_p are distinct positioned variables NOT in A, and p is a constant.
+  ## This encodes A[index_p] = p, i.e., A is the inverse of the index variables.
+  ## The A positions become channel variables.
+  ## Also consumes matching GCC/alldifferent_except_0 constraints on A.
+
+  # Step 1: Group array_var_int_element constraints by their array argument
+  var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
+      continue
+    if con.hasAnnotation("defines_var"):
+      continue
+    # Array argument is arg[1] — must be a named array
+    let arrArg = con.args[1]
+    if arrArg.kind != FznIdent:
+      continue
+    # Index arg[0] must be a named variable
+    if con.args[0].kind != FznIdent:
+      continue
+    # Result arg[2] must be a constant integer
+    if con.args[2].kind != FznIntLit:
+      continue
+    let arrName = arrArg.ident
+    if arrName notin arrayGroups:
+      arrayGroups[arrName] = @[]
+    arrayGroups[arrName].add(ci)
+
+  # Step 2: For each group, check if it forms an inverse channel pattern
+  for arrName, ciList in arrayGroups:
+    if arrName notin tr.arrayPositions:
+      continue
+    let arrayPositions = tr.arrayPositions[arrName]
+    let arraySize = arrayPositions.len
+
+    # Get element names for the array (to detect involution overlap)
+    var arrayElemNames: HashSet[string]
+    if arrName in tr.arrayElementNames:
+      for n in tr.arrayElementNames[arrName]:
+        arrayElemNames.incl(n)
+
+    # Collect index var names and result values
+    var indexVarNames: seq[string]
+    var resultValues: seq[int]
+    var resultSet: HashSet[int]
+    var allValid = true
+    var isInvolution = true  # check if index vars ARE the array elements
+    for ci in ciList:
+      let con = tr.model.constraints[ci]
+      let indexName = con.args[0].ident
+      let resultVal = con.args[2].intVal
+
+      # Index must be a positioned variable
+      if indexName notin tr.varPositions:
+        allValid = false
+        break
+      # Check for duplicate result values
+      if resultVal in resultSet:
+        allValid = false
+        break
+      resultSet.incl(resultVal)
+      indexVarNames.add(indexName)
+      resultValues.add(resultVal)
+
+      # Check if this is an involution (index var is from the same array)
+      if indexName notin arrayElemNames:
+        isInvolution = false
+
+    if not allValid:
+      continue
+    # Skip involution patterns (handled by detectInversePatterns)
+    if isInvolution:
+      continue
+    # Need at least 2 constraints
+    if ciList.len < 2:
+      continue
+    # All index vars must be distinct
+    if indexVarNames.toHashSet().len != indexVarNames.len:
+      continue
+
+    # Result values must be valid indices into the array (1-based)
+    var resultValsValid = true
+    for rv in resultValues:
+      if rv < 1 or rv > arraySize:
+        resultValsValid = false
+        break
+    if not resultValsValid:
+      continue
+
+    # Find matching GCC or alldifferent_except_0 constraints on the array positions
+    let arrayPosSet = toPackedSet(arrayPositions)
+    var gccCIs: seq[int]
+    for ci2, con2 in tr.model.constraints:
+      if ci2 in tr.definingConstraints:
+        continue
+      let cname = stripSolverPrefix(con2.name)
+      case cname
+      of "fzn_global_cardinality", "fzn_global_cardinality_closed",
+         "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed":
+        # Check if the x array covers our array positions
+        let varElems = tr.resolveVarArrayElems(con2.args[0])
+        if varElems.len == 0: continue
+        var positions: seq[int]
+        var match = true
+        for elem in varElems:
+          if elem.kind != FznIdent or elem.ident notin tr.varPositions:
+            match = false
+            break
+          positions.add(tr.varPositions[elem.ident])
+        if not match: continue
+        if toPackedSet(positions) == arrayPosSet:
+          gccCIs.add(ci2)
+      of "fzn_all_different_int", "all_different_int", "fzn_alldifferent_except_0":
+        let varElems = tr.resolveVarArrayElems(con2.args[0])
+        if varElems.len == 0: continue
+        var positions: seq[int]
+        var match = true
+        for elem in varElems:
+          if elem.kind != FznIdent or elem.ident notin tr.varPositions:
+            match = false
+            break
+          positions.add(tr.varPositions[elem.ident])
+        if not match: continue
+        if toPackedSet(positions) == arrayPosSet:
+          gccCIs.add(ci2)
+      else:
+        discard
+
+    # Mark element constraints as consumed
+    for ci in ciList:
+      tr.definingConstraints.incl(ci)
+    # Mark GCC/alldifferent constraints as consumed
+    for ci2 in gccCIs:
+      tr.definingConstraints.incl(ci2)
+
+    # Store the pattern
+    tr.inverseChannelPatterns.add((
+      arrayName: arrName,
+      elementCIs: ciList,
+      indexVarNames: indexVarNames,
+      resultValues: resultValues,
+      gccCIs: gccCIs
+    ))
+
+    stderr.writeLine(&"[FZN] Detected inverse channel on array '{arrName}': " &
+                     &"{ciList.len} element + {gccCIs.len} GCC/alldiff constraints consumed, " &
+                     &"{arraySize} inverse positions become channels")
 
 
 proc detectRedundantOrderings(tr: var FznTranslator) =
@@ -4615,6 +4864,9 @@ proc translate*(model: FznModel): FznTranslator =
 
   # Detect involution patterns (array_var_int_element groups encoding A[A[i]]=i)
   result.detectInversePatterns()
+
+  # Detect inverse channel patterns (element(person[p], seat, p) groups)
+  result.detectInverseChannelPatterns()
 
   # If geost conversion is active, record board positions and create tile variables
   let gc = result.geostConversion
@@ -4964,5 +5216,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildMinMaxChannelBindings()
   # Build channel bindings for case-analysis channels (constant lookup tables)
   result.buildCaseAnalysisChannelBindings()
+  # Build inverse channel groups (inverse relationship: seat[person[p]] = p)
+  result.buildInverseChannelBindings()
 
   result.translateSolve()

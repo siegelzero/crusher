@@ -33,6 +33,15 @@ type
         positions*: seq[int]   # System positions [index 0 = team 0+offset, etc.]
         valueOffset*: int      # group_index = value + valueOffset (e.g., -1 for 1-based teams)
 
+    InverseChannelGroup*[T] = object
+        ## A group encoding an inverse relationship: inverse[forward[i]] = i.
+        ## Forward positions are searched; inverse positions are channels.
+        forwardPositions*: seq[int]  # searched positions (e.g., person vars)
+        inversePositions*: seq[int]  # channel positions (e.g., seat vars)
+        forwardBase*: int            # value representing forwardPositions[0] (e.g., 1)
+        inverseBase*: int            # value representing inversePositions[0] (e.g., 1)
+        defaultValue*: T             # value for unmapped inverse slots (e.g., 0)
+
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
@@ -49,6 +58,8 @@ type
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
         inverseGroups*: seq[InverseGroup[T]]
+        inverseChannelGroups*: seq[InverseChannelGroup[T]]
+        inverseChannelsAtPosition*: Table[int, seq[int]]  # forward_pos → [group indices]
 
 ################################################################################
 # Value Extraction
@@ -195,6 +206,30 @@ proc addInverseGroup*[T](arr: var ConstrainedArray[T],
         positions: positions,
         valueOffset: valueOffset
     ))
+
+proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
+                                 forwardPositions, inversePositions: seq[int],
+                                 forwardBase, inverseBase: int,
+                                 defaultValue: T) =
+    ## Register an inverse channel group: inverse[forward[i]] = i.
+    ## Inverse positions become channel variables.
+    let gi = arr.inverseChannelGroups.len
+    arr.inverseChannelGroups.add(InverseChannelGroup[T](
+        forwardPositions: forwardPositions,
+        inversePositions: inversePositions,
+        forwardBase: forwardBase,
+        inverseBase: inverseBase,
+        defaultValue: defaultValue
+    ))
+    # Mark inverse positions as channels
+    for pos in inversePositions:
+        arr.channelPositions.incl(pos)
+    # Build reverse lookup: forward position → group indices
+    for pos in forwardPositions:
+        if pos notin arr.inverseChannelsAtPosition:
+            arr.inverseChannelsAtPosition[pos] = @[gi]
+        else:
+            arr.inverseChannelsAtPosition[pos].add(gi)
 
 ################################################################################
 # Bounds propagation helpers
@@ -2100,4 +2135,8 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups
+
+    # Inverse channel groups are all value types — shallow copy is fine
+    result.inverseChannelGroups = arr.inverseChannelGroups
+    result.inverseChannelsAtPosition = arr.inverseChannelsAtPosition
 
