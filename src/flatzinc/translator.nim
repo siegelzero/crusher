@@ -134,6 +134,8 @@ type
     # Tracks which output variables/arrays are boolean (for true/false formatting)
     outputBoolVars*: HashSet[string]
     outputBoolArrays*: HashSet[string]
+    # Equality copy aliases: maps eliminated copy var name → original var name
+    equalityCopyAliases*: Table[string, string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -2083,6 +2085,75 @@ proc detectReifChannels(tr: var FznTranslator) =
      tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
      tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0:
     stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif")
+
+
+proc detectEqualityCopyVars(tr: var FznTranslator) =
+  ## Detects "equality copy" variables: vars that are copies of another variable
+  ## linked via int_eq_reif(copy, original, indicator) :: defines_var(indicator),
+  ## where the copy only appears in defines_var constraints.
+  ## These copies are eliminated by aliasing them to the original variable.
+
+  # Phase 1: Build set of variable names referenced by "real" (non-defines_var) constraints
+  var nonDefinesVarRefs: HashSet[string]
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    if con.hasAnnotation("defines_var"):
+      continue
+    # Collect all FznIdent names from arguments
+    for arg in con.args:
+      if arg.kind == FznIdent:
+        nonDefinesVarRefs.incl(arg.ident)
+      elif arg.kind == FznArrayLit:
+        for elem in arg.elems:
+          if elem.kind == FznIdent:
+            nonDefinesVarRefs.incl(elem.ident)
+
+  # Phase 2: Scan reifChannelDefs for int_eq_reif(A, B, indicator) where A is a copy of B
+  var candidates: Table[string, string]  # copy → original
+  for ci in tr.reifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    if name != "int_eq_reif":
+      continue
+    let arg0 = con.args[0]
+    let arg1 = con.args[1]
+    # Both must be identifiers (variables, not constants)
+    if arg0.kind != FznIdent or arg1.kind != FznIdent:
+      continue
+    let aName = arg0.ident
+    let bName = arg1.ident
+    # A (the copy) must not be in any real constraint, and not already defined/channel/param
+    if aName in nonDefinesVarRefs:
+      continue
+    if aName in tr.definedVarNames or aName in tr.channelVarNames or aName in tr.paramValues:
+      continue
+    # B (the original) must not be a parameter
+    if bName in tr.paramValues:
+      continue
+    # First match per A wins
+    if aName notin candidates:
+      candidates[aName] = bName
+
+  if candidates.len == 0:
+    return
+
+  # Phase 3: Resolve chains (A→B→C becomes A→C)
+  for copyName in candidates.keys:
+    var target = candidates[copyName]
+    var visited: HashSet[string]
+    visited.incl(copyName)
+    while target in candidates and target notin visited:
+      visited.incl(target)
+      target = candidates[target]
+    candidates[copyName] = target
+
+  # Commit: mark copies as defined variables and store aliases
+  for copyName, originalName in candidates:
+    tr.definedVarNames.incl(copyName)
+    tr.equalityCopyAliases[copyName] = originalName
+
+  stderr.writeLine(&"[FZN] Detected {candidates.len} equality copy variables ({candidates.len} search positions eliminated)")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -4766,6 +4837,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.channelVarNames = initHashSet[string]()
   result.channelConstraints = initTable[int, string]()
   result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
+  result.equalityCopyAliases = initTable[string, string]()
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()
@@ -4775,6 +4847,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCountPatterns()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
+  # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
+  result.detectEqualityCopyVars()
   # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
   result.detectCaseAnalysisChannels()
   # Detect implication-to-table and one-hot channel patterns
@@ -4790,6 +4864,12 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+  # Build expressions for equality copy aliases (copy → original's expression)
+  for copyName, originalName in result.equalityCopyAliases:
+    if originalName in result.varPositions:
+      result.definedVarExprs[copyName] = result.getExpr(result.varPositions[originalName])
+    elif originalName in result.definedVarExprs:
+      result.definedVarExprs[copyName] = result.definedVarExprs[originalName]
   # Build set of variable names that are inputs to min/max channels.
   # Bounds on these intermediate variables are MiniZinc domain analysis artifacts,
   # not problem constraints. The min/max channel propagation maintains correct values
