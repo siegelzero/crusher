@@ -136,6 +136,8 @@ type
     outputBoolArrays*: HashSet[string]
     # Equality copy aliases: maps eliminated copy var name → original var name
     equalityCopyAliases*: Table[string, string]
+    # Constraint indices of int_eq_reif that are equality copies (skip in buildReifChannelBindings)
+    equalityCopyReifCIs*: PackedSet[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -2111,6 +2113,7 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
 
   # Phase 2: Scan reifChannelDefs for int_eq_reif(A, B, indicator) where A is a copy of B
   var candidates: Table[string, string]  # copy → original
+  var candidateCIs: Table[string, int]   # copy → constraint index
   for ci in tr.reifChannelDefs:
     let con = tr.model.constraints[ci]
     let name = stripSolverPrefix(con.name)
@@ -2134,11 +2137,13 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
     # First match per A wins
     if aName notin candidates:
       candidates[aName] = bName
+      candidateCIs[aName] = ci
 
   if candidates.len == 0:
     return
 
-  # Phase 3: Resolve chains (A→B→C becomes A→C)
+  # Phase 3: Resolve chains (A→B→C becomes A→C), drop self-cycles
+  var toRemove: seq[string]
   for copyName in candidates.keys:
     var target = candidates[copyName]
     var visited: HashSet[string]
@@ -2146,14 +2151,25 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
     while target in candidates and target notin visited:
       visited.incl(target)
       target = candidates[target]
-    candidates[copyName] = target
+    if target == copyName:
+      # Self-cycle (A→B→...→A) — can't resolve, skip
+      toRemove.add(copyName)
+    else:
+      candidates[copyName] = target
+  for name in toRemove:
+    candidates.del(name)
+    candidateCIs.del(name)
 
-  # Commit: mark copies as defined variables and store aliases
+  if candidates.len == 0:
+    return
+
+  # Commit: mark copies as defined variables and store aliases + reif constraint indices
   for copyName, originalName in candidates:
     tr.definedVarNames.incl(copyName)
     tr.equalityCopyAliases[copyName] = originalName
+    tr.equalityCopyReifCIs.incl(candidateCIs[copyName])
 
-  stderr.writeLine(&"[FZN] Detected {candidates.len} equality copy variables ({candidates.len} search positions eliminated)")
+  stderr.writeLine(&"[FZN] Detected {candidates.len} equality copy variables")
 
 
 proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
@@ -2184,6 +2200,26 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
 
   # Process int_eq_reif channels first (bool2int depends on these)
   for ci in tr.reifChannelDefs:
+    if ci in tr.equalityCopyReifCIs:
+      # Equality copy: copy == original is always true, build constant-1 channel for indicator
+      let con = tr.model.constraints[ci]
+      let bName = con.args[2].ident
+      if bName in tr.varPositions:
+        let bPos = tr.varPositions[bName]
+        let indexExpr = AlgebraicExpression[int](
+          node: ExpressionNode[int](kind: LiteralNode, value: 0),
+          positions: initPackedSet[int](),
+          linear: true
+        )
+        let binding = ChannelBinding[int](
+          channelPosition: bPos,
+          indexExpression: indexExpr,
+          arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 1)]
+        )
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+        # No entries in channelsAtPosition — no source positions, binding is constant
+      continue
     let con = tr.model.constraints[ci]
     let bName = con.args[2].ident
     if bName notin tr.varPositions:
@@ -4838,6 +4874,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.channelConstraints = initTable[int, string]()
   result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
   result.equalityCopyAliases = initTable[string, string]()
+  result.equalityCopyReifCIs = initPackedSet[int]()
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()

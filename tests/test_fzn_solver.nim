@@ -1,5 +1,5 @@
 import unittest
-import std/[sequtils, algorithm, sets, tables, strutils]
+import std/[sequtils, algorithm, sets, tables, strutils, packedsets]
 
 import crusher
 import flatzinc/[parser, translator, output]
@@ -143,3 +143,78 @@ solve satisfy;
     check "x = " in output
     check "y = " in output
     check "arr = array1d(1..2," in output
+
+  test "equality copy variable detected and eliminated":
+    # xcopy only appears in a defines_var constraint: int_eq_reif(xcopy, x, b).
+    # It should be detected as an equality copy alias of x and eliminated.
+    # The indicator b should become a constant-1 channel (since copy == original
+    # is always true). bi (via bool2int) should also be 1.
+    let src = """
+var 1..5: x:: output_var;
+var 1..5: xcopy;
+var 0..1: b;
+var 0..1: bi:: output_var;
+var 1..5: y:: output_var;
+constraint int_eq_reif(xcopy, x, b):: defines_var(b);
+constraint bool2int(b, bi):: defines_var(bi);
+constraint int_lin_eq([1,1],[x,y],6);
+constraint fzn_all_different_int([x,y]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # xcopy should be detected as an equality copy alias of x
+    check "xcopy" in tr.equalityCopyAliases
+    check tr.equalityCopyAliases["xcopy"] == "x"
+
+    # xcopy should be eliminated (no position allocated)
+    check "xcopy" notin tr.varPositions
+
+    # b should be a channel position (not searched)
+    check "b" in tr.varPositions
+    let bPos = tr.varPositions["b"]
+    check bPos in tr.sys.baseArray.channelPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # b should always be 1 (equality copy → constant-1 channel)
+    check tr.sys.assignment[bPos] == 1
+
+    # bi should also be 1 (bool2int of b)
+    if "bi" in tr.varPositions:
+      check tr.sys.assignment[tr.varPositions["bi"]] == 1
+
+    # Real constraints should be satisfied
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal + yVal == 6
+    check xVal != yVal
+
+  test "equality copy cycle detection — no crash":
+    # a and b form a cycle: int_eq_reif(a, b, ind1) and int_eq_reif(b, a, ind2).
+    # Neither should be eliminated (cycle detected and skipped).
+    let src = """
+var 1..3: a;
+var 1..3: b;
+var 0..1: ind1;
+var 0..1: ind2;
+var 1..3: x:: output_var;
+constraint int_eq_reif(a, b, ind1):: defines_var(ind1);
+constraint int_eq_reif(b, a, ind2):: defines_var(ind2);
+constraint int_eq(x, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Cycle should be detected — neither a nor b should be in equalityCopyAliases
+    check "a" notin tr.equalityCopyAliases
+    check "b" notin tr.equalityCopyAliases
+
+    # Both should still have positions (not eliminated)
+    check "a" in tr.varPositions
+    check "b" in tr.varPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    check tr.sys.assignment[tr.varPositions["x"]] == 2
