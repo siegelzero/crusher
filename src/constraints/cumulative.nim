@@ -338,7 +338,7 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
     result = initPackedSet[int]()
 
     # If the limit changed, all task positions and the limit position are affected
-    if state.lastChangedPosition == state.limitPosition:
+    if state.limitPosition >= 0 and state.lastChangedPosition == state.limitPosition:
         case state.evalMethod:
             of PositionBased:
                 for pos in state.originPositions:
@@ -387,7 +387,7 @@ proc getAffectedDomainValues*[T](state: CumulativeConstraint[T], position: int):
     result = @[]
 
     # If limit changed, all domain values are affected for every position
-    if state.lastChangedPosition == state.limitPosition:
+    if state.limitPosition >= 0 and state.lastChangedPosition == state.limitPosition:
         return result  # empty = all values
 
     # If querying the limit position, all limit values are affected

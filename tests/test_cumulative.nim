@@ -277,3 +277,88 @@ suite "Cumulative Constraint Tests":
         echo "  Start times: ", solution
 
         check actualMakespan == OptimalMakespan
+
+    test "Variable limit - basic":
+        # The limit is a decision variable; solver must find a feasible assignment
+        # for both task origins and the limit value
+        var sys = initConstraintSystem[int]()
+
+        # 3 tasks + 1 limit variable
+        var origins = sys.newConstrainedSequence(3)
+        origins.setDomain(toSeq(1..15))
+        var limitVar = sys.newConstrainedVariable()
+        limitVar.setDomain(toSeq(3..10))
+
+        let durations = @[3, 4, 2]
+        let heights = @[2, 3, 2]
+
+        # limitVar is at position 3 (after origins 0,1,2)
+        sys.addConstraint(cumulative[int]([0, 1, 2], durations, heights,
+                                          limit = 10, limitPosition = 3))
+
+        sys.resolve(parallel=true)
+
+        let solution = origins.assignment
+        let assignedLimit = limitVar.assignment
+        check validateCumulativeSolution(solution, durations, heights, assignedLimit)
+
+    test "Variable limit - optimization (minimize limit)":
+        # Minimize the resource capacity needed to schedule all tasks
+        var sys = initConstraintSystem[int]()
+
+        var origins = sys.newConstrainedSequence(3)
+        origins.setDomain(toSeq(1..20))
+        var limitVar = sys.newConstrainedVariable()
+        limitVar.setDomain(toSeq(1..10))
+
+        # 3 tasks: each height=3, duration=5
+        # With 3 tasks in domain 1..20, they can be spread out to avoid overlap
+        # Minimum possible limit = 3 (one task at a time)
+        let durations = @[5, 5, 5]
+        let heights = @[3, 3, 3]
+
+        sys.addConstraint(cumulative[int]([0, 1, 2], durations, heights,
+                                          limit = 10, limitPosition = 3))
+
+        sys.minimize(AlgebraicExpression[int](limitVar), parallel=true, verbose=false,
+                     populationSize=10, tabuThreshold=100)
+
+        let solution = origins.assignment
+        let assignedLimit = limitVar.assignment
+        check validateCumulativeSolution(solution, durations, heights, assignedLimit)
+
+        # With enough time domain, tasks can be sequential -> limit = 3
+        echo "  Variable limit optimized to: ", assignedLimit
+        check assignedLimit == 3
+
+    test "Variable limit - expression-based origins":
+        # Combine variable limit with expression-based origin times
+        var sys = initConstraintSystem[int]()
+
+        var x = sys.newConstrainedSequence(3)
+        x.setDomain(toSeq(0..12))
+        var limitVar = sys.newConstrainedVariable()
+        limitVar.setDomain(toSeq(4..10))
+
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0])
+        originExprs.add(x[1] + 1)
+        originExprs.add(x[2] + 2)
+
+        let durations = @[2, 3, 2]
+        let heights = @[3, 2, 3]
+
+        # limitVar is at position 3
+        sys.addConstraint(cumulative[int](originExprs, durations, heights,
+                                          limit = 10, limitPosition = 3))
+
+        sys.resolve(parallel=true)
+
+        let assignment = x.assignment
+        let assignedLimit = limitVar.assignment
+        let actualOrigins = @[
+            assignment[0],
+            assignment[1] + 1,
+            assignment[2] + 2
+        ]
+        check validateCumulativeSolution(actualOrigins, durations, heights, assignedLimit)
