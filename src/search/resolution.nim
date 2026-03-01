@@ -50,7 +50,6 @@ proc resolve*[T](system: ConstraintSystem[T],
     # created as @[first_value] for skipped positions. Keep the original domain intact
     # so bounds propagation can use the correct endpoints on subsequent optimization probes.
     # Note: reducedDomain is what gets deepCopied for each parallel state, not domain.
-    discard  # reducedDomain already shrunk by reduceDomain() for skipped channel positions
 
     if parallel:
         # Use persisted adapted threshold if available, otherwise caller's value

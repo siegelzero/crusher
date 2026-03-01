@@ -37,6 +37,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var currentCost = objective.value
         var hasBoundConstraint = false
         system.hasFeasibleSolution = true
+        # Cache the base reduced domain (without objective bound constraint).
+        # Subsequent iterations only change the bound — no need to recompute.
+        let baseReducedDomain = system.baseArray.reducedDomain
 
         echo "[Opt] Initial solution: ", currentCost
 
@@ -69,6 +72,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             else:
                 system.addConstraint(objective >= target)
             hasBoundConstraint = true
+            system.baseArray.reducedDomain = baseReducedDomain
 
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
@@ -143,6 +147,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     system.addConstraint(objective >= currentCost + 1)
                 hasBoundConstraint = true
+                system.baseArray.reducedDomain = baseReducedDomain
 
                 try:
                     system.resolve(
