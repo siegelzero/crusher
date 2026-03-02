@@ -68,7 +68,7 @@ proc solveNewspaper(): tuple[solution: seq[int], makespan: int] =
 
     let makespan = max(endExpressions)
 
-    sys.minimize(makespan, parallel=true, verbose=true,
+    sys.minimize(makespan, parallel=true,
                  tabuThreshold=100)
 
     let solution = startTimes.assignment

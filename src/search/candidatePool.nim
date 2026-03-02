@@ -87,7 +87,7 @@ iterator pairs*[T](pool: CandidatePool[T]): (int, int) =
         for j in 0..<i:
             yield (i, j)
 
-proc poolStatistics*[T](pool: CandidatePool[T], verbose: bool = true) =
+proc poolStatistics*[T](pool: CandidatePool[T], verbose: bool = false) =
     if not verbose or pool.entries.len == 0:
         return
     var poolSum = 0

@@ -72,7 +72,7 @@ suite "de Bruijn binary sequence":
     # Equal counts
     sys.addConstraint(b.sum() == m div 2)
 
-    sys.resolve(parallel = true, tabuThreshold = 10000, verbose = true)
+    sys.resolve(parallel = true, tabuThreshold = 10000)
 
     let sol = b.assignment()
 

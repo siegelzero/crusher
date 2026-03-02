@@ -22,9 +22,8 @@ proc testParallelMagicSquare() =
     for col in magic_square.columns:
         system.addConstraint(sum(col) == 15)
 
-    # Test parallel resolution using resolve with parallel=true and verbose=true
     let start_time = cpuTime()
-    resolve(system, tabuThreshold=5000, parallel=true, populationSize=8, numWorkers=2, verbose=true)
+    resolve(system, tabuThreshold=5000, parallel=true, populationSize=8, numWorkers=2)
     let parallel_time = cpuTime() - start_time
     let solution = system.assignment
 
@@ -62,10 +61,9 @@ proc testParallelResolve() =
     system.addConstraint(sequence.allDifferent())
 
     # Test parallelResolve directly
-    echo "Testing parallelResolve with verbose logging:"
     var pool: CandidatePool[int]
     var adaptedThreshold = 1000
-    discard parallelResolve(system, populationSize=8, numWorkers=2, tabuThreshold=1000, verbose=true, failedPool=pool, adaptedThreshold=adaptedThreshold)
+    discard parallelResolve(system, populationSize=8, numWorkers=2, tabuThreshold=1000, failedPool=pool, adaptedThreshold=adaptedThreshold)
 
     # Check that a solution was found
     check(system.assignment.len == 4)
@@ -101,8 +99,7 @@ proc testParallelVsSequential() =
     # Parallel test with verbose logging
     let system2 = system.deepCopy()
     let start_par = cpuTime()
-    echo "Testing parallel vs sequential with verbose logging:"
-    resolve(system2, tabuThreshold=5000, parallel=true, populationSize=4, numWorkers=2, verbose=true)
+    resolve(system2, tabuThreshold=5000, parallel=true, populationSize=4, numWorkers=2)
     let par_time = cpuTime() - start_par
 
     check(sequential_result.bestCost == 0)

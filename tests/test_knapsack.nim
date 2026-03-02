@@ -31,7 +31,7 @@ suite "Knapsack Problem Tests":
             profitSum = profitSum + profits[i] * x[i]
 
         # Solve using maximization
-        sys.maximize(profitSum, parallel=true, verbose=true)
+        sys.maximize(profitSum, parallel=true)
 
         # Verify the solution
         let solution = x.assignment

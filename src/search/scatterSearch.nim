@@ -224,7 +224,7 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                         tabuThreshold: int = 10000,
                         relinkThreshold: int = 5000,
                         numWorkers: int = 0,
-                        verbose: bool = true,
+                        verbose: bool = false,
                         deadline: float = 0.0): bool =
     ## Run scatter search iterations on an existing pool.
     ## Returns true if solution found (system is initialized).
@@ -562,7 +562,7 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
                     scatterThreshold: int = 3,
                     tabuThreshold: int = 10000,
                     numWorkers: int = 0,
-                    verbose: bool = true,
+                    verbose: bool = false,
                     deadline: float = 0.0): bool =
     ## Constraint-Group LNS: destroy positions covered by random compact constraints,
     ## then repair with tabu search. O(poolSize) per iteration instead of O(poolSize^2).
@@ -750,7 +750,7 @@ proc scatterResolve*[T](system: ConstraintSystem[T],
                         tabuThreshold: int = 10000,
                         relinkThreshold: int = 5000,
                         numWorkers: int = 0,
-                        verbose: bool = true) =
+                        verbose: bool = false) =
     ## Scatter search: population-based metaheuristic combining path relinking with tabu search.
 
     let actualWorkers = if numWorkers <= 0: getOptimalWorkerCount() else: numWorkers

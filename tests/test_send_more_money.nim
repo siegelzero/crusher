@@ -29,7 +29,7 @@ suite "SEND + MORE == MONEY Tests":
         sys.addConstraint(value[M] > 0)
 
         # Solve the constraint system
-        sys.resolve(10000, parallel=true, verbose=true)
+        sys.resolve(10000, parallel=true)
 
         # Extract the solution
         let solution = value.assignment()

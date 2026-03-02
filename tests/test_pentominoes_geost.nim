@@ -150,7 +150,7 @@ proc displayBoard(width, height, ntiles: int, assignments: seq[int],
 # ─── Reusable solve proc ─────────────────────────────────────────────────────
 
 proc solveInstance(instanceFile: string, tabuThreshold: int = 100000,
-                   parallel: bool = true, verbose: bool = true): bool =
+                   parallel: bool = true, verbose: bool = false): bool =
     let data = parseDzn(instanceFile)
     echo &"\n=== {instanceFile.extractFilename} ==="
     echo &"Board: {data.width}x{data.height}, {data.ntiles} tiles"
