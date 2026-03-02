@@ -63,6 +63,7 @@ type
         inverseGroups*: seq[InverseGroup[T]]
         inverseChannelGroups*: seq[InverseChannelGroup[T]]
         inverseChannelsAtPosition*: Table[int, seq[int]]  # forward_pos → [group indices]
+        elementInverseDetected*: bool  # guard: detectElementInverseChannels already ran
 
 ################################################################################
 # Value Extraction
@@ -213,35 +214,11 @@ proc addInverseGroup*[T](arr: var ConstrainedArray[T],
 proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
                                  forwardPositions, inversePositions: seq[int],
                                  forwardBase, inverseBase: int,
-                                 defaultValue: T) =
-    ## Register an inverse channel group: inverse[forward[i]] = i.
-    ## Inverse positions become channel variables.
-    let gi = arr.inverseChannelGroups.len
-    arr.inverseChannelGroups.add(InverseChannelGroup[T](
-        forwardPositions: forwardPositions,
-        inversePositions: inversePositions,
-        forwardBase: forwardBase,
-        inverseBase: inverseBase,
-        defaultValue: defaultValue
-    ))
-    # Mark inverse positions as channels
-    for pos in inversePositions:
-        arr.channelPositions.incl(pos)
-    # Build reverse lookup: forward position → group indices
-    for pos in forwardPositions:
-        if pos notin arr.inverseChannelsAtPosition:
-            arr.inverseChannelsAtPosition[pos] = @[gi]
-        else:
-            arr.inverseChannelsAtPosition[pos].add(gi)
-
-proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
-                                 forwardPositions, inversePositions: seq[int],
-                                 forwardBase, inverseBase: int,
                                  defaultValue: T,
-                                 forwardValues: seq[T]) =
-    ## Register an inverse channel group with explicit forward values.
-    ## inverse[forward[i]] = forwardValues[i] instead of i + forwardBase.
-    ## Supports duplicate values (e.g., Langford sequences).
+                                 forwardValues: seq[T] = @[]) =
+    ## Register an inverse channel group: inverse[forward[i]] = i + forwardBase.
+    ## When forwardValues is non-empty, inverse[forward[i]] = forwardValues[i] instead.
+    ## Inverse positions become channel variables.
     let gi = arr.inverseChannelGroups.len
     arr.inverseChannelGroups.add(InverseChannelGroup[T](
         forwardPositions: forwardPositions,
@@ -286,6 +263,9 @@ proc detectElementInverseChannels*[T](arr: var ConstrainedArray[T]) =
     ## and converts the array positions into inverse channel variables.
     ## This handles patterns like Langford sequences where element(position[i], solution, i)
     ## makes solution fully determined by position.
+
+    if arr.elementInverseDetected: return
+    arr.elementInverseDetected = true
 
     # Step 1: Find element constraints with singleton-domain value positions
     type ElementInfo = object
@@ -2303,4 +2283,5 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Inverse channel groups are all value types — shallow copy is fine
     result.inverseChannelGroups = arr.inverseChannelGroups
     result.inverseChannelsAtPosition = arr.inverseChannelsAtPosition
+    result.elementInverseDetected = arr.elementInverseDetected
 
