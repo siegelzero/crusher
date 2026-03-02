@@ -69,7 +69,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             raise newException(TimeLimitExceededError, "Time limit exceeded")
 
         # Parallel tabu failed — continue with scatter search using collected results
-        if pool.entries.len > 0:
+        if pool.entries.len > 0 and scatterThreshold > 0:
             let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
             if verbose:
                 echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy}, adaptedThreshold={adaptedThreshold})"

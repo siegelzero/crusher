@@ -51,7 +51,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
-        # Phase 1: Binary search — fast probes without deadlines
+        # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
             echo "[Opt] Binary search [", lo, "..", hi, "]"
 
@@ -85,12 +85,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.resolve(
                     parallel=parallel,
                     tabuThreshold=tabuThreshold,
-                    scatterThreshold=scatterThreshold,
+                    scatterThreshold=0,
                     populationSize=populationSize,
                     numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
-                    deadline=0.0,
+                    deadline=deadline,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
@@ -102,6 +102,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = currentCost - 1
                 else:
                     lo = currentCost + 1
+            except TimeLimitExceededError:
+                system.initialize(bestSolution)
+                objective.initialize(system.assignment)
+                system.searchCompleted = false
+                break
             except InfeasibleError:
                 # Domain reduction proved no solution at this bound — narrow range
                 system.initialize(bestSolution)
@@ -120,7 +125,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = target - 1
 
         # Retry: binary search narrows conservatively (NoSolutionFoundError = infeasible).
-        # Try once more to beat the current best.
+        # Try once more to beat the current best, deepening threshold on each failure.
+        var retryThreshold = tabuThreshold
         block retryLoop:
             while true:
                 if deadline > 0 and epochTime() > deadline:
@@ -141,17 +147,23 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 try:
                     system.resolve(
                         parallel=parallel,
-                        tabuThreshold=tabuThreshold,
+                        tabuThreshold=retryThreshold,
                         scatterThreshold=scatterThreshold,
                         populationSize=populationSize,
                         numWorkers=numWorkers,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
-                        deadline=0.0,
+                        deadline=deadline,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
                     echo "[Opt] Retry improved: ", currentCost
+                    retryThreshold = tabuThreshold  # reset on success
+                except TimeLimitExceededError:
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    system.searchCompleted = false
+                    break retryLoop
                 except InfeasibleError:
                     # Domain reduction proved no better solution exists — provably optimal
                     system.optimalityProven = true
@@ -161,8 +173,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 except NoSolutionFoundError:
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
+                    retryThreshold = retryThreshold * 2
+                    system.adaptedTabuThreshold = 0  # force using bumped threshold
+                    if verbose:
+                        echo "[Opt] Retry deepening threshold to ", retryThreshold
                     if deadline > 0 and epochTime() < deadline:
-                        continue  # keep trying — scatter may have given up too early
+                        continue
                     break retryLoop
 
         # Clean up the bound constraint and restore best solution
