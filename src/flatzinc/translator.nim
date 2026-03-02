@@ -1484,6 +1484,33 @@ proc collectDefinedVars(tr: var FznTranslator) =
           tr.definingConstraints.incl(ci)
           tr.minMaxChannelDefs.add((ci: ci, varName: definedName, isMin: isMin))
 
+  # Refine int_min/int_max channel decisions: only keep as channels when inputs
+  # reference other channels (risk of exponential DAG growth from chained inlining).
+  # Simple binary min/max (e.g., max(abs(x-y), abs(a-b))) can be safely inlined
+  # as defined var expressions, giving the solver direct gradient through penalty maps.
+  block:
+    var refined: seq[tuple[ci: int, varName: string, isMin: bool]]
+    for def in tr.minMaxChannelDefs:
+      let con = tr.model.constraints[def.ci]
+      let cname = stripSolverPrefix(con.name)
+      var inputsRefChannel = false
+      if cname in ["int_min", "int_max"]:
+        for argIdx in 0..1:
+          let arg = con.args[argIdx]
+          if arg.kind == FznIdent and arg.ident in tr.channelVarNames:
+            inputsRefChannel = true
+            break
+      else:
+        # array_int_minimum/maximum — variable-length arrays, keep as channels
+        inputsRefChannel = true
+      if inputsRefChannel:
+        refined.add(def)
+      else:
+        # Safe to inline as defined var expression
+        tr.channelVarNames.excl(def.varName)
+        definedVarNames[def.varName] = true
+    tr.minMaxChannelDefs = refined
+
   # Detect int_times(a, b, c) WITHOUT defines_var where c can be treated as defined.
   # MiniZinc sometimes doesn't annotate cube variables (x^2 * x = x^3) with defines_var
   # even though the result is fully determined. These can have enormous domains (54M+).

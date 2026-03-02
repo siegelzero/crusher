@@ -51,7 +51,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
 
-        # Phase 1: Binary search with per-probe time budgets
+        # Phase 1: Binary search — fast probes without deadlines
         if verbose:
             echo "[Opt] Binary search [", lo, "..", hi, "]"
 
@@ -77,14 +77,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
 
-            # Per-probe time budget: fraction of remaining time, leaving room for deep retry
-            var probeDeadline = 0.0
-            if deadline > 0:
-                let remaining = deadline - epochTime()
-                if remaining < 5.0:
-                    system.searchCompleted = false
-                    break
-                probeDeadline = min(epochTime() + max(remaining * 0.15, 5.0), deadline)
+            if deadline > 0 and deadline - epochTime() < 5.0:
+                system.searchCompleted = false
+                break
 
             try:
                 system.resolve(
@@ -95,7 +90,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
-                    deadline=probeDeadline,
+                    deadline=0.0,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
@@ -107,12 +102,6 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = currentCost - 1
                 else:
                     lo = currentCost + 1
-            except TimeLimitExceededError:
-                # Probe budget exhausted — target might still be reachable with more time
-                # Break to retry loop which gets the remaining time
-                system.initialize(bestSolution)
-                objective.initialize(system.assignment)
-                break
             except InfeasibleError:
                 # Domain reduction proved no solution at this bound — narrow range
                 system.initialize(bestSolution)
@@ -158,16 +147,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         numWorkers=numWorkers,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
-                        deadline=deadline,
+                        deadline=0.0,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
                     echo "[Opt] Retry improved: ", currentCost
-                except TimeLimitExceededError:
-                    system.searchCompleted = false
-                    system.initialize(bestSolution)
-                    objective.initialize(system.assignment)
-                    break retryLoop
                 except InfeasibleError:
                     # Domain reduction proved no better solution exists — provably optimal
                     system.optimalityProven = true
