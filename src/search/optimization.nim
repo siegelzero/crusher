@@ -27,12 +27,21 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       upperBound=high(int),
                       deadline: float = 0.0,
                       ) =
-        # Find initial solution (if this times out, re-raise — no feasible solution)
-        system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
-                      scatterThreshold=scatterThreshold,
-                      populationSize=populationSize, numWorkers=numWorkers,
-                      scatterStrategy=scatterStrategy, verbose=verbose,
-                      deadline=deadline)
+        # Find initial feasible solution: tabu-only first (fast), scatter fallback
+        try:
+            system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
+                          scatterThreshold=0,
+                          populationSize=populationSize, numWorkers=numWorkers,
+                          scatterStrategy=scatterStrategy, verbose=verbose,
+                          deadline=deadline)
+        except NoSolutionFoundError:
+            if verbose:
+                echo "[Opt] Tabu probe failed, retrying with scatter search"
+            system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
+                          scatterThreshold=scatterThreshold,
+                          populationSize=populationSize, numWorkers=numWorkers,
+                          scatterStrategy=scatterStrategy, verbose=verbose,
+                          deadline=deadline)
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
@@ -116,19 +125,27 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     hi = target - 1
             except NoSolutionFoundError:
-                # Search couldn't find this target in budget — narrow range
+                # Tabu-only couldn't find this target — stop binary search,
+                # fall through to retry loop which uses scatter search
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
-                when direction == Minimize:
-                    lo = target + 1
-                else:
-                    hi = target - 1
+                break
 
-        # Retry: binary search narrows conservatively (NoSolutionFoundError = infeasible).
-        # Try once more to beat the current best, deepening threshold on each failure.
+        # Retry: binary search used fast tabu-only probes until first failure.
+        # Now try to beat the current best with full scatter search, deepening threshold on each failure.
         var retryThreshold = tabuThreshold
         block retryLoop:
             while true:
+                # Check if current cost is already at the known bound
+                when direction == Minimize:
+                    if currentCost <= lo:
+                        system.optimalityProven = true
+                        break retryLoop
+                else:
+                    if currentCost >= hi:
+                        system.optimalityProven = true
+                        break retryLoop
+
                 if deadline > 0 and epochTime() > deadline:
                     system.searchCompleted = false
                     break retryLoop

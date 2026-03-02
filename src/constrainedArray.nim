@@ -36,11 +36,14 @@ type
     InverseChannelGroup*[T] = object
         ## A group encoding an inverse relationship: inverse[forward[i]] = i.
         ## Forward positions are searched; inverse positions are channels.
+        ## When forwardValues is non-empty, inverse[forward[i]] = forwardValues[i]
+        ## instead of i + forwardBase (supports duplicate values).
         forwardPositions*: seq[int]  # searched positions (e.g., person vars)
         inversePositions*: seq[int]  # channel positions (e.g., seat vars)
         forwardBase*: int            # value representing forwardPositions[0] (e.g., 1)
         inverseBase*: int            # value representing inversePositions[0] (e.g., 1)
         defaultValue*: T             # value for unmapped inverse slots (e.g., 0)
+        forwardValues*: seq[T]       # explicit values per forward position (empty = use i + forwardBase)
 
     ConstrainedArray*[T] = object
         len*: int
@@ -231,6 +234,33 @@ proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
         else:
             arr.inverseChannelsAtPosition[pos].add(gi)
 
+proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
+                                 forwardPositions, inversePositions: seq[int],
+                                 forwardBase, inverseBase: int,
+                                 defaultValue: T,
+                                 forwardValues: seq[T]) =
+    ## Register an inverse channel group with explicit forward values.
+    ## inverse[forward[i]] = forwardValues[i] instead of i + forwardBase.
+    ## Supports duplicate values (e.g., Langford sequences).
+    let gi = arr.inverseChannelGroups.len
+    arr.inverseChannelGroups.add(InverseChannelGroup[T](
+        forwardPositions: forwardPositions,
+        inversePositions: inversePositions,
+        forwardBase: forwardBase,
+        inverseBase: inverseBase,
+        defaultValue: defaultValue,
+        forwardValues: forwardValues
+    ))
+    # Mark inverse positions as channels
+    for pos in inversePositions:
+        arr.channelPositions.incl(pos)
+    # Build reverse lookup: forward position → group indices
+    for pos in forwardPositions:
+        if pos notin arr.inverseChannelsAtPosition:
+            arr.inverseChannelsAtPosition[pos] = @[gi]
+        else:
+            arr.inverseChannelsAtPosition[pos].add(gi)
+
 proc recomputeInverse*[T](group: InverseChannelGroup[T], assignment: seq[T]): seq[T] =
     ## Compute the inverse channel values from the current forward assignments.
     ## Returns a seq aligned with group.inversePositions.
@@ -241,7 +271,129 @@ proc recomputeInverse*[T](group: InverseChannelGroup[T], assignment: seq[T]): se
         let v = assignment[fpos]
         let idx = v - group.inverseBase
         if idx >= 0 and idx < group.inversePositions.len:
-            result[idx] = T(i + group.forwardBase)
+            if group.forwardValues.len > 0:
+                result[idx] = group.forwardValues[i]
+            else:
+                result[idx] = T(i + group.forwardBase)
+
+################################################################################
+# Element-to-inverse-channel detection
+################################################################################
+
+proc detectElementInverseChannels*[T](arr: var ConstrainedArray[T]) =
+    ## Detects element constraints of the form array[index] = constant_value
+    ## (where the value position has a singleton domain) sharing the same array,
+    ## and converts the array positions into inverse channel variables.
+    ## This handles patterns like Langford sequences where element(position[i], solution, i)
+    ## makes solution fully determined by position.
+
+    # Step 1: Find element constraints with singleton-domain value positions
+    type ElementInfo = object
+        constraintIdx: int
+        indexPosition: int
+        valuePosition: int
+        constantValue: T
+        arrayKey: seq[int]  # positions of array elements, used as group key
+
+    var candidates: seq[ElementInfo]
+    for ci in 0..<arr.constraints.len:
+        let c = arr.constraints[ci]
+        if c.stateType != ElementType: continue
+        if c.elementState.evalMethod != PositionBased: continue
+        if c.elementState.isConstantArray: continue
+
+        let vpos = c.elementState.valuePosition
+        if arr.domain[vpos].len != 1: continue
+
+        # Build the array key from element positions
+        var key: seq[int]
+        for elem in c.elementState.arrayElements:
+            if elem.isConstant: continue  # mixed arrays with constants — skip for now
+            key.add(elem.variablePosition)
+        if key.len != c.elementState.arrayElements.len:
+            continue  # had some constants, skip
+
+        candidates.add(ElementInfo(
+            constraintIdx: ci,
+            indexPosition: c.elementState.indexPosition,
+            valuePosition: vpos,
+            constantValue: arr.domain[vpos][0],
+            arrayKey: key
+        ))
+
+    if candidates.len == 0: return
+
+    # Step 2: Group by array identity
+    var groups: Table[seq[int], seq[int]]  # arrayKey -> indices into candidates
+    for i, info in candidates:
+        if info.arrayKey notin groups:
+            groups[info.arrayKey] = @[]
+        groups[info.arrayKey].add(i)
+
+    # Step 3: For each group with >= 2 constraints, create inverse channel group
+    var consumedConstraints: PackedSet[int]
+    for arrayKey, memberIdxs in groups.pairs:
+        if memberIdxs.len < 2: continue
+
+        var forwardPositions: seq[int]
+        var forwardValues: seq[T]
+        let inversePositions = arrayKey  # the shared array positions
+
+        # Check that all index positions are NOT in the inverse array
+        # (they must be independent search variables)
+        let inverseSet = toPackedSet[int](inversePositions)
+        var valid = true
+        for mi in memberIdxs:
+            let info = candidates[mi]
+            if info.indexPosition in inverseSet:
+                valid = false
+                break
+            # Also skip if index position is already a channel
+            if info.indexPosition in arr.channelPositions:
+                valid = false
+                break
+        if not valid: continue
+
+        for mi in memberIdxs:
+            let info = candidates[mi]
+            forwardPositions.add(info.indexPosition)
+            forwardValues.add(info.constantValue)
+
+        # Determine inverse base: the minimum domain value of forward positions
+        # (these are indices into the array, so inverseBase is typically 0)
+        var inverseBase = high(int)
+        for fpos in forwardPositions:
+            for v in arr.domain[fpos]:
+                if v < inverseBase:
+                    inverseBase = v
+
+        # Default value: pick first value from inverse position domain that's not in forwardValues
+        var defaultValue: T = arr.domain[inversePositions[0]][0]
+        let fvSet = toPackedSet[int](forwardValues.mapIt(int(it)))
+        for v in arr.domain[inversePositions[0]]:
+            if int(v) notin fvSet:
+                defaultValue = v
+                break
+
+        # forwardBase is not used when forwardValues is set, but set it to 0
+        arr.addInverseChannelGroup(forwardPositions, inversePositions,
+                                    0, inverseBase, defaultValue, forwardValues)
+
+        # Mark consumed constraints
+        for mi in memberIdxs:
+            consumedConstraints.incl(candidates[mi].constraintIdx)
+
+    if consumedConstraints.len == 0: return
+
+    # Remove consumed constraints
+    var newConstraints: seq[StatefulConstraint[T]]
+    for ci in 0..<arr.constraints.len:
+        if ci notin consumedConstraints:
+            newConstraints.add(arr.constraints[ci])
+    arr.constraints = newConstraints
+
+    # Invalidate cached reduced domain
+    arr.reducedDomain = @[]
 
 ################################################################################
 # Bounds propagation helpers

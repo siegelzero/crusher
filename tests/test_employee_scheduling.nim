@@ -3,21 +3,21 @@
 ##
 ## Tests the employee scheduling problem from hakank.org/picat.
 ## This provides coverage for:
-## - Reified binary indicators with biconditional (<->)
-## - Sum constraints with indicator variables
+## - AtLeast/AtMost constraints for value counting
 ## - Implication constraints (->)
-## - Optimization with SumExpression objective
+## - Optimization with abs() in objective
 
-import std/[sequtils, unittest]
+import std/[unittest]
 import crusher
 
 const
     NumPeople = 5
     NumDays = 7
+    # Off=0 so that sum(X[p]) = total shift points directly
+    Off = 0
     Morning = 1
     Midday = 2
     Evening = 3
-    Off = 4
 
 proc solveEmployeeScheduling(): int =
     ## Returns the Z value (sum of abs differences of points)
@@ -27,49 +27,23 @@ proc solveEmployeeScheduling(): int =
     var X: array[NumPeople, ConstrainedSequence[int]]
     for p in 0..<NumPeople:
         X[p] = sys.newConstrainedSequence(NumDays)
-        X[p].setDomain(@[Morning, Midday, Evening, Off])
-
-    # Reified indicators: B[p][d][s] = 1 iff X[p][d] == (s+1)
-    var B: array[NumPeople, array[NumDays, array[4, ConstrainedVariable[int]]]]
-    for p in 0..<NumPeople:
-        for d in 0..<NumDays:
-            for s in 0..<4:
-                B[p][d][s] = sys.newConstrainedVariable()
-                B[p][d][s].setDomain(@[0, 1])
-
-    # Channeling: B[p][d][s] = 1 <-> X[p][d] == (s+1)
-    for p in 0..<NumPeople:
-        for d in 0..<NumDays:
-            for s in 0..<4:
-                let shiftVal = s + 1
-                sys.addConstraint((B[p][d][s] == 1) <-> (X[p][d] == shiftVal))
-
-    # Points[p] = sum of shift point values
-    var points = sys.newConstrainedSequence(NumPeople)
-    points.setDomain(toSeq(0..21))
-
-    for p in 0..<NumPeople:
-        var pointTerms: seq[AlgebraicExpression[int]] = @[]
-        for d in 0..<NumDays:
-            pointTerms.add(1 * B[p][d][0])
-            pointTerms.add(2 * B[p][d][1])
-            pointTerms.add(3 * B[p][d][2])
-        sys.addConstraint(sum(pointTerms) == points[p])
+        X[p].setDomain(@[Off, Morning, Midday, Evening])
 
     # At least one manager per shift per day
     for d in 0..<NumDays:
-        for s in 0..<3:
-            var shiftCount: seq[AlgebraicExpression[int]] = @[]
+        for s in [Morning, Midday, Evening]:
+            var dayExprs: seq[AlgebraicExpression[int]] = @[]
             for p in 0..<NumPeople:
-                shiftCount.add(B[p][d][s])
-            sys.addConstraint(sum(shiftCount) >= 1)
+                dayExprs.add(X[p][d])
+            sys.addConstraint(atLeast(dayExprs, s, 1))
 
     # Each manager gets exactly two days off
     for p in 0..<NumPeople:
-        var offCount: seq[AlgebraicExpression[int]] = @[]
+        var personExprs: seq[AlgebraicExpression[int]] = @[]
         for d in 0..<NumDays:
-            offCount.add(B[p][d][3])
-        sys.addConstraint(sum(offCount) == 2)
+            personExprs.add(X[p][d])
+        sys.addConstraint(atLeast(personExprs, Off, 2))
+        sys.addConstraint(atMost(personExprs, Off, 2))
 
     # Evening => not morning next day
     for p in 0..<NumPeople:
@@ -78,31 +52,29 @@ proc solveEmployeeScheduling(): int =
             sys.addConstraint((X[p][d] == Evening) -> (X[p][nextDay] != Morning))
 
     # Objective: minimize Z = sum of |Points[p1] - Points[p2]|
-    let numPairs = (NumPeople * (NumPeople - 1)) div 2
-    var diffs = sys.newConstrainedSequence(numPairs)
-    diffs.setDomain(toSeq(0..21))
+    # Since Off=0, points[p] = X[p][0] + X[p][1] + ... + X[p][6]
+    var personSums: array[NumPeople, AlgebraicExpression[int]]
+    for p in 0..<NumPeople:
+        var s = X[p][0]
+        for d in 1..<NumDays:
+            s = s + X[p][d]
+        personSums[p] = s
 
-    var pairIdx = 0
+    var absDiffTerms: seq[AlgebraicExpression[int]] = @[]
     for p1 in 0..<NumPeople:
         for p2 in (p1+1)..<NumPeople:
-            sys.addConstraint(diffs[pairIdx] >= points[p1] - points[p2])
-            sys.addConstraint(diffs[pairIdx] >= points[p2] - points[p1])
-            pairIdx += 1
+            absDiffTerms.add(abs(personSums[p1] - personSums[p2]))
 
-    let zObjective = diffs.sum()
+    let zObjective = sum(absDiffTerms)
 
-    # Use parallel search with population to reliably find optimal
     sys.minimize(zObjective, verbose=false, parallel=true,
-                 tabuThreshold=10000, scatterThreshold=3)
+                 tabuThreshold=1000, scatterThreshold=3)
 
     # Calculate actual Z from solution
     var pointsVals: array[NumPeople, int]
     for p in 0..<NumPeople:
-        let assignment = X[p].assignment
-        pointsVals[p] = 0
         for d in 0..<NumDays:
-            if assignment[d] != Off:
-                pointsVals[p] += assignment[d]
+            pointsVals[p] += X[p].assignment[d]
 
     var z = 0
     for p1 in 0..<NumPeople:

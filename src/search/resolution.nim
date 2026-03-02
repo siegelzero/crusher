@@ -22,6 +22,9 @@ proc resolve*[T](system: ConstraintSystem[T],
                 scatterStrategy: ScatterStrategy = PathRelinking,
                 verbose: bool = false,
                 deadline: float = 0.0) =
+    # Detect element constraints that form inverse channel patterns
+    system.baseArray.detectElementInverseChannels()
+
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
         let drStart = epochTime()
