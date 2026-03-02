@@ -1199,10 +1199,20 @@ proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
 
 proc applyUniformDelta[T](state: TabuState[T], pos: int) {.inline.} =
     ## Apply uniform cost delta for channel-dep penalties at position.
-    ## For each constraint in the cascade, the penalty change is exactly
-    ## (savedCost - newCost) applied uniformly to all domain values.
-    ## This is exact for static cascades and constraints with linear coefficients.
-    if pos notin state.cdCascadePos: return
+    ## For cascade positions: the penalty change is exactly (savedCost - newCost)
+    ## applied uniformly to all domain values (exact for element-only cascades).
+    ## For non-cascade positions (minMax/inverse): falls back to full per-value
+    ## recomputation since cascade values are state-dependent.
+    if pos notin state.cdCascadePos:
+        # Non-cascade: full recomputation (minMax/inverse cascade values depend on state)
+        let domain = state.sharedDomain[][pos]
+        for i in 0..<domain.len:
+            let newDep = state.computeChannelDepDelta(pos, domain[i])
+            let oldDep = state.channelDepPenalties[pos][i]
+            if newDep != oldDep:
+                state.penaltyMap[pos][i] += newDep - oldDep
+                state.channelDepPenalties[pos][i] = newDep
+        return
     let cascadeIdx = state.cdCascadePos[pos]
     let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
     var uniformDelta = 0
