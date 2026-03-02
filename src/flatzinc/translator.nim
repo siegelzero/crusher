@@ -1536,7 +1536,7 @@ proc collectDefinedVars(tr: var FznTranslator) =
           tr.channelVarNames.incl(definedName)
           tr.channelConstraints[ci] = definedName
           # DO NOT add to definedVarNames (channel vars need positions)
-          # DO NOT add to definingConstraints (constraint still needs translation)
+          tr.definingConstraints.incl(ci)  # Channel binding replaces this constraint
 
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   ## Tries to build the AlgebraicExpression for one defining constraint.

@@ -98,7 +98,6 @@ type
         cdInUse: bool  # debug guard against reentrant calls
         cdTrackPerConstraint: bool  # when true, track per-constraint max delta during init
         cdPerConstraintMaxDelta: seq[int]  # [constraintIdx] -> max |delta| seen during init
-        cdChanges: seq[(int, T, T)]
         cdWorklist: seq[int]
         cdVisited: PackedSet[int]  # reusable visited set for worklist propagation
         cdProcessed: PackedSet[int]  # reusable dedup set for constraint penalty loop
@@ -145,6 +144,35 @@ type
         inverseSavedBuf*: seq[(int, T)]           # reusable buffer for computeChannelDepDelta
         forcedChannelsBuf2*: seq[int]             # reusable buffer for forced position channel propagation
 
+        # Channel-dep optimized simulation state (position-indexed arrays instead of hash tables)
+        cdIsChanged: seq[bool]           # position-indexed, true if changed during simulation
+        cdSavedVal: seq[T]               # position-indexed, original value before simulation
+        cdDirtyPositions: seq[int]       # unique positions changed during simulation (for cleanup)
+
+        # Precomputed coefficient lists for channel-dep constraints (flat arrays, no hash lookups)
+        cdConstraintCoeffs: seq[seq[tuple[pos: int, coeff: T]]]   # [constraintIdx][j] = (position, coefficient) - left side
+        cdConstraintCoeffsR: seq[seq[tuple[pos: int, coeff: T]]]  # right side coefficients
+        cdConstraintCanFast: seq[bool]                             # can use fast path (both sides PositionBased/Constant)
+
+        # Precomputed cascade tables: topology + optional precomputed values.
+        # For ALL channel-dep positions, we precompute the topology (channel order, bindings, constraints).
+        # For positions with constant-array bindings, we also precompute absolute channel values.
+        # This enables batch evaluation: walk topology once, evaluate all domain values at once.
+        cdCascadePos: Table[int, int]             # source position -> index into cdCascade*
+        cdCascadeChans: seq[seq[int]]             # [cascadeIdx] -> channel positions in topological order
+        cdCascadeBindings: seq[seq[int]]          # [cascadeIdx] -> binding index for each channel position
+        cdCascadeValues: seq[seq[seq[T]]]         # [cascadeIdx][chanIdx][domainIdx] -> absolute channel value (empty for dynamic)
+        cdCascadeIsStatic: seq[bool]              # true if values are precomputed (constant arrays)
+        # Per-constraint mapping into cascade channels (for fast penalty computation)
+        cdCascadeConstraintL: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # [cascadeIdx][constraintLocalIdx][j] = (chanIdx in cascade, coeff)
+        cdCascadeConstraintR: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # right side
+        cdCascadeConstraintIds: seq[seq[int]]     # [cascadeIdx][constraintLocalIdx] -> index into channelDepConstraints
+        # Reusable buffers for dynamic batch evaluation (avoid per-call allocation)
+        cdBatchValues: seq[seq[T]]                # [chanIdx][domainIdx] -> channel value (resized as needed)
+        cdBatchSaved: seq[T]                      # saved channel values during batch evaluation
+        # Uniform delta: saved constraint costs before propagation
+        cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -160,11 +188,22 @@ type
             positionsScanned*: int64
             affectedPosTotal*: int64
             cdTotalCalls*: int64
+            cdWorklistTime*: float   # time in worklist propagation
+            cdPenaltyTime*: float    # time in penalty computation
             cdTargetedPos*: int64
             cdFullPos*: int64
             cdNonOneHotPos*: int64
             cdMovedCalls*: int64
             affectedPosSkipped*: int64
+            neighborByType*: array[StatefulConstraintType, int64]
+            neighborTimeByType*: array[StatefulConstraintType, float]
+            timePropagateChannels*: float
+            timeChannelDep*: float
+            propagateChannelCalls*: int64
+            channelChangesTotal*: int64
+            propagateNeighborCalls*: int64
+            cdDomainEvals*: int64
+            cdWorklistEntryCalls*: int64
 
 
 # Forward declarations
@@ -498,6 +537,8 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     ## Uses precomputed search-only positions to skip channels efficiently.
 
     for constraint in state.constraintsAtPosition[position]:
+        when ProfileIteration:
+            let tNeighC = epochTime()
         let cptr = cast[pointer](constraint)
         let searchPos = state.constraintSearchPos.getOrDefault(cptr)
         if searchPos.len == 0:
@@ -578,6 +619,9 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                     state.constraintPenalties[pos][localIdx][x] = 0
                     state.constraintPenalties[pos][localIdx][1-x] = newFlip
 
+                when ProfileIteration:
+                    state.neighborByType[constraint.stateType] += 1
+                    state.neighborTimeByType[constraint.stateType] += epochTime() - tNeighC
                 continue  # Done with this constraint via broadcast
 
         # Standard path
@@ -598,6 +642,9 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                 state.updateConstraintAtPosition(pos, localIdx)
             else:
                 state.updateConstraintAtPositionValues(pos, localIdx, affectedVals)
+        when ProfileIteration:
+            state.neighborByType[constraint.stateType] += 1
+            state.neighborTimeByType[constraint.stateType] += epochTime() - tNeighC
 
 
 proc rebuildPenaltyMap*[T](state: TabuState[T]) =
@@ -634,54 +681,6 @@ proc resetProfileStats*[T](state: TabuState[T]) =
 ################################################################################
 # Channel-Dependent Constraint Penalty Routines
 ################################################################################
-
-proc channelDepConstraintDelta[T](c: StatefulConstraint[T], cdChanges: seq[(int, T, T)]): int =
-    ## Compute the penalty delta for a single channel-dep constraint given a set of
-    ## channel value changes. Uses fast arithmetic for RelationalConstraint+SumExpr,
-    ## falls back to simulate-restore for other constraint types.
-    if c.stateType == RelationalType:
-        let rc = c.relationalState
-        var newLeft = rc.leftValue
-        var newRight = rc.rightValue
-        var canFastPath = true
-
-        case rc.leftExpr.kind
-        of SumExpr:
-            if rc.leftExpr.sumExpr.evalMethod == PositionBased:
-                for (cp, oldV, newV) in cdChanges:
-                    let coeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
-                    if coeff != 0:
-                        newLeft += coeff * (newV - oldV)
-            else: canFastPath = false
-        of ConstantExpr: discard
-        else: canFastPath = false
-
-        if canFastPath:
-            case rc.rightExpr.kind
-            of SumExpr:
-                if rc.rightExpr.sumExpr.evalMethod == PositionBased:
-                    for (cp, oldV, newV) in cdChanges:
-                        let coeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(cp, T(0))
-                        if coeff != 0:
-                            newRight += coeff * (newV - oldV)
-                else: canFastPath = false
-            of ConstantExpr: discard
-            else: canFastPath = false
-
-        if canFastPath:
-            return rc.computeCost(newLeft, newRight) - rc.cost
-
-    # Fallback: simulate-restore on the constraint
-    let oldPenalty = c.penalty()
-    for (cp, _, newV) in cdChanges:
-        if cp in c.positions:
-            c.updatePosition(cp, newV)
-    let newPenalty = c.penalty()
-    for j in countdown(cdChanges.len - 1, 0):
-        let (cp, oldV, _) = cdChanges[j]
-        if cp in c.positions:
-            c.updatePosition(cp, oldV)
-    return newPenalty - oldPenalty
 
 type LinearTerm[T] = tuple[pos: int, coeff: T]
 
@@ -781,15 +780,75 @@ proc evaluateFlatMinMax[T](fb: FlatMinMaxBinding[T], assignment: seq[T]): T {.in
             let v = expr.evaluate(assignment)
             if v > result: result = v
 
+proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
+    ## Record a channel position change using position-indexed tracking.
+    ## Saves original value on first change; cdDirtyPositions stays deduplicated.
+    if not state.cdIsChanged[chanPos]:
+        state.cdSavedVal[chanPos] = state.assignment[chanPos]
+        state.cdIsChanged[chanPos] = true
+        state.cdDirtyPositions.add(chanPos)
+    state.assignment[chanPos] = newChanVal
+
 proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T): int =
     ## Compute the total penalty delta from channel-dep constraints if we were
     ## to assign candidateValue at pos. Simulates channel propagation via worklist,
-    ## then uses fast arithmetic for RelationalConstraint+SumExpr, falling back
-    ## to simulate-restore for other constraint types.
+    ## then uses precomputed coefficient arrays for fast arithmetic (no hash table
+    ## lookups), falling back to simulate-restore for other constraint types.
     if pos notin state.carray.channelsAtPosition and
        pos notin state.carray.minMaxChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition:
         return 0
+
+    # Fast path: use precomputed (static) cascade table for single-value lookup
+    if pos in state.cdCascadePos:
+        let cascadeIdx = state.cdCascadePos[pos]
+        if state.cdCascadeIsStatic[cascadeIdx]:
+            let di = state.domainIndex[pos].getOrDefault(candidateValue, -1)
+            if di < 0: return 0
+            let chans = state.cdCascadeChans[cascadeIdx]
+            let chanVals = state.cdCascadeValues[cascadeIdx]
+            let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
+            let coeffsL = state.cdCascadeConstraintL[cascadeIdx]
+            let coeffsR = state.cdCascadeConstraintR[cascadeIdx]
+            let nChans = chans.len
+            for cli in 0..<constraintIds.len:
+                let ci = constraintIds[cli]
+                var delta: int
+                if state.cdConstraintCanFast[ci]:
+                    let rc = state.channelDepConstraints[ci].relationalState
+                    var newLeft = rc.leftValue
+                    var newRight = rc.rightValue
+                    for (cascIdx, coeff) in coeffsL[cli]:
+                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                        if diff != 0:
+                            newLeft += coeff * diff
+                    for (cascIdx, coeff) in coeffsR[cli]:
+                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                        if diff != 0:
+                            newRight += coeff * diff
+                    delta = rc.computeCost(newLeft, newRight) - rc.cost
+                else:
+                    let c = state.channelDepConstraints[ci]
+                    let oldPenalty = c.penalty()
+                    var anyChanged = false
+                    for chanIdx in 0..<nChans:
+                        let chanPos = chans[chanIdx]
+                        let newVal = chanVals[chanIdx][di]
+                        if newVal != state.assignment[chanPos] and chanPos in c.positions:
+                            c.updatePosition(chanPos, newVal)
+                            anyChanged = true
+                    if anyChanged:
+                        delta = c.penalty() - oldPenalty
+                        for chanIdx in 0..<nChans:
+                            let chanPos = chans[chanIdx]
+                            if chanVals[chanIdx][di] != state.assignment[chanPos] and chanPos in c.positions:
+                                c.updatePosition(chanPos, state.assignment[chanPos])
+                    else:
+                        delta = 0
+                result += delta
+                if state.cdTrackPerConstraint and delta != 0:
+                    state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
+            return result
 
     assert not state.cdInUse, "computeChannelDepDelta is not reentrant"
     state.cdInUse = true
@@ -797,7 +856,10 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
     # Clear reusable buffers from previous call
     state.cdVisited.clear()
-    state.cdChanges.setLen(0)
+    # cdDirtyPositions and cdIsChanged are already clean from previous call's restore
+    when ProfileIteration:
+        state.cdWorklistEntryCalls += 1
+        let cdCallStart = epochTime()
     let savedPos = state.assignment[pos]
     state.assignment[pos] = candidateValue
 
@@ -824,26 +886,21 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         # Source leaving oldIdx: channels at oldIdx transition away from their active value
         if oldIdx >= 0 and oldIdx < changes.len:
             for (chanPos, activeVal) in changes[oldIdx]:
-                # Was at activeVal (source matched), now goes to 1-activeVal (source no longer matches)
                 let toVal = T(1 - activeVal)
                 if state.assignment[chanPos] != toVal:
-                    state.cdChanges.add((chanPos, state.assignment[chanPos], toVal))
-                    state.assignment[chanPos] = toVal
+                    state.trackChannelChange(chanPos, toVal)
         # Source entering newIdx: channels at newIdx transition to their active value
         if newIdx >= 0 and newIdx < changes.len:
             for (chanPos, activeVal) in changes[newIdx]:
-                # Source now matches, so channel goes to activeVal
                 let toVal = T(activeVal)
                 if state.assignment[chanPos] != toVal:
-                    state.cdChanges.add((chanPos, state.assignment[chanPos], toVal))
-                    state.assignment[chanPos] = toVal
+                    state.trackChannelChange(chanPos, toVal)
 
         # Propagate downstream from the changed channel positions
         state.cdWorklist.setLen(0)
-        for (chanPos, _, _) in state.cdChanges:
-            state.cdWorklist.add(chanPos)
         state.cdVisited.incl(pos)
-        for (chanPos, _, _) in state.cdChanges:
+        for chanPos in state.cdDirtyPositions:
+            state.cdWorklist.add(chanPos)
             state.cdVisited.incl(chanPos)
         # Add inverse forced positions to the worklist for channel propagation
         for (fPos, savedVal) in state.inverseSavedBuf:
@@ -863,8 +920,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                                      else: state.assignment[elem.variablePosition]
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
-                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                        state.assignment[chanPos] = newChanVal
+                        state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
@@ -874,8 +930,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     let newChanVal = evaluateFlatMinMax(fb, state.assignment)
                     let chanPos = fb.channelPosition
                     if newChanVal != state.assignment[chanPos]:
-                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                        state.assignment[chanPos] = newChanVal
+                        state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
@@ -885,8 +940,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
-                            state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
-                            state.assignment[ipos] = newInverse[j]
+                            state.trackChannelChange(ipos, newInverse[j])
                             if ipos notin state.cdVisited:
                                 state.cdVisited.incl(ipos)
                                 state.cdWorklist.add(ipos)
@@ -913,8 +967,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                                      else: state.assignment[elem.variablePosition]
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
-                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                        state.assignment[chanPos] = newChanVal
+                        state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
@@ -924,8 +977,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     let newChanVal = evaluateFlatMinMax(fb, state.assignment)
                     let chanPos = fb.channelPosition
                     if newChanVal != state.assignment[chanPos]:
-                        state.cdChanges.add((chanPos, state.assignment[chanPos], newChanVal))
-                        state.assignment[chanPos] = newChanVal
+                        state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
@@ -935,40 +987,61 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
-                            state.cdChanges.add((ipos, state.assignment[ipos], newInverse[j]))
-                            state.assignment[ipos] = newInverse[j]
+                            state.trackChannelChange(ipos, newInverse[j])
                             if ipos notin state.cdVisited:
                                 state.cdVisited.incl(ipos)
                                 state.cdWorklist.add(ipos)
 
-    # Restore all modified assignment values (reverse order for cdChanges because a
-    # channel position can be modified multiple times when it depends on both the
-    # primary position and an inverse forced position — only the first entry has
-    # the true original value).
-    state.assignment[pos] = savedPos
-    for (fPos, savedVal) in state.inverseSavedBuf:
-        state.assignment[fPos] = savedVal
-    for i in countdown(state.cdChanges.len - 1, 0):
-        let (chanPos, oldVal, _) = state.cdChanges[i]
-        state.assignment[chanPos] = oldVal
+    when ProfileIteration:
+        let cdWorklistEnd = epochTime()
+        state.cdDomainEvals += state.cdDirtyPositions.len
 
-    if state.cdChanges.len == 0:
+    if state.cdDirtyPositions.len == 0:
+        # No channel changes — just restore pos and inverse
+        state.assignment[pos] = savedPos
+        for (fPos, savedVal) in state.inverseSavedBuf:
+            state.assignment[fPos] = savedVal
         return 0
 
-    # Compute penalty delta for affected channel-dep constraints only.
-    # Look up affected constraints directly from changed channels instead of
-    # iterating all relevant constraints (O(cdChanges * constraints_per_channel)
-    # instead of O(all_relevant_constraints * cdChanges)).
+    # Compute penalty delta for affected channel-dep constraints.
+    # Assignment still has simulated values so we can use position-indexed lookups.
+    # Uses precomputed coefficient arrays (O(coefficients * array_access)) instead of
+    # iterating cdChanges with hash table lookups (O(cdChanges * hash_lookup)).
     if state.chanPosToDepConstraintIdx.len > 0:
-        # Clear reusable dedup set
         state.cdProcessed.clear()
-        for (chanPos, _, _) in state.cdChanges:
+        for chanPos in state.cdDirtyPositions:
             if chanPos in state.chanPosToDepConstraintIdx:
                 for ci in state.chanPosToDepConstraintIdx[chanPos]:
                     if ci in state.cdProcessed: continue
                     state.cdProcessed.incl(ci)
                     if not state.channelDepConstraintActive[ci]: continue
-                    let delta = channelDepConstraintDelta(state.channelDepConstraints[ci], state.cdChanges)
+
+                    var delta: int
+                    if state.cdConstraintCanFast[ci]:
+                        # Fast path: iterate precomputed coefficient arrays, check position-indexed flags
+                        let rc = state.channelDepConstraints[ci].relationalState
+                        var newLeft = rc.leftValue
+                        var newRight = rc.rightValue
+                        for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
+                            if state.cdIsChanged[cpos]:
+                                newLeft += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                        for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
+                            if state.cdIsChanged[cpos]:
+                                newRight += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                        delta = rc.computeCost(newLeft, newRight) - rc.cost
+                    else:
+                        # Fallback: simulate-restore on the constraint
+                        let c = state.channelDepConstraints[ci]
+                        let oldPenalty = c.penalty()
+                        for dpos in state.cdDirtyPositions:
+                            if dpos in c.positions:
+                                c.updatePosition(dpos, state.assignment[dpos])
+                        let newPenalty = c.penalty()
+                        for dpos in state.cdDirtyPositions:
+                            if dpos in c.positions:
+                                c.updatePosition(dpos, state.cdSavedVal[dpos])
+                        delta = newPenalty - oldPenalty
+
                     result += delta
                     if state.cdTrackPerConstraint and delta != 0:
                         state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
@@ -977,19 +1050,137 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
         for c in relevantConstraints:
             var affected = false
-            for (chanPos, _, _) in state.cdChanges:
-                if chanPos in c.positions:
+            for dpos in state.cdDirtyPositions:
+                if dpos in c.positions:
                     affected = true
                     break
             if not affected: continue
-            result += channelDepConstraintDelta(c, state.cdChanges)
+            let oldPenalty = c.penalty()
+            for dpos in state.cdDirtyPositions:
+                if dpos in c.positions:
+                    c.updatePosition(dpos, state.assignment[dpos])
+            let newPenalty = c.penalty()
+            for dpos in state.cdDirtyPositions:
+                if dpos in c.positions:
+                    c.updatePosition(dpos, state.cdSavedVal[dpos])
+            result += newPenalty - oldPenalty
 
+    when ProfileIteration:
+        let cdPenaltyEnd = epochTime()
+        state.cdWorklistTime += cdWorklistEnd - cdCallStart
+        state.cdPenaltyTime += cdPenaltyEnd - cdWorklistEnd
+
+    # Restore all modified assignment values
+    state.assignment[pos] = savedPos
+    for (fPos, savedVal) in state.inverseSavedBuf:
+        state.assignment[fPos] = savedVal
+    for dpos in state.cdDirtyPositions:
+        state.assignment[dpos] = state.cdSavedVal[dpos]
+        state.cdIsChanged[dpos] = false
+    state.cdDirtyPositions.setLen(0)
+
+
+proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
+    chanVals: openArray[seq[T]], domain: openArray[T], penalties: var seq[int]) =
+    ## Compute penalty deltas for all domain values given cascade channel values.
+    ## chanVals[chanIdx][domainIdx] = the channel value for that domain entry.
+    let chans = state.cdCascadeChans[cascadeIdx]
+    let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
+    let coeffsL = state.cdCascadeConstraintL[cascadeIdx]
+    let coeffsR = state.cdCascadeConstraintR[cascadeIdx]
+    let nChans = chans.len
+
+    for di in 0..<domain.len:
+        var totalDelta = 0
+        for cli in 0..<constraintIds.len:
+            let ci = constraintIds[cli]
+            var delta: int
+            if state.cdConstraintCanFast[ci]:
+                let rc = state.channelDepConstraints[ci].relationalState
+                var newLeft = rc.leftValue
+                var newRight = rc.rightValue
+                for (cascIdx, coeff) in coeffsL[cli]:
+                    let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                    if diff != 0:
+                        newLeft += coeff * diff
+                for (cascIdx, coeff) in coeffsR[cli]:
+                    let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                    if diff != 0:
+                        newRight += coeff * diff
+                delta = rc.computeCost(newLeft, newRight) - rc.cost
+            else:
+                let c = state.channelDepConstraints[ci]
+                let oldPenalty = c.penalty()
+                var anyChanged = false
+                for chanIdx in 0..<nChans:
+                    let chanPos = chans[chanIdx]
+                    let newVal = chanVals[chanIdx][di]
+                    if newVal != state.assignment[chanPos] and chanPos in c.positions:
+                        c.updatePosition(chanPos, newVal)
+                        anyChanged = true
+                if anyChanged:
+                    delta = c.penalty() - oldPenalty
+                    for chanIdx in 0..<nChans:
+                        let chanPos = chans[chanIdx]
+                        if chanVals[chanIdx][di] != state.assignment[chanPos] and chanPos in c.positions:
+                            c.updatePosition(chanPos, state.assignment[chanPos])
+                else:
+                    delta = 0
+            totalDelta += delta
+            if state.cdTrackPerConstraint and delta != 0:
+                state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
+        penalties[di] = totalDelta
 
 proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
     ## Compute channelDepPenalties[pos] for all domain values.
+    ## Uses cascade topology for batch evaluation (both static and dynamic).
+    ## Static cascades use precomputed channel values; dynamic cascades evaluate at runtime.
+    ## Falls back to per-value computeChannelDepDelta for positions without cascade topology.
     let domain = state.sharedDomain[][pos]
-    for i in 0..<domain.len:
-        state.channelDepPenalties[pos][i] = state.computeChannelDepDelta(pos, domain[i])
+    if pos in state.cdCascadePos:
+        let cascadeIdx = state.cdCascadePos[pos]
+        let nChans = state.cdCascadeChans[cascadeIdx].len
+        let nDom = domain.len
+
+        if state.cdCascadeIsStatic[cascadeIdx]:
+            # Static cascade: use precomputed values
+            state.computeCascadePenalties(cascadeIdx,
+                state.cdCascadeValues[cascadeIdx], domain, state.channelDepPenalties[pos])
+        else:
+            # Dynamic cascade: evaluate bindings at runtime for all domain values
+            let chans = state.cdCascadeChans[cascadeIdx]
+            let bindings = state.cdCascadeBindings[cascadeIdx]
+
+            # Save original assignment values
+            let savedPos = state.assignment[pos]
+            for ci in 0..<nChans:
+                state.cdBatchSaved[ci] = state.assignment[chans[ci]]
+
+            # Evaluate cascade for all domain values using in-place modify-restore
+            for di in 0..<nDom:
+                state.assignment[pos] = domain[di]
+                for ci in 0..<nChans:
+                    let binding = state.carray.channelBindings[bindings[ci]]
+                    let idxVal = binding.indexExpression.evaluate(state.assignment)
+                    if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                        let elem = binding.arrayElements[idxVal]
+                        state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
+                                                       else: state.assignment[elem.variablePosition]
+                    else:
+                        state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
+                    state.assignment[chans[ci]] = state.cdBatchValues[ci][di]
+
+            # Restore assignment
+            state.assignment[pos] = savedPos
+            for ci in 0..<nChans:
+                state.assignment[chans[ci]] = state.cdBatchSaved[ci]
+
+            # Compute penalties from batch channel values
+            state.computeCascadePenalties(cascadeIdx,
+                state.cdBatchValues, domain, state.channelDepPenalties[pos])
+    else:
+        for i in 0..<domain.len:
+            state.channelDepPenalties[pos][i] = state.computeChannelDepDelta(pos, domain[i])
 
 
 proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
@@ -1006,12 +1197,35 @@ proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
                 state.penaltyMap[pos][i] += newDep - oldDep
                 state.channelDepPenalties[pos][i] = newDep
 
+proc applyUniformDelta[T](state: TabuState[T], pos: int) {.inline.} =
+    ## Apply uniform cost delta for channel-dep penalties at position.
+    ## For each constraint in the cascade, the penalty change is exactly
+    ## (savedCost - newCost) applied uniformly to all domain values.
+    ## This is exact for static cascades and constraints with linear coefficients.
+    if pos notin state.cdCascadePos: return
+    let cascadeIdx = state.cdCascadePos[pos]
+    let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
+    var uniformDelta = 0
+    for ci in constraintIds:
+        if not state.channelDepConstraintActive[ci]: continue
+        let newCost = state.channelDepConstraints[ci].penalty()
+        let savedCost = state.cdSavedConstraintCosts[ci]
+        if savedCost != newCost:
+            uniformDelta += savedCost - newCost
+    if uniformDelta != 0:
+        let domain = state.sharedDomain[][pos]
+        for i in 0..<domain.len:
+            state.channelDepPenalties[pos][i] += uniformDelta
+            state.penaltyMap[pos][i] += uniformDelta
+
 proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannels: seq[int], movedPosition: int = -1) =
     ## Targeted recomputation: update channel-dep penalties at search positions
     ## affected by the given changed channel positions.
-    ## Uses constraint-based reverse index to find ALL affected (pos, domainIdx) pairs
-    ## across all search positions sharing constraints with changed channels.
-    ## For one-hot positions, only recomputes the 2-3 domain values per position.
+    ## Uses uniform cost delta (exact for static cascades with linear constraints):
+    ## since costAfterCascade(i) is unchanged by propagation, the penalty change
+    ## is exactly (savedCost - newCost) applied uniformly to all domain values.
+    ## For one-hot positions, targeted updates still use per-value computation
+    ## since different domain values are affected non-uniformly.
     ## The movedPosition is skipped (its penalty map is fully rebuilt by updatePenaltiesForPosition).
 
     if state.depConstraintOneHotEntries.len > 0:
@@ -1034,21 +1248,12 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
 
         for pos, affectedIndices in state.cdTargetedUpdates.pairs:
             if state.isLazy[pos]: continue
-            # Check if current value is among affected indices
-            # (leaving cost baseline changed → all candidates affected)
             let currentVal = state.assignment[pos]
             let currentIdx = state.domainIndex[pos].getOrDefault(currentVal, -1)
             if currentIdx >= 0 and currentIdx in affectedIndices:
-                # Full recomputation — current value's leaving channels affect all candidates
+                # Full recomputation — use uniform delta
                 when ProfileIteration: state.cdFullPos += 1
-                let domain = state.sharedDomain[][pos]
-                for i in 0..<domain.len:
-                    when ProfileIteration: state.cdTotalCalls += 1
-                    let newDep = state.computeChannelDepDelta(pos, domain[i])
-                    let oldDep = state.channelDepPenalties[pos][i]
-                    if newDep != oldDep:
-                        state.penaltyMap[pos][i] += newDep - oldDep
-                        state.channelDepPenalties[pos][i] = newDep
+                state.applyUniformDelta(pos)
             else:
                 # Targeted recomputation — only affected domain values
                 when ProfileIteration: state.cdTargetedPos += 1
@@ -1071,30 +1276,18 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos in nonOneHotPositions.items:
             if state.isLazy[pos]: continue
             when ProfileIteration: state.cdNonOneHotPos += 1
-            let domain = state.sharedDomain[][pos]
-            for i in 0..<domain.len:
-                when ProfileIteration: state.cdTotalCalls += 1
-                let newDep = state.computeChannelDepDelta(pos, domain[i])
-                let oldDep = state.channelDepPenalties[pos][i]
-                if newDep != oldDep:
-                    state.penaltyMap[pos][i] += newDep - oldDep
-                    state.channelDepPenalties[pos][i] = newDep
+            state.applyUniformDelta(pos)
     else:
-        # No reverse index — fall back to channelDepPosForChannel (original behavior)
+        # No reverse index — use channelDepPosForChannel with uniform delta
         var affectedPositions: PackedSet[int]
         for chanPos in changedChannels:
             if chanPos in state.channelDepPosForChannel:
                 for pos in state.channelDepPosForChannel[chanPos]:
                     affectedPositions.incl(pos)
         for pos in affectedPositions.items:
+            if pos == movedPosition: continue
             if state.isLazy[pos]: continue
-            let domain = state.sharedDomain[][pos]
-            for i in 0..<domain.len:
-                let newDep = state.computeChannelDepDelta(pos, domain[i])
-                let oldDep = state.channelDepPenalties[pos][i]
-                if newDep != oldDep:
-                    state.penaltyMap[pos][i] += newDep - oldDep
-                    state.channelDepPenalties[pos][i] = newDep
+            state.applyUniformDelta(pos)
 
 
 ################################################################################
@@ -1725,6 +1918,62 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 else:
                     state.chanPosToDepConstraintIdx[p].add(ci)
 
+        # Initialize position-indexed simulation arrays for computeChannelDepDelta
+        state.cdIsChanged = newSeq[bool](carray.len)
+        state.cdSavedVal = newSeq[T](carray.len)
+        state.cdDirtyPositions = @[]
+
+        # Precompute flat coefficient lists for each channel-dep constraint
+        let nCd = state.channelDepConstraints.len
+        state.cdConstraintCoeffs = newSeq[seq[tuple[pos: int, coeff: T]]](nCd)
+        state.cdConstraintCoeffsR = newSeq[seq[tuple[pos: int, coeff: T]]](nCd)
+        state.cdConstraintCanFast = newSeq[bool](nCd)
+        state.cdSavedConstraintCosts = newSeq[int](nCd)
+        for ci in 0..<nCd:
+            let c = state.channelDepConstraints[ci]
+            if c.stateType != RelationalType:
+                state.cdConstraintCanFast[ci] = false
+                continue
+            let rc = c.relationalState
+            var canFast = true
+
+            # Extract left side coefficients
+            case rc.leftExpr.kind
+            of SumExpr:
+                if rc.leftExpr.sumExpr.evalMethod == PositionBased:
+                    for pos, coeff in rc.leftExpr.sumExpr.coefficient.pairs:
+                        state.cdConstraintCoeffs[ci].add((pos: pos, coeff: coeff))
+                else: canFast = false
+            of ConstantExpr: discard  # No coefficients needed
+            else: canFast = false
+
+            if canFast:
+                # Extract right side coefficients
+                case rc.rightExpr.kind
+                of SumExpr:
+                    if rc.rightExpr.sumExpr.evalMethod == PositionBased:
+                        for pos, coeff in rc.rightExpr.sumExpr.coefficient.pairs:
+                            state.cdConstraintCoeffsR[ci].add((pos: pos, coeff: coeff))
+                    else: canFast = false
+                of ConstantExpr: discard
+                else: canFast = false
+
+            state.cdConstraintCanFast[ci] = canFast
+
+        if verbose and id == 0:
+            var fastCount, fallbackCount = 0
+            var maxCoeffs, totalCoeffs = 0
+            for ci in 0..<nCd:
+                if state.cdConstraintCanFast[ci]: fastCount += 1
+                else: fallbackCount += 1
+                let n = state.cdConstraintCoeffs[ci].len + state.cdConstraintCoeffsR[ci].len
+                totalCoeffs += n
+                if n > maxCoeffs: maxCoeffs = n
+            echo "[Init] Channel-dep fast path: " & $fastCount & "/" & $nCd &
+                 " constraints (fallback=" & $fallbackCount &
+                 ", avg_coeffs=" & $(totalCoeffs div max(1, fastCount)) &
+                 " max_coeffs=" & $maxCoeffs & ")"
+
     # Build level-2 reverse index for targeted channel-dep recomputation
     if not forRelinking and state.hasChannelDeps and state.oneHotChanges.len > 0:
         # For each constraint, which one-hot (pos, domainIdx) entries touch it
@@ -1751,6 +2000,179 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             echo "[Init] Channel-dep reverse index: " & $state.chanPosToDepConstraintIdx.len &
                  " channel positions, " & $state.depConstraintOneHotEntries.len &
                  " constraints, " & $totalEntries & " one-hot entries"
+
+    # Build cascade topologies for channel-dep search positions.
+    # For ALL element-only positions (no minMax/inverse), store the channel topology.
+    # For positions with constant arrays, also precompute values (static cascade).
+    # Dynamic positions evaluate at runtime using the stored topology (batch evaluation).
+    # This eliminates per-domain-value worklist overhead for ALL covered positions.
+    if not forRelinking and state.hasChannelDeps:
+        state.cdCascadePos = initTable[int, int]()
+        state.cdCascadeChans = @[]
+        state.cdCascadeBindings = @[]
+        state.cdCascadeValues = @[]
+        state.cdCascadeIsStatic = @[]
+        state.cdCascadeConstraintL = @[]
+        state.cdCascadeConstraintR = @[]
+        state.cdCascadeConstraintIds = @[]
+        let cascadeStart = epochTime()
+        var staticCount = 0
+        var dynamicCount = 0
+        var cascadeFail = 0
+
+        for pos in state.channelDepSearchPositions:
+            if state.isLazy[pos]: continue
+            # Skip positions with inverse groups (forced changes not captured by cascade)
+            if state.inverseEnabled and state.posToInverseGroup[pos] >= 0: continue
+
+            # Walk topology from this position
+            var topoOrder: seq[int] = @[]
+            var topoBindingIdx: seq[int] = @[]
+            var topoSet: PackedSet[int]
+            var worklist = @[pos]
+            var visited: PackedSet[int]
+            visited.incl(pos)
+            var canBuild = true       # can build topology at all
+            var canStatic = true      # can precompute values (constant arrays + local index deps)
+
+            while worklist.len > 0 and canBuild:
+                let p = worklist.pop()
+                if p in carray.channelsAtPosition:
+                    for bi in carray.channelsAtPosition[p]:
+                        let binding = carray.channelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        if chanPos in topoSet:
+                            # Duplicate channel — reject entirely
+                            canBuild = false
+                            break
+                        # Check static eligibility
+                        if canStatic:
+                            for ipos in binding.indexExpression.positions.items:
+                                if ipos != pos and ipos notin topoSet:
+                                    canStatic = false
+                                    break
+                            for elem in binding.arrayElements:
+                                if not elem.isConstant:
+                                    canStatic = false
+                                    break
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
+                # MinMax/inverse channels can't be batched — reject topology entirely
+                if p in carray.minMaxChannelsAtPosition:
+                    canBuild = false
+                if p in carray.inverseChannelsAtPosition:
+                    canBuild = false
+
+            if not canBuild or topoOrder.len == 0:
+                cascadeFail += 1
+                continue
+
+            # Build channel values
+            let domain = state.sharedDomain[][pos]
+            let nChans = topoOrder.len
+            let nDom = domain.len
+            var chanValues: seq[seq[T]]
+
+            if canStatic:
+                # Precompute values for all domain entries (constant arrays only)
+                chanValues = newSeq[seq[T]](nChans)
+                for ci in 0..<nChans:
+                    chanValues[ci] = newSeq[T](nDom)
+
+                let savedPos = state.assignment[pos]
+                var savedChans = newSeq[T](nChans)
+                for ci in 0..<nChans:
+                    savedChans[ci] = state.assignment[topoOrder[ci]]
+
+                for di in 0..<nDom:
+                    state.assignment[pos] = domain[di]
+                    for ci in 0..<nChans:
+                        let binding = carray.channelBindings[topoBindingIdx[ci]]
+                        let idxVal = binding.indexExpression.evaluate(state.assignment)
+                        if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                            chanValues[ci][di] = binding.arrayElements[idxVal].constantValue
+                        else:
+                            chanValues[ci][di] = savedChans[ci]
+                        state.assignment[topoOrder[ci]] = chanValues[ci][di]
+
+                state.assignment[pos] = savedPos
+                for ci in 0..<nChans:
+                    state.assignment[topoOrder[ci]] = savedChans[ci]
+                staticCount += 1
+            else:
+                # Dynamic — values computed at runtime via batch evaluation
+                chanValues = @[]  # empty signals dynamic
+                dynamicCount += 1
+
+            # Map channel position -> index in topoOrder (for constraint coefficient mapping)
+            var chanToIdx = initTable[int, int]()
+            for ci, cp in topoOrder:
+                chanToIdx[cp] = ci
+
+            # Build per-constraint coefficient mapping into cascade channels
+            var constraintLocalIds: seq[int] = @[]
+            var constraintCoeffL: seq[seq[tuple[cascadeIdx: int, coeff: T]]] = @[]
+            var constraintCoeffR: seq[seq[tuple[cascadeIdx: int, coeff: T]]] = @[]
+
+            var seenCi: PackedSet[int]
+            for chanPos in topoOrder:
+                if chanPos in state.chanPosToDepConstraintIdx:
+                    for ci in state.chanPosToDepConstraintIdx[chanPos]:
+                        if ci notin seenCi:
+                            seenCi.incl(ci)
+                            if not state.channelDepConstraintActive[ci]: continue
+                            constraintLocalIds.add(ci)
+                            var coeffsL: seq[tuple[cascadeIdx: int, coeff: T]] = @[]
+                            var coeffsR: seq[tuple[cascadeIdx: int, coeff: T]] = @[]
+                            if state.cdConstraintCanFast[ci]:
+                                for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
+                                    if cpos in chanToIdx:
+                                        coeffsL.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
+                                for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
+                                    if cpos in chanToIdx:
+                                        coeffsR.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
+                            constraintCoeffL.add(coeffsL)
+                            constraintCoeffR.add(coeffsR)
+
+            let cascadeIdx = state.cdCascadeChans.len
+            state.cdCascadePos[pos] = cascadeIdx
+            state.cdCascadeChans.add(topoOrder)
+            state.cdCascadeBindings.add(topoBindingIdx)
+            state.cdCascadeValues.add(chanValues)
+            state.cdCascadeIsStatic.add(canStatic)
+            state.cdCascadeConstraintIds.add(constraintLocalIds)
+            state.cdCascadeConstraintL.add(constraintCoeffL)
+            state.cdCascadeConstraintR.add(constraintCoeffR)
+
+        # Allocate reusable batch evaluation buffers (sized to max cascade)
+        if state.cdCascadeChans.len > 0:
+            var maxChans = 0
+            var maxDom = 0
+            for ci in 0..<state.cdCascadeChans.len:
+                maxChans = max(maxChans, state.cdCascadeChans[ci].len)
+            for pos in state.channelDepSearchPositions:
+                maxDom = max(maxDom, state.sharedDomain[][pos].len)
+            state.cdBatchValues = newSeq[seq[T]](maxChans)
+            for ci in 0..<maxChans:
+                state.cdBatchValues[ci] = newSeq[T](maxDom)
+            state.cdBatchSaved = newSeq[T](maxChans)
+
+        if verbose and id == 0:
+            var totalChans, totalMem = 0
+            for ci in 0..<state.cdCascadeChans.len:
+                totalChans += state.cdCascadeChans[ci].len
+                for v in state.cdCascadeValues[ci]:
+                    totalMem += v.len * sizeof(T)
+            echo "[Init] Cascade tables: " & $staticCount & " static + " & $dynamicCount &
+                 " dynamic / " & $(staticCount + dynamicCount + cascadeFail) &
+                 " positions (fail=" & $cascadeFail &
+                 " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
+                 " mem=" & $(totalMem div 1024) & "KB" &
+                 " built in " & $(epochTime() - cascadeStart) & "s)"
 
     # Skip penalty maps, channel-dep penalties, and element implied structures for relinking
     if forRelinking:
@@ -1837,6 +2259,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.recomputeElementImpliedDiscounts()
 
     if verbose and id == 0:
+        var typeCounts: array[StatefulConstraintType, int]
+        var typeMaxPos: array[StatefulConstraintType, int]
+        for c in state.constraints:
+            typeCounts[c.stateType] += 1
+            if c.positions.len > typeMaxPos[c.stateType]:
+                typeMaxPos[c.stateType] = c.positions.len
+        echo "[Init] Constraint type counts:"
+        for ct in StatefulConstraintType:
+            if typeCounts[ct] > 0:
+                echo "  " & $ct & ": " & $typeCounts[ct] & " (max_pos=" & $typeMaxPos[ct] & ")"
         let searchCount = state.searchPositions.len
         var lazyCount = 0
         for pos in state.searchPositions:
@@ -2529,6 +2961,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                         elif oldPenalty == 0 and newPenalty > 0:
                             for pos in c.positions.items:
                                 state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(binding.channelPosition)
                     if binding.channelPosition notin visited:
                         visited.incl(binding.channelPosition)
@@ -2553,6 +2987,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                         elif oldPenalty == 0 and newPenalty > 0:
                             for pos in c.positions.items:
                                 state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(fb.channelPosition)
                     if fb.channelPosition notin visited:
                         visited.incl(fb.channelPosition)
@@ -2578,6 +3014,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                             elif oldPenalty == 0 and newPenalty > 0:
                                 for pos in c.positions.items:
                                     state.violationCount[pos] += 1
+                        when ProfileIteration:
+                            state.propagateNeighborCalls += 1
                         state.updateNeighborPenalties(ipos)
                         if ipos notin visited:
                             visited.incl(ipos)
@@ -2714,7 +3152,14 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                     for p in constraint.positions.items:
                         state.violationCount[p] += 1
 
+    # Save channel-dep constraint costs before propagation (for uniform delta recomputation)
+    if state.hasChannelDeps:
+        for ci in 0..<state.channelDepConstraints.len:
+            state.cdSavedConstraintCosts[ci] = state.channelDepConstraints[ci].penalty()
+
     # Propagate channel variables affected by this position change
+    when ProfileIteration:
+        let tProp0 = epochTime()
     let channelsChanged = state.propagateChannels(position, state.changedChannelsBuf)
 
     # Also propagate channels for forced positions (using pre-allocated buffer)
@@ -2724,6 +3169,12 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
             if forcedChanged:
                 for ch in state.forcedChannelsBuf2:
                     state.changedChannelsBuf.add(ch)
+
+    when ProfileIteration:
+        let tProp1 = epochTime()
+        state.timePropagateChannels += tProp1 - tProp0
+        state.propagateChannelCalls += 1
+        state.channelChangesTotal += state.changedChannelsBuf.len
 
     let anyChannelsChanged = state.changedChannelsBuf.len > 0
 
@@ -2740,6 +3191,8 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
                     state.computeChannelDepPenaltiesAt(fPos)
 
     when ProfileIteration:
+        let tCD1 = epochTime()
+        state.timeChannelDep += tCD1 - tProp1
         let t1 = epochTime()
         state.timeAssignConstraints += t1 - t0
 
@@ -3337,16 +3790,54 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Profile S{state.id}] cdCalls={state.cdTotalCalls} ({state.cdTotalCalls.float/iters:.1f}/iter) " &
              &"cdMoved={state.cdMovedCalls} ({state.cdMovedCalls.float/iters:.1f}/iter) " &
              &"targeted={state.cdTargetedPos} full={state.cdFullPos} nonOneHot={state.cdNonOneHotPos}"
+        echo &"[Profile S{state.id}] propagateChannels={state.timePropagateChannels:.3f}s ({state.timePropagateChannels/max(elapsed,0.001)*100:.1f}%) " &
+             &"channelDep={state.timeChannelDep:.3f}s ({state.timeChannelDep/max(elapsed,0.001)*100:.1f}%) " &
+             &"chanChanges={state.channelChangesTotal} ({state.channelChangesTotal.float/iters:.1f}/iter) " &
+             &"propNeighborCalls={state.propagateNeighborCalls} ({state.propagateNeighborCalls.float/iters:.1f}/iter)"
+        let cdEvalPerCall = if state.cdMovedCalls > 0: state.cdDomainEvals.float / state.cdMovedCalls.float else: 0.0
+        echo &"[Profile S{state.id}] cdDomainEvals={state.cdDomainEvals} cdWorklistEntryCalls={state.cdWorklistEntryCalls} ({cdEvalPerCall:.1f} dirty/domainEval)"
+        echo &"[Profile S{state.id}] cdWorklist={state.cdWorklistTime:.3f}s cdPenalty={state.cdPenaltyTime:.3f}s"
+        echo "[Profile S" & $state.id & "] Neighbor by type:"
+        for ct in StatefulConstraintType:
+            if state.neighborByType[ct] > 0:
+                echo &"  {ct}: count={state.neighborByType[ct]} ({state.neighborByType[ct].float/iters:.1f}/iter) time={state.neighborTimeByType[ct]:.3f}s ({state.neighborTimeByType[ct]/max(elapsed,0.001)*100:.1f}%)"
     state.logProfileStats()
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     var lastImprovement = 0
 
-    # Reset timing for this run
+    # Reset timing and profiling counters for this run
     state.startTime = epochTime()
     state.lastLogTime = state.startTime
     state.lastLogIteration = 0
+    when ProfileIteration:
+        state.timeBestMoves = 0
+        state.timeAssignConstraints = 0
+        state.timeUpdatePenalties = 0
+        state.timeNeighborPenalties = 0
+        state.neighborUpdates = 0
+        state.neighborBatchCalls = 0
+        state.positionsScanned = 0
+        state.affectedPosTotal = 0
+        state.cdTotalCalls = 0
+        state.cdWorklistTime = 0
+        state.cdPenaltyTime = 0
+        state.cdTargetedPos = 0
+        state.cdFullPos = 0
+        state.cdNonOneHotPos = 0
+        state.cdMovedCalls = 0
+        state.affectedPosSkipped = 0
+        state.timePropagateChannels = 0
+        state.timeChannelDep = 0
+        state.propagateChannelCalls = 0
+        state.channelChangesTotal = 0
+        state.propagateNeighborCalls = 0
+        state.cdDomainEvals = 0
+        state.cdWorklistEntryCalls = 0
+        for ct in StatefulConstraintType:
+            state.neighborByType[ct] = 0
+            state.neighborTimeByType[ct] = 0
 
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}"
