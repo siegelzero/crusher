@@ -15,7 +15,8 @@ type
 
     CachedTermPL*[T] = object
         pl*: PiecewiseLinear
-        compiled*: bool          # false if compilePL failed for this term
+        compiled*: bool          # true if compilePL succeeded for this term
+        populated*: bool         # true after first compilation attempt
         depValues*: seq[(int, T)]  # (position, savedAssignmentValue) for invalidation
 
     RelationalConstraint*[T] = ref object
@@ -292,7 +293,6 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
 
         # Get or create cached PLs for left varying terms
         var leftTermPLs: seq[CachedTermPL[T]]
-        var leftTreeTerms: seq[int] = @[]
         var leftAllPL = true
         if hasLeftTerms:
             if position notin constraint.leftTermPLCache:
@@ -301,7 +301,7 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
             for ti in leftVarying:
                 var cache = leftTermPLs[ti]
                 # Check if cached PL is still valid
-                var valid = cache.depValues.len > 0 or cache.compiled
+                var valid = cache.populated
                 if valid:
                     for (pos, savedVal) in cache.depValues:
                         if assignment[pos] != savedVal:
@@ -314,16 +314,15 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                     for depPos in constraint.leftTerms[ti].positions.items:
                         if depPos != position:
                             deps.add((depPos, assignment[depPos]))
-                    cache = CachedTermPL[T](pl: pl, compiled: ok, depValues: deps)
-                    leftTermPLs[ti] = cache
+                    cache = CachedTermPL[T](pl: pl, compiled: ok, populated: true, depValues: deps)
                     constraint.leftTermPLCache[position][ti] = cache
                 if not cache.compiled:
-                    leftTreeTerms.add(ti)
                     leftAllPL = false
+            # Re-read local copy to pick up any recompiled entries
+            leftTermPLs = constraint.leftTermPLCache[position]
 
         # Get or create cached PLs for right varying terms
         var rightTermPLs: seq[CachedTermPL[T]]
-        var rightTreeTerms: seq[int] = @[]
         var rightAllPL = true
         if hasRightTerms:
             if position notin constraint.rightTermPLCache:
@@ -331,7 +330,7 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
             rightTermPLs = constraint.rightTermPLCache[position]
             for ti in rightVarying:
                 var cache = rightTermPLs[ti]
-                var valid = cache.depValues.len > 0 or cache.compiled
+                var valid = cache.populated
                 if valid:
                     for (pos, savedVal) in cache.depValues:
                         if assignment[pos] != savedVal:
@@ -343,12 +342,12 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                     for depPos in constraint.rightTerms[ti].positions.items:
                         if depPos != position:
                             deps.add((depPos, assignment[depPos]))
-                    cache = CachedTermPL[T](pl: pl, compiled: ok, depValues: deps)
-                    rightTermPLs[ti] = cache
+                    cache = CachedTermPL[T](pl: pl, compiled: ok, populated: true, depValues: deps)
                     constraint.rightTermPLCache[position][ti] = cache
                 if not cache.compiled:
-                    rightTreeTerms.add(ti)
                     rightAllPL = false
+            # Re-read local copy to pick up any recompiled entries
+            rightTermPLs = constraint.rightTermPLCache[position]
 
         # Compute constant part using cached PLs to avoid tree evaluation.
         # constPart = cachedValue - sum(plEval(termPL, currentValue)) for varying terms.
@@ -357,7 +356,7 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
             var varyingPart: T = 0
             for ti in leftVarying:
                 if leftTermPLs[ti].compiled:
-                    varyingPart += plEval(leftTermPLs[ti].pl, int(currentValue))
+                    varyingPart += T(plEval(leftTermPLs[ti].pl, int(currentValue)))
                 else:
                     varyingPart += constraint.leftTerms[ti].node.evaluate(assignment)
             leftConstPart = constraint.leftValue - varyingPart
@@ -367,7 +366,7 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
             var varyingPart: T = 0
             for ti in rightVarying:
                 if rightTermPLs[ti].compiled:
-                    varyingPart += plEval(rightTermPLs[ti].pl, int(currentValue))
+                    varyingPart += T(plEval(rightTermPLs[ti].pl, int(currentValue)))
                 else:
                     varyingPart += constraint.rightTerms[ti].node.evaluate(assignment)
             rightConstPart = constraint.rightValue - varyingPart

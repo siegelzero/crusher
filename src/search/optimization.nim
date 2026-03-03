@@ -27,9 +27,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       upperBound=high(int),
                       deadline: float = 0.0,
                       ) =
-        # Find initial feasible solution: tabu-only first (fast), scatter fallback
+        # Find initial feasible solution: tabu-only first (fast, capped at 1000), scatter fallback
         try:
-            system.resolve(parallel=parallel, tabuThreshold=1000,
+            system.resolve(parallel=parallel, tabuThreshold=min(tabuThreshold, 1000),
                           scatterThreshold=0,
                           populationSize=populationSize, numWorkers=numWorkers,
                           scatterStrategy=scatterStrategy, verbose=verbose,
@@ -152,7 +152,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     if currentCost >= hi:
                         if hiProven:
                             system.optimalityProven = true
-                        break retryLoop
+                            break retryLoop
+                        else:
+                            # hi was a heuristic guess — raise it and keep searching
+                            hi = max(currentCost * 2, currentCost + 1)
 
                 if deadline > 0 and epochTime() > deadline:
                     system.searchCompleted = false
