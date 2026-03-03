@@ -544,6 +544,11 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             itersSinceImprovement = 0
         else:
             inc itersSinceImprovement
+            if itersSinceImprovement >= scatterThreshold and deadline > 0:
+                # Running past stale threshold due to deadline — deepen search to escape basin
+                effectiveThreshold = effectiveThreshold + effectiveThreshold div 2
+                if verbose:
+                    echo &"[Scatter] Stale deepening threshold to {effectiveThreshold}"
 
         if verbose:
             let iterElapsed = currentTime() - iterStart
@@ -731,6 +736,11 @@ proc lnsImprove*[T](system: ConstraintSystem[T],
         else:
             inc itersSinceImprovement
             destroyCount = min(destroyCount + 1, compactIndices.len div 2)  # Escalate
+            if itersSinceImprovement >= scatterThreshold and deadline > 0:
+                # Running past stale threshold due to deadline — deepen search to escape basin
+                effectiveThreshold = effectiveThreshold + effectiveThreshold div 2
+                if verbose:
+                    echo &"[LNS] Stale deepening threshold to {effectiveThreshold}"
 
         if verbose:
             let iterElapsed = currentTime() - iterStart
