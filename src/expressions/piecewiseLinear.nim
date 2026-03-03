@@ -46,10 +46,24 @@ func plIdent*(): PiecewiseLinear {.inline.} =
 # Evaluate at a single point
 
 func plEval*(f: PiecewiseLinear, v: int): int {.inline.} =
-    var idx = 0
-    for i in 0 ..< f.n - 1:
-        if v >= f.breaks[i]: idx = i + 1
-        else: break
+    var idx: int
+    if f.n <= 8:
+        # Linear scan for small segment counts
+        idx = 0
+        for i in 0 ..< f.n - 1:
+            if v >= f.breaks[i]: idx = i + 1
+            else: break
+    else:
+        # Binary search: find number of breaks where v >= breaks[i]
+        var lo = 0
+        var hi = f.n - 1  # number of breaks
+        while lo < hi:
+            let mid = (lo + hi) shr 1
+            if v >= f.breaks[mid]:
+                lo = mid + 1
+            else:
+                hi = mid
+        idx = lo
     f.segs[idx].coeff * v + f.segs[idx].base
 
 # Negate

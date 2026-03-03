@@ -29,7 +29,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       ) =
         # Find initial feasible solution: tabu-only first (fast), scatter fallback
         try:
-            system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
+            system.resolve(parallel=parallel, tabuThreshold=1000,
                           scatterThreshold=0,
                           populationSize=populationSize, numWorkers=numWorkers,
                           scatterStrategy=scatterStrategy, verbose=verbose,
@@ -56,9 +56,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         when direction == Minimize:
             var lo = if lowerBound != low(int): lowerBound else: 0
             var hi = currentCost - 1
+            var loProven = true  # 0 is a genuine lower bound; user-provided also trusted
         else:
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
+            var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
@@ -122,8 +124,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 objective.initialize(system.assignment)
                 when direction == Minimize:
                     lo = target + 1
+                    loProven = true
                 else:
                     hi = target - 1
+                    hiProven = true
             except NoSolutionFoundError:
                 # Tabu-only couldn't find this target — stop binary search,
                 # fall through to retry loop which uses scatter search
@@ -136,14 +140,18 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var retryThreshold = tabuThreshold
         block retryLoop:
             while true:
-                # Check if current cost is already at the known bound
+                # Check if current cost is already at the known bound.
+                # Only claim proven optimal if the bound was established by
+                # InfeasibleError (domain reduction proof) or user-provided.
                 when direction == Minimize:
                     if currentCost <= lo:
-                        system.optimalityProven = true
+                        if loProven:
+                            system.optimalityProven = true
                         break retryLoop
                 else:
                     if currentCost >= hi:
-                        system.optimalityProven = true
+                        if hiProven:
+                            system.optimalityProven = true
                         break retryLoop
 
                 if deadline > 0 and epochTime() > deadline:

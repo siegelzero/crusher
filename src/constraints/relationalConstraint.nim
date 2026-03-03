@@ -13,6 +13,11 @@ type
         node*: ExpressionNode[T]
         positions*: PackedSet[int]
 
+    CachedTermPL*[T] = object
+        pl*: PiecewiseLinear
+        compiled*: bool          # false if compilePL failed for this term
+        depValues*: seq[(int, T)]  # (position, savedAssignmentValue) for invalidation
+
     RelationalConstraint*[T] = ref object
         leftExpr*: Expression[T]               # Any expression type
         rightExpr*: Expression[T]              # Any expression type
@@ -41,6 +46,9 @@ type
         rightVaryingIdx*: Table[int, seq[int]]
         rightConstantIdx*: Table[int, seq[int]]
         graduated*: bool  # When true, EqualTo uses abs(left-right) instead of binary 0/1
+        # Cached piecewise-linear compilations per (varyingPos, termIdx)
+        leftTermPLCache*: Table[int, seq[CachedTermPL[T]]]
+        rightTermPLCache*: Table[int, seq[CachedTermPL[T]]]
 
 func computeCost*[T](c: RelationalConstraint[T], left, right: T): int {.inline.} =
     ## Compute penalty, using graduated abs(left-right) for EqualTo when enabled.
@@ -267,8 +275,10 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         # Non-linear fallback: use term-based partial evaluation when available.
         # Splits expression into additive terms, precomputes constant terms once,
         # and only re-evaluates terms that depend on the varying position.
-        # For varying terms, tries to compile piecewise-linear (PL) representations
+        # For varying terms, uses cached piecewise-linear (PL) representations
         # for O(1) per-candidate evaluation instead of O(tree_depth).
+        # Each term's PL is cached and invalidated only when a non-varying
+        # dependency's assignment changes.
         let currentCost = constraint.cost
         let leftInPos = position in constraint.leftExpr.positions
         let rightInPos = position in constraint.rightExpr.positions
@@ -276,61 +286,146 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
         let hasLeftTerms = leftInPos and constraint.leftTerms.len > 0
         let hasRightTerms = rightInPos and constraint.rightTerms.len > 0
 
-        # Compute constant part as: cachedValue - varyingPart (O(k) instead of O(n-k))
+        # Cache varying term references
+        let leftVarying = if hasLeftTerms: constraint.leftVaryingIdx[position] else: @[]
+        let rightVarying = if hasRightTerms: constraint.rightVaryingIdx[position] else: @[]
+
+        # Get or create cached PLs for left varying terms
+        var leftTermPLs: seq[CachedTermPL[T]]
+        var leftTreeTerms: seq[int] = @[]
+        var leftAllPL = true
+        if hasLeftTerms:
+            if position notin constraint.leftTermPLCache:
+                constraint.leftTermPLCache[position] = newSeq[CachedTermPL[T]](constraint.leftTerms.len)
+            leftTermPLs = constraint.leftTermPLCache[position]
+            for ti in leftVarying:
+                var cache = leftTermPLs[ti]
+                # Check if cached PL is still valid
+                var valid = cache.depValues.len > 0 or cache.compiled
+                if valid:
+                    for (pos, savedVal) in cache.depValues:
+                        if assignment[pos] != savedVal:
+                            valid = false
+                            break
+                if not valid:
+                    # Recompile PL and store dependency values
+                    let (ok, pl) = compilePL(constraint.leftTerms[ti].node, position, assignment)
+                    var deps: seq[(int, T)] = @[]
+                    for depPos in constraint.leftTerms[ti].positions.items:
+                        if depPos != position:
+                            deps.add((depPos, assignment[depPos]))
+                    cache = CachedTermPL[T](pl: pl, compiled: ok, depValues: deps)
+                    leftTermPLs[ti] = cache
+                    constraint.leftTermPLCache[position][ti] = cache
+                if not cache.compiled:
+                    leftTreeTerms.add(ti)
+                    leftAllPL = false
+
+        # Get or create cached PLs for right varying terms
+        var rightTermPLs: seq[CachedTermPL[T]]
+        var rightTreeTerms: seq[int] = @[]
+        var rightAllPL = true
+        if hasRightTerms:
+            if position notin constraint.rightTermPLCache:
+                constraint.rightTermPLCache[position] = newSeq[CachedTermPL[T]](constraint.rightTerms.len)
+            rightTermPLs = constraint.rightTermPLCache[position]
+            for ti in rightVarying:
+                var cache = rightTermPLs[ti]
+                var valid = cache.depValues.len > 0 or cache.compiled
+                if valid:
+                    for (pos, savedVal) in cache.depValues:
+                        if assignment[pos] != savedVal:
+                            valid = false
+                            break
+                if not valid:
+                    let (ok, pl) = compilePL(constraint.rightTerms[ti].node, position, assignment)
+                    var deps: seq[(int, T)] = @[]
+                    for depPos in constraint.rightTerms[ti].positions.items:
+                        if depPos != position:
+                            deps.add((depPos, assignment[depPos]))
+                    cache = CachedTermPL[T](pl: pl, compiled: ok, depValues: deps)
+                    rightTermPLs[ti] = cache
+                    constraint.rightTermPLCache[position][ti] = cache
+                if not cache.compiled:
+                    rightTreeTerms.add(ti)
+                    rightAllPL = false
+
+        # Compute constant part using cached PLs to avoid tree evaluation.
+        # constPart = cachedValue - sum(plEval(termPL, currentValue)) for varying terms.
         var leftConstPart: T = 0
         if hasLeftTerms:
             var varyingPart: T = 0
-            for ti in constraint.leftVaryingIdx[position]:
-                varyingPart += constraint.leftTerms[ti].node.evaluate(assignment)
+            for ti in leftVarying:
+                if leftTermPLs[ti].compiled:
+                    varyingPart += plEval(leftTermPLs[ti].pl, int(currentValue))
+                else:
+                    varyingPart += constraint.leftTerms[ti].node.evaluate(assignment)
             leftConstPart = constraint.leftValue - varyingPart
 
         var rightConstPart: T = 0
         if hasRightTerms:
             var varyingPart: T = 0
-            for ti in constraint.rightVaryingIdx[position]:
-                varyingPart += constraint.rightTerms[ti].node.evaluate(assignment)
+            for ti in rightVarying:
+                if rightTermPLs[ti].compiled:
+                    varyingPart += plEval(rightTermPLs[ti].pl, int(currentValue))
+                else:
+                    varyingPart += constraint.rightTerms[ti].node.evaluate(assignment)
             rightConstPart = constraint.rightValue - varyingPart
 
-        # Cache varying term references
-        let leftVarying = if hasLeftTerms: constraint.leftVaryingIdx[position] else: @[]
-        let rightVarying = if hasRightTerms: constraint.rightVaryingIdx[position] else: @[]
-
-        # Try to compile varying terms into piecewise-linear functions.
-        # Sum all successfully compiled terms into one combined PL per side.
-        # Track which terms need tree-eval fallback.
-        var leftPL = plConst(0)
-        var leftTreeTerms: seq[int] = @[]
-        var leftAllPL = true
-        for ti in leftVarying:
-            let (ok, pl) = compilePL(constraint.leftTerms[ti].node, position, assignment)
-            if ok:
-                leftPL = plAdd(leftPL, pl)
-            else:
-                leftTreeTerms.add(ti)
-                leftAllPL = false
-
-        var rightPL = plConst(0)
-        var rightTreeTerms: seq[int] = @[]
-        var rightAllPL = true
-        for ti in rightVarying:
-            let (ok, pl) = compilePL(constraint.rightTerms[ti].node, position, assignment)
-            if ok:
-                rightPL = plAdd(rightPL, pl)
-            else:
-                rightTreeTerms.add(ti)
-                rightAllPL = false
-
-        # Fast path: all varying terms compiled to PL — no assignment mutation needed
+        # Fast path: all varying terms compiled to PL — no assignment mutation needed.
+        # Try to combine term PLs via plAdd for single-eval inner loop.
+        # Fall back to per-term eval if plAdd overflows MaxPLSegs.
         if (hasLeftTerms or not leftInPos) and
            (hasRightTerms or not rightInPos) and
            leftAllPL and rightAllPL:
-            for i in 0..<domain.len:
-                let v = domain[i]
-                let newLeft = if hasLeftTerms: leftConstPart + plEval(leftPL, v)
-                              else: constraint.leftValue
-                let newRight = if hasRightTerms: rightConstPart + plEval(rightPL, v)
-                               else: constraint.rightValue
-                result[i] = constraint.computeCost(newLeft, newRight) - currentCost
+            # Combine left term PLs
+            var leftCombinedPL = plConst(0)
+            var leftCombineOk = true
+            if hasLeftTerms:
+                for ti in leftVarying:
+                    let combined = plAdd(leftCombinedPL, leftTermPLs[ti].pl)
+                    if combined.n >= MaxPLSegs:
+                        leftCombineOk = false
+                        break
+                    leftCombinedPL = combined
+
+            # Combine right term PLs
+            var rightCombinedPL = plConst(0)
+            var rightCombineOk = true
+            if hasRightTerms:
+                for ti in rightVarying:
+                    let combined = plAdd(rightCombinedPL, rightTermPLs[ti].pl)
+                    if combined.n >= MaxPLSegs:
+                        rightCombineOk = false
+                        break
+                    rightCombinedPL = combined
+
+            if leftCombineOk and rightCombineOk:
+                # Single combined PL per side — fastest inner loop
+                for i in 0..<domain.len:
+                    let v = domain[i]
+                    let newLeft = if hasLeftTerms: leftConstPart + T(plEval(leftCombinedPL, int(v)))
+                                  else: constraint.leftValue
+                    let newRight = if hasRightTerms: rightConstPart + T(plEval(rightCombinedPL, int(v)))
+                                   else: constraint.rightValue
+                    result[i] = constraint.computeCost(newLeft, newRight) - currentCost
+            else:
+                # Per-term eval fallback when combined PL overflows
+                for i in 0..<domain.len:
+                    let v = domain[i]
+                    let newLeft = if hasLeftTerms:
+                        var total = leftConstPart
+                        for ti in leftVarying:
+                            total += T(plEval(leftTermPLs[ti].pl, int(v)))
+                        total
+                    else: constraint.leftValue
+                    let newRight = if hasRightTerms:
+                        var total = rightConstPart
+                        for ti in rightVarying:
+                            total += T(plEval(rightTermPLs[ti].pl, int(v)))
+                        total
+                    else: constraint.rightValue
+                    result[i] = constraint.computeCost(newLeft, newRight) - currentCost
         else:
             # Mixed path: PL for compiled terms, tree eval for the rest
             let savedValue = assignment[position]
@@ -359,9 +454,12 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                 assignment[position] = v
 
                 let newLeft = if hasLeftTerms:
-                    var total = leftConstPart + plEval(leftPL, v)
-                    for ti in leftTreeTerms:
-                        total += constraint.leftTerms[ti].node.evaluate(assignment)
+                    var total = leftConstPart
+                    for ti in leftVarying:
+                        if leftTermPLs[ti].compiled:
+                            total += T(plEval(leftTermPLs[ti].pl, int(v)))
+                        else:
+                            total += constraint.leftTerms[ti].node.evaluate(assignment)
                     total
                 elif leftIsSumEB:
                     # Fast: only evaluate terms at this position using seq-based assignment
@@ -378,9 +476,12 @@ proc batchMovePenalty*[T](constraint: RelationalConstraint[T], position: int,
                     constraint.leftValue
 
                 let newRight = if hasRightTerms:
-                    var total = rightConstPart + plEval(rightPL, v)
-                    for ti in rightTreeTerms:
-                        total += constraint.rightTerms[ti].node.evaluate(assignment)
+                    var total = rightConstPart
+                    for ti in rightVarying:
+                        if rightTermPLs[ti].compiled:
+                            total += T(plEval(rightTermPLs[ti].pl, int(v)))
+                        else:
+                            total += constraint.rightTerms[ti].node.evaluate(assignment)
                     total
                 elif rightIsSumEB:
                     let s = constraint.rightExpr.sumExpr

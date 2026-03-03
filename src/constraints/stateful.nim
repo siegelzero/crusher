@@ -1270,7 +1270,9 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                     leftConstantIdx: constraint.relationalState.leftConstantIdx,
                     rightVaryingIdx: constraint.relationalState.rightVaryingIdx,
                     rightConstantIdx: constraint.relationalState.rightConstantIdx,
-                    graduated: constraint.relationalState.graduated
+                    graduated: constraint.relationalState.graduated,
+                    leftTermPLCache: constraint.relationalState.leftTermPLCache,
+                    rightTermPLCache: constraint.relationalState.rightTermPLCache
                 )
             )
         of OrderingType:

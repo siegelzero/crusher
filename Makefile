@@ -44,7 +44,7 @@ test-parallel: clean
 # Clean all compiled executables
 clean:
 	@echo "🧹 Cleaning all compiled executables and backup files..."
-	@find . -type f -perm +111 -not -path "./.git/*" -delete 2>/dev/null || true
+	@find . -type f -perm +111 -not -path "./.git/*" -not -name "*.sh" -delete 2>/dev/null || true
 	@find . -name "*~" -type f -delete 2>/dev/null || true
 	@echo "✅ Cleanup complete"
 
