@@ -1,6 +1,7 @@
 
 import resolution
 from std/times import epochTime
+from std/math import ceil
 import ../expressions/expressions
 import ../expressions/stateful
 import ../expressions/sumExpression

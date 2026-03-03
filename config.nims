@@ -12,3 +12,9 @@ proc findProjectRoot(): string =
 
 let projectRoot = findProjectRoot()
 switch("path", projectRoot & "/src")
+
+# Use system malloc instead of Nim's built-in allocator.
+# Nim's thread-local heap allocator has a race condition in cross-thread
+# deallocation (alloc.nim listRemove) that causes SIGSEGV when objects
+# allocated on init worker threads are freed on tabu search worker threads.
+switch("define", "useMalloc")
