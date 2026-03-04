@@ -9,6 +9,7 @@ import constraints/diffn
 import expressions/expressions
 import expressions/stateful as exprStateful
 import expressions/sumExpression
+import utils
 
 ################################################################################
 # Type definitions
@@ -1202,6 +1203,80 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         of NotEqualTo, CommonFactor, CoPrime:
             discard
 
+    # Fourier-Motzkin resolution: derive new constraints by pairwise elimination.
+    # Only keep resolvents that have strictly fewer positions than both parents.
+    # Single-var resolvents (direct bounds) are always valuable. Multi-var resolvents
+    # are added too but limited to avoid bloating bounds propagation.
+    block fmResolution:
+        var positiveAt: Table[int, seq[int]]
+        var negativeAt: Table[int, seq[int]]
+        for fi, form in normalizedForms:
+            for pos, coeff in form.coefficients.pairs:
+                if coeff > 0:
+                    positiveAt.mgetOrPut(pos, @[]).add(fi)
+                elif coeff < 0:
+                    negativeAt.mgetOrPut(pos, @[]).add(fi)
+
+        var totalResolvents = 0
+        const MaxResolventsPerPos = 50
+        const MaxTotalResolvents = 500
+        const MaxPairProduct = 100
+
+        for pos in positiveAt.keys:
+            if pos notin negativeAt:
+                continue
+            let posIdxs = positiveAt[pos]
+            let negIdxs = negativeAt[pos]
+            if posIdxs.len * negIdxs.len > MaxPairProduct:
+                continue
+            var posResolvents = 0
+            for pIdx in posIdxs:
+                if posResolvents >= MaxResolventsPerPos or totalResolvents >= MaxTotalResolvents:
+                    break
+                let fp = normalizedForms[pIdx]
+                let ap = fp.coefficients[pos]
+                for nIdx in negIdxs:
+                    if posResolvents >= MaxResolventsPerPos or totalResolvents >= MaxTotalResolvents:
+                        break
+                    let fn = normalizedForms[nIdx]
+                    let an = fn.coefficients[pos]
+                    let absAn = -an
+                    var resolvent: Table[int, T]
+                    var resolventConst: T = absAn * fp.constant + ap * fn.constant
+                    for p, c in fp.coefficients.pairs:
+                        if p == pos: continue
+                        resolvent[p] = absAn * c
+                    for p, c in fn.coefficients.pairs:
+                        if p == pos: continue
+                        if p in resolvent:
+                            resolvent[p] = resolvent[p] + ap * c
+                        else:
+                            resolvent[p] = ap * c
+                    var toRemove: seq[int]
+                    for p, c in resolvent.pairs:
+                        if c == T(0):
+                            toRemove.add(p)
+                    for p in toRemove:
+                        resolvent.del(p)
+                    if resolvent.len >= fp.coefficients.len or resolvent.len >= fn.coefficients.len:
+                        continue
+                    if resolvent.len == 0:
+                        continue
+                    var g = abs(resolventConst)
+                    for p, c in resolvent.pairs:
+                        g = gcd(g, abs(c))
+                    if g > 1:
+                        for p in resolvent.keys:
+                            resolvent[p] = resolvent[p] div g
+                        resolventConst = resolventConst div g
+                    normalizedForms.add(NormalizedForm(
+                        coefficients: resolvent, constant: resolventConst))
+                    posResolvents += 1
+                    totalResolvents += 1
+
+        if totalResolvents > 0:
+            stderr.writeLine(&"[DomRed] FM resolution: {totalResolvents} resolvents added")
+
     # Collect allDifferent constraint positions for Phase 4
     var allDiffGroups: seq[seq[int]]
     for cons in carray.constraints:
@@ -2162,6 +2237,203 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[mPos] = intersection
                             outerChanged = true
 
+        # Phase CB: Channel Binding arc consistency
+        # For each channel binding with all-constant array elements, propagate domain
+        # restrictions bidirectionally between key positions and channel position.
+        var cbProcessed, cbPruned = 0
+        for binding in carray.channelBindings:
+            let chPos = binding.channelPosition
+            let arrElems = binding.arrayElements
+            let arrLen = arrElems.len
+
+            # Only process bindings where all arrayElements are constants (functional dep channels)
+            var allConstant = true
+            for elem in arrElems:
+                if not elem.isConstant:
+                    allConstant = false
+                    break
+            if not allConstant:
+                continue
+
+            let idxPositions = toSeq(binding.indexExpression.positions.items)
+            if idxPositions.len == 0 or idxPositions.len > 2:
+                continue
+
+            let chSkipped = chPos in skippedPositions
+            inc cbProcessed
+
+            if idxPositions.len == 1:
+                # Single-position index: ch = lookup[keyPos - offset]
+                let keyPos = idxPositions[0]
+                let keySkipped = keyPos in skippedPositions
+                var tempAssign = initTable[int, T]()
+
+                if not chSkipped and not keySkipped:
+                    # Forward: domain(ch) ∩= {lookup[eval(v)] : v ∈ domain(keyPos), eval(v) ∈ bounds}
+                    var reachableValues = initPackedSet[T]()
+                    for v in currentDomain[keyPos].items:
+                        tempAssign[keyPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < arrLen:
+                            reachableValues.incl(arrElems[idx].constantValue)
+                    let newChDom = currentDomain[chPos] * reachableValues
+                    if newChDom.len < currentDomain[chPos].len:
+                        currentDomain[chPos] = newChDom
+                        outerChanged = true
+
+                    # Backward: domain(keyPos) ∩= {v : eval(v) ∈ bounds AND lookup[eval(v)] ∈ domain(ch)}
+                    for v in toSeq(currentDomain[keyPos].items):
+                        tempAssign[keyPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx < 0 or idx >= arrLen:
+                            currentDomain[keyPos].excl(v)
+                            outerChanged = true
+                        elif arrElems[idx].constantValue notin currentDomain[chPos]:
+                            currentDomain[keyPos].excl(v)
+                            outerChanged = true
+
+                elif chSkipped and not keySkipped:
+                    # Channel position skipped: use domainMin/domainMax bounds for feasibility
+                    for v in toSeq(currentDomain[keyPos].items):
+                        tempAssign[keyPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx < 0 or idx >= arrLen:
+                            currentDomain[keyPos].excl(v)
+                            outerChanged = true
+                        else:
+                            let val = arrElems[idx].constantValue
+                            if val < domainMin[chPos] or val > domainMax[chPos]:
+                                currentDomain[keyPos].excl(v)
+                                outerChanged = true
+
+                elif not chSkipped and keySkipped:
+                    # Key position skipped: use original domain with min/max bounds
+                    var reachableValues = initPackedSet[T]()
+                    for v in carray.domain[keyPos]:
+                        if v < domainMin[keyPos] or v > domainMax[keyPos]:
+                            continue
+                        tempAssign[keyPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < arrLen:
+                            reachableValues.incl(arrElems[idx].constantValue)
+                    if reachableValues.len > 0:
+                        let newChDom = currentDomain[chPos] * reachableValues
+                        if newChDom.len < currentDomain[chPos].len:
+                            currentDomain[chPos] = newChDom
+                            outerChanged = true
+
+            elif idxPositions.len == 2:
+                # Two-position index: ch = lookup[(p0-a)*range + (p1-b)]
+                let p0 = idxPositions[0]
+                let p1 = idxPositions[1]
+                let p0Skipped = p0 in skippedPositions
+                let p1Skipped = p1 in skippedPositions
+
+                # Determine domain sizes for guard
+                let p0Size = if p0Skipped:
+                    (domainMax[p0] - domainMin[p0] + 1)
+                else:
+                    T(currentDomain[p0].len)
+                let p1Size = if p1Skipped:
+                    (domainMax[p1] - domainMin[p1] + 1)
+                else:
+                    T(currentDomain[p1].len)
+
+                if p0Size * p1Size > 500_000:
+                    continue
+
+                if not p0Skipped and not p1Skipped and not chSkipped:
+                    var tempAssign = initTable[int, T]()
+                    let oldP0 = currentDomain[p0].len
+                    let oldP1 = currentDomain[p1].len
+                    let oldCh = currentDomain[chPos].len
+
+                    # Forward: domain(ch) ∩= {lookup[eval(v0,v1)] : (v0,v1) ∈ dom(p0)×dom(p1)}
+                    var reachableValues = initPackedSet[T]()
+                    for v0 in currentDomain[p0].items:
+                        tempAssign[p0] = v0
+                        for v1 in currentDomain[p1].items:
+                            tempAssign[p1] = v1
+                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                reachableValues.incl(arrElems[idx].constantValue)
+                    let newChDom = currentDomain[chPos] * reachableValues
+                    if newChDom.len < currentDomain[chPos].len:
+                        currentDomain[chPos] = newChDom
+                        outerChanged = true
+
+                    # Backward for p0: keep v0 if ∃ v1 s.t. lookup[eval(v0,v1)] ∈ domain(ch)
+                    for v0 in toSeq(currentDomain[p0].items):
+                        tempAssign[p0] = v0
+                        var hasSupport = false
+                        for v1 in currentDomain[p1].items:
+                            tempAssign[p1] = v1
+                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                if arrElems[idx].constantValue in currentDomain[chPos]:
+                                    hasSupport = true
+                                    break
+                        if not hasSupport:
+                            currentDomain[p0].excl(v0)
+                            outerChanged = true
+
+                    # Backward for p1: symmetric
+                    for v1 in toSeq(currentDomain[p1].items):
+                        tempAssign[p1] = v1
+                        var hasSupport = false
+                        for v0 in currentDomain[p0].items:
+                            tempAssign[p0] = v0
+                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                if arrElems[idx].constantValue in currentDomain[chPos]:
+                                    hasSupport = true
+                                    break
+                        if not hasSupport:
+                            currentDomain[p1].excl(v1)
+                            outerChanged = true
+
+                    let prunedP0 = oldP0 - currentDomain[p0].len
+                    let prunedP1 = oldP1 - currentDomain[p1].len
+                    let prunedCh = oldCh - currentDomain[chPos].len
+                    cbPruned += prunedP0 + prunedP1 + prunedCh
+
+                elif chSkipped and not p0Skipped and not p1Skipped:
+                    # Channel skipped: use domainMin/domainMax for feasibility
+                    var tempAssign = initTable[int, T]()
+
+                    for v0 in toSeq(currentDomain[p0].items):
+                        tempAssign[p0] = v0
+                        var hasSupport = false
+                        for v1 in currentDomain[p1].items:
+                            tempAssign[p1] = v1
+                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                let val = arrElems[idx].constantValue
+                                if val >= domainMin[chPos] and val <= domainMax[chPos]:
+                                    hasSupport = true
+                                    break
+                        if not hasSupport:
+                            currentDomain[p0].excl(v0)
+                            outerChanged = true
+
+                    for v1 in toSeq(currentDomain[p1].items):
+                        tempAssign[p1] = v1
+                        var hasSupport = false
+                        for v0 in currentDomain[p0].items:
+                            tempAssign[p0] = v0
+                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                let val = arrElems[idx].constantValue
+                                if val >= domainMin[chPos] and val <= domainMax[chPos]:
+                                    hasSupport = true
+                                    break
+                        if not hasSupport:
+                            currentDomain[p1].excl(v1)
+                            outerChanged = true
+
+        if cbPruned > 0:
+            stderr.writeLine(&"[DomRed] Channel AC: {cbPruned} values pruned ({cbProcessed} bindings)")
+
         # Phase 7: Table constraint arc consistency
         # For each TableIn constraint, remove domain values that have no support
         # (no tuple where all other columns' values are in their domains).
@@ -2182,6 +2454,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             let nCols = tbl.sortedPositions.len
             for col in 0..<nCols:
                 let pos = tbl.sortedPositions[col]
+                # Skip pruning channel positions — their values are determined by
+                # channel propagation, not search. Also skip positions that were
+                # excluded from currentDomain (large-domain channels).
+                if pos in skippedPositions:
+                    continue
                 for v in toSeq(currentDomain[pos].items):
                     if v notin tbl.tuplesByColumnValue[col]:
                         continue  # Not mentioned in table — unconstrained
@@ -2193,6 +2470,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             if otherCol == col:
                                 continue
                             let otherPos = tbl.sortedPositions[otherCol]
+                            # Skipped positions (large-domain channels) have empty
+                            # currentDomain — treat them as having universal support.
+                            if otherPos in skippedPositions:
+                                continue
                             if tbl.tuples[t][otherCol] notin currentDomain[otherPos]:
                                 supported = false
                                 break

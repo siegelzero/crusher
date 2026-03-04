@@ -588,6 +588,118 @@ proc decomposeWithIndicators(tr: var FznTranslator,
       tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
     tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
+proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
+                            tuples: seq[seq[int]]): bool =
+  ## Detects functional keys in table constraints and converts dependent columns
+  ## to channel variables. Checks single-column key (col 0) first, then
+  ## composite 2-column key (cols 0,1). Returns true if the table was consumed.
+  if positions.len < 2 or tuples.len == 0:
+    return false
+
+  # === Try single-column key (column 0) ===
+  block singleKey:
+    var keyValues: PackedSet[int]
+    var keyMin = high(int)
+    var keyMax = low(int)
+    for t in tuples:
+      let k = t[0]
+      if k in keyValues:
+        break singleKey  # duplicate key — not a single-column functional dependency
+      keyValues.incl(k)
+      if k < keyMin: keyMin = k
+      if k > keyMax: keyMax = k
+
+    let keyRange = keyMax - keyMin + 1
+    if keyRange > tuples.len * 2:
+      break singleKey  # too sparse
+
+    let keyPos = positions[0]
+    let nCols = positions.len
+
+    var lookups = newSeq[seq[int]](nCols - 1)
+    for col in 1..<nCols:
+      lookups[col - 1] = newSeq[int](keyRange)
+    for t in tuples:
+      let idx = t[0] - keyMin
+      for col in 1..<nCols:
+        lookups[col - 1][idx] = t[col]
+
+    let keyDomain = tr.sys.baseArray.domain[keyPos]
+    var filteredDomain: seq[int]
+    for v in keyDomain:
+      if v in keyValues:
+        filteredDomain.add(v)
+    if filteredDomain.len < keyDomain.len:
+      tr.sys.baseArray.domain[keyPos] = filteredDomain
+
+    let keyExpr = tr.getExpr(keyPos) - keyMin
+    for col in 1..<nCols:
+      let depPos = positions[col]
+      var arrayElems = newSeq[ArrayElement[int]](keyRange)
+      for i in 0..<keyRange:
+        arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: lookups[col - 1][i])
+      tr.sys.baseArray.addChannelBinding(depPos, keyExpr, arrayElems)
+
+    return true
+
+  # === Try 2-column composite key (columns 0, 1) ===
+  if positions.len < 3:
+    return false
+
+  # Find min/max for both key columns
+  var key0Min = high(int)
+  var key0Max = low(int)
+  var key1Min = high(int)
+  var key1Max = low(int)
+  for t in tuples:
+    if t[0] < key0Min: key0Min = t[0]
+    if t[0] > key0Max: key0Max = t[0]
+    if t[1] < key1Min: key1Min = t[1]
+    if t[1] > key1Max: key1Max = t[1]
+
+  let range0 = key0Max - key0Min + 1
+  let range1 = key1Max - key1Min + 1
+  let totalRange = range0 * range1
+
+  # Only convert if linearized array is not too large (max ~500K entries)
+  if totalRange > 500_000 or totalRange > tuples.len * 5:
+    return false
+
+  # Verify all (col0, col1) pairs are unique
+  var compositeKeys: PackedSet[int]
+  for t in tuples:
+    let linearKey = (t[0] - key0Min) * range1 + (t[1] - key1Min)
+    if linearKey in compositeKeys:
+      return false  # duplicate composite key
+    compositeKeys.incl(linearKey)
+
+  let nCols = positions.len
+  let nDepCols = nCols - 2  # columns 2..n-1 are dependent
+
+  # Build linearized lookup arrays for dependent columns
+  var lookups = newSeq[seq[int]](nDepCols)
+  for col in 0..<nDepCols:
+    lookups[col] = newSeq[int](totalRange)
+  for t in tuples:
+    let idx = (t[0] - key0Min) * range1 + (t[1] - key1Min)
+    for col in 2..<nCols:
+      lookups[col - 2][idx] = t[col]
+
+  # Build composite index expression: (col0_expr - key0Min) * range1 + (col1_expr - key1Min)
+  let expr0 = tr.getExpr(positions[0])
+  let expr1 = tr.getExpr(positions[1])
+  let compositeExpr = (expr0 - key0Min) * range1 + (expr1 - key1Min)
+
+  # Create channel bindings for dependent columns
+  for col in 2..<nCols:
+    let depPos = positions[col]
+    var arrayElems = newSeq[ArrayElement[int]](totalRange)
+    for i in 0..<totalRange:
+      arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: lookups[col - 2][i])
+    tr.sys.baseArray.addChannelBinding(depPos, compositeExpr, arrayElems)
+
+  return true
+
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
   ## Translates a single FlatZinc constraint to a Crusher constraint.
   let name = stripSolverPrefix(con.name)
@@ -1177,9 +1289,54 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     var tuples = newSeq[seq[int]](nTuples)
     for i in 0..<nTuples:
       tuples[i] = flatTable[i * arity ..< (i + 1) * arity]
+
+    # Pre-filter: detect singleton-domain columns (constants) and filter tuples
+    # to matching rows, then project out constant columns. This is critical for
+    # tables like preferences_data where a user_id column is fixed per constraint.
+    var singletonCols: seq[int]   # column indices with singleton domains
+    var singletonVals: seq[int]   # the constant value for each singleton column
     let (allRefs, positions) = isAllRefs(exprs)
     if allRefs:
-      tr.sys.addConstraint(tableIn[int](positions, tuples))
+      for col in 0..<arity:
+        let pos = positions[col]
+        if tr.sys.baseArray.domain[pos].len == 1:
+          singletonCols.add(col)
+          singletonVals.add(tr.sys.baseArray.domain[pos][0])
+
+    if singletonCols.len > 0 and singletonCols.len < arity:
+      # Filter tuples to only those matching all singleton column values
+      var filtered: seq[seq[int]]
+      for t in tuples:
+        var matches = true
+        for i in 0..<singletonCols.len:
+          if t[singletonCols[i]] != singletonVals[i]:
+            matches = false
+            break
+        if matches:
+          # Project out singleton columns
+          var projected = newSeq[int](arity - singletonCols.len)
+          var j = 0
+          for col in 0..<arity:
+            if col notin singletonCols:
+              projected[j] = t[col]
+              inc j
+          filtered.add(projected)
+
+      # Build reduced position array (exclude singleton columns)
+      var reducedPositions: seq[int]
+      for col in 0..<arity:
+        if col notin singletonCols:
+          reducedPositions.add(positions[col])
+
+      if filtered.len > 0:
+        # Try functional dependency: if col0 values are unique, dependent cols become channels
+        if not tr.tryTableFunctionalDep(reducedPositions, filtered):
+          tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
+      # else: no tuples match — constraint is infeasible, will be caught by solver
+    elif allRefs:
+      # Try functional dependency on the original table
+      if not tr.tryTableFunctionalDep(positions, tuples):
+        tr.sys.addConstraint(tableIn[int](positions, tuples))
     else:
       tr.sys.addConstraint(tableIn[int](exprs, tuples))
 
