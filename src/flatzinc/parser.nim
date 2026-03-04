@@ -381,6 +381,9 @@ proc parseType(p: var Parser): (FznType, bool) =
       return (FznType(kind: FznSetOfIntSet, setValues: vals), isVar)
     elif p.curKind == TkInt_kw:
       discard p.eat()
+    else:
+      raise newException(ValueError,
+        &"FZN parse error at line {p.cur.line}: expected int type after 'set of', got {p.curKind}")
     return (FznType(kind: FznSetOfInt), isVar)
 
   case p.curKind
