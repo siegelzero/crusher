@@ -172,11 +172,22 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
         arrayElements: arrayElems
     ))
     arr.channelPositions.incl(channelPos)
+    # Register at index expression positions (index change → re-evaluate)
     for pos in indexExpr.positions.items:
         if pos notin arr.channelsAtPosition:
             arr.channelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.channelsAtPosition[pos].add(bindingIdx)
+    # Register at array element positions (value change → re-evaluate).
+    # Needed when array elements are themselves channels (e.g. min/max channels
+    # from set comprehensions feeding into element selections in deeper layers).
+    for elem in arrayElems:
+        if not elem.isConstant:
+            let pos = elem.variablePosition
+            if pos notin arr.channelsAtPosition:
+                arr.channelsAtPosition[pos] = @[bindingIdx]
+            elif bindingIdx notin arr.channelsAtPosition[pos]:
+                arr.channelsAtPosition[pos].add(bindingIdx)
 
 proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
                                   channelPos: int,

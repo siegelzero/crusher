@@ -1616,13 +1616,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  $buildElapsed & "s)"
             initStart = epochTime()
 
-        # Worklist-based fixed-point for chained min/max dependencies.
-        var worklist: seq[int]  # indices into flatMinMaxBindings
-        for i in 0..<state.flatMinMaxBindings.len:
-            worklist.add(i)
-        var inWorklist = newSeq[bool](state.flatMinMaxBindings.len)
-        for i in 0..<inWorklist.len: inWorklist[i] = true
-
         # Build reverse index: position → binding indices that use this position as input
         var posToBindings = initTable[int, seq[int]]()
         for bi, fb in state.flatMinMaxBindings:
@@ -1632,21 +1625,56 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     posToBindings[pos] = @[]
                 posToBindings[pos].add(bi)
 
+        # Combined element + min/max fixed-point for multi-layer channel dependencies.
+        # Element channels may read from min/max channel outputs (e.g., layer 3 element
+        # channels selecting from layer 2 set comprehension results). We iterate:
+        #   1. Min/max worklist until empty
+        #   2. Re-evaluate element channels; if any changed, enqueue affected min/max bindings
+        #   3. Repeat until stable
+        var worklist: seq[int]  # indices into flatMinMaxBindings
+        for i in 0..<state.flatMinMaxBindings.len:
+            worklist.add(i)
+        var inWorklist = newSeq[bool](state.flatMinMaxBindings.len)
+        for i in 0..<inWorklist.len: inWorklist[i] = true
+
         var fpEvals = 0
-        while worklist.len > 0:
-            let bi = worklist.pop()
-            inWorklist[bi] = false
-            inc fpEvals
-            let fb = state.flatMinMaxBindings[bi]
-            let newVal = evaluateFlatMinMax(fb, state.assignment)
-            if newVal != state.assignment[fb.channelPosition]:
-                state.assignment[fb.channelPosition] = newVal
-                # Enqueue downstream bindings that use this channel as input
-                if fb.channelPosition in posToBindings:
-                    for downstream in posToBindings[fb.channelPosition]:
-                        if not inWorklist[downstream]:
-                            inWorklist[downstream] = true
-                            worklist.add(downstream)
+        while true:
+            # Min/max fixed-point pass
+            while worklist.len > 0:
+                let bi = worklist.pop()
+                inWorklist[bi] = false
+                inc fpEvals
+                let fb = state.flatMinMaxBindings[bi]
+                let newVal = evaluateFlatMinMax(fb, state.assignment)
+                if newVal != state.assignment[fb.channelPosition]:
+                    state.assignment[fb.channelPosition] = newVal
+                    # Enqueue downstream bindings that use this channel as input
+                    if fb.channelPosition in posToBindings:
+                        for downstream in posToBindings[fb.channelPosition]:
+                            if not inWorklist[downstream]:
+                                inWorklist[downstream] = true
+                                worklist.add(downstream)
+
+            # Re-evaluate element channels that may read from updated min/max channels
+            var elemChanged = false
+            for binding in carray.channelBindings:
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    let newVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition]
+                    if newVal != state.assignment[binding.channelPosition]:
+                        state.assignment[binding.channelPosition] = newVal
+                        elemChanged = true
+                        # Enqueue min/max bindings affected by this element channel change
+                        if binding.channelPosition in posToBindings:
+                            for downstream in posToBindings[binding.channelPosition]:
+                                if not inWorklist[downstream]:
+                                    inWorklist[downstream] = true
+                                    worklist.add(downstream)
+            if not elemChanged:
+                break
+
         if verbose and id == 0:
             echo "[Init] Min/max channel fixed-point: " & $fpEvals & " evals, " &
                  $carray.minMaxChannelBindings.len & " bindings, took " & $(epochTime() - initStart) & "s"

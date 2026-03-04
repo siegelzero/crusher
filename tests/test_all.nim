@@ -4,6 +4,7 @@ import test_all_different_except0
 import test_atleast
 import test_atmost
 import test_boolean_constraints
+import test_channel_dependencies
 import test_circuit
 import test_constrained_variable
 import test_count_eq
