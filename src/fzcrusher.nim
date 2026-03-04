@@ -129,8 +129,8 @@ proc main() =
   gSavedFd = savedFd
   gTranslator = addr tr
   gHasSolution = addr tr.sys.hasFeasibleSolution
-  discard signal(SIGTERM, sigTermHandler)
-  discard signal(SIGINT, sigTermHandler)
+  signal(SIGTERM, sigTermHandler)
+  signal(SIGINT, sigTermHandler)
 
   # Solve
   let solveStart = cpuTime()
