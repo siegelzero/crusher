@@ -3300,7 +3300,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             if not lazy1 and oldIdx < 0:
                 continue
 
-            if state.violationCount[position] == 0:
+            if state.violationCount[position] == 0 and
+               state.channelDepPenalties[position].len == 0:
                 continue
 
             inc positionsChecked
@@ -3347,7 +3348,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             if not lazy2 and oldIdx < 0:
                 continue
 
-            if state.violationCount[position] == 0:
+            if state.violationCount[position] == 0 and
+               state.channelDepPenalties[position].len == 0:
                 continue
 
             let domain = state.sharedDomain[][position]
@@ -3515,7 +3517,8 @@ proc bestSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], int) =
     # Iterate binary positions, prefer violated ones
     for bi1 in 0..<state.binaryPositions.len:
         let p1 = state.binaryPositions[bi1]
-        if state.violationCount[p1] == 0:
+        if state.violationCount[p1] == 0 and
+           state.channelDepPenalties[p1].len == 0:
             continue
 
         let val1 = state.assignment[p1]
@@ -3578,7 +3581,8 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
 
     for i in 0..<state.searchPositions.len:
         let p1 = state.searchPositions[i]
-        if state.violationCount[p1] == 0:
+        if state.violationCount[p1] == 0 and
+           state.channelDepPenalties[p1].len == 0:
             continue
         let val1 = state.assignment[p1]
 

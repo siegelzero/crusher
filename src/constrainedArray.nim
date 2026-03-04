@@ -2513,8 +2513,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
 proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
     ## Identifies singleton-domain positions and removes constraints where all
-    ## positions are fixed (singleton domain) or channel. Such constraints are
-    ## guaranteed satisfied after domain reduction.
+    ## non-channel positions are fixed (singleton domain). Constraints that only
+    ## involve channel positions are kept — channel values depend on search
+    ## variables and aren't guaranteed satisfied by domain reduction alone.
 
     # 1. Identify singleton positions from reducedDomain
     for pos in carray.allPositions():
@@ -2524,17 +2525,23 @@ proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
     if carray.fixedPositions.len == 0:
         return
 
-    # 2. Remove constraints where all positions are fixed or channel
+    # 2. Remove constraints where all non-channel positions are fixed,
+    #    but only if the constraint has at least one fixed position.
+    #    Pure-channel constraints are kept (they become channel-dep constraints
+    #    in the tabu search, since their values depend on search variables).
     let excludedPositions = carray.fixedPositions + carray.channelPositions
     var newConstraints: seq[StatefulConstraint[T]]
     var removedCount = 0
     for c in carray.constraints:
-        var allFixed = true
+        var allExcluded = true
+        var hasFixedPos = false
         for pos in c.positions.items:
             if pos notin excludedPositions:
-                allFixed = false
+                allExcluded = false
                 break
-        if allFixed:
+            if pos in carray.fixedPositions:
+                hasFixedPos = true
+        if allExcluded and hasFixedPos:
             inc removedCount
         else:
             newConstraints.add(c)
