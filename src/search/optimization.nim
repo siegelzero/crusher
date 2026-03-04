@@ -70,8 +70,6 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 let savedAssignment = system.assignment
                 var domainResolved = false
                 # Try parallel resolve with scatter search, retrying with fresh seeds.
-                # Don't pass internal deadline — let scatter stop at its stale limit
-                # so each attempt completes quickly (~0.5-1s) for fresh restarts.
                 for attempt in 1..5:
                     if deadline > 0 and epochTime() > deadline:
                         raise newException(TimeLimitExceededError, "Time limit exceeded")
@@ -82,7 +80,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                                       scatterThreshold=max(scatterThreshold, 3),
                                       populationSize=populationSize, numWorkers=numWorkers,
                                       scatterStrategy=scatterStrategy, verbose=verbose,
-                                      deadline=0.0)
+                                      deadline=deadline)
                         domainResolved = true
                         break
                     except NoSolutionFoundError:

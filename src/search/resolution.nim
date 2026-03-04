@@ -109,6 +109,8 @@ proc resolveFromAssignment*[T](system: ConstraintSystem[T],
     ## Sequential tabu search from a given starting assignment.
     ## Used by the optimizer when domain bound constraints are added after
     ## an initial feasible solution is found.
+    ## Note: skips detectElementInverseChannels — already called by the
+    ## initial resolve() before the optimizer adds bound constraints.
     if system.baseArray.reducedDomain.len == 0:
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
         system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
