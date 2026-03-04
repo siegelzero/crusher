@@ -59,6 +59,16 @@ type
     consumedConstraints*: seq[int]
     consumedBoolVars*: seq[string]
 
+  SetVarInfo* = object
+    positions*: seq[int]  # boolean variable positions in ConstraintSystem
+    lo*: int              # min element of universe
+    hi*: int              # max element of universe
+
+  SetArrayElement* = object
+    isConstant*: bool
+    constantValues*: seq[int]  # for literal set elements
+    varName*: string           # FZN name (for variable elements)
+
   FznTranslator* = object
     sys*: ConstraintSystem[int]
     # Maps FZN variable name -> position in the ConstrainedArray
@@ -141,6 +151,20 @@ type
     equalityCopyAliases*: Table[string, string]
     # Constraint indices of int_eq_reif that are equality copies (skip in buildReifChannelBindings)
     equalityCopyReifCIs*: PackedSet[int]
+    # Set variable decomposition: maps FZN set var name -> boolean positions + universe bounds
+    setVarBoolPositions*: Table[string, SetVarInfo]
+    # Set parameter values: maps FZN set param name -> set of int values
+    setParamValues*: Table[string, seq[int]]
+    # Set array parameter values: maps FZN array name -> per-element set values
+    setArrayValues*: Table[string, seq[seq[int]]]
+    # Set array decompositions: maps FZN array name -> per-element set array info
+    setArrayDecompositions*: Table[string, seq[SetArrayElement]]
+    # Output set variables (for set output formatting)
+    outputSetVars*: HashSet[string]
+    # Output set arrays (for set array output formatting)
+    outputSetArrays*: HashSet[string]
+    # set_union channel defs: constraint index + result var name
+    setUnionChannelDefs*: seq[tuple[ci: int, resultName: string]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -425,12 +449,41 @@ proc stripSolverPrefix(name: string): string =
       return "fzn_" & stripped
   return name
 
+proc extractSetValues(value: FznExpr): seq[int] =
+  ## Extract integer values from a set literal or range expression.
+  case value.kind
+  of FznSetLit:
+    return value.setElems
+  of FznRange:
+    if value.lo > value.hi:
+      return @[]  # empty set (e.g., 1..0)
+    return toSeq(value.lo..value.hi)
+  else:
+    return @[]
+
 proc translateParameters(tr: var FznTranslator) =
   ## Process parameter declarations (constant values and arrays).
   ## Must be called before collectDefinedVars since it needs resolveIntArray.
   for decl in tr.model.parameters:
+    let isSetType = decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}
     if decl.isArray:
-      if decl.value != nil and decl.value.kind == FznArrayLit:
+      if isSetType:
+        # Array of set parameters: store per-element set values
+        if decl.value != nil and decl.value.kind == FznArrayLit:
+          var setVals = newSeq[seq[int]](decl.value.elems.len)
+          for i, e in decl.value.elems:
+            case e.kind
+            of FznSetLit, FznRange:
+              setVals[i] = extractSetValues(e)
+            of FznIdent:
+              if e.ident in tr.setParamValues:
+                setVals[i] = tr.setParamValues[e.ident]
+              else:
+                setVals[i] = @[]
+            else:
+              setVals[i] = @[]
+          tr.setArrayValues[decl.name] = setVals
+      elif decl.value != nil and decl.value.kind == FznArrayLit:
         var vals = newSeq[int](decl.value.elems.len)
         for i, e in decl.value.elems:
           case e.kind
@@ -448,7 +501,10 @@ proc translateParameters(tr: var FznTranslator) =
         tr.arrayValues[decl.name] = vals
     else:
       # Single parameter
-      if decl.value != nil:
+      if isSetType:
+        if decl.value != nil:
+          tr.setParamValues[decl.name] = extractSetValues(decl.value)
+      elif decl.value != nil:
         case decl.value.kind
         of FznIntLit:
           tr.paramValues[decl.name] = decl.value.intVal
@@ -461,6 +517,8 @@ proc translateVariables(tr: var FznTranslator) =
   ## Creates ConstrainedVariables for all FZN variable declarations and sets domains.
 
   # First pass: create all variables (non-array), skipping defined variables
+  var nSetVars = 0
+  var nSetBools = 0
   for decl in tr.model.variables:
     if decl.isArray:
       continue
@@ -474,6 +532,64 @@ proc translateVariables(tr: var FznTranslator) =
       if decl.varType.kind == FznIntRange:
         tr.definedVarBounds[decl.name] = (decl.varType.lo, decl.varType.hi)
       continue
+
+    # Handle set variables: decompose into boolean arrays
+    if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+      var lo, hi: int
+      case decl.varType.kind
+      of FznSetOfIntRange:
+        lo = decl.varType.setLo
+        hi = decl.varType.setHi
+      of FznSetOfIntSet:
+        if decl.varType.setValues.len == 0:
+          tr.setVarBoolPositions[decl.name] = SetVarInfo(positions: @[], lo: 0, hi: -1)
+          continue
+        lo = decl.varType.setValues.min
+        hi = decl.varType.setValues.max
+      of FznSetOfInt:
+        # Unbounded set of int - use reasonable range
+        lo = 0
+        hi = 99
+      else: discard
+
+      if lo > hi:
+        tr.setVarBoolPositions[decl.name] = SetVarInfo(positions: @[], lo: lo, hi: hi)
+        if decl.hasAnnotation("output_var"):
+          tr.outputSetVars.incl(decl.name)
+        continue
+
+      let size = hi - lo + 1
+      var boolPositions = newSeq[int](size)
+
+      # Determine fixed values if the variable has an assignment
+      var fixedValues: seq[int]
+      var hasFixed = false
+      if decl.value != nil:
+        fixedValues = extractSetValues(decl.value)
+        hasFixed = true
+
+      for i in 0..<size:
+        let bpos = tr.sys.baseArray.len
+        let bv = tr.sys.newConstrainedVariable()
+        if hasFixed:
+          # Fix boolean: 1 if element is in the fixed set, 0 otherwise
+          if (lo + i) in fixedValues:
+            bv.setDomain(@[1])
+          else:
+            bv.setDomain(@[0])
+        else:
+          bv.setDomain(@[0, 1])
+        boolPositions[i] = bpos
+
+      tr.setVarBoolPositions[decl.name] = SetVarInfo(
+        positions: boolPositions, lo: lo, hi: hi)
+      inc nSetVars
+      nSetBools += size
+
+      if decl.hasAnnotation("output_var"):
+        tr.outputSetVars.incl(decl.name)
+      continue
+
     let pos = tr.sys.baseArray.len
     let v = tr.sys.newConstrainedVariable()
     tr.varPositions[decl.name] = pos
@@ -498,10 +614,36 @@ proc translateVariables(tr: var FznTranslator) =
       if decl.varType.kind == FznBool:
         tr.outputBoolVars.incl(decl.name)
 
+  if nSetVars > 0:
+    stderr.writeLine(&"[FZN] Set decomposition: {nSetVars} set variables -> {nSetBools} boolean variables")
+
   # Second pass: process variable arrays (they reference already-created variables)
   for decl in tr.model.variables:
     if not decl.isArray:
       continue
+
+    # Handle set-typed arrays: decompose into per-element SetArrayElement records
+    if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+      if decl.value != nil and decl.value.kind == FznArrayLit:
+        var elems = newSeq[SetArrayElement](decl.value.elems.len)
+        for i, e in decl.value.elems:
+          case e.kind
+          of FznIdent:
+            if e.ident in tr.setVarBoolPositions:
+              elems[i] = SetArrayElement(isConstant: false, varName: e.ident)
+            elif e.ident in tr.setParamValues:
+              elems[i] = SetArrayElement(isConstant: true, constantValues: tr.setParamValues[e.ident])
+            else:
+              elems[i] = SetArrayElement(isConstant: true, constantValues: @[])
+          of FznSetLit, FznRange:
+            elems[i] = SetArrayElement(isConstant: true, constantValues: extractSetValues(e))
+          else:
+            elems[i] = SetArrayElement(isConstant: true, constantValues: @[])
+        tr.setArrayDecompositions[decl.name] = elems
+      if decl.hasAnnotation("output_array"):
+        tr.outputSetArrays.incl(decl.name)
+      continue
+
     if decl.value != nil and decl.value.kind == FznArrayLit:
       var positions = newSeq[int](decl.value.elems.len)
       var allConstants = true
@@ -702,6 +844,31 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
     tr.sys.baseArray.addChannelBinding(depPos, compositeExpr, arrayElems)
 
   return true
+
+proc resolveSetArg(tr: FznTranslator, arg: FznExpr): tuple[isConst: bool, constVals: seq[int], varInfo: SetVarInfo] =
+  ## Resolves a FznExpr that refers to a set (variable or constant).
+  case arg.kind
+  of FznSetLit:
+    return (true, arg.setElems, SetVarInfo())
+  of FznRange:
+    if arg.lo > arg.hi:
+      return (true, @[], SetVarInfo())
+    return (true, toSeq(arg.lo..arg.hi), SetVarInfo())
+  of FznIdent:
+    if arg.ident in tr.setVarBoolPositions:
+      return (false, @[], tr.setVarBoolPositions[arg.ident])
+    elif arg.ident in tr.setParamValues:
+      return (true, tr.setParamValues[arg.ident], SetVarInfo())
+    else:
+      raise newException(KeyError, &"Unknown set identifier '{arg.ident}'")
+  else:
+    raise newException(ValueError, &"Cannot resolve {arg.kind} as set")
+
+proc getSetBoolPosition(info: SetVarInfo, element: int): int {.inline.} =
+  ## Returns the boolean variable position for a given element, or -1 if outside universe.
+  if element < info.lo or element > info.hi:
+    return -1
+  return info.positions[element - info.lo]
 
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
   ## Translates a single FlatZinc constraint to a Crusher constraint.
@@ -1546,9 +1713,449 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
   of "set_in":
     # set_in(x, S) means x must be in set S
-    # For local search, this is handled by domain restriction
-    # If S is a set literal, restrict the domain
-    discard  # Domain is already set from variable declaration
+    let xArg = con.args[0]
+    let sArg = con.args[1]
+    let sInfo = tr.resolveSetArg(sArg)
+    if sInfo.isConst:
+      # S is a constant set — restrict x's domain (already handled by FlatZinc domain)
+      if xArg.kind == FznIdent and xArg.ident in tr.varPositions:
+        let pos = tr.varPositions[xArg.ident]
+        let currentDom = tr.sys.baseArray.domain[pos]
+        let allowed = toHashSet(sInfo.constVals)
+        var newDom: seq[int]
+        for v in currentDom:
+          if v in allowed:
+            newDom.add(v)
+        if newDom.len > 0 and newDom.len < currentDom.len:
+          tr.sys.baseArray.setDomain(pos, newDom)
+    else:
+      # S is a set variable
+      let info = sInfo.varInfo
+      if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
+        # x is a constant literal: fix S.bools[x - lo] to 1
+        let xVal = tr.resolveIntArg(xArg)
+        let bpos = getSetBoolPosition(info, xVal)
+        if bpos >= 0:
+          tr.sys.baseArray.setDomain(bpos, @[1])
+      elif xArg.kind == FznIdent and xArg.ident in tr.varPositions:
+        # x is a variable, S is a set variable: S.bools[x - lo] == 1
+        # Restrict x's domain to S's universe
+        let xPos = tr.varPositions[xArg.ident]
+        let currentDom = tr.sys.baseArray.domain[xPos]
+        var newDom: seq[int]
+        for v in currentDom:
+          if v >= info.lo and v <= info.hi:
+            newDom.add(v)
+        if newDom.len > 0 and newDom.len < currentDom.len:
+          tr.sys.baseArray.setDomain(xPos, newDom)
+        # Build element constraint: element(x - lo, S.bools) == 1
+        let xExpr = tr.getExpr(xPos)
+        let indexExpr = xExpr - info.lo
+        var arrayElems: seq[ArrayElement[int]]
+        for bpos in info.positions:
+          arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
+        # Create a variable fixed to 1 as the result
+        let onePos = tr.sys.baseArray.len
+        let oneVar = tr.sys.newConstrainedVariable()
+        oneVar.setDomain(@[1])
+        tr.sys.baseArray.addChannelBinding(onePos, indexExpr, arrayElems)
+
+  of "set_card":
+    # set_card(S, c) means |S| == c
+    let sArg = con.args[0]
+    let cArg = con.args[1]
+    let sInfo = tr.resolveSetArg(sArg)
+    if sInfo.isConst:
+      # S is a constant set — c must equal |S|
+      let cardVal = sInfo.constVals.len
+      if cArg.kind == FznIdent and cArg.ident in tr.varPositions:
+        let cPos = tr.varPositions[cArg.ident]
+        tr.sys.baseArray.setDomain(cPos, @[cardVal])
+    else:
+      # S is a set variable — sum(S.bools) == c
+      let info = sInfo.varInfo
+      if info.positions.len == 0:
+        # Empty universe set — cardinality must be 0
+        if cArg.kind == FznIdent and cArg.ident in tr.varPositions:
+          tr.sys.baseArray.setDomain(tr.varPositions[cArg.ident], @[0])
+      else:
+        var boolExprs = newSeq[AlgebraicExpression[int]](info.positions.len)
+        for i, bpos in info.positions:
+          boolExprs[i] = tr.getExpr(bpos)
+        let sumExpr = sum(boolExprs)
+        let cExpr = tr.resolveExprArg(cArg)
+        tr.sys.addConstraint(sumExpr == cExpr)
+
+  of "set_union":
+    # set_union(A, B, C) means C = A ∪ B
+    # For each element e in universe: C.bools[e-lo] = max(A.bools[e-lo], B.bools[e-lo])
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    let cInfo = tr.resolveSetArg(con.args[2])
+    if cInfo.isConst:
+      discard  # Constant result — no constraint needed
+    else:
+      let cVar = cInfo.varInfo
+      for idx in 0..<cVar.positions.len:
+        let elem = cVar.lo + idx
+        let cBoolPos = cVar.positions[idx]
+        # Get A's value for this element
+        var aExpr: AlgebraicExpression[int]
+        if aInfo.isConst:
+          aExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in aInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let aPos = getSetBoolPosition(aInfo.varInfo, elem)
+          if aPos >= 0:
+            aExpr = tr.getExpr(aPos)
+          else:
+            aExpr = newAlgebraicExpression[int](
+              positions = initPackedSet[int](),
+              node = ExpressionNode[int](kind: LiteralNode, value: 0),
+              linear = true)
+        # Get B's value for this element
+        var bExpr: AlgebraicExpression[int]
+        if bInfo.isConst:
+          bExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in bInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let bPos = getSetBoolPosition(bInfo.varInfo, elem)
+          if bPos >= 0:
+            bExpr = tr.getExpr(bPos)
+          else:
+            bExpr = newAlgebraicExpression[int](
+              positions = initPackedSet[int](),
+              node = ExpressionNode[int](kind: LiteralNode, value: 0),
+              linear = true)
+        # C[elem] = max(A[elem], B[elem])
+        let cExpr = tr.getExpr(cBoolPos)
+        let maxExpr = binaryMax(aExpr, bExpr)
+        tr.sys.addConstraint(cExpr == maxExpr)
+
+  of "set_intersect":
+    # set_intersect(A, B, C) means C = A ∩ B
+    # For each element e: C.bools[e-lo] = min(A.bools[e-lo], B.bools[e-lo])
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    let cInfo = tr.resolveSetArg(con.args[2])
+    if cInfo.isConst:
+      discard
+    else:
+      let cVar = cInfo.varInfo
+      for idx in 0..<cVar.positions.len:
+        let elem = cVar.lo + idx
+        let cBoolPos = cVar.positions[idx]
+        var aExpr: AlgebraicExpression[int]
+        if aInfo.isConst:
+          aExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in aInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let aPos = getSetBoolPosition(aInfo.varInfo, elem)
+          if aPos >= 0: aExpr = tr.getExpr(aPos)
+          else: aExpr = newAlgebraicExpression[int](positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        var bExpr: AlgebraicExpression[int]
+        if bInfo.isConst:
+          bExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in bInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let bPos = getSetBoolPosition(bInfo.varInfo, elem)
+          if bPos >= 0: bExpr = tr.getExpr(bPos)
+          else: bExpr = newAlgebraicExpression[int](positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        let cExpr = tr.getExpr(cBoolPos)
+        let minExpr = binaryMin(aExpr, bExpr)
+        tr.sys.addConstraint(cExpr == minExpr)
+
+  of "set_in_reif":
+    # set_in_reif(x, S, b) means b ↔ (x ∈ S)
+    let xArg = con.args[0]
+    let sArg = con.args[1]
+    let bArg = con.args[2]
+    let sInfo = tr.resolveSetArg(sArg)
+    if not sInfo.isConst and xArg.kind == FznIdent and xArg.ident in tr.setVarBoolPositions:
+      # Both x and S are set variables — skip (not expected in practice)
+      discard
+    elif not sInfo.isConst:
+      # S is a set variable, x is int/bool
+      let info = sInfo.varInfo
+      if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
+        # x is a constant: b = S.bools[x - lo]
+        let xVal = tr.resolveIntArg(xArg)
+        let bpos = getSetBoolPosition(info, xVal)
+        if bpos >= 0:
+          let bExpr = tr.resolveExprArg(bArg)
+          let sBoolExpr = tr.getExpr(bpos)
+          tr.sys.addConstraint(bExpr == sBoolExpr)
+        else:
+          # x outside universe — b must be 0
+          if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+            tr.sys.baseArray.setDomain(tr.varPositions[bArg.ident], @[0])
+      elif xArg.kind == FznIdent and xArg.ident in tr.varPositions:
+        # x is a variable: b = element(x - lo, S.bools)
+        let xPos = tr.varPositions[xArg.ident]
+        let xExpr = tr.getExpr(xPos)
+        var arrayElems: seq[ArrayElement[int]]
+        # Build array covering x's domain range within S's universe
+        let xDom = tr.sys.baseArray.domain[xPos]
+        let domLo = xDom[0]
+        let domHi = xDom[^1]
+        let arrLo = min(domLo, info.lo)
+        let arrHi = max(domHi, info.hi)
+        for v in arrLo..arrHi:
+          let bpos = getSetBoolPosition(info, v)
+          if bpos >= 0:
+            arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
+          else:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+        if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+          let bPos = tr.varPositions[bArg.ident]
+          let adjIndexExpr = xExpr - arrLo
+          tr.sys.baseArray.addChannelBinding(bPos, adjIndexExpr, arrayElems)
+    else:
+      # S is a constant set — b ↔ (x ∈ S) via domain lookup table
+      let setValues = sInfo.constVals
+      let setAsHashSet = toHashSet(setValues)
+      if xArg.kind == FznIdent and xArg.ident in tr.varPositions:
+        let xPos = tr.varPositions[xArg.ident]
+        let xExpr = tr.getExpr(xPos)
+        let domain = tr.sys.baseArray.domain[xPos]
+        if domain.len > 0:
+          let lo = domain[0]
+          let indexExpr = xExpr - lo
+          var arrayElems: seq[ArrayElement[int]]
+          for v in domain:
+            arrayElems.add(ArrayElement[int](isConstant: true,
+                constantValue: if v in setAsHashSet: 1 else: 0))
+          if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+            let bPos = tr.varPositions[bArg.ident]
+            tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
+
+  of "array_var_set_element":
+    # array_var_set_element(idx, [S1, S2, ...], R) means R = array[idx]
+    # For each element e in R's universe: R.bools[e-lo] = element(idx, [S1.bools[e-lo], S2.bools[e-lo], ...])
+    let idxArg = con.args[0]
+    let arrArg = con.args[1]
+    let rArg = con.args[2]
+
+    # Resolve the result set variable
+    let rInfo = tr.resolveSetArg(rArg)
+    if rInfo.isConst:
+      discard  # Result is constant — skip
+    else:
+      let rVar = rInfo.varInfo
+
+      # Resolve the array of set variables/constants
+      var setElems: seq[SetArrayElement]
+      case arrArg.kind
+      of FznIdent:
+        if arrArg.ident in tr.setArrayDecompositions:
+          setElems = tr.setArrayDecompositions[arrArg.ident]
+        elif arrArg.ident in tr.setArrayValues:
+          let vals = tr.setArrayValues[arrArg.ident]
+          for sv in vals:
+            setElems.add(SetArrayElement(isConstant: true, constantValues: sv))
+        else:
+          discard  # Unknown array
+      of FznArrayLit:
+        for e in arrArg.elems:
+          let si = tr.resolveSetArg(e)
+          if si.isConst:
+            setElems.add(SetArrayElement(isConstant: true, constantValues: si.constVals))
+          else:
+            setElems.add(SetArrayElement(isConstant: false, varName: e.ident))
+      else:
+        discard
+
+      if setElems.len > 0:
+        # Resolve index expression (FZN element is 1-indexed)
+        let idxExpr = tr.resolveExprArg(idxArg)
+        let indexExpr = idxExpr - 1  # Convert to 0-based
+
+        # For each boolean position in R's universe
+        for idx in 0..<rVar.positions.len:
+          let elem = rVar.lo + idx
+          let rBoolPos = rVar.positions[idx]
+
+          # Build array elements: for each set in the array, get the boolean for this element
+          var arrayElems: seq[ArrayElement[int]]
+          for se in setElems:
+            if se.isConstant:
+              arrayElems.add(ArrayElement[int](isConstant: true,
+                  constantValue: if elem in se.constantValues: 1 else: 0))
+            else:
+              if se.varName in tr.setVarBoolPositions:
+                let svi = tr.setVarBoolPositions[se.varName]
+                let bpos = getSetBoolPosition(svi, elem)
+                if bpos >= 0:
+                  arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
+                else:
+                  arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+              else:
+                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+
+          # R.bools[elem] = element(idx - 1, [array of bools for this element])
+          tr.sys.baseArray.addChannelBinding(rBoolPos, indexExpr, arrayElems)
+
+  of "set_diff":
+    # set_diff(A, B, C) means C = A \ B
+    # C.bools[i] = min(A.bools[i], 1 - B.bools[i])
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    let cInfo = tr.resolveSetArg(con.args[2])
+    if cInfo.isConst:
+      discard
+    else:
+      let cVar = cInfo.varInfo
+      for idx in 0..<cVar.positions.len:
+        let elem = cVar.lo + idx
+        let cBoolPos = cVar.positions[idx]
+        var aExpr: AlgebraicExpression[int]
+        if aInfo.isConst:
+          aExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in aInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let aPos = getSetBoolPosition(aInfo.varInfo, elem)
+          if aPos >= 0: aExpr = tr.getExpr(aPos)
+          else: aExpr = newAlgebraicExpression[int](positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        var bVal: AlgebraicExpression[int]
+        if bInfo.isConst:
+          bVal = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode,
+              value: if elem in bInfo.constVals: 1 else: 0),
+            linear = true)
+        else:
+          let bPos = getSetBoolPosition(bInfo.varInfo, elem)
+          if bPos >= 0: bVal = tr.getExpr(bPos)
+          else: bVal = newAlgebraicExpression[int](positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        let notB = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: 1),
+          linear = true) - bVal
+        let cExpr = tr.getExpr(cBoolPos)
+        let minExpr = binaryMin(aExpr, notB)
+        tr.sys.addConstraint(cExpr == minExpr)
+
+  of "set_subset":
+    # set_subset(A, B) means A ⊆ B
+    # For each element: A.bools[i] <= B.bools[i]
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    if aInfo.isConst and not bInfo.isConst:
+      # Every constant element of A must be in B
+      let bVar = bInfo.varInfo
+      for elem in aInfo.constVals:
+        let bpos = getSetBoolPosition(bVar, elem)
+        if bpos >= 0:
+          tr.sys.baseArray.setDomain(bpos, @[1])
+    elif not aInfo.isConst and bInfo.isConst:
+      # Every element of A must be in constant B
+      let aVar = aInfo.varInfo
+      let allowed = toHashSet(bInfo.constVals)
+      for idx in 0..<aVar.positions.len:
+        let elem = aVar.lo + idx
+        if elem notin allowed:
+          tr.sys.baseArray.setDomain(aVar.positions[idx], @[0])
+    elif not aInfo.isConst and not bInfo.isConst:
+      # A.bools[i] <= B.bools[i] for all i in shared universe
+      let aVar = aInfo.varInfo
+      let bVar = bInfo.varInfo
+      let lo = max(aVar.lo, bVar.lo)
+      let hi = min(aVar.hi, bVar.hi)
+      for elem in lo..hi:
+        let aPos = getSetBoolPosition(aVar, elem)
+        let bPos = getSetBoolPosition(bVar, elem)
+        if aPos >= 0 and bPos >= 0:
+          tr.sys.addConstraint(tr.getExpr(aPos) <= tr.getExpr(bPos))
+      # Elements in A outside B's universe must be 0
+      for idx in 0..<aVar.positions.len:
+        let elem = aVar.lo + idx
+        if elem < bVar.lo or elem > bVar.hi:
+          tr.sys.baseArray.setDomain(aVar.positions[idx], @[0])
+
+  of "set_eq":
+    # set_eq(A, B) means A = B (all booleans equal)
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    if aInfo.isConst and not bInfo.isConst:
+      # Fix B's booleans to match constant A
+      let bVar = bInfo.varInfo
+      let constSet = toHashSet(aInfo.constVals)
+      for idx in 0..<bVar.positions.len:
+        let elem = bVar.lo + idx
+        if elem in constSet:
+          tr.sys.baseArray.setDomain(bVar.positions[idx], @[1])
+        else:
+          tr.sys.baseArray.setDomain(bVar.positions[idx], @[0])
+    elif not aInfo.isConst and bInfo.isConst:
+      let aVar = aInfo.varInfo
+      let constSet = toHashSet(bInfo.constVals)
+      for idx in 0..<aVar.positions.len:
+        let elem = aVar.lo + idx
+        if elem in constSet:
+          tr.sys.baseArray.setDomain(aVar.positions[idx], @[1])
+        else:
+          tr.sys.baseArray.setDomain(aVar.positions[idx], @[0])
+    elif not aInfo.isConst and not bInfo.isConst:
+      let aVar = aInfo.varInfo
+      let bVar = bInfo.varInfo
+      let lo = min(aVar.lo, bVar.lo)
+      let hi = max(aVar.hi, bVar.hi)
+      for elem in lo..hi:
+        let aPos = getSetBoolPosition(aVar, elem)
+        let bPos = getSetBoolPosition(bVar, elem)
+        if aPos >= 0 and bPos >= 0:
+          tr.sys.addConstraint(tr.getExpr(aPos) == tr.getExpr(bPos))
+        elif aPos >= 0:
+          tr.sys.baseArray.setDomain(aPos, @[0])
+        elif bPos >= 0:
+          tr.sys.baseArray.setDomain(bPos, @[0])
+
+  of "set_ne":
+    # set_ne(A, B) means A ≠ B — at least one boolean differs
+    # sum(|A[i] - B[i]|) >= 1 approximated as sum(A[i] xor B[i]) >= 1
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+    if not aInfo.isConst and not bInfo.isConst:
+      let aVar = aInfo.varInfo
+      let bVar = bInfo.varInfo
+      let lo = min(aVar.lo, bVar.lo)
+      let hi = max(aVar.hi, bVar.hi)
+      # Collect difference expressions: |a[i] - b[i]|
+      var diffExprs: seq[AlgebraicExpression[int]]
+      for elem in lo..hi:
+        let aPos = getSetBoolPosition(aVar, elem)
+        let bPos = getSetBoolPosition(bVar, elem)
+        var aExpr, bExpr: AlgebraicExpression[int]
+        if aPos >= 0: aExpr = tr.getExpr(aPos)
+        else: aExpr = newAlgebraicExpression[int](positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        if bPos >= 0: bExpr = tr.getExpr(bPos)
+        else: bExpr = newAlgebraicExpression[int](positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: 0), linear = true)
+        # |a - b| for booleans = a + b - 2*min(a,b)
+        diffExprs.add(aExpr + bExpr - 2 * binaryMin(aExpr, bExpr))
+      if diffExprs.len > 0:
+        let totalDiff = sum(diffExprs)
+        tr.sys.addConstraint(totalDiff >= 1)
 
   else:
     # Unknown constraint - warn and skip
@@ -2279,6 +2886,40 @@ proc detectReifChannels(tr: var FznTranslator) =
      tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0:
     stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif")
 
+
+proc detectSetUnionChannels(tr: var FznTranslator) =
+  ## Detects set_union(A, B, C) :: defines_var(C) patterns and marks C as a channel variable.
+  ## The channel bindings are built later via buildSetUnionChannelBindings.
+  ## Must be called before translateVariables so channel booleans are marked non-search.
+  # Build set of known set variable names from the model
+  var setVarNames: HashSet[string]
+  for decl in tr.model.variables:
+    if not decl.isArray and decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+      setVarNames.incl(decl.name)
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "set_union" or not con.hasAnnotation("defines_var"):
+      continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent:
+      continue
+    let cName = con.args[2].ident
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != cName:
+      continue
+    if cName notin setVarNames:
+      continue
+    if cName in tr.channelVarNames:
+      continue
+    # Mark C as channel (its booleans will be computed, not searched)
+    tr.channelVarNames.incl(cName)
+    tr.definingConstraints.incl(ci)
+    tr.setUnionChannelDefs.add((ci: ci, resultName: cName))
+
+  if tr.setUnionChannelDefs.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.setUnionChannelDefs.len} set_union channel variables")
 
 proc detectEqualityCopyVars(tr: var FznTranslator) =
   ## Detects "equality copy" variables: vars that are copies of another variable
@@ -4446,6 +5087,84 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
   if tr.sys.baseArray.minMaxChannelBindings.len > 0:
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
 
+proc buildSetUnionChannelBindings(tr: var FznTranslator) =
+  ## Builds channel bindings for set_union(A, B, C) :: defines_var(C).
+  ## Each boolean of C becomes a max(A_bool, B_bool) channel binding.
+  var nBuilt = 0
+  for def in tr.setUnionChannelDefs:
+    let con = tr.model.constraints[def.ci]
+    let cName = def.resultName
+    if cName notin tr.setVarBoolPositions:
+      continue
+    let cVar = tr.setVarBoolPositions[cName]
+    if cVar.positions.len == 0:
+      continue
+
+    let aInfo = tr.resolveSetArg(con.args[0])
+    let bInfo = tr.resolveSetArg(con.args[1])
+
+    for idx in 0..<cVar.positions.len:
+      let elem = cVar.lo + idx
+      let cBoolPos = cVar.positions[idx]
+
+      # Get A's expression for this element
+      var aExpr: AlgebraicExpression[int]
+      var aIsConst = false
+      var aConstVal = 0
+      if aInfo.isConst:
+        aIsConst = true
+        aConstVal = if elem in aInfo.constVals: 1 else: 0
+        aExpr = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: aConstVal),
+          linear = true)
+      else:
+        let aPos = getSetBoolPosition(aInfo.varInfo, elem)
+        if aPos >= 0:
+          aExpr = tr.getExpr(aPos)
+        else:
+          aIsConst = true
+          aConstVal = 0
+          aExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true)
+
+      # Get B's expression for this element
+      var bExpr: AlgebraicExpression[int]
+      var bIsConst = false
+      var bConstVal = 0
+      if bInfo.isConst:
+        bIsConst = true
+        bConstVal = if elem in bInfo.constVals: 1 else: 0
+        bExpr = newAlgebraicExpression[int](
+          positions = initPackedSet[int](),
+          node = ExpressionNode[int](kind: LiteralNode, value: bConstVal),
+          linear = true)
+      else:
+        let bPos = getSetBoolPosition(bInfo.varInfo, elem)
+        if bPos >= 0:
+          bExpr = tr.getExpr(bPos)
+        else:
+          bIsConst = true
+          bConstVal = 0
+          bExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true)
+
+      if aIsConst and bIsConst:
+        # Both constant: fix domain directly
+        let val = max(aConstVal, bConstVal)
+        tr.sys.baseArray.setDomain(cBoolPos, @[val])
+      else:
+        # Use min/max channel binding: max(a, b)
+        tr.sys.baseArray.addMinMaxChannelBinding(cBoolPos, false, @[aExpr, bExpr])
+        inc nBuilt
+
+  if nBuilt > 0:
+    stderr.writeLine(&"[FZN] Built {nBuilt} set_union channel bindings")
+
 proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
   ## Builds channel bindings for case-analysis patterns detected by
   ## detectCaseAnalysisChannels. Each target variable becomes a channel
@@ -5099,6 +5818,12 @@ proc translate*(model: FznModel): FznTranslator =
   result.objectiveHiBound = high(int)
   result.equalityCopyAliases = initTable[string, string]()
   result.equalityCopyReifCIs = initPackedSet[int]()
+  result.setVarBoolPositions = initTable[string, SetVarInfo]()
+  result.setParamValues = initTable[string, seq[int]]()
+  result.setArrayValues = initTable[string, seq[seq[int]]]()
+  result.setArrayDecompositions = initTable[string, seq[SetArrayElement]]()
+  result.outputSetVars = initHashSet[string]()
+  result.outputSetArrays = initHashSet[string]()
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()
@@ -5108,6 +5833,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCountPatterns()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
+  # Detect set_union defines_var patterns → channel variables for set decomposition
+  result.detectSetUnionChannels()
   # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
   result.detectEqualityCopyVars()
   # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
@@ -5572,6 +6299,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildOneHotChannelBindings()
   # Build channel bindings for array_int_minimum/maximum defines_var
   result.buildMinMaxChannelBindings()
+  # Build channel bindings for set_union defines_var (max of boolean pairs)
+  result.buildSetUnionChannelBindings()
   # Build channel bindings for case-analysis channels (constant lookup tables)
   result.buildCaseAnalysisChannelBindings()
   # Build inverse channel groups (inverse relationship: seat[person[p]] = p)

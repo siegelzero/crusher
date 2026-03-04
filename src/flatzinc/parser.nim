@@ -36,7 +36,8 @@ type
       annArgs*: seq[FznExpr]
 
   FznTypeKind* = enum
-    FznInt, FznBool, FznIntRange, FznIntSet, FznSetOfInt, FznSetOfIntRange
+    FznInt, FznBool, FznIntRange, FznIntSet, FznSetOfInt, FznSetOfIntRange,
+    FznSetOfIntSet
 
   FznType* = object
     case kind*: FznTypeKind
@@ -50,6 +51,8 @@ type
       discard
     of FznSetOfIntRange:
       setLo*, setHi*: int
+    of FznSetOfIntSet:
+      setValues*: seq[int]
 
   FznVarDecl* = object
     name*: string
@@ -367,6 +370,17 @@ proc parseType(p: var Parser): (FznType, bool) =
         discard p.eat()
         let hi = p.expect(TkInt).intVal
         return (FznType(kind: FznSetOfIntRange, setLo: lo, setHi: hi), isVar)
+    elif p.curKind == TkLBrace:
+      discard p.eat()
+      var vals: seq[int]
+      if p.curKind != TkRBrace:
+        vals.add(p.expect(TkInt).intVal)
+        while p.tryEat(TkComma):
+          vals.add(p.expect(TkInt).intVal)
+      discard p.expect(TkRBrace)
+      return (FznType(kind: FznSetOfIntSet, setValues: vals), isVar)
+    elif p.curKind == TkInt_kw:
+      discard p.eat()
     return (FznType(kind: FznSetOfInt), isVar)
 
   case p.curKind
@@ -498,7 +512,7 @@ proc parseFzn*(src: string): FznModel =
       result.constraints.add(p.parseConstraint())
     of TkSolve:
       result.solve = p.parseSolve()
-    of TkArray, TkVar, TkInt, TkBool_kw, TkInt_kw:
+    of TkArray, TkVar, TkInt, TkBool_kw, TkInt_kw, TkSet:
       let decl = p.parseVarDecl()
       if decl.isVar:
         result.variables.add(decl)
