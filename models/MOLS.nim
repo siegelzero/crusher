@@ -43,7 +43,7 @@ proc MOLSSystem*(n: int) =
         for j in 0..<n:
             sys.addConstraint(matrixElement(Z, i, X[i, j], Y[i, j]))
 
-    sys.resolve(10000, parallel=true, verbose=false)
+    sys.resolve(10000, parallel=true, verbose=true)
 
     for row in X.assignment():
         echo row

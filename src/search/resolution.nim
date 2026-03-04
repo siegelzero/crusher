@@ -47,6 +47,13 @@ proc resolve*[T](system: ConstraintSystem[T],
                 echo &"[Solve] Empty domain at position {pos} (original domain size: {system.baseArray.domain[pos].len})"
             raise newException(InfeasibleError, "Domain reduction found infeasibility")
 
+    # Remove constraints where all positions are fixed (singleton domain) or channel
+    let constraintsBefore = system.baseArray.constraints.len
+    system.baseArray.removeFixedConstraints()
+    if verbose and system.baseArray.fixedPositions.len > 0:
+        let removed = constraintsBefore - system.baseArray.constraints.len
+        echo &"[Solve] Fixed positions: {system.baseArray.fixedPositions.len}, removed {removed} all-fixed constraints (of {constraintsBefore})"
+
     # Shrink channel position domains to avoid expensive deepCopy of million-element seqs.
     # Channel positions are never searched; for domain reduction only min/max are needed.
     # Use reducedDomain (the search-facing domain) as the shrunk version — it's already
@@ -117,6 +124,7 @@ proc resolveFromAssignment*[T](system: ConstraintSystem[T],
     for pos in system.baseArray.allPositions():
         if system.baseArray.reducedDomain[pos].len == 0:
             raise newException(InfeasibleError, "Domain reduction found infeasibility")
+    system.baseArray.removeFixedConstraints()
     var state = newTabuState[T](system.baseArray, assignment, verbose)
     let improved = state.tabuImprove(tabuThreshold, deadline = deadline)
     if improved.cost == 0:

@@ -1689,7 +1689,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for c in state.constraints:
         var searchPos: PackedSet[int]
         for pos in c.positions.items:
-            if pos notin carray.channelPositions:
+            if pos notin carray.channelPositions and pos notin carray.fixedPositions:
                 searchPos.incl(pos)
         state.constraintSearchPos[cast[pointer](c)] = searchPos
 

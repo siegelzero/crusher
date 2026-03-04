@@ -64,6 +64,7 @@ type
         inverseGroups*: seq[InverseGroup[T]]
         inverseChannelGroups*: seq[InverseChannelGroup[T]]
         inverseChannelsAtPosition*: Table[int, seq[int]]  # forward_pos → [group indices]
+        fixedPositions*: PackedSet[int]  # Singleton-domain positions after reduction (excluded from search)
         elementInverseDetected*: bool  # guard: detectElementInverseChannels already ran
 
 ################################################################################
@@ -76,9 +77,9 @@ iterator allPositions*[T](arr: ConstrainedArray[T]): int =
     for i in 0..<arr.len: yield int(i)
 
 iterator allSearchPositions*[T](arr: ConstrainedArray[T]): int =
-    ## Iterates over all positions that are not channel variables.
+    ## Iterates over all positions that are not channel or fixed variables.
     for i in 0..<arr.len:
-        if i notin arr.channelPositions:
+        if i notin arr.channelPositions and i notin arr.fixedPositions:
             yield int(i)
 
 func `$`*[T](arr: ConstrainedArray[T]): string =
@@ -2496,6 +2497,40 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     return reduced
 
 ################################################################################
+# Fixed-position constraint removal
+################################################################################
+
+proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
+    ## Identifies singleton-domain positions and removes constraints where all
+    ## positions are fixed (singleton domain) or channel. Such constraints are
+    ## guaranteed satisfied after domain reduction.
+
+    # 1. Identify singleton positions from reducedDomain
+    for pos in carray.allPositions():
+        if carray.reducedDomain[pos].len == 1 and pos notin carray.channelPositions:
+            carray.fixedPositions.incl(pos)
+
+    if carray.fixedPositions.len == 0:
+        return
+
+    # 2. Remove constraints where all positions are fixed or channel
+    let excludedPositions = carray.fixedPositions + carray.channelPositions
+    var newConstraints: seq[StatefulConstraint[T]]
+    var removedCount = 0
+    for c in carray.constraints:
+        var allFixed = true
+        for pos in c.positions.items:
+            if pos notin excludedPositions:
+                allFixed = false
+                break
+        if allFixed:
+            inc removedCount
+        else:
+            newConstraints.add(c)
+    if removedCount > 0:
+        carray.constraints = newConstraints
+
+################################################################################
 # Deep copy for ConstrainedArray
 ################################################################################
 
@@ -2565,5 +2600,6 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Inverse channel groups are all value types — shallow copy is fine
     result.inverseChannelGroups = arr.inverseChannelGroups
     result.inverseChannelsAtPosition = arr.inverseChannelsAtPosition
+    result.fixedPositions = arr.fixedPositions
     result.elementInverseDetected = arr.elementInverseDetected
 

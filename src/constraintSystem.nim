@@ -17,8 +17,8 @@ type
     VariableContainer[T] = ref object of RootObj
         systemPtr: pointer  # Raw (untracked) back-reference to ConstraintSystem[T].
                             # Breaking the ref cycle so both ARC and ORC can free copies.
-        offset: int
-        size: int
+        offset*: int
+        size*: int
 
     ConstrainedVariable*[T] = ref object of VariableContainer[T]
 
@@ -26,7 +26,7 @@ type
         n: int
 
     ConstrainedMatrix*[T] = ref object of VariableContainer[T]
-        m, n: int
+        m*, n*: int
 
     ConstraintSystem*[T] = ref object
         size*: int
