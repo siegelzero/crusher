@@ -69,6 +69,24 @@ type
     constantValues*: seq[int]  # for literal set elements
     varName*: string           # FZN name (for variable elements)
 
+  SetUnionChainInfo* = object
+    resultName*: string              # final result set variable
+    baseName*: string                # base set (first arg of first union)
+    baseIsConst*: bool               # true if base is a constant set
+    baseConstVals*: seq[int]         # constant values if baseIsConst
+    leafNames*: seq[string]          # leaf set names (second arg of each union)
+    intermediateNames*: seq[string]  # intermediate set names (results of all but last union)
+    constraintIndices*: seq[int]     # union constraint indices in chain order
+
+  SetComprehensionPair* = object
+    sumVal*: int            # ai + bi (the value this pair contributes when active)
+    productVarName*: string # the int_times product variable name (expression = AND of membership)
+
+  SetComprehensionInfo* = object
+    chainIdx*: int                       # index into setUnionChains
+    pairs*: seq[SetComprehensionPair]    # contributing pairs with their sum values
+    consumedConstraints*: PackedSet[int] # set_in + set_card constraint indices for singletons
+
   FznTranslator* = object
     sys*: ConstraintSystem[int]
     # Maps FZN variable name -> position in the ConstrainedArray
@@ -163,8 +181,14 @@ type
     outputSetVars*: HashSet[string]
     # Output set arrays (for set array output formatting)
     outputSetArrays*: HashSet[string]
-    # set_union channel defs: constraint index + result var name
+    # set_union channel defs: constraint index + result var name (non-chain unions only)
     setUnionChannelDefs*: seq[tuple[ci: int, resultName: string]]
+    # Detected set_union chains (linear sequences of set_union :: defines_var)
+    setUnionChains*: seq[SetUnionChainInfo]
+    # Detected set comprehension patterns (chains with traced singleton→product mapping)
+    setComprehensions*: seq[SetComprehensionInfo]
+    # Set variable names to skip boolean creation for (singletons + intermediates)
+    skipSetVarNames*: HashSet[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -535,6 +559,12 @@ proc translateVariables(tr: var FznTranslator) =
 
     # Handle set variables: decompose into boolean arrays
     if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+      # Skip boolean creation for chain intermediates and singletons
+      if decl.name in tr.skipSetVarNames:
+        tr.setVarBoolPositions[decl.name] = SetVarInfo(positions: @[], lo: 0, hi: -1)
+        if decl.hasAnnotation("output_var"):
+          tr.outputSetVars.incl(decl.name)
+        continue
       var lo, hi: int
       case decl.varType.kind
       of FznSetOfIntRange:
@@ -2888,14 +2918,23 @@ proc detectReifChannels(tr: var FznTranslator) =
 
 
 proc detectSetUnionChannels(tr: var FznTranslator) =
-  ## Detects set_union(A, B, C) :: defines_var(C) patterns and marks C as a channel variable.
-  ## The channel bindings are built later via buildSetUnionChannelBindings.
-  ## Must be called before translateVariables so channel booleans are marked non-search.
+  ## Detects set_union(A, B, C) :: defines_var(C) patterns, identifies linear chains,
+  ## and traces set comprehension patterns (singleton→product→source sets).
+  ## Chain intermediates and singletons are marked for skipping in translateVariables.
+  ## Must be called before translateVariables.
+
   # Build set of known set variable names from the model
   var setVarNames: HashSet[string]
   for decl in tr.model.variables:
     if not decl.isArray and decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
       setVarNames.incl(decl.name)
+
+  # Collect all set_union with defines_var
+  type UnionRec = object
+    ci: int
+    aName, leafName, cName: string
+  var unions: seq[UnionRec]
+  var producedBy: Table[string, int]  # cName -> index into unions
 
   for ci, con in tr.model.constraints:
     if ci in tr.definingConstraints:
@@ -2911,15 +2950,221 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
       continue
     if cName notin setVarNames:
       continue
-    if cName in tr.channelVarNames:
-      continue
-    # Mark C as channel (its booleans will be computed, not searched)
-    tr.channelVarNames.incl(cName)
-    tr.definingConstraints.incl(ci)
-    tr.setUnionChannelDefs.add((ci: ci, resultName: cName))
+    let aName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
+    let leafName = if con.args[1].kind == FznIdent: con.args[1].ident else: ""
+    let idx = unions.len
+    unions.add(UnionRec(ci: ci, aName: aName, leafName: leafName, cName: cName))
+    producedBy[cName] = idx
 
+  if unions.len == 0:
+    return
+
+  # Build forward adjacency: aName -> list of union indices where it's the accumulated input
+  var fromA: Table[string, seq[int]]
+  for i, u in unions:
+    if u.aName.len > 0:
+      fromA.mgetOrPut(u.aName, @[]).add(i)
+
+  # Find chain starts: unions whose aName is NOT produced by another union (or is constant)
+  var chainStartIndices: seq[int]
+  for i, u in unions:
+    if u.aName.len == 0 or u.aName notin producedBy:
+      chainStartIndices.add(i)
+
+  # Trace chains from each start
+  var inChain: PackedSet[int]  # union indices that are part of a chain
+  for startIdx in chainStartIndices:
+    var chain: seq[int]  # indices into unions
+    var current = startIdx
+    while true:
+      chain.add(current)
+      inChain.incl(current)
+      let cName = unions[current].cName
+      if cName in fromA and fromA[cName].len == 1:
+        current = fromA[cName][0]
+      else:
+        break
+
+    if chain.len < 3:
+      # Short chains: handle as individual unions (not worth chain-collapsing)
+      for idx in chain:
+        inChain.excl(idx)
+      continue
+
+    # Build chain info
+    var info = SetUnionChainInfo(
+      resultName: unions[chain[^1]].cName,
+      baseName: unions[chain[0]].aName,
+      constraintIndices: newSeq[int](chain.len))
+
+    # Check if base is a constant set
+    if info.baseName.len == 0:
+      info.baseIsConst = true
+      info.baseConstVals = @[]
+    elif info.baseName in tr.setParamValues:
+      info.baseIsConst = true
+      info.baseConstVals = tr.setParamValues[info.baseName]
+    else:
+      info.baseIsConst = false
+
+    for j, idx in chain:
+      info.constraintIndices[j] = unions[idx].ci
+      info.leafNames.add(unions[idx].leafName)
+      if j < chain.len - 1:
+        info.intermediateNames.add(unions[idx].cName)
+
+    # Mark all chain results as channel variables + mark constraints as consumed
+    for idx in chain:
+      let u = unions[idx]
+      tr.channelVarNames.incl(u.cName)
+      tr.definingConstraints.incl(u.ci)
+
+    # Mark intermediates to skip boolean creation
+    for iname in info.intermediateNames:
+      tr.skipSetVarNames.incl(iname)
+
+    tr.setUnionChains.add(info)
+
+  # Handle non-chain unions as individual channels (existing behavior)
+  for i, u in unions:
+    if i in inChain:
+      continue
+    if u.cName in tr.channelVarNames:
+      continue
+    tr.channelVarNames.incl(u.cName)
+    tr.definingConstraints.incl(u.ci)
+    tr.setUnionChannelDefs.add((ci: u.ci, resultName: u.cName))
+
+  # --- Set comprehension pattern detection ---
+  # For each chain, try to trace singletons to their int_times products.
+  # Pattern: set_card(S,1) + set_in(val_expr, S) where val_expr = k * product
+  # from int_lin_eq([k,-1],[product,val_expr],0) :: defines_var(val_expr)
+
+  # Build reverse map: variable name -> constraint that defines it (via defines_var)
+  var definedByCI: Table[string, int]
+  for ci, con in tr.model.constraints:
+    if not con.hasAnnotation("defines_var"):
+      continue
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+      definedByCI[ann.args[0].ident] = ci
+
+  # Build singleton map: set_card(S, 1) → S name + ci
+  var singletonCardCI: Table[string, int]  # S name -> set_card ci
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name == "set_card" and con.args.len >= 2:
+      if con.args[0].kind == FznIdent and con.args[1].kind == FznIntLit and con.args[1].intVal == 1:
+        singletonCardCI[con.args[0].ident] = ci
+
+  # Build set_in map: set_in(val_expr, S) → (ci, val_expr)
+  var singletonInCI: Table[string, tuple[ci: int, valArg: FznExpr]]
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name == "set_in" and con.args.len >= 2 and con.args[1].kind == FznIdent:
+      let sName = con.args[1].ident
+      if sName in singletonCardCI:
+        singletonInCI[sName] = (ci: ci, valArg: con.args[0])
+
+  for chainIdx in 0..<tr.setUnionChains.len:
+    let chain = tr.setUnionChains[chainIdx]
+
+    # Check if all leaves are singletons with traceable products
+    var compInfo = SetComprehensionInfo(chainIdx: chainIdx)
+    var allTraced = true
+
+    for leafName in chain.leafNames:
+      if leafName notin singletonCardCI or leafName notin singletonInCI:
+        allTraced = false
+        break
+
+      let inInfo = singletonInCI[leafName]
+      let valArg = inInfo.valArg
+
+      if valArg.kind == FznIntLit:
+        # Literal value (e.g., set_in(0, seed)) — contributes a fixed value
+        # Not a product-traced pair; skip as a comprehension pair
+        # but still consume the constraints
+        compInfo.consumedConstraints.incl(inInfo.ci)
+        compInfo.consumedConstraints.incl(singletonCardCI[leafName])
+        tr.skipSetVarNames.incl(leafName)
+        continue
+
+      if valArg.kind != FznIdent:
+        allTraced = false
+        break
+
+      let valName = valArg.ident
+
+      # Trace val_expr to find sumVal and product variable.
+      # Two patterns:
+      #   1. val_expr defined by int_lin_eq([k,-1],[product,val_expr],0) → sumVal=k
+      #   2. val_expr defined by int_times(a,b,val_expr) → sumVal=1 (product IS val_expr)
+      if valName notin definedByCI:
+        allTraced = false
+        break
+
+      let defCI = definedByCI[valName]
+      let defCon = tr.model.constraints[defCI]
+      let defName = stripSolverPrefix(defCon.name)
+
+      var sumVal: int
+      var productVarName: string
+
+      if defName == "int_lin_eq" and defCon.args.len >= 3 and
+         defCon.args[0].kind == FznArrayLit and defCon.args[1].kind == FznArrayLit:
+        # Pattern 1: int_lin_eq([k,-1],[product,val_expr],0) → val_expr = k * product
+        let coeffs = defCon.args[0].elems
+        let vars = defCon.args[1].elems
+        if coeffs.len == 2 and vars.len == 2 and
+           coeffs[0].kind == FznIntLit and coeffs[1].kind == FznIntLit and
+           coeffs[1].intVal == -1 and vars[0].kind == FznIdent:
+          sumVal = coeffs[0].intVal
+          productVarName = vars[0].ident
+        else:
+          allTraced = false
+          break
+      elif defName == "int_times" and defCon.args.len >= 3:
+        # Pattern 2: int_times(a,b,val_expr) → val_expr = a*b, sumVal depends on max domain
+        # For boolean inputs, val_expr is 0 or 1, so this contributes value 1 when active
+        # Find the actual sum value from the singleton's universe
+        # The singleton set S has universe lo..hi. The set_in(val_expr, S) means
+        # S = {val_expr}. Since val_expr domain is 0..1 and S has set_card=1,
+        # the singleton either contains {0} or {1}. So sumVal = 1.
+        sumVal = 1
+        productVarName = valName  # the product IS the val_expr
+      else:
+        allTraced = false
+        break
+
+      compInfo.pairs.add(SetComprehensionPair(sumVal: sumVal, productVarName: productVarName))
+      compInfo.consumedConstraints.incl(inInfo.ci)
+      compInfo.consumedConstraints.incl(singletonCardCI[leafName])
+      tr.skipSetVarNames.incl(leafName)
+
+    if allTraced and compInfo.pairs.len > 0:
+      # Mark consumed constraints
+      for ci in compInfo.consumedConstraints.items:
+        tr.definingConstraints.incl(ci)
+      tr.setComprehensions.add(compInfo)
+
+  # Log results
+  var nChainUnions = 0
+  for chain in tr.setUnionChains:
+    nChainUnions += chain.constraintIndices.len
+  if tr.setUnionChains.len > 0:
+    stderr.writeLine(&"[FZN] Detected {tr.setUnionChains.len} set_union chains ({nChainUnions} unions, {tr.skipSetVarNames.len} set vars skipped)")
+  if tr.setComprehensions.len > 0:
+    var nPairs = 0
+    for comp in tr.setComprehensions:
+      nPairs += comp.pairs.len
+    stderr.writeLine(&"[FZN] Detected {tr.setComprehensions.len} set comprehension patterns ({nPairs} product pairs)")
   if tr.setUnionChannelDefs.len > 0:
-    stderr.writeLine(&"[FZN] Detected {tr.setUnionChannelDefs.len} set_union channel variables")
+    stderr.writeLine(&"[FZN] Detected {tr.setUnionChannelDefs.len} individual set_union channel variables")
 
 proc detectEqualityCopyVars(tr: var FznTranslator) =
   ## Detects "equality copy" variables: vars that are copies of another variable
@@ -5088,9 +5333,25 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
 
 proc buildSetUnionChannelBindings(tr: var FznTranslator) =
-  ## Builds channel bindings for set_union(A, B, C) :: defines_var(C).
-  ## Each boolean of C becomes a max(A_bool, B_bool) channel binding.
-  var nBuilt = 0
+  ## Builds channel bindings for set_union patterns:
+  ## - Individual unions: max(A_bool, B_bool) per boolean
+  ## - Chains with comprehension pattern: N-ary max over product expressions
+  ## - Chains without comprehension: N-ary max over leaf booleans
+
+  let zeroExpr = newAlgebraicExpression[int](
+    positions = initPackedSet[int](),
+    node = ExpressionNode[int](kind: LiteralNode, value: 0),
+    linear = true)
+  let oneExpr = newAlgebraicExpression[int](
+    positions = initPackedSet[int](),
+    node = ExpressionNode[int](kind: LiteralNode, value: 1),
+    linear = true)
+
+  var nIndividual = 0
+  var nChainBindings = 0
+  var nCompBindings = 0
+
+  # --- Handle individual (non-chain) set_union channels ---
   for def in tr.setUnionChannelDefs:
     let con = tr.model.constraints[def.ci]
     let cName = def.resultName
@@ -5107,63 +5368,169 @@ proc buildSetUnionChannelBindings(tr: var FznTranslator) =
       let elem = cVar.lo + idx
       let cBoolPos = cVar.positions[idx]
 
-      # Get A's expression for this element
       var aExpr: AlgebraicExpression[int]
       var aIsConst = false
       var aConstVal = 0
       if aInfo.isConst:
         aIsConst = true
         aConstVal = if elem in aInfo.constVals: 1 else: 0
-        aExpr = newAlgebraicExpression[int](
-          positions = initPackedSet[int](),
-          node = ExpressionNode[int](kind: LiteralNode, value: aConstVal),
-          linear = true)
       else:
         let aPos = getSetBoolPosition(aInfo.varInfo, elem)
         if aPos >= 0:
           aExpr = tr.getExpr(aPos)
         else:
           aIsConst = true
-          aConstVal = 0
-          aExpr = newAlgebraicExpression[int](
-            positions = initPackedSet[int](),
-            node = ExpressionNode[int](kind: LiteralNode, value: 0),
-            linear = true)
+      if aIsConst:
+        aExpr = if aConstVal == 1: oneExpr else: zeroExpr
 
-      # Get B's expression for this element
       var bExpr: AlgebraicExpression[int]
       var bIsConst = false
       var bConstVal = 0
       if bInfo.isConst:
         bIsConst = true
         bConstVal = if elem in bInfo.constVals: 1 else: 0
-        bExpr = newAlgebraicExpression[int](
-          positions = initPackedSet[int](),
-          node = ExpressionNode[int](kind: LiteralNode, value: bConstVal),
-          linear = true)
       else:
         let bPos = getSetBoolPosition(bInfo.varInfo, elem)
         if bPos >= 0:
           bExpr = tr.getExpr(bPos)
         else:
           bIsConst = true
-          bConstVal = 0
-          bExpr = newAlgebraicExpression[int](
-            positions = initPackedSet[int](),
-            node = ExpressionNode[int](kind: LiteralNode, value: 0),
-            linear = true)
+      if bIsConst:
+        bExpr = if bConstVal == 1: oneExpr else: zeroExpr
 
       if aIsConst and bIsConst:
-        # Both constant: fix domain directly
-        let val = max(aConstVal, bConstVal)
-        tr.sys.baseArray.setDomain(cBoolPos, @[val])
+        tr.sys.baseArray.setDomain(cBoolPos, @[max(aConstVal, bConstVal)])
       else:
-        # Use min/max channel binding: max(a, b)
         tr.sys.baseArray.addMinMaxChannelBinding(cBoolPos, false, @[aExpr, bExpr])
-        inc nBuilt
+        inc nIndividual
 
-  if nBuilt > 0:
-    stderr.writeLine(&"[FZN] Built {nBuilt} set_union channel bindings")
+  # --- Handle chains with set comprehension pattern ---
+  # R.bools[v] = max over products where sumVal=v of (product_expression)
+  # R.bools[0] = 1 if base contains 0 (always true for gt-sort)
+  var comprehensionChainIndices: PackedSet[int]
+  for comp in tr.setComprehensions:
+    comprehensionChainIndices.incl(comp.chainIdx)
+    let chain = tr.setUnionChains[comp.chainIdx]
+    let rName = chain.resultName
+    if rName notin tr.setVarBoolPositions:
+      continue
+    let rVar = tr.setVarBoolPositions[rName]
+    if rVar.positions.len == 0:
+      continue
+
+    # Group pairs by sumVal
+    var pairsBySumVal: Table[int, seq[string]]  # sumVal -> product var names
+    for pair in comp.pairs:
+      pairsBySumVal.mgetOrPut(pair.sumVal, @[]).add(pair.productVarName)
+
+    # Handle base set contributions
+    var baseContains: HashSet[int]
+    if chain.baseIsConst:
+      for v in chain.baseConstVals:
+        baseContains.incl(v)
+    # If base is a set variable (not const), we'd need to include its booleans.
+    # For gt-sort, base is always {0} (a singleton).
+
+    for idx in 0..<rVar.positions.len:
+      let v = rVar.lo + idx
+      let rBoolPos = rVar.positions[idx]
+
+      if v in baseContains:
+        # Base set always contributes this value
+        tr.sys.baseArray.setDomain(rBoolPos, @[1])
+        continue
+
+      if v notin pairsBySumVal:
+        # No pair contributes this value
+        if not chain.baseIsConst:
+          # If base is variable, include its boolean
+          let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+          let bPos = getSetBoolPosition(baseInfo, v)
+          if bPos >= 0:
+            tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, @[tr.getExpr(bPos)])
+            inc nCompBindings
+          else:
+            tr.sys.baseArray.setDomain(rBoolPos, @[0])
+        else:
+          tr.sys.baseArray.setDomain(rBoolPos, @[0])
+        continue
+
+      # Collect product expressions for all pairs with this sumVal
+      var inputExprs: seq[AlgebraicExpression[int]]
+
+      # Include base boolean if base is a variable set
+      if not chain.baseIsConst:
+        let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+        let bPos = getSetBoolPosition(baseInfo, v)
+        if bPos >= 0:
+          inputExprs.add(tr.getExpr(bPos))
+
+      for productName in pairsBySumVal[v]:
+        if productName in tr.definedVarExprs:
+          inputExprs.add(tr.definedVarExprs[productName])
+        elif productName in tr.varPositions:
+          inputExprs.add(tr.getExpr(tr.varPositions[productName]))
+
+      if inputExprs.len == 0:
+        tr.sys.baseArray.setDomain(rBoolPos, @[0])
+      elif inputExprs.len == 1:
+        # Single input: direct channel binding (avoid max overhead)
+        tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+        inc nCompBindings
+      else:
+        # N-ary max over all product expressions
+        tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+        inc nCompBindings
+
+  # --- Handle chains WITHOUT comprehension pattern (plain chain collapse) ---
+  for chainIdx in 0..<tr.setUnionChains.len:
+    if chainIdx in comprehensionChainIndices:
+      continue
+    let chain = tr.setUnionChains[chainIdx]
+    let rName = chain.resultName
+    if rName notin tr.setVarBoolPositions:
+      continue
+    let rVar = tr.setVarBoolPositions[rName]
+    if rVar.positions.len == 0:
+      continue
+
+    for idx in 0..<rVar.positions.len:
+      let v = rVar.lo + idx
+      let rBoolPos = rVar.positions[idx]
+
+      var inputExprs: seq[AlgebraicExpression[int]]
+
+      # Include base
+      if chain.baseIsConst:
+        if v in chain.baseConstVals:
+          tr.sys.baseArray.setDomain(rBoolPos, @[1])
+          continue
+      else:
+        let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+        let bPos = getSetBoolPosition(baseInfo, v)
+        if bPos >= 0:
+          inputExprs.add(tr.getExpr(bPos))
+
+      # Include all leaves
+      for leafName in chain.leafNames:
+        if leafName in tr.setVarBoolPositions:
+          let leafInfo = tr.setVarBoolPositions[leafName]
+          let lPos = getSetBoolPosition(leafInfo, v)
+          if lPos >= 0:
+            inputExprs.add(tr.getExpr(lPos))
+
+      if inputExprs.len == 0:
+        tr.sys.baseArray.setDomain(rBoolPos, @[0])
+      else:
+        tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+        inc nChainBindings
+
+  if nIndividual > 0:
+    stderr.writeLine(&"[FZN] Built {nIndividual} individual set_union channel bindings")
+  if nChainBindings > 0:
+    stderr.writeLine(&"[FZN] Built {nChainBindings} chain-collapsed set_union channel bindings")
+  if nCompBindings > 0:
+    stderr.writeLine(&"[FZN] Built {nCompBindings} set comprehension channel bindings (from {tr.setComprehensions.len} patterns)")
 
 proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
   ## Builds channel bindings for case-analysis patterns detected by
@@ -5824,6 +6191,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.setArrayDecompositions = initTable[string, seq[SetArrayElement]]()
   result.outputSetVars = initHashSet[string]()
   result.outputSetArrays = initHashSet[string]()
+  result.skipSetVarNames = initHashSet[string]()
 
   # Load parameters first (needed by collectDefinedVars for resolveIntArray)
   result.translateParameters()
