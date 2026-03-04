@@ -57,7 +57,7 @@ suite "Quasigroup7 Tests":
     test "quasigroup7 n=5 via FlatZinc pipeline":
         # Compile with MiniZinc
         let fznPath = "/tmp/qg7_test_5.fzn"
-        let mznPath = "minizinc_challenge/2008/quasigroup7/quasigroup7.mzn"
+        let mznPath = "tests/data/quasigroup7/quasigroup7.mzn"
         let solverPath = os.getCurrentDir() / "minizinc"
 
         let cmd = "MZN_SOLVER_PATH=" & solverPath &

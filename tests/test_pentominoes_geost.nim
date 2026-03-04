@@ -10,7 +10,7 @@ import std/[unittest, strutils, sequtils, tables, os, strformat, packedsets]
 import crusher
 import flatzinc/dfaExtract
 
-const dataDir = "minizinc_challenge/2008/pentominoes-int"
+const dataDir = "tests/data/pentominoes-int"
 
 # ─── DZN parsing ──────────────────────────────────────────────────────────────
 
