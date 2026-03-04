@@ -1262,6 +1262,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         continue
                     if resolvent.len == 0:
                         continue
+                    # gcd(0, x) == x, so starting from resolventConst==0 is safe
                     var g = abs(resolventConst)
                     for p, c in resolvent.pairs:
                         g = gcd(g, abs(c))

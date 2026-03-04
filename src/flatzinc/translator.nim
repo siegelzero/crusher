@@ -593,6 +593,9 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
   ## Detects functional keys in table constraints and converts dependent columns
   ## to channel variables. Checks single-column key (col 0) first, then
   ## composite 2-column key (cols 0,1). Returns true if the table was consumed.
+  ## Note: only columns 0 and (0,1) are tried as keys. This relies on FlatZinc
+  ## table constraints placing key columns first, which holds for MiniZinc's
+  ## standard table decomposition.
   if positions.len < 2 or tuples.len == 0:
     return false
 
@@ -618,7 +621,7 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
 
     var lookups = newSeq[seq[int]](nCols - 1)
     for col in 1..<nCols:
-      lookups[col - 1] = newSeq[int](keyRange)
+      lookups[col - 1] = newSeqWith(keyRange, low(int))
     for t in tuples:
       let idx = t[0] - keyMin
       for col in 1..<nCols:
@@ -676,10 +679,10 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
   let nCols = positions.len
   let nDepCols = nCols - 2  # columns 2..n-1 are dependent
 
-  # Build linearized lookup arrays for dependent columns
+  # Build linearized lookup arrays for dependent columns (gaps get sentinel value)
   var lookups = newSeq[seq[int]](nDepCols)
   for col in 0..<nDepCols:
-    lookups[col] = newSeq[int](totalRange)
+    lookups[col] = newSeqWith(totalRange, low(int))
   for t in tuples:
     let idx = (t[0] - key0Min) * range1 + (t[1] - key1Min)
     for col in 2..<nCols:
@@ -1293,23 +1296,23 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     # Pre-filter: detect singleton-domain columns (constants) and filter tuples
     # to matching rows, then project out constant columns. This is critical for
     # tables like preferences_data where a user_id column is fixed per constraint.
-    var singletonCols: seq[int]   # column indices with singleton domains
-    var singletonVals: seq[int]   # the constant value for each singleton column
+    var singletonCols: PackedSet[int]  # column indices with singleton domains
+    var singletonVals: Table[int, int] # col -> constant value for each singleton column
     let (allRefs, positions) = isAllRefs(exprs)
     if allRefs:
       for col in 0..<arity:
         let pos = positions[col]
         if tr.sys.baseArray.domain[pos].len == 1:
-          singletonCols.add(col)
-          singletonVals.add(tr.sys.baseArray.domain[pos][0])
+          singletonCols.incl(col)
+          singletonVals[col] = tr.sys.baseArray.domain[pos][0]
 
     if singletonCols.len > 0 and singletonCols.len < arity:
       # Filter tuples to only those matching all singleton column values
       var filtered: seq[seq[int]]
       for t in tuples:
         var matches = true
-        for i in 0..<singletonCols.len:
-          if t[singletonCols[i]] != singletonVals[i]:
+        for col in singletonCols.items:
+          if t[col] != singletonVals[col]:
             matches = false
             break
         if matches:
@@ -1332,7 +1335,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # Try functional dependency: if col0 values are unique, dependent cols become channels
         if not tr.tryTableFunctionalDep(reducedPositions, filtered):
           tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
-      # else: no tuples match — constraint is infeasible, will be caught by solver
+      else:
+        stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
     elif allRefs:
       # Try functional dependency on the original table
       if not tr.tryTableFunctionalDep(positions, tuples):
