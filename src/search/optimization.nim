@@ -50,21 +50,21 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         echo "[Opt] Initial solution: ", currentCost
 
-        # Add domain bounds as permanent constraints (from FZN translator) and re-resolve
-        # if the initial solution violates them. Both bounds are added together so the
-        # solver sees the full feasible band at once.
+        # Add domain bounds as permanent constraints only when the initial solution
+        # violates them. Adding trivially-satisfied bounds wastes per-iteration work
+        # (full penalty map rebuilds at all positions on every move).
         block:
             var boundsViolated = false
-            if upperBound != high(int):
-                system.addConstraint(objective <= upperBound)
-                if currentCost > upperBound:
-                    boundsViolated = true
-            if lowerBound != low(int):
-                system.addConstraint(objective >= lowerBound)
-                if currentCost < lowerBound:
-                    boundsViolated = true
+            if upperBound != high(int) and currentCost > upperBound:
+                boundsViolated = true
+            if lowerBound != low(int) and currentCost < lowerBound:
+                boundsViolated = true
 
             if boundsViolated:
+                if upperBound != high(int):
+                    system.addConstraint(objective <= upperBound)
+                if lowerBound != low(int):
+                    system.addConstraint(objective >= lowerBound)
                 echo "[Opt] Objective ", currentCost, " outside domain [", lowerBound, "..", upperBound, "], constraining..."
                 system.hasFeasibleSolution = false
                 let savedAssignment = system.assignment
