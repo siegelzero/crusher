@@ -100,3 +100,29 @@ proc resolve*[T](system: ConstraintSystem[T],
         if deadline > 0 and epochTime() > deadline:
             raise newException(TimeLimitExceededError, "Time limit exceeded")
         raise newException(NoSolutionFoundError, "Can't find satisfying solution")
+
+proc resolveFromAssignment*[T](system: ConstraintSystem[T],
+                                assignment: seq[T],
+                                tabuThreshold: int,
+                                verbose: bool = false,
+                                deadline: float = 0.0) =
+    ## Sequential tabu search from a given starting assignment.
+    ## Used by the optimizer when domain bound constraints are added after
+    ## an initial feasible solution is found.
+    if system.baseArray.reducedDomain.len == 0:
+        system.baseArray.reducedDomain = reduceDomain(system.baseArray)
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
+    for pos in system.baseArray.allPositions():
+        if system.baseArray.reducedDomain[pos].len == 0:
+            raise newException(InfeasibleError, "Domain reduction found infeasibility")
+    var state = newTabuState[T](system.baseArray, assignment, verbose)
+    let improved = state.tabuImprove(tabuThreshold, deadline = deadline)
+    if improved.cost == 0:
+        system.initialize(improved.assignment)
+        system.lastIterations = improved.iteration
+        return
+    if verbose:
+        echo &"[Solve] Sequential from assignment failed: best cost={improved.cost}"
+    if deadline > 0 and epochTime() > deadline:
+        raise newException(TimeLimitExceededError, "Time limit exceeded")
+    raise newException(NoSolutionFoundError, "Can't find satisfying solution from given assignment")

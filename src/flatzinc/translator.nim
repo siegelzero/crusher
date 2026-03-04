@@ -79,6 +79,9 @@ type
     objectivePos*: int
     # Direct objective expression (for defined-variable objectives, avoids indirection)
     objectiveDefExpr*: AlgebraicExpression[int]
+    # Domain bounds on objective variable (deferred to optimizer, not added as hard constraints)
+    objectiveLoBound*: int
+    objectiveHiBound*: int
     # Set of variable names that will be replaced by defining expressions
     definedVarNames*: HashSet[string]
     # Maps defined variable name -> defining AlgebraicExpression (for defines_var elimination)
@@ -2139,6 +2142,29 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
             nonDefinesVarRefs.incl(elem.ident)
 
   # Phase 2: Scan reifChannelDefs for int_eq_reif(A, B, indicator) where A is a copy of B
+  # First pass: count how many DISTINCT comparison partners each variable has.
+  # A variable compared with multiple different partners is being equality-tested,
+  # not copied (e.g., community-detection: x[i] compared with many other x[j]).
+  var comparisonPartners: Table[string, HashSet[string]]  # var → set of distinct partners
+  for ci in tr.reifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    if name != "int_eq_reif":
+      continue
+    let arg0 = con.args[0]
+    let arg1 = con.args[1]
+    if arg0.kind != FznIdent or arg1.kind != FznIdent:
+      continue
+    let aName = arg0.ident
+    let bName = arg1.ident
+    if aName notin comparisonPartners:
+      comparisonPartners[aName] = initHashSet[string]()
+    comparisonPartners[aName].incl(bName)
+    if bName notin comparisonPartners:
+      comparisonPartners[bName] = initHashSet[string]()
+    comparisonPartners[bName].incl(aName)
+
+  # Second pass: identify candidates
   var candidates: Table[string, string]  # copy → original
   var candidateCIs: Table[string, int]   # copy → constraint index
   for ci in tr.reifChannelDefs:
@@ -2160,6 +2186,14 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
       continue
     # B (the original) must not be a parameter
     if bName in tr.paramValues:
+      continue
+    # A must only be compared with ONE partner (B) — if compared with multiple
+    # different variables, it's an independent decision variable being equality-tested
+    if aName in comparisonPartners and comparisonPartners[aName].len > 1:
+      continue
+    # B must also only be compared with one partner — otherwise it's a hub variable
+    # that multiple variables are tested against, not a simple copy source
+    if bName in comparisonPartners and comparisonPartners[bName].len > 1:
       continue
     # First match per A wins
     if aName notin candidates:
@@ -4900,6 +4934,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.channelVarNames = initHashSet[string]()
   result.channelConstraints = initTable[int, string]()
   result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
+  result.objectiveLoBound = low(int)
+  result.objectiveHiBound = high(int)
   result.equalityCopyAliases = initTable[string, string]()
   result.equalityCopyReifCIs = initPackedSet[int]()
 
@@ -4978,18 +5014,33 @@ proc translate*(model: FznModel): FznTranslator =
              v.ident notin minMaxInputNames:
             minMaxInputNames.incl(v.ident)
             changed = true
+  # Determine objective variable name — its domain bounds are deferred to optimizer
+  # rather than added as hard constraints (too tight for local search to satisfy directly)
+  var objectiveVarName = ""
+  if result.model.solve.kind in {Minimize, Maximize}:
+    if result.model.solve.objective != nil and result.model.solve.objective.kind == FznIdent:
+      objectiveVarName = result.model.solve.objective.ident
+
   # Add domain constraints for defined variables with finite bounds,
   # but skip bounds that are naturally satisfied by the expression's range
   # or where the variable is an input to a min/max channel (bounds are MiniZinc
   # domain artifacts, not problem constraints)
   var nBoundsSkipped = 0
   var nChannelBoundsSkipped = 0
+  var nObjBoundsSkipped = 0
   for varName, bounds in result.definedVarBounds:
     if varName in result.definedVarExprs:
       let expr = result.definedVarExprs[varName]
       # Skip bounds on min/max channel input variables
       if varName in minMaxInputNames:
         nChannelBoundsSkipped += 2
+        continue
+      # Skip bounds on objective variable — defer to optimizer for two-phase solving
+      if varName == objectiveVarName:
+        let (lo, hi) = bounds
+        result.objectiveLoBound = lo
+        result.objectiveHiBound = hi
+        nObjBoundsSkipped += 2
         continue
       let (lo, hi) = bounds
       let (exprMin, exprMax) = result.estimateRange(expr.node)
@@ -5001,8 +5052,10 @@ proc translate*(model: FznModel): FznTranslator =
         result.sys.addConstraint(expr <= hi)
       else:
         inc nBoundsSkipped
-  if nBoundsSkipped > 0 or nChannelBoundsSkipped > 0:
-    stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped} redundant defined-var bounds constraints (range={nBoundsSkipped} channel={nChannelBoundsSkipped})")
+  if nBoundsSkipped > 0 or nChannelBoundsSkipped > 0 or nObjBoundsSkipped > 0:
+    stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped + nObjBoundsSkipped} defined-var bounds (range={nBoundsSkipped} channel={nChannelBoundsSkipped} objective={nObjBoundsSkipped})")
+  if nObjBoundsSkipped > 0:
+    stderr.writeLine(&"[FZN] Objective domain bounds [{result.objectiveLoBound}..{result.objectiveHiBound}] deferred to optimizer")
   # Build matrix infos for matrix_element pattern detection
   result.buildMatrixInfos()
 

@@ -47,11 +47,61 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var currentCost = objective.value
         var hasBoundConstraint = false
         system.hasFeasibleSolution = true
-        # Cache the base reduced domain (without objective bound constraint).
-        # Subsequent iterations only change the bound — no need to recompute.
-        let baseReducedDomain = system.baseArray.reducedDomain
 
         echo "[Opt] Initial solution: ", currentCost
+
+        # Add domain bounds as permanent constraints (from FZN translator) and re-resolve
+        # if the initial solution violates them. Both bounds are added together so the
+        # solver sees the full feasible band at once.
+        block:
+            var boundsViolated = false
+            if upperBound != high(int):
+                system.addConstraint(objective <= upperBound)
+                if currentCost > upperBound:
+                    boundsViolated = true
+            if lowerBound != low(int):
+                system.addConstraint(objective >= lowerBound)
+                if currentCost < lowerBound:
+                    boundsViolated = true
+
+            if boundsViolated:
+                echo "[Opt] Objective ", currentCost, " outside domain [", lowerBound, "..", upperBound, "], constraining..."
+                system.hasFeasibleSolution = false
+                let savedAssignment = system.assignment
+                var domainResolved = false
+                # Try parallel resolve with scatter search, retrying with fresh seeds.
+                # Don't pass internal deadline — let scatter stop at its stale limit
+                # so each attempt completes quickly (~0.5-1s) for fresh restarts.
+                for attempt in 1..5:
+                    if deadline > 0 and epochTime() > deadline:
+                        raise newException(TimeLimitExceededError, "Time limit exceeded")
+                    system.baseArray.reducedDomain = @[]  # Force recomputation
+                    system.adaptedTabuThreshold = 0  # Use full threshold
+                    try:
+                        system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
+                                      scatterThreshold=max(scatterThreshold, 3),
+                                      populationSize=populationSize, numWorkers=numWorkers,
+                                      scatterStrategy=scatterStrategy, verbose=verbose,
+                                      deadline=0.0)
+                        domainResolved = true
+                        break
+                    except NoSolutionFoundError:
+                        if verbose:
+                            echo "[Opt] Domain bound resolve attempt ", attempt, " failed"
+                    except InfeasibleError:
+                        raise
+                if not domainResolved:
+                    if verbose:
+                        echo "[Opt] Trying sequential from saved assignment"
+                    system.resolveFromAssignment(savedAssignment, tabuThreshold, verbose, deadline)
+                objective.initialize(system.assignment)
+                currentCost = objective.value
+                system.hasFeasibleSolution = true
+                echo "[Opt] Resolved within domain bounds: ", currentCost
+
+        # Cache the base reduced domain (after any domain bound constraints).
+        # Subsequent iterations only change the search bound — no need to recompute.
+        let baseReducedDomain = system.baseArray.reducedDomain
 
         # Binary search bounds
         when direction == Minimize:

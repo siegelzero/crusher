@@ -163,7 +163,9 @@ proc main() =
         tabuThreshold = tabuThreshold,
         numWorkers = numWorkers,
         verbose = verbose,
-        deadline = deadline
+        deadline = deadline,
+        lowerBound = tr.objectiveLoBound,
+        upperBound = tr.objectiveHiBound
       )
       solved = true
     except TimeLimitExceededError:
@@ -189,7 +191,9 @@ proc main() =
         tabuThreshold = tabuThreshold,
         numWorkers = numWorkers,
         verbose = verbose,
-        deadline = deadline
+        deadline = deadline,
+        lowerBound = tr.objectiveLoBound,
+        upperBound = tr.objectiveHiBound
       )
       solved = true
     except TimeLimitExceededError:
