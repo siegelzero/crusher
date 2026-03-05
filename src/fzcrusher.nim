@@ -27,7 +27,8 @@ proc sigTermHandler(sig: cint) {.noconv.} =
   if gSavedFd >= 0:
     discard dup2(gSavedFd, stdout.getFileHandle())
   if gTranslator != nil and gHasSolution != nil and gHasSolution[]:
-    if gTranslator[].sys.bestFeasibleAssignment.len > 0:
+    if gTranslator[].sys.bestAssignmentValid and
+       gTranslator[].sys.bestFeasibleAssignment.len > 0:
       gTranslator[].sys.assignment = gTranslator[].sys.bestFeasibleAssignment
     gTranslator[].printSolution()
   else:
@@ -158,7 +159,7 @@ proc main() =
 
   of Minimize:
     try:
-      if tr.objectivePos == -3:
+      if tr.objectivePos == ObjPosWeightedSV:
         minimize(tr.sys, tr.weightedSameValueExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
@@ -170,7 +171,7 @@ proc main() =
         )
       else:
         let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                      elif tr.objectivePos == -1: tr.objectiveDefExpr
+                      elif tr.objectivePos == ObjPosDefinedExpr: tr.objectiveDefExpr
                       else: raise newException(ValueError, "No objective expression for minimize")
         minimize(tr.sys, objExpr,
           parallel = parallel,
@@ -197,7 +198,7 @@ proc main() =
 
   of Maximize:
     try:
-      if tr.objectivePos == -3:
+      if tr.objectivePos == ObjPosWeightedSV:
         maximize(tr.sys, tr.weightedSameValueExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
@@ -209,7 +210,7 @@ proc main() =
         )
       else:
         let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                      elif tr.objectivePos == -1: tr.objectiveDefExpr
+                      elif tr.objectivePos == ObjPosDefinedExpr: tr.objectiveDefExpr
                       else: raise newException(ValueError, "No objective expression for maximize")
         maximize(tr.sys, objExpr,
           parallel = parallel,

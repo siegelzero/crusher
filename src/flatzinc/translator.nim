@@ -9,6 +9,11 @@ import ../constrainedArray
 import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
+const
+  ObjPosNone* = -2          ## No objective (satisfy problem)
+  ObjPosDefinedExpr* = -1   ## Objective is a defined-variable expression
+  ObjPosWeightedSV* = -3    ## Objective is a WeightedSameValueExpression
+
 type
   CountEqPattern* = object
     ## A detected count_eq pattern from int_lin_eq → bool2int → int_eq_reif chains
@@ -2215,7 +2220,7 @@ proc translateSolve(tr: var FznTranslator) =
         let objName = tr.model.solve.objective.ident
         if objName == tr.weightedSameValueObjName:
           # Weighted same-value objective — handled separately via WeightedSameValueExpression
-          tr.objectivePos = -3  # sentinel for WeightedSameValue
+          tr.objectivePos = ObjPosWeightedSV
         elif objName in tr.varPositions:
           tr.objectivePos = tr.varPositions[objName]
         elif objName in tr.definedVarExprs:
@@ -2223,13 +2228,13 @@ proc translateSolve(tr: var FznTranslator) =
           # This avoids an intermediate position + binary-penalty linking constraint,
           # which would hide objective gradient from compound moves (ejection chains).
           tr.objectiveDefExpr = tr.definedVarExprs[objName]
-          tr.objectivePos = -1
+          tr.objectivePos = ObjPosDefinedExpr
         else:
           raise newException(KeyError, &"Unknown objective variable '{objName}'")
       else:
         raise newException(ValueError, "Objective must be a variable identifier")
   of Satisfy:
-    tr.objectivePos = -2  # distinct from -1 (defined-var objective)
+    tr.objectivePos = ObjPosNone
 
 proc resolveVarArrayElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
   ## Resolves a variable array argument to its elements, from inline literal or named declaration.
@@ -2837,6 +2842,9 @@ proc detectWeightedSameValuePattern(tr: var FznTranslator) =
       # Pair coefficient: from objCoeff * objective + coeff_k * ind_k = rhs
       # => objective = (rhs - coeff_k * ind_k) / objCoeff
       # => pairCoeff = -coeff_k / objCoeff
+      if (-coeffs[i] mod objCoeff) != 0:
+        valid = false
+        break
       let pairCoeff = -coeffs[i] div objCoeff
       pairs.add((varNameA: varNameA, varNameB: varNameB, coeff: pairCoeff))
       consumedConstraints.add(b2iIdx)
@@ -2845,6 +2853,8 @@ proc detectWeightedSameValuePattern(tr: var FznTranslator) =
       consumedVarNames.add(boolVarName)
 
     if not valid or pairs.len == 0:
+      continue
+    if (rhs mod objCoeff) != 0:
       continue
 
     # Pattern detected!
@@ -6562,7 +6572,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.definedVarBounds = initTable[string, (int, int)]()
   result.channelVarNames = initHashSet[string]()
   result.channelConstraints = initTable[int, string]()
-  result.objectivePos = -2  # no objective yet; -1 = defined-var objective, >= 0 = position
+  result.objectivePos = ObjPosNone
   result.objectiveLoBound = low(int)
   result.objectiveHiBound = high(int)
   result.equalityCopyAliases = initTable[string, string]()

@@ -16,23 +16,30 @@ func newWeightedSameValueExpression*[T](
     constant: T = 0): WeightedSameValueExpression[T] =
   var positions = initPackedSet[int]()
   var pairsAtPosition = initTable[int, seq[int]]()
-  for i, pair in pairs:
+  var filteredPairs: seq[WeightedSameValuePair[T]]
+  var adjustedConstant = constant
+  for pair in pairs:
+    if pair.posA == pair.posB:
+      # Self-pairs always match — fold into constant
+      adjustedConstant += pair.coeff
+      continue
+    filteredPairs.add(pair)
+  for i, pair in filteredPairs:
     positions.incl(pair.posA)
     positions.incl(pair.posB)
     if pair.posA notin pairsAtPosition:
       pairsAtPosition[pair.posA] = @[]
     pairsAtPosition[pair.posA].add(i)
-    if pair.posB != pair.posA:
-      if pair.posB notin pairsAtPosition:
-        pairsAtPosition[pair.posB] = @[]
-      pairsAtPosition[pair.posB].add(i)
+    if pair.posB notin pairsAtPosition:
+      pairsAtPosition[pair.posB] = @[]
+    pairsAtPosition[pair.posB].add(i)
 
   result = WeightedSameValueExpression[T](
     value: 0,
-    constant: constant,
+    constant: adjustedConstant,
     positions: positions,
     currentAssignment: initTable[int, T](),
-    pairs: pairs,
+    pairs: filteredPairs,
     pairsAtPosition: pairsAtPosition
   )
 
@@ -63,9 +70,6 @@ func updatePosition*[T](state: WeightedSameValueExpression[T], position: int, ne
     let pair = state.pairs[pairIdx]
     let otherPos = if pair.posA == position: pair.posB else: pair.posA
     let otherVal = state.currentAssignment[otherPos]
-    # Handle self-pairs (posA == posB): both old and new always match
-    if pair.posA == pair.posB:
-      continue
     let wasMatch = (oldValue == otherVal)
     let isMatch = (newValue == otherVal)
     if isMatch and not wasMatch:
@@ -80,8 +84,6 @@ func moveDelta*[T](state: WeightedSameValueExpression[T], position: int,
   result = 0
   for pairIdx in state.pairsAtPosition[position]:
     let pair = state.pairs[pairIdx]
-    if pair.posA == pair.posB:
-      continue
     let otherPos = if pair.posA == position: pair.posB else: pair.posA
     let otherVal = state.currentAssignment[otherPos]
     let wasMatch = (oldValue == otherVal)

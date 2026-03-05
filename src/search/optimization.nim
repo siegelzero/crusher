@@ -48,7 +48,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var currentCost = objective.value
         var hasBoundConstraint = false
         system.hasFeasibleSolution = true
+        system.bestAssignmentValid = false
         system.bestFeasibleAssignment = system.assignment
+        system.bestAssignmentValid = true
 
         echo "[Opt] Initial solution: ", currentCost
 
@@ -156,7 +158,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
+                system.bestAssignmentValid = false
                 system.bestFeasibleAssignment = system.assignment
+                system.bestAssignmentValid = true
                 echo "[Opt] Improved: ", objective.value
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
@@ -237,7 +241,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
+                    system.bestAssignmentValid = false
                     system.bestFeasibleAssignment = system.assignment
+                    system.bestAssignmentValid = true
                     echo "[Opt] Retry improved: ", currentCost
                     retryThreshold = tabuThreshold  # reset on success
                 except TimeLimitExceededError:
