@@ -1442,7 +1442,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     var durations: seq[int]
     try:
       durations = tr.resolveIntArray(con.args[1])
-    except:
+    except CatchableError:
       let dExprs = tr.resolveExprArray(con.args[1])
       durations = newSeq[int](dExprs.len)
       for i, e in dExprs:
@@ -1454,6 +1454,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             durations[i] = dom[0]
           else:
             durations[i] = dom[dom.len div 2]
+            stderr.writeLine(&"[FZN] Warning: disjunctive duration variable has non-singleton domain (size {dom.len}), using median value {durations[i]}")
     let heights = newSeqWith(durations.len, 1)
     tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, 1))
 
@@ -4670,28 +4671,29 @@ proc detectDisjunctiveResources(tr: var FznTranslator) =
     return
 
   # Step 2: Build adjacency and validate duration consistency
-  # Each position (variable name) should have a consistent duration across all pairs
+  # Each position (variable name) should have a consistent duration across all pairs.
+  # Variables with inconsistent durations are excluded; remaining consistent pairs are kept.
   var varDuration: Table[string, int]  # var → its duration
-  var adjacency: Table[string, Table[string, int]]  # var → {partner → pairIdx}
-  var consistent = true
+  var inconsistentVars: HashSet[string]
 
+  # First pass: detect duration inconsistencies
   for pi in validPairs:
-    # Check duration consistency for posA
     if pi.posA in varDuration:
       if varDuration[pi.posA] != pi.durA:
-        consistent = false
-        break
+        inconsistentVars.incl(pi.posA)
     else:
       varDuration[pi.posA] = pi.durA
-
-    # Check duration consistency for posB
     if pi.posB in varDuration:
       if varDuration[pi.posB] != pi.durB:
-        consistent = false
-        break
+        inconsistentVars.incl(pi.posB)
     else:
       varDuration[pi.posB] = pi.durB
 
+  # Second pass: build adjacency from consistent pairs only
+  var adjacency: Table[string, Table[string, int]]  # var → {partner → pairIdx}
+  for pi in validPairs:
+    if pi.posA in inconsistentVars or pi.posB in inconsistentVars:
+      continue
     if pi.posA notin adjacency:
       adjacency[pi.posA] = initTable[string, int]()
     adjacency[pi.posA][pi.posB] = pi.pairIdx
@@ -4700,7 +4702,7 @@ proc detectDisjunctiveResources(tr: var FznTranslator) =
       adjacency[pi.posB] = initTable[string, int]()
     adjacency[pi.posB][pi.posA] = pi.pairIdx
 
-  if not consistent:
+  if adjacency.len == 0:
     return
 
   # Step 3: Find cliques by greedy detection
@@ -6250,6 +6252,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
 
   # Compute longest-path distances bottom-up (reverse topological order)
   # dist[u][v] = longest path weight from u to v
+  const NoPath = low(int) div 2  # Safe sentinel that won't overflow when added to a weight
   var dist = newSeq[Table[int, int]](n)
   for i in 0..<n:
     dist[i] = initTable[int, int]()
@@ -6258,10 +6261,10 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     let u = topoOrder[i]
     for v, w in succ[u]:
       # Direct edge u→v
-      dist[u][v] = max(dist[u].getOrDefault(v, low(int)), w)
+      dist[u][v] = max(dist[u].getOrDefault(v, NoPath), w)
       # Transitive: u→v→...→target
       for target, d in dist[v]:
-        dist[u][target] = max(dist[u].getOrDefault(target, low(int)), w + d)
+        dist[u][target] = max(dist[u].getOrDefault(target, NoPath), w + d)
 
   # Mark redundant edges: edge u→v weight w is redundant if
   # there exists an intermediate node x (x≠v) with succ[u][x] + dist[x][v] >= w
@@ -6274,7 +6277,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     for x, wx in succ[fromId]:
       if x == toId:
         continue
-      let pathWeight = wx + dist[x].getOrDefault(toId, low(int))
+      let pathWeight = wx + dist[x].getOrDefault(toId, NoPath)
       if pathWeight >= e.weight:
         isRedundant = true
         break

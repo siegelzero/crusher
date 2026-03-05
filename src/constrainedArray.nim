@@ -1757,7 +1757,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             var lst = newSeq[int](nTasks)
             var hasCompulsory = false
             var globalMin = high(int)
-            var globalMax = 0
+            var globalMax = low(int)
 
             for i in 0..<nTasks:
                 let pos = cumState.originPositions[i]
