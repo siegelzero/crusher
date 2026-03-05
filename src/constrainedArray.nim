@@ -1731,6 +1731,109 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[pos] = toPackedSet[T]([T(target)])
                             outerChanged = true
 
+        # Phase: Time-table domain reduction for disjunctive cumulative (limit=1)
+        # For each cumulative constraint with limit=1 and all heights=1:
+        # 1. Compute compulsory parts: [LST_i, EST_i + dur_i) when LST_i < EST_i + dur_i
+        # 2. Build compulsory profile with prefix sums
+        # 3. Prune start values where foreign compulsory usage overlaps
+        for cons in carray.constraints:
+            if cons.stateType != CumulativeType: continue
+            let cumState = cons.cumulativeState
+            if cumState.limit != 1: continue
+            if cumState.evalMethod != PositionBased: continue
+            # Verify all heights are 1
+            var allUnit = true
+            for h in cumState.heights:
+                if h != T(1):
+                    allUnit = false
+                    break
+            if not allUnit: continue
+
+            let nTasks = cumState.originPositions.len
+            if nTasks < 2: continue
+
+            # Compute EST (earliest start time) and LST (latest start time) from current domains
+            var est = newSeq[int](nTasks)
+            var lst = newSeq[int](nTasks)
+            var hasCompulsory = false
+            var globalMin = high(int)
+            var globalMax = 0
+
+            for i in 0..<nTasks:
+                let pos = cumState.originPositions[i]
+                let dur = int(cumState.durations[i])
+                if dur <= 0: continue
+                if currentDomain[pos].len == 0: continue
+                # Get min and max from current domain
+                var dmin = high(int)
+                var dmax = low(int)
+                for v in currentDomain[pos].items:
+                    if int(v) < dmin: dmin = int(v)
+                    if int(v) > dmax: dmax = int(v)
+                est[i] = dmin
+                lst[i] = dmax
+                if lst[i] < est[i] + dur:
+                    hasCompulsory = true
+                if dmin < globalMin: globalMin = dmin
+                let ect = dmax + dur
+                if ect > globalMax: globalMax = ect
+
+            if not hasCompulsory: continue
+            if globalMax - globalMin > 100000: continue  # Guard against enormous profiles
+
+            let profileSize = globalMax - globalMin + 1
+            var profile = newSeq[int](profileSize)
+
+            # Build compulsory profile
+            for i in 0..<nTasks:
+                let pos = cumState.originPositions[i]
+                let dur = int(cumState.durations[i])
+                if dur <= 0 or currentDomain[pos].len == 0: continue
+                let compStart = lst[i]
+                let compEnd = est[i] + dur
+                if compStart < compEnd:
+                    # Task i has a compulsory part [compStart, compEnd)
+                    for t in compStart..<compEnd:
+                        profile[t - globalMin] += 1
+
+            # Build prefix sums for O(1) range queries
+            var prefix = newSeq[int](profileSize + 1)
+            for t in 0..<profileSize:
+                prefix[t + 1] = prefix[t] + profile[t]
+
+            # Prune infeasible start values for each task
+            for i in 0..<nTasks:
+                let pos = cumState.originPositions[i]
+                let dur = int(cumState.durations[i])
+                if dur <= 0 or currentDomain[pos].len == 0: continue
+                let compStart = lst[i]
+                let compEnd = est[i] + dur
+                let hasOwnCompulsory = compStart < compEnd
+
+                var toExclude: seq[T]
+                for v in currentDomain[pos].items:
+                    let s = int(v)
+                    let sEnd = s + dur
+                    # Clamp to profile range
+                    let lo = max(s, globalMin) - globalMin
+                    let hi = min(sEnd, globalMax) - globalMin
+                    if lo >= hi: continue
+                    # Total compulsory usage in [s, s+dur)
+                    var totalUsage = prefix[hi] - prefix[lo]
+                    # Subtract own contribution if this task has a compulsory part
+                    if hasOwnCompulsory:
+                        let ownLo = max(s, compStart) - globalMin
+                        let ownHi = min(sEnd, compEnd) - globalMin
+                        if ownLo < ownHi:
+                            totalUsage -= (ownHi - ownLo)  # Own contribution is 1 per time unit
+                    # For limit=1 resource: any foreign usage > 0 means conflict
+                    if totalUsage > 0:
+                        toExclude.add(v)
+
+                for v in toExclude:
+                    currentDomain[pos].excl(v)
+                    outerChanged = true
+
         # Phase: Disjunctive pair propagation
         if carray.disjunctivePairs.len > 0:
             # Recompute domainMin/domainMax from current PackedSets

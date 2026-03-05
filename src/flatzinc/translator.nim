@@ -156,6 +156,10 @@ type
     setInReifChannelDefs*: seq[int]
     # array_bool_and/array_bool_or with defines_var → channel variables
     boolAndOrChannelDefs*: seq[int]
+    # Consumed disjunctive pair indices (replaced by cumulative constraints)
+    consumedDisjunctivePairs*: PackedSet[int]
+    # Detected disjunctive resource groups (cliques of disjunctive pairs → cumulative)
+    disjunctiveResourceGroups*: seq[tuple[varNames: seq[string], durations: seq[int]]]
     # Detected NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
     noOverlapPatterns*: seq[NoOverlapPattern]
     # Detected inverse channel patterns: element(person[p], seat, p) groups
@@ -1431,6 +1435,27 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       else:
         limit = 10  # fallback
     tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, limit, limitPos))
+
+  of "fzn_disjunctive", "fzn_disjunctive_strict":
+    # disjunctive(starts, durations) = cumulative(starts, durations, heights=[1,...], limit=1)
+    let startExprs = tr.resolveExprArray(con.args[0])
+    var durations: seq[int]
+    try:
+      durations = tr.resolveIntArray(con.args[1])
+    except:
+      let dExprs = tr.resolveExprArray(con.args[1])
+      durations = newSeq[int](dExprs.len)
+      for i, e in dExprs:
+        if e.node.kind == LiteralNode:
+          durations[i] = e.node.value
+        elif e.node.kind == RefNode:
+          let dom = tr.sys.baseArray.domain[e.node.position]
+          if dom.len == 1:
+            durations[i] = dom[0]
+          else:
+            durations[i] = dom[dom.len div 2]
+    let heights = newSeqWith(durations.len, 1)
+    tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, 1))
 
   of "fzn_diffn":
     # diffn(x, y, dx, dy) - non-overlapping rectangles
@@ -4571,6 +4596,203 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                      &"{tr.disjunctivePairs.len * 2} bool variables eliminated")
 
 
+proc detectDisjunctiveResources(tr: var FznTranslator) =
+  ## Detects disjunctive resource groups among disjunctive pairs and replaces
+  ## them with cumulative(limit=1) constraints.
+  ## A disjunctive resource is a complete subgraph (clique) of pairwise
+  ## disjunctive constraints where all tasks on the same resource have
+  ## consistent durations.
+  if tr.disjunctivePairs.len == 0:
+    return
+
+  # Step 1: Extract 2-variable disjunctive pairs with [1,-1]/[-1,1] coefficients
+  # These represent: either (a - b <= -durA) or (b - a <= -durB),
+  # meaning tasks don't overlap on the same resource.
+  type PairInfo = object
+    pairIdx: int
+    posA, posB: string  # Variable names (posA < posB for canonical ordering)
+    durA, durB: int     # Duration of A (when A before B), duration of B (when B before A)
+
+  var validPairs: seq[PairInfo]
+  for idx, pair in tr.disjunctivePairs:
+    # Only handle simple 2-variable pairs
+    if pair.varNames1.len != 2 or pair.varNames2.len != 2:
+      continue
+    # Check coefficient pattern: [1,-1] or [-1,1]
+    var varA1, varB1, varA2, varB2: string
+    var durFromDisj1, durFromDisj2: int
+
+    # Disjunct 1: coeffs1·vars1 <= rhs1
+    if pair.coeffs1 == @[1, -1]:
+      # a - b <= rhs1 → a + (-rhs1) <= b → if a before b, a needs duration -rhs1
+      varA1 = pair.varNames1[0]
+      varB1 = pair.varNames1[1]
+      durFromDisj1 = -pair.rhs1  # duration of A in "A before B" interpretation
+    elif pair.coeffs1 == @[-1, 1]:
+      # -a + b <= rhs1 → b - a <= rhs1 → b + (-rhs1) <= a → if b before a, b needs duration -rhs1
+      varA1 = pair.varNames1[1]
+      varB1 = pair.varNames1[0]
+      durFromDisj1 = -pair.rhs1
+    else:
+      continue
+
+    # Disjunct 2: coeffs2·vars2 <= rhs2
+    if pair.coeffs2 == @[1, -1]:
+      varA2 = pair.varNames2[0]
+      varB2 = pair.varNames2[1]
+      durFromDisj2 = -pair.rhs2
+    elif pair.coeffs2 == @[-1, 1]:
+      varA2 = pair.varNames2[1]
+      varB2 = pair.varNames2[0]
+      durFromDisj2 = -pair.rhs2
+    else:
+      continue
+
+    # The two disjuncts should involve the same pair of variables
+    # but in opposite directions:
+    # disjunct 1: A + durA <= B (A before B)
+    # disjunct 2: B + durB <= A (B before A)
+    if varA1 == varA2 and varB1 == varB2:
+      # Same direction — not a proper disjunctive pair for our purposes
+      # Actually this means: (A+dur1<=B) or (A+dur2<=B) — skip
+      continue
+    elif varA1 == varB2 and varB1 == varA2:
+      # disjunct1: A1+dur1<=B1, disjunct2: A2+dur2<=B2 where A1=B2, B1=A2
+      # So: A+durA<=B or B+durB<=A — correct pattern
+      validPairs.add(PairInfo(
+        pairIdx: idx,
+        posA: varA1, posB: varB1,
+        durA: durFromDisj1, durB: durFromDisj2))
+    else:
+      continue
+
+  if validPairs.len == 0:
+    return
+
+  # Step 2: Build adjacency and validate duration consistency
+  # Each position (variable name) should have a consistent duration across all pairs
+  var varDuration: Table[string, int]  # var → its duration
+  var adjacency: Table[string, Table[string, int]]  # var → {partner → pairIdx}
+  var consistent = true
+
+  for pi in validPairs:
+    # Check duration consistency for posA
+    if pi.posA in varDuration:
+      if varDuration[pi.posA] != pi.durA:
+        consistent = false
+        break
+    else:
+      varDuration[pi.posA] = pi.durA
+
+    # Check duration consistency for posB
+    if pi.posB in varDuration:
+      if varDuration[pi.posB] != pi.durB:
+        consistent = false
+        break
+    else:
+      varDuration[pi.posB] = pi.durB
+
+    if pi.posA notin adjacency:
+      adjacency[pi.posA] = initTable[string, int]()
+    adjacency[pi.posA][pi.posB] = pi.pairIdx
+
+    if pi.posB notin adjacency:
+      adjacency[pi.posB] = initTable[string, int]()
+    adjacency[pi.posB][pi.posA] = pi.pairIdx
+
+  if not consistent:
+    return
+
+  # Step 3: Find cliques by greedy detection
+  var assigned: HashSet[string]  # Variables already assigned to a resource group
+  type ResourceGroup = object
+    members: seq[string]
+    pairIndices: seq[int]
+
+  var groups: seq[ResourceGroup]
+
+  # Sort variables by degree (highest first) for better clique detection
+  var varsByDegree: seq[(int, string)]
+  for v, partners in adjacency:
+    varsByDegree.add((partners.len, v))
+  varsByDegree.sort(proc(a, b: (int, string)): int = -cmp(a[0], b[0]))
+
+  for (_, startVar) in varsByDegree:
+    if startVar in assigned:
+      continue
+
+    # Try to build a clique starting from startVar
+    var clique = @[startVar]
+    # Candidates: all partners of startVar not yet assigned
+    var candidates: seq[string]
+    for partner in adjacency[startVar].keys:
+      if partner notin assigned:
+        candidates.add(partner)
+
+    # Greedily add candidates that are connected to all current clique members
+    for candidate in candidates:
+      var connectedToAll = true
+      for member in clique:
+        if member == candidate:
+          connectedToAll = false
+          break
+        if candidate notin adjacency.getOrDefault(member):
+          connectedToAll = false
+          break
+      if connectedToAll:
+        clique.add(candidate)
+
+    if clique.len < 2:
+      continue
+
+    # Verify it's a complete subgraph and collect pair indices
+    var pairIndices: seq[int]
+    var isComplete = true
+    for i in 0..<clique.len:
+      for j in (i+1)..<clique.len:
+        if clique[j] notin adjacency.getOrDefault(clique[i]):
+          isComplete = false
+          break
+        pairIndices.add(adjacency[clique[i]][clique[j]])
+      if not isComplete:
+        break
+
+    if not isComplete:
+      continue
+
+    for member in clique:
+      assigned.incl(member)
+    groups.add(ResourceGroup(members: clique, pairIndices: pairIndices))
+
+  if groups.len == 0:
+    return
+
+  # Step 4: Mark consumed pairs and create cumulative constraints
+  var totalConsumed = 0
+  var totalTasks = 0
+
+  for group in groups:
+    for pidx in group.pairIndices:
+      tr.consumedDisjunctivePairs.incl(pidx)
+      inc totalConsumed
+
+    totalTasks += group.members.len
+
+    # Collect positions and durations for cumulative constraint
+    # We store var names here; positions will be resolved during constraint emission
+    # (after translateVariables has run)
+    var memberNames = group.members
+    var durations: seq[int]
+    for m in memberNames:
+      durations.add(varDuration[m])
+
+    # Store for later emission (positions aren't resolved yet)
+    tr.disjunctiveResourceGroups.add((varNames: memberNames, durations: durations))
+
+  stderr.writeLine(&"[FZN] Detected {groups.len} disjunctive resource groups ({totalTasks} tasks total), " &
+                   &"{totalConsumed} pairs consumed -> {groups.len} cumulative constraints")
+
+
 proc detectNoOverlapPatterns(tr: var FznTranslator) =
   ## Detects 6-literal bool_clause patterns encoding 3D box non-overlap:
   ##   bool_clause([b1,b2,b3,b4,b5,b6], [])
@@ -5901,11 +6123,12 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
 
 proc detectRedundantOrderings(tr: var FznTranslator) =
   ## Detects transitively redundant ordering constraints.
-  ## For int_lin_le([1,-1], [a, b], 0) meaning a <= b, identifies edges
-  ## implied by transitivity (e.g., a<=c is redundant if a<=b and b<=c).
+  ## Handles weighted edges: int_lin_le([-1,1], [a,b], -d) means b >= a + d (edge a→b weight d).
+  ## Edge u→v weight w is redundant if there exists a path u→...→v with total weight >= w.
   type OrderEdge = object
     constraintIdx: int
     fromVar, toVar: string
+    weight: int  # a + weight <= b
 
   var edges: seq[OrderEdge]
   var nameToId: Table[string, int]
@@ -5920,7 +6143,11 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     idToName.add(name)
     inc nextId
 
-  # Collect ordering edges: int_lin_le([1,-1], [a, b], 0) means a <= b
+  # Collect ordering edges from int_lin_le with 2 variables
+  # Patterns:
+  #   [1,-1], [a,b], rhs  →  a - b <= rhs  →  a + (-rhs) <= b  →  edge a→b weight -rhs
+  #   [-1,1], [a,b], rhs  →  -a + b <= rhs  →  b + (-rhs) <= a  →  edge b→a weight -rhs
+  #   [c,-c], [a,b], rhs (c>0)  →  c(a-b) <= rhs  →  a - b <= rhs/c  →  edge a→b weight -rhs/c
   for ci, con in tr.model.constraints:
     if ci in tr.definingConstraints:
       continue
@@ -5932,7 +6159,11 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
       coeffs = tr.resolveIntArray(con.args[0])
     except CatchableError:
       continue
-    if coeffs != @[1, -1]:
+    if coeffs.len != 2:
+      continue
+    # Need one positive and one negative coefficient of same magnitude
+    if not ((coeffs[0] > 0 and coeffs[1] < 0 and coeffs[0] == -coeffs[1]) or
+            (coeffs[0] < 0 and coeffs[1] > 0 and -coeffs[0] == coeffs[1])):
       continue
     # Resolve RHS
     var rhs: int
@@ -5940,8 +6171,11 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
       rhs = tr.resolveIntArg(con.args[2])
     except CatchableError:
       continue
-    if rhs != 0:
-      continue
+    # Compute weight: for coeffs [c,-c] with c>0: edge a→b weight -rhs/c
+    let c = abs(coeffs[0])
+    if c > 1 and rhs mod c != 0:
+      continue  # Non-integer weight, skip
+    let scaledRhs = rhs div c
     # Resolve variable names
     let varNames = tr.resolveVarNames(con.args[1])
     if varNames.len != 2:
@@ -5949,26 +6183,41 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     # Skip if either variable is defined (will be replaced by expression)
     if varNames[0] in tr.definedVarNames or varNames[1] in tr.definedVarNames:
       continue
-    let fromId = getId(varNames[0])
-    let toId = getId(varNames[1])
-    edges.add(OrderEdge(constraintIdx: ci, fromVar: varNames[0], toVar: varNames[1]))
+    # Determine edge direction based on coefficient signs
+    var fromVar, toVar: string
+    if coeffs[0] > 0:
+      # [+c, -c]: a - b <= rhs/c → a + (-rhs/c) <= b → edge a→b
+      fromVar = varNames[0]
+      toVar = varNames[1]
+    else:
+      # [-c, +c]: b - a <= rhs/c → b + (-rhs/c) <= a → edge b→a
+      fromVar = varNames[1]
+      toVar = varNames[0]
+    let weight = -scaledRhs  # from + weight <= to
+    discard getId(fromVar)
+    discard getId(toVar)
+    edges.add(OrderEdge(constraintIdx: ci, fromVar: fromVar, toVar: toVar, weight: weight))
 
   if edges.len == 0:
     return
 
   let n = nextId
 
-  # Build adjacency using PackedSets
-  var succ = newSeq[PackedSet[int]](n)
+  # Build adjacency: node → {successor → max weight}
+  var succ = newSeq[Table[int, int]](n)
   for i in 0..<n:
-    succ[i] = initPackedSet[int]()
-  # Map edge to constraint index for lookup
-  var edgeConstraints: Table[(int, int), seq[int]]
+    succ[i] = initTable[int, int]()
+  # Map (from, to, weight) to constraint indices
+  var edgeConstraints: Table[(int, int, int), seq[int]]
   for e in edges:
     let fromId = nameToId[e.fromVar]
     let toId = nameToId[e.toVar]
-    succ[fromId].incl(toId)
-    let key = (fromId, toId)
+    # Keep max weight for adjacency
+    if toId in succ[fromId]:
+      succ[fromId][toId] = max(succ[fromId][toId], e.weight)
+    else:
+      succ[fromId][toId] = e.weight
+    let key = (fromId, toId, e.weight)
     if key notin edgeConstraints:
       edgeConstraints[key] = @[]
     edgeConstraints[key].add(e.constraintIdx)
@@ -5976,7 +6225,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
   # Compute in-degree for topological sort (Kahn's algorithm)
   var inDeg = newSeq[int](n)
   for i in 0..<n:
-    for j in succ[i].items:
+    for j in succ[i].keys:
       inDeg[j] += 1
 
   var queue: seq[int]
@@ -5990,7 +6239,7 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     let u = queue[qi]
     inc qi
     topoOrder.add(u)
-    for v in succ[u].items:
+    for v in succ[u].keys:
       inDeg[v] -= 1
       if inDeg[v] == 0:
         queue.add(v)
@@ -5999,46 +6248,43 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     # Graph has cycles — can't do transitive reduction, skip
     return
 
-  # Compute topological index for each node
-  var topoIdx = newSeq[int](n)
-  for i, node in topoOrder:
-    topoIdx[node] = i
-
-  # Compute reachable sets bottom-up (reverse topological order)
-  var reachable = newSeq[PackedSet[int]](n)
+  # Compute longest-path distances bottom-up (reverse topological order)
+  # dist[u][v] = longest path weight from u to v
+  var dist = newSeq[Table[int, int]](n)
   for i in 0..<n:
-    reachable[i] = initPackedSet[int]()
+    dist[i] = initTable[int, int]()
 
   for i in countdown(topoOrder.len - 1, 0):
     let u = topoOrder[i]
-    for v in succ[u].items:
-      reachable[u].incl(v)
-      reachable[u] = reachable[u] + reachable[v]
+    for v, w in succ[u]:
+      # Direct edge u→v
+      dist[u][v] = max(dist[u].getOrDefault(v, low(int)), w)
+      # Transitive: u→v→...→target
+      for target, d in dist[v]:
+        dist[u][target] = max(dist[u].getOrDefault(target, low(int)), w + d)
 
-  # Compute transitive reduction: for each node, keep only immediate successors
-  var reducedSucc = newSeq[PackedSet[int]](n)
-  for i in 0..<n:
-    reducedSucc[i] = succ[i]  # start with all direct successors
-
-  for u in topoOrder:
-    # Process successors in topological order (nearest first)
-    var sortedSucc: seq[int]
-    for v in succ[u].items:
-      sortedSucc.add(v)
-    sortedSucc.sort(proc(a, b: int): int = cmp(topoIdx[a], topoIdx[b]))
-
-    for v in sortedSucc:
-      if v in reducedSucc[u]:
-        # Keep v, but remove everything reachable from v
-        reducedSucc[u] = reducedSucc[u] - reachable[v]
-        reducedSucc[u].incl(v)  # re-include v itself
-
-  # Mark redundant edges
+  # Mark redundant edges: edge u→v weight w is redundant if
+  # there exists an intermediate node x (x≠v) with succ[u][x] + dist[x][v] >= w
   var redundantCount = 0
   for e in edges:
     let fromId = nameToId[e.fromVar]
     let toId = nameToId[e.toVar]
-    if toId notin reducedSucc[fromId]:
+    var isRedundant = false
+    # Check if any other neighbor provides a path with >= weight
+    for x, wx in succ[fromId]:
+      if x == toId:
+        continue
+      let pathWeight = wx + dist[x].getOrDefault(toId, low(int))
+      if pathWeight >= e.weight:
+        isRedundant = true
+        break
+    # Also: if multiple constraints exist for the same (from, to) pair,
+    # keep only the one with the largest weight
+    if not isRedundant:
+      let maxWeight = succ[fromId][toId]  # This is the max weight for this edge
+      if e.weight < maxWeight:
+        isRedundant = true  # A stronger constraint exists for this edge
+    if isRedundant:
       tr.redundantOrderings.incl(e.constraintIdx)
       inc redundantCount
 
@@ -6142,6 +6388,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectImplicationPatterns()
   # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
   result.detectDisjunctivePairs()
+  # Detect disjunctive resource groups (cliques of pairs → cumulative)
+  result.detectDisjunctiveResources()
   # Detect NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
   result.detectNoOverlapPatterns()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
@@ -6339,7 +6587,9 @@ proc translate*(model: FznModel): FznTranslator =
     stderr.writeLine(&"[FZN] Table domain restrictions from eliminated variables: {nTableDomainRestrictions}")
 
   # Add disjunctive pair constraints: min(max(0, expr1), max(0, expr2)) == 0
-  for pair in result.disjunctivePairs:
+  for pairIdx, pair in result.disjunctivePairs:
+    if pairIdx in result.consumedDisjunctivePairs:
+      continue
     var exprs1 = newSeq[AlgebraicExpression[int]](pair.varNames1.len)
     for i, vn in pair.varNames1:
       exprs1[i] = result.resolveExprArg(FznExpr(kind: FznIdent, ident: vn))
@@ -6393,6 +6643,25 @@ proc translate*(model: FznModel): FznTranslator =
 
   if result.sys.baseArray.disjunctivePairs.len > 0:
     stderr.writeLine(&"[FZN] Disjunctive pairs for domain reduction: {result.sys.baseArray.disjunctivePairs.len}")
+
+  # Emit cumulative constraints for detected disjunctive resource groups
+  for group in result.disjunctiveResourceGroups:
+    var positions: seq[int]
+    var allResolved = true
+    for vn in group.varNames:
+      if vn in result.varPositions:
+        positions.add(result.varPositions[vn])
+      elif vn in result.definedVarExprs:
+        # Defined var — shouldn't happen for start_time variables, but skip gracefully
+        allResolved = false
+        break
+      else:
+        allResolved = false
+        break
+    if not allResolved:
+      continue
+    let heights = newSeqWith(group.durations.len, 1)
+    result.sys.addConstraint(cumulative[int](positions, group.durations, heights, 1))
 
   # Build NoOverlap constraints from detected patterns
   for pattern in result.noOverlapPatterns:

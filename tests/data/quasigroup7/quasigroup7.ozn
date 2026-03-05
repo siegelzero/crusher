@@ -1,4 +1,4 @@
-output [show(quasiGroup)];
+output let {array [int] of string: X_INTRODUCED_129_ = [show(quasiGroup)]} in (X_INTRODUCED_129_);
 set of int: nDomain = 0..4;
 array [1..25] of int: X_INTRODUCED_16_;
 array [nDomain,nDomain] of int: quasiGroup = array2d(0..4,0..4,X_INTRODUCED_16_);

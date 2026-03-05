@@ -12,6 +12,7 @@ const LogInterval* = 50000  # Log every N iterations
 const ProfileMoveDelta* = false  # Enable moveDelta profiling (disable for performance)
 const ProfileIteration* = false  # Enable per-iteration phase profiling
 const LazyThreshold* = 1000  # Positions with domain > this use on-demand costDelta instead of penalty maps
+const BatchLazyMax* = 10000  # Lazy positions with domain <= this use batch evaluation in bestMoves
 
 ################################################################################
 # Type definitions
@@ -304,6 +305,56 @@ proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
         result += state.computeChannelDepDelta(position, newValue)
     if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
         result += state.computeInverseDeltaAt(position, newValue)
+
+proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
+    ## Batch-compute cost delta for all domain values at a lazy position.
+    ## Returns (bestCostDelta, bestValue, movesEvaluated).
+    ## Uses batchMovePenalty for constraint types that support it.
+    let domain = state.sharedDomain[][position]
+    let dLen = domain.len
+    let oldValue = state.assignment[position]
+
+    var penalties = newSeq[int](dLen)
+
+    for constraint in state.constraintsAtPosition[position]:
+        if constraint.stateType == CumulativeType and
+           constraint.cumulativeState.evalMethod == PositionBased:
+            let p = constraint.cumulativeState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == RelationalType:
+            let p = constraint.relationalState.batchMovePenalty(
+                position, oldValue, domain, state.assignment)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == MatrixElementType:
+            let p = constraint.matrixElementState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == TableConstraintType:
+            let p = constraint.tableConstraintState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == DiffnType:
+            let p = constraint.diffnState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        else:
+            for i in 0..<dLen:
+                if domain[i] != oldValue:
+                    penalties[i] += state.movePenalty(constraint, position, domain[i])
+
+    # Find minimum (excluding current value)
+    var bestDelta = high(int)
+    var bestVal = oldValue
+    var evaluated = 0
+    for i in 0..<dLen:
+        if domain[i] == oldValue: continue
+        inc evaluated
+        if penalties[i] < bestDelta:
+            bestDelta = penalties[i]
+            bestVal = domain[i]
+
+    return (bestDelta, bestVal, evaluated)
 
 ################################################################################
 # Penalty Map Routines
@@ -3309,28 +3360,40 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             let domain = state.sharedDomain[][position]
             let dLen = domain.len
 
-            # Sample random domain values, break on first improving move
+            # Evaluate domain values — batch for eligible lazy positions, sampling otherwise
             let hasInverse1 = state.inverseEnabled and state.posToInverseGroup[position] >= 0
-            for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
-                let i = rand(dLen - 1)
-                if lazy1:
-                    if domain[i] == oldValue: continue
-                elif i == oldIdx:
-                    continue
-                inc movesEvaluated
-                var newCost: int
-                if lazy1:
-                    newCost = state.cost + state.costDelta(position, domain[i])
-                else:
-                    newCost = state.cost + state.penaltyMap[position][i]
-                    if hasInverse1:
-                        newCost += state.inverseDelta[position][i]
-                if lazy1 or state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
-                    if newCost < bestMoveCost:
-                        result = @[(position, domain[i])]
-                        bestMoveCost = newCost
-                    if bestMoveCost < state.cost:
-                        break  # Found improving value, stop domain scan
+            let useBatch1 = lazy1 and dLen <= BatchLazyMax and
+                (not state.hasChannelDeps or state.channelDepPenalties[position].len == 0) and
+                not hasInverse1
+
+            if useBatch1:
+                let (bestDelta, bestVal, nEval) = state.batchCostDelta(position)
+                movesEvaluated += nEval
+                let newCost = state.cost + bestDelta
+                if newCost < bestMoveCost:
+                    result = @[(position, bestVal)]
+                    bestMoveCost = newCost
+            else:
+                for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
+                    let i = rand(dLen - 1)
+                    if lazy1:
+                        if domain[i] == oldValue: continue
+                    elif i == oldIdx:
+                        continue
+                    inc movesEvaluated
+                    var newCost: int
+                    if lazy1:
+                        newCost = state.cost + state.costDelta(position, domain[i])
+                    else:
+                        newCost = state.cost + state.penaltyMap[position][i]
+                        if hasInverse1:
+                            newCost += state.inverseDelta[position][i]
+                    if lazy1 or state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                        if newCost < bestMoveCost:
+                            result = @[(position, domain[i])]
+                            bestMoveCost = newCost
+                        if bestMoveCost < state.cost:
+                            break  # Found improving value, stop domain scan
 
             # Stop after finding an improving move or checking enough positions
             if bestMoveCost < state.cost:
@@ -3355,8 +3418,20 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             let domain = state.sharedDomain[][position]
             let dLen = domain.len
             let hasInverse2 = state.inverseEnabled and state.posToInverseGroup[position] >= 0
+            let useBatch2 = lazy2 and dLen <= BatchLazyMax and
+                (not state.hasChannelDeps or state.channelDepPenalties[position].len == 0) and
+                not hasInverse2
 
-            if dLen <= MAX_CANDIDATES_PER_POS:
+            if useBatch2:
+                let (bestDelta, bestVal, nEval) = state.batchCostDelta(position)
+                movesEvaluated += nEval
+                let newCost = state.cost + bestDelta
+                if newCost < bestMoveCost:
+                    result = @[(position, bestVal)]
+                    bestMoveCost = newCost
+                elif newCost == bestMoveCost:
+                    result.add((position, bestVal))
+            elif dLen <= MAX_CANDIDATES_PER_POS:
                 for i in 0..<dLen:
                     if lazy2:
                         if domain[i] == oldValue: continue
