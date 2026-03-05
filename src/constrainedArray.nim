@@ -435,160 +435,6 @@ proc tightenFromLe[T](domainMin, domainMax: var seq[T],
             if newMin > domainMin[pos_j]:
                 domainMin[pos_j] = newMin
 
-proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
-    ## Lightweight bounds propagation on the existing reducedDomain using
-    ## linear forms extracted from constraints. Does NOT modify constraints
-    ## or fixed positions — safe to call repeatedly during optimization.
-    if carray.reducedDomain.len == 0: return
-
-    let n = carray.len
-    var domainMin = newSeq[T](n)
-    var domainMax = newSeq[T](n)
-    for pos in carray.allPositions():
-        let rd = carray.reducedDomain[pos]
-        if rd.len == 0:
-            domainMin[pos] = T(0)
-            domainMax[pos] = T(0)
-        else:
-            # Find actual min/max (reducedDomain may not be sorted)
-            domainMin[pos] = rd[0]
-            domainMax[pos] = rd[0]
-            for v in rd:
-                if v < domainMin[pos]: domainMin[pos] = v
-                if v > domainMax[pos]: domainMax[pos] = v
-
-    # Extract linear forms from relational constraints
-    type NormForm = object
-        coefficients: Table[int, T]
-        constant: T  # form: Σ(coeff[i]*x[i]) + constant >= 0
-    var forms: seq[NormForm]
-    for cons in carray.constraints:
-        if cons.stateType != RelationalType: continue
-        let rc = cons.relationalState
-        # Only handle PositionBased SumExpr on both sides
-        var leftCoeffs: Table[int, T]
-        var leftConst: T
-        var rightCoeffs: Table[int, T]
-        var rightConst: T
-        var ok = true
-        case rc.leftExpr.kind
-        of SumExpr:
-            let s = rc.leftExpr.sumExpr
-            if s.evalMethod == PositionBased:
-                leftCoeffs = s.coefficient
-                leftConst = s.constant
-            else: ok = false
-        of ConstantExpr:
-            leftConst = rc.leftExpr.constantValue
-        else: ok = false
-        if not ok: continue
-        case rc.rightExpr.kind
-        of SumExpr:
-            let s = rc.rightExpr.sumExpr
-            if s.evalMethod == PositionBased:
-                rightCoeffs = s.coefficient
-                rightConst = s.constant
-            else: ok = false
-        of ConstantExpr:
-            rightConst = rc.rightExpr.constantValue
-        else: ok = false
-        if not ok: continue
-
-        # Combine into: left - right `relation` 0
-        var combined: Table[int, T]
-        for pos, c in leftCoeffs.pairs:
-            combined[pos] = c
-        for pos, c in rightCoeffs.pairs:
-            if pos in combined:
-                combined[pos] = combined[pos] - c
-            else:
-                combined[pos] = -c
-        let combinedConst = leftConst - rightConst
-
-        # Normalize to >= 0
-        case rc.relation
-        of LessThanEq:
-            # left - right <= 0 => -(left - right) >= 0 => right - left >= 0
-            var neg: Table[int, T]
-            for pos, c in combined.pairs:
-                neg[pos] = -c
-            forms.add(NormForm(coefficients: neg, constant: -combinedConst))
-        of GreaterThanEq:
-            forms.add(NormForm(coefficients: combined, constant: combinedConst))
-        of EqualTo:
-            forms.add(NormForm(coefficients: combined, constant: combinedConst))
-            var neg: Table[int, T]
-            for pos, c in combined.pairs:
-                neg[pos] = -c
-            forms.add(NormForm(coefficients: neg, constant: -combinedConst))
-        of LessThan:
-            var neg: Table[int, T]
-            for pos, c in combined.pairs:
-                neg[pos] = -c
-            forms.add(NormForm(coefficients: neg, constant: -combinedConst - T(1)))
-        of GreaterThan:
-            forms.add(NormForm(coefficients: combined, constant: combinedConst - T(1)))
-        else: discard
-
-    if forms.len == 0: return
-
-    # Fixed-point bounds propagation (same as reduceDomain Phase 3)
-    # Guard against overflow — skip any form where arithmetic would overflow
-    const SafeLimit = high(T) div 4  # conservative bound to prevent overflow
-    var changed = true
-    for iteration in 0..<50:
-        if not changed: break
-        changed = false
-        for form in forms:
-            for pos_j in form.coefficients.keys:
-                let a_j = form.coefficients[pos_j]
-                if a_j == 0: continue
-                var restMax: T = 0
-                var overflow = false
-                for pos_i in form.coefficients.keys:
-                    if pos_i == pos_j: continue
-                    let a_i = form.coefficients[pos_i]
-                    if a_i == 0: continue
-                    let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
-                    if abs(dVal) > SafeLimit or abs(a_i) > SafeLimit:
-                        overflow = true; break
-                    let product = a_i * dVal
-                    if abs(restMax) > SafeLimit:
-                        overflow = true; break
-                    restMax += product
-                if overflow: continue
-                if abs(form.constant) > SafeLimit or abs(restMax) > SafeLimit:
-                    continue
-                let bound = -form.constant - restMax
-                if a_j > 0:
-                    let newMin = ceilDivPositive(bound, a_j)
-                    if newMin > domainMin[pos_j]:
-                        domainMin[pos_j] = newMin
-                        changed = true
-                else:
-                    let newMax = floorDivPositive(-bound, -a_j)
-                    if newMax < domainMax[pos_j]:
-                        domainMax[pos_j] = newMax
-                        changed = true
-
-    # Apply tightened bounds to reducedDomain.
-    # Never produce empty or singleton domains — empty causes crashes,
-    # singletons cause removeFixedConstraints to remove constraints that
-    # are still needed during optimization.
-    var totalRemoved = 0
-    for pos in carray.allPositions():
-        let rd = carray.reducedDomain[pos]
-        if rd.len <= 2: continue  # keep at least 2 values
-        if domainMin[pos] > domainMax[pos]: continue
-        var newDomain: seq[T]
-        for v in rd:
-            if v >= domainMin[pos] and v <= domainMax[pos]:
-                newDomain.add(v)
-        if newDomain.len < 2: continue  # never tighten to singleton or empty
-        if newDomain.len < rd.len:
-            totalRemoved += rd.len - newDomain.len
-            carray.reducedDomain[pos] = newDomain
-
 type
     LinearForm[T] = object
         coefficients: Table[int, T]
@@ -659,6 +505,121 @@ proc extractLinearForm[T](cons: RelationalConstraint[T]): (bool, LinearForm[T]) 
         constant: mergedConst,
         relation: cons.relation
     ))
+
+proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
+    ## Lightweight bounds propagation on the existing reducedDomain using
+    ## linear forms extracted from constraints. Does NOT modify constraints
+    ## or fixed positions — safe to call repeatedly during optimization.
+    if carray.reducedDomain.len == 0: return
+
+    let n = carray.len
+    var domainMin = newSeq[T](n)
+    var domainMax = newSeq[T](n)
+    for pos in carray.allPositions():
+        let rd = carray.reducedDomain[pos]
+        if rd.len == 0:
+            domainMin[pos] = T(0)
+            domainMax[pos] = T(0)
+        else:
+            # Find actual min/max (reducedDomain may not be sorted)
+            domainMin[pos] = rd[0]
+            domainMax[pos] = rd[0]
+            for v in rd:
+                if v < domainMin[pos]: domainMin[pos] = v
+                if v > domainMax[pos]: domainMax[pos] = v
+
+    # Extract linear forms from relational constraints, reusing extractLinearForm
+    type NormForm = object
+        coefficients: Table[int, T]
+        constant: T  # form: Σ(coeff[i]*x[i]) + constant >= 0
+
+    proc normalizeToGe(form: LinearForm[T]): seq[NormForm] =
+        ## Normalize a LinearForm to one or two >= 0 forms
+        case form.relation
+        of LessThanEq:
+            var neg: Table[int, T]
+            for pos, c in form.coefficients.pairs: neg[pos] = -c
+            result.add(NormForm(coefficients: neg, constant: -form.constant))
+        of GreaterThanEq:
+            result.add(NormForm(coefficients: form.coefficients, constant: form.constant))
+        of EqualTo:
+            result.add(NormForm(coefficients: form.coefficients, constant: form.constant))
+            var neg: Table[int, T]
+            for pos, c in form.coefficients.pairs: neg[pos] = -c
+            result.add(NormForm(coefficients: neg, constant: -form.constant))
+        of LessThan:
+            var neg: Table[int, T]
+            for pos, c in form.coefficients.pairs: neg[pos] = -c
+            result.add(NormForm(coefficients: neg, constant: -form.constant - T(1)))
+        of GreaterThan:
+            result.add(NormForm(coefficients: form.coefficients, constant: form.constant - T(1)))
+        else: discard
+
+    var forms: seq[NormForm]
+    for cons in carray.constraints:
+        if cons.stateType != RelationalType: continue
+        let (ok, linearForm) = extractLinearForm[T](cons.relationalState)
+        if not ok: continue
+        forms.add(normalizeToGe(linearForm))
+
+    if forms.len == 0: return
+
+    # Fixed-point bounds propagation (same as reduceDomain Phase 3)
+    # Guard against overflow — skip any form where arithmetic would overflow
+    const SafeLimit = high(T) div 4  # conservative bound to prevent overflow
+    var changed = true
+    for iteration in 0..<50:
+        if not changed: break
+        changed = false
+        for form in forms:
+            for pos_j in form.coefficients.keys:
+                let a_j = form.coefficients[pos_j]
+                if a_j == 0: continue
+                var restMax: T = 0
+                var overflow = false
+                for pos_i in form.coefficients.keys:
+                    if pos_i == pos_j: continue
+                    let a_i = form.coefficients[pos_i]
+                    if a_i == 0: continue
+                    let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
+                    if abs(dVal) > SafeLimit or abs(a_i) > SafeLimit:
+                        overflow = true; break
+                    let product = a_i * dVal
+                    if abs(restMax) > SafeLimit:
+                        overflow = true; break
+                    restMax += product
+                if overflow: continue
+                if abs(form.constant) > SafeLimit or abs(restMax) > SafeLimit:
+                    continue
+                let bound = -form.constant - restMax
+                if a_j > 0:
+                    let newMin = ceilDivPositive(bound, a_j)
+                    if newMin > domainMin[pos_j]:
+                        domainMin[pos_j] = newMin
+                        changed = true
+                else:
+                    let newMax = floorDivPositive(-bound, -a_j)
+                    if newMax < domainMax[pos_j]:
+                        domainMax[pos_j] = newMax
+                        changed = true
+
+    # Apply tightened bounds to reducedDomain.
+    # Never produce empty or singleton domains — empty causes crashes,
+    # singletons cause removeFixedConstraints to remove constraints that
+    # are still needed during optimization.
+    var totalRemoved = 0
+    for pos in carray.allPositions():
+        let rd = carray.reducedDomain[pos]
+        if rd.len <= 2: continue  # keep at least 2 values
+        if domainMin[pos] > domainMax[pos]: continue
+        var newDomain: seq[T]
+        for v in rd:
+            if v >= domainMin[pos] and v <= domainMax[pos]:
+                newDomain.add(v)
+        if newDomain.len < 2: continue  # never tighten to singleton or empty
+        if newDomain.len < rd.len:
+            totalRemoved += rd.len - newDomain.len
+            carray.reducedDomain[pos] = newDomain
 
 proc extractLinearCoeffs[T](expr: Expression[T]): (bool, Table[int, T], T) =
     ## Extract coefficients and constant from a linear Expression.

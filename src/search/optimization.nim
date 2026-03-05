@@ -108,33 +108,13 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         let baseFixedPositions = system.baseArray.fixedPositions
 
         # Binary search bounds
-        # Tighten bounds using reduced domain of objective positions
-        var domainLo = low(int)
-        var domainHi = high(int)
-        if baseReducedDomain.len > 0:
-            for pos in objective.positions.items:
-                if pos < baseReducedDomain.len and baseReducedDomain[pos].len > 0:
-                    let dom = baseReducedDomain[pos]
-                    # Find actual min/max (domain may not be sorted)
-                    var posMin = dom[0]
-                    var posMax = dom[0]
-                    for v in dom:
-                        if v < posMin: posMin = v
-                        if v > posMax: posMax = v
-                    if posMin > domainLo: domainLo = posMin
-                    if posMax < domainHi: domainHi = posMax
-
         when direction == Minimize:
             var lo = if lowerBound != low(int): lowerBound else: 0
-            if domainLo > lo:
-                lo = domainLo
             var hi = currentCost - 1
             var loProven = true  # 0 is a genuine lower bound; user-provided also trusted
         else:
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
-            if domainHi < hi:
-                hi = domainHi
             var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)

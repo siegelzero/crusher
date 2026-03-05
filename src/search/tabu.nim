@@ -516,6 +516,8 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
        (constraint.cumulativeState.evalMethod == PositionBased or
         (constraint.cumulativeState.evalMethod == ExpressionBased and
          position in constraint.cumulativeState.expressionsAtPosition and
+         # Multi-task batch temporarily mutates the resource profile, which isn't
+         # safe during single-constraint partial updates — restrict to single-task.
          constraint.cumulativeState.expressionsAtPosition[position].len == 1)):
         # Batch computation via prefix sums
         let penalties = constraint.cumulativeState.batchMovePenalty(

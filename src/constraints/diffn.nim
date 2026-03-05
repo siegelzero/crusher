@@ -286,6 +286,7 @@ proc batchMovePenalty*[T](constraint: DiffnConstraint[T], position: int,
         if dxr <= 0 or dyr <= 0:
             return  # zero-size rect can't overlap anything
 
+        # Single affected rect: overlaps[r].len == number of overlap pairs involving r
         let oldOverlaps = constraint.overlaps[r].len
 
         # Pre-compute candidate x values by evaluating expression for each domain value
@@ -339,6 +340,7 @@ proc batchMovePenalty*[T](constraint: DiffnConstraint[T], position: int,
         if dxr <= 0 or dyr <= 0:
             return
 
+        # Single affected rect: overlaps[r].len == number of overlap pairs involving r
         let oldOverlaps = constraint.overlaps[r].len
 
         var candidateYs = newSeq[T](dLen)
