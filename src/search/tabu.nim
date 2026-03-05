@@ -278,6 +278,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.matrixElementState.moveDelta(position, oldValue, newValue)
         of NoOverlapFixedBoxType:
             result = constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
+        of ConnectedType:
+            result = constraint.connectedState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

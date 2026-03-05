@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression]
 
@@ -284,6 +284,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "MatrixElement Constraint"
         of NoOverlapFixedBoxType:
             return "NoOverlapFixedBox Constraint"
+        of ConnectedType:
+            return "Connected Constraint"
 
 ################################################################################
 # Evaluation
@@ -339,6 +341,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.matrixElementState.cost
         of NoOverlapFixedBoxType:
             return constraint.noOverlapFixedBoxState.cost
+        of ConnectedType:
+            return constraint.connectedState.cost
 
 ################################################################################
 # Computed Constraints
@@ -933,6 +937,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.matrixElementState.initialize(assignment)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.initialize(assignment)
+        of ConnectedType:
+            constraint.connectedState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -985,6 +991,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.matrixElementState.moveDelta(position, oldValue, newValue)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
+        of ConnectedType:
+            constraint.connectedState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1037,6 +1045,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.matrixElementState.updatePosition(position, newValue)
         of NoOverlapFixedBoxType:
             constraint.noOverlapFixedBoxState.updatePosition(position, newValue)
+        of ConnectedType:
+            constraint.connectedState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1625,6 +1635,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: NoOverlapFixedBoxType,
                 noOverlapFixedBoxState: constraint.noOverlapFixedBoxState.deepCopy()
             )
+        of ConnectedType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ConnectedType,
+                connectedState: constraint.connectedState.deepCopy()
+            )
 
 
 
@@ -1877,6 +1893,24 @@ func subcircuit*[T](positions: openArray[int]): StatefulConstraint[T] =
         positions: subcircuitConstraint.positions,
         stateType: SubcircuitType,
         subcircuitState: subcircuitConstraint
+    )
+
+################################################################################
+# Connected wrapper functions
+################################################################################
+
+func connected*[T](nodePositions, edgePositions: openArray[int],
+                   edgeFrom, edgeTo: openArray[int]): StatefulConstraint[T] =
+    ## Creates a Connected constraint ensuring active nodes form a single connected component.
+    ## Node/edge activity is determined by boolean variables (0 = inactive, non-0 = active).
+    ## Edge activity is derived from node activity (active iff both endpoints active).
+    ##
+    ## **Violation Cost**: max(0, numComponents - 1)
+    let connectedConstraint = newConnectedConstraint[T](nodePositions, edgePositions, edgeFrom, edgeTo)
+    return StatefulConstraint[T](
+        positions: connectedConstraint.positions,
+        stateType: ConnectedType,
+        connectedState: connectedConstraint
     )
 
 ################################################################################

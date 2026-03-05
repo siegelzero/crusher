@@ -1509,6 +1509,51 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
       tr.sys.addConstraint(subcircuit[int](positions2))
       tr.sys.addConstraint(allDifferent[int](positions2))
 
+  of "fzn_connected":
+    # fzn_connected(from, to, ns, es)
+    # from, to: constant int arrays (1-based node indices for edge endpoints)
+    # ns: var bool array (node activity)
+    # es: var bool array (edge activity)
+    let fromArr = tr.resolveIntArray(con.args[0])
+    let toArr = tr.resolveIntArray(con.args[1])
+    let nsExprs = tr.resolveExprArray(con.args[2])
+    let esExprs = tr.resolveExprArray(con.args[3])
+
+    # Extract node positions
+    var nodePositions: seq[int]
+    for e in nsExprs:
+      if e.node.kind == RefNode:
+        nodePositions.add(e.node.position)
+      elif e.node.kind == LiteralNode:
+        let pos = tr.sys.baseArray.len
+        let v = tr.sys.newConstrainedVariable()
+        v.setDomain(@[int(e.node.value)])
+        nodePositions.add(pos)
+      else:
+        raise newException(ValueError, "fzn_connected: unsupported ns expression node kind " & $e.node.kind)
+
+    # Extract edge positions
+    var edgePositions: seq[int]
+    for e in esExprs:
+      if e.node.kind == RefNode:
+        edgePositions.add(e.node.position)
+      elif e.node.kind == LiteralNode:
+        let pos = tr.sys.baseArray.len
+        let v = tr.sys.newConstrainedVariable()
+        v.setDomain(@[int(e.node.value)])
+        edgePositions.add(pos)
+      else:
+        raise newException(ValueError, "fzn_connected: unsupported es expression node kind " & $e.node.kind)
+
+    # Convert from/to from 1-based MiniZinc to 0-based node indices
+    var from0 = newSeq[int](fromArr.len)
+    var to0 = newSeq[int](toArr.len)
+    for i in 0..<fromArr.len:
+      from0[i] = fromArr[i] - 1
+      to0[i] = toArr[i] - 1
+
+    tr.sys.addConstraint(connected[int](nodePositions, edgePositions, from0, to0))
+
   of "fzn_regular":
     # regular(x, Q, S, d, q0, F)
     let exprs = tr.resolveExprArray(con.args[0])
