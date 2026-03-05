@@ -7,6 +7,7 @@ import ../expressions/stateful
 import ../expressions/sumExpression
 import ../expressions/weightedSameValue
 import ../constraintSystem
+import ../constrainedArray
 
 type
     OptimizationDirection* = enum
@@ -101,18 +102,39 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.hasFeasibleSolution = true
                 echo "[Opt] Resolved within domain bounds: ", currentCost
 
-        # Cache the base reduced domain (after any domain bound constraints).
+        # Cache the base reduced domain and fixed positions (after any domain bound constraints).
         # Subsequent iterations only change the search bound — no need to recompute.
         let baseReducedDomain = system.baseArray.reducedDomain
+        let baseFixedPositions = system.baseArray.fixedPositions
 
         # Binary search bounds
+        # Tighten bounds using reduced domain of objective positions
+        var domainLo = low(int)
+        var domainHi = high(int)
+        if baseReducedDomain.len > 0:
+            for pos in objective.positions.items:
+                if pos < baseReducedDomain.len and baseReducedDomain[pos].len > 0:
+                    let dom = baseReducedDomain[pos]
+                    # Find actual min/max (domain may not be sorted)
+                    var posMin = dom[0]
+                    var posMax = dom[0]
+                    for v in dom:
+                        if v < posMin: posMin = v
+                        if v > posMax: posMax = v
+                    if posMin > domainLo: domainLo = posMin
+                    if posMax < domainHi: domainHi = posMax
+
         when direction == Minimize:
             var lo = if lowerBound != low(int): lowerBound else: 0
+            if domainLo > lo:
+                lo = domainLo
             var hi = currentCost - 1
             var loProven = true  # 0 is a genuine lower bound; user-provided also trusted
         else:
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
+            if domainHi < hi:
+                hi = domainHi
             var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
@@ -137,6 +159,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.addConstraint(objective >= target)
             hasBoundConstraint = true
             system.baseArray.reducedDomain = baseReducedDomain
+            system.baseArray.fixedPositions = baseFixedPositions
+            system.baseArray.tightenReducedDomain()
 
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
@@ -144,6 +168,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if deadline > 0 and deadline - epochTime() < 5.0:
                 system.searchCompleted = false
                 break
+
+            # Save constraints/fixedPositions before resolve (which may mutate them
+            # via removeFixedConstraints) so the optimizer can still add/remove bounds
+            let savedConstraints = system.baseArray.constraints
+            let savedFixed = system.baseArray.fixedPositions
 
             try:
                 system.resolve(
@@ -190,6 +219,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 break
+            finally:
+                system.baseArray.constraints = savedConstraints
+                system.baseArray.fixedPositions = savedFixed
 
         # Retry: binary search used fast tabu-only probes until first failure.
         # Now try to beat the current best with full scatter search, deepening threshold on each failure.
@@ -227,6 +259,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.addConstraint(objective >= currentCost + 1)
                 hasBoundConstraint = true
                 system.baseArray.reducedDomain = baseReducedDomain
+                system.baseArray.fixedPositions = baseFixedPositions
+                system.baseArray.tightenReducedDomain()
+
+                let savedConstraints2 = system.baseArray.constraints
+                let savedFixed2 = system.baseArray.fixedPositions
 
                 try:
                     system.resolve(
@@ -267,6 +304,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     if deadline > 0 and epochTime() < deadline:
                         continue
                     break retryLoop
+                finally:
+                    system.baseArray.constraints = savedConstraints2
+                    system.baseArray.fixedPositions = savedFixed2
 
         # Clean up the bound constraint and restore best solution
         if hasBoundConstraint:

@@ -435,6 +435,160 @@ proc tightenFromLe[T](domainMin, domainMax: var seq[T],
             if newMin > domainMin[pos_j]:
                 domainMin[pos_j] = newMin
 
+proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
+    ## Lightweight bounds propagation on the existing reducedDomain using
+    ## linear forms extracted from constraints. Does NOT modify constraints
+    ## or fixed positions — safe to call repeatedly during optimization.
+    if carray.reducedDomain.len == 0: return
+
+    let n = carray.len
+    var domainMin = newSeq[T](n)
+    var domainMax = newSeq[T](n)
+    for pos in carray.allPositions():
+        let rd = carray.reducedDomain[pos]
+        if rd.len == 0:
+            domainMin[pos] = T(0)
+            domainMax[pos] = T(0)
+        else:
+            # Find actual min/max (reducedDomain may not be sorted)
+            domainMin[pos] = rd[0]
+            domainMax[pos] = rd[0]
+            for v in rd:
+                if v < domainMin[pos]: domainMin[pos] = v
+                if v > domainMax[pos]: domainMax[pos] = v
+
+    # Extract linear forms from relational constraints
+    type NormForm = object
+        coefficients: Table[int, T]
+        constant: T  # form: Σ(coeff[i]*x[i]) + constant >= 0
+    var forms: seq[NormForm]
+    for cons in carray.constraints:
+        if cons.stateType != RelationalType: continue
+        let rc = cons.relationalState
+        # Only handle PositionBased SumExpr on both sides
+        var leftCoeffs: Table[int, T]
+        var leftConst: T
+        var rightCoeffs: Table[int, T]
+        var rightConst: T
+        var ok = true
+        case rc.leftExpr.kind
+        of SumExpr:
+            let s = rc.leftExpr.sumExpr
+            if s.evalMethod == PositionBased:
+                leftCoeffs = s.coefficient
+                leftConst = s.constant
+            else: ok = false
+        of ConstantExpr:
+            leftConst = rc.leftExpr.constantValue
+        else: ok = false
+        if not ok: continue
+        case rc.rightExpr.kind
+        of SumExpr:
+            let s = rc.rightExpr.sumExpr
+            if s.evalMethod == PositionBased:
+                rightCoeffs = s.coefficient
+                rightConst = s.constant
+            else: ok = false
+        of ConstantExpr:
+            rightConst = rc.rightExpr.constantValue
+        else: ok = false
+        if not ok: continue
+
+        # Combine into: left - right `relation` 0
+        var combined: Table[int, T]
+        for pos, c in leftCoeffs.pairs:
+            combined[pos] = c
+        for pos, c in rightCoeffs.pairs:
+            if pos in combined:
+                combined[pos] = combined[pos] - c
+            else:
+                combined[pos] = -c
+        let combinedConst = leftConst - rightConst
+
+        # Normalize to >= 0
+        case rc.relation
+        of LessThanEq:
+            # left - right <= 0 => -(left - right) >= 0 => right - left >= 0
+            var neg: Table[int, T]
+            for pos, c in combined.pairs:
+                neg[pos] = -c
+            forms.add(NormForm(coefficients: neg, constant: -combinedConst))
+        of GreaterThanEq:
+            forms.add(NormForm(coefficients: combined, constant: combinedConst))
+        of EqualTo:
+            forms.add(NormForm(coefficients: combined, constant: combinedConst))
+            var neg: Table[int, T]
+            for pos, c in combined.pairs:
+                neg[pos] = -c
+            forms.add(NormForm(coefficients: neg, constant: -combinedConst))
+        of LessThan:
+            var neg: Table[int, T]
+            for pos, c in combined.pairs:
+                neg[pos] = -c
+            forms.add(NormForm(coefficients: neg, constant: -combinedConst - T(1)))
+        of GreaterThan:
+            forms.add(NormForm(coefficients: combined, constant: combinedConst - T(1)))
+        else: discard
+
+    if forms.len == 0: return
+
+    # Fixed-point bounds propagation (same as reduceDomain Phase 3)
+    # Guard against overflow — skip any form where arithmetic would overflow
+    const SafeLimit = high(T) div 4  # conservative bound to prevent overflow
+    var changed = true
+    for iteration in 0..<50:
+        if not changed: break
+        changed = false
+        for form in forms:
+            for pos_j in form.coefficients.keys:
+                let a_j = form.coefficients[pos_j]
+                if a_j == 0: continue
+                var restMax: T = 0
+                var overflow = false
+                for pos_i in form.coefficients.keys:
+                    if pos_i == pos_j: continue
+                    let a_i = form.coefficients[pos_i]
+                    if a_i == 0: continue
+                    let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
+                    if abs(dVal) > SafeLimit or abs(a_i) > SafeLimit:
+                        overflow = true; break
+                    let product = a_i * dVal
+                    if abs(restMax) > SafeLimit:
+                        overflow = true; break
+                    restMax += product
+                if overflow: continue
+                if abs(form.constant) > SafeLimit or abs(restMax) > SafeLimit:
+                    continue
+                let bound = -form.constant - restMax
+                if a_j > 0:
+                    let newMin = ceilDivPositive(bound, a_j)
+                    if newMin > domainMin[pos_j]:
+                        domainMin[pos_j] = newMin
+                        changed = true
+                else:
+                    let newMax = floorDivPositive(-bound, -a_j)
+                    if newMax < domainMax[pos_j]:
+                        domainMax[pos_j] = newMax
+                        changed = true
+
+    # Apply tightened bounds to reducedDomain.
+    # Never produce empty or singleton domains — empty causes crashes,
+    # singletons cause removeFixedConstraints to remove constraints that
+    # are still needed during optimization.
+    var totalRemoved = 0
+    for pos in carray.allPositions():
+        let rd = carray.reducedDomain[pos]
+        if rd.len <= 2: continue  # keep at least 2 values
+        if domainMin[pos] > domainMax[pos]: continue
+        var newDomain: seq[T]
+        for v in rd:
+            if v >= domainMin[pos] and v <= domainMax[pos]:
+                newDomain.add(v)
+        if newDomain.len < 2: continue  # never tighten to singleton or empty
+        if newDomain.len < rd.len:
+            totalRemoved += rd.len - newDomain.len
+            carray.reducedDomain[pos] = newDomain
+
 type
     LinearForm[T] = object
         coefficients: Table[int, T]
@@ -1179,6 +1333,345 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     if channelLinearForms > 0:
         stderr.writeLine(&"[DomRed] Channel-to-linear forms: {channelLinearForms}")
+
+    # Phase: Cumulative energy bounds
+    # For cumulative(starts, durations, heights, limit):
+    #   energy = sum(d_i * h_i) <= limit * makespan
+    #   => limit >= ceil(energy / makespan_max)
+    # When limit is a variable, this gives a lower bound on the limit variable.
+    # When limit is constant, this gives a lower bound on makespan which propagates
+    # through other constraints.
+    # Also: for each task i, start_i + duration_i <= max_end
+    #   => start_i <= max_end - duration_i (linear bound on start position)
+    var cumulativeEnergyForms = 0
+    for cons in carray.constraints:
+        if cons.stateType != CumulativeType: continue
+        let cumState = cons.cumulativeState
+
+        var durations, heights: seq[T]
+        var nTasks: int
+        case cumState.evalMethod:
+        of PositionBased:
+            durations = cumState.durations
+            heights = cumState.heights
+            nTasks = cumState.originPositions.len
+        of ExpressionBased:
+            durations = cumState.durationsExpr
+            heights = cumState.heightsExpr
+            nTasks = cumState.originExpressions.len
+
+        if nTasks == 0: continue
+
+        # Compute total energy
+        var energy: T = T(0)
+        for i in 0..<nTasks:
+            energy += durations[i] * heights[i]
+
+        if energy <= T(0): continue
+
+        # Compute makespan upper bound from domains
+        var minStart = T.high
+        var maxEnd = T.low
+        case cumState.evalMethod:
+        of PositionBased:
+            for i in 0..<nTasks:
+                let pos = cumState.originPositions[i]
+                let dom = carray.domain[pos]
+                if dom.len == 0: continue
+                if dom[0] < minStart: minStart = dom[0]
+                let endMax = dom[^1] + durations[i]
+                if endMax > maxEnd: maxEnd = endMax
+        of ExpressionBased:
+            for i in 0..<nTasks:
+                let expr = cumState.originExpressions[i]
+                for pos in expr.positions.items:
+                    let dom = carray.domain[pos]
+                    if dom.len == 0: continue
+                    if dom[0] < minStart: minStart = dom[0]
+                    if dom[^1] > maxEnd: maxEnd = dom[^1]
+                # ExpressionBased: maxEnd is approximate (from position domains, not expr evaluation)
+                # Add maximum possible duration shift
+                maxEnd += durations[i]
+
+        let makespanMax = maxEnd - minStart
+        if makespanMax <= T(0): continue
+
+        # Variable limit: limit >= ceil(energy / makespanMax)
+        if cumState.limitPosition >= 0:
+            let lowerBound = (energy + makespanMax - T(1)) div makespanMax  # ceil division
+            # limitVar >= lowerBound => limitVar - lowerBound >= 0
+            var coeffs: Table[int, T]
+            coeffs[cumState.limitPosition] = T(1)
+            linearForms.add(LinearForm[T](
+                coefficients: coeffs,
+                constant: -lowerBound,
+                relation: GreaterThanEq
+            ))
+            cumulativeEnergyForms += 1
+
+        # Per-task start bounds: for PositionBased with constant limit,
+        # start_i + duration_i <= limit (resource time horizon not directly, but
+        # we know start_i >= 0 from domains; the useful bound is from the start+dur<=W
+        # constraints which are already generated by MiniZinc as int_lin_le).
+
+    if cumulativeEnergyForms > 0:
+        stderr.writeLine(&"[DomRed] Cumulative energy bounds: {cumulativeEnergyForms} linear forms")
+
+    # Phase: Diffn area/strip bounds
+    # For diffn(x, y, dx, dy):
+    #   1. Area bound: sum(dx_i * dy_i) <= W * H where W/H are bounding box dimensions
+    #      If a cumulative constraint shares the same starts/dimensions and has a variable limit,
+    #      the area bound tightens the limit (e.g., objective).
+    #   2. Per-rect strip bounds: x_i + dx_i <= W, y_i + dy_i <= H
+    #      These are linear forms when expressions are linear.
+    var diffnBoundForms = 0
+    for cons in carray.constraints:
+        if cons.stateType != DiffnType: continue
+        let ds = cons.diffnState
+        let n = ds.n
+
+        # Compute minimum total area using domain bounds on dimensions
+        # For each rect, compute min(dx_i) * min(dy_i) as a conservative area lower bound
+        var totalMinArea: T = T(0)
+        for i in 0..<n:
+            var minDX, minDY: T
+
+            if ds.dxExprs[i].positions.len == 0:
+                # Constant expression — evaluate directly
+                minDX = ds.dxExprs[i].node.evaluate(initTable[int, T]())
+            else:
+                # Variable — use minimum domain values for each position
+                # For a linear expression, min occurs at min/max of domain depending on coefficient sign
+                if ds.dxExprs[i].linear:
+                    let lin = linearize(ds.dxExprs[i])
+                    var minVal: T = lin.constant
+                    for pos in lin.coefficient.keys:
+                        let c = lin.coefficient[pos]
+                        let dom = carray.domain[pos]
+                        if dom.len == 0: continue
+                        if c > 0:
+                            minVal += c * dom[0]
+                        else:
+                            minVal += c * dom[^1]
+                    minDX = max(minVal, T(0))
+                else:
+                    minDX = T(0)  # Can't bound non-linear — conservative
+
+            if ds.dyExprs[i].positions.len == 0:
+                minDY = ds.dyExprs[i].node.evaluate(initTable[int, T]())
+            else:
+                if ds.dyExprs[i].linear:
+                    let lin = linearize(ds.dyExprs[i])
+                    var minVal: T = lin.constant
+                    for pos in lin.coefficient.keys:
+                        let c = lin.coefficient[pos]
+                        let dom = carray.domain[pos]
+                        if dom.len == 0: continue
+                        if c > 0:
+                            minVal += c * dom[0]
+                        else:
+                            minVal += c * dom[^1]
+                    minDY = max(minVal, T(0))
+                else:
+                    minDY = T(0)
+
+            totalMinArea += minDX * minDY
+
+        if totalMinArea <= T(0): continue
+
+        # Find companion cumulative constraints sharing the same variable limit
+        # Pattern: cumulative(x, dx, dy, Limit) or cumulative(y, dy, dx, Limit)
+        # where Limit is a variable (e.g., objective)
+        for cons2 in carray.constraints:
+            if cons2.stateType != CumulativeType: continue
+            let cumState = cons2.cumulativeState
+            if cumState.limitPosition < 0: continue  # constant limit, skip
+
+            # Get the cumulative's fixed capacity (the non-variable dimension)
+            # Look for a companion cumulative with a constant limit
+            # that represents the other dimension of the bounding box
+            discard  # Handled below
+
+        # Approach: for each cumulative with variable limit sharing positions with this diffn,
+        # the area bound gives: limitVar >= ceil(totalMinArea / fixedDimLimit)
+        # But we need to find the fixed dimension. In carpet-cutting:
+        #   cumulative(y, dy, dx, objective) => objective >= ceil(area / H)
+        #   cumulative(x, dx, dy, 1000)     => H=1000 is the fixed dimension
+        # General approach: for any cumulative with variable limit, we know
+        # limit * makespan_ub >= energy. The area bound is:
+        # limit >= ceil(totalMinArea / other_dimension_limit)
+        #
+        # Find constant-limit cumulatives sharing positions with this diffn
+        for cons2 in carray.constraints:
+            if cons2.stateType != CumulativeType: continue
+            let cumState = cons2.cumulativeState
+            if cumState.limitPosition >= 0: continue  # variable limit, skip
+            let fixedLimit = cumState.limit
+            if fixedLimit <= T(0): continue
+
+            # Check if this cumulative shares positions with the diffn
+            var shared = false
+            for pos in cons2.positions.items:
+                if pos in cons.positions:
+                    shared = true
+                    break
+            if not shared: continue
+
+            # Now find variable-limit cumulatives also sharing positions with diffn
+            for cons3 in carray.constraints:
+                if cons3.stateType != CumulativeType: continue
+                let cumState3 = cons3.cumulativeState
+                if cumState3.limitPosition < 0: continue  # constant limit, skip
+
+                var shared3 = false
+                for pos in cons3.positions.items:
+                    if pos in cons.positions:
+                        shared3 = true
+                        break
+                if not shared3: continue
+
+                # Area bound: varLimit >= ceil(totalMinArea / fixedLimit)
+                let lowerBound = (totalMinArea + fixedLimit - T(1)) div fixedLimit
+                var coeffs: Table[int, T]
+                coeffs[cumState3.limitPosition] = T(1)
+                linearForms.add(LinearForm[T](
+                    coefficients: coeffs,
+                    constant: -lowerBound,
+                    relation: GreaterThanEq
+                ))
+                diffnBoundForms += 1
+
+        # Per-rect linear bounds: if x_i + dx_i is a linear expression,
+        # generate synthetic linear forms for bounds propagation.
+        # For each rect i where xExpr[i] + dxExpr[i] is linear:
+        #   xExpr[i] + dxExpr[i] <= domainMax(objective or bounding variable)
+        #   This is already handled by int_lin_le constraints from MiniZinc.
+        # More useful: pairwise separation bounds.
+        # For rects i,j: if min_y_i + min_dy_i > max_y_j or min_y_j + min_dy_j > max_y_i,
+        # they can't overlap in y -> no x constraint needed.
+        # Otherwise they MIGHT overlap in y, so they must separate in x:
+        #   x_i + dx_i <= x_j OR x_j + dx_j <= x_i
+        # This is a disjunction, not a linear form. But if we have 3+ rects that all
+        # must separate in x, we get: sum(dx_i) <= W (strip bound).
+        # Compute a "must-separate-in-x" clique and add sum(dx_i) <= varLimit.
+
+        # Strip bound using compulsory parts.
+        # A rect's compulsory y-interval is [lst_y, est_y + minDy) where:
+        #   est_y = earliest start (min possible y)
+        #   lst_y = latest start (max possible y)
+        #   minDy = minimum height
+        # A rect only has a compulsory part if lst_y < est_y + minDy.
+        # At any y-cut, sum of minWidths of rects whose compulsory part covers that y <= limit.
+        type CompulsoryPart = tuple[cpStart, cpEnd, minWidth: T, valid: bool]
+        var compParts = newSeq[CompulsoryPart](n)
+        for i in 0..<n:
+            var estY, lstY, minDY: T
+
+            # Compute est_y (earliest start) and lst_y (latest start)
+            if ds.yExprs[i].positions.len == 0:
+                let yConst = ds.yExprs[i].node.evaluate(initTable[int, T]())
+                estY = yConst
+                lstY = yConst
+            elif ds.yExprs[i].linear:
+                let lin = linearize(ds.yExprs[i])
+                var minVal: T = lin.constant
+                var maxVal: T = lin.constant
+                for pos in lin.coefficient.keys:
+                    let c = lin.coefficient[pos]
+                    let dom = carray.domain[pos]
+                    if dom.len == 0: continue
+                    if c > 0:
+                        minVal += c * dom[0]
+                        maxVal += c * dom[^1]
+                    else:
+                        minVal += c * dom[^1]
+                        maxVal += c * dom[0]
+                estY = minVal
+                lstY = maxVal
+            else:
+                # Non-linear — can't compute tight bounds, skip
+                compParts[i].valid = false
+                continue
+
+            # Compute minDy
+            if ds.dyExprs[i].positions.len == 0:
+                minDY = ds.dyExprs[i].node.evaluate(initTable[int, T]())
+            elif ds.dyExprs[i].linear:
+                let lin = linearize(ds.dyExprs[i])
+                var minVal: T = lin.constant
+                for pos in lin.coefficient.keys:
+                    let c = lin.coefficient[pos]
+                    let dom = carray.domain[pos]
+                    if dom.len == 0: continue
+                    if c > 0: minVal += c * dom[0]
+                    else: minVal += c * dom[^1]
+                minDY = max(minVal, T(0))
+            else:
+                minDY = T(0)
+
+            # Compute minimum width (dx)
+            var minDX: T
+            if ds.dxExprs[i].positions.len == 0:
+                minDX = ds.dxExprs[i].node.evaluate(initTable[int, T]())
+            elif ds.dxExprs[i].linear:
+                let lin = linearize(ds.dxExprs[i])
+                var minVal: T = lin.constant
+                for pos in lin.coefficient.keys:
+                    let c = lin.coefficient[pos]
+                    let dom = carray.domain[pos]
+                    if dom.len == 0: continue
+                    if c > 0: minVal += c * dom[0]
+                    else: minVal += c * dom[^1]
+                minDX = max(minVal, T(0))
+            else:
+                minDX = T(0)
+
+            # Compulsory part exists only if lst_y < est_y + minDy
+            if lstY < estY + minDY:
+                compParts[i] = (cpStart: lstY, cpEnd: estY + minDY, minWidth: minDX, valid: true)
+            else:
+                compParts[i].valid = false
+
+        # For each variable-limit cumulative sharing positions with diffn,
+        # sweep over compulsory parts to find the y-cut with maximum total width.
+        for cons3 in carray.constraints:
+            if cons3.stateType != CumulativeType: continue
+            let cumState3 = cons3.cumulativeState
+            if cumState3.limitPosition < 0: continue
+
+            var shared3 = false
+            for pos in cons3.positions.items:
+                if pos in cons.positions:
+                    shared3 = true
+                    break
+            if not shared3: continue
+
+            # Find best strip bound by sweeping compulsory part start points
+            var bestStripSum: T = T(0)
+            for i in 0..<n:
+                if not compParts[i].valid: continue
+                let cutY = compParts[i].cpStart
+                var stripSum: T = T(0)
+                for j in 0..<n:
+                    if not compParts[j].valid: continue
+                    if compParts[j].cpStart <= cutY and cutY < compParts[j].cpEnd:
+                        stripSum += compParts[j].minWidth
+                if stripSum > bestStripSum:
+                    bestStripSum = stripSum
+
+            if bestStripSum > T(0):
+                # limitVar >= bestStripSum
+                var coeffs: Table[int, T]
+                coeffs[cumState3.limitPosition] = T(1)
+                linearForms.add(LinearForm[T](
+                    coefficients: coeffs,
+                    constant: -bestStripSum,
+                    relation: GreaterThanEq
+                ))
+                diffnBoundForms += 1
+
+    if diffnBoundForms > 0:
+        stderr.writeLine(&"[DomRed] Diffn area/strip bounds: {diffnBoundForms} linear forms")
 
     # Normalize each linear form to >= 0
     type NormalizedForm = object
