@@ -36,6 +36,7 @@ type
         lastIterations*: int
         searchCompleted*: bool
         hasFeasibleSolution*: bool
+        bestFeasibleAssignment*: seq[T]  # Best solution found during optimization (for signal handler)
         optimalityProven*: bool  # Domain reduction proved no better solution exists
         adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
 

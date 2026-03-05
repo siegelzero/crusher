@@ -3,6 +3,7 @@ import types
 import sumExpression
 import minExpression
 import maxExpression
+import weightedSameValue
 
 ################################################################################
 # StatefulAlgebraicExpression - mirrors Sum/Min/MaxExpression pattern
@@ -72,6 +73,7 @@ type
         MinExpr
         MaxExpr
         ConstantExpr
+        WeightedSameValueExpr
 
     Expression*[T] = object
         positions*: PackedSet[int]
@@ -86,6 +88,8 @@ type
             maxExpr*: MaxExpression[T]
         of ConstantExpr:
             constantValue*: T
+        of WeightedSameValueExpr:
+            weightedSameValueExpr*: WeightedSameValueExpression[T]
 
 # Overloaded procs to create Expression wrapper from various expression types
 proc newExpression*[T](expression: StatefulAlgebraicExpression[T]): Expression[T] =
@@ -137,6 +141,9 @@ proc newExpression*[T](expression: MaxExpression[T]): Expression[T] =
 proc newExpression*[T](value: T): Expression[T] =
     Expression[T](kind: ConstantExpr, constantValue: value, positions: initPackedSet[int]())
 
+proc newExpression*[T](expression: WeightedSameValueExpression[T]): Expression[T] =
+    Expression[T](kind: WeightedSameValueExpr, weightedSameValueExpr: expression, positions: expression.positions)
+
 # Helper functions for Expression operations
 func initialize*[T](expression: Expression[T], assignment: seq[T]) =
     case expression.kind
@@ -150,6 +157,8 @@ func initialize*[T](expression: Expression[T], assignment: seq[T]) =
         expression.maxExpr.initialize(assignment)
     of ConstantExpr:
         discard  # Constants don't need initialization
+    of WeightedSameValueExpr:
+        expression.weightedSameValueExpr.initialize(assignment)
 
 func getValue*[T](expression: Expression[T]): T =
     case expression.kind
@@ -163,6 +172,8 @@ func getValue*[T](expression: Expression[T]): T =
         return expression.maxExpr.value
     of ConstantExpr:
         return expression.constantValue
+    of WeightedSameValueExpr:
+        return expression.weightedSameValueExpr.value
 
 func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
     case expression.kind
@@ -176,6 +187,8 @@ func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
         expression.maxExpr.updatePosition(position, newValue)
     of ConstantExpr:
         discard  # Constants don't change
+    of WeightedSameValueExpr:
+        expression.weightedSameValueExpr.updatePosition(position, newValue)
 
 
 func moveDelta*[T](expression: Expression[T], position: int,
@@ -191,6 +204,8 @@ func moveDelta*[T](expression: Expression[T], position: int,
         return expression.maxExpr.moveDelta(position, oldValue, newValue)
     of ConstantExpr:
         return 0  # Constants don't change
+    of WeightedSameValueExpr:
+        return expression.weightedSameValueExpr.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Deep copy implementations for thread-safe parallel processing
@@ -237,4 +252,10 @@ proc deepCopy*[T](expression: Expression[T]): Expression[T] =
                 kind: ConstantExpr,
                 positions: expression.positions,  # PackedSet is a value type, safe to copy
                 constantValue: expression.constantValue  # Constants are immutable
+            )
+        of WeightedSameValueExpr:
+            result = Expression[T](
+                kind: WeightedSameValueExpr,
+                positions: expression.positions,
+                weightedSameValueExpr: expression.weightedSameValueExpr.deepCopy()
             )

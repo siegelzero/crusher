@@ -6,6 +6,7 @@ import std/[strutils, strformat, tables, sets, algorithm, sequtils]
 import parser
 import translator
 import ../expressions/expressions
+import ../expressions/weightedSameValue
 
 proc formatBool(val: int): string {.inline.} =
   if val != 0: "true" else: "false"
@@ -37,7 +38,11 @@ proc formatSolution*(tr: FznTranslator): string =
   # Output single variables
   for name in tr.outputVars:
     let isBool = name in tr.outputBoolVars
-    if name in tr.definedVarExprs:
+    if name == tr.weightedSameValueObjName and tr.weightedSameValueExpr != nil:
+      tr.weightedSameValueExpr.initialize(tr.sys.assignment)
+      let val = tr.weightedSameValueExpr.value
+      lines.add(&"{name} = {val};")
+    elif name in tr.definedVarExprs:
       let expr = tr.definedVarExprs[name]
       let val = expr.evaluate(tr.sys.assignment)
       if isBool:

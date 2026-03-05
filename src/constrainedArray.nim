@@ -649,6 +649,8 @@ proc evaluateExpression[T](expr: Expression[T], assignment: seq[T]): T =
         return expr.minExpr.evaluate(assignment)
     of MaxExpr:
         return expr.maxExpr.evaluate(assignment)
+    of WeightedSameValueExpr:
+        return expr.weightedSameValueExpr.evaluate(assignment)
 
 proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
     ## Statelessly evaluate a constraint's penalty with a raw assignment.

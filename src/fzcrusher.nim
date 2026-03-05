@@ -15,6 +15,7 @@ import std/[os, strutils, strformat, times, posix]
 
 import crusher
 import flatzinc/[parser, translator, output]
+import expressions/weightedSameValue
 
 # Global state for SIGTERM handler — allows graceful output on MiniZinc kill
 var gSavedFd: cint = -1
@@ -26,6 +27,8 @@ proc sigTermHandler(sig: cint) {.noconv.} =
   if gSavedFd >= 0:
     discard dup2(gSavedFd, stdout.getFileHandle())
   if gTranslator != nil and gHasSolution != nil and gHasSolution[]:
+    if gTranslator[].sys.bestFeasibleAssignment.len > 0:
+      gTranslator[].sys.assignment = gTranslator[].sys.bestFeasibleAssignment
     gTranslator[].printSolution()
   else:
     printUnknown()
@@ -155,18 +158,29 @@ proc main() =
 
   of Minimize:
     try:
-      let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                    elif tr.objectivePos == -1: tr.objectiveDefExpr
-                    else: raise newException(ValueError, "No objective expression for minimize")
-      minimize(tr.sys, objExpr,
-        parallel = parallel,
-        tabuThreshold = tabuThreshold,
-        numWorkers = numWorkers,
-        verbose = verbose,
-        deadline = deadline,
-        lowerBound = tr.objectiveLoBound,
-        upperBound = tr.objectiveHiBound
-      )
+      if tr.objectivePos == -3:
+        minimize(tr.sys, tr.weightedSameValueExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
+      else:
+        let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                      elif tr.objectivePos == -1: tr.objectiveDefExpr
+                      else: raise newException(ValueError, "No objective expression for minimize")
+        minimize(tr.sys, objExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
       solved = true
     except TimeLimitExceededError:
       timedOut = true
@@ -183,18 +197,29 @@ proc main() =
 
   of Maximize:
     try:
-      let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
-                    elif tr.objectivePos == -1: tr.objectiveDefExpr
-                    else: raise newException(ValueError, "No objective expression for maximize")
-      maximize(tr.sys, objExpr,
-        parallel = parallel,
-        tabuThreshold = tabuThreshold,
-        numWorkers = numWorkers,
-        verbose = verbose,
-        deadline = deadline,
-        lowerBound = tr.objectiveLoBound,
-        upperBound = tr.objectiveHiBound
-      )
+      if tr.objectivePos == -3:
+        maximize(tr.sys, tr.weightedSameValueExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
+      else:
+        let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                      elif tr.objectivePos == -1: tr.objectiveDefExpr
+                      else: raise newException(ValueError, "No objective expression for maximize")
+        maximize(tr.sys, objExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
       solved = true
     except TimeLimitExceededError:
       timedOut = true

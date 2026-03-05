@@ -2,7 +2,7 @@ import std/[packedsets, sequtils, tables]
 
 import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
 import constraintNode, types
-import ../expressions/[algebraic, maxExpression, minExpression]
+import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
 export StatefulConstraint, StatefulConstraintType, StatefulAlgebraicConstraint, BooleanConstraint
 
@@ -528,6 +528,15 @@ template ExprConstRel(rel, relEnum: untyped) =
     # StatefulAlgebraicExpression-to-constant relations
     func `rel`*[T](left: StatefulAlgebraicExpression[T], right: T): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left.algebraicExpr, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalType,
+            relationalState: constraint
+        )
+
+    # WeightedSameValueExpression-to-constant relations
+    func `rel`*[T](left: WeightedSameValueExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,
             stateType: RelationalType,

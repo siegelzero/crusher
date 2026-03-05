@@ -5,6 +5,7 @@ from std/math import ceil
 import ../expressions/expressions
 import ../expressions/stateful
 import ../expressions/sumExpression
+import ../expressions/weightedSameValue
 import ../constraintSystem
 
 type
@@ -47,6 +48,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         var currentCost = objective.value
         var hasBoundConstraint = false
         system.hasFeasibleSolution = true
+        system.bestFeasibleAssignment = system.assignment
 
         echo "[Opt] Initial solution: ", currentCost
 
@@ -154,6 +156,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
+                system.bestFeasibleAssignment = system.assignment
                 echo "[Opt] Improved: ", objective.value
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
@@ -234,6 +237,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
+                    system.bestFeasibleAssignment = system.assignment
                     echo "[Opt] Retry improved: ", currentCost
                     retryThreshold = tabuThreshold  # reset on success
                 except TimeLimitExceededError:
@@ -278,6 +282,9 @@ optimizeImpl(SumExpression, Maximize, maximize)
 optimizeImpl(MinExpression, Maximize, maximize)
 optimizeImpl(MaxExpression, Maximize, maximize)
 optimizeImpl(StatefulAlgebraicExpression, Maximize, maximize)
+
+optimizeImpl(WeightedSameValueExpression, Minimize, minimize)
+optimizeImpl(WeightedSameValueExpression, Maximize, maximize)
 
 # Template for AlgebraicExpression wrappers - convert to StatefulAlgebraicExpression
 template algebraicWrapper(procName: untyped) =

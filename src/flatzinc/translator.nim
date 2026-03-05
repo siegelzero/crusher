@@ -7,7 +7,7 @@ import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
 import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox]
-import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression]
+import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 type
   CountEqPattern* = object
@@ -195,6 +195,11 @@ type
     skipSetVarNames*: HashSet[string]
     # Reusable position for a variable fixed to 1 (for set_in channel bindings), -1 if not yet created
     fixedOnePos*: int
+    # Detected weighted same-value pattern for objective
+    weightedSameValuePairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
+    weightedSameValueConstant*: int
+    weightedSameValueObjName*: string
+    weightedSameValueExpr*: WeightedSameValueExpression[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -2208,7 +2213,10 @@ proc translateSolve(tr: var FznTranslator) =
       case tr.model.solve.objective.kind
       of FznIdent:
         let objName = tr.model.solve.objective.ident
-        if objName in tr.varPositions:
+        if objName == tr.weightedSameValueObjName:
+          # Weighted same-value objective — handled separately via WeightedSameValueExpression
+          tr.objectivePos = -3  # sentinel for WeightedSameValue
+        elif objName in tr.varPositions:
           tr.objectivePos = tr.varPositions[objName]
         elif objName in tr.definedVarExprs:
           # Objective was eliminated as a defined variable — use its defining expression directly.
@@ -2413,6 +2421,9 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     return true
   if definedName in tr.definedVarExprs:
     return true  # already built
+  # WeightedSameValue objective is handled separately
+  if definedName == tr.weightedSameValueObjName:
+    return true
 
   # Handle int_abs, int_max, int_min
   if name == "int_abs":
@@ -2708,6 +2719,153 @@ proc detectCountPatterns(tr: var FznTranslator) =
       tr.definedVarNames.incl(vn)
 
     stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
+
+proc detectWeightedSameValuePattern(tr: var FznTranslator) =
+  ## Detects weighted same-value objective pattern:
+  ##   int_eq_reif(x_i, x_j, b_ij) :: defines_var(b_ij)  -- variable-variable equality
+  ##   bool2int(b_ij, ind_ij) :: defines_var(ind_ij)
+  ##   int_lin_eq(coeffs, [objective, ind_1, ...], rhs) :: defines_var(objective)
+  ## Produces: objective = rhs + Σ(-coeff_k * δ(x_i == x_j))
+
+  # Build maps: variable name → defining constraint index
+  var bool2intDefs: Table[string, int]  # indicator var → constraint index
+  var intEqReifDefs: Table[string, int]  # bool var → constraint index
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name == "bool2int" and con.hasAnnotation("defines_var"):
+      if con.args.len >= 2 and con.args[1].kind == FznIdent:
+        bool2intDefs[con.args[1].ident] = ci
+    elif name == "int_eq_reif" and con.hasAnnotation("defines_var"):
+      if con.args.len >= 3 and con.args[2].kind == FznIdent:
+        intEqReifDefs[con.args[2].ident] = ci
+
+  # Only scan if this is a minimize/maximize problem
+  if tr.model.solve.kind notin {Minimize, Maximize}:
+    return
+  if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent:
+    return
+  let objectiveName = tr.model.solve.objective.ident
+
+  # Find the int_lin_eq that defines the objective
+  # Note: don't skip definingConstraints — collectDefinedVars may have already claimed this
+  for ci, con in tr.model.constraints:
+    if ci in tr.countEqPatterns:
+      continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+      continue
+    let ann = con.getAnnotation("defines_var")
+    if ann.args.len == 0 or ann.args[0].kind != FznIdent:
+      continue
+    if ann.args[0].ident != objectiveName:
+      continue
+
+    # Found the defining constraint for the objective
+    let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+    let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+
+    # Extract variable names
+    let vars = con.args[1]
+    var varElems: seq[FznExpr]
+    if vars.kind == FznArrayLit:
+      varElems = vars.elems
+    elif vars.kind == FznIdent:
+      var found = false
+      for decl in tr.model.variables:
+        if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+          varElems = decl.value.elems
+          found = true
+          break
+      if not found:
+        continue
+    else:
+      continue
+
+    if coeffs.len != varElems.len or varElems.len < 2:
+      continue
+
+    # First variable must be the objective (coefficient for objective itself)
+    if varElems[0].kind != FznIdent or varElems[0].ident != objectiveName:
+      continue
+    let objCoeff = coeffs[0]  # usually 1
+
+    # Try to trace all other variables through bool2int → int_eq_reif(varA, varB, bool)
+    var pairs: seq[tuple[varNameA, varNameB: string, coeff: int]]
+    var consumedConstraints: seq[int]
+    var consumedVarNames: seq[string]
+    var valid = true
+
+    for i in 1..<varElems.len:
+      let indArg = varElems[i]
+      if indArg.kind != FznIdent:
+        valid = false
+        break
+
+      let indName = indArg.ident
+      if indName notin bool2intDefs:
+        valid = false
+        break
+
+      let b2iIdx = bool2intDefs[indName]
+      let b2iCon = tr.model.constraints[b2iIdx]
+      if b2iCon.args[0].kind != FznIdent:
+        valid = false
+        break
+      let boolVarName = b2iCon.args[0].ident
+
+      if boolVarName notin intEqReifDefs:
+        valid = false
+        break
+
+      let eqReifIdx = intEqReifDefs[boolVarName]
+      let eqReifCon = tr.model.constraints[eqReifIdx]
+      # int_eq_reif(argA, argB, boolVar) — both must be variable idents
+      if eqReifCon.args[0].kind != FznIdent or eqReifCon.args[1].kind != FznIdent:
+        valid = false
+        break
+
+      let varNameA = eqReifCon.args[0].ident
+      let varNameB = eqReifCon.args[1].ident
+      # Both must be real variables (not defined/consumed)
+      if varNameA in tr.definedVarNames or varNameB in tr.definedVarNames:
+        valid = false
+        break
+
+      # Pair coefficient: from objCoeff * objective + coeff_k * ind_k = rhs
+      # => objective = (rhs - coeff_k * ind_k) / objCoeff
+      # => pairCoeff = -coeff_k / objCoeff
+      let pairCoeff = -coeffs[i] div objCoeff
+      pairs.add((varNameA: varNameA, varNameB: varNameB, coeff: pairCoeff))
+      consumedConstraints.add(b2iIdx)
+      consumedConstraints.add(eqReifIdx)
+      consumedVarNames.add(indName)
+      consumedVarNames.add(boolVarName)
+
+    if not valid or pairs.len == 0:
+      continue
+
+    # Pattern detected!
+    tr.weightedSameValuePairs = pairs
+    tr.weightedSameValueConstant = rhs div objCoeff
+    tr.weightedSameValueObjName = objectiveName
+
+    # Mark consumed constraints
+    for idx in consumedConstraints:
+      tr.definingConstraints.incl(idx)
+    # The int_lin_eq itself is a defining constraint (we handle the objective directly)
+    tr.definingConstraints.incl(ci)
+
+    # Mark intermediate variable names as defined (skip position creation)
+    for vn in consumedVarNames:
+      tr.definedVarNames.incl(vn)
+    # Also mark the objective as defined
+    tr.definedVarNames.incl(objectiveName)
+
+    stderr.writeLine(&"[FZN] Detected weighted same-value pattern: {pairs.len} pairs, constant={tr.weightedSameValueConstant}, objective={objectiveName}")
+    break  # Only one objective
 
 proc detectReifChannels(tr: var FznTranslator) =
   ## Detects int_eq_reif(x, val, b) :: defines_var(b) and bool2int(b, i) :: defines_var(i)
@@ -6424,6 +6582,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.collectDefinedVars()
   # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
   result.detectCountPatterns()
+  # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
+  result.detectWeightedSameValuePattern()
   # Detect int_eq_reif/bool2int defines_var patterns → channel variables
   result.detectReifChannels()
   # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -6535,6 +6695,12 @@ proc translate*(model: FznModel): FznTranslator =
         result.sys.addConstraint(expr <= hi)
       else:
         inc nBoundsSkipped
+  # Handle objective bounds for weighted same-value objective (not in definedVarExprs)
+  if result.weightedSameValueObjName != "" and result.weightedSameValueObjName in result.definedVarBounds:
+    let (lo, hi) = result.definedVarBounds[result.weightedSameValueObjName]
+    result.objectiveLoBound = lo
+    result.objectiveHiBound = hi
+    nObjBoundsSkipped += 2
   if nBoundsSkipped > 0 or nChannelBoundsSkipped > 0 or nObjBoundsSkipped > 0:
     stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped + nObjBoundsSkipped} defined-var bounds (range={nBoundsSkipped} channel={nChannelBoundsSkipped} objective={nObjBoundsSkipped})")
   if nObjBoundsSkipped > 0:
@@ -6923,3 +7089,13 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildInverseChannelBindings()
 
   result.translateSolve()
+
+  # Build WeightedSameValueExpression if pattern was detected
+  if result.weightedSameValueObjName != "":
+    var wsvPairs: seq[WeightedSameValuePair[int]]
+    for pair in result.weightedSameValuePairs:
+      let posA = result.varPositions[pair.varNameA]
+      let posB = result.varPositions[pair.varNameB]
+      wsvPairs.add((posA: posA, posB: posB, coeff: pair.coeff))
+    result.weightedSameValueExpr = newWeightedSameValueExpression[int](
+      wsvPairs, result.weightedSameValueConstant)
