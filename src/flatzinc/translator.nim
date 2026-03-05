@@ -3607,6 +3607,25 @@ proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
   return @[]
 
 
+proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
+                           defs: var seq[int], label: string) =
+  ## Un-channel skipped reif variables — they couldn't have bindings built due to
+  ## large domains, so they must be treated as normal constraints instead.
+  if skipped.len == 0: return
+  for ci in skipped:
+    let con = tr.model.constraints[ci]
+    if con.args.len >= 3 and con.args[2].kind == FznIdent:
+      let bName = con.args[2].ident
+      tr.channelVarNames.excl(bName)
+    tr.definingConstraints.excl(ci)
+  var filtered: seq[int]
+  for ci in defs:
+    if ci notin skipped:
+      filtered.add(ci)
+  defs = filtered
+  stderr.writeLine(&"[FZN] Un-channeled {skipped.len} {label} bindings (domain too large)")
+
+
 proc buildReifChannelBindings(tr: var FznTranslator) =
   ## Builds channel bindings for int_eq_reif and bool2int patterns detected
   ## by detectReifChannels. Must be called after translateVariables.
@@ -3719,22 +3738,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
-  # Un-channel skipped reif variables — they couldn't have bindings built due to
-  # large domains, so they must be treated as normal constraints instead.
-  if skippedReifCIs.len > 0:
-    for ci in skippedReifCIs:
-      let con = tr.model.constraints[ci]
-      if con.args.len >= 3 and con.args[2].kind == FznIdent:
-        let bName = con.args[2].ident
-        tr.channelVarNames.excl(bName)
-      tr.definingConstraints.excl(ci)
-    # Remove skipped CIs from reifChannelDefs so normal translation handles them
-    var filtered: seq[int]
-    for ci in tr.reifChannelDefs:
-      if ci notin skippedReifCIs:
-        filtered.add(ci)
-    tr.reifChannelDefs = filtered
-    stderr.writeLine(&"[FZN] Un-channeled {skippedReifCIs.len} reif bindings (domain too large)")
+  tr.unchannelSkippedReifs(skippedReifCIs, tr.reifChannelDefs, "reif")
 
   # Process bool2int channels (after reif channels so b positions are set up)
   for ci in tr.bool2intChannelDefs:
@@ -3980,20 +3984,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
-  # Un-channel skipped le_reif variables
-  if skippedLeReifCIs.len > 0:
-    for ci in skippedLeReifCIs:
-      let con = tr.model.constraints[ci]
-      if con.args.len >= 3 and con.args[2].kind == FznIdent:
-        let bName = con.args[2].ident
-        tr.channelVarNames.excl(bName)
-      tr.definingConstraints.excl(ci)
-    var filtered: seq[int]
-    for ci in tr.leReifChannelDefs:
-      if ci notin skippedLeReifCIs:
-        filtered.add(ci)
-    tr.leReifChannelDefs = filtered
-    stderr.writeLine(&"[FZN] Un-channeled {skippedLeReifCIs.len} le_reif bindings (domain too large)")
+  tr.unchannelSkippedReifs(skippedLeReifCIs, tr.leReifChannelDefs, "le_reif")
 
   let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
                           tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
@@ -4436,20 +4427,19 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
   if neReifMap.len == 0 and leReifMap.len == 0: return
 
   # Step 2: Scan non-consumed bool_clause constraints with 2-3 positive literals
+  type CaseEntryKind = enum cekSimple, cekLinear
   type CaseEntry = object
     condVarVals: seq[(string, int)]
-    testVal: FznExpr  # For int_eq_reif cases
     boolClauseIdx: int
-    # Extended fields for int_lin_eq_reif cases
-    isLinear: bool
-    linOtherVars: seq[string]
-    linOtherCoeffs: seq[int]
-    linRhs: int
-    linTargetCoeff: int
-    linReifIdx: int  # constraint index of the int_lin_eq_reif
-    # Expanded le_reif conditions (covers multiple condVarVals)
-    isExpanded: bool
-    expandedCondVarVals: seq[seq[(string, int)]]
+    case kind: CaseEntryKind
+    of cekSimple:
+      testVal: FznExpr
+    of cekLinear:
+      linOtherVars: seq[string]
+      linOtherCoeffs: seq[int]
+      linRhs: int
+      linTargetCoeff: int
+      linReifIdx: int  # constraint index of the int_lin_eq_reif
 
   var casesByTarget: Table[string, seq[CaseEntry]]
 
@@ -4532,37 +4522,35 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
           for item in group:
             newCombos.add(existing & item)
         combos = newCombos
+        if combos.len > 100_000:
+          allValid = false
+          break
+      if not allValid: continue
 
       # Add a case entry for each expanded combination
       for combo in combos:
-        var entry = CaseEntry(
-          condVarVals: combo,
-          boolClauseIdx: ci,
-          isLinear: eqIsLinear)
         if eqIsLinear:
-          entry.linOtherVars = eqLinEntry.otherVars
-          entry.linOtherCoeffs = eqLinEntry.otherCoeffs
-          entry.linRhs = eqLinEntry.rhs
-          entry.linTargetCoeff = eqLinEntry.targetCoeff
-          entry.linReifIdx = eqLinEntry.constraintIdx
+          casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
+            kind: cekLinear, condVarVals: combo, boolClauseIdx: ci,
+            linOtherVars: eqLinEntry.otherVars, linOtherCoeffs: eqLinEntry.otherCoeffs,
+            linRhs: eqLinEntry.rhs, linTargetCoeff: eqLinEntry.targetCoeff,
+            linReifIdx: eqLinEntry.constraintIdx))
         else:
-          entry.testVal = eqTestVal
-        casesByTarget.mgetOrPut(eqSourceVar, @[]).add(entry)
+          casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
+            kind: cekSimple, condVarVals: combo, boolClauseIdx: ci,
+            testVal: eqTestVal))
     else:
       # Standard case: all conditions are ne_reif
-      var entry = CaseEntry(
-        condVarVals: neLits,
-        boolClauseIdx: ci,
-        isLinear: eqIsLinear)
       if eqIsLinear:
-        entry.linOtherVars = eqLinEntry.otherVars
-        entry.linOtherCoeffs = eqLinEntry.otherCoeffs
-        entry.linRhs = eqLinEntry.rhs
-        entry.linTargetCoeff = eqLinEntry.targetCoeff
-        entry.linReifIdx = eqLinEntry.constraintIdx
+        casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
+          kind: cekLinear, condVarVals: neLits, boolClauseIdx: ci,
+          linOtherVars: eqLinEntry.otherVars, linOtherCoeffs: eqLinEntry.otherCoeffs,
+          linRhs: eqLinEntry.rhs, linTargetCoeff: eqLinEntry.targetCoeff,
+          linReifIdx: eqLinEntry.constraintIdx))
       else:
-        entry.testVal = eqTestVal
-      casesByTarget.mgetOrPut(eqSourceVar, @[]).add(entry)
+        casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
+          kind: cekSimple, condVarVals: neLits, boolClauseIdx: ci,
+          testVal: eqTestVal))
 
   if casesByTarget.len == 0: return
 
@@ -4636,7 +4624,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     # For channel/defined variables, trace transitive source variables via case analysis defs.
     var exprVarSet: HashSet[string]
     for e in entries:
-      if e.isLinear:
+      if e.kind == cekLinear:
         for ov in e.linOtherVars:
           exprVarSet.incl(ov)
       elif e.testVal.kind == FznIdent and e.testVal.ident notin tr.paramValues:
@@ -4759,7 +4747,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     block precompute:
       var channelVarsNeeded: HashSet[string]
       for e in entries:
-        if e.isLinear:
+        if e.kind == cekLinear:
           for ov in e.linOtherVars:
             if ov in tr.channelVarNames or ov in tr.definedVarNames:
               var isCaseAnalysis = false
@@ -4769,25 +4757,34 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                   break
               if not isCaseAnalysis:
                 channelVarsNeeded.incl(ov)
+      # Compute base mapping once for all channel vars (all sources at domain minimum)
+      var baseValues = initTable[string, int]()
+      for i, sv in sourceVarNames:
+        baseValues[sv] = domainOffsets[i]
+      let baseMapping = tr.buildValueMapping(baseValues)
+
+      # Determine dependencies for all channel vars at once: probe each source var
+      # with a shifted value and check which channel vars changed.
+      # depSets[cv] = set of source indices that affect cv.
+      var depSets: Table[string, seq[int]]
       for cv in channelVarsNeeded:
-        # Determine which source variables this channel var depends on
-        # by probing: compute with all-minimum, then vary each source var
-        var baseValues = initTable[string, int]()
-        for i, sv in sourceVarNames:
-          baseValues[sv] = domainOffsets[i]
-        let baseMapping = tr.buildValueMapping(baseValues)
         if cv notin baseMapping:
           valid = false
           break
-        let baseVal = baseMapping[cv]
-        var depIndices: seq[int]
-        for i, sv in sourceVarNames:
-          if domainSizes[i] <= 1: continue
-          var probeValues = baseValues
-          probeValues[sv] = domainOffsets[i] + 1  # try second value
-          let probeMapping = tr.buildValueMapping(probeValues)
-          if cv in probeMapping and probeMapping[cv] != baseVal:
-            depIndices.add(i)
+        depSets[cv] = @[]
+      if not valid: break
+
+      for i, sv in sourceVarNames:
+        if domainSizes[i] <= 1: continue
+        var probeValues = baseValues
+        probeValues[sv] = domainOffsets[i] + 1
+        let probeMapping = tr.buildValueMapping(probeValues)
+        for cv in channelVarsNeeded:
+          if cv in probeMapping and probeMapping[cv] != baseMapping[cv]:
+            depSets[cv].add(i)
+
+      for cv in channelVarsNeeded:
+        let depIndices = depSets[cv]
         # Build mini table over dependent source vars only
         var miniOffsets: seq[int]
         var miniSizes: seq[int]
@@ -4800,9 +4797,10 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             break
           miniTableSize *= domainSizes[di]
         if not valid: break
+
         var miniTable = newSeq[int](miniTableSize)
         for mi in 0..<miniTableSize:
-          var vals = baseValues  # start with all-minimum base values
+          var vals = baseValues
           var rem = mi
           for k in countdown(depIndices.len - 1, 0):
             let di = depIndices[k]
@@ -4820,7 +4818,10 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
           srcOffsets: miniOffsets, srcSizes: miniSizes)
     if not valid: continue
 
-    # For incomplete cases, determine a default value (target domain minimum)
+    # For incomplete cases (exactly 1 missing), use domain minimum as default.
+    # This is safe because incomplete cases arise from conditional assignments where
+    # the missing case represents the "inactive" state (e.g., task not assigned to a
+    # machine), and the domain minimum is the natural sentinel for that state.
     var defaultVal = 0
     if not isComplete:
       let tdom = tr.lookupVarDomain(targetVar)
@@ -4866,7 +4867,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
 
       let entry = caseMap[condValues]
 
-      if entry.isLinear:
+      if entry.kind == cekLinear:
         # Compute target from linear equation:
         # targetCoeff * target + sum(otherCoeffs[i] * otherVars[i]) = rhs
         # target = (rhs - sum(otherCoeffs[i] * otherVars[i])) / targetCoeff
@@ -4950,7 +4951,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         tr.definingConstraints.incl(e.boolClauseIdx)
         consumedBoolClauses.incl(e.boolClauseIdx)
         inc nConsumed
-      if e.isLinear and e.linReifIdx notin consumedLinReifs:
+      if e.kind == cekLinear and e.linReifIdx notin consumedLinReifs:
         tr.definingConstraints.incl(e.linReifIdx)
         consumedLinReifs.incl(e.linReifIdx)
 
@@ -7526,10 +7527,15 @@ proc translate*(model: FznModel): FznTranslator =
   # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
   result.detectEqualityCopyVars()
   # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
-  # Run twice: first pass channels simple targets (e.g. job_time), second pass channels
-  # targets that depend on first-pass results (e.g. job_end depending on job_time).
-  result.detectCaseAnalysisChannels()
-  result.detectCaseAnalysisChannels()
+  # Run as fixpoint: first pass channels simple targets (e.g. job_time), subsequent passes
+  # channel targets that depend on earlier results (e.g. job_end depending on job_time).
+  block:
+    var prevCount = -1
+    var iterations = 0
+    while result.caseAnalysisDefs.len != prevCount and iterations < 10:
+      prevCount = result.caseAnalysisDefs.len
+      result.detectCaseAnalysisChannels()
+      inc iterations
   # Detect implication-to-table and one-hot channel patterns
   result.detectImplicationPatterns()
   # Detect conditional gain patterns (reified value assignment → element channel)
