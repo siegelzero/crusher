@@ -3473,6 +3473,28 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
           if elem.kind == FznIdent:
             nonDefinesVarRefs.incl(elem.ident)
 
+  # Build set of variables that are elements of any array referenced by constraints.
+  # Variables used indirectly through array names (e.g., job_end in array_var_int_element)
+  # must not be treated as equality copies, even if the referencing constraint has defines_var.
+  var arrayElementVars: HashSet[string]
+  block:
+    # Map array names to their element variable names
+    var arrElems: Table[string, seq[string]]
+    for decl in tr.model.variables:
+      if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+        var elems: seq[string]
+        for e in decl.value.elems:
+          if e.kind == FznIdent:
+            elems.add(e.ident)
+        if elems.len > 0:
+          arrElems[decl.name] = elems
+    # Find arrays referenced in any constraint
+    for ci, con in tr.model.constraints:
+      for arg in con.args:
+        if arg.kind == FznIdent and arg.ident in arrElems:
+          for elemName in arrElems[arg.ident]:
+            arrayElementVars.incl(elemName)
+
   # Phase 2: Scan reifChannelDefs for int_eq_reif(A, B, indicator) where A is a copy of B
   # First pass: count how many DISTINCT comparison partners each variable has.
   # A variable compared with multiple different partners is being equality-tested,
@@ -3515,6 +3537,9 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
     if aName in nonDefinesVarRefs:
       continue
     if aName in tr.definedVarNames or aName in tr.channelVarNames or aName in tr.paramValues:
+      continue
+    # A must not be an element of an array used in constraints (indirect reference)
+    if aName in arrayElementVars:
       continue
     # B (the original) must not be a parameter
     if bName in tr.paramValues:
@@ -3592,6 +3617,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
   ## bool2int(b, i):          i = element(b, [0, 1])
 
   # Process int_eq_reif channels first (bool2int depends on these)
+  var skippedReifCIs: HashSet[int]
   for ci in tr.reifChannelDefs:
     if ci in tr.equalityCopyReifCIs:
       # Equality copy: copy == original is always true, build constant-1 channel for indicator
@@ -3634,6 +3660,11 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let xExpr = tr.resolveExprArg(xArg)
       let domain = tr.lookupVarDomain(xArg.ident)
       if domain.len == 0:
+        skippedReifCIs.incl(ci)
+        continue
+      # Guard against huge 1D tables
+      if domain.len > 100_000:
+        skippedReifCIs.incl(ci)
         continue
       let lo = domain[0]  # domain is sorted
 
@@ -3649,6 +3680,12 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let domainX = tr.lookupVarDomain(xArg.ident)
       let domainY = tr.lookupVarDomain(valArg.ident)
       if domainX.len == 0 or domainY.len == 0:
+        skippedReifCIs.incl(ci)
+        continue
+      # Guard against huge 2D tables
+      if domainX.len > 10_000 or domainY.len > 10_000 or
+         domainX.len * domainY.len > 100_000:
+        skippedReifCIs.incl(ci)
         continue
       let loX = domainX[0]
       let loY = domainY[0]
@@ -3663,6 +3700,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
           arrayElems.add(ArrayElement[int](isConstant: true,
               constantValue: if (vx == vy) == isEq: 1 else: 0))
     else:
+      skippedReifCIs.incl(ci)
       continue
 
     let binding = ChannelBinding[int](
@@ -3680,6 +3718,23 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  # Un-channel skipped reif variables — they couldn't have bindings built due to
+  # large domains, so they must be treated as normal constraints instead.
+  if skippedReifCIs.len > 0:
+    for ci in skippedReifCIs:
+      let con = tr.model.constraints[ci]
+      if con.args.len >= 3 and con.args[2].kind == FznIdent:
+        let bName = con.args[2].ident
+        tr.channelVarNames.excl(bName)
+      tr.definingConstraints.excl(ci)
+    # Remove skipped CIs from reifChannelDefs so normal translation handles them
+    var filtered: seq[int]
+    for ci in tr.reifChannelDefs:
+      if ci notin skippedReifCIs:
+        filtered.add(ci)
+    tr.reifChannelDefs = filtered
+    stderr.writeLine(&"[FZN] Un-channeled {skippedReifCIs.len} reif bindings (domain too large)")
 
   # Process bool2int channels (after reif channels so b positions are set up)
   for ci in tr.bool2intChannelDefs:
@@ -3803,7 +3858,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
 
     let xExpr = tr.resolveExprArg(xArg)
     let domain = tr.lookupVarDomain(xArg.ident)
-    if domain.len == 0:
+    if domain.len == 0 or domain.len > 100_000:
       continue
     let lo = domain[0]  # domain is sorted
 
@@ -3830,6 +3885,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
   # Process int_le_reif / int_lt_reif channels
+  var skippedLeReifCIs: HashSet[int]
   for ci in tr.leReifChannelDefs:
     let con = tr.model.constraints[ci]
     let bName = con.args[2].ident
@@ -3854,7 +3910,9 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
               else: tr.paramValues[arg0.ident]
       let xExpr = tr.resolveExprArg(arg1)
       let domain = tr.lookupVarDomain(arg1.ident)
-      if domain.len == 0: continue
+      if domain.len == 0 or domain.len > 100_000:
+        skippedLeReifCIs.incl(ci)
+        continue
       let lo = domain[0]
       indexExpr = xExpr - lo
       for v in domain:
@@ -3868,7 +3926,9 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
               else: tr.paramValues[arg1.ident]
       let xExpr = tr.resolveExprArg(arg0)
       let domain = tr.lookupVarDomain(arg0.ident)
-      if domain.len == 0: continue
+      if domain.len == 0 or domain.len > 100_000:
+        skippedLeReifCIs.incl(ci)
+        continue
       let lo = domain[0]
       indexExpr = xExpr - lo
       for v in domain:
@@ -3884,7 +3944,13 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let yName = if arg1.kind == FznIdent: arg1.ident else: ""
       let domainX = if xName.len > 0: tr.lookupVarDomain(xName) else: @[]
       let domainY = if yName.len > 0: tr.lookupVarDomain(yName) else: @[]
-      if domainX.len == 0 or domainY.len == 0: continue
+      if domainX.len == 0 or domainY.len == 0:
+        skippedLeReifCIs.incl(ci)
+        continue
+      if domainX.len > 10_000 or domainY.len > 10_000 or
+         domainX.len * domainY.len > 100_000:
+        skippedLeReifCIs.incl(ci)
+        continue
       let loX = domainX[0]
       let loY = domainY[0]
       let sizeY = domainY.len
@@ -3896,6 +3962,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
               constantValue: if cmp: 1 else: 0))
     else:
       # Both constant — skip
+      skippedLeReifCIs.incl(ci)
       continue
 
     let binding = ChannelBinding[int](
@@ -3912,6 +3979,21 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  # Un-channel skipped le_reif variables
+  if skippedLeReifCIs.len > 0:
+    for ci in skippedLeReifCIs:
+      let con = tr.model.constraints[ci]
+      if con.args.len >= 3 and con.args[2].kind == FznIdent:
+        let bName = con.args[2].ident
+        tr.channelVarNames.excl(bName)
+      tr.definingConstraints.excl(ci)
+    var filtered: seq[int]
+    for ci in tr.leReifChannelDefs:
+      if ci notin skippedLeReifCIs:
+        filtered.add(ci)
+    tr.leReifChannelDefs = filtered
+    stderr.writeLine(&"[FZN] Un-channeled {skippedLeReifCIs.len} le_reif bindings (domain too large)")
 
   let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
                           tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
@@ -4186,6 +4268,56 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
       if i < 0 or i >= arr.len: continue
       result[resultArg.ident] = arr[i]
       changed = true
+    # Evaluate int_lin_eq_reif / int_lin_ne_reif with defines_var
+    for ci, con in tr.model.constraints:
+      let cname = stripSolverPrefix(con.name)
+      if cname != "int_lin_eq_reif" and cname != "int_lin_ne_reif": continue
+      if not con.hasAnnotation("defines_var"): continue
+      if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+      let resultVar = con.args[3].ident
+      if resultVar in result: continue
+      let coeffs = try: tr.resolveIntArray(con.args[0])
+                   except ValueError, KeyError: continue
+      let varElems = tr.resolveVarArrayElems(con.args[1])
+      let rhs = try: tr.resolveIntArg(con.args[2])
+                except ValueError, KeyError: continue
+      if coeffs.len != varElems.len: continue
+      var allVarsResolved = true
+      var linSum = 0
+      for vi, v in varElems:
+        case v.kind
+        of FznIntLit: linSum += coeffs[vi] * v.intVal
+        of FznBoolLit: linSum += coeffs[vi] * (if v.boolVal: 1 else: 0)
+        of FznIdent:
+          if v.ident in result: linSum += coeffs[vi] * result[v.ident]
+          else: allVarsResolved = false; break
+        else: allVarsResolved = false; break
+      if not allVarsResolved: continue
+      if cname == "int_lin_eq_reif":
+        result[resultVar] = if linSum == rhs: 1 else: 0
+      else:
+        result[resultVar] = if linSum != rhs: 1 else: 0
+      changed = true
+    # Evaluate case analysis channel defs
+    for def in tr.caseAnalysisDefs:
+      if def.targetVarName in result: continue
+      # Compute flat index from source variable values
+      var allSourcesKnown = true
+      var flatIdx = 0
+      for i, srcName in def.sourceVarNames:
+        if srcName notin result:
+          allSourcesKnown = false
+          break
+        let srcVal = result[srcName]
+        let localIdx = srcVal - def.domainOffsets[i]
+        if localIdx < 0 or localIdx >= def.domainSizes[i]:
+          allSourcesKnown = false
+          break
+        flatIdx = flatIdx * def.domainSizes[i] + localIdx
+      if not allSourcesKnown: continue
+      if flatIdx < 0 or flatIdx >= def.lookupTable.len: continue
+      result[def.targetVarName] = def.lookupTable[flatIdx]
+      changed = true
 
 
 proc detectCaseAnalysisChannels(tr: var FznTranslator) =
@@ -4201,8 +4333,16 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
   ## Pattern (3-literal, middle rounds):
   ##   bool_clause([B, C1, C2], [])  — condVar1==v1 AND condVar2==v2 → target==val
   ##
-  ## When all condition value combinations are covered, the target becomes a channel
-  ## with a precomputed constant lookup table indexed by source variable values.
+  ## Extended patterns:
+  ##   int_lin_eq_reif(coeffs, vars, rhs, B) :: defines_var(B)
+  ##   — condVar==condVal → target = f(otherVars)  (linear equation)
+  ##
+  ##   int_le_reif(condVar, threshold, C) :: defines_var(C) as condition
+  ##   — condVar > threshold → target == val  (covers multiple condition values)
+  ##
+  ## When all condition value combinations are covered (or uncovered cases can be
+  ## defaulted), the target becomes a channel with a precomputed constant lookup
+  ## table indexed by source variable values.
 
   # Step 1: Build reverse index from reifChannelDefs
   var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
@@ -4221,13 +4361,95 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
       let condVal = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
       neReifMap[resultVar] = (condVar: con.args[0].ident, condVal: condVal)
 
-  if eqReifMap.len == 0 or neReifMap.len == 0: return
+  # Step 1b: Build linEqReifMap from int_lin_eq_reif :: defines_var constraints.
+  # These encode: sum(coeffs[i]*vars[i]) == rhs <-> bool, allowing us to solve for
+  # the target variable: target = (rhs - sum of other terms) / targetCoeff.
+  type LinEqReifEntry = object
+    targetVar: string
+    otherVars: seq[string]
+    otherCoeffs: seq[int]
+    rhs: int
+    targetCoeff: int
+    constraintIdx: int
+
+  var linEqReifMap: Table[string, LinEqReifEntry]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
+    if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+    let boolVar = con.args[3].ident
+    if boolVar in tr.definedVarNames or boolVar in tr.channelVarNames: continue
+    let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+    let varElems = tr.resolveVarArrayElems(con.args[1])
+    let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+    if coeffs.len != varElems.len: continue
+    # Find a variable with coefficient 1 or -1 to be the target
+    var targetIdx = -1
+    for i in 0..<varElems.len:
+      if varElems[i].kind == FznIdent and (coeffs[i] == 1 or coeffs[i] == -1):
+        if varElems[i].ident notin tr.definedVarNames and
+           varElems[i].ident notin tr.channelVarNames:
+          targetIdx = i
+          break
+    if targetIdx < 0: continue
+    var otherVars: seq[string]
+    var otherCoeffs: seq[int]
+    var allVarsIdent = true
+    for i in 0..<varElems.len:
+      if i == targetIdx: continue
+      if varElems[i].kind != FznIdent:
+        allVarsIdent = false
+        break
+      otherVars.add(varElems[i].ident)
+      otherCoeffs.add(coeffs[i])
+    if not allVarsIdent: continue
+    linEqReifMap[boolVar] = LinEqReifEntry(
+      targetVar: varElems[targetIdx].ident,
+      otherVars: otherVars,
+      otherCoeffs: otherCoeffs,
+      rhs: rhs,
+      targetCoeff: coeffs[targetIdx],
+      constraintIdx: ci)
+
+  # Step 1c: Build leReifMap from int_le_reif :: defines_var for use as conditions.
+  # int_le_reif(var, threshold, bool) → bool = (var <= threshold)
+  # In a bool_clause, this covers all condition values > threshold.
+  type LeReifEntry = object
+    condVar: string
+    threshold: int
+  var leReifMap: Table[string, LeReifEntry]
+
+  for ci in tr.leReifChannelDefs:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    if name != "int_le_reif": continue
+    if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+    let resultVar = con.args[2].ident
+    if con.args[0].kind != FznIdent: continue
+    let condVar = con.args[0].ident
+    let threshold = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+    leReifMap[resultVar] = LeReifEntry(condVar: condVar, threshold: threshold)
+
+  if eqReifMap.len == 0 and linEqReifMap.len == 0: return
+  if neReifMap.len == 0 and leReifMap.len == 0: return
 
   # Step 2: Scan non-consumed bool_clause constraints with 2-3 positive literals
   type CaseEntry = object
     condVarVals: seq[(string, int)]
-    testVal: FznExpr
+    testVal: FznExpr  # For int_eq_reif cases
     boolClauseIdx: int
+    # Extended fields for int_lin_eq_reif cases
+    isLinear: bool
+    linOtherVars: seq[string]
+    linOtherCoeffs: seq[int]
+    linRhs: int
+    linTargetCoeff: int
+    linReifIdx: int  # constraint index of the int_lin_eq_reif
+    # Expanded le_reif conditions (covers multiple condVarVals)
+    isExpanded: bool
+    expandedCondVarVals: seq[seq[(string, int)]]
 
   var casesByTarget: Table[string, seq[CaseEntry]]
 
@@ -4243,36 +4465,104 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     let nLits = posArg.elems.len
     if nLits < 2 or nLits > 3: continue
 
-    # Classify literals: exactly 1 eq_reif + rest ne_reif
+    # Classify literals: exactly 1 eq_reif (or lin_eq_reif) + rest ne_reif (or le_reif)
     var eqLitVar = ""
     var eqSourceVar = ""
     var eqTestVal: FznExpr
+    var eqIsLinear = false
+    var eqLinEntry: LinEqReifEntry
     var neLits: seq[(string, int)]
+    var leEntries: seq[LeReifEntry]
     var allValid = true
 
     for elem in posArg.elems:
       if elem.kind != FznIdent:
         allValid = false
         break
-      if elem.ident in eqReifMap and eqLitVar == "":
+      if eqLitVar == "" and elem.ident in eqReifMap:
         eqLitVar = elem.ident
         eqSourceVar = eqReifMap[elem.ident].sourceVar
         eqTestVal = eqReifMap[elem.ident].testVal
+      elif eqLitVar == "" and elem.ident in linEqReifMap:
+        eqLitVar = elem.ident
+        eqLinEntry = linEqReifMap[elem.ident]
+        eqSourceVar = eqLinEntry.targetVar
+        eqIsLinear = true
       elif elem.ident in neReifMap:
         let info = neReifMap[elem.ident]
         neLits.add((info.condVar, info.condVal))
+      elif elem.ident in leReifMap:
+        leEntries.add(leReifMap[elem.ident])
       else:
         allValid = false
         break
 
     if not allValid or eqLitVar == "": continue
-    if neLits.len != nLits - 1: continue
+    if neLits.len + leEntries.len != nLits - 1: continue
 
-    casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
-      condVarVals: neLits,
-      testVal: eqTestVal,
-      boolClauseIdx: ci
-    ))
+    # For le_reif conditions, expand to individual condition values.
+    # int_le_reif(var, threshold, bool) in bool_clause means: var > threshold → eq holds.
+    # So the case applies for all domain values > threshold.
+    if leEntries.len > 0:
+      # Get condition variable domains for le_reif entries
+      var expandedNeLists: seq[seq[(string, int)]]
+      expandedNeLists.add(neLits.mapIt(@[it]))
+
+      for le in leEntries:
+        let dom = tr.lookupVarDomain(le.condVar)
+        if dom.len == 0:
+          allValid = false
+          break
+        var vals: seq[(string, int)]
+        for v in dom:
+          if v > le.threshold:
+            vals.add((le.condVar, v))
+        if vals.len == 0:
+          allValid = false
+          break
+        expandedNeLists.add(vals)
+
+      if not allValid: continue
+
+      # Build cross-product of all condition combinations
+      var combos: seq[seq[(string, int)]] = @[@[]]
+      for group in expandedNeLists:
+        var newCombos: seq[seq[(string, int)]]
+        for existing in combos:
+          for item in group:
+            newCombos.add(existing & item)
+        combos = newCombos
+
+      # Add a case entry for each expanded combination
+      for combo in combos:
+        var entry = CaseEntry(
+          condVarVals: combo,
+          boolClauseIdx: ci,
+          isLinear: eqIsLinear)
+        if eqIsLinear:
+          entry.linOtherVars = eqLinEntry.otherVars
+          entry.linOtherCoeffs = eqLinEntry.otherCoeffs
+          entry.linRhs = eqLinEntry.rhs
+          entry.linTargetCoeff = eqLinEntry.targetCoeff
+          entry.linReifIdx = eqLinEntry.constraintIdx
+        else:
+          entry.testVal = eqTestVal
+        casesByTarget.mgetOrPut(eqSourceVar, @[]).add(entry)
+    else:
+      # Standard case: all conditions are ne_reif
+      var entry = CaseEntry(
+        condVarVals: neLits,
+        boolClauseIdx: ci,
+        isLinear: eqIsLinear)
+      if eqIsLinear:
+        entry.linOtherVars = eqLinEntry.otherVars
+        entry.linOtherCoeffs = eqLinEntry.otherCoeffs
+        entry.linRhs = eqLinEntry.rhs
+        entry.linTargetCoeff = eqLinEntry.targetCoeff
+        entry.linReifIdx = eqLinEntry.constraintIdx
+      else:
+        entry.testVal = eqTestVal
+      casesByTarget.mgetOrPut(eqSourceVar, @[]).add(entry)
 
   if casesByTarget.len == 0: return
 
@@ -4313,13 +4603,17 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     if not valid: continue
 
     # Check completeness: number of cases == product of condition domain sizes
+    # Allow incomplete case analyses only when exactly 1 case is missing
+    # (e.g., the "inactive" case for conditional assignments).
     var expectedCases = 1
     for dom in condDomains:
       expectedCases *= dom.len
-    if entries.len != expectedCases: continue
+    let isComplete = entries.len == expectedCases
+    if entries.len > expectedCases: continue  # Duplicates — skip
+    if not isComplete and (expectedCases - entries.len) > 1: continue  # Too many missing
 
-    # Build case map (condValues → testVal)
-    var caseMap: Table[seq[int], FznExpr]
+    # Build case map (condValues → CaseEntry)
+    var caseMap: Table[seq[int], CaseEntry]
     for e in entries:
       var combo: seq[int]
       var byName: Table[string, int]
@@ -4334,37 +4628,89 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
       if combo in caseMap:
         valid = false
         break
-      caseMap[combo] = e.testVal
-    if not valid or caseMap.len != expectedCases: continue
-
-    # Step 4: Trace condition variables to source variables via element channels
-    var sourceVarNames: seq[string]
-    var sourceArrays: seq[seq[int]]
-    for cv in condVarNames:
-      if cv notin channelByName:
-        valid = false
-        break
-      let ci = channelByName[cv]
-      let con = tr.model.constraints[ci]
-      if con.args.len < 3:
-        valid = false
-        break
-      let idxArg = con.args[0]
-      if idxArg.kind != FznIdent:
-        valid = false
-        break
-      let srcVar = idxArg.ident
-      if srcVar in tr.definedVarNames or srcVar in tr.channelVarNames:
-        valid = false
-        break
-      let constArr = try: tr.resolveIntArray(con.args[1])
-                     except ValueError, KeyError:
-                       valid = false
-                       @[]
-      if not valid: break
-      sourceVarNames.add(srcVar)
-      sourceArrays.add(constArr)
+      caseMap[combo] = e
     if not valid: continue
+
+    # Collect all "expression variables" from linear entries (otherVars in lin_eq_reif)
+    # and from non-linear entries with variable test values.
+    # For channel/defined variables, trace transitive source variables via case analysis defs.
+    var exprVarSet: HashSet[string]
+    for e in entries:
+      if e.isLinear:
+        for ov in e.linOtherVars:
+          exprVarSet.incl(ov)
+      elif e.testVal.kind == FznIdent and e.testVal.ident notin tr.paramValues:
+        exprVarSet.incl(e.testVal.ident)
+
+    # Replace channel/defined variables with their transitive source variables.
+    # Channel vars will be resolved via buildValueMapping during table building.
+    var resolvedExprVars: HashSet[string]
+    for ev in exprVarSet:
+      if ev in tr.channelVarNames or ev in tr.definedVarNames:
+        # Trace through case analysis defs for known transitive sources
+        for caDef in tr.caseAnalysisDefs:
+          if caDef.targetVarName == ev:
+            for sv in caDef.sourceVarNames:
+              resolvedExprVars.incl(sv)
+            break
+        # Other channel types (bool2int, reif chains) are resolved via buildValueMapping;
+        # their dependencies on search variables are covered by the case analysis sources above.
+      else:
+        resolvedExprVars.incl(ev)
+    exprVarSet = resolvedExprVars
+
+    # Step 4: Trace condition variables to source variables.
+    # Condition variables may be:
+    # a) Element channel results → trace to the element index variable
+    # b) Direct search variables → use directly as source
+    type CondSourceKind = enum cskElement, cskDirect
+    type CondSource = object
+      kind: CondSourceKind
+      varName: string        # source variable name
+      constArray: seq[int]   # for cskElement: the lookup array
+
+    var condSources: seq[CondSource]
+    var sourceVarNames: seq[string]
+    for cv in condVarNames:
+      if cv in channelByName:
+        # Element channel: trace to index variable
+        let ci = channelByName[cv]
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3:
+          valid = false
+          break
+        let idxArg = con.args[0]
+        if idxArg.kind != FznIdent:
+          valid = false
+          break
+        let srcVar = idxArg.ident
+        if srcVar in tr.definedVarNames or srcVar in tr.channelVarNames:
+          valid = false
+          break
+        let constArr = try: tr.resolveIntArray(con.args[1])
+                       except ValueError, KeyError:
+                         valid = false
+                         @[]
+        if not valid: break
+        condSources.add(CondSource(kind: cskElement, varName: srcVar, constArray: constArr))
+        sourceVarNames.add(srcVar)
+      else:
+        # Direct search variable: use as-is
+        if cv in tr.definedVarNames or cv in tr.channelVarNames:
+          valid = false
+          break
+        condSources.add(CondSource(kind: cskDirect, varName: cv))
+        sourceVarNames.add(cv)
+    if not valid: continue
+
+    # Add expression variables as additional source variables
+    # (channel/defined vars already replaced with transitive sources in exprVarSet)
+    for ev in exprVarSet:
+      if ev in tr.definedVarNames or ev in tr.channelVarNames:
+        continue  # Skip residual channel vars — resolved via buildValueMapping
+      if ev notin sourceVarNames:
+        sourceVarNames.add(ev)
+    if sourceVarNames.len == 0: continue
 
     # Validate source variables are unique
     block uniqueCheck:
@@ -4393,8 +4739,93 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
       domainSizes.add(dom[^1] - dom[0] + 1)
 
     var tableSize = 1
+    var tableSizeOk = true
     for ds in domainSizes:
+      if ds > 100_000 or (ds > 0 and tableSize > 100_000 div ds):
+        tableSizeOk = false
+        break
       tableSize *= ds
+    if not tableSizeOk or tableSize > 100_000: continue
+
+    # Pre-compute mini lookup tables for channel variables referenced in linear entries.
+    # For each channel var not in caseAnalysisDefs, determine which source variables
+    # it depends on, then build a small lookup table only over those dimensions.
+    type MiniTable = object
+      table: seq[int]
+      srcIndices: seq[int]    # indices into sourceVarNames
+      srcOffsets: seq[int]
+      srcSizes: seq[int]
+    var channelMiniTables: Table[string, MiniTable]
+    block precompute:
+      var channelVarsNeeded: HashSet[string]
+      for e in entries:
+        if e.isLinear:
+          for ov in e.linOtherVars:
+            if ov in tr.channelVarNames or ov in tr.definedVarNames:
+              var isCaseAnalysis = false
+              for caDef in tr.caseAnalysisDefs:
+                if caDef.targetVarName == ov:
+                  isCaseAnalysis = true
+                  break
+              if not isCaseAnalysis:
+                channelVarsNeeded.incl(ov)
+      for cv in channelVarsNeeded:
+        # Determine which source variables this channel var depends on
+        # by probing: compute with all-minimum, then vary each source var
+        var baseValues = initTable[string, int]()
+        for i, sv in sourceVarNames:
+          baseValues[sv] = domainOffsets[i]
+        let baseMapping = tr.buildValueMapping(baseValues)
+        if cv notin baseMapping:
+          valid = false
+          break
+        let baseVal = baseMapping[cv]
+        var depIndices: seq[int]
+        for i, sv in sourceVarNames:
+          if domainSizes[i] <= 1: continue
+          var probeValues = baseValues
+          probeValues[sv] = domainOffsets[i] + 1  # try second value
+          let probeMapping = tr.buildValueMapping(probeValues)
+          if cv in probeMapping and probeMapping[cv] != baseVal:
+            depIndices.add(i)
+        # Build mini table over dependent source vars only
+        var miniOffsets: seq[int]
+        var miniSizes: seq[int]
+        var miniTableSize = 1
+        for di in depIndices:
+          miniOffsets.add(domainOffsets[di])
+          miniSizes.add(domainSizes[di])
+          if miniTableSize > 1_000_000 div max(1, domainSizes[di]):
+            valid = false
+            break
+          miniTableSize *= domainSizes[di]
+        if not valid: break
+        var miniTable = newSeq[int](miniTableSize)
+        for mi in 0..<miniTableSize:
+          var vals = baseValues  # start with all-minimum base values
+          var rem = mi
+          for k in countdown(depIndices.len - 1, 0):
+            let di = depIndices[k]
+            let li = rem mod domainSizes[di]
+            rem = rem div domainSizes[di]
+            vals[sourceVarNames[di]] = domainOffsets[di] + li
+          let m = tr.buildValueMapping(vals)
+          if cv notin m:
+            valid = false
+            break
+          miniTable[mi] = m[cv]
+        if not valid: break
+        channelMiniTables[cv] = MiniTable(
+          table: miniTable, srcIndices: depIndices,
+          srcOffsets: miniOffsets, srcSizes: miniSizes)
+    if not valid: continue
+
+    # For incomplete cases, determine a default value (target domain minimum)
+    var defaultVal = 0
+    if not isComplete:
+      let tdom = tr.lookupVarDomain(targetVar)
+      if tdom.len > 0:
+        defaultVal = tdom[0]
 
     var lookupTable = newSeq[int](tableSize)
     var allResolved = true
@@ -4408,48 +4839,120 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         remaining = remaining div domainSizes[i]
         sourceValues[sourceVarNames[i]] = localIdx + domainOffsets[i]
 
-      # Compute condition values via element lookup
+      # Compute condition values from source values
       var condValues: seq[int]
       var condOk = true
-      for i, cv in condVarNames:
-        let srcVal = sourceValues[sourceVarNames[i]]
-        let arrIdx = srcVal - 1  # FZN 1-based to 0-based
-        if arrIdx < 0 or arrIdx >= sourceArrays[i].len:
-          condOk = false
-          break
-        condValues.add(sourceArrays[i][arrIdx])
-      if not condOk or condValues notin caseMap:
-        lookupTable[flatIdx] = 0  # dummy for out-of-domain values
+      for i, cs in condSources:
+        let srcVal = sourceValues[cs.varName]
+        case cs.kind
+        of cskElement:
+          let arrIdx = srcVal - 1  # FZN 1-based to 0-based
+          if arrIdx < 0 or arrIdx >= cs.constArray.len:
+            condOk = false
+            break
+          condValues.add(cs.constArray[arrIdx])
+        of cskDirect:
+          condValues.add(srcVal)
+      if not condOk:
+        lookupTable[flatIdx] = defaultVal
         continue
 
-      # Resolve test value to constant
-      let testValExpr = caseMap[condValues]
-      case testValExpr.kind
-      of FznIntLit:
-        lookupTable[flatIdx] = testValExpr.intVal
-      of FznBoolLit:
-        lookupTable[flatIdx] = if testValExpr.boolVal: 1 else: 0
-      of FznIdent:
-        if testValExpr.ident in tr.paramValues:
-          lookupTable[flatIdx] = tr.paramValues[testValExpr.ident]
+      if condValues notin caseMap:
+        if isComplete:
+          lookupTable[flatIdx] = 0  # dummy for out-of-domain values
         else:
-          let mapping = tr.buildValueMapping(sourceValues)
-          if testValExpr.ident in mapping:
-            lookupTable[flatIdx] = mapping[testValExpr.ident]
+          lookupTable[flatIdx] = defaultVal  # uncovered case
+        continue
+
+      let entry = caseMap[condValues]
+
+      if entry.isLinear:
+        # Compute target from linear equation:
+        # targetCoeff * target + sum(otherCoeffs[i] * otherVars[i]) = rhs
+        # target = (rhs - sum(otherCoeffs[i] * otherVars[i])) / targetCoeff
+        var numerator = entry.linRhs
+        var linOk = true
+        var needMapping = false
+        for j in 0..<entry.linOtherVars.len:
+          let ov = entry.linOtherVars[j]
+          if ov in sourceValues:
+            numerator -= entry.linOtherCoeffs[j] * sourceValues[ov]
+          elif ov in tr.paramValues:
+            numerator -= entry.linOtherCoeffs[j] * tr.paramValues[ov]
           else:
-            allResolved = false
-            break
+            # Try case analysis def lookup first (fast path)
+            var resolved = false
+            for caDef in tr.caseAnalysisDefs:
+              if caDef.targetVarName == ov:
+                var caIdx = 0
+                var caOk = true
+                for si, srcName in caDef.sourceVarNames:
+                  let sv = if srcName in sourceValues: sourceValues[srcName]
+                           elif srcName in tr.paramValues: tr.paramValues[srcName]
+                           else: (caOk = false; 0)
+                  if not caOk: break
+                  let li = sv - caDef.domainOffsets[si]
+                  if li < 0 or li >= caDef.domainSizes[si]: caOk = false; break
+                  caIdx = caIdx * caDef.domainSizes[si] + li
+                if caOk and caIdx >= 0 and caIdx < caDef.lookupTable.len:
+                  numerator -= entry.linOtherCoeffs[j] * caDef.lookupTable[caIdx]
+                  resolved = true
+                break
+            if not resolved:
+              # Try pre-computed mini table
+              if ov in channelMiniTables:
+                let mt = channelMiniTables[ov]
+                var mtIdx = 0
+                for k, di in mt.srcIndices:
+                  let sv = sourceValues[sourceVarNames[di]]
+                  let li = sv - mt.srcOffsets[k]
+                  mtIdx = mtIdx * mt.srcSizes[k] + li
+                numerator -= entry.linOtherCoeffs[j] * mt.table[mtIdx]
+              else:
+                linOk = false
+                break
+        if not linOk or numerator mod entry.linTargetCoeff != 0:
+          allResolved = false
+          break
+        lookupTable[flatIdx] = numerator div entry.linTargetCoeff
       else:
-        allResolved = false
-        break
+        # Resolve test value to constant (original logic)
+        let testValExpr = entry.testVal
+        case testValExpr.kind
+        of FznIntLit:
+          lookupTable[flatIdx] = testValExpr.intVal
+        of FznBoolLit:
+          lookupTable[flatIdx] = if testValExpr.boolVal: 1 else: 0
+        of FznIdent:
+          if testValExpr.ident in tr.paramValues:
+            lookupTable[flatIdx] = tr.paramValues[testValExpr.ident]
+          elif testValExpr.ident in sourceValues:
+            lookupTable[flatIdx] = sourceValues[testValExpr.ident]
+          else:
+            let mapping = tr.buildValueMapping(sourceValues)
+            if testValExpr.ident in mapping:
+              lookupTable[flatIdx] = mapping[testValExpr.ident]
+            else:
+              allResolved = false
+              break
+        else:
+          allResolved = false
+          break
 
     if not allResolved: continue
 
     # Step 6: Register channel and consume constraints
     tr.channelVarNames.incl(targetVar)
+    var consumedBoolClauses: HashSet[int]
+    var consumedLinReifs: HashSet[int]
     for e in entries:
-      tr.definingConstraints.incl(e.boolClauseIdx)
-      inc nConsumed
+      if e.boolClauseIdx notin consumedBoolClauses:
+        tr.definingConstraints.incl(e.boolClauseIdx)
+        consumedBoolClauses.incl(e.boolClauseIdx)
+        inc nConsumed
+      if e.isLinear and e.linReifIdx notin consumedLinReifs:
+        tr.definingConstraints.incl(e.linReifIdx)
+        consumedLinReifs.incl(e.linReifIdx)
 
     tr.caseAnalysisDefs.add(CaseAnalysisDef(
       targetVarName: targetVar,
@@ -7023,6 +7526,9 @@ proc translate*(model: FznModel): FznTranslator =
   # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
   result.detectEqualityCopyVars()
   # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
+  # Run twice: first pass channels simple targets (e.g. job_time), second pass channels
+  # targets that depend on first-pass results (e.g. job_end depending on job_time).
+  result.detectCaseAnalysisChannels()
   result.detectCaseAnalysisChannels()
   # Detect implication-to-table and one-hot channel patterns
   result.detectImplicationPatterns()
