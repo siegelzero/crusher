@@ -30,12 +30,10 @@ type
         nodePositions*: seq[int]         # variable position for each node
         edgePositions*: seq[int]         # variable position for each edge
         nodePositionToIndex*: Table[int, int]  # position -> node index
-        edgePositionToIndex*: Table[int, int]  # position -> edge index
-        positions*: PackedSet[int]       # all variable positions (nodes + edges)
+        positions*: PackedSet[int]       # node variable positions only
 
         # Mutable state
         cost*: int
-        currentAssignment*: Table[int, T]
         nodeActive*: seq[bool]
         numComponents*: int
 
@@ -110,20 +108,13 @@ proc newConnectedConstraint*[T](nodePositions, edgePositions: openArray[int],
     for i, pos in nodePositions:
         result.nodePositionToIndex[pos] = i
 
-    result.edgePositionToIndex = initTable[int, int]()
-    for i, pos in edgePositions:
-        result.edgePositionToIndex[pos] = i
-
-    # All positions
+    # Only node positions — edge activity is derived, so edges don't affect penalty
     result.positions = initPackedSet[int]()
     for pos in nodePositions:
-        result.positions.incl(pos)
-    for pos in edgePositions:
         result.positions.incl(pos)
 
     # Mutable state
     result.cost = 0
-    result.currentAssignment = initTable[int, T]()
     result.nodeActive = newSeq[bool](result.numNodes)
     result.numComponents = 0
 
@@ -136,12 +127,7 @@ proc newConnectedConstraint*[T](nodePositions, edgePositions: openArray[int],
 ################################################################################
 
 proc initialize*[T](constraint: ConnectedConstraint[T], assignment: seq[T]) =
-    ## Set node/edge activity from assignment and compute initial cost.
-    for pos in constraint.positions:
-        if pos < assignment.len:
-            constraint.currentAssignment[pos] = assignment[pos]
-
-    # Set node activity from assignment
+    ## Set node activity from assignment and compute initial cost.
     for i in 0..<constraint.numNodes:
         let pos = constraint.nodePositions[i]
         constraint.nodeActive[i] = (assignment[pos] != T(0))
@@ -173,7 +159,8 @@ proc moveDelta*[T](constraint: ConnectedConstraint[T], position: int, oldValue, 
     if wasActive == willBeActive:
         return 0
 
-    # Temporarily toggle, recompute, untoggle
+    # Temporarily toggle, recompute, untoggle.
+    # Safe: each thread gets its own deep copy, so no concurrent access.
     constraint.nodeActive[nodeIdx] = willBeActive
     let newComponents = constraint.computeComponents()
     constraint.nodeActive[nodeIdx] = wasActive
@@ -187,8 +174,6 @@ proc moveDelta*[T](constraint: ConnectedConstraint[T], position: int, oldValue, 
 
 proc updatePosition*[T](constraint: ConnectedConstraint[T], position: int, newValue: T) =
     ## Apply a change and recompute components.
-    constraint.currentAssignment[position] = newValue
-
     if position in constraint.nodePositionToIndex:
         let nodeIdx = constraint.nodePositionToIndex[position]
         constraint.nodeActive[nodeIdx] = (newValue != T(0))
@@ -211,15 +196,10 @@ proc deepCopy*[T](constraint: ConnectedConstraint[T]): ConnectedConstraint[T] =
     result.nodePositions = constraint.nodePositions
     result.edgePositions = constraint.edgePositions
     result.nodePositionToIndex = constraint.nodePositionToIndex
-    result.edgePositionToIndex = constraint.edgePositionToIndex
     result.positions = constraint.positions
 
     # Deep copy mutable state
     result.cost = constraint.cost
-    result.currentAssignment = initTable[int, T]()
-    for k, v in constraint.currentAssignment.pairs:
-        result.currentAssignment[k] = v
-
     result.nodeActive = newSeq[bool](constraint.numNodes)
     for i in 0..<constraint.numNodes:
         result.nodeActive[i] = constraint.nodeActive[i]

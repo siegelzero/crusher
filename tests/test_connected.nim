@@ -280,3 +280,31 @@ suite "Connected Constraint":
         constraint.updatePosition(3, 0)
         # Remaining: 0 (isolated) + {2,5,6,7,8} — 2 components
         check constraint.penalty() == 1
+
+    test "end-to-end resolve: path graph":
+        # 4 nodes in a path: 0-1-2-3
+        # Solver must find an assignment where active nodes are connected.
+        var sys = initConstraintSystem[int]()
+        var ns = sys.newConstrainedSequence(4)
+        ns.setDomain(@[0, 1])
+        var es = sys.newConstrainedSequence(3)
+        es.setDomain(@[0, 1])
+
+        let nodePos = @[0, 1, 2, 3]
+        let edgePos = @[4, 5, 6]
+        let edgeFrom = @[0, 1, 2]
+        let edgeTo = @[1, 2, 3]
+
+        sys.addConstraint(connected[int](nodePos, edgePos, edgeFrom, edgeTo))
+
+        # Force at least 2 nodes active via a simple sum constraint
+        let sumExpr = ns[0] + ns[1] + ns[2] + ns[3]
+        sys.addConstraint(sumExpr >= 2)
+
+        sys.resolve()
+
+        # Verify all constraints satisfied (zero penalty)
+        let assignment = sys.assignment
+        sys.initialize(assignment)
+        for c in sys.baseArray.constraints:
+            check c.penalty() == 0
