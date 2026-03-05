@@ -1,5 +1,6 @@
 import std/[sequtils, strutils, sets, unittest, tables]
 import crusher
+import constraints/cumulative
 
 proc validateCumulativeSolution[T](origins: seq[T], durations: seq[T], heights: seq[T], limit: T): bool =
     ## Validates that the cumulative constraint is satisfied
@@ -362,3 +363,165 @@ suite "Cumulative Constraint Tests":
             assignment[2] + 2
         ]
         check validateCumulativeSolution(actualOrigins, durations, heights, assignedLimit)
+
+suite "ExpressionBased Cumulative batchMovePenalty":
+    test "Single-task batchMovePenalty matches moveDelta":
+        # Create an ExpressionBased cumulative with one task per position
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(3)
+        x.setDomain(toSeq(0..20))
+
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0])
+        originExprs.add(x[1] + 2)
+        originExprs.add(x[2])
+
+        let durations = @[4, 3, 5]
+        let heights = @[2, 3, 2]
+        let limit = 5
+
+        let cumul = newCumulativeConstraint[int](originExprs, durations, heights, limit, maxTime = 30)
+
+        # Initialize with a known assignment
+        var assignment = newSeq[int](3)
+        assignment[0] = 5
+        assignment[1] = 10
+        assignment[2] = 0
+        cumul.initialize(assignment)
+
+        # For each position, verify batchMovePenalty matches individual moveDelta
+        let domain = toSeq(0..20)
+        for pos in 0..2:
+            let currentVal = assignment[pos]
+            let batchResult = cumul.batchMovePenalty(pos, currentVal, domain)
+
+            for i, v in domain:
+                let expected = cumul.moveDelta(pos, currentVal, v)
+                check batchResult[i] == expected
+
+    test "Multi-task batchMovePenalty matches moveDelta":
+        # Create an ExpressionBased cumulative where one position affects multiple tasks
+        # x[0] appears in origins of task 0 and task 1
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(3)
+        x.setDomain(toSeq(0..15))
+
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0])           # task 0: origin = x[0]
+        originExprs.add(x[0] + x[1])    # task 1: origin = x[0] + x[1] (shares x[0])
+        originExprs.add(x[2])           # task 2: origin = x[2]
+
+        let durations = @[3, 2, 4]
+        let heights = @[2, 3, 1]
+        let limit = 5
+
+        let cumul = newCumulativeConstraint[int](originExprs, durations, heights, limit, maxTime = 30)
+
+        var assignment = newSeq[int](3)
+        assignment[0] = 2
+        assignment[1] = 5
+        assignment[2] = 10
+        cumul.initialize(assignment)
+
+        # Position 0 affects both task 0 and task 1 — multi-task path
+        let domain = toSeq(0..15)
+        let currentVal = assignment[0]
+        let batchResult = cumul.batchMovePenalty(0, currentVal, domain)
+
+        for i, v in domain:
+            let expected = cumul.moveDelta(0, currentVal, v)
+            if batchResult[i] != expected:
+                echo "  Mismatch at pos=0, value=", v, ": batch=", batchResult[i], " moveDelta=", expected
+            check batchResult[i] == expected
+
+    test "Multi-task shared position solving":
+        # End-to-end test where x[0] is shared between two task origins
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(3)
+        x.setDomain(toSeq(0..20))
+
+        # Task origins: x[0], x[0]+x[1], x[2]
+        # x[0] appears in two origins — tests multi-task handling
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0])
+        originExprs.add(x[0] + x[1])
+        originExprs.add(x[2])
+
+        let durations = @[3, 4, 5]
+        let heights = @[3, 3, 3]
+        let limit = 3  # Only one task at a time
+
+        sys.addConstraint(cumulative[int](originExprs, durations, heights, limit))
+
+        sys.resolve(parallel=true)
+
+        let assignment = x.assignment
+        let actualOrigins = @[
+            assignment[0],
+            assignment[0] + assignment[1],
+            assignment[2]
+        ]
+        check validateCumulativeSolution(actualOrigins, durations, heights, limit)
+
+    test "Expression-based moveDelta correctness":
+        # Verify the optimized (hash-table-free) moveDelta produces correct results
+        # by comparing against manually computed penalties
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(2)
+        x.setDomain(toSeq(0..10))
+
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0] + 1)  # task 0: origin = x[0] + 1
+        originExprs.add(x[1])      # task 1: origin = x[1]
+
+        let durations = @[3, 3]
+        let heights = @[4, 4]
+        let limit = 4  # Only one task at a time
+
+        let cumul = newCumulativeConstraint[int](originExprs, durations, heights, limit, maxTime = 20)
+
+        # Place tasks so they overlap: task0 at t=3..6, task1 at t=4..7
+        var assignment = newSeq[int](2)
+        assignment[0] = 2  # origin = 2+1 = 3
+        assignment[1] = 4  # origin = 4
+        cumul.initialize(assignment)
+
+        # Overlap at t=4,5 => overuse = 4 at each => cost = 8
+        check cumul.cost == 8
+
+        # Move x[0] to 7 => origin = 8 => task0 at t=8..10, no overlap with task1 (t=4..6)
+        let delta = cumul.moveDelta(0, 2, 7)
+        check delta == -8  # removing all overlap
+
+        # Move x[0] to 1 => origin = 2 => task0 at t=2..4, overlap at t=4 only
+        let delta2 = cumul.moveDelta(0, 2, 1)
+        check delta2 == -4  # overlap reduced from 2 points to 1 point
+
+    test "batchMovePenalty with non-origin position returns zeros":
+        # Position not in any origin expression should return all zeros
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(3)
+        x.setDomain(toSeq(0..10))
+
+        var originExprs: seq[AlgebraicExpression[int]] = @[]
+        originExprs.add(x[0])
+        originExprs.add(x[1])
+        # x[2] is NOT used in any origin expression
+
+        let durations = @[3, 3]
+        let heights = @[2, 2]
+        let limit = 3
+
+        let cumul = newCumulativeConstraint[int](originExprs, durations, heights, limit, maxTime = 20)
+
+        var assignment = newSeq[int](3)
+        assignment[0] = 1
+        assignment[1] = 5
+        assignment[2] = 7
+        cumul.initialize(assignment)
+
+        # Position 2 is not in expressionsAtPosition, so batchMovePenalty should return zeros
+        let domain = toSeq(0..10)
+        let batchResult = cumul.batchMovePenalty(2, assignment[2], domain)
+        for i in 0..<domain.len:
+            check batchResult[i] == 0

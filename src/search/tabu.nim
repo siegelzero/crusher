@@ -320,7 +320,9 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
 
     for constraint in state.constraintsAtPosition[position]:
         if constraint.stateType == CumulativeType and
-           constraint.cumulativeState.evalMethod == PositionBased:
+           (constraint.cumulativeState.evalMethod == PositionBased or
+            (constraint.cumulativeState.evalMethod == ExpressionBased and
+             position in constraint.cumulativeState.expressionsAtPosition)):
             let p = constraint.cumulativeState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
@@ -446,7 +448,9 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
 
     for ci, constraint in state.constraintsAtPosition[position]:
         if constraint.stateType == CumulativeType and
-           constraint.cumulativeState.evalMethod == PositionBased:
+           (constraint.cumulativeState.evalMethod == PositionBased or
+            (constraint.cumulativeState.evalMethod == ExpressionBased and
+             position in constraint.cumulativeState.expressionsAtPosition)):
             # Batch computation via prefix sums — O(maxTime + domainSize)
             let penalties = constraint.cumulativeState.batchMovePenalty(
                 position, state.assignment[position], domain)
@@ -509,7 +513,10 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     let domain = state.sharedDomain[][position]
 
     if constraint.stateType == CumulativeType and
-       constraint.cumulativeState.evalMethod == PositionBased:
+       (constraint.cumulativeState.evalMethod == PositionBased or
+        (constraint.cumulativeState.evalMethod == ExpressionBased and
+         position in constraint.cumulativeState.expressionsAtPosition and
+         constraint.cumulativeState.expressionsAtPosition[position].len == 1)):
         # Batch computation via prefix sums
         let penalties = constraint.cumulativeState.batchMovePenalty(
             position, state.assignment[position], domain)

@@ -27,6 +27,7 @@ type
         lastChangedPosition*: int        # Track last changed position for smart affected positions
         lastOldValue*: T                 # Track old value for smart affected positions
         limitPosition*: int              # Position of variable limit (-1 = constant limit)
+        prefixDeltaBuf*: seq[int64]      # Pre-allocated buffer for batch prefix sums
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 originPositions*: seq[int]
@@ -81,6 +82,7 @@ func newCumulativeConstraint*[T](originPositions: openArray[int],
         positionToTask: posToTask,
         resourceProfile: newSeq[T](maxTime + 1),
         currentAssignment: newSeq[T](maxPos + 1),
+        prefixDeltaBuf: newSeq[int64](maxTime + 2),
     )
 
 func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
@@ -114,6 +116,7 @@ func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
         heightsExpr: @heights,
         resourceProfile: newSeq[T](maxTime + 1),
         currentAssignment: newSeq[T](maxPos + 1),
+        prefixDeltaBuf: newSeq[int64](maxTime + 2),
         expressionsAtPosition: buildExpressionPositionMap(originExpressions)
     )
 
@@ -189,6 +192,7 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
     if requiredMaxTime > state.maxTime:
         state.maxTime = requiredMaxTime
         state.resourceProfile = newSeq[T](requiredMaxTime + 1)
+        state.prefixDeltaBuf = newSeq[int64](requiredMaxTime + 2)
 
     # Reset resource profile
     for t in 0..state.maxTime:
@@ -554,46 +558,72 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
             if position notin state.expressionsAtPosition:
                 return 0
 
-            var profileDelta = initTable[int, T]()
             let tMax = state.maxTime + 1
 
+            # Evaluate old origins before mutation
+            type TaskChange = tuple[oldStart, oldEnd, newStart, newEnd: int, height: T]
+            var changes: seq[TaskChange]
+
             for i in state.expressionsAtPosition[position]:
-                var tempAssign = initTable[int, T]()
-                for pos in state.originExpressions[i].positions.items:
-                    tempAssign[pos] = state.currentAssignment[pos]
-                let oldOrigin = state.originExpressions[i].evaluate(tempAssign)
-                tempAssign[position] = newValue
-                let newOrigin = state.originExpressions[i].evaluate(tempAssign)
+                let oldOrigin = state.originExpressions[i].evaluate(state.currentAssignment)
+                state.currentAssignment[position] = newValue
+                let newOrigin = state.originExpressions[i].evaluate(state.currentAssignment)
+                state.currentAssignment[position] = oldValue
 
                 if oldOrigin == newOrigin:
                     continue
 
                 let duration = state.durationsExpr[i]
-                let height = state.heightsExpr[i]
-                let oldStart = int(oldOrigin)
-                let oldEnd = int(oldOrigin + duration)
-                let newStart = int(newOrigin)
-                let newEnd = int(newOrigin + duration)
+                changes.add((
+                    oldStart: int(oldOrigin), oldEnd: int(oldOrigin + duration),
+                    newStart: int(newOrigin), newEnd: int(newOrigin + duration),
+                    height: state.heightsExpr[i]
+                ))
 
-                # Symmetric difference: only track time points that actually change
-                if newStart > oldStart:
-                    for t in max(0, oldStart) ..< min(tMax, min(newStart, oldEnd)):
-                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) - height
-                    for t in max(0, max(oldEnd, newStart)) ..< min(tMax, newEnd):
-                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) + height
-                else:
-                    for t in max(0, newStart) ..< min(tMax, min(oldStart, newEnd)):
-                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) + height
-                    for t in max(0, max(newEnd, oldStart)) ..< min(tMax, oldEnd):
-                        profileDelta[t] = profileDelta.getOrDefault(t, T(0)) - height
+            if changes.len == 0:
+                return 0
 
-            # Calculate cost delta
+            # Apply symmetric differences directly to resource profile, accumulate cost delta
             var costDelta = 0
-            for time, delta in profileDelta.pairs:
-                if delta != T(0):
-                    let oldUsage = state.resourceProfile[time]
-                    let newUsage = oldUsage + delta
-                    costDelta += calculateCostDelta(oldUsage, newUsage, state.limit)
+
+            # Pass 1: remove leaving time points
+            for c in changes:
+                if c.newStart > c.oldStart:
+                    for t in max(0, c.oldStart) ..< min(tMax, min(c.newStart, c.oldEnd)):
+                        let u = state.resourceProfile[t]
+                        state.resourceProfile[t] = u - c.height
+                        costDelta += calculateCostDelta(u, u - c.height, state.limit)
+                else:
+                    for t in max(0, max(c.newEnd, c.oldStart)) ..< min(tMax, c.oldEnd):
+                        let u = state.resourceProfile[t]
+                        state.resourceProfile[t] = u - c.height
+                        costDelta += calculateCostDelta(u, u - c.height, state.limit)
+
+            # Pass 2: add entering time points
+            for c in changes:
+                if c.newStart > c.oldStart:
+                    for t in max(0, max(c.oldEnd, c.newStart)) ..< min(tMax, c.newEnd):
+                        let u = state.resourceProfile[t]
+                        state.resourceProfile[t] = u + c.height
+                        costDelta += calculateCostDelta(u, u + c.height, state.limit)
+                else:
+                    for t in max(0, c.newStart) ..< min(tMax, min(c.oldStart, c.newEnd)):
+                        let u = state.resourceProfile[t]
+                        state.resourceProfile[t] = u + c.height
+                        costDelta += calculateCostDelta(u, u + c.height, state.limit)
+
+            # Undo: restore resource profile
+            for c in changes:
+                if c.newStart > c.oldStart:
+                    for t in max(0, c.oldStart) ..< min(tMax, min(c.newStart, c.oldEnd)):
+                        state.resourceProfile[t] += c.height
+                    for t in max(0, max(c.oldEnd, c.newStart)) ..< min(tMax, c.newEnd):
+                        state.resourceProfile[t] -= c.height
+                else:
+                    for t in max(0, max(c.newEnd, c.oldStart)) ..< min(tMax, c.oldEnd):
+                        state.resourceProfile[t] += c.height
+                    for t in max(0, c.newStart) ..< min(tMax, min(c.oldStart, c.newEnd)):
+                        state.resourceProfile[t] -= c.height
 
             return costDelta
 
@@ -615,11 +645,130 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
             result[i] = newCost - state.cost
         return
 
-    if state.evalMethod != PositionBased:
-        # Fallback to individual computation
-        for i, v in domain:
-            result[i] = state.moveDelta(position, currentValue, v)
-        return
+    if state.evalMethod == ExpressionBased:
+        if position notin state.expressionsAtPosition:
+            return
+        let taskIndices = state.expressionsAtPosition[position]
+        if taskIndices.len == 1:
+            # Single task affected — use prefix-sum batch approach
+            let taskIdx = taskIndices[0]
+            let duration = int(state.durationsExpr[taskIdx])
+            let height = int(state.heightsExpr[taskIdx])
+            let limit = int(state.limit)
+            let tMax = state.maxTime + 1
+
+            # Evaluate current origin
+            let oldOrigin = state.originExpressions[taskIdx].evaluate(state.currentAssignment)
+            let oldStart = max(0, int(oldOrigin))
+            let oldEnd = min(tMax, int(oldOrigin) + duration)
+
+            # Build prefix sum with current task removed
+            state.prefixDeltaBuf[0] = 0
+            var baseOveruse: int64 = 0
+            for t in 0..<tMax:
+                let rp = int(state.resourceProfile[t])
+                var removedP: int
+                if t >= oldStart and t < oldEnd:
+                    removedP = rp - height
+                else:
+                    removedP = rp
+                let overuseWithout = max(0, removedP - limit)
+                let overuseWith = max(0, removedP + height - limit)
+                baseOveruse += int64(overuseWithout)
+                state.prefixDeltaBuf[t + 1] = state.prefixDeltaBuf[t] + int64(overuseWith - overuseWithout)
+
+            let currentCost = int64(state.cost)
+            for i, v in domain:
+                if v == currentValue:
+                    continue
+                state.currentAssignment[position] = v
+                let newOrigin = state.originExpressions[taskIdx].evaluate(state.currentAssignment)
+                let newStart = max(0, int(newOrigin))
+                let newEnd = min(tMax, int(newOrigin) + duration)
+                if newStart >= tMax:
+                    result[i] = int(baseOveruse - currentCost)
+                else:
+                    let addedCost = state.prefixDeltaBuf[newEnd] - state.prefixDeltaBuf[newStart]
+                    result[i] = int(baseOveruse + addedCost - currentCost)
+            state.currentAssignment[position] = currentValue
+            return
+        else:
+            # Multiple tasks affected — batch via mutate/restore
+            let limit = int(state.limit)
+            let tMax = state.maxTime + 1
+
+            # Pre-evaluate current origins and remove all affected tasks from profile
+            type TaskInfo = tuple[taskIdx: int, duration, height: int, oldStart, oldEnd: int]
+            var tasks: seq[TaskInfo]
+            for taskIdx in taskIndices:
+                let oldOrigin = state.originExpressions[taskIdx].evaluate(state.currentAssignment)
+                let duration = int(state.durationsExpr[taskIdx])
+                let height = int(state.heightsExpr[taskIdx])
+                let oldStart = max(0, int(oldOrigin))
+                let oldEnd = min(tMax, int(oldOrigin) + duration)
+                tasks.add((taskIdx: taskIdx, duration: duration, height: height,
+                           oldStart: oldStart, oldEnd: oldEnd))
+                # Remove this task from profile
+                for t in oldStart..<oldEnd:
+                    state.resourceProfile[t] -= T(height)
+
+            # Compute base cost (profile without affected tasks)
+            var baseCost = 0
+            for t in 0..<tMax:
+                let usage = int(state.resourceProfile[t])
+                if usage > limit:
+                    baseCost += usage - limit
+
+            # For each candidate: add tasks to base profile, compute cost delta, remove.
+            let currentCost = state.cost
+            var newRanges = newSeq[(int, int)](tasks.len)
+
+            for i, v in domain:
+                if v == currentValue:
+                    continue
+                state.currentAssignment[position] = v
+
+                # Evaluate all new origins and add to profile
+                var minStart = tMax
+                var maxEnd = 0
+                for ti in 0..<tasks.len:
+                    let task = tasks[ti]
+                    let newOrigin = state.originExpressions[task.taskIdx].evaluate(state.currentAssignment)
+                    let ns = max(0, int(newOrigin))
+                    let ne = min(tMax, int(newOrigin) + task.duration)
+                    newRanges[ti] = (ns, ne)
+                    if ns < minStart: minStart = ns
+                    if ne > maxEnd: maxEnd = ne
+                    for t in ns..<ne:
+                        state.resourceProfile[t] += T(task.height)
+
+                # Compute cost delta at touched time points
+                var costDelta = 0
+                for t in minStart..<maxEnd:
+                    var added = 0
+                    for ti in 0..<tasks.len:
+                        let (ns, ne) = newRanges[ti]
+                        if t >= ns and t < ne:
+                            added += tasks[ti].height
+                    if added > 0:
+                        let withTasks = int(state.resourceProfile[t])
+                        let baseVal = withTasks - added
+                        costDelta += max(0, withTasks - limit) - max(0, baseVal - limit)
+
+                result[i] = costDelta + baseCost - currentCost
+
+                # Remove tasks from profile
+                for ti in 0..<tasks.len:
+                    let (ns, ne) = newRanges[ti]
+                    for t in ns..<ne:
+                        state.resourceProfile[t] -= T(tasks[ti].height)
+
+            # Restore original profile (add tasks back with original origins)
+            state.currentAssignment[position] = currentValue
+            for task in tasks:
+                for t in task.oldStart..<task.oldEnd:
+                    state.resourceProfile[t] += T(task.height)
+            return
 
     if position >= state.positionToTask.len or state.positionToTask[position] < 0:
         # Not a task origin — moveDelta is 0 for all values
@@ -639,7 +788,8 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     let oldEnd = min(tMax, int(currentValue) + duration)
 
     # Build prefix sum of delta values
-    var prefixDelta = newSeq[int64](tMax + 1)
+    let prefixDelta = state.prefixDeltaBuf
+    state.prefixDeltaBuf[0] = 0
     var baseOveruse: int64 = 0
     for t in 0..<tMax:
         let rp = int(state.resourceProfile[t])
@@ -651,7 +801,7 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
         let overuseWithout = max(0, removedP - limit)
         let overuseWith = max(0, removedP + height - limit)
         baseOveruse += int64(overuseWithout)
-        prefixDelta[t + 1] = prefixDelta[t] + int64(overuseWith - overuseWithout)
+        state.prefixDeltaBuf[t + 1] = state.prefixDeltaBuf[t] + int64(overuseWith - overuseWithout)
 
     # Step 2: For each candidate, compute total penalty in O(1)
     let currentCost = int64(state.cost)
@@ -662,5 +812,5 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
             # Task entirely outside profile — penalty is just base overuse
             result[i] = int(baseOveruse - currentCost)
         else:
-            let addedCost = prefixDelta[newEnd] - prefixDelta[newStart]
+            let addedCost = state.prefixDeltaBuf[newEnd] - state.prefixDeltaBuf[newStart]
             result[i] = int(baseOveruse + addedCost - currentCost)
