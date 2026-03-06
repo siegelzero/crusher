@@ -109,12 +109,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         # Binary search bounds
         when direction == Minimize:
-            var lo = if lowerBound != low(int): lowerBound else: 0
+            var lo = if lowerBound != low(int): lowerBound else: min(0, currentCost - abs(currentCost) - 1)
             var hi = currentCost - 1
-            var loProven = true  # 0 is a genuine lower bound; user-provided also trusted
+            var loProven = lowerBound != low(int)  # only proven if user-provided or domain-derived
         else:
             var lo = currentCost + 1
-            var hi = if upperBound != high(int): upperBound else: max(currentCost * 2, currentCost + 1)
+            var hi = if upperBound != high(int): upperBound else: max(0, currentCost + abs(currentCost) + 1)
             var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
@@ -215,7 +215,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     if currentCost <= lo:
                         if loProven:
                             system.optimalityProven = true
-                        break retryLoop
+                            break retryLoop
+                        else:
+                            # lo was a heuristic guess — lower it and keep searching
+                            lo = min(currentCost - abs(currentCost) - 1, lo - abs(lo) - 1)
                 else:
                     if currentCost >= hi:
                         if hiProven:
@@ -223,7 +226,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             break retryLoop
                         else:
                             # hi was a heuristic guess — raise it and keep searching
-                            hi = max(currentCost * 2, currentCost + 1)
+                            hi = max(currentCost + abs(currentCost) + 1, hi + abs(hi) + 1)
 
                 if deadline > 0 and epochTime() > deadline:
                     system.searchCompleted = false

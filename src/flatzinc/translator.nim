@@ -1,6 +1,6 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes]
 
 import parser
 import dfaExtract
@@ -174,6 +174,9 @@ type
     # Tracks which output variables/arrays are boolean (for true/false formatting)
     outputBoolVars*: HashSet[string]
     outputBoolArrays*: HashSet[string]
+    # Element channel aliases: maps duplicate channel var name → original channel var name
+    # (when multiple element constraints share same index var and constant array)
+    elementChannelAliases*: Table[string, string]
     # Equality copy aliases: maps eliminated copy var name → original var name
     equalityCopyAliases*: Table[string, string]
     # Constraint indices of int_eq_reif that are equality copies (skip in buildReifChannelBindings)
@@ -200,6 +203,8 @@ type
     skipSetVarNames*: HashSet[string]
     # Reusable position for a variable fixed to 1 (for set_in channel bindings), -1 if not yet created
     fixedOnePos*: int
+    # Synthetic element channels: precomputed lookup tables for conditional gain variables
+    syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
     # Detected weighted same-value pattern for objective
     weightedSameValuePairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
     weightedSameValueConstant*: int
@@ -2223,6 +2228,13 @@ proc translateSolve(tr: var FznTranslator) =
           tr.objectivePos = ObjPosWeightedSV
         elif objName in tr.varPositions:
           tr.objectivePos = tr.varPositions[objName]
+          # Extract domain bounds from the variable declaration for the optimizer
+          for decl in tr.model.variables:
+            if not decl.isArray and decl.name == objName:
+              if decl.varType.kind == FznIntRange:
+                tr.objectiveLoBound = decl.varType.lo
+                tr.objectiveHiBound = decl.varType.hi
+              break
         elif objName in tr.definedVarExprs:
           # Objective was eliminated as a defined variable — use its defining expression directly.
           # This avoids an intermediate position + binary-penalty linking constraint,
@@ -2370,6 +2382,13 @@ proc collectDefinedVars(tr: var FznTranslator) =
 
   # Second loop: identify element constraints with defines_var annotations
   # These define channel variables that should be computed, not searched
+  # Also deduplicate: when multiple constant-array element constraints share the same
+  # index variable and array content, only the first becomes a channel; duplicates
+  # become defined-variable aliases (eliminated, no position allocated).
+  type ElementKey = tuple[indexVar: string, arrayHash: Hash, arrayLen: int]
+  var elementChannelMap: Table[ElementKey, string]  # key -> first channel var name
+  var elementArrayCache: Table[string, seq[int]]  # channel var name -> resolved array (for verification)
+  var nElementAliases = 0
   for ci, con in tr.model.constraints:
     let name = stripSolverPrefix(con.name)
     if name in ["array_var_int_element", "array_var_int_element_nonshifted",
@@ -2383,10 +2402,88 @@ proc collectDefinedVars(tr: var FznTranslator) =
         let ann = con.getAnnotation("defines_var")
         if ann.args.len > 0 and ann.args[0].kind == FznIdent and
            ann.args[0].ident == definedName:
-          tr.channelVarNames.incl(definedName)
-          tr.channelConstraints[ci] = definedName
-          # DO NOT add to definedVarNames (channel vars need positions)
-          tr.definingConstraints.incl(ci)  # Channel binding replaces this constraint
+          # Try to deduplicate constant-array element constraints
+          var deduplicated = false
+          if name in ["array_int_element", "array_int_element_nonshifted",
+                      "array_bool_element"] and
+             con.args[0].kind == FznIdent:
+            let indexVar = con.args[0].ident
+            try:
+              let constArray = tr.resolveIntArray(con.args[1])
+              let key: ElementKey = (indexVar, hash(constArray), constArray.len)
+              if key in elementChannelMap:
+                # Verify content match (hash collision guard)
+                let originalName = elementChannelMap[key]
+                if elementArrayCache[originalName] == constArray:
+                  # Duplicate! Make this a defined-var alias instead of a channel
+                  tr.elementChannelAliases[definedName] = originalName
+                  tr.definedVarNames.incl(definedName)
+                  tr.definingConstraints.incl(ci)
+                  deduplicated = true
+                  nElementAliases += 1
+              else:
+                elementChannelMap[key] = definedName
+                elementArrayCache[definedName] = constArray
+            except KeyError:
+              discard  # array resolution failed, skip dedup
+
+          if not deduplicated:
+            tr.channelVarNames.incl(definedName)
+            tr.channelConstraints[ci] = definedName
+            # DO NOT add to definedVarNames (channel vars need positions)
+            tr.definingConstraints.incl(ci)  # Channel binding replaces this constraint
+  if nElementAliases > 0:
+    stderr.writeLine(&"[FZN] Deduplicated {nElementAliases} element channels (shared index+array)")
+
+  # Dead element channel elimination: detect element channel variables that
+  # are not referenced by any non-defining constraint. These are "dead" channels
+  # (e.g., stock lookups when symmetry breaking is disabled) and can be eliminated.
+  block:
+    # Collect all variable references from non-defining constraints
+    var referencedVars = initHashSet[string]()
+    for ci, con in tr.model.constraints:
+      if ci in tr.definingConstraints:
+        continue
+      for arg in con.args:
+        if arg.kind == FznIdent:
+          referencedVars.incl(arg.ident)
+        elif arg.kind == FznArrayLit:
+          for elem in arg.elems:
+            if elem.kind == FznIdent:
+              referencedVars.incl(elem.ident)
+      # Also check annotation args (some constraints reference vars in annotations)
+      for ann in con.annotations:
+        for annArg in ann.args:
+          if annArg.kind == FznIdent:
+            referencedVars.incl(annArg.ident)
+
+    # Build reverse alias map: original channel name → set of alias names
+    var aliasesOf = initTable[string, seq[string]]()
+    for aliasName, originalName in tr.elementChannelAliases:
+      if originalName notin aliasesOf:
+        aliasesOf[originalName] = @[]
+      aliasesOf[originalName].add(aliasName)
+
+    # Check each element channel: if neither it nor any alias is referenced, eliminate it
+    var nDeadChannels = 0
+    var deadCIs: seq[int] = @[]
+    for ci, chanName in tr.channelConstraints:
+      var isReferenced = chanName in referencedVars
+      if not isReferenced and chanName in aliasesOf:
+        for aliasName in aliasesOf[chanName]:
+          if aliasName in referencedVars:
+            isReferenced = true
+            break
+      if not isReferenced:
+        # Dead channel: convert to defined var (no position needed)
+        tr.channelVarNames.excl(chanName)
+        tr.definedVarNames.incl(chanName)
+        deadCIs.add(ci)
+        nDeadChannels += 1
+    for ci in deadCIs:
+      tr.channelConstraints.del(ci)
+    if nDeadChannels > 0:
+      stderr.writeLine(&"[FZN] Eliminated {nDeadChannels} dead element channels (unreferenced)")
 
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
   ## Tries to build the AlgebraicExpression for one defining constraint.
@@ -2911,12 +3008,14 @@ proc detectReifChannels(tr: var FznTranslator) =
     if xArg.kind != FznIdent:
       continue
     # x must resolve to a position (not a defined variable with no position)
-    if xArg.ident in tr.definedVarNames:
+    # Exception: element channel aliases resolve to a single channel position
+    if xArg.ident in tr.definedVarNames and xArg.ident notin tr.elementChannelAliases:
       continue
 
     # For var-to-var case, verify args[1] is also a positioned variable
     let valArg = con.args[1]
-    if valArg.kind == FznIdent and valArg.ident in tr.definedVarNames:
+    if valArg.kind == FznIdent and valArg.ident in tr.definedVarNames and
+       valArg.ident notin tr.elementChannelAliases:
       continue
 
     tr.channelVarNames.incl(bName)
@@ -3078,10 +3177,13 @@ proc detectReifChannels(tr: var FznTranslator) =
     let arg1 = con.args[1]
 
     # Check arg0: must be constant, channel var, or positioned variable (not defined var)
-    if arg0.kind == FznIdent and arg0.ident in tr.definedVarNames:
+    # Exception: element channel aliases resolve to a channel position
+    if arg0.kind == FznIdent and arg0.ident in tr.definedVarNames and
+       arg0.ident notin tr.elementChannelAliases:
       continue
     # Check arg1: must be constant, channel var, or positioned variable (not defined var)
-    if arg1.kind == FznIdent and arg1.ident in tr.definedVarNames:
+    if arg1.kind == FznIdent and arg1.ident in tr.definedVarNames and
+       arg1.ident notin tr.elementChannelAliases:
       continue
 
     tr.channelVarNames.incl(bName)
@@ -4682,6 +4784,287 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
                      &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc detectConditionalGainChannels(tr: var FznTranslator) =
+  ## Detects variables that are conditionally a linear function of element channels
+  ## or zero, where the conditions are also element-channel-derived. Converts them
+  ## to element channels with precomputed lookup tables.
+  ##
+  ## Pattern (per gain variable V):
+  ##   int_eq_reif(V, 0, B_zero) :: defines_var(B_zero)
+  ##   int_lin_eq_reif(coeffs, [V, W], rhs, B_eq) :: defines_var(B_eq)
+  ##   bool_clause([B_eq], [cond1, cond2, ...])
+  ##   bool_clause([cond_and_or_cond, B_zero], [])
+  ## where W is an element channel and conditions are int_le_reif of element channels,
+  ## all sharing the same index (origin) variable.
+
+  # Step 1: Find int_eq_reif(V, 0, B_zero) patterns
+  # These may already be consumed by reif channel detection, but we scan all constraints.
+  var zeroReifVars: Table[string, tuple[ci: int, boolVar: string]]
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name == "int_eq_reif" and con.args.len >= 3:
+      if con.args[0].kind == FznIdent and
+         con.args[1].kind == FznIntLit and con.args[1].intVal == 0 and
+         con.args[2].kind == FznIdent:
+        let v = con.args[0].ident
+        if v notin tr.channelVarNames and v notin tr.definedVarNames:
+          zeroReifVars[v] = (ci, con.args[2].ident)
+
+  if zeroReifVars.len == 0:
+    return
+
+  # Step 2: Find matching int_lin_eq_reif with 2 variables (one is V, other is a channel)
+  type LinEqReifInfo = object
+    ci: int
+    gainVar: string
+    otherVar: string
+    gainCoeff: int
+    otherCoeff: int
+    rhs: int
+    boolVar: string
+
+  var linEqReifs: Table[string, LinEqReifInfo]
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_eq_reif" or con.args.len < 4: continue
+    if not con.hasAnnotation("defines_var"): continue
+
+    let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+    if coeffs.len != 2: continue
+
+    let vars = con.args[1]
+    if vars.kind != FznArrayLit or vars.elems.len != 2: continue
+    if vars.elems[0].kind != FznIdent or vars.elems[1].kind != FznIdent: continue
+
+    let var0 = vars.elems[0].ident
+    let var1 = vars.elems[1].ident
+    let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+    if con.args[3].kind != FznIdent: continue
+    let boolVar = con.args[3].ident
+
+    # The "other" variable must be a channel or element channel alias
+    let isVar0Channel = var0 in tr.channelVarNames or var0 in tr.elementChannelAliases
+    let isVar1Channel = var1 in tr.channelVarNames or var1 in tr.elementChannelAliases
+
+    if var0 in zeroReifVars and isVar1Channel:
+      linEqReifs[var0] = LinEqReifInfo(ci: ci, gainVar: var0, otherVar: var1,
+                                        gainCoeff: coeffs[0], otherCoeff: coeffs[1],
+                                        rhs: rhs, boolVar: boolVar)
+    elif var1 in zeroReifVars and isVar0Channel:
+      linEqReifs[var1] = LinEqReifInfo(ci: ci, gainVar: var1, otherVar: var0,
+                                        gainCoeff: coeffs[1], otherCoeff: coeffs[0],
+                                        rhs: rhs, boolVar: boolVar)
+
+  if linEqReifs.len == 0:
+    return
+
+  # Step 3: Index bool_clause constraints by positive literals
+  type BoolClauseInfo = object
+    ci: int
+    posLits: seq[string]
+    negLits: seq[string]
+
+  var boolClausesByPosLit: Table[string, seq[BoolClauseInfo]]
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause" or con.args.len < 2: continue
+
+    var info = BoolClauseInfo(ci: ci)
+    if con.args[0].kind == FznArrayLit:
+      for elem in con.args[0].elems:
+        if elem.kind == FznIdent:
+          info.posLits.add(elem.ident)
+    if con.args[1].kind == FznArrayLit:
+      for elem in con.args[1].elems:
+        if elem.kind == FznIdent:
+          info.negLits.add(elem.ident)
+
+    for lit in info.posLits:
+      if lit notin boolClausesByPosLit:
+        boolClausesByPosLit[lit] = @[]
+      boolClausesByPosLit[lit].add(info)
+
+  # Step 4: Index int_le_reif definitions by their boolean output variable
+  type LeReifInfo = object
+    leftVar: string
+    leftConst: int
+    rightVar: string
+    rightConst: int
+    isLeftConst: bool
+    isRightConst: bool
+
+  var leReifByBool: Table[string, LeReifInfo]
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name notin ["int_le_reif", "int_lt_reif"] or con.args.len < 3: continue
+    if con.args[2].kind != FznIdent: continue
+    let boolVar = con.args[2].ident
+
+    var info: LeReifInfo
+    if con.args[0].kind == FznIdent:
+      info.leftVar = con.args[0].ident
+    elif con.args[0].kind == FznIntLit:
+      info.leftConst = con.args[0].intVal
+      info.isLeftConst = true
+    else: continue
+
+    if con.args[1].kind == FznIdent:
+      info.rightVar = con.args[1].ident
+    elif con.args[1].kind == FznIntLit:
+      info.rightConst = con.args[1].intVal
+      info.isRightConst = true
+    else: continue
+
+    leReifByBool[boolVar] = info
+
+  # Step 5: Build element channel info: channel var name -> (origin var, constant array)
+  type ElementInfo = object
+    originVar: string
+    constArray: seq[int]
+
+  var elementInfo: Table[string, ElementInfo]
+  for ci, chanName in tr.channelConstraints:
+    let con = tr.model.constraints[ci]
+    if con.args[0].kind == FznIdent:
+      try:
+        let constArray = tr.resolveIntArray(con.args[1])
+        elementInfo[chanName] = ElementInfo(originVar: con.args[0].ident, constArray: constArray)
+      except ValueError, KeyError: discard
+
+  for aliasName, originalName in tr.elementChannelAliases:
+    if originalName in elementInfo:
+      elementInfo[aliasName] = elementInfo[originalName]
+
+  # Step 6: Process each gain variable
+  var nConverted = 0
+  var consumedBoolClauses: PackedSet[int]
+
+  for gainVar, info in linEqReifs:
+    let zeroInfo = zeroReifVars[gainVar]
+    let bEq = info.boolVar
+    let bZero = zeroInfo.boolVar
+
+    # Find conditional bool_clause: bool_clause([B_eq], [cond1, cond2, ...])
+    if bEq notin boolClausesByPosLit: continue
+    var condClause: BoolClauseInfo
+    var foundCond = false
+    for bc in boolClausesByPosLit[bEq]:
+      if bc.posLits.len == 1 and bc.negLits.len > 0:
+        condClause = bc
+        foundCond = true
+        break
+    if not foundCond: continue
+
+    # Find complementary bool_clause: bool_clause([..., B_zero], [])
+    if bZero notin boolClausesByPosLit: continue
+    var compClause: BoolClauseInfo
+    var foundComp = false
+    for bc in boolClausesByPosLit[bZero]:
+      if bc.negLits.len == 0:
+        compClause = bc
+        foundComp = true
+        break
+    if not foundComp: continue
+
+    # Extract conditions from negative literals of the conditional clause
+    type ConditionInfo = object
+      channelVar: string
+      threshold: int
+      isLessEqual: bool  # true: channel <= threshold, false: channel >= threshold
+
+    var conditions: seq[ConditionInfo]
+    var allConditionsTraced = true
+    for condBool in condClause.negLits:
+      if condBool notin leReifByBool:
+        allConditionsTraced = false
+        break
+      let leInfo = leReifByBool[condBool]
+      if leInfo.isLeftConst and not leInfo.isRightConst:
+        # int_le_reif(constant, channel, bool) → channel >= constant
+        conditions.add(ConditionInfo(channelVar: leInfo.rightVar, threshold: leInfo.leftConst, isLessEqual: false))
+      elif not leInfo.isLeftConst and leInfo.isRightConst:
+        # int_le_reif(channel, constant, bool) → channel <= constant
+        conditions.add(ConditionInfo(channelVar: leInfo.leftVar, threshold: leInfo.rightConst, isLessEqual: true))
+      else:
+        allConditionsTraced = false
+        break
+    if not allConditionsTraced: continue
+
+    # Trace price channel (W) to element info (may be alias)
+    let otherVar = if info.otherVar in tr.elementChannelAliases:
+                     tr.elementChannelAliases[info.otherVar]
+                   else: info.otherVar
+    if otherVar notin elementInfo: continue
+    let priceElem = elementInfo[otherVar]
+    let originVar = priceElem.originVar
+    let arrayLen = priceElem.constArray.len
+
+    # Trace condition channels and verify all share the same origin
+    type CondEval = object
+      constArray: seq[int]
+      threshold: int
+      isLessEqual: bool
+
+    var condEvals: seq[CondEval]
+    var allSameOrigin = true
+    for cond in conditions:
+      # Resolve alias if needed
+      let condChanVar = if cond.channelVar in tr.elementChannelAliases:
+                          tr.elementChannelAliases[cond.channelVar]
+                        else: cond.channelVar
+      if condChanVar notin elementInfo:
+        allSameOrigin = false
+        break
+      let condElem = elementInfo[condChanVar]
+      if condElem.originVar != originVar or condElem.constArray.len != arrayLen:
+        allSameOrigin = false
+        break
+      condEvals.add(CondEval(constArray: condElem.constArray, threshold: cond.threshold,
+                              isLessEqual: cond.isLessEqual))
+    if not allSameOrigin: continue
+
+    # Compute the lookup table
+    if info.gainCoeff == 0: continue
+    var lookupTable = newSeq[int](arrayLen)
+    for v in 0..<arrayLen:
+      var conditionsMet = true
+      for ce in condEvals:
+        let val = ce.constArray[v]
+        if ce.isLessEqual:
+          if val > ce.threshold:
+            conditionsMet = false
+            break
+        else:
+          if val < ce.threshold:
+            conditionsMet = false
+            break
+
+      if conditionsMet:
+        let price = priceElem.constArray[v]
+        let numerator = info.rhs - info.otherCoeff * price
+        lookupTable[v] = numerator div info.gainCoeff
+      # else: lookupTable[v] = 0 (default)
+
+    # Convert gain variable to element channel
+    tr.channelVarNames.incl(gainVar)
+    tr.definedVarNames.excl(gainVar)
+    tr.syntheticElementChannels.add((gainVar, originVar, lookupTable))
+
+    # Consume constraints
+    tr.definingConstraints.incl(info.ci)  # int_lin_eq_reif
+    tr.definingConstraints.incl(condClause.ci)
+    consumedBoolClauses.incl(condClause.ci)
+    tr.definingConstraints.incl(compClause.ci)
+    consumedBoolClauses.incl(compClause.ci)
+
+    nConverted += 1
+
+  if nConverted > 0:
+    stderr.writeLine(&"[FZN] Converted {nConverted} conditional gain variables to element channels")
+
+
 proc detectDisjunctivePairs(tr: var FznTranslator) =
   ## Detects disjunctive pair patterns:
   ##   int_lin_le_reif(coeffs1, vars1, rhs1, b1) :: defines_var(b1)
@@ -5683,6 +6066,38 @@ proc buildChannelBindings(tr: var FznTranslator) =
   if tr.sys.baseArray.channelBindings.len > 0:
     stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
+proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
+  ## Builds element channel bindings for synthetic channels (precomputed lookup tables
+  ## from detectConditionalGainChannels).
+  for syn in tr.syntheticElementChannels:
+    if syn.varName notin tr.varPositions:
+      continue
+    let channelPos = tr.varPositions[syn.varName]
+
+    if syn.originVar notin tr.varPositions:
+      continue
+    let originPos = tr.varPositions[syn.originVar]
+    let indexExpr = tr.getExpr(originPos) - 1  # FZN is 1-based
+
+    var arrayElems: seq[ArrayElement[int]]
+    for v in syn.lookupTable:
+      arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+    let binding = ChannelBinding[int](
+      channelPosition: channelPos,
+      indexExpression: indexExpr,
+      arrayElements: arrayElems
+    )
+    let bindingIdx = tr.sys.baseArray.channelBindings.len
+    tr.sys.baseArray.channelBindings.add(binding)
+    tr.sys.baseArray.channelPositions.incl(channelPos)
+
+    for pos in indexExpr.positions.items:
+      if pos notin tr.sys.baseArray.channelsAtPosition:
+        tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+      else:
+        tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
   ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
   ## constraints with defines_var annotations. Must be called after buildDefinedExpressions
@@ -6575,6 +6990,7 @@ proc translate*(model: FznModel): FznTranslator =
   result.objectivePos = ObjPosNone
   result.objectiveLoBound = low(int)
   result.objectiveHiBound = high(int)
+  result.elementChannelAliases = initTable[string, string]()
   result.equalityCopyAliases = initTable[string, string]()
   result.equalityCopyReifCIs = initPackedSet[int]()
   result.setVarBoolPositions = initTable[string, SetVarInfo]()
@@ -6604,6 +7020,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectCaseAnalysisChannels()
   # Detect implication-to-table and one-hot channel patterns
   result.detectImplicationPatterns()
+  # Detect conditional gain patterns (reified value assignment → element channel)
+  result.detectConditionalGainChannels()
   # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
   result.detectDisjunctivePairs()
   # Detect disjunctive resource groups (cliques of pairs → cumulative)
@@ -6617,6 +7035,12 @@ proc translate*(model: FznModel): FznTranslator =
   result.translateVariables()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
+  # Build expressions for element channel aliases (duplicate → original channel's position)
+  for aliasName, originalName in result.elementChannelAliases:
+    if originalName in result.varPositions:
+      result.definedVarExprs[aliasName] = result.getExpr(result.varPositions[originalName])
+    elif originalName in result.definedVarExprs:
+      result.definedVarExprs[aliasName] = result.definedVarExprs[originalName]
   # Build expressions for equality copy aliases (copy → original's expression)
   for copyName, originalName in result.equalityCopyAliases:
     if originalName in result.varPositions:
@@ -6684,6 +7108,10 @@ proc translate*(model: FznModel): FznTranslator =
   for varName, bounds in result.definedVarBounds:
     if varName in result.definedVarExprs:
       let expr = result.definedVarExprs[varName]
+      # Skip bounds on element channel aliases (same range as original channel)
+      if varName in result.elementChannelAliases:
+        nBoundsSkipped += 2
+        continue
       # Skip bounds on min/max channel input variables
       if varName in minMaxInputNames:
         nChannelBoundsSkipped += 2
@@ -7083,6 +7511,8 @@ proc translate*(model: FznModel): FznTranslator =
 
   # Build channel bindings for element defines_var
   result.buildChannelBindings()
+  # Build channel bindings for synthetic element channels (conditional gain variables)
+  result.buildSyntheticElementChannelBindings()
   # Build channel bindings for int_eq_reif/bool2int reification channels
   result.buildReifChannelBindings()
   # Build channel bindings for array_bool_and/or with defines_var

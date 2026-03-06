@@ -134,3 +134,26 @@ suite "Optimization with objective bounds":
 
         check vals.len == n  # allDifferent
         check actualSum == 6  # 1+2+3
+
+    test "minimize with negative optimal value":
+        # 3 variables in {1..10}, allDifferent.
+        # Objective: x[0] - x[1] - x[2]
+        # Minimum is 1 - 10 - 9 = -18 (x[0]=1, x[1]=10, x[2]=9)
+        # Previously, binary search lo defaulted to 0, so negative
+        # optima were unreachable.
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..10))
+        sys.addConstraint(allDifferent(x))
+
+        let total = x[0] - x[1] - x[2]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000)
+
+        let solution = x.assignment
+        let objVal = solution[0] - solution[1] - solution[2]
+        let vals = toHashSet(solution)
+
+        check vals.len == n  # allDifferent
+        check objVal == -18  # 1 - 10 - 9
