@@ -2436,9 +2436,32 @@ proc collectDefinedVars(tr: var FznTranslator) =
     stderr.writeLine(&"[FZN] Deduplicated {nElementAliases} element channels (shared index+array)")
 
   # Dead element channel elimination: detect element channel variables that
-  # are not referenced by any non-defining constraint. These are "dead" channels
-  # (e.g., stock lookups when symmetry breaking is disabled) and can be eliminated.
+  # are not referenced by any constraint other than their own defining constraint.
+  # These are "dead" channels (e.g., stock lookups when symmetry breaking is disabled)
+  # and can be eliminated.
   block:
+    # Collect variable references per constraint (excluding only the channel's own
+    # defining constraint, not all defining constraints — other defining constraints
+    # like the objective's int_lin_eq may reference channels that must be kept alive).
+    # Build a set of all variable references from non-defining constraints,
+    # PLUS references from defining constraints that define OTHER variables.
+    # For each element channel, it's "dead" only if no constraint other than its
+    # own defining constraint references it.
+
+    # First: build per-constraint reference sets for defining constraints
+    var definingRefs: Table[int, HashSet[string]]
+    for ci in tr.definingConstraints:
+      let con = tr.model.constraints[ci]
+      var refs = initHashSet[string]()
+      for arg in con.args:
+        if arg.kind == FznIdent:
+          refs.incl(arg.ident)
+        elif arg.kind == FznArrayLit:
+          for elem in arg.elems:
+            if elem.kind == FznIdent:
+              refs.incl(elem.ident)
+      definingRefs[ci] = refs
+
     # Collect all variable references from non-defining constraints
     var referencedVars = initHashSet[string]()
     for ci, con in tr.model.constraints:
@@ -2471,14 +2494,34 @@ proc collectDefinedVars(tr: var FznTranslator) =
       aliasesOf[originalName].add(aliasName)
 
     # Check each element channel: if neither it nor any alias is referenced, eliminate it
+    # A channel is referenced if:
+    #   1. It appears in a non-defining constraint, OR
+    #   2. It appears in a defining constraint OTHER than its own
     var nDeadChannels = 0
     var deadCIs: seq[int] = @[]
     for ci, chanName in tr.channelConstraints:
       var isReferenced = chanName in referencedVars
-      if not isReferenced and chanName in aliasesOf:
-        for aliasName in aliasesOf[chanName]:
-          if aliasName in referencedVars:
+      if not isReferenced:
+        # Check aliases
+        if chanName in aliasesOf:
+          for aliasName in aliasesOf[chanName]:
+            if aliasName in referencedVars:
+              isReferenced = true
+              break
+      if not isReferenced:
+        # Check if any OTHER defining constraint references this channel
+        for defCi, refs in definingRefs:
+          if defCi == ci:
+            continue  # skip own defining constraint
+          if chanName in refs:
             isReferenced = true
+            break
+          if not isReferenced and chanName in aliasesOf:
+            for aliasName in aliasesOf[chanName]:
+              if aliasName in refs:
+                isReferenced = true
+                break
+          if isReferenced:
             break
       if not isReferenced:
         # Dead channel: convert to defined var (no position needed)
@@ -3677,45 +3720,65 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let val = if valArg.kind == FznIntLit: valArg.intVal
                 else: tr.paramValues[valArg.ident]
       let xExpr = tr.resolveExprArg(xArg)
-      let domain = tr.lookupVarDomain(xArg.ident)
+      # Use the actual domain of the resolved position (not the FZN declaration domain)
+      # because resolveExprArg may resolve through definedVarExprs to a different position.
+      let xPositions = toSeq(xExpr.positions.items)
+      let domain = if xPositions.len == 1:
+                     tr.sys.baseArray.domain[xPositions[0]].sorted()
+                   else:
+                     tr.lookupVarDomain(xArg.ident)
       if domain.len == 0:
         skippedReifCIs.incl(ci)
         continue
-      # Guard against huge 1D tables
-      if domain.len > 100_000:
+      let lo = domain[0]
+      let hi = domain[^1]
+      # Guard against huge 1D tables (use range, not domain size, since we fill gaps)
+      if hi - lo + 1 > 100_000:
         skippedReifCIs.incl(ci)
         continue
-      let lo = domain[0]  # domain is sorted
 
       indexExpr = xExpr - lo
-      for v in domain:
+      # Build table for full range lo..hi (not just domain values) so index = x - lo works
+      for v in lo..hi:
         arrayElems.add(ArrayElement[int](isConstant: true,
             constantValue: if (v == val) == isEq: 1 else: 0))
 
     elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
-      # Variable val: b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
+      # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
       let xExpr = tr.resolveExprArg(xArg)
       let yExpr = tr.resolveExprArg(valArg)
-      let domainX = tr.lookupVarDomain(xArg.ident)
-      let domainY = tr.lookupVarDomain(valArg.ident)
+      # Use actual domain of resolved positions (not FZN declaration domain)
+      let xPositions = toSeq(xExpr.positions.items)
+      let yPositions = toSeq(yExpr.positions.items)
+      let domainX = if xPositions.len == 1:
+                      tr.sys.baseArray.domain[xPositions[0]].sorted()
+                    else:
+                      tr.lookupVarDomain(xArg.ident)
+      let domainY = if yPositions.len == 1:
+                      tr.sys.baseArray.domain[yPositions[0]].sorted()
+                    else:
+                      tr.lookupVarDomain(valArg.ident)
       if domainX.len == 0 or domainY.len == 0:
         skippedReifCIs.incl(ci)
         continue
-      # Guard against huge 2D tables
-      if domainX.len > 10_000 or domainY.len > 10_000 or
-         domainX.len * domainY.len > 100_000:
+      let loX = domainX[0]
+      let hiX = domainX[^1]
+      let loY = domainY[0]
+      let hiY = domainY[^1]
+      let rangeX = hiX - loX + 1
+      let rangeY = hiY - loY + 1
+      # Guard against huge 2D tables (use ranges, not domain sizes, since we fill gaps)
+      if rangeX > 10_000 or rangeY > 10_000 or
+         rangeX * rangeY > 100_000:
         skippedReifCIs.incl(ci)
         continue
-      let loX = domainX[0]
-      let loY = domainY[0]
-      let sizeY = domainY.len
 
-      # index = (x - lo_x) * size_y + (y - lo_y)
-      indexExpr = (xExpr - loX) * sizeY + (yExpr - loY)
+      # index = (x - lo_x) * range_y + (y - lo_y)
+      indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
 
-      # Build 2D equality table (row-major: x varies in outer loop, y in inner)
-      for vx in domainX:
-        for vy in domainY:
+      # Build 2D equality table for full ranges (row-major: x varies in outer loop, y in inner)
+      for vx in loX..hiX:
+        for vy in loY..hiY:
           arrayElems.add(ArrayElement[int](isConstant: true,
               constantValue: if (vx == vy) == isEq: 1 else: 0))
     else:
@@ -3861,15 +3924,24 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
     let setAsHashSet = toHashSet(setValues)
 
     let xExpr = tr.resolveExprArg(xArg)
-    let domain = tr.lookupVarDomain(xArg.ident)
-    if domain.len == 0 or domain.len > 100_000:
+    # Use the actual domain of the resolved position (not the FZN declaration domain)
+    let xPositions = toSeq(xExpr.positions.items)
+    let domain = if xPositions.len == 1:
+                   tr.sys.baseArray.domain[xPositions[0]].sorted()
+                 else:
+                   tr.lookupVarDomain(xArg.ident)
+    if domain.len == 0:
       continue
-    let lo = domain[0]  # domain is sorted
+    let lo = domain[0]
+    let hi = domain[^1]
+    # Guard against huge tables (use range, not domain size)
+    if hi - lo + 1 > 100_000:
+      continue
 
-    # b = element(x - lo, [1 if v in S else 0 for v in domain])
+    # b = element(x - lo, [1 if v in S else 0 for v in lo..hi])
     let indexExpr = xExpr - lo
     var arrayElems: seq[ArrayElement[int]]
-    for v in domain:
+    for v in lo..hi:
       arrayElems.add(ArrayElement[int](isConstant: true,
           constantValue: if v in setAsHashSet: 1 else: 0))
 
@@ -3913,13 +3985,21 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let c = if arg0.kind == FznIntLit: arg0.intVal
               else: tr.paramValues[arg0.ident]
       let xExpr = tr.resolveExprArg(arg1)
-      let domain = tr.lookupVarDomain(arg1.ident)
-      if domain.len == 0 or domain.len > 100_000:
+      let xPositions = toSeq(xExpr.positions.items)
+      let domain = if xPositions.len == 1:
+                     tr.sys.baseArray.domain[xPositions[0]].sorted()
+                   else:
+                     tr.lookupVarDomain(arg1.ident)
+      if domain.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
       let lo = domain[0]
+      let hi = domain[^1]
+      if hi - lo + 1 > 100_000:
+        skippedLeReifCIs.incl(ci)
+        continue
       indexExpr = xExpr - lo
-      for v in domain:
+      for v in lo..hi:
         let cmp = if isLe: (c <= v) else: (c < v)
         arrayElems.add(ArrayElement[int](isConstant: true,
             constantValue: if cmp: 1 else: 0))
@@ -3929,13 +4009,21 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let c = if arg1.kind == FznIntLit: arg1.intVal
               else: tr.paramValues[arg1.ident]
       let xExpr = tr.resolveExprArg(arg0)
-      let domain = tr.lookupVarDomain(arg0.ident)
-      if domain.len == 0 or domain.len > 100_000:
+      let xPositions = toSeq(xExpr.positions.items)
+      let domain = if xPositions.len == 1:
+                     tr.sys.baseArray.domain[xPositions[0]].sorted()
+                   else:
+                     tr.lookupVarDomain(arg0.ident)
+      if domain.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
       let lo = domain[0]
+      let hi = domain[^1]
+      if hi - lo + 1 > 100_000:
+        skippedLeReifCIs.incl(ci)
+        continue
       indexExpr = xExpr - lo
-      for v in domain:
+      for v in lo..hi:
         let cmp = if isLe: (v <= c) else: (v < c)
         arrayElems.add(ArrayElement[int](isConstant: true,
             constantValue: if cmp: 1 else: 0))
@@ -3944,23 +4032,36 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
       let xExpr = tr.resolveExprArg(arg0)
       let yExpr = tr.resolveExprArg(arg1)
+      let xPoss = toSeq(xExpr.positions.items)
+      let yPoss = toSeq(yExpr.positions.items)
       let xName = if arg0.kind == FznIdent: arg0.ident else: ""
       let yName = if arg1.kind == FznIdent: arg1.ident else: ""
-      let domainX = if xName.len > 0: tr.lookupVarDomain(xName) else: @[]
-      let domainY = if yName.len > 0: tr.lookupVarDomain(yName) else: @[]
+      let domainX = if xPoss.len == 1:
+                      tr.sys.baseArray.domain[xPoss[0]].sorted()
+                    elif xName.len > 0:
+                      tr.lookupVarDomain(xName)
+                    else: @[]
+      let domainY = if yPoss.len == 1:
+                      tr.sys.baseArray.domain[yPoss[0]].sorted()
+                    elif yName.len > 0:
+                      tr.lookupVarDomain(yName)
+                    else: @[]
       if domainX.len == 0 or domainY.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
-      if domainX.len > 10_000 or domainY.len > 10_000 or
-         domainX.len * domainY.len > 100_000:
+      let loX = domainX[0]
+      let hiX = domainX[^1]
+      let loY = domainY[0]
+      let hiY = domainY[^1]
+      let rangeX = hiX - loX + 1
+      let rangeY = hiY - loY + 1
+      if rangeX > 10_000 or rangeY > 10_000 or
+         rangeX * rangeY > 100_000:
         skippedLeReifCIs.incl(ci)
         continue
-      let loX = domainX[0]
-      let loY = domainY[0]
-      let sizeY = domainY.len
-      indexExpr = (xExpr - loX) * sizeY + (yExpr - loY)
-      for vx in domainX:
-        for vy in domainY:
+      indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
+      for vx in loX..hiX:
+        for vy in loY..hiY:
           let cmp = if isLe: (vx <= vy) else: (vx < vy)
           arrayElems.add(ArrayElement[int](isConstant: true,
               constantValue: if cmp: 1 else: 0))
@@ -5237,14 +5338,16 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
     let indicatorPos = tr.varPositions[indicatorVar]
     let intPos = tr.varPositions[intVar]
     let intExpr = tr.getExpr(intPos)
-    let domain = tr.lookupVarDomain(intVar)
+    let domain = tr.sys.baseArray.domain[intPos].sorted()
     if domain.len == 0: continue
 
     let lo = domain[0]
+    let hi = domain[^1]
+    if hi - lo + 1 > 100_000: continue
     let indexExpr = intExpr - lo
 
     var arrayElems: seq[ArrayElement[int]]
-    for v in domain:
+    for v in lo..hi:
       arrayElems.add(ArrayElement[int](isConstant: true,
           constantValue: if v == value: 1 else: 0))
 

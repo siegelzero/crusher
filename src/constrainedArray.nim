@@ -2842,6 +2842,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                 if not chSkipped and not keySkipped:
                     # Forward: domain(ch) ∩= {lookup[eval(v)] : v ∈ domain(keyPos), eval(v) ∈ bounds}
+                    if currentDomain[keyPos].len == 0 or currentDomain[chPos].len == 0:
+                        continue
                     var reachableValues = initPackedSet[T]()
                     for v in currentDomain[keyPos].items:
                         tempAssign[keyPos] = v
@@ -2866,6 +2868,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                 elif chSkipped and not keySkipped:
                     # Channel position skipped: use domainMin/domainMax bounds for feasibility
+                    if currentDomain[keyPos].len == 0:
+                        continue
                     for v in toSeq(currentDomain[keyPos].items):
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
@@ -2915,6 +2919,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     continue
 
                 if not p0Skipped and not p1Skipped and not chSkipped:
+                    # Skip if any participating domain is already empty (infeasibility cascading)
+                    if currentDomain[p0].len == 0 or currentDomain[p1].len == 0 or currentDomain[chPos].len == 0:
+                        continue
+
                     var tempAssign = initTable[int, T]()
                     let oldP0 = currentDomain[p0].len
                     let oldP1 = currentDomain[p1].len
@@ -2970,6 +2978,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     cbPruned += prunedP0 + prunedP1 + prunedCh
 
                 elif chSkipped and not p0Skipped and not p1Skipped:
+                    # Skip if any participating domain is already empty
+                    if currentDomain[p0].len == 0 or currentDomain[p1].len == 0:
+                        continue
+
                     # Channel skipped: use domainMin/domainMax for feasibility
                     var tempAssign = initTable[int, T]()
 
