@@ -2516,7 +2516,7 @@ proc collectDefinedVars(tr: var FznTranslator) =
           if chanName in refs:
             isReferenced = true
             break
-          if not isReferenced and chanName in aliasesOf:
+          if chanName in aliasesOf:
             for aliasName in aliasesOf[chanName]:
               if aliasName in refs:
                 isReferenced = true
@@ -3649,6 +3649,17 @@ proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
         return @[]
   return @[]
 
+proc resolveActualDomain(tr: FznTranslator, expr: AlgebraicExpression[int],
+                         identName: string): seq[int] =
+  ## Resolve the actual domain for an expression. If it maps to a single position,
+  ## use the base array's domain (which reflects aliasing). Otherwise fall back to
+  ## the FZN declaration domain via lookupVarDomain.
+  let positions = toSeq(expr.positions.items)
+  if positions.len == 1:
+    return tr.sys.baseArray.domain[positions[0]].sorted()
+  else:
+    return tr.lookupVarDomain(identName)
+
 
 proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
                            defs: var seq[int], label: string) =
@@ -3720,25 +3731,17 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let val = if valArg.kind == FznIntLit: valArg.intVal
                 else: tr.paramValues[valArg.ident]
       let xExpr = tr.resolveExprArg(xArg)
-      # Use the actual domain of the resolved position (not the FZN declaration domain)
-      # because resolveExprArg may resolve through definedVarExprs to a different position.
-      let xPositions = toSeq(xExpr.positions.items)
-      let domain = if xPositions.len == 1:
-                     tr.sys.baseArray.domain[xPositions[0]].sorted()
-                   else:
-                     tr.lookupVarDomain(xArg.ident)
+      let domain = tr.resolveActualDomain(xExpr, xArg.ident)
       if domain.len == 0:
         skippedReifCIs.incl(ci)
         continue
       let lo = domain[0]
       let hi = domain[^1]
-      # Guard against huge 1D tables (use range, not domain size, since we fill gaps)
       if hi - lo + 1 > 100_000:
         skippedReifCIs.incl(ci)
         continue
 
       indexExpr = xExpr - lo
-      # Build table for full range lo..hi (not just domain values) so index = x - lo works
       for v in lo..hi:
         arrayElems.add(ArrayElement[int](isConstant: true,
             constantValue: if (v == val) == isEq: 1 else: 0))
@@ -3747,17 +3750,8 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
       let xExpr = tr.resolveExprArg(xArg)
       let yExpr = tr.resolveExprArg(valArg)
-      # Use actual domain of resolved positions (not FZN declaration domain)
-      let xPositions = toSeq(xExpr.positions.items)
-      let yPositions = toSeq(yExpr.positions.items)
-      let domainX = if xPositions.len == 1:
-                      tr.sys.baseArray.domain[xPositions[0]].sorted()
-                    else:
-                      tr.lookupVarDomain(xArg.ident)
-      let domainY = if yPositions.len == 1:
-                      tr.sys.baseArray.domain[yPositions[0]].sorted()
-                    else:
-                      tr.lookupVarDomain(valArg.ident)
+      let domainX = tr.resolveActualDomain(xExpr, xArg.ident)
+      let domainY = tr.resolveActualDomain(yExpr, valArg.ident)
       if domainX.len == 0 or domainY.len == 0:
         skippedReifCIs.incl(ci)
         continue
@@ -3900,6 +3894,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
   # Process set_in_reif channels
+  var skippedSetInReifCIs: HashSet[int]
   for ci in tr.setInReifChannelDefs:
     let con = tr.model.constraints[ci]
     let bName = con.args[2].ident
@@ -3924,18 +3919,14 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
     let setAsHashSet = toHashSet(setValues)
 
     let xExpr = tr.resolveExprArg(xArg)
-    # Use the actual domain of the resolved position (not the FZN declaration domain)
-    let xPositions = toSeq(xExpr.positions.items)
-    let domain = if xPositions.len == 1:
-                   tr.sys.baseArray.domain[xPositions[0]].sorted()
-                 else:
-                   tr.lookupVarDomain(xArg.ident)
+    let domain = tr.resolveActualDomain(xExpr, xArg.ident)
     if domain.len == 0:
+      skippedSetInReifCIs.incl(ci)
       continue
     let lo = domain[0]
     let hi = domain[^1]
-    # Guard against huge tables (use range, not domain size)
     if hi - lo + 1 > 100_000:
+      skippedSetInReifCIs.incl(ci)
       continue
 
     # b = element(x - lo, [1 if v in S else 0 for v in lo..hi])
@@ -3959,6 +3950,8 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
       else:
         tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+  tr.unchannelSkippedReifs(skippedSetInReifCIs, tr.setInReifChannelDefs, "set_in_reif")
 
   # Process int_le_reif / int_lt_reif channels
   var skippedLeReifCIs: HashSet[int]
@@ -3985,11 +3978,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let c = if arg0.kind == FznIntLit: arg0.intVal
               else: tr.paramValues[arg0.ident]
       let xExpr = tr.resolveExprArg(arg1)
-      let xPositions = toSeq(xExpr.positions.items)
-      let domain = if xPositions.len == 1:
-                     tr.sys.baseArray.domain[xPositions[0]].sorted()
-                   else:
-                     tr.lookupVarDomain(arg1.ident)
+      let domain = tr.resolveActualDomain(xExpr, arg1.ident)
       if domain.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
@@ -4009,11 +3998,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       let c = if arg1.kind == FznIntLit: arg1.intVal
               else: tr.paramValues[arg1.ident]
       let xExpr = tr.resolveExprArg(arg0)
-      let xPositions = toSeq(xExpr.positions.items)
-      let domain = if xPositions.len == 1:
-                     tr.sys.baseArray.domain[xPositions[0]].sorted()
-                   else:
-                     tr.lookupVarDomain(arg0.ident)
+      let domain = tr.resolveActualDomain(xExpr, arg0.ident)
       if domain.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
@@ -4032,20 +4017,10 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
       # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
       let xExpr = tr.resolveExprArg(arg0)
       let yExpr = tr.resolveExprArg(arg1)
-      let xPoss = toSeq(xExpr.positions.items)
-      let yPoss = toSeq(yExpr.positions.items)
       let xName = if arg0.kind == FznIdent: arg0.ident else: ""
       let yName = if arg1.kind == FznIdent: arg1.ident else: ""
-      let domainX = if xPoss.len == 1:
-                      tr.sys.baseArray.domain[xPoss[0]].sorted()
-                    elif xName.len > 0:
-                      tr.lookupVarDomain(xName)
-                    else: @[]
-      let domainY = if yPoss.len == 1:
-                      tr.sys.baseArray.domain[yPoss[0]].sorted()
-                    elif yName.len > 0:
-                      tr.lookupVarDomain(yName)
-                    else: @[]
+      let domainX = tr.resolveActualDomain(xExpr, xName)
+      let domainY = tr.resolveActualDomain(yExpr, yName)
       if domainX.len == 0 or domainY.len == 0:
         skippedLeReifCIs.incl(ci)
         continue
