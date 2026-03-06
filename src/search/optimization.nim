@@ -2,6 +2,19 @@
 import resolution
 from std/times import epochTime
 from std/math import ceil
+
+const BoundFloor = low(int) div 2
+const BoundCeil = high(int) div 2
+
+proc safeLowerBound(v: int): int {.inline.} =
+    ## Compute a heuristic lower bound well below v, without overflow.
+    if v <= BoundFloor: v
+    else: min(0, v - abs(v) - 1)
+
+proc safeUpperBound(v: int): int {.inline.} =
+    ## Compute a heuristic upper bound well above v, without overflow.
+    if v >= BoundCeil: v
+    else: max(0, v + abs(v) + 1)
 import ../expressions/expressions
 import ../expressions/stateful
 import ../expressions/sumExpression
@@ -109,12 +122,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         # Binary search bounds
         when direction == Minimize:
-            var lo = if lowerBound != low(int): lowerBound else: min(0, currentCost - abs(currentCost) - 1)
+            var lo = if lowerBound != low(int): lowerBound else: safeLowerBound(currentCost)
             var hi = currentCost - 1
             var loProven = lowerBound != low(int)  # only proven if user-provided or domain-derived
         else:
             var lo = currentCost + 1
-            var hi = if upperBound != high(int): upperBound else: max(0, currentCost + abs(currentCost) + 1)
+            var hi = if upperBound != high(int): upperBound else: safeUpperBound(currentCost)
             var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
@@ -218,7 +231,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             break retryLoop
                         else:
                             # lo was a heuristic guess — lower it and keep searching
-                            lo = min(currentCost - abs(currentCost) - 1, lo - abs(lo) - 1)
+                            lo = min(safeLowerBound(currentCost), safeLowerBound(lo))
                 else:
                     if currentCost >= hi:
                         if hiProven:
@@ -226,7 +239,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             break retryLoop
                         else:
                             # hi was a heuristic guess — raise it and keep searching
-                            hi = max(currentCost + abs(currentCost) + 1, hi + abs(hi) + 1)
+                            hi = max(safeUpperBound(currentCost), safeUpperBound(hi))
 
                 if deadline > 0 and epochTime() > deadline:
                     system.searchCompleted = false
