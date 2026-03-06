@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -210,6 +210,35 @@ type
     weightedSameValueConstant*: int
     weightedSameValueObjName*: string
     weightedSameValueExpr*: WeightedSameValueExpression[int]
+    # Detected conditional no-overlap pair patterns
+    conditionalNoOverlapInfos*: seq[tuple[
+      startAName, startBName: string,
+      durationA, durationB: int,
+      resourceAName, resourceBName: string,
+      resourceAFixed, resourceBFixed: int,
+      condAName, condBName: string,
+      consumedCIs: seq[int],
+      consumedVars: seq[string]]]
+    # Detected conditional cumulative patterns (room_admission elimination)
+    conditionalCumulativeInfos*: seq[tuple[
+      fixedTasks: seq[tuple[start, duration, height: int]],
+      conditionalTasks: seq[tuple[admissionVarName, selectionVarName, roomVarName: string,
+                                   duration, height, roomValue, fixedAdmission: int]],
+      limit: int,
+      cumulativeCi: int,
+      consumedElementCIs: seq[int],
+      consumedEqReifCIs: seq[int],
+      consumedBoolClauseCIs: seq[int],
+      consumedRaVarNames: seq[string],
+      consumedBoolVarNames: seq[string]]]
+    # Detected conditional day capacity patterns (H3/H4 surgeon/OT capacity)
+    conditionalDayCapacityInfos*: seq[tuple[
+      tasks: seq[tuple[weight: int, admissionVarName, selectionVarName: string,
+                        extraCondVarName: string, extraCondVal: int]],
+      capacities: seq[int],
+      maxDay: int,
+      consumedCIs: seq[int],
+      consumedVarNames: seq[string]]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
   tr.sys.baseArray[pos]
@@ -3721,6 +3750,19 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
     let xArg = con.args[0]
     let valArg = con.args[1]
 
+    # Skip if source var has been eliminated (e.g., dead element result)
+    var deadSource = false
+    for arg in [xArg, valArg]:
+      if arg.kind == FznIdent and arg.ident in tr.definedVarNames and
+         arg.ident notin tr.varPositions and arg.ident notin tr.definedVarExprs:
+        deadSource = true
+        break
+    if deadSource:
+      # Dead source: mark the bool output as defined to cascade elimination
+      tr.channelVarNames.excl(bName)
+      tr.definedVarNames.incl(bName)
+      continue
+
     var indexExpr: AlgebraicExpression[int]
     var arrayElems: seq[ArrayElement[int]]
 
@@ -3805,6 +3847,15 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
 
     if iName notin tr.varPositions:
       continue
+
+    # Skip if source var is dead (cascade from dead element chain)
+    if bArg.kind == FznIdent and bArg.ident in tr.definedVarNames and
+       bArg.ident notin tr.varPositions and bArg.ident notin tr.definedVarExprs:
+      # Mark the output as defined too to cascade
+      tr.channelVarNames.excl(iName)
+      tr.definedVarNames.incl(iName)
+      continue
+
     let iPos = tr.varPositions[iName]
 
     let bExpr = tr.resolveExprArg(bArg)
@@ -4081,6 +4132,20 @@ proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
     let rName = con.args[1].ident
     if rName notin tr.varPositions:
       continue
+
+    # Check if any input var is dead (cascade from dead element chain)
+    var hasDead = false
+    if con.args[0].kind == FznArrayLit:
+      for elem in con.args[0].elems:
+        if elem.kind == FznIdent and elem.ident in tr.definedVarNames and
+           elem.ident notin tr.varPositions and elem.ident notin tr.definedVarExprs:
+          hasDead = true
+          break
+    if hasDead:
+      tr.channelVarNames.excl(rName)
+      tr.definedVarNames.incl(rName)
+      continue
+
     let rPos = tr.varPositions[rName]
 
     # Build index expression: sum of input expressions
@@ -7339,6 +7404,964 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                      &"{arraySize} inverse positions become channels")
 
 
+proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
+  ## Detects conditional no-overlap pair patterns from room-conflict constraints:
+  ##
+  ## Patient-patient (3+2 or 3+1 bool_clause):
+  ##   int_lin_ne_reif([1,-1], [room_A, room_B], 0, B_ne) :: defines_var(B_ne)
+  ##   int_lin_le_reif([-1,1], [adm_A, adm_B], -stay_B, B_le1) :: defines_var(B_le1)
+  ##   int_lin_le_reif([-1,1], [adm_B, adm_A], -stay_A, B_le2) :: defines_var(B_le2)
+  ##   bool_clause([B_le1, B_le2, B_ne], [sel_A, sel_B])  -- both optional
+  ##   bool_clause([B_le1, B_le2, B_ne], [sel_A])          -- B is mandatory
+  ##
+  ## Occupant-patient (2+1 bool_clause):
+  ##   int_ne_reif(room_A, occ_room, B_ne) :: defines_var(B_ne)
+  ##   int_le_reif(occ_end, adm_A, B_le) :: defines_var(B_le)
+  ##   bool_clause([B_ne, B_le], [sel_A])
+
+  type
+    ConditionalNoOverlapInfo = object
+      startAName, startBName: string
+      durationA, durationB: int
+      resourceAName, resourceBName: string  # "" if fixed
+      resourceAFixed, resourceBFixed: int
+      condAName, condBName: string          # "" if always true
+      consumedCIs: seq[int]                 # constraint indices to consume
+      consumedVars: seq[string]             # intermediate bool vars to eliminate
+
+  # Step 1: Index reification constraints with defines_var
+  type ReifInfo = object
+    ci: int
+    constraintType: string  # "int_lin_ne_reif", "int_lin_le_reif", "int_ne_reif", "int_le_reif"
+    varNames: seq[string]
+    coeffs: seq[int]
+    rhs: int
+
+  var reifByOutputVar: Table[string, ReifInfo]  # output bool var -> info
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    if not con.hasAnnotation("defines_var"): continue
+    let name = stripSolverPrefix(con.name)
+    if name notin ["int_lin_ne_reif", "int_lin_le_reif", "int_ne_reif", "int_le_reif"]: continue
+
+    var info: ReifInfo
+    info.ci = ci
+    info.constraintType = name
+
+    case name
+    of "int_lin_ne_reif":
+      # int_lin_ne_reif(coeffs, vars, rhs, result_bool)
+      if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+      try:
+        info.coeffs = tr.resolveIntArray(con.args[0])
+        let varExprs = tr.resolveVarArrayElems(con.args[1])
+        info.varNames = newSeq[string](varExprs.len)
+        for i, e in varExprs:
+          if e.kind != FznIdent: continue
+          info.varNames[i] = e.ident
+        info.rhs = tr.resolveIntArg(con.args[2])
+      except: continue
+      reifByOutputVar[con.args[3].ident] = info
+
+    of "int_lin_le_reif":
+      # int_lin_le_reif(coeffs, vars, rhs, result_bool)
+      if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+      try:
+        info.coeffs = tr.resolveIntArray(con.args[0])
+        let varExprs = tr.resolveVarArrayElems(con.args[1])
+        info.varNames = newSeq[string](varExprs.len)
+        for i, e in varExprs:
+          if e.kind != FznIdent: continue
+          info.varNames[i] = e.ident
+        info.rhs = tr.resolveIntArg(con.args[2])
+      except: continue
+      reifByOutputVar[con.args[3].ident] = info
+
+    of "int_ne_reif":
+      # int_ne_reif(var, val, result_bool) or int_ne_reif(val, var, result_bool)
+      if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+      info.varNames = @[]
+      info.coeffs = @[]
+      # Extract var and constant
+      if con.args[0].kind == FznIdent and con.args[1].kind == FznIntLit:
+        info.varNames = @[con.args[0].ident]
+        info.rhs = con.args[1].intVal
+      elif con.args[0].kind == FznIntLit and con.args[1].kind == FznIdent:
+        info.varNames = @[con.args[1].ident]
+        info.rhs = con.args[0].intVal
+      else: continue
+      reifByOutputVar[con.args[2].ident] = info
+
+    of "int_le_reif":
+      # int_le_reif(a, b, result_bool) — a <= b
+      if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+      # We need: const <= var (meaning var >= const, i.e., admission >= occ_end)
+      if con.args[0].kind == FznIntLit and con.args[1].kind == FznIdent:
+        info.varNames = @[con.args[1].ident]
+        info.rhs = con.args[0].intVal  # the constant (occ_end)
+      elif con.args[0].kind == FznIdent and con.args[1].kind == FznIntLit:
+        info.varNames = @[con.args[0].ident]
+        info.rhs = con.args[1].intVal
+      else: continue
+      reifByOutputVar[con.args[2].ident] = info
+
+    else: discard
+
+  if reifByOutputVar.len == 0: return
+
+  # Step 2: Scan bool_clause constraints for the no-overlap patterns
+  var nPatientPatient = 0
+  var nOccupantPatient = 0
+  var detected: seq[ConditionalNoOverlapInfo]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+
+    # Extract positive and negative literals
+    var posLits, negLits: seq[string]
+    if con.args[0].kind == FznArrayLit:
+      for e in con.args[0].elems:
+        if e.kind == FznIdent: posLits.add(e.ident)
+    if con.args[1].kind == FznArrayLit:
+      for e in con.args[1].elems:
+        if e.kind == FznIdent: negLits.add(e.ident)
+
+    # Pattern A: 3 positive, 1-2 negative (patient-patient no-overlap)
+    # bool_clause([B_le1, B_le2, B_ne], [sel_A, sel_B]) or [sel_A]
+    if posLits.len == 3 and negLits.len in {1, 2}:
+      # Find which positive lits are lin_le_reif and which is lin_ne_reif
+      var leReifs: seq[ReifInfo]
+      var neReif: ReifInfo
+      var hasNe = false
+      var allFound = true
+
+      for lit in posLits:
+        if lit notin reifByOutputVar:
+          allFound = false
+          break
+        let info = reifByOutputVar[lit]
+        if info.constraintType == "int_lin_le_reif":
+          leReifs.add(info)
+        elif info.constraintType == "int_lin_ne_reif":
+          neReif = info
+          hasNe = true
+        else:
+          allFound = false
+          break
+
+      if allFound and hasNe and leReifs.len == 2:
+        # Validate structure:
+        # neReif: [1,-1], [roomA, roomB], 0 → roomA != roomB
+        # leReif1: [-1,1], [admA, admB], -stayB → admA >= admB + stayB
+        # leReif2: [-1,1], [admB, admA], -stayA → admB >= admA + stayA
+        if neReif.coeffs == @[1, -1] and neReif.rhs == 0 and neReif.varNames.len == 2 and
+           leReifs[0].coeffs == @[-1, 1] and leReifs[0].varNames.len == 2 and
+           leReifs[1].coeffs == @[-1, 1] and leReifs[1].varNames.len == 2:
+          let roomAName = neReif.varNames[0]
+          let roomBName = neReif.varNames[1]
+
+          # Extract admission vars and durations from le_reifs
+          # leReif: [-1,1]*[x,y] <= -d means y - x <= -d, i.e., x >= y + d
+          # So if leReif1 has vars [admA, admB] and rhs -stayB: admA >= admB + stayB
+          #    leReif2 has vars [admB, admA] and rhs -stayA: admB >= admA + stayA
+          let admA1 = leReifs[0].varNames[0]  # admA (the one that must be >= other + dur)
+          let admB1 = leReifs[0].varNames[1]
+          let durB = -leReifs[0].rhs  # stayB
+          let admB2 = leReifs[1].varNames[0]
+          let admA2 = leReifs[1].varNames[1]
+          let durA = -leReifs[1].rhs  # stayA
+
+          # Verify consistency: the two le_reifs should involve the same admission pairs
+          if admA1 == admA2 and admB1 == admB2 and durA > 0 and durB > 0:
+            var info: ConditionalNoOverlapInfo
+            info.startAName = admA1
+            info.startBName = admB1
+            info.durationA = durA
+            info.durationB = durB
+            info.resourceAName = roomAName
+            info.resourceBName = roomBName
+            info.resourceAFixed = -1
+            info.resourceBFixed = -1
+
+            # Condition vars from negative literals (selection vars)
+            if negLits.len >= 1:
+              info.condAName = negLits[0]
+            if negLits.len >= 2:
+              info.condBName = negLits[1]
+
+            info.consumedCIs = @[ci, neReif.ci, leReifs[0].ci, leReifs[1].ci]
+            info.consumedVars = @[]
+            for lit in posLits:
+              info.consumedVars.add(lit)
+
+            detected.add(info)
+            nPatientPatient += 1
+
+    # Pattern B: 2 positive, 1 negative (occupant-patient no-overlap)
+    # bool_clause([B_ne, B_le], [sel_A])
+    elif posLits.len == 2 and negLits.len == 1:
+      var neReif: ReifInfo
+      var leReif: ReifInfo
+      var hasNe, hasLe = false
+
+      for lit in posLits:
+        if lit notin reifByOutputVar: continue
+        let info = reifByOutputVar[lit]
+        if info.constraintType in ["int_ne_reif", "int_lin_ne_reif"]:
+          neReif = info
+          hasNe = true
+        elif info.constraintType in ["int_le_reif", "int_lin_le_reif"]:
+          leReif = info
+          hasLe = true
+
+      if hasNe and hasLe:
+        var info: ConditionalNoOverlapInfo
+        info.condAName = negLits[0]  # selection var
+
+        if neReif.constraintType == "int_ne_reif" and neReif.varNames.len == 1:
+          # int_ne_reif(room, occ_room_val, B) → room != occ_room_val
+          info.resourceAName = neReif.varNames[0]
+          info.resourceBFixed = neReif.rhs
+        elif neReif.constraintType == "int_lin_ne_reif" and neReif.varNames.len == 2 and
+             neReif.coeffs == @[1, -1] and neReif.rhs == 0:
+          info.resourceAName = neReif.varNames[0]
+          info.resourceBName = neReif.varNames[1]
+        else:
+          continue
+
+        if leReif.constraintType == "int_le_reif" and leReif.varNames.len == 1:
+          # int_le_reif(occ_end, adm, B) → adm >= occ_end
+          # Occupant: fixed start=0, duration=occ_end (occupies [0, occ_end))
+          # Patient: start=adm, duration=stay
+          # No overlap: adm >= occ_end OR occ_end <= adm (same thing)
+          # We model this as: occupant has start=0, dur=occ_end; patient has start=adm, dur=stay
+          # But we don't know patient's duration here — look it up later
+          info.startAName = leReif.varNames[0]  # admission var
+          info.durationB = leReif.rhs            # occupant end time = start(0) + duration
+          info.startBName = ""                   # occupant has fixed start
+          info.durationA = 0                     # will be filled if we can find it
+        else:
+          continue
+
+        info.consumedCIs = @[ci, neReif.ci, leReif.ci]
+        info.consumedVars = @[]
+        for lit in posLits:
+          info.consumedVars.add(lit)
+
+        detected.add(info)
+        nOccupantPatient += 1
+
+  if detected.len == 0: return
+
+  # Step 3: Consume detected patterns
+  for info in detected:
+    for ci in info.consumedCIs:
+      tr.definingConstraints.incl(ci)
+    for v in info.consumedVars:
+      tr.definedVarNames.incl(v)
+
+  # Store for later constraint creation (after translateVariables)
+  for info in detected:
+    tr.conditionalNoOverlapInfos.add((
+      startAName: info.startAName, startBName: info.startBName,
+      durationA: info.durationA, durationB: info.durationB,
+      resourceAName: info.resourceAName, resourceBName: info.resourceBName,
+      resourceAFixed: info.resourceAFixed, resourceBFixed: info.resourceBFixed,
+      condAName: info.condAName, condBName: info.condBName,
+      consumedCIs: info.consumedCIs, consumedVars: info.consumedVars))
+
+  stderr.writeLine(&"[FZN] Detected {nPatientPatient} patient-patient + {nOccupantPatient} occupant-patient conditional no-overlap pairs")
+
+
+proc detectConditionalCumulativePattern(tr: var FznTranslator) =
+  ## Detects the room_admission encoding pattern:
+  ##   array_var_int_element(room[p], [ra[1,p]..ra[n,p]], result) :: defines_var(result)
+  ##   int_eq_reif(result, admission[p], B) :: defines_var(B)
+  ##   fzn_cumulative([fixed..., ra[r,1]..ra[r,n]], durations, heights, limit) for each room r
+  ##
+  ## Replaces with ConditionalCumulative constraints where tasks are active
+  ## only when room[p] == r AND selection[p] == true.
+
+  type
+    ElementInfo = object
+      ci: int
+      indexVarName: string      # room[p]
+      arrayVarNames: seq[string] # [ra[1,p], ra[2,p], ...]
+      resultVarName: string      # element output (channel), "" if constant result
+      resultConstVal: int        # constant result value (when resultVarName == "")
+
+  # Pre-build array name -> element names and constant values from model variable declarations
+  # (arrayElementNames is populated later in translateVariables, so we build a local one)
+  var localArrayElements: Table[string, seq[string]]
+  var localArrayConstVals: Table[string, seq[int]]  # parallel: const value when name is ""
+  for decl in tr.model.variables:
+    if decl.value != nil and decl.value.kind == FznArrayLit:
+      var elemNames: seq[string]
+      var constVals: seq[int]
+      for e in decl.value.elems:
+        if e.kind == FznIdent:
+          elemNames.add(e.ident)
+          constVals.add(0)
+        elif e.kind == FznIntLit:
+          elemNames.add("")
+          constVals.add(e.intVal)
+        else:
+          elemNames.add("")
+          constVals.add(0)
+      localArrayElements[decl.name] = elemNames
+      localArrayConstVals[decl.name] = constVals
+
+  template resolveArrayNames(arrArg: FznExpr): seq[string] =
+    block:
+      var res: seq[string]
+      if arrArg.kind == FznIdent:
+        if arrArg.ident in localArrayElements:
+          res = localArrayElements[arrArg.ident]
+        elif arrArg.ident in tr.arrayElementNames:
+          res = tr.arrayElementNames[arrArg.ident]
+      elif arrArg.kind == FznArrayLit:
+        for elem in arrArg.elems:
+          if elem.kind == FznIdent:
+            res.add(elem.ident)
+          else:
+            res.add("")
+      res
+
+  # Step 1: Find element constraints with ra var arrays
+  # Scan ALL constraints, not just channelConstraints — some element constraints have
+  # constant results (mandatory patients with fixed admission days) and no defines_var.
+  var elementInfos: seq[ElementInfo]
+  var elementByResult: Table[string, int]
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
+    if con.args.len < 3: continue
+    if con.args[0].kind != FznIdent: continue
+    # Result can be variable (FznIdent) or constant (FznIntLit)
+    let hasVarResult = con.args[2].kind == FznIdent
+    let hasConstResult = con.args[2].kind == FznIntLit
+    if not hasVarResult and not hasConstResult: continue
+
+    let arrayVarNames = resolveArrayNames(con.args[1])
+    if arrayVarNames.len == 0: continue
+
+    # All array elements must be variables (not constants, not already defined/channel)
+    var allVars = true
+    for vn in arrayVarNames:
+      if vn == "" or vn in tr.definedVarNames or vn in tr.channelVarNames:
+        allVars = false
+        break
+    if not allVars: continue
+
+    if hasVarResult:
+      elementByResult[con.args[2].ident] = elementInfos.len
+      elementInfos.add(ElementInfo(
+        ci: ci,
+        indexVarName: con.args[0].ident,
+        arrayVarNames: arrayVarNames,
+        resultVarName: con.args[2].ident,
+        resultConstVal: 0
+      ))
+    else:
+      # Constant result: mandatory patient with fixed admission day
+      elementInfos.add(ElementInfo(
+        ci: ci,
+        indexVarName: con.args[0].ident,
+        arrayVarNames: arrayVarNames,
+        resultVarName: "",
+        resultConstVal: con.args[2].intVal
+      ))
+
+  if elementInfos.len == 0: return
+
+  # Step 2: Find int_eq_reif(result, admission, B) for each element result
+  # NOTE: scan ALL constraints including definingConstraints (reif channels consumed them)
+  type EqReifInfo = object
+    admissionVarName: string
+    selectionVarName: string  # filled in step 3
+
+  var eqReifByResult: Table[string, EqReifInfo]
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name != "int_eq_reif": continue
+    if con.args.len < 3: continue
+    if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent or con.args[2].kind != FznIdent:
+      continue
+    let resultName = con.args[0].ident
+    if resultName notin elementByResult: continue
+    eqReifByResult[resultName] = EqReifInfo(
+      admissionVarName: con.args[1].ident,
+      selectionVarName: ""
+    )
+
+  if eqReifByResult.len == 0: return
+
+  # Step 3: Find bool_clause linking selection to eq_reif bool vars
+  # Pattern: bool_clause([B], [sel]) where B is the eq_reif bool output
+  # Build set of eq_reif bool var names for quick lookup
+  var eqReifBoolVars: Table[string, string]  # boolVarName -> resultVarName
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name != "int_eq_reif": continue
+    if con.args.len < 3: continue
+    if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+    if con.args[0].ident in eqReifByResult:
+      eqReifBoolVars[con.args[2].ident] = con.args[0].ident
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "bool_clause": continue
+    if con.args.len < 2: continue
+    var posLits, negLits: seq[string]
+    if con.args[0].kind == FznArrayLit:
+      for e in con.args[0].elems:
+        if e.kind == FznIdent: posLits.add(e.ident)
+    if con.args[1].kind == FznArrayLit:
+      for e in con.args[1].elems:
+        if e.kind == FznIdent: negLits.add(e.ident)
+    if posLits.len == 1 and negLits.len == 1:
+      if posLits[0] in eqReifBoolVars:
+        let resultName = eqReifBoolVars[posLits[0]]
+        if resultName in eqReifByResult:
+          eqReifByResult[resultName].selectionVarName = negLits[0]
+
+  # Step 4: Find cumulative constraints with ra vars as start times
+  # Build ra_var -> (elementIdx, roomIdx) lookup
+  var allRaVarNames = initHashSet[string]()
+  var raVarToElementRoom: Table[string, tuple[elemIdx, roomIdx: int]]
+  for ei, einfo in elementInfos:
+    for ri, vn in einfo.arrayVarNames:
+      allRaVarNames.incl(vn)
+      raVarToElementRoom[vn] = (ei, ri)
+
+  type ConditionalCumulativeInfo = object
+    fixedTasks: seq[tuple[start, duration, height: int]]
+    conditionalTasks: seq[tuple[admissionVarName, selectionVarName, roomVarName: string,
+                                 duration, height, roomValue, fixedAdmission: int]]
+    limit: int
+    cumulativeCi: int
+    consumedRaVarNames: seq[string]
+
+  var conditionalCumulatives: seq[ConditionalCumulativeInfo]
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name notin ["fzn_cumulative", "fzn_cumulatives"]: continue
+    if ci in tr.definingConstraints: continue
+
+    # Resolve start array names and const values
+    let startArg = con.args[0]
+    var startNames: seq[string]
+    var startConstVals: seq[int]  # parallel: const value when name is ""
+    if startArg.kind == FznIdent:
+      if startArg.ident in localArrayElements:
+        startNames = localArrayElements[startArg.ident]
+        startConstVals = localArrayConstVals[startArg.ident]
+      elif startArg.ident in tr.arrayElementNames:
+        startNames = tr.arrayElementNames[startArg.ident]
+        startConstVals = newSeq[int](startNames.len)
+      else: continue
+    elif startArg.kind == FznArrayLit:
+      for e in startArg.elems:
+        if e.kind == FznIdent:
+          startNames.add(e.ident)
+          startConstVals.add(0)
+        elif e.kind == FznIntLit:
+          startNames.add("")
+          startConstVals.add(e.intVal)
+        else:
+          startNames.add("")
+          startConstVals.add(0)
+    else: continue
+
+    if startNames.len == 0: continue
+
+    # Check if this cumulative has ra vars
+    var raCount = 0
+    for sn in startNames:
+      if sn in allRaVarNames: raCount += 1
+    if raCount == 0: continue
+
+    var durations, heights: seq[int]
+    var limit: int
+    try:
+      durations = tr.resolveIntArray(con.args[1])
+      heights = tr.resolveIntArray(con.args[2])
+      limit = tr.resolveIntArg(con.args[3])
+    except: continue
+    if durations.len != startNames.len or heights.len != startNames.len: continue
+
+    var ccinfo: ConditionalCumulativeInfo
+    ccinfo.limit = limit
+    ccinfo.cumulativeCi = ci
+    var allMatched = true
+    var roomValue = -1
+
+    for i, sn in startNames:
+      if sn in tr.paramValues:
+        ccinfo.fixedTasks.add((tr.paramValues[sn], durations[i], heights[i]))
+      elif sn == "":
+        # Inline constant in the start array
+        ccinfo.fixedTasks.add((startConstVals[i], durations[i], heights[i]))
+      elif sn in allRaVarNames:
+        let (elemIdx, roomIdx) = raVarToElementRoom[sn]
+        if roomValue < 0:
+          roomValue = roomIdx
+        elif roomIdx != roomValue:
+          allMatched = false
+          break
+        let einfo = elementInfos[elemIdx]
+        if einfo.resultVarName == "":
+          # Constant-result element: mandatory patient with fixed admission day
+          # This is a conditional task (depends on room assignment) but admission is fixed
+          ccinfo.conditionalTasks.add((
+            admissionVarName: "",  # signals fixed admission
+            selectionVarName: "",  # always active (mandatory)
+            roomVarName: einfo.indexVarName,
+            duration: durations[i],
+            height: heights[i],
+            roomValue: roomIdx + 1,  # FZN 1-based
+            fixedAdmission: einfo.resultConstVal
+          ))
+        elif einfo.resultVarName in eqReifByResult:
+          # Optional patient: element(room[p], ra_array, result), eq_reif(result, admission, B)
+          let eqInfo = eqReifByResult[einfo.resultVarName]
+          ccinfo.conditionalTasks.add((
+            admissionVarName: eqInfo.admissionVarName,
+            selectionVarName: eqInfo.selectionVarName,
+            roomVarName: einfo.indexVarName,
+            duration: durations[i],
+            height: heights[i],
+            roomValue: roomIdx + 1,  # FZN 1-based
+            fixedAdmission: -1
+          ))
+        else:
+          # Mandatory patient: element(room[p], ra_array, admission[p]) directly
+          # The element result IS the admission var; no selection condition needed
+          ccinfo.conditionalTasks.add((
+            admissionVarName: einfo.resultVarName,
+            selectionVarName: "",  # always active (mandatory)
+            roomVarName: einfo.indexVarName,
+            duration: durations[i],
+            height: heights[i],
+            roomValue: roomIdx + 1,
+            fixedAdmission: -1
+          ))
+        ccinfo.consumedRaVarNames.add(sn)
+      else:
+        # Non-ra variable start time - can't convert
+        allMatched = false
+        break
+
+    if not allMatched or roomValue < 0: continue
+    conditionalCumulatives.add(ccinfo)
+
+  if conditionalCumulatives.len == 0: return
+
+  # Step 5: Consume cumulative constraints and mark ra vars as non-searchable
+  for ccinfo in conditionalCumulatives:
+    tr.definingConstraints.incl(ccinfo.cumulativeCi)
+
+  # Mark ra vars as channel vars so they're not searched (but still get positions)
+  var nRaChanneled = 0
+  var consumedRaSet = initHashSet[string]()
+  for ccinfo in conditionalCumulatives:
+    for raName in ccinfo.consumedRaVarNames:
+      consumedRaSet.incl(raName)
+      if raName notin tr.channelVarNames and raName notin tr.definedVarNames:
+        tr.channelVarNames.incl(raName)
+        nRaChanneled += 1
+
+  # Also mark ra vars from constant-result elements (mandatory patients with fixed admission)
+  for ei, einfo in elementInfos:
+    if einfo.resultVarName == "":
+      for vn in einfo.arrayVarNames:
+        consumedRaSet.incl(vn)
+        if vn notin tr.channelVarNames and vn notin tr.definedVarNames:
+          tr.channelVarNames.incl(vn)
+          nRaChanneled += 1
+
+  # Also remove element channel constraints whose arrays reference consumed ra vars.
+  # These channels are dead (cumulative replaced by conditional cumulative)
+  # and would waste time propagating.
+  var elementsToRemove: seq[int]
+  for ci, chanVar in tr.channelConstraints:
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+    if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
+    let arrayNames = resolveArrayNames(con.args[1])
+    var hasRa = false
+    for vn in arrayNames:
+      if vn in consumedRaSet:
+        hasRa = true
+        break
+    if hasRa:
+      elementsToRemove.add(ci)
+      if chanVar in eqReifByResult:
+        # Intermediate result: eq_reif links it to admission. Safe to eliminate.
+        tr.channelVarNames.excl(chanVar)
+        tr.definedVarNames.incl(chanVar)
+      else:
+        # Mandatory patient: admission var IS the element result.
+        # Remove channel status so it becomes a search position.
+        # The element constraint in the main constraint set ensures consistency.
+        tr.channelVarNames.excl(chanVar)
+
+  for ci in elementsToRemove:
+    tr.channelConstraints.del(ci)
+
+  # Also consume constant-result element constraints (mandatory patients)
+  for ei, einfo in elementInfos:
+    if einfo.resultVarName == "":
+      tr.definingConstraints.incl(einfo.ci)
+
+  stderr.writeLine(&"[FZN] Marked {nRaChanneled} ra vars as channels, removed {elementsToRemove.len} dead element channels for conditional cumulative")
+
+  # Store for later constraint creation
+  for ccinfo in conditionalCumulatives:
+    var condTaskTuples: seq[tuple[admissionVarName, selectionVarName, roomVarName: string,
+                                   duration, height, roomValue, fixedAdmission: int]]
+    for ct in ccinfo.conditionalTasks:
+      condTaskTuples.add(ct)
+    var fixedTaskTuples: seq[tuple[start, duration, height: int]]
+    for ft in ccinfo.fixedTasks:
+      fixedTaskTuples.add(ft)
+    tr.conditionalCumulativeInfos.add((
+      fixedTasks: fixedTaskTuples,
+      conditionalTasks: condTaskTuples,
+      limit: ccinfo.limit,
+      cumulativeCi: ccinfo.cumulativeCi,
+      consumedElementCIs: newSeq[int](),
+      consumedEqReifCIs: newSeq[int](),
+      consumedBoolClauseCIs: newSeq[int](),
+      consumedRaVarNames: ccinfo.consumedRaVarNames,
+      consumedBoolVarNames: newSeq[string]()))
+
+  stderr.writeLine(&"[FZN] Detected {conditionalCumulatives.len} conditional cumulative constraints (replacing regular cumulatives)")
+
+
+proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
+  ## Detects the H3/H4 surgeon/OT capacity encoding pattern:
+  ##   int_lin_le(coeffs, [D_1, ..., D_n], capacity)
+  ## where each D_i is:
+  ##   bool2int(C_i, D_i) :: defines_var(D_i)
+  ##   array_bool_and([sel[p], B_day, (B_ot)?], C_i) :: defines_var(C_i)
+  ##   int_eq_reif(admission[p], day, B_day) :: defines_var(B_day)
+  ##   int_eq_reif(ot[p], otVal, B_ot) :: defines_var(B_ot)  [H4 only]
+  ##
+  ## Replaces with ConditionalDayCapacity constraints.
+
+  # Step 1: Build lookup tables from FZN constraints
+  # bool2int: outputVar -> inputVar
+  var bool2intInput: Table[string, string]
+  # array_bool_and: outputVar -> seq of input vars
+  var boolAndInputs: Table[string, seq[string]]
+  # int_eq_reif: outputVar -> (sourceVar, value)
+  var eqReifSource: Table[string, tuple[sourceVar: string, value: int]]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name == "bool2int" and con.annotations.len > 0:
+      # bool2int(B, I) :: defines_var(I)
+      if con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
+        bool2intInput[con.args[1].ident] = con.args[0].ident
+    elif name == "array_bool_and" and con.annotations.len > 0:
+      # array_bool_and([...], R) :: defines_var(R)
+      if con.args[0].kind == FznArrayLit and con.args[1].kind == FznIdent:
+        var inputs: seq[string]
+        for elem in con.args[0].elems:
+          if elem.kind == FznIdent:
+            inputs.add(elem.ident)
+          elif elem.kind == FznBoolLit:
+            if not elem.boolVal:
+              inputs = @[]  # false literal => always false, skip
+              break
+            # true literal: skip (doesn't affect AND result)
+          else:
+            inputs = @[]
+            break
+        if inputs.len >= 1:
+          boolAndInputs[con.args[1].ident] = inputs
+    elif name == "int_eq_reif" and con.annotations.len > 0:
+      # int_eq_reif(X, val, B) :: defines_var(B)
+      if con.args[0].kind == FznIdent and con.args[1].kind == FznIntLit and
+         con.args[2].kind == FznIdent:
+        eqReifSource[con.args[2].ident] = (con.args[0].ident, con.args[1].intVal)
+
+  # Also scan definingConstraints for eq_reif that were already consumed by reif channel detection
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name == "int_eq_reif" and con.args[0].kind == FznIdent and
+       con.args[1].kind == FznIntLit and con.args[2].kind == FznIdent:
+      if con.args[2].ident notin eqReifSource:
+        eqReifSource[con.args[2].ident] = (con.args[0].ident, con.args[1].intVal)
+    if name == "bool2int" and con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
+      if con.args[1].ident notin bool2intInput:
+        bool2intInput[con.args[1].ident] = con.args[0].ident
+    if name == "array_bool_and" and con.args[0].kind == FznArrayLit and con.args[1].kind == FznIdent:
+      if con.args[1].ident notin boolAndInputs:
+        var inputs: seq[string]
+        for elem in con.args[0].elems:
+          if elem.kind == FznIdent:
+            inputs.add(elem.ident)
+          elif elem.kind == FznBoolLit:
+            if not elem.boolVal:
+              inputs = @[]
+              break
+          else:
+            inputs = @[]
+            break
+        if inputs.len >= 1:
+          boolAndInputs[con.args[1].ident] = inputs
+
+  # Step 2: Find int_lin_le constraints with many bool2int variables
+  # Identify the selection and admission arrays
+  var selectionVarNames: HashSet[string]
+  var admissionVarNames: HashSet[string]
+  var otVarNames: HashSet[string]
+
+  # Look at output arrays to identify variable roles
+  for v in tr.model.variables:
+    if v.isArray and v.value != nil and v.value.kind == FznArrayLit:
+      if v.name.startsWith("selection"):
+        for elem in v.value.elems:
+          if elem.kind == FznIdent:
+            selectionVarNames.incl(elem.ident)
+      elif v.name.startsWith("admission"):
+        for elem in v.value.elems:
+          if elem.kind == FznIdent:
+            admissionVarNames.incl(elem.ident)
+      elif v.name == "ot" or v.name.startsWith("ot_"):
+        for elem in v.value.elems:
+          if elem.kind == FznIdent:
+            otVarNames.incl(elem.ident)
+
+  # Step 3: Trace each candidate int_lin_le
+  type
+    TaskInfo = object
+      weight: int
+      admissionVarName: string
+      selectionVarName: string
+      extraCondVarName: string  # "" if none
+      extraCondVal: int
+      day: int
+
+  type
+    PerDayConstraint = object
+      ci: int
+      day: int
+      capacity: int
+      tasks: seq[TaskInfo]
+      consumedVarNames: seq[string]
+
+  var nDetected = 0
+  var perDayConstraints: seq[PerDayConstraint]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_le": continue
+
+    if con.args[2].kind != FznIntLit:
+      continue
+
+    # Resolve coefficient and variable arrays (can be inline FznArrayLit or named FznIdent)
+    var coeffs: seq[FznExpr]
+    var vars: seq[FznExpr]
+    if con.args[0].kind == FznArrayLit:
+      coeffs = con.args[0].elems
+    elif con.args[0].kind == FznIdent:
+      # Resolve named parameter array
+      if con.args[0].ident in tr.arrayValues:
+        for v in tr.arrayValues[con.args[0].ident]:
+          coeffs.add(FznExpr(kind: FznIntLit, intVal: v))
+      else:
+        continue
+    else:
+      continue
+
+    if con.args[1].kind == FznArrayLit:
+      vars = con.args[1].elems
+    elif con.args[1].kind == FznIdent:
+      # Resolve named variable array
+      for v in tr.model.variables:
+        if v.isArray and v.name == con.args[1].ident and v.value != nil and v.value.kind == FznArrayLit:
+          vars = v.value.elems
+          break
+      if vars.len == 0:
+        continue
+    else:
+      continue
+
+    let rhs = con.args[2].intVal
+
+    if coeffs.len != vars.len or coeffs.len < 10:
+      continue
+
+    let isFirstCandidate = perDayConstraints.len == 0 and nDetected == 0
+
+    var tasks: seq[TaskInfo]
+    var allValid = true
+    var commonDay = -1
+    var consumedVarNames: seq[string]
+
+    for idx in 0..<vars.len:
+      if vars[idx].kind != FznIdent or coeffs[idx].kind != FznIntLit:
+        allValid = false
+        break
+
+      let dVarName = vars[idx].ident
+      let weight = coeffs[idx].intVal
+
+      if dVarName notin bool2intInput:
+        allValid = false
+        break
+      let cVarName = bool2intInput[dVarName]
+
+      var selVar = ""
+      var day = -1
+      var admVar = ""
+      var extraSource = ""
+      var extraVal = -1
+
+      if cVarName in boolAndInputs:
+        # Normal case: bool2int input is an array_bool_and output
+        let andInputs = boolAndInputs[cVarName]
+
+        if andInputs.len < 1 or andInputs.len > 3:
+          allValid = false
+          break
+
+        for inp in andInputs:
+          if inp in selectionVarNames:
+            selVar = inp
+          elif inp in eqReifSource:
+            let (srcVar, val) = eqReifSource[inp]
+            if srcVar in admissionVarNames:
+              admVar = srcVar
+              day = val
+            elif srcVar in otVarNames:
+              extraSource = srcVar
+              extraVal = val
+            else:
+              allValid = false
+              break
+          else:
+            allValid = false
+            break
+      elif cVarName in eqReifSource:
+        # Mandatory patient case: bool2int input is directly eq_reif output
+        # (selection=true was constant-folded away, no AND needed)
+        let (srcVar, val) = eqReifSource[cVarName]
+        if srcVar in admissionVarNames:
+          admVar = srcVar
+          day = val
+          selVar = "MANDATORY"  # sentinel: always active
+        else:
+          allValid = false
+      else:
+        allValid = false
+
+      if not allValid: break
+      if admVar == "" or day < 0:
+        allValid = false
+        break
+
+      if commonDay < 0:
+        commonDay = day
+      elif commonDay != day:
+        allValid = false
+        break
+
+      tasks.add(TaskInfo(
+        weight: weight,
+        admissionVarName: admVar,
+        selectionVarName: selVar,
+        extraCondVarName: extraSource,
+        extraCondVal: extraVal,
+        day: day))
+      consumedVarNames.add(dVarName)
+      consumedVarNames.add(cVarName)
+
+    if not allValid or tasks.len == 0:
+      continue
+
+    perDayConstraints.add(PerDayConstraint(
+      ci: ci, day: commonDay, capacity: rhs, tasks: tasks,
+      consumedVarNames: consumedVarNames))
+
+  # Group by task signature (same patients, same conditions, different days)
+  # Signature = sorted list of (admissionVar, selectionVar, extraCondVarName, extraCondVal, weight)
+  var groups: Table[string, seq[int]]  # signature -> indices into perDayConstraints
+
+  for i, pdc in perDayConstraints:
+    var sig = ""
+    for t in pdc.tasks:
+      sig.add(t.admissionVarName & ":" & t.selectionVarName & ":" &
+              t.extraCondVarName & ":" & $t.extraCondVal & ":" & $t.weight & ";")
+    groups.mgetOrPut(sig, @[]).add(i)
+
+  # Build ConditionalDayCapacity constraints from groups
+  for sig, indices in groups:
+    var maxDay = 0
+    for i in indices:
+      if perDayConstraints[i].day > maxDay:
+        maxDay = perDayConstraints[i].day
+
+    # Build capacity array: default to max int (unconstrained) for days not mentioned
+    var capacities = newSeq[int](maxDay + 1)
+    for d in 0..maxDay:
+      capacities[d] = high(int32).int  # unconstrained by default
+
+    var consumedCIs: seq[int]
+    var consumedVarNames: seq[string]
+
+    for i in indices:
+      let pdc = perDayConstraints[i]
+      if pdc.day <= maxDay:
+        capacities[pdc.day] = pdc.capacity
+      consumedCIs.add(pdc.ci)
+      for vn in pdc.consumedVarNames:
+        consumedVarNames.add(vn)
+
+    # Build task list from the first constraint (all have same structure)
+    let firstPdc = perDayConstraints[indices[0]]
+    var taskInfos: seq[tuple[weight: int, admissionVarName, selectionVarName: string,
+                              extraCondVarName: string, extraCondVal: int]]
+    for t in firstPdc.tasks:
+      taskInfos.add((weight: t.weight,
+                      admissionVarName: t.admissionVarName,
+                      selectionVarName: t.selectionVarName,
+                      extraCondVarName: t.extraCondVarName,
+                      extraCondVal: t.extraCondVal))
+
+    # Mark consumed
+    for ci in consumedCIs:
+      tr.definingConstraints.incl(ci)
+    for vn in consumedVarNames:
+      if vn notin tr.channelVarNames and vn notin tr.definedVarNames:
+        tr.definedVarNames.incl(vn)
+
+    tr.conditionalDayCapacityInfos.add((
+      tasks: taskInfos,
+      capacities: capacities,
+      maxDay: maxDay,
+      consumedCIs: consumedCIs,
+      consumedVarNames: consumedVarNames))
+
+    nDetected += indices.len
+
+  stderr.writeLine(&"[FZN] Detected {nDetected} int_lin_le → {tr.conditionalDayCapacityInfos.len} ConditionalDayCapacity constraints")
+
+
 proc detectRedundantOrderings(tr: var FznTranslator) =
   ## Detects transitively redundant ordering constraints.
   ## Handles weighted edges: int_lin_le([-1,1], [a,b], -d) means b >= a + d (edge a→b weight d).
@@ -7559,6 +8582,200 @@ proc estimateRange(tr: FznTranslator, node: ExpressionNode[int]): (int, int) =
   var cache = initTable[pointer, (int, int)]()
   tr.estimateRangeImpl(node, cache)
 
+
+proc pruneZeroCapacityDays(tr: var FznTranslator) =
+  ## Prune admission domains by detecting zero-capacity day constraints.
+  ##
+  ## Pattern: int_lin_le(coeffs, bool_vars, 0) where each bool_var is a
+  ## channel encoding "selection[p] AND admission[p]==d" (surgeon capacity)
+  ## or "selection[p] AND admission[p]==d AND ot[p]==o" (OT capacity).
+  ##
+  ## When capacity=0, no patient can be admitted on that day (for surgeon)
+  ## or on that day+OT combo. For surgeon zero days, we directly prune
+  ## the admission domain. For OT, we only prune if ALL OTs are zero on that day.
+
+  # Step 1: Build defines_var map for chain tracing
+  var definerOf: Table[string, int]  # varName → constraint index
+  for ci, con in tr.model.constraints:
+    if con.hasAnnotation("defines_var"):
+      let ann = con.getAnnotation("defines_var")
+      if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+        definerOf[ann.args[0].ident] = ci
+
+  # Step 2: Find zero-capacity int_lin_le constraints and trace to find day values
+  type CapInfo = object
+    day: int
+    isOtConstrained: bool  # true = OT-specific, false = surgeon (all OTs)
+
+  var zeroCaps: seq[CapInfo]
+
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_le":
+      continue
+    if con.args.len < 3:
+      continue
+
+    # Check RHS <= 0
+    let rhsArg = con.args[2]
+    if rhsArg.kind != FznIntLit or rhsArg.intVal > 0:
+      continue
+
+    # Check all coefficients are positive
+    let coeffArg = con.args[0]
+    if coeffArg.kind != FznArrayLit:
+      continue
+    var allPositive = true
+    for elem in coeffArg.elems:
+      if elem.kind != FznIntLit or elem.intVal <= 0:
+        allPositive = false
+        break
+    if not allPositive:
+      continue
+
+    # Need many variables (capacity constraint spans all patients)
+    let varsArg = con.args[1]
+    if varsArg.kind != FznArrayLit or varsArg.elems.len < 5:
+      continue
+
+    # Trace first variable back: bool2int → array_bool_and → int_eq_reif
+    let firstVar = varsArg.elems[0]
+    if firstVar.kind != FznIdent or firstVar.ident notin definerOf:
+      continue
+    let b2iCon = tr.model.constraints[definerOf[firstVar.ident]]
+    if stripSolverPrefix(b2iCon.name) != "bool2int" or b2iCon.args.len < 2:
+      continue
+    let boolVar = b2iCon.args[0]
+    if boolVar.kind != FznIdent or boolVar.ident notin definerOf:
+      continue
+    let andCon = tr.model.constraints[definerOf[boolVar.ident]]
+    if stripSolverPrefix(andCon.name) != "array_bool_and" or andCon.args.len < 2:
+      continue
+    let andInputs = andCon.args[0]
+    if andInputs.kind != FznArrayLit:
+      continue
+
+    # Determine constraint type by AND input count:
+    # 2 inputs = surgeon (sel + adm==d), 3 inputs = OT (sel + adm==d + ot==o)
+    let isOtConstrained = andInputs.elems.len >= 3
+
+    # Find int_eq_reif among the AND inputs to extract the day value
+    var foundDay = -1
+    for inp in andInputs.elems:
+      if inp.kind != FznIdent or inp.ident notin definerOf:
+        continue
+      let eqCon = tr.model.constraints[definerOf[inp.ident]]
+      if stripSolverPrefix(eqCon.name) != "int_eq_reif" or eqCon.args.len < 3:
+        continue
+      # int_eq_reif(var, constant, result) — we want the constant (day value)
+      if eqCon.args[1].kind == FznIntLit:
+        # Verify the first arg is an admission variable (has a non-tiny domain)
+        let varArg = eqCon.args[0]
+        if varArg.kind == FznIdent and varArg.ident in tr.varPositions:
+          let pos = tr.varPositions[varArg.ident]
+          let dom = tr.sys.baseArray.domain[pos]
+          if dom.len > 2:  # admission-like domain, not a boolean
+            foundDay = eqCon.args[1].intVal
+            break
+
+    if foundDay >= 0:
+      zeroCaps.add(CapInfo(day: foundDay, isOtConstrained: isOtConstrained))
+
+  if zeroCaps.len == 0:
+    return
+
+  # Step 3: Determine which days to prune
+  # Surgeon zero days (isOtConstrained=false) → directly prune
+  # OT zero days (isOtConstrained=true) → only prune if ALL OT slots for that day are zero
+  var surgeonZeroDays: PackedSet[int]
+  var otZeroDayCount: Table[int, int]  # day → count of zero-capacity OT slots
+  var otTotalPerDay: Table[int, int]   # day → total OT constraints for that day
+
+  for cap in zeroCaps:
+    if not cap.isOtConstrained:
+      surgeonZeroDays.incl(cap.day)
+    else:
+      discard otZeroDayCount.mgetOrPut(cap.day, 0)
+      otZeroDayCount[cap.day] += 1
+
+  # Count total OT constraints per day from ALL int_lin_le (not just zero ones)
+  for ci, con in tr.model.constraints:
+    let name = stripSolverPrefix(con.name)
+    if name != "int_lin_le":
+      continue
+    if con.args.len < 3:
+      continue
+    let varsArg = con.args[1]
+    if varsArg.kind != FznArrayLit or varsArg.elems.len < 5:
+      continue
+    # Quick trace to check if this is an OT constraint
+    let firstVar = varsArg.elems[0]
+    if firstVar.kind != FznIdent or firstVar.ident notin definerOf:
+      continue
+    let b2iCon = tr.model.constraints[definerOf[firstVar.ident]]
+    if stripSolverPrefix(b2iCon.name) != "bool2int" or b2iCon.args.len < 2:
+      continue
+    let boolVar = b2iCon.args[0]
+    if boolVar.kind != FznIdent or boolVar.ident notin definerOf:
+      continue
+    let andCon = tr.model.constraints[definerOf[boolVar.ident]]
+    if stripSolverPrefix(andCon.name) != "array_bool_and" or andCon.args.len < 2:
+      continue
+    let andInputs = andCon.args[0]
+    if andInputs.kind != FznArrayLit or andInputs.elems.len < 3:
+      continue
+    # This is an OT constraint — find its day
+    for inp in andInputs.elems:
+      if inp.kind != FznIdent or inp.ident notin definerOf:
+        continue
+      let eqCon = tr.model.constraints[definerOf[inp.ident]]
+      if stripSolverPrefix(eqCon.name) != "int_eq_reif" or eqCon.args.len < 3:
+        continue
+      if eqCon.args[1].kind == FznIntLit:
+        let varArg = eqCon.args[0]
+        if varArg.kind == FznIdent and varArg.ident in tr.varPositions:
+          let pos = tr.varPositions[varArg.ident]
+          let dom = tr.sys.baseArray.domain[pos]
+          if dom.len > 2:
+            let day = eqCon.args[1].intVal
+            discard otTotalPerDay.mgetOrPut(day, 0)
+            otTotalPerDay[day] += 1
+            break
+
+  # Days where ALL OTs have zero capacity
+  var otFullyZeroDays: PackedSet[int]
+  for day, zeroCount in otZeroDayCount:
+    if day in otTotalPerDay and zeroCount >= otTotalPerDay[day]:
+      otFullyZeroDays.incl(day)
+
+  let pruneDays = surgeonZeroDays + otFullyZeroDays
+  if pruneDays.len == 0:
+    return
+
+  # Step 4: Prune admission variable domains
+  if "admission" notin tr.arrayPositions:
+    return
+
+  let admPositions = tr.arrayPositions["admission"]
+  var totalPruned = 0
+  for pos in admPositions:
+    if pos < 0: continue  # constant placeholder
+    var domain = tr.sys.baseArray.domain[pos]
+    var newDomain: seq[int]
+    for v in domain:
+      if v notin pruneDays:
+        newDomain.add(v)
+    if newDomain.len < domain.len:
+      totalPruned += domain.len - newDomain.len
+      tr.sys.baseArray.domain[pos] = newDomain
+
+  var dayList: seq[int]
+  for d in pruneDays.items:
+    dayList.add(d)
+  dayList.sort()
+  stderr.writeLine(&"[FZN] Zero-capacity day pruning: removed {totalPruned} values from {admPositions.len} admission vars (zero days: {dayList})")
+
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -7626,9 +8843,22 @@ proc translate*(model: FznModel): FznTranslator =
   result.detectNoOverlapPatterns()
   # Detect DFA-to-geost pattern (needs paramValues for DFA data)
   result.detectDfaGeostPattern()
+  # Detect conditional no-overlap pair patterns (room-conflict bool_clause chains)
+  result.detectConditionalNoOverlapPairs()
+  # Detect conditional cumulative patterns (room_admission elimination)
+  result.detectConditionalCumulativePattern()
+  # Detect conditional day capacity patterns (H3/H4 surgeon/OT capacity)
+  result.detectConditionalDayCapacityPattern()
   # Detect redundant ordering constraints (transitive reduction)
   result.detectRedundantOrderings()
   result.translateVariables()
+  # Mark channelVarNames positions as channelPositions (for vars like ra vars
+  # that are marked as channels during detection but don't have channel bindings)
+  for vn in result.channelVarNames:
+    if vn in result.varPositions:
+      result.sys.baseArray.channelPositions.incl(result.varPositions[vn])
+  # Prune admission domains using zero-capacity day detection
+  result.pruneZeroCapacityDays()
   # Build expressions for defined variables using the now-created positions
   result.buildDefinedExpressions()
   # Build expressions for element channel aliases (duplicate → original channel's position)
@@ -7943,6 +9173,162 @@ proc translate*(model: FznModel): FznTranslator =
 
   if result.noOverlapPatterns.len > 0:
     stderr.writeLine(&"[FZN] Built {result.noOverlapPatterns.len} NoOverlapFixedBox constraints")
+
+  # Build ConditionalNoOverlapPair constraints from detected patterns
+  var nBuiltNoOverlap = 0
+  template resolvePosName(name: string): int =
+    if name == "": -1
+    elif name in result.varPositions: result.varPositions[name]
+    else: -1
+
+  for info in result.conditionalNoOverlapInfos:
+    let startAPos = resolvePosName(info.startAName)
+    let startBPos = resolvePosName(info.startBName)
+    if startAPos < 0: continue  # can't resolve
+
+    let resourceAPos = resolvePosName(info.resourceAName)
+    let resourceBPos = resolvePosName(info.resourceBName)
+    let condAPos = resolvePosName(info.condAName)
+    let condBPos = resolvePosName(info.condBName)
+
+    # For occupant-patient pattern: startB is fixed (occupant at time 0),
+    # durationB is the occupant's length of stay (=occupancy end time)
+    # We model: occupant has start=0, dur=occEnd; patient has start=adm, dur=stay
+    # But we need patient's duration. For occupant pattern, durationA was set to 0
+    # because we couldn't determine it during detection. Skip these for now
+    # if durationA is unknown.
+    if info.durationA == 0 and startBPos < 0:
+      # Occupant-patient pattern: we don't have patient duration.
+      # These are simpler constraints, keep them as boolean constraints.
+      # Un-consume them
+      for ci in info.consumedCIs:
+        result.definingConstraints.excl(ci)
+      for v in info.consumedVars:
+        result.definedVarNames.excl(v)
+      continue
+
+    if startBPos < 0:
+      # Fixed start B (occupant) — not yet handled, skip
+      for ci in info.consumedCIs:
+        result.definingConstraints.excl(ci)
+      for v in info.consumedVars:
+        result.definedVarNames.excl(v)
+      continue
+
+    result.sys.addConstraint(conditionalNoOverlapPair[int](
+      startAPos, startBPos,
+      info.durationA, info.durationB,
+      resourceAPos, resourceBPos,
+      info.resourceAFixed, info.resourceBFixed,
+      condAPos, condBPos))
+    nBuiltNoOverlap += 1
+
+  if nBuiltNoOverlap > 0:
+    stderr.writeLine(&"[FZN] Built {nBuiltNoOverlap} ConditionalNoOverlapPair constraints")
+
+  # Build ConditionalCumulative constraints from detected patterns
+  for ccinfo in result.conditionalCumulativeInfos:
+    var fixedTasks: seq[FixedTask]
+    for ft in ccinfo.fixedTasks:
+      fixedTasks.add(FixedTask(start: ft.start, duration: ft.duration, height: ft.height))
+
+    var condTasks: seq[ConditionalTask]
+    var allResolved = true
+    var maxTime = 0
+
+    for ct in ccinfo.conditionalTasks:
+      let roomPos = if ct.roomVarName in result.varPositions:
+        result.varPositions[ct.roomVarName] else: -1
+      if roomPos < 0:
+        allResolved = false
+        break
+
+      var conditions: seq[TaskCondition]
+      conditions.add(TaskCondition(position: roomPos, value: ct.roomValue))
+
+      # Add selection condition if present
+      if ct.selectionVarName != "":
+        let selPos = if ct.selectionVarName in result.varPositions:
+          result.varPositions[ct.selectionVarName] else: -1
+        if selPos < 0:
+          allResolved = false
+          break
+        conditions.add(TaskCondition(position: selPos, value: 1))
+
+      if ct.fixedAdmission >= 0 and ct.admissionVarName == "":
+        # Fixed-admission task: conditional on room, but start time is constant
+        condTasks.add(ConditionalTask(
+          startPosition: -1,
+          fixedStart: ct.fixedAdmission,
+          duration: ct.duration,
+          height: ct.height,
+          conditions: conditions
+        ))
+        maxTime = max(maxTime, ct.fixedAdmission + ct.duration)
+      else:
+        let admPos = if ct.admissionVarName in result.varPositions:
+          result.varPositions[ct.admissionVarName] else: -1
+        if admPos < 0:
+          allResolved = false
+          break
+
+        condTasks.add(ConditionalTask(
+          startPosition: admPos,
+          fixedStart: -1,
+          duration: ct.duration,
+          height: ct.height,
+          conditions: conditions
+        ))
+
+        # Estimate maxTime from admission domain upper bounds + duration
+        let dom = result.sys.baseArray.domain[admPos]
+        if dom.len > 0:
+          let maxAdm = dom[dom.len - 1]
+          maxTime = max(maxTime, maxAdm + ct.duration)
+
+    if not allResolved: continue
+
+    # Also account for fixed tasks in maxTime
+    for ft in fixedTasks:
+      maxTime = max(maxTime, ft.start + ft.duration)
+
+    result.sys.addConstraint(conditionalCumulative[int](fixedTasks, condTasks, ccinfo.limit, maxTime))
+
+  if result.conditionalCumulativeInfos.len > 0:
+    stderr.writeLine(&"[FZN] Built {result.conditionalCumulativeInfos.len} ConditionalCumulative constraints")
+
+  # Build ConditionalDayCapacity constraints
+  for cdcinfo in result.conditionalDayCapacityInfos:
+    var tasks: seq[DayCapacityTask]
+    var allResolved = true
+    for tinfo in cdcinfo.tasks:
+      let admPos = result.varPositions.getOrDefault(tinfo.admissionVarName, -1)
+      var selPos = -1
+      if tinfo.selectionVarName != "" and tinfo.selectionVarName != "MANDATORY":
+        selPos = result.varPositions.getOrDefault(tinfo.selectionVarName, -1)
+      if admPos < 0 or (selPos < 0 and tinfo.selectionVarName != "" and tinfo.selectionVarName != "MANDATORY"):
+        stderr.writeLine(&"[FZN] WARNING: ConditionalDayCapacity task variable not found: adm={tinfo.admissionVarName}({admPos}) sel={tinfo.selectionVarName}({selPos})")
+        allResolved = false
+        break
+      var extraPos = -1
+      if tinfo.extraCondVarName != "":
+        extraPos = result.varPositions.getOrDefault(tinfo.extraCondVarName, -1)
+        if extraPos < 0:
+          stderr.writeLine(&"[FZN] WARNING: ConditionalDayCapacity extra condition variable not found: {tinfo.extraCondVarName}")
+          allResolved = false
+          break
+      tasks.add(DayCapacityTask(
+        weight: tinfo.weight,
+        admissionPos: admPos,
+        selectionPos: selPos,
+        selectionVal: 1,  # selection[p] == true (1)
+        extraCondPos: extraPos,
+        extraCondVal: tinfo.extraCondVal))
+    if not allResolved: continue
+    result.sys.addConstraint(conditionalDayCapacity[int](tasks, cdcinfo.capacities, cdcinfo.maxDay))
+
+  if result.conditionalDayCapacityInfos.len > 0:
+    stderr.writeLine(&"[FZN] Built {result.conditionalDayCapacityInfos.len} ConditionalDayCapacity constraints")
 
   # Detect transition table chains and apply bidirectional multi-hop reachability
   # domain reduction. MiniZinc may eliminate boundary variables (e.g., agentAtTimeT[1,a]=58

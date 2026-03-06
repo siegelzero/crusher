@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity
 
 ################################################################################
 # Shared constraint type definitions
@@ -33,7 +33,10 @@ type
         DiffnType,
         MatrixElementType,
         NoOverlapFixedBoxType,
-        ConnectedType
+        ConnectedType,
+        ConditionalCumulativeType,
+        ConditionalNoOverlapPairType,
+        ConditionalDayCapacityType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -116,3 +119,9 @@ type
                 noOverlapFixedBoxState*: NoOverlapFixedBoxConstraint[T]
             of ConnectedType:
                 connectedState*: ConnectedConstraint[T]
+            of ConditionalCumulativeType:
+                conditionalCumulativeState*: ConditionalCumulativeConstraint[T]
+            of ConditionalNoOverlapPairType:
+                conditionalNoOverlapPairState*: ConditionalNoOverlapPairConstraint[T]
+            of ConditionalDayCapacityType:
+                conditionalDayCapacityState*: ConditionalDayCapacityConstraint[T]

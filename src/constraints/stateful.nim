@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -286,6 +286,12 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "NoOverlapFixedBox Constraint"
         of ConnectedType:
             return "Connected Constraint"
+        of ConditionalCumulativeType:
+            return "ConditionalCumulative Constraint"
+        of ConditionalNoOverlapPairType:
+            return "ConditionalNoOverlapPair Constraint"
+        of ConditionalDayCapacityType:
+            return "ConditionalDayCapacity Constraint"
 
 ################################################################################
 # Evaluation
@@ -343,6 +349,12 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.noOverlapFixedBoxState.cost
         of ConnectedType:
             return constraint.connectedState.cost
+        of ConditionalCumulativeType:
+            return constraint.conditionalCumulativeState.cost
+        of ConditionalNoOverlapPairType:
+            return constraint.conditionalNoOverlapPairState.cost
+        of ConditionalDayCapacityType:
+            return constraint.conditionalDayCapacityState.cost
 
 ################################################################################
 # Computed Constraints
@@ -948,6 +960,12 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.noOverlapFixedBoxState.initialize(assignment)
         of ConnectedType:
             constraint.connectedState.initialize(assignment)
+        of ConditionalCumulativeType:
+            constraint.conditionalCumulativeState.initialize(assignment)
+        of ConditionalNoOverlapPairType:
+            constraint.conditionalNoOverlapPairState.initialize(assignment)
+        of ConditionalDayCapacityType:
+            constraint.conditionalDayCapacityState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1002,6 +1020,12 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
         of ConnectedType:
             constraint.connectedState.moveDelta(position, oldValue, newValue)
+        of ConditionalCumulativeType:
+            constraint.conditionalCumulativeState.moveDelta(position, oldValue, newValue)
+        of ConditionalNoOverlapPairType:
+            constraint.conditionalNoOverlapPairState.moveDelta(position, oldValue, newValue)
+        of ConditionalDayCapacityType:
+            constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1056,6 +1080,12 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.noOverlapFixedBoxState.updatePosition(position, newValue)
         of ConnectedType:
             constraint.connectedState.updatePosition(position, newValue)
+        of ConditionalCumulativeType:
+            constraint.conditionalCumulativeState.updatePosition(position, newValue)
+        of ConditionalNoOverlapPairType:
+            constraint.conditionalNoOverlapPairState.updatePosition(position, newValue)
+        of ConditionalDayCapacityType:
+            constraint.conditionalDayCapacityState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1091,6 +1121,12 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.tableConstraintState.getAffectedPositions()
         of NoOverlapFixedBoxType:
             return constraint.noOverlapFixedBoxState.getAffectedPositions()
+        of ConditionalCumulativeType:
+            return constraint.conditionalCumulativeState.getAffectedPositions()
+        of ConditionalNoOverlapPairType:
+            return constraint.conditionalNoOverlapPairState.getAffectedPositions()
+        of ConditionalDayCapacityType:
+            return constraint.conditionalDayCapacityState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1119,6 +1155,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.geostState.getAffectedDomainValues(position)
         of RelationalType:
             return constraint.relationalState.getAffectedDomainValues(position)
+        of ConditionalCumulativeType:
+            return constraint.conditionalCumulativeState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1652,6 +1690,24 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: ConnectedType,
                 connectedState: constraint.connectedState.deepCopy()
             )
+        of ConditionalCumulativeType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ConditionalCumulativeType,
+                conditionalCumulativeState: constraint.conditionalCumulativeState.deepCopy()
+            )
+        of ConditionalNoOverlapPairType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ConditionalNoOverlapPairType,
+                conditionalNoOverlapPairState: constraint.conditionalNoOverlapPairState.deepCopy()
+            )
+        of ConditionalDayCapacityType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ConditionalDayCapacityType,
+                conditionalDayCapacityState: constraint.conditionalDayCapacityState.deepCopy()
+            )
 
 
 
@@ -1767,6 +1823,80 @@ func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: o
             stateType: CumulativeType,
             cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit, limitPosition = limitPosition)
         )
+
+################################################################################
+# ConditionalCumulative wrapper function
+################################################################################
+
+func conditionalCumulative*[T](
+    fixedTasks: seq[FixedTask],
+    tasks: seq[ConditionalTask],
+    limit: int,
+    maxTime: int = 500): StatefulConstraint[T] =
+  ## Creates a conditional cumulative constraint where tasks are only active
+  ## when all conditions are satisfied (e.g., room[p]==r AND selection[p]==true).
+  var positions = initPackedSet[int]()
+  for task in tasks:
+    if task.fixedStart < 0:
+      positions.incl(task.startPosition)
+    for cond in task.conditions:
+      positions.incl(cond.position)
+  return StatefulConstraint[T](
+    positions: positions,
+    stateType: ConditionalCumulativeType,
+    conditionalCumulativeState: newConditionalCumulativeConstraint[T](fixedTasks, tasks, limit, maxTime)
+  )
+
+################################################################################
+# ConditionalNoOverlapPair wrapper function
+################################################################################
+
+func conditionalNoOverlapPair*[T](
+    startAPos, startBPos: int,
+    durationA, durationB: int,
+    resourceAPos, resourceBPos: int,
+    resourceAFixed, resourceBFixed: int,
+    condAPos, condBPos: int): StatefulConstraint[T] =
+  ## Creates a conditional no-overlap pair constraint: if both conditions are met
+  ## and resources match, time intervals must not overlap.
+  var positions = initPackedSet[int]()
+  positions.incl(startAPos)
+  positions.incl(startBPos)
+  if resourceAPos >= 0: positions.incl(resourceAPos)
+  if resourceBPos >= 0: positions.incl(resourceBPos)
+  if condAPos >= 0: positions.incl(condAPos)
+  if condBPos >= 0: positions.incl(condBPos)
+  return StatefulConstraint[T](
+    positions: positions,
+    stateType: ConditionalNoOverlapPairType,
+    conditionalNoOverlapPairState: newConditionalNoOverlapPairConstraint[T](
+      startAPos, startBPos, durationA, durationB,
+      resourceAPos, resourceBPos, resourceAFixed, resourceBFixed,
+      condAPos, condBPos)
+  )
+
+################################################################################
+# ConditionalDayCapacity wrapper function
+################################################################################
+
+func conditionalDayCapacity*[T](
+    tasks: seq[DayCapacityTask],
+    capacities: seq[int],
+    maxDay: int): StatefulConstraint[T] =
+  ## Creates a conditional day capacity constraint.
+  ## For each day d: sum(weight[i] * active(i)) <= capacity[d]
+  var positions = initPackedSet[int]()
+  for task in tasks:
+    positions.incl(task.admissionPos)
+    if task.selectionPos >= 0:
+      positions.incl(task.selectionPos)
+    if task.extraCondPos >= 0:
+      positions.incl(task.extraCondPos)
+  return StatefulConstraint[T](
+    positions: positions,
+    stateType: ConditionalDayCapacityType,
+    conditionalDayCapacityState: newConditionalDayCapacityConstraint[T](tasks, capacities, maxDay)
+  )
 
 ################################################################################
 # Geost wrapper functions

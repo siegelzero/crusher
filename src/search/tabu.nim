@@ -1,7 +1,7 @@
 import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -280,6 +280,12 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.noOverlapFixedBoxState.moveDelta(position, oldValue, newValue)
         of ConnectedType:
             result = constraint.connectedState.moveDelta(position, oldValue, newValue)
+        of ConditionalCumulativeType:
+            result = constraint.conditionalCumulativeState.moveDelta(position, oldValue, newValue)
+        of ConditionalNoOverlapPairType:
+            result = constraint.conditionalNoOverlapPairState.moveDelta(position, oldValue, newValue)
+        of ConditionalDayCapacityType:
+            result = constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -340,6 +346,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == DiffnType:
             let p = constraint.diffnState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == ConditionalDayCapacityType:
+            let p = constraint.conditionalDayCapacityState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         else:
@@ -485,6 +495,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
                 state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == ConditionalDayCapacityType:
+            let penalties = constraint.conditionalDayCapacityState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
         else:
             # Individual computation for other constraints
             for i in 0..<dLen:
@@ -557,6 +573,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     elif constraint.stateType == DiffnType:
         # Batch computation for diffn — pre-caches fixed rect coords
         let penalties = constraint.diffnState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == ConditionalDayCapacityType:
+        let penalties = constraint.conditionalDayCapacityState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
@@ -1783,7 +1807,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 searchPos.incl(pos)
         state.constraintSearchPos[cast[pointer](c)] = searchPos
 
-    # Identify channel-dep constraints (those with no search positions)
+    # Identify channel-dep constraints:
+    # 1. Pure-channel constraints (all positions are channels)
+    # 2. Mixed constraints (some search, some channel) — needed for constraints
+    #    where channel positions carry cost information (e.g., cumulative, element)
     state.hasChannelDeps = false
     state.channelDepConstraints = @[]
     state.channelDepSearchPositions = @[]
@@ -1792,6 +1819,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         let searchPos = state.constraintSearchPos.getOrDefault(cptr)
         if searchPos.len == 0:
             state.channelDepConstraints.add(c)
+        else:
+            for p in c.positions.items:
+                if p in carray.channelPositions:
+                    state.channelDepConstraints.add(c)
+                    break
     state.channelDepConstraintActive = newSeq[bool](state.channelDepConstraints.len)
     for i in 0..<state.channelDepConstraintActive.len:
         state.channelDepConstraintActive[i] = true
