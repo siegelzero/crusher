@@ -185,7 +185,6 @@ proc moveDelta*[T](c: ConditionalCumulativeConstraint[T], position: int, oldValu
 
   # Case 1: position is a condition — tasks may activate/deactivate
   if position in c.condPosToTasks:
-    # Directly compute cost change by scanning affected time ranges
     for taskIdx in c.condPosToTasks[position]:
       let task = c.tasks[taskIdx]
       let wasActive = c.activeFlags[taskIdx]
@@ -217,9 +216,8 @@ proc moveDelta*[T](c: ConditionalCumulativeConstraint[T], position: int, oldValu
           let newExcess = max(int(c.resourceProfile[t]) + h - c.limit, 0)
           newCost += newExcess - oldExcess
 
-    return newCost - oldCost
-
   # Case 2: position is a start time — shift active tasks
+  # (not mutually exclusive with Case 1: a position could be both)
   if position in c.startPosToTasks:
     for taskIdx in c.startPosToTasks[position]:
       if not c.activeFlags[taskIdx]: continue
@@ -271,9 +269,7 @@ proc moveDelta*[T](c: ConditionalCumulativeConstraint[T], position: int, oldValu
             let newExcess = max(int(c.resourceProfile[t]) + int(h) - c.limit, 0)
             newCost += newExcess - oldExcess
 
-    return newCost - oldCost
-
-  return 0
+  return newCost - oldCost
 
 
 proc getAffectedPositions*[T](c: ConditionalCumulativeConstraint[T]): PackedSet[int] =

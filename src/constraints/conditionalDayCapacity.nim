@@ -327,27 +327,27 @@ proc getAffectedPositions*[T](c: ConditionalDayCapacityConstraint[T]): PackedSet
     return result
 
   # Determine which days were affected
-  var affectedDays: set[0..31]  # Supports up to 32 days
+  var affectedDays: PackedSet[int]
 
   if pos < c.admissionPosToTasks.len:
     for taskIdx in c.admissionPosToTasks[pos]:
       if c.activeFlags[taskIdx]:
         let oldDay = int(c.lastOldValue)
         let newDay = int(c.currentAssignment[pos])
-        if oldDay >= 0 and oldDay <= min(c.maxDay, 31): affectedDays.incl(oldDay)
-        if newDay >= 0 and newDay <= min(c.maxDay, 31): affectedDays.incl(newDay)
+        if oldDay >= 0 and oldDay <= c.maxDay: affectedDays.incl(oldDay)
+        if newDay >= 0 and newDay <= c.maxDay: affectedDays.incl(newDay)
 
   if pos < c.selectionPosToTasks.len:
     for taskIdx in c.selectionPosToTasks[pos]:
       let day = int(c.currentAssignment[c.tasks[taskIdx].admissionPos])
-      if day >= 0 and day <= min(c.maxDay, 31): affectedDays.incl(day)
+      if day >= 0 and day <= c.maxDay: affectedDays.incl(day)
 
   if pos < c.extraCondPosToTasks.len:
     for taskIdx in c.extraCondPosToTasks[pos]:
       let day = int(c.currentAssignment[c.tasks[taskIdx].admissionPos])
-      if day >= 0 and day <= min(c.maxDay, 31): affectedDays.incl(day)
+      if day >= 0 and day <= c.maxDay: affectedDays.incl(day)
 
-  if affectedDays == {}:
+  if affectedDays.len == 0:
     return initPackedSet[int]()
 
   # Return positions of all tasks on affected days
@@ -355,7 +355,7 @@ proc getAffectedPositions*[T](c: ConditionalDayCapacityConstraint[T]): PackedSet
   for i, task in c.tasks:
     if not c.activeFlags[i]: continue
     let day = int(c.currentAssignment[task.admissionPos])
-    if day >= 0 and day <= min(c.maxDay, 31) and day in affectedDays:
+    if day >= 0 and day <= c.maxDay and day in affectedDays:
       result.incl(task.admissionPos)
       if task.selectionPos >= 0:
         result.incl(task.selectionPos)

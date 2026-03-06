@@ -11,7 +11,7 @@
 #
 # Performance: O(1) penalty and moveDelta.
 
-import std/[packedsets, tables]
+import std/[packedsets]
 
 type
   ConditionalNoOverlapPairConstraint*[T] = ref object

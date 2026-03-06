@@ -234,7 +234,8 @@ type
     # Detected conditional day capacity patterns (H3/H4 surgeon/OT capacity)
     conditionalDayCapacityInfos*: seq[tuple[
       tasks: seq[tuple[weight: int, admissionVarName, selectionVarName: string,
-                        extraCondVarName: string, extraCondVal: int]],
+                        extraCondVarName: string, extraCondVal: int,
+                        isMandatory: bool]],
       capacities: seq[int],
       maxDay: int,
       consumedCIs: seq[int],
@@ -7461,7 +7462,7 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
           if e.kind != FznIdent: continue
           info.varNames[i] = e.ident
         info.rhs = tr.resolveIntArg(con.args[2])
-      except: continue
+      except KeyError, ValueError: continue
       reifByOutputVar[con.args[3].ident] = info
 
     of "int_lin_le_reif":
@@ -7475,7 +7476,7 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
           if e.kind != FznIdent: continue
           info.varNames[i] = e.ident
         info.rhs = tr.resolveIntArg(con.args[2])
-      except: continue
+      except KeyError, ValueError: continue
       reifByOutputVar[con.args[3].ident] = info
 
     of "int_ne_reif":
@@ -7512,7 +7513,6 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
 
   # Step 2: Scan bool_clause constraints for the no-overlap patterns
   var nPatientPatient = 0
-  var nOccupantPatient = 0
   var detected: seq[ConditionalNoOverlapInfo]
 
   for ci, con in tr.model.constraints:
@@ -7602,58 +7602,8 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
             nPatientPatient += 1
 
     # Pattern B: 2 positive, 1 negative (occupant-patient no-overlap)
-    # bool_clause([B_ne, B_le], [sel_A])
-    elif posLits.len == 2 and negLits.len == 1:
-      var neReif: ReifInfo
-      var leReif: ReifInfo
-      var hasNe, hasLe = false
-
-      for lit in posLits:
-        if lit notin reifByOutputVar: continue
-        let info = reifByOutputVar[lit]
-        if info.constraintType in ["int_ne_reif", "int_lin_ne_reif"]:
-          neReif = info
-          hasNe = true
-        elif info.constraintType in ["int_le_reif", "int_lin_le_reif"]:
-          leReif = info
-          hasLe = true
-
-      if hasNe and hasLe:
-        var info: ConditionalNoOverlapInfo
-        info.condAName = negLits[0]  # selection var
-
-        if neReif.constraintType == "int_ne_reif" and neReif.varNames.len == 1:
-          # int_ne_reif(room, occ_room_val, B) → room != occ_room_val
-          info.resourceAName = neReif.varNames[0]
-          info.resourceBFixed = neReif.rhs
-        elif neReif.constraintType == "int_lin_ne_reif" and neReif.varNames.len == 2 and
-             neReif.coeffs == @[1, -1] and neReif.rhs == 0:
-          info.resourceAName = neReif.varNames[0]
-          info.resourceBName = neReif.varNames[1]
-        else:
-          continue
-
-        if leReif.constraintType == "int_le_reif" and leReif.varNames.len == 1:
-          # int_le_reif(occ_end, adm, B) → adm >= occ_end
-          # Occupant: fixed start=0, duration=occ_end (occupies [0, occ_end))
-          # Patient: start=adm, duration=stay
-          # No overlap: adm >= occ_end OR occ_end <= adm (same thing)
-          # We model this as: occupant has start=0, dur=occ_end; patient has start=adm, dur=stay
-          # But we don't know patient's duration here — look it up later
-          info.startAName = leReif.varNames[0]  # admission var
-          info.durationB = leReif.rhs            # occupant end time = start(0) + duration
-          info.startBName = ""                   # occupant has fixed start
-          info.durationA = 0                     # will be filled if we can find it
-        else:
-          continue
-
-        info.consumedCIs = @[ci, neReif.ci, leReif.ci]
-        info.consumedVars = @[]
-        for lit in posLits:
-          info.consumedVars.add(lit)
-
-        detected.add(info)
-        nOccupantPatient += 1
+    # Skipped: patient duration is unknown at detection time and these
+    # are handled adequately as boolean constraints.
 
   if detected.len == 0: return
 
@@ -7674,7 +7624,7 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
       condAName: info.condAName, condBName: info.condBName,
       consumedCIs: info.consumedCIs, consumedVars: info.consumedVars))
 
-  stderr.writeLine(&"[FZN] Detected {nPatientPatient} patient-patient + {nOccupantPatient} occupant-patient conditional no-overlap pairs")
+  stderr.writeLine(&"[FZN] Detected {nPatientPatient} patient-patient conditional no-overlap pairs")
 
 
 proc detectConditionalCumulativePattern(tr: var FznTranslator) =
@@ -7895,7 +7845,7 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
       durations = tr.resolveIntArray(con.args[1])
       heights = tr.resolveIntArray(con.args[2])
       limit = tr.resolveIntArg(con.args[3])
-    except: continue
+    except KeyError, ValueError: continue
     if durations.len != startNames.len or heights.len != startNames.len: continue
 
     var ccinfo: ConditionalCumulativeInfo
@@ -8153,6 +8103,7 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
       extraCondVarName: string  # "" if none
       extraCondVal: int
       day: int
+      isMandatory: bool
 
   type
     PerDayConstraint = object
@@ -8231,6 +8182,7 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
       var admVar = ""
       var extraSource = ""
       var extraVal = -1
+      var mandatory = false
 
       if cVarName in boolAndInputs:
         # Normal case: bool2int input is an array_bool_and output
@@ -8264,7 +8216,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
         if srcVar in admissionVarNames:
           admVar = srcVar
           day = val
-          selVar = "MANDATORY"  # sentinel: always active
+          selVar = ""
+          mandatory = true
         else:
           allValid = false
       else:
@@ -8287,7 +8240,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
         selectionVarName: selVar,
         extraCondVarName: extraSource,
         extraCondVal: extraVal,
-        day: day))
+        day: day,
+        isMandatory: mandatory))
       consumedVarNames.add(dVarName)
       consumedVarNames.add(cVarName)
 
@@ -8335,13 +8289,15 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
     # Build task list from the first constraint (all have same structure)
     let firstPdc = perDayConstraints[indices[0]]
     var taskInfos: seq[tuple[weight: int, admissionVarName, selectionVarName: string,
-                              extraCondVarName: string, extraCondVal: int]]
+                              extraCondVarName: string, extraCondVal: int,
+                              isMandatory: bool]]
     for t in firstPdc.tasks:
       taskInfos.add((weight: t.weight,
                       admissionVarName: t.admissionVarName,
                       selectionVarName: t.selectionVarName,
                       extraCondVarName: t.extraCondVarName,
-                      extraCondVal: t.extraCondVal))
+                      extraCondVal: t.extraCondVal,
+                      isMandatory: t.isMandatory))
 
     # Mark consumed
     for ci in consumedCIs:
@@ -9191,29 +9147,7 @@ proc translate*(model: FznModel): FznTranslator =
     let condAPos = resolvePosName(info.condAName)
     let condBPos = resolvePosName(info.condBName)
 
-    # For occupant-patient pattern: startB is fixed (occupant at time 0),
-    # durationB is the occupant's length of stay (=occupancy end time)
-    # We model: occupant has start=0, dur=occEnd; patient has start=adm, dur=stay
-    # But we need patient's duration. For occupant pattern, durationA was set to 0
-    # because we couldn't determine it during detection. Skip these for now
-    # if durationA is unknown.
-    if info.durationA == 0 and startBPos < 0:
-      # Occupant-patient pattern: we don't have patient duration.
-      # These are simpler constraints, keep them as boolean constraints.
-      # Un-consume them
-      for ci in info.consumedCIs:
-        result.definingConstraints.excl(ci)
-      for v in info.consumedVars:
-        result.definedVarNames.excl(v)
-      continue
-
-    if startBPos < 0:
-      # Fixed start B (occupant) — not yet handled, skip
-      for ci in info.consumedCIs:
-        result.definingConstraints.excl(ci)
-      for v in info.consumedVars:
-        result.definedVarNames.excl(v)
-      continue
+    if startAPos < 0 or startBPos < 0: continue
 
     result.sys.addConstraint(conditionalNoOverlapPair[int](
       startAPos, startBPos,
@@ -9304,9 +9238,9 @@ proc translate*(model: FznModel): FznTranslator =
     for tinfo in cdcinfo.tasks:
       let admPos = result.varPositions.getOrDefault(tinfo.admissionVarName, -1)
       var selPos = -1
-      if tinfo.selectionVarName != "" and tinfo.selectionVarName != "MANDATORY":
+      if tinfo.selectionVarName != "" and not tinfo.isMandatory:
         selPos = result.varPositions.getOrDefault(tinfo.selectionVarName, -1)
-      if admPos < 0 or (selPos < 0 and tinfo.selectionVarName != "" and tinfo.selectionVarName != "MANDATORY"):
+      if admPos < 0 or (selPos < 0 and tinfo.selectionVarName != "" and not tinfo.isMandatory):
         stderr.writeLine(&"[FZN] WARNING: ConditionalDayCapacity task variable not found: adm={tinfo.admissionVarName}({admPos}) sel={tinfo.selectionVarName}({selPos})")
         allResolved = false
         break
