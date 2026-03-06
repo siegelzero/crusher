@@ -2456,6 +2456,12 @@ proc collectDefinedVars(tr: var FznTranslator) =
         for annArg in ann.args:
           if annArg.kind == FznIdent:
             referencedVars.incl(annArg.ident)
+    # Also check array variable declarations (vars referenced as array elements)
+    for decl in tr.model.variables:
+      if decl.value != nil and decl.value.kind == FznArrayLit:
+        for elem in decl.value.elems:
+          if elem.kind == FznIdent:
+            referencedVars.incl(elem.ident)
 
     # Build reverse alias map: original channel name → set of alias names
     var aliasesOf = initTable[string, seq[string]]()
