@@ -2,6 +2,15 @@
 import resolution
 from std/times import epochTime
 from std/math import ceil
+import std/packedsets
+
+proc copyPackedSet(src: PackedSet[int]): PackedSet[int] =
+    ## Force a deep copy of a PackedSet to avoid shared Trunk refs under ARC.
+    ## Nim 2.2.6's PackedSet.=copy is buggy: it doesn't clear dest.head before
+    ## rebuilding the linked list, causing old and new trunks to chain together.
+    result = initPackedSet[int]()
+    for item in src.items:
+        result.incl(item)
 
 const BoundFloor = low(int) div 2
 const BoundCeil = high(int) div 2
@@ -67,6 +76,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         system.bestAssignmentValid = true
 
         echo "[Opt] Initial solution: ", currentCost
+        flushFile(stdout)
 
         # Add domain bounds as permanent constraints only when the initial solution
         # violates them. Adding trivially-satisfied bounds wastes per-iteration work
@@ -117,8 +127,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         # Cache the base reduced domain and fixed positions (after any domain bound constraints).
         # Subsequent iterations only change the search bound — no need to recompute.
+        # Use copyPackedSet for PackedSet to work around Nim 2.2.6 =copy bug under ARC.
         let baseReducedDomain = system.baseArray.reducedDomain
-        let baseFixedPositions = system.baseArray.fixedPositions
+        let baseFixedPositions = copyPackedSet(system.baseArray.fixedPositions)
 
         # Binary search bounds
         when direction == Minimize:
@@ -133,6 +144,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
             echo "[Opt] Binary search [", lo, "..", hi, "]"
+            flushFile(stdout)
 
         while lo <= hi:
             if deadline > 0 and epochTime() > deadline:
@@ -152,11 +164,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.addConstraint(objective >= target)
             hasBoundConstraint = true
             system.baseArray.reducedDomain = baseReducedDomain
-            system.baseArray.fixedPositions = baseFixedPositions
+            system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
             system.baseArray.tightenReducedDomain()
 
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
+                flushFile(stdout)
 
             if deadline > 0 and deadline - epochTime() < 5.0:
                 system.searchCompleted = false
@@ -165,7 +178,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             # Save constraints/fixedPositions before resolve (which may mutate them
             # via removeFixedConstraints) so the optimizer can still add/remove bounds
             let savedConstraints = system.baseArray.constraints
-            let savedFixed = system.baseArray.fixedPositions
+            let savedFixed = copyPackedSet(system.baseArray.fixedPositions)
 
             try:
                 system.resolve(
@@ -184,6 +197,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.bestFeasibleAssignment = system.assignment
                 system.bestAssignmentValid = true
                 echo "[Opt] Improved: ", objective.value
+                flushFile(stdout)
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
                 # Found solution at value currentCost — narrow toward better
@@ -207,14 +221,13 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = target - 1
                     hiProven = true
             except NoSolutionFoundError:
-                # Tabu-only couldn't find this target — stop binary search,
-                # fall through to retry loop which uses scatter search
+                # Tabu-only couldn't find — break to retry with scatter search
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 break
             finally:
                 system.baseArray.constraints = savedConstraints
-                system.baseArray.fixedPositions = savedFixed
+                system.baseArray.fixedPositions = copyPackedSet(savedFixed)
 
         # Retry: binary search used fast tabu-only probes until first failure.
         # Now try to beat the current best with full scatter search, deepening threshold on each failure.
@@ -255,13 +268,17 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.addConstraint(objective >= currentCost + 1)
                 hasBoundConstraint = true
                 system.baseArray.reducedDomain = baseReducedDomain
-                system.baseArray.fixedPositions = baseFixedPositions
+                system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
                 system.baseArray.tightenReducedDomain()
 
                 let savedConstraints2 = system.baseArray.constraints
-                let savedFixed2 = system.baseArray.fixedPositions
+                let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)
 
                 try:
+                    if verbose:
+                        echo "[Opt] Retry targeting ", (when direction == Minimize: currentCost - 1 else: currentCost + 1)
+                        flushFile(stdout)
+
                     system.resolve(
                         parallel=parallel,
                         tabuThreshold=retryThreshold,
@@ -278,6 +295,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.bestFeasibleAssignment = system.assignment
                     system.bestAssignmentValid = true
                     echo "[Opt] Retry improved: ", currentCost
+                    flushFile(stdout)
                     retryThreshold = tabuThreshold  # reset on success
                 except TimeLimitExceededError:
                     system.initialize(bestSolution)
@@ -297,12 +315,13 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.adaptedTabuThreshold = 0  # force using bumped threshold
                     if verbose:
                         echo "[Opt] Retry deepening threshold to ", retryThreshold
+                        flushFile(stdout)
                     if deadline > 0 and epochTime() < deadline:
                         continue
                     break retryLoop
                 finally:
                     system.baseArray.constraints = savedConstraints2
-                    system.baseArray.fixedPositions = savedFixed2
+                    system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
 
         # Clean up the bound constraint and restore best solution
         if hasBoundConstraint:

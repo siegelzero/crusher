@@ -83,6 +83,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
             if verbose:
                 echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy}, adaptedThreshold={adaptedThreshold})"
+                flushFile(stdout)
                 pool.poolStatistics()
             let improved = case scatterStrategy:
                 of PathRelinking:

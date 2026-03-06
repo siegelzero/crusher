@@ -539,5 +539,6 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     if verbose:
         let bestCost = if allResults.len > 0: allResults[0].cost else: -1
         echo &"[Solve] Initial parallel search failed: best cost={bestCost}"
+        flushFile(stdout)
 
     return false
