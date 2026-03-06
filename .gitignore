@@ -4,6 +4,9 @@
 !*.*
 !Makefile
 
+# Generated MiniZinc output files
+*.ozn
+
 # Nim-specific ignores
 *~
 *.out

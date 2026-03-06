@@ -94,6 +94,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 if lowerBound != low(int):
                     system.addConstraint(objective >= lowerBound)
                 echo "[Opt] Objective ", currentCost, " outside domain [", lowerBound, "..", upperBound, "], constraining..."
+                flushFile(stdout)
                 system.hasFeasibleSolution = false
                 let savedAssignment = system.assignment
                 var domainResolved = false
@@ -114,16 +115,19 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     except NoSolutionFoundError:
                         if verbose:
                             echo "[Opt] Domain bound resolve attempt ", attempt, " failed"
+                        flushFile(stdout)
                     except InfeasibleError:
                         raise
                 if not domainResolved:
                     if verbose:
                         echo "[Opt] Trying sequential from saved assignment"
+                        flushFile(stdout)
                     system.resolveFromAssignment(savedAssignment, tabuThreshold, verbose, deadline)
                 objective.initialize(system.assignment)
                 currentCost = objective.value
                 system.hasFeasibleSolution = true
                 echo "[Opt] Resolved within domain bounds: ", currentCost
+                flushFile(stdout)
 
         # Cache the base reduced domain and fixed positions (after any domain bound constraints).
         # Subsequent iterations only change the search bound — no need to recompute.
@@ -200,6 +204,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 flushFile(stdout)
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
+                    flushFile(stdout)
                 # Found solution at value currentCost — narrow toward better
                 when direction == Minimize:
                     hi = currentCost - 1
@@ -332,6 +337,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             echo "[Opt] Proven optimal: ", objective.value
         else:
             echo "[Opt] Done: ", objective.value
+        flushFile(stdout)
 
 # Generate minimize and maximize procedures for all stateful expression types
 optimizeImpl(SumExpression, Minimize, minimize)
