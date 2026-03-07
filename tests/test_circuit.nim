@@ -2,20 +2,19 @@ import std/[sequtils, tables, unittest]
 import crusher
 import constraints/circuit
 
-proc validateCircuit(assignment: seq[int], n: int): bool =
+proc validateCircuit(assignment: seq[int], n: int, offset: int = 1): bool =
     ## Validate that an assignment forms a single Hamiltonian circuit.
-    ## Assignment uses 1-based values: value j at position i means node i -> node j.
+    ## offset=1 for 1-based values, offset=0 for 0-based values.
     var visited = newSeq[bool](n)
-    var current = 0  # start at node 0 (1-based node 1)
+    var current = 0
     for step in 0..<n:
         if visited[current]:
-            return false  # visited a node twice before completing
+            return false
         visited[current] = true
-        let next = assignment[current] - 1  # convert 1-based to 0-based
+        let next = assignment[current] - offset
         if next < 0 or next >= n:
             return false
         current = next
-    # After n steps, should be back at start
     return current == 0 and visited.allIt(it)
 
 suite "Circuit Constraint":
@@ -274,3 +273,63 @@ suite "Circuit Constraint":
                     circuitRef.successorArray[pos] = oldSucc
                     let expectedDelta = expectedNewCost - constraint.penalty()
                     check delta == expectedDelta
+
+    test "0-based: valid single circuit [1,2,3,4,5,0]":
+        # 0-based: 0->1->2->3->4->5->0, penalty = 0
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(0..5))
+        let pos = toSeq(x.offset..<(x.offset + x.size))
+        sys.addConstraint(circuit[int](pos, valueOffset = 0))
+
+        let assignment = @[1, 2, 3, 4, 5, 0]
+        sys.initialize(assignment)
+
+        let cost = sys.baseArray.constraints[0].penalty()
+        check cost == 0
+
+    test "0-based: all self-loops [0,1,2,3,4,5]":
+        # 0-based self-loops, penalty = 5
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(0..5))
+        let pos = toSeq(x.offset..<(x.offset + x.size))
+        sys.addConstraint(circuit[int](pos, valueOffset = 0))
+
+        let assignment = @[0, 1, 2, 3, 4, 5]
+        sys.initialize(assignment)
+
+        let cost = sys.baseArray.constraints[0].penalty()
+        check cost == 5
+
+    test "0-based: moveDelta consistency":
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(0..5))
+        let pos = toSeq(x.offset..<(x.offset + x.size))
+        sys.addConstraint(circuit[int](pos, valueOffset = 0))
+
+        let assignment = @[1, 0, 3, 2, 5, 4]  # three 2-cycles
+        sys.initialize(assignment)
+
+        let constraint = sys.baseArray.constraints[0]
+        let initialCost = constraint.penalty()
+        check initialCost == 2
+
+        let delta = constraint.moveDelta(1, 0, 2)
+        constraint.updatePosition(1, 2)
+        let newCost = constraint.penalty()
+        check newCost == initialCost + delta
+
+    test "0-based: solver finds valid circuit":
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(0..5))
+        let pos = toSeq(x.offset..<(x.offset + x.size))
+        sys.addConstraint(allDifferent(x))
+        sys.addConstraint(circuit[int](pos, valueOffset = 0))
+
+        sys.resolve(parallel=true, tabuThreshold=10000)
+
+        let sol = x.assignment()
+        check validateCircuit(sol, 6, offset = 0)

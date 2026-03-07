@@ -218,3 +218,166 @@ solve satisfy;
 
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
     check tr.sys.assignment[tr.varPositions["x"]] == 2
+
+  test "0-based circuit via FlatZinc":
+    # fzn_circuit with 0-based values (domain 0..3 for 4 nodes)
+    let src = """
+var 0..3: x1;
+var 0..3: x2;
+var 0..3: x3;
+var 0..3: x4;
+array [1..4] of var int: x:: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_all_different_int(x);
+constraint fzn_circuit(x);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](4)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    # All different
+    check values.toHashSet.len == 4
+    # Valid 0-based circuit: follow successors from node 0, visit all nodes
+    var visited = initPackedSet[int]()
+    var cur = 0
+    for step in 0..<4:
+      check cur notin visited
+      visited.incl(cur)
+      cur = values[cur]
+    check cur == 0
+    check visited.len == 4
+
+  test "bool_not channel detection":
+    # bool_not(a, b) with defines_var(b) should make b a channel = 1 - a.
+    # We force a = 1 via int_eq, so b should be 0.
+    let src = """
+var 0..1: a:: output_var;
+var 0..1: b:: output_var;
+constraint int_eq(a, 1);
+constraint bool_not(a, b):: defines_var(b);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # b should be detected as a channel variable
+    check "b" in tr.channelVarNames
+    check "b" in tr.varPositions
+    let bPos = tr.varPositions["b"]
+    check bPos in tr.sys.baseArray.channelPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let aVal = tr.sys.assignment[tr.varPositions["a"]]
+    let bVal = tr.sys.assignment[bPos]
+    check aVal == 1
+    check bVal == 0  # b = 1 - a
+
+  test "bool_not channel with downstream constraint":
+    # b = not(a), then use b in a constraint to verify it propagates correctly.
+    # x + y = 5, a = (x != 3), b = not(a), so b = (x == 3).
+    # Force b = 1 via bool2int + int_eq, meaning x must be 3, y must be 2.
+    let src = """
+var 1..4: x:: output_var;
+var 1..4: y:: output_var;
+var 0..1: a;
+var 0..1: b;
+var 0..1: bi:: output_var;
+constraint int_ne_reif(x, 3, a):: defines_var(a);
+constraint bool_not(a, b):: defines_var(b);
+constraint bool2int(b, bi):: defines_var(bi);
+constraint int_eq(bi, 1);
+constraint int_lin_eq([1,1],[x,y],5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "b" in tr.channelVarNames
+    check "bi" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal == 3
+    check yVal == 2
+
+  test "incomplete case analysis not channeled":
+    # Pattern: place has domain {1,2,3}. We only define what target equals when
+    # place != 1 (via bool_clause + int_eq_reif + int_ne_reif), but NOT when place == 1.
+    # The old code would have channeled target with a wrong default for the missing case.
+    # The fix requires all cases to be covered, so target stays a search variable.
+    #
+    # place==2 → target==10, place==3 → target==20, place==1 → unconstrained
+    let src = """
+var 1..3: place:: output_var;
+var 5..25: target:: output_var;
+var 0..1: eq2;
+var 0..1: ne2;
+var 0..1: eq3;
+var 0..1: ne3;
+constraint int_eq_reif(target, 10, eq2):: defines_var(eq2);
+constraint int_ne_reif(place, 2, ne2):: defines_var(ne2);
+constraint bool_clause([eq2, ne2], []);
+constraint int_eq_reif(target, 20, eq3):: defines_var(eq3);
+constraint int_ne_reif(place, 3, ne3):: defines_var(ne3);
+constraint bool_clause([eq3, ne3], []);
+constraint int_eq(place, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # target should NOT be a channel — incomplete case analysis
+    check "target" notin tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let placeVal = tr.sys.assignment[tr.varPositions["place"]]
+    let targetVal = tr.sys.assignment[tr.varPositions["target"]]
+    check placeVal == 2
+    check targetVal == 10
+
+  test "complete case analysis is channeled":
+    # Same pattern but ALL cases covered: place has domain {1,2,3}.
+    # place==1 → target==5, place==2 → target==10, place==3 → target==20
+    # This should be detected as a complete case analysis and channeled.
+    let src = """
+var 1..3: place:: output_var;
+var 5..25: target:: output_var;
+var 0..1: eq1;
+var 0..1: ne1;
+var 0..1: eq2;
+var 0..1: ne2;
+var 0..1: eq3;
+var 0..1: ne3;
+constraint int_eq_reif(target, 5, eq1):: defines_var(eq1);
+constraint int_ne_reif(place, 1, ne1):: defines_var(ne1);
+constraint bool_clause([eq1, ne1], []);
+constraint int_eq_reif(target, 10, eq2):: defines_var(eq2);
+constraint int_ne_reif(place, 2, ne2):: defines_var(ne2);
+constraint bool_clause([eq2, ne2], []);
+constraint int_eq_reif(target, 20, eq3):: defines_var(eq3);
+constraint int_ne_reif(place, 3, ne3):: defines_var(ne3);
+constraint bool_clause([eq3, ne3], []);
+constraint int_eq(place, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # target SHOULD be a channel — complete case analysis
+    check "target" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let placeVal = tr.sys.assignment[tr.varPositions["place"]]
+    let targetVal = tr.sys.assignment[tr.varPositions["target"]]
+    check placeVal == 2
+    check targetVal == 10
