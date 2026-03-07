@@ -4733,14 +4733,11 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     if not valid: continue
 
     # Check completeness: number of cases == product of condition domain sizes
-    # Allow incomplete case analyses only when exactly 1 case is missing
-    # (e.g., the "inactive" case for conditional assignments).
     var expectedCases = 1
     for dom in condDomains:
       expectedCases *= dom.len
     let isComplete = entries.len == expectedCases
-    if entries.len > expectedCases: continue  # Duplicates — skip
-    if not isComplete and (expectedCases - entries.len) > 1: continue  # Too many missing
+    if not isComplete: continue  # Only allow complete case analyses
 
     # Build case map (condValues → CaseEntry)
     var caseMap: Table[seq[int], CaseEntry]
@@ -4763,7 +4760,6 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
 
     # Collect all "expression variables" from linear entries (otherVars in lin_eq_reif)
     # and from non-linear entries with variable test values.
-    # For channel/defined variables, trace transitive source variables via case analysis defs.
     var exprVarSet: HashSet[string]
     for e in entries:
       if e.kind == cekLinear:
@@ -4772,19 +4768,14 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
       elif e.testVal.kind == FznIdent and e.testVal.ident notin tr.paramValues:
         exprVarSet.incl(e.testVal.ident)
 
-    # Replace channel/defined variables with their transitive source variables.
-    # Channel vars will be resolved via buildValueMapping during table building.
+    # Filter expression variables: channel/defined variables are resolved via
+    # buildValueMapping during table building, so exclude them here.
+    # Do NOT transitively resolve their source variables — that creates wrong
+    # multi-dimensional lookup tables with spurious dependencies.
     var resolvedExprVars: HashSet[string]
     for ev in exprVarSet:
       if ev in tr.channelVarNames or ev in tr.definedVarNames:
-        # Trace through case analysis defs for known transitive sources
-        for caDef in tr.caseAnalysisDefs:
-          if caDef.targetVarName == ev:
-            for sv in caDef.sourceVarNames:
-              resolvedExprVars.incl(sv)
-            break
-        # Other channel types (bool2int, reif chains) are resolved via buildValueMapping;
-        # their dependencies on search variables are covered by the case analysis sources above.
+        continue  # buildValueMapping handles these at table-construction time
       else:
         resolvedExprVars.incl(ev)
     exprVarSet = resolvedExprVars
