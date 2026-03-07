@@ -1993,22 +1993,23 @@ func irdcs*[T](positions: openArray[int], singletonPenalty: int = 1): StatefulCo
 # Circuit wrapper functions
 ################################################################################
 
-func circuit*[T](positions: openArray[int]): StatefulConstraint[T] =
+func circuit*[T](positions: openArray[int], valueOffset: int = 1): StatefulConstraint[T] =
     ## Creates a Circuit constraint ensuring variables form a single Hamiltonian circuit.
-    ## Uses 1-based convention: value j at position i means "from node i, go to node j."
+    ## valueOffset=1 for 1-based values (default), valueOffset=0 for 0-based values.
     ##
     ## **Mathematical Form**: The successor function defined by the variables forms exactly
     ## one cycle visiting all n nodes.
     ##
     ## **Parameters**:
     ## - `positions`: Variable positions that define the successor function
+    ## - `valueOffset`: Subtracted from values to get 0-based index (1 for 1-based, 0 for 0-based)
     ##
     ## **Note**: Does NOT enforce allDifferent. Add both constraints:
     ##   sys.addConstraint(allDifferent(x))
     ##   sys.addConstraint(circuit(x))
     ##
     ## **Violation Cost**: max(0, numCycles - 1) + numTailNodes
-    let circuitConstraint = newCircuitConstraint[T](positions)
+    let circuitConstraint = newCircuitConstraint[T](positions, valueOffset)
     return StatefulConstraint[T](
         positions: circuitConstraint.positions,
         stateType: CircuitType,
@@ -2019,9 +2020,9 @@ func circuit*[T](positions: openArray[int]): StatefulConstraint[T] =
 # Subcircuit wrapper functions
 ################################################################################
 
-func subcircuit*[T](positions: openArray[int]): StatefulConstraint[T] =
+func subcircuit*[T](positions: openArray[int], valueOffset: int = 1): StatefulConstraint[T] =
     ## Creates a Subcircuit constraint ensuring variables form at most one circuit.
-    ## Uses 1-based convention: value j at position i means "from node i, go to node j."
+    ## valueOffset=1 for 1-based values (default), valueOffset=0 for 0-based values.
     ## Self-loops (i -> i) indicate nodes NOT part of the subcircuit.
     ##
     ## **Note**: Does NOT enforce allDifferent. Add both constraints:
@@ -2029,7 +2030,7 @@ func subcircuit*[T](positions: openArray[int]): StatefulConstraint[T] =
     ##   sys.addConstraint(subcircuit(x))
     ##
     ## **Violation Cost**: max(0, numNonTrivialCycles - 1) + numTailNodes
-    let subcircuitConstraint = newSubcircuitConstraint[T](positions)
+    let subcircuitConstraint = newSubcircuitConstraint[T](positions, valueOffset)
     return StatefulConstraint[T](
         positions: subcircuitConstraint.positions,
         stateType: SubcircuitType,

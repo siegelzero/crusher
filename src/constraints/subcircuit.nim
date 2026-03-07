@@ -25,6 +25,7 @@ type
 
     SubcircuitConstraint*[T] = ref object
         n*: int                              # number of nodes
+        valueOffset*: int                    # subtracted from values to get 0-based index
         positions*: PackedSet[int]           # all variable positions
         positionArray*: seq[int]             # position per node index (input order)
         positionToIndex*: Table[int, int]    # position -> 0-based node index
@@ -251,9 +252,10 @@ proc countCyclesAndTails[T](constraint: SubcircuitConstraint[T],
 # Constructor
 ################################################################################
 
-proc newSubcircuitConstraint*[T](positions: openArray[int]): SubcircuitConstraint[T] =
+proc newSubcircuitConstraint*[T](positions: openArray[int], valueOffset: int = 1): SubcircuitConstraint[T] =
     new(result)
     result.n = positions.len
+    result.valueOffset = valueOffset
     result.positionArray = @positions  # Keep input order — node i = positions[i]
     result.positions = toPackedSet[int](positions)
     result.positionToIndex = initTable[int, int]()
@@ -286,8 +288,8 @@ proc initialize*[T](constraint: SubcircuitConstraint[T], assignment: seq[T]) =
     for i, pos in constraint.positionArray:
         let value = assignment[pos]
         constraint.currentAssignment[pos] = value
-        # Convert 1-based value to 0-based index
-        constraint.successorArray[i] = int(value) - 1
+        # Convert value to 0-based index
+        constraint.successorArray[i] = int(value) - constraint.valueOffset
 
     # Reset metadata counters
     constraint.nextComponentId = 0
@@ -304,7 +306,7 @@ proc moveDelta*[T](constraint: SubcircuitConstraint[T], position: int, oldValue,
     if position notin constraint.positionToIndex:
         return 0
     let nodeIdx = constraint.positionToIndex[position]
-    let newSucc = int(newValue) - 1
+    let newSucc = int(newValue) - constraint.valueOffset
     let n = constraint.n
 
     # Identify affected components: comp1 (moved node) and comp2 (new successor).
@@ -382,7 +384,7 @@ proc updatePosition*[T](constraint: SubcircuitConstraint[T], position: int, newV
     let nodeIdx = constraint.positionToIndex[position]
 
     constraint.currentAssignment[position] = newValue
-    constraint.successorArray[nodeIdx] = int(newValue) - 1
+    constraint.successorArray[nodeIdx] = int(newValue) - constraint.valueOffset
 
     constraint.nextComponentId = 0
     constraint.nextCycleId = 0
@@ -397,6 +399,7 @@ proc deepCopy*[T](constraint: SubcircuitConstraint[T]): SubcircuitConstraint[T] 
     ## Creates a deep copy for parallel search.
     new(result)
     result.n = constraint.n
+    result.valueOffset = constraint.valueOffset
     result.positions = constraint.positions  # PackedSet is value type
     result.positionArray = constraint.positionArray  # Read-only after construction
     result.positionToIndex = constraint.positionToIndex  # Read-only after construction

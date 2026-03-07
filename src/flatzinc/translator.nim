@@ -1514,45 +1514,62 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
   of "fzn_circuit":
     let exprs = tr.resolveExprArray(con.args[0])
     let (allRefs, positions) = isAllRefs(exprs)
+    # Detect value offset: 0-based (offset=0) if values include 0 but not n
+    var circuitPositions: seq[int]
     if allRefs:
-      tr.sys.addConstraint(circuit[int](positions))
+      circuitPositions = positions
     else:
-      # Circuit/subcircuit need ALL nodes including constants (fixed vars).
-      # Constants get a singleton-domain position so node indexing stays correct.
-      var positions2: seq[int]
       for e in exprs:
         if e.node.kind == RefNode:
-          positions2.add(e.node.position)
+          circuitPositions.add(e.node.position)
         elif e.node.kind == LiteralNode:
           let pos = tr.sys.baseArray.len
           let v = tr.sys.newConstrainedVariable()
           v.setDomain(@[int(e.node.value)])
-          positions2.add(pos)
+          circuitPositions.add(pos)
         else:
           raise newException(ValueError, "fzn_circuit: unsupported expression node kind " & $e.node.kind)
-      tr.sys.addConstraint(circuit[int](positions2))
+    let n = circuitPositions.len
+    var hasZero = false
+    var hasN = false
+    for pos in circuitPositions:
+      let dom = tr.sys.baseArray.domain[pos]
+      for v in dom:
+        if v == 0: hasZero = true
+        if v == n: hasN = true
+    let valueOffset = if hasZero and not hasN: 0 else: 1
+    if valueOffset == 0:
+      stderr.writeLine(&"[FZN] Circuit with {n} nodes uses 0-based indexing")
+    tr.sys.addConstraint(circuit[int](circuitPositions, valueOffset))
 
   of "fzn_subcircuit":
     let exprs = tr.resolveExprArray(con.args[0])
     let (allRefs, positions) = isAllRefs(exprs)
+    var subcircuitPositions: seq[int]
     if allRefs:
-      tr.sys.addConstraint(subcircuit[int](positions))
-      tr.sys.addConstraint(allDifferent[int](positions))
+      subcircuitPositions = positions
     else:
-      # Constants get a singleton-domain position so node indexing stays correct.
-      var positions2: seq[int]
       for e in exprs:
         if e.node.kind == RefNode:
-          positions2.add(e.node.position)
+          subcircuitPositions.add(e.node.position)
         elif e.node.kind == LiteralNode:
           let pos = tr.sys.baseArray.len
           let v = tr.sys.newConstrainedVariable()
           v.setDomain(@[int(e.node.value)])
-          positions2.add(pos)
+          subcircuitPositions.add(pos)
         else:
           raise newException(ValueError, "fzn_subcircuit: unsupported expression node kind " & $e.node.kind)
-      tr.sys.addConstraint(subcircuit[int](positions2))
-      tr.sys.addConstraint(allDifferent[int](positions2))
+    let nSub = subcircuitPositions.len
+    var hasZeroSub = false
+    var hasNSub = false
+    for pos in subcircuitPositions:
+      let dom = tr.sys.baseArray.domain[pos]
+      for v in dom:
+        if v == 0: hasZeroSub = true
+        if v == nSub: hasNSub = true
+    let valueOffsetSub = if hasZeroSub and not hasNSub: 0 else: 1
+    tr.sys.addConstraint(subcircuit[int](subcircuitPositions, valueOffsetSub))
+    tr.sys.addConstraint(allDifferent[int](subcircuitPositions))
 
   of "fzn_connected":
     # fzn_connected(from, to, ns, es)
