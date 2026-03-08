@@ -7517,14 +7517,14 @@ proc detectIfThenElseChannels(tr: var FznTranslator) =
     var coeffs: seq[int]
     try:
       coeffs = tr.resolveIntArray(con.args[0])
-    except: continue
+    except CatchableError: continue
     if coeffs.len != 2: continue
     if not ((coeffs[0] == 1 and coeffs[1] == -1) or (coeffs[0] == -1 and coeffs[1] == 1)): continue
     # Check RHS is 0
     var rhs: int
     try:
       rhs = tr.resolveIntArg(con.args[2])
-    except: continue
+    except CatchableError: continue
     if rhs != 0: continue
     # Get the two variable names
     if con.args[1].kind != FznArrayLit or con.args[1].elems.len != 2: continue
@@ -7750,24 +7750,22 @@ proc detectGccCountChannels(tr: var FznTranslator) =
     let name = con.name
     if name != "fzn_global_cardinality": continue
 
-    # Check if counts are variable (not constant)
-    var constantCounts = true
-    try:
-      discard tr.resolveIntArray(con.args[2])
-    except KeyError:
-      constantCounts = false
-    if constantCounts: continue
-
-    # Extract count variable names
+    # Extract count variable names (skip if counts are all constants)
     let countArg = con.args[2]
     if countArg.kind != FznArrayLit and countArg.kind != FznIdent: continue
 
     var countNames: seq[string]
     if countArg.kind == FznArrayLit:
+      var hasVariable = false
       for elem in countArg.elems:
-        if elem.kind != FznIdent:
+        if elem.kind == FznIdent and elem.ident notin tr.paramValues:
+          hasVariable = true
+          countNames.add(elem.ident)
+        elif elem.kind == FznIdent and elem.ident in tr.paramValues:
+          countNames.setLen(0); break  # mixed constant/variable — skip
+        else:
           countNames.setLen(0); break
-        countNames.add(elem.ident)
+      if not hasVariable: continue
     elif countArg.kind == FznIdent:
       # Array variable reference — resolve to element names
       if countArg.ident in tr.arrayElementNames:
@@ -7784,7 +7782,8 @@ proc detectGccCountChannels(tr: var FznTranslator) =
         allHavePos = false; break
     if not allHavePos: continue
 
-    # Check each count variable is "pure output": only referenced by this GCC + min/max chain
+    # Check each count variable is "pure output": only referenced by this GCC,
+    # already-consumed defining constraints (channel defs), and min/max channel defs.
     var allPureOutput = true
     for cname in countNames:
       for ci2, con2 in tr.model.constraints:
@@ -7811,34 +7810,45 @@ proc detectGccCountChannels(tr: var FznTranslator) =
     let cover = tr.resolveIntArray(con.args[1])
     let xArg = con.args[0]
     var inputPositions: seq[int]
+    var constantValues: seq[int]  # constant elements in the x-array
+    var xArgValid = true
     if xArg.kind == FznArrayLit:
       for elem in xArg.elems:
         if elem.kind == FznIdent:
-          if elem.ident in tr.varPositions:
+          if elem.ident in tr.paramValues:
+            constantValues.add(tr.paramValues[elem.ident])
+          elif elem.ident in tr.varPositions:
             inputPositions.add(tr.varPositions[elem.ident])
           elif elem.ident in tr.definedVarExprs:
             let expr = tr.definedVarExprs[elem.ident]
             if expr.node.kind == RefNode:
               inputPositions.add(expr.node.position)
             else:
-              inputPositions.setLen(0); break
+              xArgValid = false; break
           else:
-            inputPositions.setLen(0); break
+            xArgValid = false; break
+        elif elem.kind == FznIntLit:
+          constantValues.add(elem.intVal)
         else:
-          inputPositions.setLen(0); break
+          xArgValid = false; break
     elif xArg.kind == FznIdent and xArg.ident in tr.arrayPositions:
       inputPositions = tr.arrayPositions[xArg.ident]
     else:
       continue
 
-    if inputPositions.len == 0: continue
+    if not xArgValid or inputPositions.len == 0: continue
+    let totalElements = inputPositions.len + constantValues.len
 
     for i, cname in countNames:
       let countPos = tr.varPositions[cname]
-      tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions)
+      # Count how many constant elements match this cover value
+      var constOffset = 0
+      for cv in constantValues:
+        if cv == cover[i]: inc constOffset
+      tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions, constOffset)
       tr.channelVarNames.incl(cname)
       # Set domain to valid range for this channel
-      tr.sys.baseArray.domain[countPos] = toSeq(0..inputPositions.len)
+      tr.sys.baseArray.domain[countPos] = toSeq(0..totalElements)
       inc totalChannels
 
     tr.definingConstraints.incl(ci)  # GCC is consumed — counts are channels now
@@ -9905,23 +9915,22 @@ proc translate*(model: FznModel): FznTranslator =
     if result.objectivePos in posToBind:
       let objBind = carray.minMaxChannelBindings[posToBind[result.objectivePos]]
       if not objBind.isMin:
-        # Build paired max/min sets: positions where (maxPos, minPos) share the same inputs
+        # Build paired max/min sets: positions where (maxPos, minPos) share the same inputs.
+        # Uses a hash map from sorted input position seqs to channel positions for O(n) pairing.
         var pairedNonNeg: PackedSet[int]  # positions where max-min >= 0
+        var minByInputs: Table[seq[int], int]  # sorted input positions → min channel position
         for i, b in carray.minMaxChannelBindings:
-          if b.isMin: continue
-          # Find corresponding min binding with same input positions
-          var inputPos: PackedSet[int]
+          var inputPos: seq[int]
           for e in b.inputExprs:
-            for p in e.positions.items: inputPos.incl(p)
-          for j, b2 in carray.minMaxChannelBindings:
-            if j == i or not b2.isMin: continue
-            var inputPos2: PackedSet[int]
-            for e in b2.inputExprs:
-              for p in e.positions.items: inputPos2.incl(p)
-            if inputPos == inputPos2:
+            for p in e.positions.items: inputPos.add(p)
+          inputPos.sort()
+          if b.isMin:
+            minByInputs[inputPos] = b.channelPosition
+          else:
+            if inputPos in minByInputs:
               # max and min on same inputs: max - min >= 0
               pairedNonNeg.incl(b.channelPosition)
-              pairedNonNeg.incl(b2.channelPosition)
+              pairedNonNeg.incl(minByInputs[inputPos])
         # Check if all objective inputs reference only paired positions
         if pairedNonNeg.len > 0:
           var allNonNeg = true

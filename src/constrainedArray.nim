@@ -31,6 +31,7 @@ type
         channelPosition*: int                # Position of the count output variable
         targetValue*: T                      # Value being counted
         inputPositions*: seq[int]            # Positions to scan
+        constantOffset*: T                   # Fixed count from constant elements in the array
 
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
@@ -224,14 +225,17 @@ proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
 proc addCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
                                    channelPos: int,
                                    targetValue: T,
-                                   inputPositions: seq[int]) =
-    ## Register a count-equals channel: channelPos = #{p in inputPositions : assignment[p] == targetValue}.
+                                   inputPositions: seq[int],
+                                   constantOffset: T = T(0)) =
+    ## Register a count-equals channel: channelPos = constantOffset + #{p in inputPositions : assignment[p] == targetValue}.
+    ## constantOffset accounts for fixed elements in the source array that always match targetValue.
     ## The channel position is added to channelPositions (not searched).
     let bindingIdx = arr.countEqChannelBindings.len
     arr.countEqChannelBindings.add(CountEqChannelBinding[T](
         channelPosition: channelPos,
         targetValue: targetValue,
-        inputPositions: inputPositions
+        inputPositions: inputPositions,
+        constantOffset: constantOffset
     ))
     arr.channelPositions.incl(channelPos)
     for pos in inputPositions:

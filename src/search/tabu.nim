@@ -867,8 +867,8 @@ proc evaluateFlatMinMax[T](fb: FlatMinMaxBinding[T], assignment: seq[T]): T {.in
             if v > result: result = v
 
 proc evaluateCountEq[T](binding: CountEqChannelBinding[T], assignment: seq[T]): T {.inline.} =
-    ## Evaluate a count-equals channel: count of positions where assignment equals targetValue.
-    var count: T = 0
+    ## Evaluate a count-equals channel: constantOffset + count of positions where assignment equals targetValue.
+    var count: T = binding.constantOffset
     for p in binding.inputPositions:
         if assignment[p] == binding.targetValue:
             inc count
