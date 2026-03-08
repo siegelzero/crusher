@@ -127,6 +127,8 @@ proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.
 ################################################################################
 
 proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
+    state.countTable.clear()
+    state.cost = 0
     var value: T
     case state.evalMethod:
         of PositionBased:
