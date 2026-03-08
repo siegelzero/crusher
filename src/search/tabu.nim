@@ -2400,14 +2400,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if verbose and id == 0:
             echo "[Init] Channel-dep penalties computed in " & $(epochTime() - cdStart) & "s" &
                  " (binary=" & $cdBinaryCount & " large=" & $cdLargeCount & " totalEvals=" & $cdTotalEvals & ")"
-            # Diagnostic: count non-zero total penalty entries
-            var nonZeroCount = 0
-            for pos in state.channelDepSearchPositions:
-                if state.isLazy[pos]: continue
-                for i in 0..<state.sharedDomain[][pos].len:
-                    if state.channelDepPenalties[pos][i] != 0:
-                        nonZeroCount += 1
-            echo "[Init] Channel-dep non-zero penalty entries: " & $nonZeroCount & "/" & $cdTotalEvals
 
         # Check if all channel-dep penalties are zero (tautological constraints).
         block tautologyCheck:

@@ -47,6 +47,7 @@ import test_parallel_search
 import test_pentominoes_geost
 import test_quasigroup7
 import test_regular
+import test_reinitialize
 import test_relational_constraints
 import test_scalar_product
 import test_scatter_search
