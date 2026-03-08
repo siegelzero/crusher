@@ -7490,6 +7490,362 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                      &"{arraySize} inverse positions become channels")
 
 
+proc detectIfThenElseChannels(tr: var FznTranslator) =
+  ## Detects if-then-else patterns encoded as:
+  ##   int_lin_ne_reif([1,-1], [prev, curr], 0, b) :: defines_var(b)
+  ##   int_eq_reif(result, curr, b1) :: defines_var(b1)
+  ##   int_eq_reif(result, elseVal, b2) :: defines_var(b2)
+  ##   bool_clause([b1], [b])          -- b → b1: if prev!=curr then result==curr
+  ##   bool_clause([b, b2], [])        -- ¬b → b2: if prev==curr then result==elseVal
+  ## Converts result to a 2D table channel: result = if prev != curr then curr else elseVal
+
+  # Phase 1: Index int_lin_ne_reif with defines_var → condition bool var
+  # Maps condBoolVar → (ci, prevVarName, currVarName)
+  type LinNeReifEntry = object
+    ci: int
+    prevVar, currVar: string
+
+  var linNeReifMap: Table[string, LinNeReifEntry]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    if con.name != "int_lin_ne_reif": continue
+    if not con.hasAnnotation("defines_var"): continue
+    if con.args.len < 4: continue
+    if con.args[3].kind != FznIdent: continue
+    # Check coefficients are [1,-1] or [-1,1]
+    var coeffs: seq[int]
+    try:
+      coeffs = tr.resolveIntArray(con.args[0])
+    except: continue
+    if coeffs.len != 2: continue
+    if not ((coeffs[0] == 1 and coeffs[1] == -1) or (coeffs[0] == -1 and coeffs[1] == 1)): continue
+    # Check RHS is 0
+    var rhs: int
+    try:
+      rhs = tr.resolveIntArg(con.args[2])
+    except: continue
+    if rhs != 0: continue
+    # Get the two variable names
+    if con.args[1].kind != FznArrayLit or con.args[1].elems.len != 2: continue
+    if con.args[1].elems[0].kind != FznIdent or con.args[1].elems[1].kind != FznIdent: continue
+    let v0 = con.args[1].elems[0].ident
+    let v1 = con.args[1].elems[1].ident
+    let boolVar = con.args[3].ident
+    # coeffs [1,-1] means v0 - v1 != 0, i.e., v0 != v1
+    if coeffs[0] == 1:
+      linNeReifMap[boolVar] = LinNeReifEntry(ci: ci, prevVar: v0, currVar: v1)
+    else:
+      linNeReifMap[boolVar] = LinNeReifEntry(ci: ci, prevVar: v1, currVar: v0)
+
+  if linNeReifMap.len == 0: return
+
+  # Phase 2: Index int_eq_reif with defines_var where first arg is a result variable
+  # Maps resultVarName → seq of (ci, testArg, boolVar)
+  type EqReifEntry = object
+    ci: int
+    boolVar: string
+    # The test value: either a variable name or a constant
+    isConstTest: bool
+    constVal: int
+    varName: string  # if not const
+
+  var eqReifByResult: Table[string, seq[EqReifEntry]]
+
+  for ci in tr.reifChannelDefs:
+    let con = tr.model.constraints[ci]
+    if con.name != "int_eq_reif": continue
+    if con.args.len < 3: continue
+    if con.args[0].kind != FznIdent: continue
+    if con.args[2].kind != FznIdent: continue
+    let resultVar = con.args[0].ident
+    let boolVar = con.args[2].ident
+    var entry: EqReifEntry
+    entry.ci = ci
+    entry.boolVar = boolVar
+    if con.args[1].kind == FznIntLit:
+      entry.isConstTest = true
+      entry.constVal = con.args[1].intVal
+    elif con.args[1].kind == FznIdent:
+      entry.isConstTest = false
+      entry.varName = con.args[1].ident
+    else:
+      continue
+    if resultVar notin eqReifByResult:
+      eqReifByResult[resultVar] = @[]
+    eqReifByResult[resultVar].add(entry)
+
+  # Phase 3: Index bool_clause constraints
+  # For each bool_clause, check if it matches one of the two patterns:
+  # Pattern A: bool_clause([b1], [b]) — 1 positive, 1 negative
+  # Pattern B: bool_clause([b, b2], []) — 2 positive, 0 negative
+  type BoolClauseEntry = object
+    ci: int
+    # For Pattern A: posLit is b1 (eq_reif bool), negLit is b (condition bool)
+    # For Pattern B: lit1 is b (condition bool), lit2 is b2 (eq_reif bool)
+    posLits: seq[string]
+    negLits: seq[string]
+
+  var boolClausesByLit: Table[string, seq[BoolClauseEntry]]
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    if con.name != "bool_clause": continue
+    if con.args.len < 2: continue
+    var posLits, negLits: seq[string]
+    if con.args[0].kind == FznArrayLit:
+      for e in con.args[0].elems:
+        if e.kind == FznIdent: posLits.add(e.ident)
+    if con.args[1].kind == FznArrayLit:
+      for e in con.args[1].elems:
+        if e.kind == FznIdent: negLits.add(e.ident)
+    let entry = BoolClauseEntry(ci: ci, posLits: posLits, negLits: negLits)
+    for lit in posLits:
+      if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+      boolClausesByLit[lit].add(entry)
+    for lit in negLits:
+      if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+      boolClausesByLit[lit].add(entry)
+
+  # Phase 4: Match the full pattern for each candidate result variable
+  var totalChannels = 0
+
+  for resultVar, eqEntries in eqReifByResult:
+    if eqEntries.len != 2: continue
+    if resultVar notin tr.varPositions: continue
+    if resultVar in tr.channelVarNames: continue
+    if resultVar in tr.definedVarNames: continue
+
+    # Identify which eq_reif is the "then" (variable test) and which is "else" (constant test)
+    var thenIdx, elseIdx: int = -1
+    for i, e in eqEntries:
+      if e.isConstTest:
+        elseIdx = i
+      else:
+        thenIdx = i
+    if thenIdx < 0 or elseIdx < 0: continue
+
+    let thenEntry = eqEntries[thenIdx]
+    let elseEntry = eqEntries[elseIdx]
+    let elseVal = elseEntry.constVal
+    let thenVarName = thenEntry.varName
+
+    # Find bool_clause linking thenEntry.boolVar to a condition b
+    # Pattern A: bool_clause([thenEntry.boolVar], [b]) — b → result==curr
+    var condBoolVar = ""
+    var clauseA_ci = -1
+    if thenEntry.boolVar in boolClausesByLit:
+      for bc in boolClausesByLit[thenEntry.boolVar]:
+        if bc.ci in tr.definingConstraints: continue
+        if bc.posLits.len == 1 and bc.negLits.len == 1 and bc.posLits[0] == thenEntry.boolVar:
+          # bool_clause([b1], [b]) → b → b1
+          let candidateB = bc.negLits[0]
+          if candidateB in linNeReifMap:
+            condBoolVar = candidateB
+            clauseA_ci = bc.ci
+            break
+
+    if condBoolVar == "": continue
+    let linNeEntry = linNeReifMap[condBoolVar]
+
+    # Verify: thenVarName must be the "curr" variable from int_lin_ne_reif
+    if thenVarName != linNeEntry.currVar: continue
+
+    # Find bool_clause Pattern B: bool_clause([condBoolVar, elseEntry.boolVar], [])
+    # — ¬b → b2: if prev==curr then result==elseVal
+    var clauseB_ci = -1
+    if condBoolVar in boolClausesByLit:
+      for bc in boolClausesByLit[condBoolVar]:
+        if bc.ci in tr.definingConstraints: continue
+        if bc.ci == clauseA_ci: continue
+        if bc.posLits.len == 2 and bc.negLits.len == 0:
+          if (bc.posLits[0] == condBoolVar and bc.posLits[1] == elseEntry.boolVar) or
+             (bc.posLits[1] == condBoolVar and bc.posLits[0] == elseEntry.boolVar):
+            clauseB_ci = bc.ci
+            break
+
+    if clauseB_ci < 0: continue
+
+    # Full pattern matched! Build 2D table channel.
+    let prevVarName = linNeEntry.prevVar
+    let currVarName = linNeEntry.currVar
+
+    if prevVarName notin tr.varPositions and prevVarName notin tr.definedVarExprs: continue
+    if currVarName notin tr.varPositions and currVarName notin tr.definedVarExprs: continue
+
+    let prevExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: prevVarName))
+    let currExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: currVarName))
+    let resultPos = tr.varPositions[resultVar]
+
+    # Get domains for the 2D table
+    var prevPos, currPos: int
+    if prevExpr.node.kind == RefNode:
+      prevPos = prevExpr.node.position
+    else: continue
+    if currExpr.node.kind == RefNode:
+      currPos = currExpr.node.position
+    else: continue
+
+    let prevDom = tr.sys.baseArray.domain[prevPos].sorted()
+    let currDom = tr.sys.baseArray.domain[currPos].sorted()
+    if prevDom.len == 0 or currDom.len == 0: continue
+
+    let loPrev = prevDom[0]
+    let hiPrev = prevDom[^1]
+    let loCurr = currDom[0]
+    let hiCurr = currDom[^1]
+    let rangePrev = hiPrev - loPrev + 1
+    let rangeCurr = hiCurr - loCurr + 1
+    let tableSize = rangePrev * rangeCurr
+
+    if tableSize > 100_000: continue  # safety limit
+
+    var arrayElems = newSeq[ArrayElement[int]](tableSize)
+    for vp in loPrev..hiPrev:
+      for vc in loCurr..hiCurr:
+        let idx = (vp - loPrev) * rangeCurr + (vc - loCurr)
+        if vp != vc:
+          arrayElems[idx] = ArrayElement[int](isConstant: true, constantValue: vc)
+        else:
+          arrayElems[idx] = ArrayElement[int](isConstant: true, constantValue: elseVal)
+
+    # Build index expression: (prev - loPrev) * rangeCurr + (curr - loCurr)
+    let indexExpr = (prevExpr - loPrev) * rangeCurr + (currExpr - loCurr)
+
+    tr.sys.baseArray.addChannelBinding(resultPos, indexExpr, arrayElems)
+    tr.channelVarNames.incl(resultVar)
+
+    # Mark consumed constraints
+    tr.definingConstraints.incl(linNeEntry.ci)  # int_lin_ne_reif
+    tr.definingConstraints.incl(clauseA_ci)     # bool_clause pattern A
+    tr.definingConstraints.incl(clauseB_ci)     # bool_clause pattern B
+    # The two int_eq_reif are already reif channel defs — mark them as consumed too
+    # so their channel bindings for b1/b2 are not created (they're no longer needed)
+    tr.definingConstraints.incl(thenEntry.ci)
+    tr.definingConstraints.incl(elseEntry.ci)
+
+    inc totalChannels
+
+  if totalChannels > 0:
+    stderr.writeLine(&"[FZN] Detected {totalChannels} if-then-else channels")
+
+proc detectGccCountChannels(tr: var FznTranslator) =
+  ## Detects fzn_global_cardinality constraints whose count outputs are pure channels
+  ## (only used by the GCC itself and downstream min/max/objective chains).
+  ## Converts count outputs to CountEqChannelBindings, eliminating the need for
+  ## indicator decomposition.
+  ##
+  ## Pattern: fzn_global_cardinality(x, cover, counts) where each count var is
+  ## referenced only by this GCC + array_int_minimum/maximum defines_var constraints.
+
+  # Build set of min/max channel def constraint indices for fast lookup
+  var minMaxCIs: PackedSet[int]
+  for def in tr.minMaxChannelDefs:
+    minMaxCIs.incl(def.ci)
+
+  var totalChannels = 0
+
+  for ci, con in tr.model.constraints:
+    if ci in tr.definingConstraints: continue
+    let name = con.name
+    if name != "fzn_global_cardinality": continue
+
+    # Check if counts are variable (not constant)
+    var constantCounts = true
+    try:
+      discard tr.resolveIntArray(con.args[2])
+    except KeyError:
+      constantCounts = false
+    if constantCounts: continue
+
+    # Extract count variable names
+    let countArg = con.args[2]
+    if countArg.kind != FznArrayLit and countArg.kind != FznIdent: continue
+
+    var countNames: seq[string]
+    if countArg.kind == FznArrayLit:
+      for elem in countArg.elems:
+        if elem.kind != FznIdent:
+          countNames.setLen(0); break
+        countNames.add(elem.ident)
+    elif countArg.kind == FznIdent:
+      # Array variable reference — resolve to element names
+      if countArg.ident in tr.arrayElementNames:
+        countNames = tr.arrayElementNames[countArg.ident]
+      else:
+        continue
+
+    if countNames.len == 0: continue
+
+    # Check all count vars have positions (not already eliminated)
+    var allHavePos = true
+    for cname in countNames:
+      if cname notin tr.varPositions:
+        allHavePos = false; break
+    if not allHavePos: continue
+
+    # Check each count variable is "pure output": only referenced by this GCC + min/max chain
+    var allPureOutput = true
+    for cname in countNames:
+      for ci2, con2 in tr.model.constraints:
+        if ci2 == ci: continue  # skip this GCC itself
+        if ci2 in tr.definingConstraints: continue  # already consumed
+        if ci2 in minMaxCIs: continue  # min/max channel def is fine
+        # Check if con2 references cname in any arg
+        var refersToCount = false
+        for arg in con2.args:
+          if arg.kind == FznIdent and arg.ident == cname:
+            refersToCount = true; break
+          elif arg.kind == FznArrayLit:
+            for elem in arg.elems:
+              if elem.kind == FznIdent and elem.ident == cname:
+                refersToCount = true; break
+            if refersToCount: break
+        if refersToCount:
+          allPureOutput = false; break
+      if not allPureOutput: break
+
+    if not allPureOutput: continue
+
+    # All checks passed — convert count outputs to channel bindings
+    let cover = tr.resolveIntArray(con.args[1])
+    let xArg = con.args[0]
+    var inputPositions: seq[int]
+    if xArg.kind == FznArrayLit:
+      for elem in xArg.elems:
+        if elem.kind == FznIdent:
+          if elem.ident in tr.varPositions:
+            inputPositions.add(tr.varPositions[elem.ident])
+          elif elem.ident in tr.definedVarExprs:
+            let expr = tr.definedVarExprs[elem.ident]
+            if expr.node.kind == RefNode:
+              inputPositions.add(expr.node.position)
+            else:
+              inputPositions.setLen(0); break
+          else:
+            inputPositions.setLen(0); break
+        else:
+          inputPositions.setLen(0); break
+    elif xArg.kind == FznIdent and xArg.ident in tr.arrayPositions:
+      inputPositions = tr.arrayPositions[xArg.ident]
+    else:
+      continue
+
+    if inputPositions.len == 0: continue
+
+    for i, cname in countNames:
+      let countPos = tr.varPositions[cname]
+      tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions)
+      tr.channelVarNames.incl(cname)
+      # Set domain to valid range for this channel
+      tr.sys.baseArray.domain[countPos] = toSeq(0..inputPositions.len)
+      inc totalChannels
+
+    tr.definingConstraints.incl(ci)  # GCC is consumed — counts are channels now
+
+  if totalChannels > 0:
+    stderr.writeLine(&"[FZN] Detected {totalChannels} GCC count channels")
+
 proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
   ## Detects conditional no-overlap pair patterns from room-conflict constraints:
   ##
@@ -9019,6 +9375,12 @@ proc translate*(model: FznModel): FznTranslator =
   # Detect inverse channel patterns (element(person[p], seat, p) groups)
   result.detectInverseChannelPatterns()
 
+  # Detect if-then-else channels (int_lin_ne_reif + int_eq_reif + bool_clause → 2D table channel)
+  result.detectIfThenElseChannels()
+
+  # Detect GCC count channels (variable-count GCC outputs → count-eq channel bindings)
+  result.detectGccCountChannels()
+
   # If geost conversion is active, record board positions and create tile variables
   let gc = result.geostConversion
   if gc.tileValues.len > 0:
@@ -9530,6 +9892,49 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildInverseChannelBindings()
 
   result.translateSolve()
+
+  # Tighten objective lower bound: if objective is max(diff_i) where each diff_i = max(counts) - min(counts),
+  # then objective >= 0 since max >= min for the same input set.
+  if result.model.solve.kind == Minimize and result.objectivePos >= 0:
+    let carray = result.sys.baseArray
+    # Build position-to-minmax-binding map
+    var posToBind: Table[int, int]  # position → binding index
+    for i, b in carray.minMaxChannelBindings:
+      posToBind[b.channelPosition] = i
+    # Check if objective position is a max channel
+    if result.objectivePos in posToBind:
+      let objBind = carray.minMaxChannelBindings[posToBind[result.objectivePos]]
+      if not objBind.isMin:
+        # Build paired max/min sets: positions where (maxPos, minPos) share the same inputs
+        var pairedNonNeg: PackedSet[int]  # positions where max-min >= 0
+        for i, b in carray.minMaxChannelBindings:
+          if b.isMin: continue
+          # Find corresponding min binding with same input positions
+          var inputPos: PackedSet[int]
+          for e in b.inputExprs:
+            for p in e.positions.items: inputPos.incl(p)
+          for j, b2 in carray.minMaxChannelBindings:
+            if j == i or not b2.isMin: continue
+            var inputPos2: PackedSet[int]
+            for e in b2.inputExprs:
+              for p in e.positions.items: inputPos2.incl(p)
+            if inputPos == inputPos2:
+              # max and min on same inputs: max - min >= 0
+              pairedNonNeg.incl(b.channelPosition)
+              pairedNonNeg.incl(b2.channelPosition)
+        # Check if all objective inputs reference only paired positions
+        if pairedNonNeg.len > 0:
+          var allNonNeg = true
+          for inputExpr in objBind.inputExprs:
+            for p in inputExpr.positions.items:
+              if p notin pairedNonNeg:
+                allNonNeg = false; break
+            if not allNonNeg: break
+          if allNonNeg:
+            let oldLo = result.objectiveLoBound
+            result.objectiveLoBound = max(result.objectiveLoBound, 0)
+            if result.objectiveLoBound != oldLo:
+              stderr.writeLine(&"[FZN] Objective lower bound tightened: {oldLo} → {result.objectiveLoBound}")
 
   # Build WeightedSameValueExpression if pattern was detected
   if result.weightedSameValueObjName != "":

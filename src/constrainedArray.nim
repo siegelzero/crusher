@@ -27,6 +27,11 @@ type
         inputExprs*: seq[AlgebraicExpression[T]]  # Input expressions to take min/max of
         inputPositions*: PackedSet[int]      # Union of all input expression positions
 
+    CountEqChannelBinding*[T] = object
+        channelPosition*: int                # Position of the count output variable
+        targetValue*: T                      # Value being counted
+        inputPositions*: seq[int]            # Positions to scan
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -58,6 +63,8 @@ type
         channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
         minMaxChannelBindings*: seq[MinMaxChannelBinding[T]]
         minMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [minMax binding indices]
+        countEqChannelBindings*: seq[CountEqChannelBinding[T]]
+        countEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [countEq binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -213,6 +220,25 @@ proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.minMaxChannelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.minMaxChannelsAtPosition[pos].add(bindingIdx)
+
+proc addCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
+                                   channelPos: int,
+                                   targetValue: T,
+                                   inputPositions: seq[int]) =
+    ## Register a count-equals channel: channelPos = #{p in inputPositions : assignment[p] == targetValue}.
+    ## The channel position is added to channelPositions (not searched).
+    let bindingIdx = arr.countEqChannelBindings.len
+    arr.countEqChannelBindings.add(CountEqChannelBinding[T](
+        channelPosition: channelPos,
+        targetValue: targetValue,
+        inputPositions: inputPositions
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in inputPositions:
+        if pos notin arr.countEqChannelsAtPosition:
+            arr.countEqChannelsAtPosition[pos] = @[bindingIdx]
+        else:
+            arr.countEqChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -1291,6 +1317,67 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             relation: GreaterThanEq
                         ))
                         channelLinearForms += 1
+
+    # Count-equals channel linear forms
+    # For each countEq binding: count[v] >= 0 and count[v] <= n
+    # For groups sharing the same inputPositions: sum(count[v]) == n (closed GCC)
+    var countEqLinearForms = 0
+    for binding in carray.countEqChannelBindings:
+        let chPos = binding.channelPosition
+        let n = T(binding.inputPositions.len)
+        # count >= 0
+        var geCoeffs: Table[int, T]
+        geCoeffs[chPos] = T(1)
+        linearForms.add(LinearForm[T](
+            coefficients: geCoeffs,
+            constant: T(0),
+            relation: GreaterThanEq
+        ))
+        # count <= n  →  n - count >= 0
+        var leCoeffs: Table[int, T]
+        leCoeffs[chPos] = T(-1)
+        linearForms.add(LinearForm[T](
+            coefficients: leCoeffs,
+            constant: n,
+            relation: GreaterThanEq
+        ))
+        countEqLinearForms += 2
+
+    # Detect closed-GCC groups: bindings sharing the same inputPositions
+    # For closed groups: sum(all counts) == n
+    var groupsByInputs: Table[seq[int], seq[int]]  # inputPositions → [binding indices]
+    for i, binding in carray.countEqChannelBindings:
+        if binding.inputPositions notin groupsByInputs:
+            groupsByInputs[binding.inputPositions] = @[i]
+        else:
+            groupsByInputs[binding.inputPositions].add(i)
+    for inputPositions, bindingIndices in groupsByInputs.pairs:
+        if bindingIndices.len < 2: continue
+        # Check if closed: all input position domains ⊆ cover set
+        var coverValues: PackedSet[int]
+        for bi in bindingIndices:
+            coverValues.incl(int(carray.countEqChannelBindings[bi].targetValue))
+        var isClosed = true
+        for p in inputPositions:
+            for v in carray.domain[p]:
+                if v notin coverValues:
+                    isClosed = false
+                    break
+            if not isClosed: break
+        if isClosed:
+            # sum(count[v] for v in cover) == n
+            var sumCoeffs: Table[int, T]
+            for bi in bindingIndices:
+                let chPos = carray.countEqChannelBindings[bi].channelPosition
+                sumCoeffs[chPos] = T(1)
+            linearForms.add(LinearForm[T](
+                coefficients: sumCoeffs,
+                constant: -T(inputPositions.len),
+                relation: EqualTo
+            ))
+            countEqLinearForms += 1
+
+    channelLinearForms += countEqLinearForms
 
     if channelLinearForms > 0:
         stderr.writeLine(&"[DomRed] Channel-to-linear forms: {channelLinearForms}")
@@ -3182,6 +3269,10 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             inputPositions: binding.inputPositions
         )
     result.minMaxChannelsAtPosition = arr.minMaxChannelsAtPosition
+
+    # Count-equals channel bindings are all value types — shallow copy is fine
+    result.countEqChannelBindings = arr.countEqChannelBindings
+    result.countEqChannelsAtPosition = arr.countEqChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups

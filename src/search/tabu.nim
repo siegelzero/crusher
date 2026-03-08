@@ -866,6 +866,14 @@ proc evaluateFlatMinMax[T](fb: FlatMinMaxBinding[T], assignment: seq[T]): T {.in
             let v = expr.evaluate(assignment)
             if v > result: result = v
 
+proc evaluateCountEq[T](binding: CountEqChannelBinding[T], assignment: seq[T]): T {.inline.} =
+    ## Evaluate a count-equals channel: count of positions where assignment equals targetValue.
+    var count: T = 0
+    for p in binding.inputPositions:
+        if assignment[p] == binding.targetValue:
+            inc count
+    count
+
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.
     ## Saves original value on first change; cdDirtyPositions stays deduplicated.
@@ -882,6 +890,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     ## lookups), falling back to simulate-restore for other constraint types.
     if pos notin state.carray.channelsAtPosition and
        pos notin state.carray.minMaxChannelsAtPosition and
+       pos notin state.carray.countEqChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition:
         return 0
 
@@ -1020,6 +1029,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            if p in state.carray.countEqChannelsAtPosition:
+                for bi in state.carray.countEqChannelsAtPosition[p]:
+                    let binding = state.carray.countEqChannelBindings[bi]
+                    let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
                     let group = state.carray.inverseChannelGroups[gi]
@@ -1062,6 +1081,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     let fb = state.flatMinMaxBindings[bi]
                     let newChanVal = evaluateFlatMinMax(fb, state.assignment)
                     let chanPos = fb.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            if p in state.carray.countEqChannelsAtPosition:
+                for bi in state.carray.countEqChannelsAtPosition[p]:
+                    let binding = state.carray.countEqChannelBindings[bi]
+                    let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
@@ -1635,6 +1664,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if elem.isConstant: elem.constantValue
                 else: state.assignment[elem.variablePosition]
 
+    # Compute count-equals channel initial values
+    for binding in carray.countEqChannelBindings:
+        state.assignment[binding.channelPosition] = evaluateCountEq(binding, state.assignment)
+
     # Compute inverse channel initial values from forward assignments
     for group in carray.inverseChannelGroups:
         let newInverse = group.recomputeInverse(state.assignment)
@@ -1832,7 +1865,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # Find search positions that have channel bindings (can affect channel-dep constraints)
         for pos in state.searchPositions:
             if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition or
-               pos in carray.inverseChannelsAtPosition:
+               pos in carray.countEqChannelsAtPosition or pos in carray.inverseChannelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -1869,6 +1902,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if p in carray.minMaxChannelsAtPosition:
                     for bi in carray.minMaxChannelsAtPosition[p]:
                         let binding = carray.minMaxChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
+                # Count-equals channel bindings
+                if p in carray.countEqChannelsAtPosition:
+                    for bi in carray.countEqChannelsAtPosition[p]:
+                        let binding = carray.countEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2193,8 +2235,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             worklist.add(chanPos)
-                # MinMax/inverse channels can't be batched — reject topology entirely
+                # MinMax/countEq/inverse channels can't be batched — reject topology entirely
                 if p in carray.minMaxChannelsAtPosition:
+                    canBuild = false
+                if p in carray.countEqChannelsAtPosition:
                     canBuild = false
                 if p in carray.inverseChannelsAtPosition:
                     canBuild = false
@@ -3125,6 +3169,32 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     if fb.channelPosition notin visited:
                         visited.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
+        # Count-equals channel bindings
+        if pos in state.carray.countEqChannelsAtPosition:
+            for bi in state.carray.countEqChannelsAtPosition[pos]:
+                let binding = state.carray.countEqChannelBindings[bi]
+                let newVal = evaluateCountEq(binding, state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    result = true
+                    changedChannels.add(binding.channelPosition)
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
+                    state.updateNeighborPenalties(binding.channelPosition)
+                    if binding.channelPosition notin visited:
+                        visited.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
         # Inverse channel bindings: recompute inverse from forward assignments
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
@@ -3199,6 +3269,21 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                     if fb.channelPosition notin visited:
                         visited.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
+        # Count-equals channel bindings (lean: no penalty maps or violationCount)
+        if pos in state.carray.countEqChannelsAtPosition:
+            for bi in state.carray.countEqChannelsAtPosition[pos]:
+                let binding = state.carray.countEqChannelBindings[bi]
+                let newVal = evaluateCountEq(binding, state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if binding.channelPosition notin visited:
+                        visited.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
         # Inverse channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:

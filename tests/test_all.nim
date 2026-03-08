@@ -9,6 +9,7 @@ import test_circuit
 import test_connected
 import test_constrained_variable
 import test_count_eq
+import test_count_eq_channels
 import test_cumulative
 import test_debruijn
 import test_deepcopy
@@ -17,6 +18,7 @@ import test_element_constraint
 import test_element_expr
 import test_employee_scheduling
 import test_furniture_moving
+import test_fzn_channel_detection
 import test_fzn_parser
 import test_fzcrusher
 import test_fzn_solver
