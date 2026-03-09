@@ -1,0 +1,1758 @@
+## Included from translator.nim -- not a standalone module.
+
+proc buildVarDomainIndex(tr: var FznTranslator) =
+    ## Build a hash table index from variable name to declaration index
+    ## for O(1) domain lookups instead of O(n) linear scans.
+    if tr.varDomainIndex.len > 0: return  # already built
+    for i, decl in tr.model.variables:
+        if decl.isArray: continue
+        tr.varDomainIndex[decl.name] = i
+
+proc lookupVarDomain(tr: var FznTranslator, varName: string): seq[int] =
+    ## Look up a variable's domain from the FznModel declarations.
+    tr.buildVarDomainIndex()
+    if varName in tr.varDomainIndex:
+        let decl = tr.model.variables[tr.varDomainIndex[varName]]
+        case decl.varType.kind
+        of FznIntRange:
+            return toSeq(decl.varType.lo..decl.varType.hi)
+        of FznIntSet:
+            return decl.varType.values
+        of FznBool:
+            return @[0, 1]
+        else:
+            return @[]
+    return @[]
+
+proc resolveActualDomain(tr: var FznTranslator, expr: AlgebraicExpression[int],
+                                                  identName: string): seq[int] =
+    ## Resolve the actual domain for an expression. If it maps to a single position,
+    ## use the base array's domain (which reflects aliasing). Otherwise fall back to
+    ## the FZN declaration domain via lookupVarDomain.
+    let positions = toSeq(expr.positions.items)
+    if positions.len == 1:
+        return tr.sys.baseArray.domain[positions[0]].sorted()
+    else:
+        return tr.lookupVarDomain(identName)
+
+
+proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
+                                                      defs: var seq[int], label: string) =
+    ## Un-channel skipped reif variables — they couldn't have bindings built due to
+    ## large domains, so they must be treated as normal constraints instead.
+    if skipped.len == 0: return
+    for ci in skipped:
+        let con = tr.model.constraints[ci]
+        if con.args.len >= 3 and con.args[2].kind == FznIdent:
+            let bName = con.args[2].ident
+            tr.channelVarNames.excl(bName)
+        tr.definingConstraints.excl(ci)
+    var filtered: seq[int]
+    for ci in defs:
+        if ci notin skipped:
+            filtered.add(ci)
+    defs = filtered
+    stderr.writeLine(&"[FZN] Un-channeled {skipped.len} {label} bindings (domain too large)")
+
+
+proc buildReifChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for int_eq_reif and bool2int patterns detected
+    ## by detectReifChannels. Must be called after translateVariables.
+    ##
+    ## int_eq_reif(x, val, b): b = element(x - lo, [1 if v==val else 0 for v in domain])
+    ## int_ne_reif(x, val, b): b = element(x - lo, [0 if v==val else 1 for v in domain])
+    ## int_eq_reif(x, y, b):   b = element((x-lo_x)*size_y + (y-lo_y), equality_table)
+    ## bool2int(b, i):          i = element(b, [0, 1])
+
+    # Process int_eq_reif channels first (bool2int depends on these)
+    var skippedReifCIs: HashSet[int]
+    for ci in tr.reifChannelDefs:
+        if ci in tr.equalityCopyReifCIs:
+            # Equality copy: copy == original is always true, build constant-1 channel for indicator
+            let con = tr.model.constraints[ci]
+            let bName = con.args[2].ident
+            if bName in tr.varPositions:
+                let bPos = tr.varPositions[bName]
+                let indexExpr = AlgebraicExpression[int](
+                    node: ExpressionNode[int](kind: LiteralNode, value: 0),
+                    positions: initPackedSet[int](),
+                    linear: true
+                )
+                let binding = ChannelBinding[int](
+                    channelPosition: bPos,
+                    indexExpression: indexExpr,
+                    arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 1)]
+                )
+                tr.sys.baseArray.channelBindings.add(binding)
+                tr.sys.baseArray.channelPositions.incl(bPos)
+                # No entries in channelsAtPosition — no source positions, binding is constant
+            continue
+        let con = tr.model.constraints[ci]
+        let bName = con.args[2].ident
+        if bName notin tr.varPositions:
+            continue
+
+        let bPos = tr.varPositions[bName]
+        let xArg = con.args[0]
+        let valArg = con.args[1]
+
+        # Skip if source var has been eliminated (e.g., dead element result)
+        var deadSource = false
+        for arg in [xArg, valArg]:
+            if arg.kind == FznIdent and arg.ident in tr.definedVarNames and
+                  arg.ident notin tr.varPositions and arg.ident notin tr.definedVarExprs:
+                deadSource = true
+                break
+        if deadSource:
+            # Dead source: mark the bool output as defined to cascade elimination
+            tr.channelVarNames.excl(bName)
+            tr.definedVarNames.incl(bName)
+            continue
+
+        var indexExpr: AlgebraicExpression[int]
+        var arrayElems: seq[ArrayElement[int]]
+
+        let isEq = stripSolverPrefix(con.name) == "int_eq_reif"
+
+        if valArg.kind == FznIntLit or (valArg.kind == FznIdent and valArg.ident in tr.paramValues):
+            # Constant val: b = element(x - lo, [1 if v==val else 0]) (inverted for ne)
+            let val = if valArg.kind == FznIntLit: valArg.intVal
+                                else: tr.paramValues[valArg.ident]
+            let xExpr = tr.resolveExprArg(xArg)
+            let domain = tr.resolveActualDomain(xExpr, xArg.ident)
+            if domain.len == 0:
+                skippedReifCIs.incl(ci)
+                continue
+            let lo = domain[0]
+            let hi = domain[^1]
+            if hi - lo + 1 > 100_000:
+                skippedReifCIs.incl(ci)
+                continue
+
+            indexExpr = xExpr - lo
+            for v in lo..hi:
+                arrayElems.add(ArrayElement[int](isConstant: true,
+                        constantValue: if (v == val) == isEq: 1 else: 0))
+
+        elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
+            # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
+            let xExpr = tr.resolveExprArg(xArg)
+            let yExpr = tr.resolveExprArg(valArg)
+            let domainX = tr.resolveActualDomain(xExpr, xArg.ident)
+            let domainY = tr.resolveActualDomain(yExpr, valArg.ident)
+            if domainX.len == 0 or domainY.len == 0:
+                skippedReifCIs.incl(ci)
+                continue
+            let loX = domainX[0]
+            let hiX = domainX[^1]
+            let loY = domainY[0]
+            let hiY = domainY[^1]
+            let rangeX = hiX - loX + 1
+            let rangeY = hiY - loY + 1
+            # Guard against huge 2D tables (use ranges, not domain sizes, since we fill gaps)
+            if rangeX > 10_000 or rangeY > 10_000 or
+                  rangeX * rangeY > 100_000:
+                skippedReifCIs.incl(ci)
+                continue
+
+            # index = (x - lo_x) * range_y + (y - lo_y)
+            indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
+
+            # Build 2D equality table for full ranges (row-major: x varies in outer loop, y in inner)
+            for vx in loX..hiX:
+                for vy in loY..hiY:
+                    arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if (vx == vy) == isEq: 1 else: 0))
+        else:
+            skippedReifCIs.incl(ci)
+            continue
+
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        # Map source positions to this binding (for channel propagation triggers)
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    tr.unchannelSkippedReifs(skippedReifCIs, tr.reifChannelDefs, "reif")
+
+    # Process bool2int channels (after reif channels so b positions are set up)
+    for ci in tr.bool2intChannelDefs:
+        let con = tr.model.constraints[ci]
+        let iName = con.args[1].ident
+        let bArg = con.args[0]
+
+        if iName notin tr.varPositions:
+            continue
+
+        # Skip if source var is dead (cascade from dead element chain)
+        if bArg.kind == FznIdent and bArg.ident in tr.definedVarNames and
+              bArg.ident notin tr.varPositions and bArg.ident notin tr.definedVarExprs:
+            # Mark the output as defined too to cascade
+            tr.channelVarNames.excl(iName)
+            tr.definedVarNames.incl(iName)
+            continue
+
+        let iPos = tr.varPositions[iName]
+
+        let bExpr = tr.resolveExprArg(bArg)
+
+        # i = element(b, [0, 1])  — identity mapping for domain {0, 1}
+        let arrayElems = @[
+            ArrayElement[int](isConstant: true, constantValue: 0),
+            ArrayElement[int](isConstant: true, constantValue: 1)
+        ]
+
+        let binding = ChannelBinding[int](
+            channelPosition: iPos,
+            indexExpression: bExpr,  # b is 0-based (domain {0,1})
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(iPos)
+
+        for pos in bExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    # Process bool_not channels: b = 1 - a = element(a, [1, 0])
+    for ci in tr.boolNotChannelDefs:
+        let con = tr.model.constraints[ci]
+        let bName = con.args[1].ident
+        let aArg = con.args[0]
+
+        if bName notin tr.varPositions:
+            continue
+        let bPos = tr.varPositions[bName]
+
+        let aExpr = tr.resolveExprArg(aArg)
+
+        # b = element(a, [1, 0]) — negation for domain {0, 1}
+        let arrayElems = @[
+            ArrayElement[int](isConstant: true, constantValue: 1),
+            ArrayElement[int](isConstant: true, constantValue: 0)
+        ]
+
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: aExpr,  # a is 0-based (domain {0,1})
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        for pos in aExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    # Process bool_clause_reif channels
+    for ci in tr.boolClauseReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let rName = con.args[2].ident
+        if rName notin tr.varPositions:
+            continue
+        let rPos = tr.varPositions[rName]
+
+        # Build index expression: sum(pos_exprs) - sum(neg_exprs) + len(neg)
+        let posExprs = tr.resolveExprArray(con.args[0])
+        let negExprs = tr.resolveExprArray(con.args[1])
+        let n = posExprs.len + negExprs.len
+
+        var indexExpr: AlgebraicExpression[int]
+        if n == 0:
+            # Empty clause — index is always 0 (clause always false)
+            indexExpr = newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: 0),
+                linear = true
+            )
+        else:
+            # Start with first positive or negative expression
+            var started = false
+            for e in posExprs:
+                if not started:
+                    indexExpr = e
+                    started = true
+                else:
+                    indexExpr = indexExpr + e
+            for e in negExprs:
+                if not started:
+                    indexExpr = 0 - e
+                    started = true
+                else:
+                    indexExpr = indexExpr - e
+            # Add constant offset: len(neg)
+            if negExprs.len > 0:
+                indexExpr = indexExpr + negExprs.len
+
+        # Array: [0, 1, 1, ..., 1] of length N+M+1
+        # index 0 means all pos are 0 and all neg are 1 → clause false → r=0
+        # any other index → clause true → r=1
+        var arrayElems: seq[ArrayElement[int]]
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+        for i in 1..n:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+        let binding = ChannelBinding[int](
+            channelPosition: rPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(rPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    # Process set_in_reif channels
+    var skippedSetInReifCIs: HashSet[int]
+    for ci in tr.setInReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let bName = con.args[2].ident
+        if bName notin tr.varPositions:
+            continue
+
+        let bPos = tr.varPositions[bName]
+        let xArg = con.args[0]
+        let setArg = con.args[1]
+
+        # Build the set of values for membership test
+        var setValues: seq[int]
+        case setArg.kind
+        of FznRange:
+            for v in setArg.lo..setArg.hi:
+                setValues.add(v)
+        of FznSetLit:
+            setValues = setArg.setElems
+        else:
+            continue
+
+        let setAsHashSet = toHashSet(setValues)
+
+        let xExpr = tr.resolveExprArg(xArg)
+        let domain = tr.resolveActualDomain(xExpr, xArg.ident)
+        if domain.len == 0:
+            skippedSetInReifCIs.incl(ci)
+            continue
+        let lo = domain[0]
+        let hi = domain[^1]
+        if hi - lo + 1 > 100_000:
+            skippedSetInReifCIs.incl(ci)
+            continue
+
+        # b = element(x - lo, [1 if v in S else 0 for v in lo..hi])
+        let indexExpr = xExpr - lo
+        var arrayElems: seq[ArrayElement[int]]
+        for v in lo..hi:
+            arrayElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if v in setAsHashSet: 1 else: 0))
+
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    tr.unchannelSkippedReifs(skippedSetInReifCIs, tr.setInReifChannelDefs, "set_in_reif")
+
+    # Process int_le_reif / int_lt_reif channels
+    var skippedLeReifCIs: HashSet[int]
+    for ci in tr.leReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let bName = con.args[2].ident
+        if bName notin tr.varPositions:
+            continue
+        let bPos = tr.varPositions[bName]
+        let arg0 = con.args[0]
+        let arg1 = con.args[1]
+        let name = stripSolverPrefix(con.name)
+        let isLe = (name == "int_le_reif")  # le: <=, lt: <
+
+        var indexExpr: AlgebraicExpression[int]
+        var arrayElems: seq[ArrayElement[int]]
+
+        # Determine which arg is constant and which is variable
+        let arg0IsConst = arg0.kind == FznIntLit or (arg0.kind == FznIdent and arg0.ident in tr.paramValues)
+        let arg1IsConst = arg1.kind == FznIntLit or (arg1.kind == FznIdent and arg1.ident in tr.paramValues)
+
+        if arg0IsConst and not arg1IsConst:
+            # int_le_reif(const, x, b): b = (const <= x) for le, b = (const < x) for lt
+            let c = if arg0.kind == FznIntLit: arg0.intVal
+                            else: tr.paramValues[arg0.ident]
+            let xExpr = tr.resolveExprArg(arg1)
+            let domain = tr.resolveActualDomain(xExpr, arg1.ident)
+            if domain.len == 0:
+                skippedLeReifCIs.incl(ci)
+                continue
+            let lo = domain[0]
+            let hi = domain[^1]
+            if hi - lo + 1 > 100_000:
+                skippedLeReifCIs.incl(ci)
+                continue
+            indexExpr = xExpr - lo
+            for v in lo..hi:
+                let cmp = if isLe: (c <= v) else: (c < v)
+                arrayElems.add(ArrayElement[int](isConstant: true,
+                        constantValue: if cmp: 1 else: 0))
+
+        elif not arg0IsConst and arg1IsConst:
+            # int_le_reif(x, const, b): b = (x <= const) for le, b = (x < const) for lt
+            let c = if arg1.kind == FznIntLit: arg1.intVal
+                            else: tr.paramValues[arg1.ident]
+            let xExpr = tr.resolveExprArg(arg0)
+            let domain = tr.resolveActualDomain(xExpr, arg0.ident)
+            if domain.len == 0:
+                skippedLeReifCIs.incl(ci)
+                continue
+            let lo = domain[0]
+            let hi = domain[^1]
+            if hi - lo + 1 > 100_000:
+                skippedLeReifCIs.incl(ci)
+                continue
+            indexExpr = xExpr - lo
+            for v in lo..hi:
+                let cmp = if isLe: (v <= c) else: (v < c)
+                arrayElems.add(ArrayElement[int](isConstant: true,
+                        constantValue: if cmp: 1 else: 0))
+
+        elif not arg0IsConst and not arg1IsConst:
+            # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
+            let xExpr = tr.resolveExprArg(arg0)
+            let yExpr = tr.resolveExprArg(arg1)
+            let xName = if arg0.kind == FznIdent: arg0.ident else: ""
+            let yName = if arg1.kind == FznIdent: arg1.ident else: ""
+            let domainX = tr.resolveActualDomain(xExpr, xName)
+            let domainY = tr.resolveActualDomain(yExpr, yName)
+            if domainX.len == 0 or domainY.len == 0:
+                skippedLeReifCIs.incl(ci)
+                continue
+            let loX = domainX[0]
+            let hiX = domainX[^1]
+            let loY = domainY[0]
+            let hiY = domainY[^1]
+            let rangeX = hiX - loX + 1
+            let rangeY = hiY - loY + 1
+            if rangeX > 10_000 or rangeY > 10_000 or
+                  rangeX * rangeY > 100_000:
+                skippedLeReifCIs.incl(ci)
+                continue
+            indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
+            for vx in loX..hiX:
+                for vy in loY..hiY:
+                    let cmp = if isLe: (vx <= vy) else: (vx < vy)
+                    arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if cmp: 1 else: 0))
+        else:
+            # Both constant — skip
+            skippedLeReifCIs.incl(ci)
+            continue
+
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    tr.unchannelSkippedReifs(skippedLeReifCIs, tr.leReifChannelDefs, "le_reif")
+
+    let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
+                                                    tr.boolNotChannelDefs.len +
+                                                    tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
+                                                    tr.leReifChannelDefs.len
+    if totalReifChannels > 0:
+        stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for array_bool_and/array_bool_or with defines_var.
+    ## array_bool_and([a,b,...], r): r = (a AND b AND ...) = element(a+b+..., [0,..,0,1])
+    ## array_bool_or([a,b,...], r):  r = (a OR b OR ...) = element(a+b+..., [0,1,..,1])
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        let isAnd = (name == "array_bool_and")
+        let rName = con.args[1].ident
+        if rName notin tr.varPositions:
+            continue
+
+        # Check if any input var is dead (cascade from dead element chain)
+        var hasDead = false
+        if con.args[0].kind == FznArrayLit:
+            for elem in con.args[0].elems:
+                if elem.kind == FznIdent and elem.ident in tr.definedVarNames and
+                      elem.ident notin tr.varPositions and elem.ident notin tr.definedVarExprs:
+                    hasDead = true
+                    break
+        if hasDead:
+            tr.channelVarNames.excl(rName)
+            tr.definedVarNames.incl(rName)
+            continue
+
+        let rPos = tr.varPositions[rName]
+
+        # Build index expression: sum of input expressions
+        let inputExprs = tr.resolveExprArray(con.args[0])
+        let n = inputExprs.len
+
+        var indexExpr: AlgebraicExpression[int]
+        if n == 0:
+            indexExpr = newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: 0),
+                linear = true
+            )
+        else:
+            indexExpr = inputExprs[0]
+            for i in 1..<n:
+                indexExpr = indexExpr + inputExprs[i]
+
+        # Build lookup array of length n+1
+        var arrayElems: seq[ArrayElement[int]]
+        if isAnd:
+            # AND: only all-true (index n) maps to 1
+            for i in 0..<n:
+                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+        else:
+            # OR: only all-false (index 0) maps to 0
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+            for i in 1..n:
+                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+        let binding = ChannelBinding[int](
+            channelPosition: rPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(rPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    if tr.boolAndOrChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {tr.boolAndOrChannelDefs.len} array_bool_and/or channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildOneHotChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for one-hot indicator variables detected by
+    ## detectImplicationPatterns. Each indicator B_v = (intVar == value) becomes
+    ## a channel: B_v = element(intVar - lo, [1 if v==value else 0 for v in domain])
+
+    for def in tr.oneHotChannelDefs:
+        let indicatorVar = def.indicatorVar
+        let intVar = def.intVar
+        let value = def.value
+
+        if indicatorVar notin tr.varPositions: continue
+        if intVar notin tr.varPositions: continue
+
+        let indicatorPos = tr.varPositions[indicatorVar]
+        let intPos = tr.varPositions[intVar]
+        let intExpr = tr.getExpr(intPos)
+        let domain = tr.sys.baseArray.domain[intPos].sorted()
+        if domain.len == 0: continue
+
+        let lo = domain[0]
+        let hi = domain[^1]
+        if hi - lo + 1 > 100_000: continue
+        let indexExpr = intExpr - lo
+
+        var arrayElems: seq[ArrayElement[int]]
+        for v in lo..hi:
+            arrayElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if v == value: 1 else: 0))
+
+        let binding = ChannelBinding[int](
+            channelPosition: indicatorPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(indicatorPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    if tr.oneHotChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {tr.oneHotChannelDefs.len} one-hot channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+    # Build constant-zero channel bindings for boundary indicator variables
+    var nConstZero = 0
+    for bVar in tr.constantZeroChannels:
+        if bVar notin tr.varPositions: continue
+        let bPos = tr.varPositions[bVar]
+
+        # Constant binding: element(0, [0]) — always evaluates to 0
+        let indexExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true
+        )
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 0)]
+        )
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+        # No entries in channelsAtPosition — no source positions, binding is constant
+        nConstZero += 1
+
+    if nConstZero > 0:
+        stderr.writeLine(&"[FZN] Built {nConstZero} constant-zero channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings from element constraints with defines_var annotations.
+    ## Must be called after all constraints are translated and all positions are known.
+    for ci, definedName in tr.channelConstraints:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+
+        # The defined variable must have a position (it was NOT added to definedVarNames)
+        if definedName notin tr.varPositions:
+            continue
+
+        let channelPos = tr.varPositions[definedName]
+
+        # Build the adjusted index expression (0-based)
+        let indexExpr = tr.resolveExprArg(con.args[0])
+        let adjustedIndex = indexExpr - 1
+
+        # Build the array elements
+        var arrayElems: seq[ArrayElement[int]]
+        if name in ["array_var_int_element", "array_var_int_element_nonshifted",
+                                "array_var_bool_element", "array_var_bool_element_nonshifted"]:
+            arrayElems = tr.resolveMixedArray(con.args[1])
+        else:
+            # array_int_element / array_bool_element: constant array
+            let constArray = tr.resolveIntArray(con.args[1])
+            for v in constArray:
+                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        let binding = ChannelBinding[int](
+            channelPosition: channelPos,
+            indexExpression: adjustedIndex,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(channelPos)
+
+        # Map source positions to this binding
+        for pos in adjustedIndex.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        for elem in arrayElems:
+            if not elem.isConstant:
+                if elem.variablePosition notin tr.sys.baseArray.channelsAtPosition:
+                    tr.sys.baseArray.channelsAtPosition[elem.variablePosition] = @[bindingIdx]
+                else:
+                    tr.sys.baseArray.channelsAtPosition[elem.variablePosition].add(bindingIdx)
+
+    if tr.sys.baseArray.channelBindings.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
+
+proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
+    ## Builds element channel bindings for synthetic channels (precomputed lookup tables
+    ## from detectConditionalGainChannels).
+    for syn in tr.syntheticElementChannels:
+        if syn.varName notin tr.varPositions:
+            continue
+        let channelPos = tr.varPositions[syn.varName]
+
+        if syn.originVar notin tr.varPositions:
+            continue
+        let originPos = tr.varPositions[syn.originVar]
+        let indexExpr = tr.getExpr(originPos) - 1  # FZN is 1-based
+
+        var arrayElems: seq[ArrayElement[int]]
+        for v in syn.lookupTable:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        let binding = ChannelBinding[int](
+            channelPosition: channelPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(channelPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+proc buildMinMaxChannelBindings(tr: var FznTranslator) =
+    ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
+    ## constraints with defines_var annotations. Must be called after buildDefinedExpressions
+    ## so that defined-var inputs can be resolved.
+    for def in tr.minMaxChannelDefs:
+        let con = tr.model.constraints[def.ci]
+        if def.varName notin tr.varPositions:
+            continue
+        let channelPos = tr.varPositions[def.varName]
+        let name = stripSolverPrefix(con.name)
+        var inputExprs: seq[AlgebraicExpression[int]]
+        if name in ["int_min", "int_max"]:
+            # int_min(a, b, c) / int_max(a, b, c) → inputs are [a, b]
+            inputExprs = @[tr.resolveExprArg(con.args[0]), tr.resolveExprArg(con.args[1])]
+        else:
+            # array_int_minimum(m, array) / array_int_maximum(m, array) → inputs are array
+            inputExprs = tr.resolveExprArray(con.args[1])
+        if inputExprs.len == 0:
+            continue
+        tr.sys.baseArray.addMinMaxChannelBinding(channelPos, def.isMin, inputExprs)
+
+    if tr.sys.baseArray.minMaxChannelBindings.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
+
+proc buildSetUnionChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for set_union patterns:
+    ## - Individual unions: max(A_bool, B_bool) per boolean
+    ## - Chains with comprehension pattern: N-ary max over product expressions
+    ## - Chains without comprehension: N-ary max over leaf booleans
+
+    let zeroExpr = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: 0),
+        linear = true)
+    let oneExpr = newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: 1),
+        linear = true)
+
+    var nIndividual = 0
+    var nChainBindings = 0
+    var nCompBindings = 0
+
+    # --- Handle individual (non-chain) set_union channels ---
+    for def in tr.setUnionChannelDefs:
+        let con = tr.model.constraints[def.ci]
+        let cName = def.resultName
+        if cName notin tr.setVarBoolPositions:
+            continue
+        let cVar = tr.setVarBoolPositions[cName]
+        if cVar.positions.len == 0:
+            continue
+
+        let aInfo = tr.resolveSetArg(con.args[0])
+        let bInfo = tr.resolveSetArg(con.args[1])
+
+        for idx in 0..<cVar.positions.len:
+            let elem = cVar.lo + idx
+            let cBoolPos = cVar.positions[idx]
+
+            var aExpr: AlgebraicExpression[int]
+            var aIsConst = false
+            var aConstVal = 0
+            if aInfo.isConst:
+                aIsConst = true
+                aConstVal = if elem in aInfo.constVals: 1 else: 0
+            else:
+                let aPos = getSetBoolPosition(aInfo.varInfo, elem)
+                if aPos >= 0:
+                    aExpr = tr.getExpr(aPos)
+                else:
+                    aIsConst = true
+            if aIsConst:
+                aExpr = if aConstVal == 1: oneExpr else: zeroExpr
+
+            var bExpr: AlgebraicExpression[int]
+            var bIsConst = false
+            var bConstVal = 0
+            if bInfo.isConst:
+                bIsConst = true
+                bConstVal = if elem in bInfo.constVals: 1 else: 0
+            else:
+                let bPos = getSetBoolPosition(bInfo.varInfo, elem)
+                if bPos >= 0:
+                    bExpr = tr.getExpr(bPos)
+                else:
+                    bIsConst = true
+            if bIsConst:
+                bExpr = if bConstVal == 1: oneExpr else: zeroExpr
+
+            if aIsConst and bIsConst:
+                tr.sys.baseArray.setDomain(cBoolPos, @[max(aConstVal, bConstVal)])
+            else:
+                tr.sys.baseArray.addMinMaxChannelBinding(cBoolPos, false, @[aExpr, bExpr])
+                inc nIndividual
+
+    # --- Handle chains with set comprehension pattern ---
+    # R.bools[v] = max over products where sumVal=v of (product_expression)
+    # R.bools[0] = 1 if base contains 0 (always true for gt-sort)
+    var comprehensionChainIndices: PackedSet[int]
+    for comp in tr.setComprehensions:
+        comprehensionChainIndices.incl(comp.chainIdx)
+        let chain = tr.setUnionChains[comp.chainIdx]
+        let rName = chain.resultName
+        if rName notin tr.setVarBoolPositions:
+            continue
+        let rVar = tr.setVarBoolPositions[rName]
+        if rVar.positions.len == 0:
+            continue
+
+        # Group pairs by sumVal
+        var pairsBySumVal: Table[int, seq[string]]  # sumVal -> product var names
+        for pair in comp.pairs:
+            pairsBySumVal.mgetOrPut(pair.sumVal, @[]).add(pair.productVarName)
+
+        for idx in 0..<rVar.positions.len:
+            let v = rVar.lo + idx
+            let rBoolPos = rVar.positions[idx]
+
+            if chain.baseIsConst and v in chain.baseConstVals:
+                # Base set always contributes this value
+                tr.sys.baseArray.setDomain(rBoolPos, @[1])
+                continue
+
+            if v notin pairsBySumVal:
+                # No pair contributes this value
+                if not chain.baseIsConst:
+                    # If base is variable, include its boolean
+                    let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+                    let bPos = getSetBoolPosition(baseInfo, v)
+                    if bPos >= 0:
+                        tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, @[tr.getExpr(bPos)])
+                        inc nCompBindings
+                    else:
+                        tr.sys.baseArray.setDomain(rBoolPos, @[0])
+                else:
+                    tr.sys.baseArray.setDomain(rBoolPos, @[0])
+                continue
+
+            # Collect product expressions for all pairs with this sumVal
+            var inputExprs: seq[AlgebraicExpression[int]]
+
+            # Include base boolean if base is a variable set
+            if not chain.baseIsConst:
+                let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+                let bPos = getSetBoolPosition(baseInfo, v)
+                if bPos >= 0:
+                    inputExprs.add(tr.getExpr(bPos))
+
+            for productName in pairsBySumVal[v]:
+                if productName in tr.definedVarExprs:
+                    inputExprs.add(tr.definedVarExprs[productName])
+                elif productName in tr.varPositions:
+                    inputExprs.add(tr.getExpr(tr.varPositions[productName]))
+
+            if inputExprs.len == 0:
+                tr.sys.baseArray.setDomain(rBoolPos, @[0])
+            elif inputExprs.len == 1:
+                # Single input: direct channel binding (avoid max overhead)
+                tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+                inc nCompBindings
+            else:
+                # N-ary max over all product expressions
+                tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+                inc nCompBindings
+
+    # --- Handle chains WITHOUT comprehension pattern (plain chain collapse) ---
+    for chainIdx in 0..<tr.setUnionChains.len:
+        if chainIdx in comprehensionChainIndices:
+            continue
+        let chain = tr.setUnionChains[chainIdx]
+        let rName = chain.resultName
+        if rName notin tr.setVarBoolPositions:
+            continue
+        let rVar = tr.setVarBoolPositions[rName]
+        if rVar.positions.len == 0:
+            continue
+
+        for idx in 0..<rVar.positions.len:
+            let v = rVar.lo + idx
+            let rBoolPos = rVar.positions[idx]
+
+            var inputExprs: seq[AlgebraicExpression[int]]
+
+            # Include base
+            if chain.baseIsConst:
+                if v in chain.baseConstVals:
+                    tr.sys.baseArray.setDomain(rBoolPos, @[1])
+                    continue
+            else:
+                let baseInfo = tr.setVarBoolPositions.getOrDefault(chain.baseName)
+                let bPos = getSetBoolPosition(baseInfo, v)
+                if bPos >= 0:
+                    inputExprs.add(tr.getExpr(bPos))
+
+            # Include all leaves
+            for leafName in chain.leafNames:
+                if leafName in tr.setVarBoolPositions:
+                    let leafInfo = tr.setVarBoolPositions[leafName]
+                    let lPos = getSetBoolPosition(leafInfo, v)
+                    if lPos >= 0:
+                        inputExprs.add(tr.getExpr(lPos))
+
+            if inputExprs.len == 0:
+                tr.sys.baseArray.setDomain(rBoolPos, @[0])
+            else:
+                tr.sys.baseArray.addMinMaxChannelBinding(rBoolPos, false, inputExprs)
+                inc nChainBindings
+
+    if nIndividual > 0:
+        stderr.writeLine(&"[FZN] Built {nIndividual} individual set_union channel bindings")
+    if nChainBindings > 0:
+        stderr.writeLine(&"[FZN] Built {nChainBindings} chain-collapsed set_union channel bindings")
+    if nCompBindings > 0:
+        stderr.writeLine(&"[FZN] Built {nCompBindings} set comprehension channel bindings (from {tr.setComprehensions.len} patterns)")
+
+proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for case-analysis patterns detected by
+    ## detectCaseAnalysisChannels. Each target variable becomes a channel
+    ## with a constant lookup table indexed by source variable positions.
+    var nBuilt = 0
+    for def in tr.caseAnalysisDefs:
+        if def.targetVarName notin tr.varPositions: continue
+        let channelPos = tr.varPositions[def.targetVarName]
+
+        # Build array elements (all constants from precomputed lookup table)
+        var arrayElems: seq[ArrayElement[int]]
+        for v in def.lookupTable:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        # Build index expression from source positions
+        # Row-major: index = (src0 - off0) * size1 * ... * sizeN + ... + (srcN - offN)
+        var indexExpr: AlgebraicExpression[int]
+        var valid = true
+        for i, srcName in def.sourceVarNames:
+            if srcName notin tr.varPositions:
+                valid = false
+                break
+            let srcPos = tr.varPositions[srcName]
+            let srcExpr = tr.getExpr(srcPos)
+            let termExpr = srcExpr - def.domainOffsets[i]
+            if i == 0:
+                indexExpr = termExpr
+            else:
+                indexExpr = indexExpr * def.domainSizes[i] + termExpr
+        if not valid: continue
+
+        # Create and register channel binding
+        let binding = ChannelBinding[int](
+            channelPosition: channelPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(channelPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} case-analysis channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+proc buildInverseChannelBindings(tr: var FznTranslator) =
+    ## Builds inverse channel groups from patterns detected by detectInverseChannelPatterns.
+    for pattern in tr.inverseChannelPatterns:
+        let arrayPositions = tr.arrayPositions[pattern.arrayName]
+        # Resolve forward (index) positions
+        var forwardPositions: seq[int]
+        for vn in pattern.indexVarNames:
+            forwardPositions.add(tr.varPositions[vn])
+
+        # Determine the forward base (minimum result value = the "name" of forwardPositions[0])
+        # and sort by result value to align positions with their result values
+        var pairs: seq[(int, int, string)]  # (resultValue, forwardPosition, varName)
+        for i in 0..<pattern.resultValues.len:
+            pairs.add((pattern.resultValues[i], forwardPositions[i], pattern.indexVarNames[i]))
+        pairs.sort(proc(a, b: (int, int, string)): int = cmp(a[0], b[0]))
+
+        var sortedForward: seq[int]
+        var sortedResults: seq[int]
+        for (rv, fp, _) in pairs:
+            sortedForward.add(fp)
+            sortedResults.add(rv)
+
+        let forwardBase = sortedResults[0]
+        # Verify result values are consecutive
+        var consecutive = true
+        for i in 1..<sortedResults.len:
+            if sortedResults[i] != sortedResults[i-1] + 1:
+                consecutive = false
+                break
+        if not consecutive:
+            stderr.writeLine(&"[FZN] Warning: inverse channel on '{pattern.arrayName}' has non-consecutive results, skipping")
+            continue
+
+        # Inverse base is 1 (FlatZinc arrays are 1-based)
+        let inverseBase = 1
+
+        # Default value: find a value in the inverse domain that is NOT in the result values
+        # Typically 0 for alldifferent_except_0 patterns
+        let resultSet = sortedResults.toHashSet()
+        var defaultValue = 0
+        if defaultValue in resultSet:
+            # Find any value not in the result set from the inverse domain
+            let dom = tr.sys.baseArray.domain[arrayPositions[0]]
+            for v in dom:
+                if v notin resultSet:
+                    defaultValue = v
+                    break
+
+        tr.sys.baseArray.addInverseChannelGroup(
+            sortedForward, arrayPositions, forwardBase, inverseBase, defaultValue)
+
+        # Domain reduction: if the inverse array has all-constant elements,
+        # each forward position is uniquely determined.
+        # element(forward[i], constantArray, i+forwardBase) means constantArray[forward[i]] = i+forwardBase
+        # So forward[i] = the unique index where constantArray has value (i+forwardBase).
+        var nReduced = 0
+        block:
+            # Get the array declaration elements
+            var arrayArg = FznExpr(kind: FznIdent, ident: pattern.arrayName)
+            let elems = tr.resolveVarArrayElems(arrayArg)
+            if elems.len > 0:
+                # Check if all elements are integer literals (constant array)
+                var allConstant = true
+                var constValues: seq[int]
+                for elem in elems:
+                    if elem.kind == FznIntLit:
+                        constValues.add(elem.intVal)
+                    else:
+                        allConstant = false
+                        break
+
+                if allConstant:
+                    # Build value -> 1-based index lookup
+                    var valueToIndex: Table[int, int]
+                    for idx, v in constValues:
+                        valueToIndex[v] = idx + inverseBase  # 1-based FlatZinc index
+
+                    # Reduce each forward position's domain to its unique value
+                    for i, fpos in sortedForward:
+                        let targetValue = i + forwardBase  # what constantArray[forward[i]] must equal
+                        if targetValue in valueToIndex:
+                            let requiredIdx = valueToIndex[targetValue]
+                            tr.sys.baseArray.domain[fpos] = @[requiredIdx]
+                            inc nReduced
+
+        stderr.writeLine(&"[FZN] Built inverse channel group on '{pattern.arrayName}': " &
+                                          &"{sortedForward.len} forward + {arrayPositions.len} inverse positions, " &
+                                          &"forwardBase={forwardBase}, defaultValue={defaultValue}" &
+                                          (if nReduced > 0: &", {nReduced} forward domains fixed" else: ""))
+
+proc resolveVarNames(tr: FznTranslator, arg: FznExpr): seq[string] =
+    ## Resolves a FznExpr to variable names (for ordering detection).
+    ## Only handles inline array literals since this runs before translateVariables.
+    case arg.kind
+    of FznArrayLit:
+        for e in arg.elems:
+            if e.kind == FznIdent:
+                result.add(e.ident)
+            else:
+                return @[]  # non-variable element, bail out
+    else:
+        return @[]
+
+proc detectInversePatterns(tr: var FznTranslator) =
+    ## Detects involution patterns from array_var_int_element constraints.
+    ## Pattern: for an n-element array A, n constraints of the form
+    ##   array_var_int_element(A[i], A, i)  for i in 1..n
+    ## encode the involution A[A[i]] = i. These are replaced by an InverseGroup
+    ## that maintains the invariant via compound moves.
+    ## Also removes matching fzn_all_different_int constraints (implied by involution).
+
+    # Step 1: Group array_var_int_element constraints by their array argument
+    var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
+                                      "array_var_bool_element", "array_var_bool_element_nonshifted"]:
+            continue
+        if con.hasAnnotation("defines_var"):
+            continue
+        # Array argument is arg[1]
+        let arrArg = con.args[1]
+        if arrArg.kind != FznIdent:
+            continue
+        let arrName = arrArg.ident
+        if arrName notin arrayGroups:
+            arrayGroups[arrName] = @[]
+        arrayGroups[arrName].add(ci)
+
+    # Step 2: For each group, check if it forms an involution pattern
+    for arrName, ciList in arrayGroups:
+        # Get the element names for this array
+        if arrName notin tr.arrayElementNames:
+            continue
+        let elemNames = tr.arrayElementNames[arrName]
+        let n = elemNames.len
+        if ciList.len != n:
+            continue  # must have exactly one constraint per element
+
+        # Build map: element name -> 0-based index in the array
+        var nameToIdx: Table[string, int]
+        for i, name in elemNames:
+            nameToIdx[name] = i
+
+        # Check each constraint: arg[0] must be one of the array elements,
+        # arg[2] must be the constant (1-based index) of that element
+        var matched = newSeq[bool](n)
+        var allMatch = true
+        for ci in ciList:
+            let con = tr.model.constraints[ci]
+            # arg[0] = index (should be one of the array's element variables)
+            if con.args[0].kind != FznIdent:
+                allMatch = false
+                break
+            let indexName = con.args[0].ident
+            # The index might be a defined variable — resolve through definedVarNames
+            # But for the involution, the index should be one of the array elements directly
+            if indexName notin nameToIdx:
+                allMatch = false
+                break
+            let elemIdx = nameToIdx[indexName]  # 0-based
+
+            # arg[2] = value (should be constant = elemIdx + 1, i.e., 1-based)
+            if con.args[2].kind != FznIntLit:
+                allMatch = false
+                break
+            let constVal = con.args[2].intVal
+            if constVal != elemIdx + 1:
+                allMatch = false
+                break
+
+            if matched[elemIdx]:
+                allMatch = false  # duplicate
+                break
+            matched[elemIdx] = true
+
+        if not allMatch:
+            continue
+        # Verify all elements matched
+        var complete = true
+        for m in matched:
+            if not m:
+                complete = false
+                break
+        if not complete:
+            continue
+
+        # All checks passed — this is an involution group!
+        # Get positions for all elements
+        if arrName notin tr.arrayPositions:
+            continue
+        let positions = tr.arrayPositions[arrName]
+        if positions.len != n:
+            continue
+
+        # Mark all element constraints as consumed
+        for ci in ciList:
+            tr.definingConstraints.incl(ci)
+
+        # Find and mark matching fzn_all_different_int constraints on the same positions
+        let posSet = toPackedSet(positions)
+        var nAllDiffRemoved = 0
+        for ci2, con2 in tr.model.constraints:
+            if ci2 in tr.definingConstraints:
+                continue
+            let cname = stripSolverPrefix(con2.name)
+            if cname notin ["fzn_all_different_int", "all_different_int"]:
+                continue
+            # Check if the constraint's variable set matches our positions
+            let varElems = tr.resolveVarArrayElems(con2.args[0])
+            if varElems.len != n:
+                continue
+            var allInGroup = true
+            for elem in varElems:
+                if elem.kind != FznIdent or elem.ident notin nameToIdx:
+                    allInGroup = false
+                    break
+            if allInGroup:
+                tr.definingConstraints.incl(ci2)
+                inc nAllDiffRemoved
+
+        # Register the inverse group (valueOffset = -1 for 1-based FlatZinc indexing)
+        tr.sys.baseArray.addInverseGroup(positions, -1)
+
+        stderr.writeLine(&"[FZN] Detected involution on array '{arrName}': {n} positions, " &
+                                          &"{ciList.len} element + {nAllDiffRemoved} all_different constraints consumed")
+
+
+proc detectInverseChannelPatterns(tr: var FznTranslator) =
+    ## Detects inverse channel patterns from array_var_int_element constraints.
+    ## Pattern: for an array A of size S, P constraints of the form
+    ##   array_var_int_element(index_p, A, p)  for p in 1..P
+    ## where index_p are distinct positioned variables NOT in A, and p is a constant.
+    ## This encodes A[index_p] = p, i.e., A is the inverse of the index variables.
+    ## The A positions become channel variables.
+    ## Also consumes matching GCC/alldifferent_except_0 constraints on A.
+
+    # Step 1: Group array_var_int_element constraints by their array argument
+    var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
+            continue
+        if con.hasAnnotation("defines_var"):
+            continue
+        # Array argument is arg[1] — must be a named array
+        let arrArg = con.args[1]
+        if arrArg.kind != FznIdent:
+            continue
+        # Index arg[0] must be a named variable
+        if con.args[0].kind != FznIdent:
+            continue
+        # Result arg[2] must be a constant integer
+        if con.args[2].kind != FznIntLit:
+            continue
+        let arrName = arrArg.ident
+        if arrName notin arrayGroups:
+            arrayGroups[arrName] = @[]
+        arrayGroups[arrName].add(ci)
+
+    # Step 2: For each group, check if it forms an inverse channel pattern
+    for arrName, ciList in arrayGroups:
+        if arrName notin tr.arrayPositions:
+            continue
+        let arrayPositions = tr.arrayPositions[arrName]
+        let arraySize = arrayPositions.len
+
+        # Get element names for the array (to detect involution overlap)
+        var arrayElemNames: HashSet[string]
+        if arrName in tr.arrayElementNames:
+            for n in tr.arrayElementNames[arrName]:
+                arrayElemNames.incl(n)
+
+        # Collect index var names and result values
+        var indexVarNames: seq[string]
+        var resultValues: seq[int]
+        var resultSet: HashSet[int]
+        var allValid = true
+        var isInvolution = true  # check if index vars ARE the array elements
+        for ci in ciList:
+            let con = tr.model.constraints[ci]
+            let indexName = con.args[0].ident
+            let resultVal = con.args[2].intVal
+
+            # Index must be a positioned variable
+            if indexName notin tr.varPositions:
+                allValid = false
+                break
+            # Check for duplicate result values
+            if resultVal in resultSet:
+                allValid = false
+                break
+            resultSet.incl(resultVal)
+            indexVarNames.add(indexName)
+            resultValues.add(resultVal)
+
+            # Check if this is an involution (index var is from the same array)
+            if indexName notin arrayElemNames:
+                isInvolution = false
+
+        if not allValid:
+            continue
+        # Skip involution patterns (handled by detectInversePatterns)
+        if isInvolution:
+            continue
+        # Need at least 2 constraints
+        if ciList.len < 2:
+            continue
+        # All index vars must be distinct
+        if indexVarNames.toHashSet().len != indexVarNames.len:
+            continue
+
+        # Result values must be valid indices into the array (1-based)
+        var resultValsValid = true
+        for rv in resultValues:
+            if rv < 1 or rv > arraySize:
+                resultValsValid = false
+                break
+        if not resultValsValid:
+            continue
+
+        # Find matching GCC or alldifferent_except_0 constraints on the array positions
+        let arrayPosSet = toPackedSet(arrayPositions)
+        var gccCIs: seq[int]
+        for ci2, con2 in tr.model.constraints:
+            if ci2 in tr.definingConstraints:
+                continue
+            let cname = stripSolverPrefix(con2.name)
+            case cname
+            of "fzn_global_cardinality", "fzn_global_cardinality_closed",
+                  "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed":
+                # Check if the x array covers our array positions
+                let varElems = tr.resolveVarArrayElems(con2.args[0])
+                if varElems.len == 0: continue
+                var positions: seq[int]
+                var match = true
+                for elem in varElems:
+                    if elem.kind != FznIdent or elem.ident notin tr.varPositions:
+                        match = false
+                        break
+                    positions.add(tr.varPositions[elem.ident])
+                if not match: continue
+                if toPackedSet(positions) == arrayPosSet:
+                    gccCIs.add(ci2)
+            of "fzn_all_different_int", "all_different_int", "fzn_alldifferent_except_0":
+                let varElems = tr.resolveVarArrayElems(con2.args[0])
+                if varElems.len == 0: continue
+                var positions: seq[int]
+                var match = true
+                for elem in varElems:
+                    if elem.kind != FznIdent or elem.ident notin tr.varPositions:
+                        match = false
+                        break
+                    positions.add(tr.varPositions[elem.ident])
+                if not match: continue
+                if toPackedSet(positions) == arrayPosSet:
+                    gccCIs.add(ci2)
+            else:
+                discard
+
+        # Mark element constraints as consumed
+        for ci in ciList:
+            tr.definingConstraints.incl(ci)
+        # Mark GCC/alldifferent constraints as consumed
+        for ci2 in gccCIs:
+            tr.definingConstraints.incl(ci2)
+
+        # Store the pattern
+        tr.inverseChannelPatterns.add((
+            arrayName: arrName,
+            elementCIs: ciList,
+            indexVarNames: indexVarNames,
+            resultValues: resultValues,
+            gccCIs: gccCIs
+        ))
+
+        stderr.writeLine(&"[FZN] Detected inverse channel on array '{arrName}': " &
+                                          &"{ciList.len} element + {gccCIs.len} GCC/alldiff constraints consumed, " &
+                                          &"{arraySize} inverse positions become channels")
+
+
+proc detectIfThenElseChannels(tr: var FznTranslator) =
+    ## Detects if-then-else patterns encoded as:
+    ##   int_lin_ne_reif([1,-1], [prev, curr], 0, b) :: defines_var(b)
+    ##   int_eq_reif(result, curr, b1) :: defines_var(b1)
+    ##   int_eq_reif(result, elseVal, b2) :: defines_var(b2)
+    ##   bool_clause([b1], [b])          -- b → b1: if prev!=curr then result==curr
+    ##   bool_clause([b, b2], [])        -- ¬b → b2: if prev==curr then result==elseVal
+    ## Converts result to a 2D table channel: result = if prev != curr then curr else elseVal
+
+    # Phase 1: Index int_lin_ne_reif with defines_var → condition bool var
+    # Maps condBoolVar → (ci, prevVarName, currVarName)
+    type LinNeReifEntry = object
+        ci: int
+        prevVar, currVar: string
+
+    var linNeReifMap: Table[string, LinNeReifEntry]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.name != "int_lin_ne_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 4: continue
+        if con.args[3].kind != FznIdent: continue
+        # Check coefficients are [1,-1] or [-1,1]
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError: continue
+        if coeffs.len != 2: continue
+        if not ((coeffs[0] == 1 and coeffs[1] == -1) or (coeffs[0] == -1 and coeffs[1] == 1)): continue
+        # Check RHS is 0
+        var rhs: int
+        try:
+            rhs = tr.resolveIntArg(con.args[2])
+        except CatchableError: continue
+        if rhs != 0: continue
+        # Get the two variable names
+        if con.args[1].kind != FznArrayLit or con.args[1].elems.len != 2: continue
+        if con.args[1].elems[0].kind != FznIdent or con.args[1].elems[1].kind != FznIdent: continue
+        let v0 = con.args[1].elems[0].ident
+        let v1 = con.args[1].elems[1].ident
+        let boolVar = con.args[3].ident
+        # coeffs [1,-1] means v0 - v1 != 0, i.e., v0 != v1
+        if coeffs[0] == 1:
+            linNeReifMap[boolVar] = LinNeReifEntry(ci: ci, prevVar: v0, currVar: v1)
+        else:
+            linNeReifMap[boolVar] = LinNeReifEntry(ci: ci, prevVar: v1, currVar: v0)
+
+    if linNeReifMap.len == 0: return
+
+    # Phase 2: Index int_eq_reif with defines_var where first arg is a result variable
+    # Maps resultVarName → seq of (ci, testArg, boolVar)
+    type EqReifEntry = object
+        ci: int
+        boolVar: string
+        # The test value: either a variable name or a constant
+        isConstTest: bool
+        constVal: int
+        varName: string  # if not const
+
+    var eqReifByResult: Table[string, seq[EqReifEntry]]
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[2].kind != FznIdent: continue
+        let resultVar = con.args[0].ident
+        let boolVar = con.args[2].ident
+        var entry: EqReifEntry
+        entry.ci = ci
+        entry.boolVar = boolVar
+        if con.args[1].kind == FznIntLit:
+            entry.isConstTest = true
+            entry.constVal = con.args[1].intVal
+        elif con.args[1].kind == FznIdent:
+            entry.isConstTest = false
+            entry.varName = con.args[1].ident
+        else:
+            continue
+        if resultVar notin eqReifByResult:
+            eqReifByResult[resultVar] = @[]
+        eqReifByResult[resultVar].add(entry)
+
+    # Phase 3: Index bool_clause constraints
+    # For each bool_clause, check if it matches one of the two patterns:
+    # Pattern A: bool_clause([b1], [b]) — 1 positive, 1 negative
+    # Pattern B: bool_clause([b, b2], []) — 2 positive, 0 negative
+    type BoolClauseEntry = object
+        ci: int
+        # For Pattern A: posLit is b1 (eq_reif bool), negLit is b (condition bool)
+        # For Pattern B: lit1 is b (condition bool), lit2 is b2 (eq_reif bool)
+        posLits: seq[string]
+        negLits: seq[string]
+
+    var boolClausesByLit: Table[string, seq[BoolClauseEntry]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.name != "bool_clause": continue
+        if con.args.len < 2: continue
+        var posLits, negLits: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.add(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.add(e.ident)
+        let entry = BoolClauseEntry(ci: ci, posLits: posLits, negLits: negLits)
+        for lit in posLits:
+            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+            boolClausesByLit[lit].add(entry)
+        for lit in negLits:
+            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+            boolClausesByLit[lit].add(entry)
+
+    # Phase 4: Match the full pattern for each candidate result variable
+    var totalChannels = 0
+
+    for resultVar, eqEntries in eqReifByResult:
+        if eqEntries.len != 2: continue
+        if resultVar notin tr.varPositions: continue
+        if resultVar in tr.channelVarNames: continue
+        if resultVar in tr.definedVarNames: continue
+
+        # Identify which eq_reif is the "then" (variable test) and which is "else" (constant test)
+        var thenIdx, elseIdx: int = -1
+        for i, e in eqEntries:
+            if e.isConstTest:
+                elseIdx = i
+            else:
+                thenIdx = i
+        if thenIdx < 0 or elseIdx < 0: continue
+
+        let thenEntry = eqEntries[thenIdx]
+        let elseEntry = eqEntries[elseIdx]
+        let elseVal = elseEntry.constVal
+        let thenVarName = thenEntry.varName
+
+        # Find bool_clause linking thenEntry.boolVar to a condition b
+        # Pattern A: bool_clause([thenEntry.boolVar], [b]) — b → result==curr
+        var condBoolVar = ""
+        var clauseA_ci = -1
+        if thenEntry.boolVar in boolClausesByLit:
+            for bc in boolClausesByLit[thenEntry.boolVar]:
+                if bc.ci in tr.definingConstraints: continue
+                if bc.posLits.len == 1 and bc.negLits.len == 1 and bc.posLits[0] == thenEntry.boolVar:
+                    # bool_clause([b1], [b]) → b → b1
+                    let candidateB = bc.negLits[0]
+                    if candidateB in linNeReifMap:
+                        condBoolVar = candidateB
+                        clauseA_ci = bc.ci
+                        break
+
+        if condBoolVar == "": continue
+        let linNeEntry = linNeReifMap[condBoolVar]
+
+        # Verify: thenVarName must be the "curr" variable from int_lin_ne_reif
+        if thenVarName != linNeEntry.currVar: continue
+
+        # Find bool_clause Pattern B: bool_clause([condBoolVar, elseEntry.boolVar], [])
+        # — ¬b → b2: if prev==curr then result==elseVal
+        var clauseB_ci = -1
+        if condBoolVar in boolClausesByLit:
+            for bc in boolClausesByLit[condBoolVar]:
+                if bc.ci in tr.definingConstraints: continue
+                if bc.ci == clauseA_ci: continue
+                if bc.posLits.len == 2 and bc.negLits.len == 0:
+                    if (bc.posLits[0] == condBoolVar and bc.posLits[1] == elseEntry.boolVar) or
+                          (bc.posLits[1] == condBoolVar and bc.posLits[0] == elseEntry.boolVar):
+                        clauseB_ci = bc.ci
+                        break
+
+        if clauseB_ci < 0: continue
+
+        # Full pattern matched! Build 2D table channel.
+        let prevVarName = linNeEntry.prevVar
+        let currVarName = linNeEntry.currVar
+
+        if prevVarName notin tr.varPositions and prevVarName notin tr.definedVarExprs: continue
+        if currVarName notin tr.varPositions and currVarName notin tr.definedVarExprs: continue
+
+        let prevExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: prevVarName))
+        let currExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: currVarName))
+        let resultPos = tr.varPositions[resultVar]
+
+        # Get domains for the 2D table
+        var prevPos, currPos: int
+        if prevExpr.node.kind == RefNode:
+            prevPos = prevExpr.node.position
+        else: continue
+        if currExpr.node.kind == RefNode:
+            currPos = currExpr.node.position
+        else: continue
+
+        let prevDom = tr.sys.baseArray.domain[prevPos].sorted()
+        let currDom = tr.sys.baseArray.domain[currPos].sorted()
+        if prevDom.len == 0 or currDom.len == 0: continue
+
+        let loPrev = prevDom[0]
+        let hiPrev = prevDom[^1]
+        let loCurr = currDom[0]
+        let hiCurr = currDom[^1]
+        let rangePrev = hiPrev - loPrev + 1
+        let rangeCurr = hiCurr - loCurr + 1
+        let tableSize = rangePrev * rangeCurr
+
+        if tableSize > 100_000: continue  # safety limit
+
+        var arrayElems = newSeq[ArrayElement[int]](tableSize)
+        for vp in loPrev..hiPrev:
+            for vc in loCurr..hiCurr:
+                let idx = (vp - loPrev) * rangeCurr + (vc - loCurr)
+                if vp != vc:
+                    arrayElems[idx] = ArrayElement[int](isConstant: true, constantValue: vc)
+                else:
+                    arrayElems[idx] = ArrayElement[int](isConstant: true, constantValue: elseVal)
+
+        # Build index expression: (prev - loPrev) * rangeCurr + (curr - loCurr)
+        let indexExpr = (prevExpr - loPrev) * rangeCurr + (currExpr - loCurr)
+
+        tr.sys.baseArray.addChannelBinding(resultPos, indexExpr, arrayElems)
+        tr.channelVarNames.incl(resultVar)
+
+        # Mark consumed constraints
+        tr.definingConstraints.incl(linNeEntry.ci)  # int_lin_ne_reif
+        tr.definingConstraints.incl(clauseA_ci)     # bool_clause pattern A
+        tr.definingConstraints.incl(clauseB_ci)     # bool_clause pattern B
+        # The two int_eq_reif are already reif channel defs — mark them as consumed too
+        # so their channel bindings for b1/b2 are not created (they're no longer needed)
+        tr.definingConstraints.incl(thenEntry.ci)
+        tr.definingConstraints.incl(elseEntry.ci)
+
+        inc totalChannels
+
+    if totalChannels > 0:
+        stderr.writeLine(&"[FZN] Detected {totalChannels} if-then-else channels")
+
+proc detectGccCountChannels(tr: var FznTranslator) =
+    ## Detects fzn_global_cardinality constraints whose count outputs are pure channels
+    ## (only used by the GCC itself and downstream min/max/objective chains).
+    ## Converts count outputs to CountEqChannelBindings, eliminating the need for
+    ## indicator decomposition.
+    ##
+    ## Pattern: fzn_global_cardinality(x, cover, counts) where each count var is
+    ## referenced only by this GCC + array_int_minimum/maximum defines_var constraints.
+
+    # Build set of min/max channel def constraint indices for fast lookup
+    var minMaxCIs: PackedSet[int]
+    for def in tr.minMaxChannelDefs:
+        minMaxCIs.incl(def.ci)
+
+    var totalChannels = 0
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = con.name
+        if name != "fzn_global_cardinality": continue
+
+        # Extract count variable names (skip if counts are all constants)
+        let countArg = con.args[2]
+        if countArg.kind != FznArrayLit and countArg.kind != FznIdent: continue
+
+        var countNames: seq[string]
+        if countArg.kind == FznArrayLit:
+            var hasVariable = false
+            for elem in countArg.elems:
+                if elem.kind == FznIdent and elem.ident notin tr.paramValues:
+                    hasVariable = true
+                    countNames.add(elem.ident)
+                elif elem.kind == FznIdent and elem.ident in tr.paramValues:
+                    countNames.setLen(0); break  # mixed constant/variable — skip
+                else:
+                    countNames.setLen(0); break
+            if not hasVariable: continue
+        elif countArg.kind == FznIdent:
+            # Array variable reference — resolve to element names
+            if countArg.ident in tr.arrayElementNames:
+                countNames = tr.arrayElementNames[countArg.ident]
+            else:
+                continue
+
+        if countNames.len == 0: continue
+
+        # Check all count vars have positions (not already eliminated)
+        var allHavePos = true
+        for cname in countNames:
+            if cname notin tr.varPositions:
+                allHavePos = false; break
+        if not allHavePos: continue
+
+        # Check each count variable is "pure output": only referenced by this GCC,
+        # already-consumed defining constraints (channel defs), and min/max channel defs.
+        var allPureOutput = true
+        for cname in countNames:
+            for ci2, con2 in tr.model.constraints:
+                if ci2 == ci: continue  # skip this GCC itself
+                if ci2 in tr.definingConstraints: continue  # already consumed
+                if ci2 in minMaxCIs: continue  # min/max channel def is fine
+                # Check if con2 references cname in any arg
+                var refersToCount = false
+                for arg in con2.args:
+                    if arg.kind == FznIdent and arg.ident == cname:
+                        refersToCount = true; break
+                    elif arg.kind == FznArrayLit:
+                        for elem in arg.elems:
+                            if elem.kind == FznIdent and elem.ident == cname:
+                                refersToCount = true; break
+                        if refersToCount: break
+                if refersToCount:
+                    allPureOutput = false; break
+            if not allPureOutput: break
+
+        if not allPureOutput: continue
+
+        # All checks passed — convert count outputs to channel bindings
+        let cover = tr.resolveIntArray(con.args[1])
+        let xArg = con.args[0]
+        var inputPositions: seq[int]
+        var constantValues: seq[int]  # constant elements in the x-array
+        var xArgValid = true
+        if xArg.kind == FznArrayLit:
+            for elem in xArg.elems:
+                if elem.kind == FznIdent:
+                    if elem.ident in tr.paramValues:
+                        constantValues.add(tr.paramValues[elem.ident])
+                    elif elem.ident in tr.varPositions:
+                        inputPositions.add(tr.varPositions[elem.ident])
+                    elif elem.ident in tr.definedVarExprs:
+                        let expr = tr.definedVarExprs[elem.ident]
+                        if expr.node.kind == RefNode:
+                            inputPositions.add(expr.node.position)
+                        else:
+                            xArgValid = false; break
+                    else:
+                        xArgValid = false; break
+                elif elem.kind == FznIntLit:
+                    constantValues.add(elem.intVal)
+                else:
+                    xArgValid = false; break
+        elif xArg.kind == FznIdent and xArg.ident in tr.arrayPositions:
+            inputPositions = tr.arrayPositions[xArg.ident]
+        else:
+            continue
+
+        if not xArgValid or inputPositions.len == 0: continue
+        let totalElements = inputPositions.len + constantValues.len
+
+        for i, cname in countNames:
+            let countPos = tr.varPositions[cname]
+            # Count how many constant elements match this cover value
+            var constOffset = 0
+            for cv in constantValues:
+                if cv == cover[i]: inc constOffset
+            tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions, constOffset)
+            tr.channelVarNames.incl(cname)
+            # Set domain to valid range for this channel
+            tr.sys.baseArray.domain[countPos] = toSeq(0..totalElements)
+            inc totalChannels
+
+        tr.definingConstraints.incl(ci)  # GCC is consumed — counts are channels now
+
+    if totalChannels > 0:
+        stderr.writeLine(&"[FZN] Detected {totalChannels} GCC count channels")
+
