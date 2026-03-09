@@ -282,6 +282,8 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
     ## Try column keyCol as a unique functional key.
     ## If successful, all other columns become channel variables.
     let nCols = positions.len
+    if nCols < 2:
+        return false
 
     var keyValues: PackedSet[int]
     var keyMin = high(int)
@@ -362,6 +364,29 @@ proc tryCompositeColumnKey(tr: var FznTranslator, positions: seq[int],
         if linearKey in compositeKeys:
             return false
         compositeKeys.incl(linearKey)
+
+    # Filter key columns' domains to values present in the table
+    var key0Values: PackedSet[int]
+    var key1Values: PackedSet[int]
+    for t in tuples:
+        key0Values.incl(t[keyCol0])
+        key1Values.incl(t[keyCol1])
+    let key0Pos = positions[keyCol0]
+    let key0Domain = tr.sys.baseArray.domain[key0Pos]
+    var filtered0: seq[int]
+    for v in key0Domain:
+        if v in key0Values:
+            filtered0.add(v)
+    if filtered0.len < key0Domain.len:
+        tr.sys.baseArray.domain[key0Pos] = filtered0
+    let key1Pos = positions[keyCol1]
+    let key1Domain = tr.sys.baseArray.domain[key1Pos]
+    var filtered1: seq[int]
+    for v in key1Domain:
+        if v in key1Values:
+            filtered1.add(v)
+    if filtered1.len < key1Domain.len:
+        tr.sys.baseArray.domain[key1Pos] = filtered1
 
     # Dependent columns: all columns except keyCol0 and keyCol1
     var depCols: seq[int]

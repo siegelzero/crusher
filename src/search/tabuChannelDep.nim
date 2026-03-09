@@ -494,6 +494,8 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             # Static cascade: use precomputed values
             state.computeCascadePenalties(cascadeIdx,
                 state.cdCascadeValues[cascadeIdx], domain, state.channelDepPenalties[pos])
+            when ProfileIteration:
+                state.cdCascadeCalls += 1
         else:
             when ProfileIteration:
                 let tBind0CD = epochTime()

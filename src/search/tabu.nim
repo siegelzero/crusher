@@ -1331,7 +1331,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
             var isOneHot = true
             for bi in bindingIndices:
-                let bindingPtr = addr carray.channelBindings[bi]
+                let bindingPtr = addr carray.channelBindings[bi]  # addr avoids value copy under ARC
                 # Verify this binding uses the same index expression (same lo) as the first
                 let bNode = bindingPtr.indexExpression.node
                 var bLo = -1  # sentinel: doesn't match
