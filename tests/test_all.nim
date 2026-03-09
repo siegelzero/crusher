@@ -14,6 +14,7 @@ import test_cumulative
 import test_debruijn
 import test_deepcopy
 import test_diffn
+import test_diffn_k
 import test_element_constraint
 import test_element_expr
 import test_employee_scheduling

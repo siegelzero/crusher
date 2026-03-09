@@ -74,6 +74,8 @@ type
         inverseChannelsAtPosition*: Table[int, seq[int]]  # forward_pos → [group indices]
         fixedPositions*: PackedSet[int]  # Singleton-domain positions after reduction (excluded from search)
         elementInverseDetected*: bool  # guard: detectElementInverseChannels already ran
+        dormancyBindings*: seq[tuple[dormantPos: int, selectorPos: int, activeValue: T]]
+        dormancyAtSelector*: Table[int, seq[int]]  # selector_pos → [binding indices]
 
 ################################################################################
 # Value Extraction
@@ -984,7 +986,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType:
                     # Skip these constraint types for domain reduction
                     continue
 
@@ -3286,4 +3288,8 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     result.inverseChannelsAtPosition = arr.inverseChannelsAtPosition
     result.fixedPositions = arr.fixedPositions
     result.elementInverseDetected = arr.elementInverseDetected
+
+    # Dormancy bindings are all value types — shallow copy is fine
+    result.dormancyBindings = arr.dormancyBindings
+    result.dormancyAtSelector = arr.dormancyAtSelector
 

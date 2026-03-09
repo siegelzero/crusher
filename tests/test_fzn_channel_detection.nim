@@ -385,3 +385,97 @@ solve minimize obj;
     # Each row should have one of each color for optimal balance
     check p1 != p2  # row 1 balanced
     check p3 != p4  # row 2 balanced
+
+suite "FlatZinc Case-Analysis 1-Pos-1-Neg Channel Detection":
+
+  test "conditional size channel via bool_clause([A],[B])":
+    ## Encodes: size = if selector==1 then 5 else 0
+    ## Uses the 1-positive-1-negative bool_clause pattern:
+    ##   int_eq_reif(selector, 1, B) :: defines_var(B)
+    ##   int_eq_reif(size, 5, A) :: defines_var(A)
+    ##   bool_clause([A], [B])  — selector==1 → size==5
+    ## With domain 0..7 (non-binary), default should be 0.
+    let src = """
+var 1..3: selector :: output_var;
+var 0..7: size :: output_var;
+var bool: b_eq_sel :: var_is_introduced :: is_defined_var;
+var bool: b_eq_size :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(selector, 1, b_eq_sel) :: defines_var(b_eq_sel);
+constraint int_eq_reif(size, 5, b_eq_size) :: defines_var(b_eq_size);
+constraint bool_clause([b_eq_size], [b_eq_sel]);
+constraint int_eq(selector, 1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let sel = tr.sys.assignment[tr.varPositions["selector"]]
+    let sz = tr.sys.assignment[tr.varPositions["size"]]
+
+    check sel == 1
+    check sz == 5  # selector==1 → size==5
+
+  test "conditional size defaults to 0 for non-matching selector":
+    ## Same pattern but selector is forced to 2 (not 1).
+    ## size should default to 0 since the case doesn't match.
+    let src = """
+var 1..3: selector :: output_var;
+var 0..7: size :: output_var;
+var bool: b_eq_sel :: var_is_introduced :: is_defined_var;
+var bool: b_eq_size :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(selector, 1, b_eq_sel) :: defines_var(b_eq_sel);
+constraint int_eq_reif(size, 5, b_eq_size) :: defines_var(b_eq_size);
+constraint bool_clause([b_eq_size], [b_eq_sel]);
+constraint int_eq(selector, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let sel = tr.sys.assignment[tr.varPositions["selector"]]
+    let sz = tr.sys.assignment[tr.varPositions["size"]]
+
+    check sel == 2
+    check sz == 0  # selector!=1 → size defaults to 0
+
+  test "multiple conditional sizes with same condition variable":
+    ## 3 size variables, each activated by a different selector value.
+    ## size1 = if sel==1 then 4 else 0
+    ## size2 = if sel==2 then 3 else 0
+    ## size3 = if sel==1 then 6 else 0
+    let src = """
+var 1..3: sel :: output_var;
+var 0..7: size1 :: output_var;
+var 0..7: size2 :: output_var;
+var 0..7: size3 :: output_var;
+var bool: b_sel1 :: var_is_introduced :: is_defined_var;
+var bool: b_sel2 :: var_is_introduced :: is_defined_var;
+var bool: b_sz1 :: var_is_introduced :: is_defined_var;
+var bool: b_sz2 :: var_is_introduced :: is_defined_var;
+var bool: b_sz3 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(sel, 1, b_sel1) :: defines_var(b_sel1);
+constraint int_eq_reif(sel, 2, b_sel2) :: defines_var(b_sel2);
+constraint int_eq_reif(size1, 4, b_sz1) :: defines_var(b_sz1);
+constraint int_eq_reif(size2, 3, b_sz2) :: defines_var(b_sz2);
+constraint int_eq_reif(size3, 6, b_sz3) :: defines_var(b_sz3);
+constraint bool_clause([b_sz1], [b_sel1]);
+constraint bool_clause([b_sz2], [b_sel2]);
+constraint bool_clause([b_sz3], [b_sel1]);
+constraint int_eq(sel, 1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let sel = tr.sys.assignment[tr.varPositions["sel"]]
+    let s1 = tr.sys.assignment[tr.varPositions["size1"]]
+    let s2 = tr.sys.assignment[tr.varPositions["size2"]]
+    let s3 = tr.sys.assignment[tr.varPositions["size3"]]
+
+    check sel == 1
+    check s1 == 4  # sel==1 → size1==4
+    check s2 == 0  # sel!=2 → size2==0
+    check s3 == 6  # sel==1 → size3==6

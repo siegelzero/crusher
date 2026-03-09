@@ -205,6 +205,8 @@ type
     skipSetVarNames*: HashSet[string]
     # Reusable position for a variable fixed to 1 (for set_in channel bindings), -1 if not yet created
     fixedOnePos*: int
+    # Index from variable name -> declaration index for O(1) lookupVarDomain
+    varDomainIndex*: Table[string, int]
     # Synthetic element channels: precomputed lookup tables for conditional gain variables
     syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
     # Detected weighted same-value pattern for objective
@@ -1512,6 +1514,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     let dxExprs = tr.resolveExprArray(con.args[2])
     let dyExprs = tr.resolveExprArray(con.args[3])
     tr.sys.addConstraint(diffn[int](xExprs, yExprs, dxExprs, dyExprs))
+
+  of "fzn_crusher_diffn_k":
+    let n = tr.resolveIntArg(con.args[0])
+    let k = tr.resolveIntArg(con.args[1])
+    let flatPosn = tr.resolveExprArray(con.args[2])
+    let flatSize = tr.resolveExprArray(con.args[3])
+    var posExprs = newSeq[seq[AlgebraicExpression[int]]](n)
+    var sizeExprs = newSeq[seq[AlgebraicExpression[int]]](n)
+    for i in 0..<n:
+        posExprs[i] = flatPosn[i*k ..< (i+1)*k]
+        sizeExprs[i] = flatSize[i*k ..< (i+1)*k]
+    tr.sys.addConstraint(diffnK[int](n, k, posExprs, sizeExprs))
 
   of "fzn_circuit":
     let exprs = tr.resolveExprArray(con.args[0])
@@ -3712,23 +3726,31 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
   stderr.writeLine(&"[FZN] Detected {candidates.len} equality copy variables")
 
 
-proc lookupVarDomain(tr: FznTranslator, varName: string): seq[int] =
-  ## Look up a variable's domain from the FznModel declarations.
-  for decl in tr.model.variables:
+proc buildVarDomainIndex(tr: var FznTranslator) =
+  ## Build a hash table index from variable name to declaration index
+  ## for O(1) domain lookups instead of O(n) linear scans.
+  if tr.varDomainIndex.len > 0: return  # already built
+  for i, decl in tr.model.variables:
     if decl.isArray: continue
-    if decl.name == varName:
-      case decl.varType.kind
-      of FznIntRange:
-        return toSeq(decl.varType.lo..decl.varType.hi)
-      of FznIntSet:
-        return decl.varType.values
-      of FznBool:
-        return @[0, 1]
-      else:
-        return @[]
+    tr.varDomainIndex[decl.name] = i
+
+proc lookupVarDomain(tr: var FznTranslator, varName: string): seq[int] =
+  ## Look up a variable's domain from the FznModel declarations.
+  tr.buildVarDomainIndex()
+  if varName in tr.varDomainIndex:
+    let decl = tr.model.variables[tr.varDomainIndex[varName]]
+    case decl.varType.kind
+    of FznIntRange:
+      return toSeq(decl.varType.lo..decl.varType.hi)
+    of FznIntSet:
+      return decl.varType.values
+    of FznBool:
+      return @[0, 1]
+    else:
+      return @[]
   return @[]
 
-proc resolveActualDomain(tr: FznTranslator, expr: AlgebraicExpression[int],
+proc resolveActualDomain(tr: var FznTranslator, expr: AlgebraicExpression[int],
                          identName: string): seq[int] =
   ## Resolve the actual domain for an expression. If it maps to a single position,
   ## use the base array's domain (which reflects aliasing). Otherwise fall back to
@@ -4660,7 +4682,6 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     leReifMap[resultVar] = LeReifEntry(condVar: condVar, threshold: threshold)
 
   if eqReifMap.len == 0 and linEqReifMap.len == 0: return
-  if neReifMap.len == 0 and leReifMap.len == 0: return
 
   # Step 2: Scan non-consumed bool_clause constraints with 2-3 positive literals
   type CaseEntryKind = enum cekSimple, cekLinear
@@ -4687,8 +4708,40 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     let posArg = con.args[0]
     let negArg = con.args[1]
     if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
-    if negArg.elems.len != 0: continue
+    if negArg.elems.len > 1: continue
     let nLits = posArg.elems.len
+
+    # Handle 1-positive-1-negative case: bool_clause([A], [B]) = A ∨ ¬B = B → A
+    if nLits == 1 and negArg.elems.len == 1:
+      let posLit = posArg.elems[0]
+      let negLit = negArg.elems[0]
+      if posLit.kind != FznIdent or negLit.kind != FznIdent: continue
+      # negLit (B) is the condition: eq_reif(condVar, condVal, B)
+      # posLit (A) is the consequence: eq_reif(targetVar, val, A)
+      if negLit.ident notin eqReifMap: continue
+      let condInfo = eqReifMap[negLit.ident]
+      let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError: continue
+      if posLit.ident in eqReifMap:
+        let eqInfo = eqReifMap[posLit.ident]
+        casesByTarget.mgetOrPut(eqInfo.sourceVar, @[]).add(CaseEntry(
+          kind: cekSimple,
+          condVarVals: @[(condInfo.sourceVar, condVal)],
+          boolClauseIdx: ci,
+          testVal: eqInfo.testVal))
+      elif posLit.ident in linEqReifMap:
+        let linEntry = linEqReifMap[posLit.ident]
+        casesByTarget.mgetOrPut(linEntry.targetVar, @[]).add(CaseEntry(
+          kind: cekLinear,
+          condVarVals: @[(condInfo.sourceVar, condVal)],
+          boolClauseIdx: ci,
+          linOtherVars: linEntry.otherVars,
+          linOtherCoeffs: linEntry.otherCoeffs,
+          linRhs: linEntry.rhs,
+          linTargetCoeff: linEntry.targetCoeff,
+          linReifIdx: linEntry.constraintIdx))
+      continue
+
+    if negArg.elems.len != 0: continue
     if nLits < 2 or nLits > 3: continue
 
     # Classify literals: exactly 1 eq_reif (or lin_eq_reif) + rest ne_reif (or le_reif)
@@ -4831,7 +4884,21 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     for dom in condDomains:
       expectedCases *= dom.len
     let isComplete = entries.len == expectedCases
-    if not isComplete: continue  # Only allow complete case analyses
+    if not isComplete:
+      # All explicit cases must be simple with the same integer literal value
+      let allSameSimple = entries.allIt(it.kind == cekSimple and
+          it.testVal.kind == FznIntLit)
+      if not allSameSimple: continue
+      let mappedVal = entries[0].testVal.intVal
+      if not entries.allIt(it.testVal.intVal == mappedVal): continue
+      let tdom = tr.lookupVarDomain(targetVar).sorted()
+      if tdom.len < 2: continue
+      if tdom.len == 2:
+        discard  # binary domain: default is the other value (handled below)
+      else:
+        # Non-binary domain: default to 0 if it's in the domain and
+        # the mapped value is non-zero (conditional assignment pattern)
+        if mappedVal == 0 or 0 notin tdom: continue
 
     # Build case map (condValues → CaseEntry)
     var caseMap: Table[seq[int], CaseEntry]
@@ -4984,6 +5051,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                   break
               if not isCaseAnalysis:
                 channelVarsNeeded.incl(ov)
+      if channelVarsNeeded.len == 0:
+        break precompute
       # Compute base mapping once for all channel vars (all sources at domain minimum)
       var baseValues = initTable[string, int]()
       for i, sv in sourceVarNames:
@@ -5045,15 +5114,17 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
           srcOffsets: miniOffsets, srcSizes: miniSizes)
     if not valid: continue
 
-    # For incomplete cases (exactly 1 missing), use domain minimum as default.
-    # This is safe because incomplete cases arise from conditional assignments where
-    # the missing case represents the "inactive" state (e.g., task not assigned to a
-    # machine), and the domain minimum is the natural sentinel for that state.
+    # For incomplete cases, compute the default value for uncovered cases.
     var defaultVal = 0
     if not isComplete:
-      let tdom = tr.lookupVarDomain(targetVar)
-      if tdom.len > 0:
-        defaultVal = tdom[0]
+      let tdom = tr.lookupVarDomain(targetVar).sorted()
+      let mappedVal = entries[0].testVal.intVal
+      if tdom.len == 2:
+        # Binary domain: default is the other value
+        defaultVal = if tdom[0] == mappedVal: tdom[1] else: tdom[0]
+      else:
+        # Non-binary domain: default to 0 (conditional assignment pattern)
+        defaultVal = 0
 
     var lookupTable = newSeq[int](tableSize)
     var allResolved = true
@@ -9183,6 +9254,99 @@ proc pruneZeroCapacityDays(tr: var FznTranslator) =
   stderr.writeLine(&"[FZN] Zero-capacity day pruning: removed {totalPruned} values from {admPositions.len} admission vars (zero days: {dayList})")
 
 
+proc detectDormantPositions(tr: var FznTranslator) =
+  ## Detects don't-care (dormant) positions in diffnK constraints.
+  ## When a box's sizes are all case-analysis channels that equal zero for most
+  ## selector values, the corresponding position variables are irrelevant
+  ## (dormant) whenever the selector doesn't match. This dramatically reduces
+  ## the effective search space for problems like products-and-shelves.
+
+  # Build reverse map: channel position → (selectorPos, activeValue)
+  # Only for single-source case-analysis channels where exactly one selector value
+  # produces a non-zero result.
+  var channelToSelector: Table[int, tuple[selectorPos: int, activeValue: int]]
+
+  for def in tr.caseAnalysisDefs:
+    if def.sourceVarNames.len != 1: continue
+    if def.targetVarName notin tr.varPositions: continue
+    let channelPos = tr.varPositions[def.targetVarName]
+    let srcName = def.sourceVarNames[0]
+    if srcName notin tr.varPositions: continue
+    let selectorPos = tr.varPositions[srcName]
+
+    # Find which selector values produce non-zero outputs
+    var nonZeroIndices: seq[int]
+    for i, v in def.lookupTable:
+      if v != 0:
+        nonZeroIndices.add(i)
+    # Dormancy only works if exactly one selector value produces non-zero
+    if nonZeroIndices.len != 1: continue
+    let activeValue = nonZeroIndices[0] + def.domainOffsets[0]
+    channelToSelector[channelPos] = (selectorPos: selectorPos, activeValue: activeValue)
+
+  if channelToSelector.len == 0: return
+
+  # Scan diffnK constraints for boxes where all size dimensions are controlled channels
+  var nDormant = 0
+  var dormantPositions: PackedSet[int]  # avoid duplicates
+  for cons in tr.sys.baseArray.constraints:
+    if cons.stateType != DiffnKType: continue
+    let dk = cons.diffnKState
+    for boxI in 0..<dk.n:
+      var allSizeChannel = true
+      var selectorPos = -1
+      var activeValue = -1
+      var consistent = true
+
+      for d in 0..<dk.k:
+        let sizeExpr = dk.sizeExprs[boxI][d]
+        # Size expression must reference exactly one position
+        if sizeExpr.positions.len != 1:
+          allSizeChannel = false
+          break
+        var sizePos = -1
+        for p in sizeExpr.positions.items:
+          sizePos = p
+          break
+        # That position must be a known channel with selector info
+        if sizePos notin channelToSelector:
+          allSizeChannel = false
+          break
+        let info = channelToSelector[sizePos]
+        if d == 0:
+          selectorPos = info.selectorPos
+          activeValue = info.activeValue
+        elif info.selectorPos != selectorPos or info.activeValue != activeValue:
+          consistent = false
+          break
+
+      if not allSizeChannel or not consistent or selectorPos < 0:
+        continue
+
+      # All k size dimensions are channels controlled by the same selector.
+      # Mark the k position expressions as dormant.
+      for d in 0..<dk.k:
+        let posExpr = dk.posExprs[boxI][d]
+        if posExpr.positions.len != 1: continue
+        var posPos = -1
+        for p in posExpr.positions.items:
+          posPos = p
+          break
+        # Only mark non-channel, non-fixed search positions
+        if posPos in tr.sys.baseArray.channelPositions: continue
+        if posPos in tr.sys.baseArray.fixedPositions: continue
+        if posPos in dormantPositions: continue
+        dormantPositions.incl(posPos)
+        let bi = tr.sys.baseArray.dormancyBindings.len
+        tr.sys.baseArray.dormancyBindings.add(
+          (dormantPos: posPos, selectorPos: selectorPos, activeValue: activeValue))
+        tr.sys.baseArray.dormancyAtSelector.mgetOrPut(selectorPos, @[]).add(bi)
+        nDormant += 1
+
+  if nDormant > 0:
+    stderr.writeLine(&"[FZN] Detected {nDormant} dormant positions (diffnK don't-care placements)")
+
+
 proc translate*(model: FznModel): FznTranslator =
   ## Translates a complete FznModel to a ConstraintSystem.
   result.sys = initConstraintSystem[int]()
@@ -9900,6 +10064,8 @@ proc translate*(model: FznModel): FznTranslator =
   result.buildCaseAnalysisChannelBindings()
   # Build inverse channel groups (inverse relationship: seat[person[p]] = p)
   result.buildInverseChannelBindings()
+  # Detect dormant positions in diffnK constraints (don't-care placements)
+  result.detectDormantPositions()
 
   result.translateSolve()
 

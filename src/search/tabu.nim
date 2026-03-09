@@ -174,6 +174,12 @@ type
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
 
+        # Dormancy support: positions that are don't-care based on a selector variable's value
+        hasDormancy*: bool
+        isDormant*: seq[bool]  # [position] -> currently dormant (don't-care)
+        dormancyBindings*: seq[tuple[dormantPos: int, selectorPos: int, activeValue: int]]
+        dormancyAtSelector*: Table[int, seq[int]]  # selector_pos -> [binding indices]
+
         # Profiling per constraint type
         profileByType*: array[StatefulConstraintType, ConstraintProfile]
         lastProfileLogTime*: float
@@ -274,6 +280,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.countEqState.moveDelta(position, oldValue, newValue)
         of DiffnType:
             result = constraint.diffnState.moveDelta(position, oldValue, newValue)
+        of DiffnKType:
+            result = constraint.diffnKState.moveDelta(position, oldValue, newValue)
         of MatrixElementType:
             result = constraint.matrixElementState.moveDelta(position, oldValue, newValue)
         of NoOverlapFixedBoxType:
@@ -346,6 +354,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == DiffnType:
             let p = constraint.diffnState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == DiffnKType:
+            let p = constraint.diffnKState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ConditionalDayCapacityType:
@@ -448,6 +460,7 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
     ## Full rebuild of penalty map at position, including per-constraint cache.
     ## Uses batch computation for cumulative constraints (prefix-sum approach).
     if state.isLazy[position]: return
+    if state.hasDormancy and state.isDormant[position]: return
     let domain = state.sharedDomain[][position]
     let dLen = domain.len
     if dLen == 0: return
@@ -491,6 +504,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
         elif constraint.stateType == DiffnType:
             # Batch computation for diffn — pre-caches fixed rect coords
             let penalties = constraint.diffnState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == DiffnKType:
+            let penalties = constraint.diffnKState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -573,6 +592,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     elif constraint.stateType == DiffnType:
         # Batch computation for diffn — pre-caches fixed rect coords
         let penalties = constraint.diffnState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == DiffnKType:
+        let penalties = constraint.diffnKState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
@@ -715,6 +742,8 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
             if pos == position:
                 continue
             if state.isLazy[pos]:
+                continue
+            if state.hasDormancy and state.isDormant[pos]:
                 continue
             if pos notin affectedPositions:
                 continue
@@ -1830,6 +1859,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.isLazy[pos] = true
         else:
             state.totalDomainSize += dsize
+
+    # Initialize dormancy support
+    state.isDormant = newSeq[bool](carray.len)
+    state.hasDormancy = carray.dormancyBindings.len > 0
+    if state.hasDormancy:
+        for bi, binding in carray.dormancyBindings:
+            state.dormancyBindings.add((dormantPos: binding.dormantPos,
+                                        selectorPos: binding.selectorPos,
+                                        activeValue: binding.activeValue))
+        state.dormancyAtSelector = carray.dormancyAtSelector
+        # Set initial dormancy based on current assignment
+        var dormantCount = 0
+        for bi, binding in state.dormancyBindings:
+            if state.assignment[binding.selectorPos] != binding.activeValue:
+                state.isDormant[binding.dormantPos] = true
+                dormantCount += 1
+        if verbose and id == 0:
+            echo "[Init] Dormant positions: " & $dormantCount & "/" &
+                 $(dormantCount + state.searchPositions.len) & " search positions dormant"
 
     # Precompute search-only positions per constraint (excluding channels)
     state.constraintSearchPos = initTable[pointer, PackedSet[int]]()
@@ -3418,7 +3466,29 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     if state.elementImpliedEnabled and position in state.elementImpliedMoves:
         state.recomputeElementImpliedDiscounts()
 
+    # Update dormancy state when a selector position changes
+    if state.hasDormancy and position in state.dormancyAtSelector:
+        for bi in state.dormancyAtSelector[position]:
+            let binding = state.dormancyBindings[bi]
+            let wasActive = (oldValueAssign == binding.activeValue)
+            let nowActive = (value == binding.activeValue)
+            if wasActive and not nowActive:
+                # Position becomes dormant (don't-care)
+                state.isDormant[binding.dormantPos] = true
+            elif nowActive and not wasActive:
+                # Position wakes up — penalty map will be rebuilt below
+                state.isDormant[binding.dormantPos] = false
+
     state.updatePenaltiesForPosition(position)
+
+    # Rebuild penalty maps for positions that just woke up
+    if state.hasDormancy and position in state.dormancyAtSelector:
+        for bi in state.dormancyAtSelector[position]:
+            let binding = state.dormancyBindings[bi]
+            let nowActive = (value == binding.activeValue)
+            let wasActive = (oldValueAssign == binding.activeValue)
+            if nowActive and not wasActive:
+                state.updatePenaltiesForPosition(binding.dormantPos)
 
     # Also rebuild penalty maps for forced positions
     if hasInverseMove:
@@ -3483,6 +3553,9 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                state.channelDepPenalties[position].len == 0:
                 continue
 
+            if state.hasDormancy and state.isDormant[position]:
+                continue
+
             inc positionsChecked
 
             let domain = state.sharedDomain[][position]
@@ -3541,6 +3614,9 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             if state.violationCount[position] == 0 and
                state.channelDepPenalties[position].len == 0:
+                continue
+
+            if state.hasDormancy and state.isDormant[position]:
                 continue
 
             let domain = state.sharedDomain[][position]
