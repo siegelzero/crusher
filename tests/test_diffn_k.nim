@@ -65,14 +65,15 @@ suite "DiffnK Constraint Tests":
         check validateDiffnKSolution(positions, sizes)
 
     test "3D with zero-size boxes (nonstrict)":
-        # 4 boxes in 3D, 2 have zero size in one dimension — should be trivially satisfiable
+        # 4 boxes in 3D: first 2 have zero size in z (can overlap freely),
+        # last 2 have nonzero size in all dims and must be placed without overlap
         var sys = initConstraintSystem[int]()
         var xs = sys.newConstrainedSequence(4)
         var ys = sys.newConstrainedSequence(4)
         var zs = sys.newConstrainedSequence(4)
-        xs.setDomain(toSeq(0..0))  # all at position 0
-        ys.setDomain(toSeq(0..0))
-        zs.setDomain(toSeq(0..0))
+        xs.setDomain(toSeq(0..1))
+        ys.setDomain(toSeq(0..1))
+        zs.setDomain(toSeq(0..1))
 
         let n = 4
         let k = 3
@@ -88,15 +89,26 @@ suite "DiffnK Constraint Tests":
 
         for i in 0 ..< n:
             posExprs[i] = @[sys.baseArray[i], sys.baseArray[i + n], sys.baseArray[i + 2*n]]
-            # First 2 boxes have size 0 in z-dimension
             if i < 2:
+                # Zero size in z-dimension — these boxes cannot overlap with anything
                 sizeExprs[i] = @[litExpr(1), litExpr(1), litExpr(0)]
             else:
-                sizeExprs[i] = @[litExpr(1), litExpr(1), litExpr(0)]
+                # Nonzero size in all dimensions — must be placed without overlap
+                sizeExprs[i] = @[litExpr(1), litExpr(1), litExpr(1)]
 
         sys.addConstraint(diffnK[int](n, k, posExprs, sizeExprs))
         sys.resolve(parallel = true)
-        # All sizes are 0, so no overlaps possible — trivially solved
+
+        # Validate: zero-size boxes are ignored, non-zero boxes must not overlap
+        var positions = newSeq[seq[int]](n)
+        var sizes = newSeq[seq[int]](n)
+        for i in 0 ..< n:
+            positions[i] = @[xs.assignment[i], ys.assignment[i], zs.assignment[i]]
+            if i < 2:
+                sizes[i] = @[1, 1, 0]
+            else:
+                sizes[i] = @[1, 1, 1]
+        check validateDiffnKSolution(positions, sizes)
 
     test "Incremental update correctness":
         # Verify moveDelta matches full recompute

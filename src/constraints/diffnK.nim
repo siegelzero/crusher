@@ -168,8 +168,10 @@ proc moveDelta*[T](constraint: DiffnKConstraint[T], position: int, oldValue, new
     let k = constraint.k
 
     var affectedSet: PackedSet[int]
-    for r in affectedBoxes:
+    var affectedIdx: Table[int, int]  # box index → position in affectedBoxes
+    for idx, r in affectedBoxes:
         affectedSet.incl(r)
+        affectedIdx[r] = idx
 
     # Count overlaps with old value
     var oldOverlaps = 0
@@ -197,12 +199,7 @@ proc moveDelta*[T](constraint: DiffnKConstraint[T], position: int, oldValue, new
             if j in affectedSet and j < i: continue
             let bi = newBoxes[idx]
             let bj = if j in affectedSet:
-                var jBox: BoxCoords[T]
-                for idx2, r2 in affectedBoxes:
-                    if r2 == j:
-                        jBox = newBoxes[idx2]
-                        break
-                jBox
+                newBoxes[affectedIdx[j]]
             else:
                 constraint.cachedBoxes[j]
             if boxesOverlap(bi, bj, k):
@@ -258,8 +255,10 @@ proc batchMovePenalty*[T](constraint: DiffnKConstraint[T], position: int,
     # General fallback: per-value evaluation
     let affectedBoxes = constraint.posToBoxes[position]
     var affectedSet: PackedSet[int]
-    for r in affectedBoxes:
+    var affectedIdx: Table[int, int]  # box index → position in affectedBoxes
+    for idx, r in affectedBoxes:
         affectedSet.incl(r)
+        affectedIdx[r] = idx
 
     var oldOverlaps = 0
     for i in affectedBoxes:
@@ -288,12 +287,7 @@ proc batchMovePenalty*[T](constraint: DiffnKConstraint[T], position: int,
                 if j in affectedSet and j < i: continue
                 let bi = tempBoxes[idx]
                 let bj = if j in affectedSet:
-                    var jBox: BoxCoords[T]
-                    for idx2, r2 in affectedBoxes:
-                        if r2 == j:
-                            jBox = tempBoxes[idx2]
-                            break
-                    jBox
+                    tempBoxes[affectedIdx[j]]
                 else:
                     constraint.cachedBoxes[j]
                 if boxesOverlap(bi, bj, k):
@@ -324,6 +318,13 @@ proc deepCopy*[T](constraint: DiffnKConstraint[T]): DiffnKConstraint[T] =
     for i in 0 ..< constraint.n:
         copiedOverlaps[i] = constraint.overlaps[i]
 
+    # Deep copy mutable seqs to avoid shared state between parallel workers
+    var copiedCachedBoxes = newSeq[BoxCoords[T]](constraint.n)
+    for i in 0 ..< constraint.n:
+        copiedCachedBoxes[i] = BoxCoords[T](
+            pos: @(constraint.cachedBoxes[i].pos),
+            size: @(constraint.cachedBoxes[i].size))
+
     result = DiffnKConstraint[T](
         n: constraint.n,
         k: constraint.k,
@@ -331,10 +332,10 @@ proc deepCopy*[T](constraint: DiffnKConstraint[T]): DiffnKConstraint[T] =
         sizeExprs: copiedSize,
         positions: constraint.positions,
         posToBoxes: constraint.posToBoxes,
-        currentAssignment: constraint.currentAssignment,
+        currentAssignment: @(constraint.currentAssignment),
         cost: constraint.cost,
         lastAffectedPositions: constraint.lastAffectedPositions,
-        cachedBoxes: constraint.cachedBoxes,
+        cachedBoxes: copiedCachedBoxes,
         overlaps: copiedOverlaps,
         posIsPosDim: constraint.posIsPosDim,
         posIsSizeDim: constraint.posIsSizeDim,

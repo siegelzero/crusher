@@ -4885,7 +4885,11 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
       expectedCases *= dom.len
     let isComplete = entries.len == expectedCases
     if not isComplete:
-      # All explicit cases must be simple with the same integer literal value
+      # Incomplete case analysis: all explicit cases must map to the same non-zero
+      # literal value, and 0 must be in the domain. This pattern arises from
+      # conditional activation (e.g., "size = if selector==k then S else 0").
+      # The channel binding replaces the variable entirely, so the default value
+      # only needs to be consistent with the domain, not with external constraints.
       let allSameSimple = entries.allIt(it.kind == cekSimple and
           it.testVal.kind == FznIntLit)
       if not allSameSimple: continue
@@ -4897,7 +4901,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         discard  # binary domain: default is the other value (handled below)
       else:
         # Non-binary domain: default to 0 if it's in the domain and
-        # the mapped value is non-zero (conditional assignment pattern)
+        # the mapped value is non-zero (conditional activation pattern)
         if mappedVal == 0 or 0 notin tdom: continue
 
     # Build case map (condValues → CaseEntry)

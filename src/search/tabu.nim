@@ -3467,6 +3467,7 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         state.recomputeElementImpliedDiscounts()
 
     # Update dormancy state when a selector position changes
+    var wokenPositions: seq[int]
     if state.hasDormancy and position in state.dormancyAtSelector:
         for bi in state.dormancyAtSelector[position]:
             let binding = state.dormancyBindings[bi]
@@ -3478,17 +3479,13 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
             elif nowActive and not wasActive:
                 # Position wakes up — penalty map will be rebuilt below
                 state.isDormant[binding.dormantPos] = false
+                wokenPositions.add(binding.dormantPos)
 
     state.updatePenaltiesForPosition(position)
 
     # Rebuild penalty maps for positions that just woke up
-    if state.hasDormancy and position in state.dormancyAtSelector:
-        for bi in state.dormancyAtSelector[position]:
-            let binding = state.dormancyBindings[bi]
-            let nowActive = (value == binding.activeValue)
-            let wasActive = (oldValueAssign == binding.activeValue)
-            if nowActive and not wasActive:
-                state.updatePenaltiesForPosition(binding.dormantPos)
+    for pos in wokenPositions:
+        state.updatePenaltiesForPosition(pos)
 
     # Also rebuild penalty maps for forced positions
     if hasInverseMove:
