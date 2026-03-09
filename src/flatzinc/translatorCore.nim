@@ -277,120 +277,147 @@ proc decomposeWithIndicators(tr: var FznTranslator,
             tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
         tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
-proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
-                                                        tuples: seq[seq[int]]): bool =
-    ## Detects functional keys in table constraints and converts dependent columns
-    ## to channel variables. Checks single-column key (col 0) first, then
-    ## composite 2-column key (cols 0,1). Returns true if the table was consumed.
-    ## Note: only columns 0 and (0,1) are tried as keys. This relies on FlatZinc
-    ## table constraints placing key columns first, which holds for MiniZinc's
-    ## standard table decomposition.
-    if positions.len < 2 or tuples.len == 0:
-        return false
+proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
+                        tuples: seq[seq[int]], keyCol: int): bool =
+    ## Try column keyCol as a unique functional key.
+    ## If successful, all other columns become channel variables.
+    let nCols = positions.len
 
-    # === Try single-column key (column 0) ===
-    block singleKey:
-        var keyValues: PackedSet[int]
-        var keyMin = high(int)
-        var keyMax = low(int)
-        for t in tuples:
-            let k = t[0]
-            if k in keyValues:
-                break singleKey  # duplicate key — not a single-column functional dependency
-            keyValues.incl(k)
-            if k < keyMin: keyMin = k
-            if k > keyMax: keyMax = k
+    var keyValues: PackedSet[int]
+    var keyMin = high(int)
+    var keyMax = low(int)
+    for t in tuples:
+        let k = t[keyCol]
+        if k in keyValues:
+            return false  # duplicate — not a unique key
+        keyValues.incl(k)
+        if k < keyMin: keyMin = k
+        if k > keyMax: keyMax = k
 
-        let keyRange = keyMax - keyMin + 1
-        if keyRange > tuples.len * 2:
-            break singleKey  # too sparse
+    let keyRange = keyMax - keyMin + 1
+    if keyRange > tuples.len * 2:
+        return false  # too sparse
 
-        let keyPos = positions[0]
-        let nCols = positions.len
+    # Dependent columns: all columns except keyCol
+    var depCols: seq[int]
+    for c in 0..<nCols:
+        if c != keyCol:
+            depCols.add(c)
 
-        var lookups = newSeq[seq[int]](nCols - 1)
-        for col in 1..<nCols:
-            lookups[col - 1] = newSeqWith(keyRange, low(int))
-        for t in tuples:
-            let idx = t[0] - keyMin
-            for col in 1..<nCols:
-                lookups[col - 1][idx] = t[col]
+    var lookups = newSeq[seq[int]](depCols.len)
+    for i in 0..<depCols.len:
+        lookups[i] = newSeqWith(keyRange, low(int))
+    for t in tuples:
+        let idx = t[keyCol] - keyMin
+        for i, depCol in depCols:
+            lookups[i][idx] = t[depCol]
 
-        let keyDomain = tr.sys.baseArray.domain[keyPos]
-        var filteredDomain: seq[int]
-        for v in keyDomain:
-            if v in keyValues:
-                filteredDomain.add(v)
-        if filteredDomain.len < keyDomain.len:
-            tr.sys.baseArray.domain[keyPos] = filteredDomain
+    # Filter key position's domain to values present in the table
+    let keyPos = positions[keyCol]
+    let keyDomain = tr.sys.baseArray.domain[keyPos]
+    var filteredDomain: seq[int]
+    for v in keyDomain:
+        if v in keyValues:
+            filteredDomain.add(v)
+    if filteredDomain.len < keyDomain.len:
+        tr.sys.baseArray.domain[keyPos] = filteredDomain
 
-        let keyExpr = tr.getExpr(keyPos) - keyMin
-        for col in 1..<nCols:
-            let depPos = positions[col]
-            var arrayElems = newSeq[ArrayElement[int]](keyRange)
-            for i in 0..<keyRange:
-                arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: lookups[col - 1][i])
-            tr.sys.baseArray.addChannelBinding(depPos, keyExpr, arrayElems)
+    let keyExpr = tr.getExpr(keyPos) - keyMin
+    for i, depCol in depCols:
+        let depPos = positions[depCol]
+        var arrayElems = newSeq[ArrayElement[int]](keyRange)
+        for j in 0..<keyRange:
+            arrayElems[j] = ArrayElement[int](isConstant: true, constantValue: lookups[i][j])
+        tr.sys.baseArray.addChannelBinding(depPos, keyExpr, arrayElems)
 
-        return true
+    return true
 
-    # === Try 2-column composite key (columns 0, 1) ===
-    if positions.len < 3:
-        return false
+proc tryCompositeColumnKey(tr: var FznTranslator, positions: seq[int],
+                           tuples: seq[seq[int]], keyCol0, keyCol1: int): bool =
+    ## Try (keyCol0, keyCol1) as a composite functional key.
+    ## If successful, all other columns become channel variables.
+    let nCols = positions.len
 
-    # Find min/max for both key columns
     var key0Min = high(int)
     var key0Max = low(int)
     var key1Min = high(int)
     var key1Max = low(int)
     for t in tuples:
-        if t[0] < key0Min: key0Min = t[0]
-        if t[0] > key0Max: key0Max = t[0]
-        if t[1] < key1Min: key1Min = t[1]
-        if t[1] > key1Max: key1Max = t[1]
+        if t[keyCol0] < key0Min: key0Min = t[keyCol0]
+        if t[keyCol0] > key0Max: key0Max = t[keyCol0]
+        if t[keyCol1] < key1Min: key1Min = t[keyCol1]
+        if t[keyCol1] > key1Max: key1Max = t[keyCol1]
 
     let range0 = key0Max - key0Min + 1
     let range1 = key1Max - key1Min + 1
     let totalRange = range0 * range1
 
-    # Only convert if linearized array is not too large (max ~500K entries)
     if totalRange > 500_000 or totalRange > tuples.len * 5:
         return false
 
-    # Verify all (col0, col1) pairs are unique
+    # Verify all (keyCol0, keyCol1) pairs are unique
     var compositeKeys: PackedSet[int]
     for t in tuples:
-        let linearKey = (t[0] - key0Min) * range1 + (t[1] - key1Min)
+        let linearKey = (t[keyCol0] - key0Min) * range1 + (t[keyCol1] - key1Min)
         if linearKey in compositeKeys:
-            return false  # duplicate composite key
+            return false
         compositeKeys.incl(linearKey)
 
-    let nCols = positions.len
-    let nDepCols = nCols - 2  # columns 2..n-1 are dependent
+    # Dependent columns: all columns except keyCol0 and keyCol1
+    var depCols: seq[int]
+    for c in 0..<nCols:
+        if c != keyCol0 and c != keyCol1:
+            depCols.add(c)
 
-    # Build linearized lookup arrays for dependent columns (gaps get sentinel value)
-    var lookups = newSeq[seq[int]](nDepCols)
-    for col in 0..<nDepCols:
-        lookups[col] = newSeqWith(totalRange, low(int))
+    if depCols.len == 0:
+        return false
+
+    # Build linearized lookup arrays (gaps get sentinel value)
+    var lookups = newSeq[seq[int]](depCols.len)
+    for i in 0..<depCols.len:
+        lookups[i] = newSeqWith(totalRange, low(int))
     for t in tuples:
-        let idx = (t[0] - key0Min) * range1 + (t[1] - key1Min)
-        for col in 2..<nCols:
-            lookups[col - 2][idx] = t[col]
+        let idx = (t[keyCol0] - key0Min) * range1 + (t[keyCol1] - key1Min)
+        for i, depCol in depCols:
+            lookups[i][idx] = t[depCol]
 
-    # Build composite index expression: (col0_expr - key0Min) * range1 + (col1_expr - key1Min)
-    let expr0 = tr.getExpr(positions[0])
-    let expr1 = tr.getExpr(positions[1])
+    # Build composite index expression
+    let expr0 = tr.getExpr(positions[keyCol0])
+    let expr1 = tr.getExpr(positions[keyCol1])
     let compositeExpr = (expr0 - key0Min) * range1 + (expr1 - key1Min)
 
-    # Create channel bindings for dependent columns
-    for col in 2..<nCols:
-        let depPos = positions[col]
+    for i, depCol in depCols:
+        let depPos = positions[depCol]
         var arrayElems = newSeq[ArrayElement[int]](totalRange)
-        for i in 0..<totalRange:
-            arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: lookups[col - 2][i])
+        for j in 0..<totalRange:
+            arrayElems[j] = ArrayElement[int](isConstant: true, constantValue: lookups[i][j])
         tr.sys.baseArray.addChannelBinding(depPos, compositeExpr, arrayElems)
 
     return true
+
+proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
+                                                        tuples: seq[seq[int]]): bool =
+    ## Detects functional keys in table constraints and converts dependent columns
+    ## to channel variables. Tries all single columns as keys first, then all
+    ## column pairs as composite keys. Returns true if the table was consumed.
+    if positions.len < 2 or tuples.len == 0:
+        return false
+
+    let nCols = positions.len
+
+    # Try each single column as a unique key
+    for keyCol in 0..<nCols:
+        if tr.trySingleColumnKey(positions, tuples, keyCol):
+            return true
+
+    # Try each column pair as a composite key
+    if nCols >= 3:
+        for keyCol0 in 0..<nCols:
+            for keyCol1 in (keyCol0 + 1)..<nCols:
+                if tr.tryCompositeColumnKey(positions, tuples, keyCol0, keyCol1):
+                    return true
+
+    return false
 
 proc resolveSetArg(tr: FznTranslator, arg: FznExpr): tuple[isConst: bool, constVals: HashSet[int], varInfo: SetVarInfo] =
     ## Resolves a FznExpr that refers to a set (variable or constant).

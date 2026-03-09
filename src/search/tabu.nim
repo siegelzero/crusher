@@ -211,6 +211,10 @@ type
             propagateNeighborCalls*: int64
             cdDomainEvals*: int64
             cdWorklistEntryCalls*: int64
+            cdCascadeBindingTime*: float
+            cdCascadePenaltyTime*: float
+            cdCascadeFallbackTime*: float
+            cdCascadeCalls*: int64
 
 
 # Forward declarations
@@ -1230,8 +1234,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Element channel bindings
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
-                        let binding = carray.channelBindings[bi]
-                        let chanPos = binding.channelPosition
+                        let chanPos = carray.channelBindings[bi].channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
                             visited.incl(chanPos)
@@ -1328,9 +1331,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
             var isOneHot = true
             for bi in bindingIndices:
-                let binding = carray.channelBindings[bi]
+                let bindingPtr = addr carray.channelBindings[bi]
                 # Verify this binding uses the same index expression (same lo) as the first
-                let bNode = binding.indexExpression.node
+                let bNode = bindingPtr.indexExpression.node
                 var bLo = -1  # sentinel: doesn't match
                 if bNode.kind == RefNode and bNode.position == pos:
                     bLo = 0
@@ -1341,7 +1344,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if bLo != lo:
                     isOneHot = false
                     break
-                if binding.arrayElements.len != arrayLen:
+                if bindingPtr.arrayElements.len != arrayLen:
                     isOneHot = false
                     break
                 var oneCount = 0
@@ -1349,7 +1352,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 var firstOneIdx = -1
                 var firstZeroIdx = -1
                 var valid = true
-                for j, elem in binding.arrayElements:
+                for j, elem in bindingPtr.arrayElements:
                     if not elem.isConstant:
                         valid = false
                         break
@@ -1367,10 +1370,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     break
                 if oneCount == 1 and zeroCount == arrayLen - 1:
                     # Normal one-hot: when source == (key+lo), channel = 1
-                    changesByIdx[firstOneIdx].add((binding.channelPosition, 1))
+                    changesByIdx[firstOneIdx].add((bindingPtr.channelPosition, 1))
                 elif zeroCount == 1 and oneCount == arrayLen - 1:
                     # Inverted one-hot: when source == (key+lo), channel = 0
-                    changesByIdx[firstZeroIdx].add((binding.channelPosition, 0))
+                    changesByIdx[firstZeroIdx].add((bindingPtr.channelPosition, 0))
                 else:
                     isOneHot = false
                     break
@@ -1551,19 +1554,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 let p = worklist.pop()
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
-                        let binding = carray.channelBindings[bi]
-                        let chanPos = binding.channelPosition
+                        let bindingPtr = addr carray.channelBindings[bi]
+                        let chanPos = bindingPtr.channelPosition
                         if chanPos in topoSet:
                             # Duplicate channel — reject entirely
                             canBuild = false
                             break
                         # Check static eligibility
                         if canStatic:
-                            for ipos in binding.indexExpression.positions.items:
+                            for ipos in bindingPtr.indexExpression.positions.items:
                                 if ipos != pos and ipos notin topoSet:
                                     canStatic = false
                                     break
-                            for elem in binding.arrayElements:
+                            for elem in bindingPtr.arrayElements:
                                 if not elem.isConstant:
                                     canStatic = false
                                     break
@@ -1605,10 +1608,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 for di in 0..<nDom:
                     state.assignment[pos] = domain[di]
                     for ci in 0..<nChans:
-                        let binding = carray.channelBindings[topoBindingIdx[ci]]
-                        let idxVal = binding.indexExpression.evaluate(state.assignment)
-                        if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                            chanValues[ci][di] = binding.arrayElements[idxVal].constantValue
+                        let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
+                        let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                        if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                            chanValues[ci][di] = bindingPtr.arrayElements[idxVal].constantValue
                         else:
                             chanValues[ci][di] = savedChans[ci]
                         state.assignment[topoOrder[ci]] = chanValues[ci][di]
@@ -1848,23 +1851,23 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
-                let binding = state.carray.channelBindings[bi]
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let bindingPtr = addr state.carray.channelBindings[bi]
+                let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
                 var newVal: T
-                if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                    let elem = binding.arrayElements[idxVal]
+                if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                    let elem = bindingPtr.arrayElements[idxVal]
                     newVal = if elem.isConstant: elem.constantValue
                              else: state.assignment[elem.variablePosition]
                 else:
                     continue  # out of bounds, leave as-is
 
-                if newVal != state.assignment[binding.channelPosition]:
+                if newVal != state.assignment[bindingPtr.channelPosition]:
                     result = true
-                    changedChannels.add(binding.channelPosition)
-                    state.assignment[binding.channelPosition] = newVal
-                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                    changedChannels.add(bindingPtr.channelPosition)
+                    state.assignment[bindingPtr.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[bindingPtr.channelPosition]:
                         let oldPenalty = c.penalty()
-                        c.updatePosition(binding.channelPosition, newVal)
+                        c.updatePosition(bindingPtr.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
                         if oldPenalty > 0 and newPenalty == 0:
@@ -1875,10 +1878,10 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    state.updateNeighborPenalties(binding.channelPosition)
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
-                        worklist.add(binding.channelPosition)
+                    state.updateNeighborPenalties(bindingPtr.channelPosition)
+                    if bindingPtr.channelPosition notin visited:
+                        visited.incl(bindingPtr.channelPosition)
+                        worklist.add(bindingPtr.channelPosition)
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
             for bi in state.carray.minMaxChannelsAtPosition[pos]:
@@ -1971,25 +1974,25 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
-                let binding = state.carray.channelBindings[bi]
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let bindingPtr = addr state.carray.channelBindings[bi]
+                let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
                 var newVal: T
-                if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                    let elem = binding.arrayElements[idxVal]
+                if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                    let elem = bindingPtr.arrayElements[idxVal]
                     newVal = if elem.isConstant: elem.constantValue
                              else: state.assignment[elem.variablePosition]
                 else:
                     continue
-                if newVal != state.assignment[binding.channelPosition]:
-                    state.assignment[binding.channelPosition] = newVal
-                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                if newVal != state.assignment[bindingPtr.channelPosition]:
+                    state.assignment[bindingPtr.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[bindingPtr.channelPosition]:
                         let oldPenalty = c.penalty()
-                        c.updatePosition(binding.channelPosition, newVal)
+                        c.updatePosition(bindingPtr.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
-                        worklist.add(binding.channelPosition)
+                    if bindingPtr.channelPosition notin visited:
+                        visited.incl(bindingPtr.channelPosition)
+                        worklist.add(bindingPtr.channelPosition)
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
             for bi in state.carray.minMaxChannelsAtPosition[pos]:
@@ -2476,6 +2479,7 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         let cdEvalPerCall = if state.cdMovedCalls > 0: state.cdDomainEvals.float / state.cdMovedCalls.float else: 0.0
         echo &"[Profile S{state.id}] cdDomainEvals={state.cdDomainEvals} cdWorklistEntryCalls={state.cdWorklistEntryCalls} ({cdEvalPerCall:.1f} dirty/domainEval)"
         echo &"[Profile S{state.id}] cdWorklist={state.cdWorklistTime:.3f}s cdPenalty={state.cdPenaltyTime:.3f}s"
+        echo &"[Profile S{state.id}] cdCascade: binding={state.cdCascadeBindingTime:.3f}s penalty={state.cdCascadePenaltyTime:.3f}s fallback={state.cdCascadeFallbackTime:.3f}s calls={state.cdCascadeCalls}"
         echo "[Profile S" & $state.id & "] Neighbor by type:"
         for ct in StatefulConstraintType:
             if state.neighborByType[ct] > 0:

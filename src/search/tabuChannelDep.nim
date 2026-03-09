@@ -240,13 +240,13 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             let p = state.cdWorklist.pop()
             if p in state.carray.channelsAtPosition:
                 for bi in state.carray.channelsAtPosition[p]:
-                    let binding = state.carray.channelBindings[bi]
-                    let idxVal = binding.indexExpression.evaluate(state.assignment)
-                    if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
-                    let elem = binding.arrayElements[idxVal]
+                    let bindingPtr = addr state.carray.channelBindings[bi]
+                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
+                    let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
                                      else: state.assignment[elem.variablePosition]
-                    let chanPos = binding.channelPosition
+                    let chanPos = bindingPtr.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
@@ -297,13 +297,13 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             let p = state.cdWorklist.pop()
             if p in state.carray.channelsAtPosition:
                 for bi in state.carray.channelsAtPosition[p]:
-                    let binding = state.carray.channelBindings[bi]
-                    let idxVal = binding.indexExpression.evaluate(state.assignment)
-                    if idxVal < 0 or idxVal >= binding.arrayElements.len: continue
-                    let elem = binding.arrayElements[idxVal]
+                    let bindingPtr = addr state.carray.channelBindings[bi]
+                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
+                    let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
                                      else: state.assignment[elem.variablePosition]
-                    let chanPos = binding.channelPosition
+                    let chanPos = bindingPtr.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
                         if chanPos notin state.cdVisited:
@@ -495,6 +495,8 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             state.computeCascadePenalties(cascadeIdx,
                 state.cdCascadeValues[cascadeIdx], domain, state.channelDepPenalties[pos])
         else:
+            when ProfileIteration:
+                let tBind0CD = epochTime()
             # Dynamic cascade: evaluate bindings at runtime for all domain values
             let chans = state.cdCascadeChans[cascadeIdx]
             let bindings = state.cdCascadeBindings[cascadeIdx]
@@ -508,10 +510,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             for di in 0..<nDom:
                 state.assignment[pos] = domain[di]
                 for ci in 0..<nChans:
-                    let binding = state.carray.channelBindings[bindings[ci]]
-                    let idxVal = binding.indexExpression.evaluate(state.assignment)
-                    if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                        let elem = binding.arrayElements[idxVal]
+                    let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
+                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                        let elem = bindingPtr.arrayElements[idxVal]
                         state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
                                                        else: state.assignment[elem.variablePosition]
                     else:
@@ -523,12 +525,23 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             for ci in 0..<nChans:
                 state.assignment[chans[ci]] = state.cdBatchSaved[ci]
 
+            when ProfileIteration:
+                let tBind1CD = epochTime()
+                state.cdCascadeBindingTime += tBind1CD - tBind0CD
+
             # Compute penalties from batch channel values
             state.computeCascadePenalties(cascadeIdx,
                 state.cdBatchValues, domain, state.channelDepPenalties[pos])
+            when ProfileIteration:
+                state.cdCascadePenaltyTime += epochTime() - tBind1CD
+                state.cdCascadeCalls += 1
     else:
+        when ProfileIteration:
+            let tFall0CD = epochTime()
         for i in 0..<domain.len:
             state.channelDepPenalties[pos][i] = state.computeChannelDepDelta(pos, domain[i])
+        when ProfileIteration:
+            state.cdCascadeFallbackTime += epochTime() - tFall0CD
 
 
 proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =

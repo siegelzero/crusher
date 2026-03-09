@@ -3,7 +3,8 @@
 ##   detectCountPatterns, detectReifChannels (sub-patterns),
 ##   detectImplicationPatterns, detectDisjunctivePairs,
 ##   detectDisjunctiveResources, detectRedundantOrderings,
-##   detectInversePatterns, detectInverseChannelPatterns.
+##   detectInversePatterns, detectInverseChannelPatterns,
+##   tryTableFunctionalDep (generalized key column detection).
 
 import unittest
 import std/[sequtils, algorithm, sets, tables, strutils, packedsets]
@@ -627,3 +628,110 @@ solve satisfy;
         check a[idx1 - 1] == 1
         check a[idx2 - 1] == 2
         check a[idx3 - 1] == 3
+
+
+suite "Table Functional Dependency Detection":
+
+    test "col0 as key (existing behavior)":
+        ## Standard case: col0 uniquely determines col1.
+        ## table([x, y], [[1,10],[2,20],[3,30]]) → y = channel(x)
+        let src = """
+var 1..3: x :: output_var;
+var 10..30: y :: output_var;
+array [1..6] of int: t = [1,10, 2,20, 3,30];
+constraint fzn_table_int([x, y], t);
+constraint int_eq(x, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # y should become a channel — no table constraints remain
+        check tr.sys.baseArray.constraints.len == 1  # only the int_eq
+        check tr.sys.baseArray.channelBindings.len >= 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let yVal = tr.sys.assignment[tr.varPositions["y"]]
+        check yVal == 20  # x=2 → y=20
+
+    test "last column as key (WCSP unary pattern)":
+        ## WCSP unary cost table: [cost, p_val] where p_val (col1) is the unique key.
+        ## The key is NOT col0. The generalized detection must find col1 as key.
+        let src = """
+var 0..100: cost :: output_var;
+var 1..4: p :: output_var;
+array [1..8] of int: t = [10,1, 20,2, 30,3, 40,4];
+constraint fzn_table_int([cost, p], t);
+constraint int_eq(p, 3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # cost should become a channel via col1 (p) as key
+        check tr.sys.baseArray.constraints.len == 1  # only the int_eq
+        check tr.sys.baseArray.channelBindings.len >= 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let costVal = tr.sys.assignment[tr.varPositions["cost"]]
+        check costVal == 30  # p=3 → cost=30
+
+    test "composite key in last columns (WCSP binary pattern)":
+        ## WCSP binary cost table: [cost, p_x, p_y] where (col1, col2) is the key.
+        ## Neither col0 nor (col0, col1) works as key — must try (col1, col2).
+        let src = """
+var 0..100: cost :: output_var;
+var 1..2: px :: output_var;
+var 1..2: py :: output_var;
+array [1..12] of int: t = [10,1,1, 20,1,2, 30,2,1, 40,2,2];
+constraint fzn_table_int([cost, px, py], t);
+constraint int_eq(px, 2);
+constraint int_eq(py, 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # cost should become a channel via (px, py) as composite key
+        check tr.sys.baseArray.constraints.len == 2  # only the two int_eq's
+        check tr.sys.baseArray.channelBindings.len >= 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let costVal = tr.sys.assignment[tr.varPositions["cost"]]
+        check costVal == 30  # px=2, py=1 → cost=30
+
+    test "WCSP pattern: multiple cost channels from tables":
+        ## Mini WCSP: 2 decision vars, 2 unary costs + 1 binary cost.
+        ## All cost vars should become channels via generalized key detection.
+        let src = """
+var 1..3: p1 :: output_var;
+var 1..3: p2 :: output_var;
+var 0..100: ucost1 :: output_var;
+var 0..100: ucost2 :: output_var;
+var 0..100: bcost :: output_var;
+array [1..6] of int: ut1 = [5,1, 3,2, 8,3];
+constraint fzn_table_int([ucost1, p1], ut1);
+array [1..6] of int: ut2 = [7,1, 2,2, 6,3];
+constraint fzn_table_int([ucost2, p2], ut2);
+array [1..27] of int: bt = [10,1,1, 1,1,2, 9,1,3, 8,2,1, 4,2,2, 7,2,3, 6,3,1, 3,3,2, 2,3,3];
+constraint fzn_table_int([bcost, p1, p2], bt);
+constraint int_eq(p1, 1);
+constraint int_eq(p2, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # All 3 cost vars should be channels — only int_eq constraints remain
+        check tr.sys.baseArray.constraints.len == 2
+        check tr.sys.baseArray.channelBindings.len >= 3
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+        let ucost1 = tr.sys.assignment[tr.varPositions["ucost1"]]
+        let ucost2 = tr.sys.assignment[tr.varPositions["ucost2"]]
+        let bcost = tr.sys.assignment[tr.varPositions["bcost"]]
+
+        # p1=1, p2=2: ucost1=5, ucost2=2, bcost=1
+        check ucost1 == 5
+        check ucost2 == 2
+        check bcost == 1
