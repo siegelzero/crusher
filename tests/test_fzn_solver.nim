@@ -381,3 +381,69 @@ solve satisfy;
     let targetVal = tr.sys.assignment[tr.varPositions["target"]]
     check placeVal == 2
     check targetVal == 10
+
+  test "int_le_reif → bool2int channel chain initialization order":
+    # Regression test for channel initialization ordering bug.
+    # bool2int bindings are created BEFORE int_le_reif bindings in
+    # buildReifChannelBindings. Without fixed-point iteration, the i_k
+    # channels (from bool2int) are computed before b_k channels
+    # (from int_le_reif), leaving i_k stuck at 0 regardless of x values.
+    #
+    # Model: 3 variables x1,x2,x3 with domain {0,1,2,3}.
+    # b_k = (1 <= x_k) via int_le_reif, i_k = int(b_k) via bool2int.
+    # Objective = sum(i_k), defined via int_lin_eq.
+    # Constraint: x1 + x2 + x3 = 6 (forces all x_k >= 1, so objective must be 3).
+    let src = """
+var 0..3: x1;
+var 0..3: x2;
+var 0..3: x3;
+var 0..1: b1;
+var 0..1: b2;
+var 0..1: b3;
+var 0..1: i1;
+var 0..1: i2;
+var 0..1: i3;
+var 0..3: objective:: output_var;
+array [1..3] of var int: xs:: output_array([1..3]) = [x1,x2,x3];
+constraint int_le_reif(1, x1, b1):: defines_var(b1);
+constraint int_le_reif(1, x2, b2):: defines_var(b2);
+constraint int_le_reif(1, x3, b3):: defines_var(b3);
+constraint bool2int(b1, i1):: defines_var(i1);
+constraint bool2int(b2, i2):: defines_var(i2);
+constraint bool2int(b3, i3):: defines_var(i3);
+constraint int_lin_eq([1, -1, -1, -1], [objective, i1, i2, i3], 0):: defines_var(objective);
+constraint int_lin_eq([1, 1, 1], [x1, x2, x3], 7);
+solve minimize objective;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # b_k should be channel positions (int_le_reif channels)
+    for name in ["b1", "b2", "b3"]:
+      check name in tr.channelVarNames
+
+    # i_k should be channel positions (bool2int channels)
+    for name in ["i1", "i2", "i3"]:
+      check name in tr.channelVarNames
+
+    # objective should be a defined-var expression (eliminated, no position)
+    check "objective" in tr.definedVarExprs
+
+    # Solve: x1+x2+x3=7, domain 0..3.
+    # If any x_k == 0, the other two sum to 7, but max is 3+3=6. Impossible.
+    # So all x_k >= 1, hence b_k = 1, i_k = 1, objective = 3.
+    # The bug would report objective = 0 because i_k were stuck at 0.
+    let objExpr = tr.objectiveDefExpr
+    minimize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+
+    let xs = [tr.sys.assignment[tr.varPositions["x1"]],
+              tr.sys.assignment[tr.varPositions["x2"]],
+              tr.sys.assignment[tr.varPositions["x3"]]]
+    check xs[0] + xs[1] + xs[2] == 7
+    for v in xs:
+      check v >= 1
+
+    # The critical check: objective must be 3, not 0
+    let objVal = objExpr.evaluate(tr.sys.assignment)
+    check objVal == 3

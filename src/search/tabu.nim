@@ -978,14 +978,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     if initialAssignment.len == 0:
         state.balanceBinarySums()
 
-    # Compute channel variable initial values from their defining element constraints
-    for binding in carray.channelBindings:
-        let idxVal = binding.indexExpression.evaluate(state.assignment)
-        if idxVal >= 0 and idxVal < binding.arrayElements.len:
-            let elem = binding.arrayElements[idxVal]
-            state.assignment[binding.channelPosition] =
-                if elem.isConstant: elem.constantValue
-                else: state.assignment[elem.variablePosition]
+    # Compute channel variable initial values from their defining element constraints.
+    # Iterate to fixed point: bindings may not be in topological order (e.g., bool2int
+    # bindings for i_k are created before int_le_reif bindings for b_k that i_k depends on).
+    # A single pass would leave downstream channels stale.
+    var channelChanged = true
+    while channelChanged:
+        channelChanged = false
+        for binding in carray.channelBindings:
+            let idxVal = binding.indexExpression.evaluate(state.assignment)
+            if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                let elem = binding.arrayElements[idxVal]
+                let newVal = if elem.isConstant: elem.constantValue
+                             else: state.assignment[elem.variablePosition]
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    channelChanged = true
 
     # Compute count-equals channel initial values
     for binding in carray.countEqChannelBindings:
