@@ -20,6 +20,7 @@ import test_element_expr
 import test_employee_scheduling
 import test_furniture_moving
 import test_fzn_channel_detection
+import test_fzn_pattern_detection
 import test_fzn_parser
 import test_fzcrusher
 import test_fzn_solver
