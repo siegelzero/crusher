@@ -219,6 +219,41 @@ solve satisfy;
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
     check tr.sys.assignment[tr.varPositions["x"]] == 2
 
+  test "equality copy not applied to objective inputs":
+    # Regression test: a variable that only appears in defines_var constraints
+    # must NOT be eliminated as an equality copy when one of those constraints
+    # is an int_lin_eq defining the objective. The objective's inputs are real
+    # references that need positions.
+    # Here v1 appears in:
+    #   1. int_eq_reif(v1, v2, b) :: defines_var(b)  — reification
+    #   2. int_lin_eq([1,1,-1],[v1,v2,cost],0) :: defines_var(cost) — objective
+    # Without the fix, v1 would be treated as an equality copy of v2 (since it
+    # only appears in defines_var constraints), blocking the cost expression.
+    let src = """
+var 1..5: v1;
+var 1..5: v2;
+var 0..1: b;
+var 2..10: cost:: output_var;
+constraint int_eq_reif(v1, v2, b):: defines_var(b);
+constraint int_lin_eq([1,1,-1],[v1,v2,cost],0):: defines_var(cost);
+constraint int_eq(v1, 3);
+constraint int_eq(v2, 4);
+solve minimize cost;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # v1 must NOT be an equality copy — it's an objective input
+    check "v1" notin tr.equalityCopyAliases
+    check "v1" in tr.varPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # cost = v1 + v2 = 3 + 4 = 7
+    let costVal = tr.sys.assignment[tr.varPositions["v1"]] +
+                  tr.sys.assignment[tr.varPositions["v2"]]
+    check costVal == 7
+
   test "0-based circuit via FlatZinc":
     # fzn_circuit with 0-based values (domain 0..3 for 4 nodes)
     let src = """

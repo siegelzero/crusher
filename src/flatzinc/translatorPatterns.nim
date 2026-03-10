@@ -818,10 +818,30 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
     ## where the copy only appears in defines_var constraints.
     ## These copies are eliminated by aliasing them to the original variable.
 
-    # Phase 1: Build set of variable names referenced by "real" (non-defines_var) constraints
+    # Phase 1: Build set of variable names referenced by "real" (non-defines_var) constraints.
+    # For expression-defining constraints (int_lin_eq/int_abs/int_times/etc. defines_var
+    # where the defined variable is in definedVarNames), include input variable references
+    # — inputs to objective/defined expressions are real references that prevent
+    # equality-copy elimination. Channel-defining constraints (reif channels, element
+    # channels) are excluded since their inputs may be equality copy candidates.
     var nonDefinesVarRefs: HashSet[string]
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints:
+            # Check if this defines an expression variable (definedVarNames) vs a channel variable
+            if con.hasAnnotation("defines_var"):
+                let ann = con.getAnnotation("defines_var")
+                if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                    let definedName = ann.args[0].ident
+                    if definedName in tr.definedVarNames:
+                        # Expression-defining constraint — inputs are real references
+                        for arg in con.args:
+                            if arg.kind == FznIdent:
+                                if arg.ident != definedName:
+                                    nonDefinesVarRefs.incl(arg.ident)
+                            elif arg.kind == FznArrayLit:
+                                for elem in arg.elems:
+                                    if elem.kind == FznIdent and elem.ident != definedName:
+                                        nonDefinesVarRefs.incl(elem.ident)
             continue
         if con.hasAnnotation("defines_var"):
             continue
