@@ -25,12 +25,6 @@ test:
 	nim c -r --threads:on --mm:arc --deepcopy:on -d:release tests/test_all.nim
 	@echo "✅ All tests completed successfully!"
 
-csplib:
-	@echo "🚀 Running CSPLib benchmark tests (combined binary)..."
-	@echo "======================================================="
-	nim c -r --threads:on --mm:arc --deepcopy:on -d:release csplib/test_all.nim
-	@echo "✅ All CSPLib tests completed successfully!"
-
 test-parallel: clean
 	@echo "🚀 Auto-discovering and running all test files with threading..."
 	@echo "============================================================="
@@ -40,13 +34,6 @@ test-parallel: clean
 		echo ""; \
 	done
 	@echo "✅ All parallel tests completed successfully!"
-
-# Clean all compiled executables
-clean:
-	@echo "🧹 Cleaning all compiled executables and backup files..."
-	@find . -type f -perm +111 -not -path "./.git/*" -not -name "*.sh" -delete 2>/dev/null || true
-	@find . -name "*~" -type f -delete 2>/dev/null || true
-	@echo "✅ Cleanup complete"
 
 # Format code by stripping trailing whitespace
 format:
