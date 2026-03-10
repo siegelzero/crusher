@@ -1,6 +1,6 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes, os]
 
 import parser
 import dfaExtract
@@ -91,6 +91,29 @@ type
         chainIdx*: int                       # index into setUnionChains
         pairs*: seq[SetComprehensionPair]    # contributing pairs with their sum values
         consumedConstraints*: PackedSet[int] # set_in + set_card constraint indices for singletons
+
+    SkillAllocationDef* = object
+        ## A detected skill-allocation disjunctive pattern:
+        ## bool_clause([b_set_in, b_and_1, ..., b_and_N], []) where:
+        ##   b_set_in <- set_in_reif(alloc_var, POSENGS, b)
+        ##   b_and_k  <- array_bool_and([b_skill_k, b_alloc_k], b_and_k)
+        ##   b_skill_k <- int_eq_reif(new_skills_var, required_skill, b)
+        ##   b_alloc_k <- int_eq_reif(alloc_var, eng_val, b)
+        allocVarName*: string          # the allocation decision variable
+        requiredSkill*: int            # skill value required by this job
+        posEngs*: seq[int]             # engineers who already have the skill (POSENGS set)
+        nsVarNames*: seq[seq[string]]  # new_skills var names per training slot
+                                       # nsVarNames[t] = [ns_var for engineer 1, ..., ns_var for engineer E]
+        nTrainingSlots*: int           # number of training slots
+
+    AtMostThroughReifDef* = object
+        ## A detected atMost-through-reification pattern:
+        ## int_lin_le([1,...,1], [b_1,...,b_n], rhs) where each b_k comes from
+        ## int_eq_reif(x_k, same_value, b_k) — counts how many x_k == same_value.
+        ## Equivalent to atMost(x_positions, same_value, rhs).
+        allocVarNames*: seq[string]    # the source variable names from int_eq_reif
+        targetValue*: int              # the shared constant value being counted
+        maxCount*: int                 # maximum allowed count (rhs)
 
     FznTranslator* = object
         sys*: ConstraintSystem[int]
@@ -244,6 +267,10 @@ type
             maxDay: int,
             consumedCIs: seq[int],
             consumedVarNames: seq[string]]]
+        # Detected skill-allocation disjunctive patterns (bool_clause + set_in_reif + int_eq_reif + array_bool_and)
+        skillAllocationDefs*: seq[SkillAllocationDef]
+        # Detected atMost-through-reification patterns (int_lin_le on int_eq_reif outputs)
+        atMostThroughReifDefs*: seq[AtMostThroughReifDef]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -585,6 +612,13 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectCountPatterns()
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
+    # Detect skill-allocation disjunctive patterns (MUST run before detectReifChannels
+    # to prevent intermediate booleans from being wastefully channeled)
+    if getEnv("CRUSHER_NO_COMPACT") == "":
+        result.detectSkillAllocationPattern()
+        # Detect atMost-through-reification: int_lin_le([1,...,1], [int_eq_reif outputs]) → direct atMost
+        # (MUST run after skill-allocation detection and before detectReifChannels)
+        result.detectAtMostThroughReif()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
     result.detectReifChannels()
     # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -627,6 +661,14 @@ proc translate*(model: FznModel): FznTranslator =
     for vn in result.channelVarNames:
         if vn in result.varPositions:
             result.sys.baseArray.channelPositions.incl(result.varPositions[vn])
+    # Phase 1: Prune unreferenced domain values (removes skills never required by any job)
+    result.pruneUnreferencedDomainValues()
+    # Emit compact constraints for skill-allocation patterns (Phase 2 + Phase 3)
+    if result.skillAllocationDefs.len > 0:
+        result.emitSkillAllocationConstraints()
+    # Emit direct atMost constraints for detected atMost-through-reification patterns
+    if result.atMostThroughReifDefs.len > 0:
+        result.emitAtMostThroughReif()
     # Prune admission domains using zero-capacity day detection
     result.pruneZeroCapacityDays()
     # Build expressions for defined variables using the now-created positions

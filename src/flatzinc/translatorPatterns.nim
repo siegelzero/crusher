@@ -2452,3 +2452,770 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Converted {nConverted} conditional gain variables to element channels")
 
 
+proc detectSkillAllocationPattern(tr: var FznTranslator) =
+    ## Detects the disjunctive skill-assignment pattern from MiniZinc's decomposition:
+    ##   set_in_reif(alloc, POSENGS, b_base) :: defines_var(b_base)
+    ##   int_eq_reif(new_skills[e,t], skill, b_skill) :: defines_var(b_skill)
+    ##   int_eq_reif(alloc, eng, b_alloc) :: defines_var(b_alloc)
+    ##   array_bool_and([b_skill, b_alloc], b_both) :: defines_var(b_both)
+    ##   bool_clause([b_base, b_both_1, ..., b_both_N], [])
+    ##
+    ## Replaces ~130 auxiliary booleans per job with compact channel-based constraints:
+    ##   learned_t = element(alloc - 1, [new_skills[1,t], ..., new_skills[E,t]])
+    ##   alloc in POSENGS OR learned_1 == skill OR learned_2 == skill OR ...
+
+    # Build indices for defines_var constraints (not yet consumed)
+    var setInReifByResult: Table[string, int]  # b_name -> constraint index
+    var intEqReifByResult: Table[string, int]  # b_name -> constraint index
+    var boolAndByResult: Table[string, int]    # b_name -> constraint index
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        let defVar = ann.args[0].ident
+
+        if name == "set_in_reif":
+            if con.args.len >= 3 and con.args[2].kind == FznIdent and con.args[2].ident == defVar:
+                setInReifByResult[defVar] = ci
+        elif name == "int_eq_reif":
+            if con.args.len >= 3 and con.args[2].kind == FznIdent and con.args[2].ident == defVar:
+                intEqReifByResult[defVar] = ci
+        elif name == "array_bool_and":
+            if con.args.len >= 2 and con.args[1].kind == FznIdent and con.args[1].ident == defVar:
+                boolAndByResult[defVar] = ci
+
+    # Scan bool_clause([positives], []) with many positive literals
+    var nDetected = 0
+    var allConsumedCIs: PackedSet[int]
+    var allConsumedVars: HashSet[string]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+
+        # Must have empty negatives
+        let negArg = con.args[1]
+        if negArg.kind != FznArrayLit or negArg.elems.len != 0: continue
+
+        let posArg = con.args[0]
+        if posArg.kind != FznArrayLit: continue
+        if posArg.elems.len < 10: continue  # Need substantial disjunction
+
+        # Scan all positive literals: find the set_in_reif element (if any) and array_bool_and elements
+        var allocVarName = ""
+        var posEngs: seq[int]
+        var setInReifIdx = -1  # index in posArg.elems of the set_in_reif element, -1 if none
+        var localConsumedCIs: seq[int]
+        var localConsumedVars: seq[string]
+
+        # First scan: find the set_in_reif element (may be at any position, not just first)
+        for i in 0..<posArg.elems.len:
+            let bName = if posArg.elems[i].kind == FznIdent: posArg.elems[i].ident else: ""
+            if bName != "" and bName in setInReifByResult:
+                let setInCI = setInReifByResult[bName]
+                let setInCon = tr.model.constraints[setInCI]
+                if setInCon.args[0].kind != FznIdent: continue
+                allocVarName = setInCon.args[0].ident
+                let setArg = setInCon.args[1]
+                case setArg.kind
+                of FznSetLit: posEngs = setArg.setElems
+                of FznRange:
+                    for v in setArg.lo..setArg.hi:
+                        posEngs.add(v)
+                else: continue
+                setInReifIdx = i
+                localConsumedCIs.add(setInCI)
+                localConsumedVars.add(bName)
+                break
+
+        localConsumedCIs.add(ci)  # the bool_clause itself
+
+        # When allocVarName is unknown (no set_in_reif), infer it from the disjuncts.
+        # The alloc var appears as arg0 in int_eq_reif for ALL disjuncts (same alloc var per job).
+        if allocVarName == "":
+            var argCounts: Table[string, int]
+            for i in 0..<posArg.elems.len:
+                let bName = if posArg.elems[i].kind == FznIdent: posArg.elems[i].ident else: ""
+                if bName == "" or bName notin boolAndByResult: continue
+                let bCon = tr.model.constraints[boolAndByResult[bName]]
+                if bCon.args[0].kind != FznArrayLit or bCon.args[0].elems.len != 2: continue
+                for elem in bCon.args[0].elems:
+                    if elem.kind == FznIdent and elem.ident in intEqReifByResult:
+                        let reifCon = tr.model.constraints[intEqReifByResult[elem.ident]]
+                        if reifCon.args[0].kind == FznIdent:
+                            argCounts.mgetOrPut(reifCon.args[0].ident, 0) += 1
+            # The alloc var has the highest count (appears in all disjuncts)
+            var maxCount = 0
+            for varName, count in argCounts:
+                if count > maxCount:
+                    maxCount = count
+                    allocVarName = varName
+            if allocVarName == "": continue
+
+        # Trace disjuncts through array_bool_and -> (int_eq_reif_skill, int_eq_reif_alloc)
+        var requiredSkill = -1
+        var skillSet = false
+        var valid = true
+        var nsByEng: Table[int, seq[string]]  # eng -> list of new_skills var names
+        var engSet: PackedSet[int]  # all engineer values seen
+
+        for i in 0..<posArg.elems.len:
+            if i == setInReifIdx: continue  # Skip the set_in_reif element
+            let bAndName = if posArg.elems[i].kind == FznIdent: posArg.elems[i].ident else: ""
+            if bAndName == "" or bAndName notin boolAndByResult:
+                valid = false
+                break
+
+            let bAndCI = boolAndByResult[bAndName]
+            let bAndCon = tr.model.constraints[bAndCI]
+            # array_bool_and([b1, b2], result) — extract the two inputs
+            if bAndCon.args[0].kind != FznArrayLit or bAndCon.args[0].elems.len != 2:
+                valid = false
+                break
+
+            let inp0 = bAndCon.args[0].elems[0]
+            let inp1 = bAndCon.args[0].elems[1]
+            if inp0.kind != FznIdent or inp1.kind != FznIdent:
+                valid = false
+                break
+
+            # One should be int_eq_reif on new_skills (skill match), other on alloc (engineer match)
+            # Both inputs must be int_eq_reif defines_var results
+            if inp0.ident notin intEqReifByResult or inp1.ident notin intEqReifByResult:
+                valid = false
+                break
+
+            let ci0 = intEqReifByResult[inp0.ident]
+            let ci1 = intEqReifByResult[inp1.ident]
+            let con0 = tr.model.constraints[ci0]
+            let con1 = tr.model.constraints[ci1]
+
+            if con0.args[0].kind != FznIdent or con1.args[0].kind != FznIdent:
+                valid = false
+                break
+
+            # Determine which is alloc reif and which is skill reif based on allocVarName
+            var skillReifName, allocReifName: string
+            if con0.args[0].ident == allocVarName and con1.args[0].ident != allocVarName:
+                allocReifName = inp0.ident
+                skillReifName = inp1.ident
+            elif con1.args[0].ident == allocVarName and con0.args[0].ident != allocVarName:
+                allocReifName = inp1.ident
+                skillReifName = inp0.ident
+            else:
+                valid = false
+                break
+
+            # Extract skill value from skill reif: int_eq_reif(ns_var, skill_val, b_skill)
+            let skillCI = intEqReifByResult[skillReifName]
+            let skillCon = tr.model.constraints[skillCI]
+            let nsVarName = skillCon.args[0].ident
+            let skillVal = try: tr.resolveIntArg(skillCon.args[1]) except ValueError, KeyError: (valid = false; 0)
+            if not valid: break
+
+            if not skillSet:
+                requiredSkill = skillVal
+                skillSet = true
+            elif skillVal != requiredSkill:
+                valid = false
+                break
+
+            # Extract engineer value from alloc reif: int_eq_reif(alloc_var, eng_val, b_alloc)
+            let allocCI = intEqReifByResult[allocReifName]
+            let allocCon = tr.model.constraints[allocCI]
+            let engVal = try: tr.resolveIntArg(allocCon.args[1]) except ValueError, KeyError: (valid = false; 0)
+            if not valid: break
+
+            engSet.incl(engVal)
+            nsByEng.mgetOrPut(engVal, @[]).add(nsVarName)
+
+            # Only consume the array_bool_and — int_eq_reif constraints are SHARED
+            # across multiple jobs (same b_skill/b_alloc used in multiple bool_clauses)
+            localConsumedCIs.add(bAndCI)
+            localConsumedVars.add(bAndName)
+
+        if not valid or not skillSet or allocVarName == "": continue
+
+        # Determine training slot structure from the grouped new_skills vars.
+        # Each engineer should have the same number of ns vars (= nTrainingSlots).
+        # Verify all engineers have the same number of training slots
+        var nSlots = -1
+        var slotCountValid = true
+        for eng, nsVars in nsByEng:
+            if nSlots < 0:
+                nSlots = nsVars.len
+            elif nsVars.len != nSlots:
+                slotCountValid = false
+                break
+        if not slotCountValid or nSlots <= 0: continue
+
+        # But wait - the mapping above puts all vars for the same engineer under slot 0.
+        # We need to re-trace the array_bool_and to find which ns_var goes with which slot.
+        # Actually, the ns_vars per engineer are just the distinct new_skills vars that
+        # appear in int_eq_reif for that engineer's conjunctions. We can sort them
+        # to get a consistent ordering.
+        var nsVarNames = newSeq[seq[string]](nSlots)
+        # Collect sorted engineers
+        var sortedEngs: seq[int]
+        for eng in engSet.items:
+            sortedEngs.add(eng)
+        sortedEngs.sort()
+
+        for eng in sortedEngs:
+            let nsVars = nsByEng[eng]
+            # Sort for consistent slot ordering (same var appears in same slot position across engineers)
+            var sorted = nsVars
+            sorted.sort()
+            for t in 0..<nSlots:
+                nsVarNames[t].add(sorted[t])
+
+        # Verify the structure: nsVarNames[t] should have one entry per engineer
+        var structureValid = true
+        for t in 0..<nSlots:
+            if nsVarNames[t].len != sortedEngs.len:
+                structureValid = false
+                break
+        if not structureValid: continue
+
+        # Pattern detected!
+        tr.skillAllocationDefs.add(SkillAllocationDef(
+            allocVarName: allocVarName,
+            requiredSkill: requiredSkill,
+            posEngs: posEngs,
+            nsVarNames: nsVarNames,
+            nTrainingSlots: nSlots
+        ))
+
+        # Mark consumed constraints and variables
+        for idx in localConsumedCIs:
+            allConsumedCIs.incl(idx)
+        for vn in localConsumedVars:
+            allConsumedVars.incl(vn)
+
+        inc nDetected
+
+    # Apply all consumed constraints and variables
+    # Note: int_eq_reif(alloc, eng, b_alloc) constraints are SHARED across jobs,
+    # so we collect all consumed CIs globally and apply at the end.
+    for idx in allConsumedCIs.items:
+        tr.definingConstraints.incl(idx)
+    for vn in allConsumedVars:
+        tr.definedVarNames.incl(vn)
+
+    # Dead-channel elimination: find int_eq_reif constraints whose outputs
+    # have NO remaining (non-consumed) consumers.
+    if nDetected > 0:
+        # Build reverse index: var name → count of non-consumed constraint references
+        var liveRefCount: Table[string, int]
+
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            # Count references to identifiers in this constraint's args
+            for arg in con.args:
+                if arg.kind == FznIdent:
+                    liveRefCount.mgetOrPut(arg.ident, 0) += 1
+                elif arg.kind == FznArrayLit:
+                    for elem in arg.elems:
+                        if elem.kind == FznIdent:
+                            liveRefCount.mgetOrPut(elem.ident, 0) += 1
+
+        # Find int_eq_reif with defines_var whose output has only 1 live reference (itself)
+        var deadChannelCIs: seq[int]
+        var deadChannelVars: seq[string]
+
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let name = stripSolverPrefix(con.name)
+            if name != "int_eq_reif": continue
+            if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+            let bName = con.args[2].ident
+
+            # If bName has only 1 live reference (in this defining constraint), it's dead
+            let refCount = liveRefCount.getOrDefault(bName, 0)
+            if refCount <= 1:
+                deadChannelCIs.add(ci)
+                deadChannelVars.add(bName)
+
+        for ci in deadChannelCIs:
+            tr.definingConstraints.incl(ci)
+        for vn in deadChannelVars:
+            tr.definedVarNames.incl(vn)
+
+        if deadChannelVars.len > 0:
+            allConsumedVars = allConsumedVars + toHashSet(deadChannelVars)
+            stderr.writeLine(&"[FZN] Dead-channel elimination: {deadChannelVars.len} int_eq_reif outputs removed")
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} skill-allocation patterns ({allConsumedVars.len} vars, {allConsumedCIs.card} constraints consumed)")
+
+
+proc pruneUnreferencedDomainValues(tr: var FznTranslator) =
+    ## Phase 1: For variables with domain containing 0 and size > 10 that appear in
+    ## int_eq_reif(var, const, b) constraints, restrict domain to {0} ∪ referenced values.
+    ## This removes unreachable domain values (e.g., skills never required by any job).
+    var referencedValues: Table[string, PackedSet[int]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+
+        let xArg = con.args[0]
+        let valArg = con.args[1]
+
+        # One arg must be an identifier (variable), other must be a constant
+        if xArg.kind == FznIdent and (valArg.kind == FznIntLit or
+                (valArg.kind == FznIdent and valArg.ident in tr.paramValues)):
+            let val = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
+            referencedValues.mgetOrPut(xArg.ident, initPackedSet[int]()).incl(val)
+        elif valArg.kind == FznIdent and (xArg.kind == FznIntLit or
+                (xArg.kind == FznIdent and xArg.ident in tr.paramValues)):
+            let val = try: tr.resolveIntArg(xArg) except ValueError, KeyError: continue
+            referencedValues.mgetOrPut(valArg.ident, initPackedSet[int]()).incl(val)
+
+    var nPruned = 0
+    for varName, refVals in referencedValues:
+        if varName notin tr.varPositions: continue
+        let pos = tr.varPositions[varName]
+        let dom = tr.sys.baseArray.domain[pos]
+        if dom.len <= 10 or 0 notin dom: continue
+        var newDom: seq[int] = @[0]
+        for v in dom:
+            if v != 0 and v in refVals:
+                newDom.add(v)
+        if newDom.len < dom.len:
+            tr.sys.baseArray.setDomain(pos, newDom)
+            inc nPruned
+
+    if nPruned > 0:
+        stderr.writeLine(&"[FZN] Pruned unreferenced domain values from {nPruned} variables")
+
+
+proc emitSkillAllocationConstraints(tr: var FznTranslator) =
+    ## Creates compact channel-based constraints for detected skill-allocation patterns.
+    ## For each job requiring skill s with allocation variable alloc:
+    ##   1. Create channel vars: learned_t = element(alloc-1, [ns[1,t], ..., ns[E,t]])
+    ##   2. Create set-membership lookup: b_base = element(alloc-lo, [1 if v in POSENGS else 0])
+    ##   3. Create equality lookups: b_eq_t = element(learned_t, [1 if v==s else 0])
+    ##   4. Constraint: b_base + b_eq_1 + ... + b_eq_T >= 1
+
+    var nChannels = 0
+    var nConstraints = 0
+    var nDomainRestrictions = 0
+
+    for pattern in tr.skillAllocationDefs:
+        if pattern.allocVarName notin tr.varPositions: continue
+        let allocPos = tr.varPositions[pattern.allocVarName]
+        let allocExpr = tr.getExpr(allocPos)
+        let allocDomain = tr.sys.baseArray.domain[allocPos]
+        if allocDomain.len == 0: continue
+        let allocLo = allocDomain[0]
+        let allocHi = allocDomain[^1]
+        let nEngs = allocHi  # engineers numbered 1..nEngs (allocLo should be 1)
+
+        # Phase 3: Restrict allocation domain to engineers who can do the job
+        var validEngs: PackedSet[int]
+        for e in pattern.posEngs:
+            validEngs.incl(e)
+        # Add engineers who can learn the required skill
+        for t in 0..<pattern.nTrainingSlots:
+            for i, nsVarName in pattern.nsVarNames[t]:
+                if nsVarName in tr.varPositions:
+                    let nsPos = tr.varPositions[nsVarName]
+                    let nsDom = tr.sys.baseArray.domain[nsPos]
+                    if pattern.requiredSkill in nsDom:
+                        # This engineer's ns var can take the required skill value
+                        # The engineer value is the sorted index + 1 based on detection order
+                        # But we don't directly know the engineer value from nsVarName.
+                        # Instead, use the fact that nsVarNames[t] is ordered by engineer value.
+                        # The detection sorts engineers and adds ns_vars in that order.
+                        # However, we don't store the sorted engineer list in the pattern.
+                        # For now, just add all engineers in the element array — the element
+                        # channel will handle the mapping correctly.
+                        discard  # handled below after element channels
+                elif nsVarName in tr.paramValues:
+                    discard  # constant — won't help
+
+        # 1. Create learned_t channel variables (variable-array element)
+        # learned_t = element(alloc - 1, [ns[1,t], ns[2,t], ..., ns[nEngs,t]])
+        var learnedPositions: seq[int]
+        for t in 0..<pattern.nTrainingSlots:
+            let channelPos = tr.sys.baseArray.len
+            let v = tr.sys.newConstrainedVariable()
+            # Set domain to union of all new_skills domains for this training slot
+            var domSet: PackedSet[int]
+            for nsVarName in pattern.nsVarNames[t]:
+                if nsVarName in tr.varPositions:
+                    let nsPos = tr.varPositions[nsVarName]
+                    for dv in tr.sys.baseArray.domain[nsPos]:
+                        domSet.incl(dv)
+                elif nsVarName in tr.paramValues:
+                    domSet.incl(tr.paramValues[nsVarName])
+            var domSeq: seq[int]
+            for dv in domSet.items:
+                domSeq.add(dv)
+            domSeq.sort()
+            v.setDomain(domSeq)
+            tr.sys.baseArray.channelPositions.incl(channelPos)
+
+            # Build the element array: one entry per engineer (1..nEngs)
+            # Index = alloc - 1 (alloc is 1-based, array is 0-based)
+            var arrayElems = newSeq[ArrayElement[int]](nEngs)
+            for i, nsVarName in pattern.nsVarNames[t]:
+                # nsVarNames[t][i] is for the i-th engineer in sorted order
+                # We need to map to the correct array position
+                if nsVarName in tr.varPositions:
+                    let nsPos = tr.varPositions[nsVarName]
+                    let nsDom = tr.sys.baseArray.domain[nsPos]
+                    if nsDom.len == 1:
+                        arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: nsDom[0])
+                    else:
+                        arrayElems[i] = ArrayElement[int](isConstant: false, variablePosition: nsPos)
+                elif nsVarName in tr.paramValues:
+                    arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: tr.paramValues[nsVarName])
+
+            let indexExpr = allocExpr - 1
+            let binding = ChannelBinding[int](
+                channelPosition: channelPos,
+                indexExpression: indexExpr,
+                arrayElements: arrayElems
+            )
+            let bindingIdx = tr.sys.baseArray.channelBindings.len
+            tr.sys.baseArray.channelBindings.add(binding)
+
+            # Register in channelsAtPosition
+            for pos in indexExpr.positions.items:
+                if pos notin tr.sys.baseArray.channelsAtPosition:
+                    tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+                else:
+                    tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+            for elem in arrayElems:
+                if not elem.isConstant:
+                    if elem.variablePosition notin tr.sys.baseArray.channelsAtPosition:
+                        tr.sys.baseArray.channelsAtPosition[elem.variablePosition] = @[bindingIdx]
+                    else:
+                        tr.sys.baseArray.channelsAtPosition[elem.variablePosition].add(bindingIdx)
+
+            learnedPositions.add(channelPos)
+            inc nChannels
+
+        # 2. Build constraint: alloc in POSENGS OR learned_1 == skill OR ... OR learned_T == skill
+        # Express as: set_in_check + eq_check_1 + ... + eq_check_T >= 1
+        # Where set_in_check = element(alloc - lo, membership_table)
+        #       eq_check_t = element(learned_t - lo_t, equality_table)
+        # But we can use algebraic expressions directly instead of channels.
+
+        # Build set-in expression for alloc in POSENGS
+        let posEngSet = toHashSet(pattern.posEngs)
+        var setInElems: seq[ArrayElement[int]]
+        for v in allocLo..allocHi:
+            setInElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if v in posEngSet: 1 else: 0))
+        # Create channel for set_in check
+        let setInPos = tr.sys.baseArray.len
+        let setInVar = tr.sys.newConstrainedVariable()
+        setInVar.setDomain(@[0, 1])
+        tr.sys.baseArray.channelPositions.incl(setInPos)
+        block:
+            let indexExpr = allocExpr - allocLo
+            let binding = ChannelBinding[int](
+                channelPosition: setInPos,
+                indexExpression: indexExpr,
+                arrayElements: setInElems
+            )
+            let bindingIdx = tr.sys.baseArray.channelBindings.len
+            tr.sys.baseArray.channelBindings.add(binding)
+            for pos in indexExpr.positions.items:
+                if pos notin tr.sys.baseArray.channelsAtPosition:
+                    tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+                else:
+                    tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc nChannels
+
+        # Build equality check channels: learned_t == requiredSkill
+        var eqCheckPositions: seq[int]
+        for t in 0..<pattern.nTrainingSlots:
+            let learnedPos = learnedPositions[t]
+            let learnedDom = tr.sys.baseArray.domain[learnedPos]
+            if learnedDom.len == 0: continue
+            let lo = learnedDom[0]
+            let hi = learnedDom[^1]
+
+            let eqPos = tr.sys.baseArray.len
+            let eqVar = tr.sys.newConstrainedVariable()
+            eqVar.setDomain(@[0, 1])
+            tr.sys.baseArray.channelPositions.incl(eqPos)
+
+            var eqElems: seq[ArrayElement[int]]
+            for v in lo..hi:
+                eqElems.add(ArrayElement[int](isConstant: true,
+                        constantValue: if v == pattern.requiredSkill: 1 else: 0))
+
+            let learnedExpr = tr.getExpr(learnedPos)
+            let indexExpr = learnedExpr - lo
+            let binding = ChannelBinding[int](
+                channelPosition: eqPos,
+                indexExpression: indexExpr,
+                arrayElements: eqElems
+            )
+            let bindingIdx = tr.sys.baseArray.channelBindings.len
+            tr.sys.baseArray.channelBindings.add(binding)
+            for pos in indexExpr.positions.items:
+                if pos notin tr.sys.baseArray.channelsAtPosition:
+                    tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+                else:
+                    tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+            eqCheckPositions.add(eqPos)
+            inc nChannels
+
+        # 3. Add constraint: setIn + eq_1 + ... + eq_T >= 1
+        var sumExpr = tr.getExpr(setInPos)
+        for eqPos in eqCheckPositions:
+            sumExpr = sumExpr + tr.getExpr(eqPos)
+        tr.sys.addConstraint(sumExpr >= 1)
+        inc nConstraints
+
+        # Phase 3: Domain restriction for allocations
+        # Restrict alloc domain to engineers who already have the skill OR
+        # have at least one training slot whose domain includes the required skill
+        var validEngineers: PackedSet[int]
+        for e in pattern.posEngs:
+            validEngineers.incl(e)
+        for t in 0..<pattern.nTrainingSlots:
+            for i, nsVarName in pattern.nsVarNames[t]:
+                if nsVarName in tr.varPositions:
+                    let nsPos = tr.varPositions[nsVarName]
+                    let nsDom = tr.sys.baseArray.domain[nsPos]
+                    if pattern.requiredSkill in nsDom:
+                        # Engineer at sorted index i+1 can learn this skill
+                        let engVal = i + 1  # engineers are 1-based in sorted order
+                        validEngineers.incl(engVal)
+        var newDom: seq[int]
+        for v in allocDomain:
+            if v in validEngineers:
+                newDom.add(v)
+        if newDom.len > 0 and newDom.len < allocDomain.len:
+            tr.sys.baseArray.setDomain(allocPos, newDom)
+            inc nDomainRestrictions
+
+    if nChannels > 0 or nConstraints > 0:
+        stderr.writeLine(&"[FZN] Skill-allocation: {nChannels} channels, {nConstraints} constraints")
+    if nDomainRestrictions > 0:
+        stderr.writeLine(&"[FZN] Skill-allocation domain restrictions: {nDomainRestrictions} allocation variables")
+
+
+proc detectAtMostThroughReif*(tr: var FznTranslator) =
+    ## Detects int_lin_le([1,...,1], [b_1,...,b_n], rhs) where each b_k comes from
+    ## int_eq_reif(x_k, same_value, b_k) :: defines_var(b_k), possibly through
+    ## a bool2int(b_k, i_k) :: defines_var(i_k) chain.
+    ## This is equivalent to atMost(x_positions, same_value, rhs).
+    ## Consumes the int_lin_le, bool2int, and int_eq_reif constraints.
+
+    # Build index: bool output var name -> (constraint index, source var name, constant value)
+    var intEqReifByOutput: Table[string, tuple[ci: int, srcVar: string, constVal: int]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+
+        # int_eq_reif(x, c, b) where c is a constant
+        let srcVar = con.args[0].ident
+        let bName = con.args[2].ident
+        let constVal = try: tr.resolveIntArg(con.args[1])
+                       except ValueError, KeyError: continue
+
+        intEqReifByOutput[bName] = (ci: ci, srcVar: srcVar, constVal: constVal)
+
+    # Build index: bool2int int output var name -> (constraint index, bool input var name)
+    var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool2int": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        bool2intByOutput[con.args[1].ident] = (ci: ci, boolVar: con.args[0].ident)
+
+    if intEqReifByOutput.len == 0: return
+
+    var nDetected = 0
+    var consumedLinLeCIs: PackedSet[int]
+    var consumedEqReifCIs: PackedSet[int]
+    var consumedBoolVarNames: HashSet[string]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        # Resolve coefficients
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+
+        # Check all coefficients are +1
+        var allPosOne = true
+        for c in coeffs:
+            if c != 1:
+                allPosOne = false
+                break
+        if not allPosOne: continue
+
+        # Resolve variable names
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != coeffs.len: continue
+
+        # Check each variable is an int_eq_reif output (directly or through bool2int)
+        # with the same constant value
+        var targetValue = -1
+        var targetSet = false
+        var valid = true
+        var srcVarNames: seq[string]
+        var eqReifCIs: seq[int]
+        var bool2intCIs: seq[int]
+        var boolNames: seq[string]
+        var intNames: seq[string]
+
+        for elem in varElems:
+            if elem.kind != FznIdent:
+                valid = false
+                break
+            let varName = elem.ident
+
+            # Try direct: varName is a bool output of int_eq_reif
+            if varName in intEqReifByOutput:
+                let info = intEqReifByOutput[varName]
+                if not targetSet:
+                    targetValue = info.constVal
+                    targetSet = true
+                elif info.constVal != targetValue:
+                    valid = false
+                    break
+                srcVarNames.add(info.srcVar)
+                eqReifCIs.add(info.ci)
+                boolNames.add(varName)
+            # Try through bool2int: varName is int output of bool2int(boolVar, varName)
+            elif varName in bool2intByOutput:
+                let b2iInfo = bool2intByOutput[varName]
+                let boolVar = b2iInfo.boolVar
+                if boolVar notin intEqReifByOutput:
+                    valid = false
+                    break
+                let info = intEqReifByOutput[boolVar]
+                if not targetSet:
+                    targetValue = info.constVal
+                    targetSet = true
+                elif info.constVal != targetValue:
+                    valid = false
+                    break
+                srcVarNames.add(info.srcVar)
+                eqReifCIs.add(info.ci)
+                bool2intCIs.add(b2iInfo.ci)
+                boolNames.add(boolVar)
+                intNames.add(varName)
+            else:
+                valid = false
+                break
+
+        if not valid or not targetSet: continue
+        if srcVarNames.len < 2: continue  # Need at least 2 variables for a meaningful atMost
+
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+
+        # Pattern detected!
+        tr.atMostThroughReifDefs.add(AtMostThroughReifDef(
+            allocVarNames: srcVarNames,
+            targetValue: targetValue,
+            maxCount: rhs
+        ))
+
+        # Consume the int_lin_le constraint
+        consumedLinLeCIs.incl(ci)
+
+        # Record the int_eq_reif and bool2int constraints and their output vars
+        for eqCi in eqReifCIs:
+            consumedEqReifCIs.incl(eqCi)
+        for b2iCi in bool2intCIs:
+            # Consume the bool2int constraint directly since it's no longer needed
+            tr.definingConstraints.incl(b2iCi)
+        for bn in boolNames:
+            consumedBoolVarNames.incl(bn)
+        for iName in intNames:
+            tr.definedVarNames.incl(iName)
+
+        inc nDetected
+
+    # Apply consumed int_lin_le constraints
+    for idx in consumedLinLeCIs.items:
+        tr.definingConstraints.incl(idx)
+
+    # Dead-channel elimination for int_eq_reif outputs that now have no remaining consumers
+    if nDetected > 0:
+        # Build reverse index: var name → count of non-consumed constraint references
+        var liveRefCount: Table[string, int]
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            for arg in con.args:
+                if arg.kind == FznIdent:
+                    liveRefCount.mgetOrPut(arg.ident, 0) += 1
+                elif arg.kind == FznArrayLit:
+                    for elem in arg.elems:
+                        if elem.kind == FznIdent:
+                            liveRefCount.mgetOrPut(elem.ident, 0) += 1
+
+        var deadChannelCount = 0
+        for eqCi in consumedEqReifCIs.items:
+            let con = tr.model.constraints[eqCi]
+            if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+            let bName = con.args[2].ident
+            # If bName has only 1 live reference (in this defining constraint), it's dead
+            let refCount = liveRefCount.getOrDefault(bName, 0)
+            if refCount <= 1:
+                tr.definingConstraints.incl(eqCi)
+                tr.definedVarNames.incl(bName)
+                inc deadChannelCount
+
+        stderr.writeLine(&"[FZN] AtMost-through-reif: {nDetected} patterns detected, {deadChannelCount} int_eq_reif channels eliminated")
+
+
+proc emitAtMostThroughReif*(tr: var FznTranslator) =
+    ## Emits direct atMost constraints for detected atMost-through-reification patterns.
+    var nEmitted = 0
+    for def in tr.atMostThroughReifDefs:
+        var positions: seq[int]
+        var allFound = true
+        for vn in def.allocVarNames:
+            if vn in tr.varPositions:
+                positions.add(tr.varPositions[vn])
+            elif vn in tr.definedVarExprs:
+                # Shouldn't happen for allocation vars, but handle gracefully
+                allFound = false
+                break
+            else:
+                allFound = false
+                break
+        if not allFound or positions.len == 0: continue
+        tr.sys.addConstraint(atMost[int](positions, def.targetValue, def.maxCount))
+        inc nEmitted
+
+    if nEmitted > 0:
+        stderr.writeLine(&"[FZN] AtMost-through-reif: emitted {nEmitted} direct atMost constraints")
+
+
+
+
