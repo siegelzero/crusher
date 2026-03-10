@@ -2452,6 +2452,37 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Converted {nConverted} conditional gain variables to element channels")
 
 
+proc eliminateDeadIntEqReifChannels(tr: var FznTranslator,
+                                    candidateCIs: PackedSet[int]): tuple[count: int, deadVarNames: seq[string]] =
+    ## For int_eq_reif constraints in candidateCIs, eliminate those whose boolean
+    ## output has no remaining live references (at most 1, from the defining constraint itself).
+    var liveRefCount: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        for arg in con.args:
+            if arg.kind == FznIdent:
+                liveRefCount.mgetOrPut(arg.ident, 0) += 1
+            elif arg.kind == FznArrayLit:
+                for elem in arg.elems:
+                    if elem.kind == FznIdent:
+                        liveRefCount.mgetOrPut(elem.ident, 0) += 1
+
+    var deadCount = 0
+    var deadVarNames: seq[string]
+    for ci in candidateCIs.items:
+        if ci in tr.definingConstraints: continue
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let bName = con.args[2].ident
+        let refCount = liveRefCount.getOrDefault(bName, 0)
+        if refCount <= 1:
+            tr.definingConstraints.incl(ci)
+            tr.definedVarNames.incl(bName)
+            deadVarNames.add(bName)
+            inc deadCount
+    return (deadCount, deadVarNames)
+
+
 proc detectSkillAllocationPattern(tr: var FznTranslator) =
     ## Detects the disjunctive skill-assignment pattern from MiniZinc's decomposition:
     ##   set_in_reif(alloc, POSENGS, b_base) :: defines_var(b_base)
@@ -2687,6 +2718,7 @@ proc detectSkillAllocationPattern(tr: var FznTranslator) =
             allocVarName: allocVarName,
             requiredSkill: requiredSkill,
             posEngs: posEngs,
+            sortedEngs: sortedEngs,
             nsVarNames: nsVarNames,
             nTrainingSlots: nSlots
         ))
@@ -2710,55 +2742,28 @@ proc detectSkillAllocationPattern(tr: var FznTranslator) =
     # Dead-channel elimination: find int_eq_reif constraints whose outputs
     # have NO remaining (non-consumed) consumers.
     if nDetected > 0:
-        # Build reverse index: var name → count of non-consumed constraint references
-        var liveRefCount: Table[string, int]
-
-        for ci, con in tr.model.constraints:
-            if ci in tr.definingConstraints: continue
-            # Count references to identifiers in this constraint's args
-            for arg in con.args:
-                if arg.kind == FznIdent:
-                    liveRefCount.mgetOrPut(arg.ident, 0) += 1
-                elif arg.kind == FznArrayLit:
-                    for elem in arg.elems:
-                        if elem.kind == FznIdent:
-                            liveRefCount.mgetOrPut(elem.ident, 0) += 1
-
-        # Find int_eq_reif with defines_var whose output has only 1 live reference (itself)
-        var deadChannelCIs: seq[int]
-        var deadChannelVars: seq[string]
-
+        var candidateCIs: PackedSet[int]
         for ci, con in tr.model.constraints:
             if ci in tr.definingConstraints: continue
             if not con.hasAnnotation("defines_var"): continue
-            let name = stripSolverPrefix(con.name)
-            if name != "int_eq_reif": continue
+            if stripSolverPrefix(con.name) != "int_eq_reif": continue
             if con.args.len < 3 or con.args[2].kind != FznIdent: continue
-            let bName = con.args[2].ident
-
-            # If bName has only 1 live reference (in this defining constraint), it's dead
-            let refCount = liveRefCount.getOrDefault(bName, 0)
-            if refCount <= 1:
-                deadChannelCIs.add(ci)
-                deadChannelVars.add(bName)
-
-        for ci in deadChannelCIs:
-            tr.definingConstraints.incl(ci)
-        for vn in deadChannelVars:
-            tr.definedVarNames.incl(vn)
-
-        if deadChannelVars.len > 0:
-            allConsumedVars = allConsumedVars + toHashSet(deadChannelVars)
-            stderr.writeLine(&"[FZN] Dead-channel elimination: {deadChannelVars.len} int_eq_reif outputs removed")
+            candidateCIs.incl(ci)
+        let (deadCount, deadNames) = tr.eliminateDeadIntEqReifChannels(candidateCIs)
+        if deadCount > 0:
+            allConsumedVars = allConsumedVars + toHashSet(deadNames)
+            stderr.writeLine(&"[FZN] Dead-channel elimination: {deadCount} int_eq_reif outputs removed")
 
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} skill-allocation patterns ({allConsumedVars.len} vars, {allConsumedCIs.card} constraints consumed)")
 
 
-proc pruneUnreferencedDomainValues(tr: var FznTranslator) =
-    ## Phase 1: For variables with domain containing 0 and size > 10 that appear in
-    ## int_eq_reif(var, const, b) constraints, restrict domain to {0} ∪ referenced values.
-    ## This removes unreachable domain values (e.g., skills never required by any job).
+proc pruneUnreferencedSkillValues(tr: var FznTranslator) =
+    ## For new_skills variables in skill-allocation patterns: variables with domain
+    ## containing 0 (meaning "no skill") and size > 10 that appear in
+    ## int_eq_reif(var, const, b) constraints get their domain restricted to
+    ## {0} ∪ {values actually referenced in int_eq_reif}.
+    ## This removes skill values never required by any job.
     var referencedValues: Table[string, PackedSet[int]]
 
     for ci, con in tr.model.constraints:
@@ -2818,33 +2823,10 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
         if allocDomain.len == 0: continue
         let allocLo = allocDomain[0]
         let allocHi = allocDomain[^1]
-        let nEngs = allocHi  # engineers numbered 1..nEngs (allocLo should be 1)
-
-        # Phase 3: Restrict allocation domain to engineers who can do the job
-        var validEngs: PackedSet[int]
-        for e in pattern.posEngs:
-            validEngs.incl(e)
-        # Add engineers who can learn the required skill
-        for t in 0..<pattern.nTrainingSlots:
-            for i, nsVarName in pattern.nsVarNames[t]:
-                if nsVarName in tr.varPositions:
-                    let nsPos = tr.varPositions[nsVarName]
-                    let nsDom = tr.sys.baseArray.domain[nsPos]
-                    if pattern.requiredSkill in nsDom:
-                        # This engineer's ns var can take the required skill value
-                        # The engineer value is the sorted index + 1 based on detection order
-                        # But we don't directly know the engineer value from nsVarName.
-                        # Instead, use the fact that nsVarNames[t] is ordered by engineer value.
-                        # The detection sorts engineers and adds ns_vars in that order.
-                        # However, we don't store the sorted engineer list in the pattern.
-                        # For now, just add all engineers in the element array — the element
-                        # channel will handle the mapping correctly.
-                        discard  # handled below after element channels
-                elif nsVarName in tr.paramValues:
-                    discard  # constant — won't help
+        let domainRange = allocHi - allocLo + 1  # element array covers allocLo..allocHi
 
         # 1. Create learned_t channel variables (variable-array element)
-        # learned_t = element(alloc - 1, [ns[1,t], ns[2,t], ..., ns[nEngs,t]])
+        # learned_t = element(alloc - allocLo, [ns[eng_lo,t], ..., ns[eng_hi,t]])
         var learnedPositions: seq[int]
         for t in 0..<pattern.nTrainingSlots:
             let channelPos = tr.sys.baseArray.len
@@ -2865,23 +2847,23 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
             v.setDomain(domSeq)
             tr.sys.baseArray.channelPositions.incl(channelPos)
 
-            # Build the element array: one entry per engineer (1..nEngs)
-            # Index = alloc - 1 (alloc is 1-based, array is 0-based)
-            var arrayElems = newSeq[ArrayElement[int]](nEngs)
+            # Build the element array: one entry per domain value (allocLo..allocHi)
+            # Index = alloc - allocLo
+            var arrayElems = newSeq[ArrayElement[int]](domainRange)
             for i, nsVarName in pattern.nsVarNames[t]:
-                # nsVarNames[t][i] is for the i-th engineer in sorted order
-                # We need to map to the correct array position
+                let engVal = pattern.sortedEngs[i]
+                let arrayIdx = engVal - allocLo
                 if nsVarName in tr.varPositions:
                     let nsPos = tr.varPositions[nsVarName]
                     let nsDom = tr.sys.baseArray.domain[nsPos]
                     if nsDom.len == 1:
-                        arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: nsDom[0])
+                        arrayElems[arrayIdx] = ArrayElement[int](isConstant: true, constantValue: nsDom[0])
                     else:
-                        arrayElems[i] = ArrayElement[int](isConstant: false, variablePosition: nsPos)
+                        arrayElems[arrayIdx] = ArrayElement[int](isConstant: false, variablePosition: nsPos)
                 elif nsVarName in tr.paramValues:
-                    arrayElems[i] = ArrayElement[int](isConstant: true, constantValue: tr.paramValues[nsVarName])
+                    arrayElems[arrayIdx] = ArrayElement[int](isConstant: true, constantValue: tr.paramValues[nsVarName])
 
-            let indexExpr = allocExpr - 1
+            let indexExpr = allocExpr - allocLo
             let binding = ChannelBinding[int](
                 channelPosition: channelPos,
                 indexExpression: indexExpr,
@@ -2983,8 +2965,7 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
         tr.sys.addConstraint(sumExpr >= 1)
         inc nConstraints
 
-        # Phase 3: Domain restriction for allocations
-        # Restrict alloc domain to engineers who already have the skill OR
+        # Domain restriction: restrict alloc to engineers who already have the skill OR
         # have at least one training slot whose domain includes the required skill
         var validEngineers: PackedSet[int]
         for e in pattern.posEngs:
@@ -2995,9 +2976,7 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
                     let nsPos = tr.varPositions[nsVarName]
                     let nsDom = tr.sys.baseArray.domain[nsPos]
                     if pattern.requiredSkill in nsDom:
-                        # Engineer at sorted index i+1 can learn this skill
-                        let engVal = i + 1  # engineers are 1-based in sorted order
-                        validEngineers.incl(engVal)
+                        validEngineers.incl(pattern.sortedEngs[i])
         var newDom: seq[int]
         for v in allocDomain:
             if v in validEngineers:
@@ -3139,7 +3118,7 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
 
         # Pattern detected!
         tr.atMostThroughReifDefs.add(AtMostThroughReifDef(
-            allocVarNames: srcVarNames,
+            srcVarNames: srcVarNames,
             targetValue: targetValue,
             maxCount: rhs
         ))
@@ -3166,31 +3145,8 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
 
     # Dead-channel elimination for int_eq_reif outputs that now have no remaining consumers
     if nDetected > 0:
-        # Build reverse index: var name → count of non-consumed constraint references
-        var liveRefCount: Table[string, int]
-        for ci, con in tr.model.constraints:
-            if ci in tr.definingConstraints: continue
-            for arg in con.args:
-                if arg.kind == FznIdent:
-                    liveRefCount.mgetOrPut(arg.ident, 0) += 1
-                elif arg.kind == FznArrayLit:
-                    for elem in arg.elems:
-                        if elem.kind == FznIdent:
-                            liveRefCount.mgetOrPut(elem.ident, 0) += 1
-
-        var deadChannelCount = 0
-        for eqCi in consumedEqReifCIs.items:
-            let con = tr.model.constraints[eqCi]
-            if con.args.len < 3 or con.args[2].kind != FznIdent: continue
-            let bName = con.args[2].ident
-            # If bName has only 1 live reference (in this defining constraint), it's dead
-            let refCount = liveRefCount.getOrDefault(bName, 0)
-            if refCount <= 1:
-                tr.definingConstraints.incl(eqCi)
-                tr.definedVarNames.incl(bName)
-                inc deadChannelCount
-
-        stderr.writeLine(&"[FZN] AtMost-through-reif: {nDetected} patterns detected, {deadChannelCount} int_eq_reif channels eliminated")
+        let (deadCount, _) = tr.eliminateDeadIntEqReifChannels(consumedEqReifCIs)
+        stderr.writeLine(&"[FZN] AtMost-through-reif: {nDetected} patterns detected, {deadCount} int_eq_reif channels eliminated")
 
 
 proc emitAtMostThroughReif*(tr: var FznTranslator) =
@@ -3199,11 +3155,11 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
     for def in tr.atMostThroughReifDefs:
         var positions: seq[int]
         var allFound = true
-        for vn in def.allocVarNames:
+        for vn in def.srcVarNames:
             if vn in tr.varPositions:
                 positions.add(tr.varPositions[vn])
             elif vn in tr.definedVarExprs:
-                # Shouldn't happen for allocation vars, but handle gracefully
+                # Shouldn't happen for source vars, but handle gracefully
                 allFound = false
                 break
             else:
@@ -3215,7 +3171,3 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
 
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] AtMost-through-reif: emitted {nEmitted} direct atMost constraints")
-
-
-
-
