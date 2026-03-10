@@ -3220,3 +3220,214 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
 
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] AtMost-through-reif: emitted {nEmitted} direct atMost constraints")
+
+proc detectArgmaxPattern(tr: var FznTranslator) =
+    ## Detects argmax decomposition patterns from MiniZinc's arg_max:
+    ##   N × int_ne_reif(tower_var, t, ne_var_t) :: defines_var(ne_var_t)
+    ##   N × int_lin_le_reif(coeffs, [max_var, ...], rhs, ne_var_t)
+    ##   1 × array_int_maximum(max_var, signal_array) :: defines_var(max_var)
+    ##
+    ## Replaced by a single element constraint: signal_array[tower-1] == max_var
+    ## This reduces N BooleanType constraints to 1 ElementType per argmax group.
+
+    # Step 1: Index ne_reif channels by source variable.
+    # reifChannelDefs contains CIs of int_eq_reif/int_ne_reif with defines_var.
+    # We only care about int_ne_reif with a constant second arg.
+    var neReifByTowerVar: Table[string, seq[tuple[tValue: int, neVarName: string, ci: int]]]
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_ne_reif":
+            continue
+        if con.args.len < 3:
+            continue
+        # int_ne_reif(tower_var, const_t, ne_var) :: defines_var(ne_var)
+        let towerArg = con.args[0]
+        let valArg = con.args[1]
+        let neArg = con.args[2]
+        if towerArg.kind != FznIdent or neArg.kind != FznIdent:
+            continue
+        # val must be a constant
+        let tVal = try: tr.resolveIntArg(valArg) except ValueError, KeyError: continue
+        let towerVarName = towerArg.ident
+        let neVarName = neArg.ident
+
+        if towerVarName notin neReifByTowerVar:
+            neReifByTowerVar[towerVarName] = @[]
+        neReifByTowerVar[towerVarName].add((tValue: tVal, neVarName: neVarName, ci: ci))
+
+    if neReifByTowerVar.len == 0:
+        return
+
+    # Step 2: Build set of max channel variable names (from array_int_maximum defines_var).
+    var maxChannelVarNames: HashSet[string]
+    var maxVarToCI: Table[string, int]  # max_var_name → CI of array_int_maximum
+    for def in tr.minMaxChannelDefs:
+        if not def.isMin:
+            maxChannelVarNames.incl(def.varName)
+            maxVarToCI[def.varName] = def.ci
+
+    if maxChannelVarNames.len == 0:
+        return
+
+    # Step 3: Index unconsumed int_lin_le_reif by boolean output variable.
+    # These are NOT consumed by detectReifChannels (no defines_var annotation).
+    var linLeReifByBoolVar: Table[string, tuple[ci: int, con: FznConstraint]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le_reif":
+            continue
+        if con.hasAnnotation("defines_var"):
+            continue  # Already consumed by detectReifChannels
+        if con.args.len < 4:
+            continue
+        # int_lin_le_reif(coeffs, vars, rhs, bool_var)
+        let boolArg = con.args[3]
+        if boolArg.kind != FznIdent:
+            continue
+        # Only index if the bool var is a known ne_reif channel output
+        if boolArg.ident in tr.channelVarNames:
+            linLeReifByBoolVar[boolArg.ident] = (ci: ci, con: con)
+
+    if linLeReifByBoolVar.len == 0:
+        return
+
+    # Step 4: Match complete argmax groups.
+    var totalConsumedLinLeReif = 0
+    var totalConsumedNeReif = 0
+
+    for towerVarName, neReifGroup in neReifByTowerVar:
+        if neReifGroup.len < 2:
+            continue  # Need at least 2 entries for a meaningful argmax
+
+        # Try to match each ne_reif to a lin_le_reif
+        var matchedMaxVar = ""
+        var valid = true
+        var linLeCIs: seq[int]
+        var neVarNames: seq[string]
+        var neCIs: seq[int]
+
+        # Sort by tValue to get ordered signal array
+        var sortedGroup = neReifGroup
+        sortedGroup.sort(proc(a, b: auto): int = cmp(a.tValue, b.tValue))
+
+        for entry in sortedGroup:
+            if entry.neVarName notin linLeReifByBoolVar:
+                valid = false
+                break
+
+            let (linLeCi, linLeCon) = linLeReifByBoolVar[entry.neVarName]
+
+            # Extract vars array from lin_le_reif
+            let varsArg = linLeCon.args[1]
+            var varElems: seq[FznExpr]
+            if varsArg.kind == FznArrayLit:
+                varElems = varsArg.elems
+            else:
+                valid = false
+                break
+
+            # Find the max_var among the variables (should have negative coefficient)
+            let coeffs = try: tr.resolveIntArray(linLeCon.args[0]) except ValueError, KeyError: (valid = false; @[0])
+            if not valid:
+                break
+            if coeffs.len != varElems.len or varElems.len < 2:
+                valid = false
+                break
+
+            var foundMaxVar = ""
+            for i in 0..<varElems.len:
+                if varElems[i].kind == FznIdent and varElems[i].ident in maxChannelVarNames and coeffs[i] < 0:
+                    foundMaxVar = varElems[i].ident
+                    break
+
+            if foundMaxVar == "":
+                valid = false
+                break
+
+            if matchedMaxVar == "":
+                matchedMaxVar = foundMaxVar
+            elif matchedMaxVar != foundMaxVar:
+                valid = false
+                break
+
+            linLeCIs.add(linLeCi)
+            neVarNames.add(entry.neVarName)
+            neCIs.add(entry.ci)
+
+        if not valid or matchedMaxVar == "":
+            continue
+
+        # Verify the ne_reif tValues form a contiguous 1..N range
+        var tValues: seq[int]
+        for entry in sortedGroup:
+            tValues.add(entry.tValue)
+        let minT = tValues[0]
+        let maxT = tValues[^1]
+        if maxT - minT + 1 != tValues.len:
+            continue  # Not contiguous
+        for i in 0..<tValues.len:
+            if tValues[i] != minT + i:
+                valid = false
+                break
+        if not valid:
+            continue
+
+        # Get the signal_array from array_int_maximum(max_var, signal_array)
+        if matchedMaxVar notin maxVarToCI:
+            continue
+        let maxCi = maxVarToCI[matchedMaxVar]
+        let maxCon = tr.model.constraints[maxCi]
+        let signalArrayArg = maxCon.args[1]
+        let signalElems = tr.resolveVarArrayElems(signalArrayArg)
+        if signalElems.len != tValues.len:
+            continue  # Signal array size must match number of towers
+
+        # Extract signal variable names in order
+        var signalVarNames: seq[string]
+        var signalValid = true
+        for elem in signalElems:
+            if elem.kind == FznIdent:
+                signalVarNames.add(elem.ident)
+            else:
+                signalValid = false
+                break
+        if not signalValid:
+            continue
+
+        # Pattern detected! Use first lin_le_reif CI as trigger, consume the rest.
+        let triggerCI = linLeCIs[0]
+        tr.argmaxPatterns[triggerCI] = ArgmaxPattern(
+            towerVarName: towerVarName,
+            maxVarName: matchedMaxVar,
+            signalVarNames: signalVarNames,
+            triggerCI: triggerCI
+        )
+
+        # Consume all lin_le_reif CIs except the trigger
+        for i in 1..<linLeCIs.len:
+            tr.definingConstraints.incl(linLeCIs[i])
+
+        # Dead channel cleanup: remove ne_var channels (their only consumer is consumed)
+        for i in 0..<neVarNames.len:
+            tr.channelVarNames.excl(neVarNames[i])
+            tr.definedVarNames.incl(neVarNames[i])
+        # Remove ne_reif CIs from reifChannelDefs
+        var neCIset: PackedSet[int]
+        for ci in neCIs:
+            neCIset.incl(ci)
+        var filteredReifDefs: seq[int]
+        for ci in tr.reifChannelDefs:
+            if ci notin neCIset:
+                filteredReifDefs.add(ci)
+        tr.reifChannelDefs = filteredReifDefs
+
+        totalConsumedLinLeReif += linLeCIs.len
+        totalConsumedNeReif += neVarNames.len
+        stderr.writeLine(&"[FZN] Detected argmax pattern: {towerVarName} = argmax({signalVarNames.len} signals, max={matchedMaxVar})")
+
+    if tr.argmaxPatterns.len > 0:
+        stderr.writeLine(&"[FZN] Argmax detection: {tr.argmaxPatterns.len} groups, consumed {totalConsumedLinLeReif} int_lin_le_reif + {totalConsumedNeReif} int_ne_reif channels")

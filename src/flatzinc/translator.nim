@@ -116,6 +116,16 @@ type
         targetValue*: int              # the shared constant value being counted
         maxCount*: int                 # maximum allowed count (rhs)
 
+    ArgmaxPattern* = object
+        ## A detected argmax decomposition pattern:
+        ## N int_ne_reif(tower, t, ne_t) + N int_lin_le_reif(coeffs, [max_var, ...], rhs, ne_t)
+        ## + array_int_maximum(max_var, signal_array)
+        ## Replaced by a single element constraint: signal_array[tower-1] == max_var
+        towerVarName*: string         # argmax result (search variable)
+        maxVarName*: string           # max(signals) channel variable
+        signalVarNames*: seq[string]  # signal array elements (ordered by tower index 1..N)
+        triggerCI*: int               # first lin_le_reif CI (emission trigger)
+
     FznTranslator* = object
         sys*: ConstraintSystem[int]
         # Maps FZN variable name -> position in the ConstrainedArray
@@ -273,6 +283,8 @@ type
         skillAllocationDefs*: seq[SkillAllocationDef]
         # Detected atMost-through-reification patterns (int_lin_le on int_eq_reif outputs)
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
+        # Detected argmax patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
+        argmaxPatterns*: Table[int, ArgmaxPattern]
         # Rescued defined vars: originally defined-var-only, but appear in var-indexed arrays
         # so need positions. Converted to channel variables with single-input MinMaxChannelBindings.
         rescuedChannelDefs*: seq[tuple[ci: int, varName: string]]
@@ -590,6 +602,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
     result.arrayElementNames = initTable[string, seq[string]]()
     result.countEqPatterns = initTable[int, CountEqPattern]()
+    result.argmaxPatterns = initTable[int, ArgmaxPattern]()
     result.matrixInfos = initTable[string, MatrixInfo]()
     result.definedVarBounds = initTable[string, (int, int)]()
     result.channelVarNames = initHashSet[string]()
@@ -631,6 +644,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
     result.detectReifChannels()
+    # Detect argmax decomposition patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
+    result.detectArgmaxPattern()
     # Detect set_union defines_var patterns → channel variables for set decomposition
     result.detectSetUnionChannels()
     # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
@@ -831,6 +846,15 @@ proc translate*(model: FznModel): FznTranslator =
                     raise newException(KeyError, &"Unknown variable '{vn}' in count_eq pattern")
             let targetPos = result.varPositions[pattern.targetVarName]
             result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
+        elif ci in result.argmaxPatterns:
+            # Emit element constraint for detected argmax pattern: signal_array[tower-1] == max_signal
+            let p = result.argmaxPatterns[ci]
+            let indexExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.towerVarName)) - 1
+            var signalExprs: seq[AlgebraicExpression[int]]
+            for sn in p.signalVarNames:
+                signalExprs.add(result.resolveExprArg(FznExpr(kind: FznIdent, ident: sn)))
+            let maxExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.maxVarName))
+            result.sys.addConstraint(elementExpr(indexExpr, signalExprs, maxExpr))
         else:
             result.translateConstraint(con)
 
