@@ -482,3 +482,92 @@ solve minimize objective;
     # The critical check: objective must be 3, not 0
     let objVal = objExpr.evaluate(tr.sys.assignment)
     check objVal == 3
+
+  test "defined vars in var-indexed arrays rescued as channels":
+    # Regression test: defined vars (is_defined_var, no position) appearing in
+    # arrays indexed by variable expressions (array_var_int_element) must be
+    # rescued as channel variables. Without rescue, resolveMixedArray crashes
+    # because defined vars have no position.
+    #
+    # Model: x1, x2 in 1..3; d1 = x1 + 1 (defined var); d2 = x2 + 1 (defined var).
+    # Array A = [d1, d2, 5]. idx in 1..3, result = A[idx] via array_var_int_element.
+    # Constraint: result == 3 (forces idx to pick an element that equals 3).
+    let src = """
+var 1..3: x1;
+var 1..3: x2;
+var 2..4: d1:: is_defined_var:: var_is_introduced;
+var 2..4: d2:: is_defined_var:: var_is_introduced;
+var 1..3: idx;
+var 2..5: result:: output_var;
+array [1..3] of var int: A = [d1, d2, 5];
+constraint int_lin_eq([1, -1], [d1, x1], 1):: defines_var(d1);
+constraint int_lin_eq([1, -1], [d2, x2], 1):: defines_var(d2);
+constraint array_var_int_element(idx, A, result);
+constraint int_eq(result, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # d1 and d2 should be rescued as channel vars (not defined vars)
+    check "d1" in tr.channelVarNames
+    check "d2" in tr.channelVarNames
+    check "d1" notin tr.definedVarNames
+    check "d2" notin tr.definedVarNames
+    # They should have positions
+    check "d1" in tr.varPositions
+    check "d2" in tr.varPositions
+    # And rescued channel bindings should have been recorded
+    check tr.rescuedChannelDefs.len == 2
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let resultVal = tr.sys.assignment[tr.varPositions["result"]]
+    check resultVal == 3
+
+    # Verify channel propagation: d1 = x1 + 1, d2 = x2 + 1
+    let x1Val = tr.sys.assignment[tr.varPositions["x1"]]
+    let x2Val = tr.sys.assignment[tr.varPositions["x2"]]
+    let d1Val = tr.sys.assignment[tr.varPositions["d1"]]
+    let d2Val = tr.sys.assignment[tr.varPositions["d2"]]
+    check d1Val == x1Val + 1
+    check d2Val == x2Val + 1
+
+  test "rescued channel with defined-var dependency (multi-layer)":
+    # Test that rescued channels correctly inline defined-var dependencies.
+    # d1 = x + 2 (defined var, not in array), d2 = d1 * 2 (rescued, in array).
+    # d2's channel binding should inline d1's expression: d2 = (x + 2) * 2.
+    # Array A = [d2, 10], idx in 1..2, result = A[idx].
+    # Constraint: result == 10 (satisfied by idx=1 when x=3: d1=5, d2=10, or idx=2).
+    let src = """
+var 1..5: x;
+var 3..7: d1:: is_defined_var:: var_is_introduced;
+var 6..14: d2:: is_defined_var:: var_is_introduced;
+var 1..2: idx;
+var 6..14: result:: output_var;
+array [1..2] of var int: A = [d2, 10];
+constraint int_lin_eq([1, -1], [d1, x], 2):: defines_var(d1);
+constraint int_times(d1, 2, d2):: defines_var(d2);
+constraint array_var_int_element(idx, A, result);
+constraint int_eq(result, 10);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Only d2 is rescued (it appears in the var-indexed array)
+    check "d2" in tr.channelVarNames
+    check "d2" in tr.varPositions
+    # d1 stays as a defined var (inlined into d2's channel expression)
+    check "d1" in tr.definedVarNames
+    check "d1" notin tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let resultVal = tr.sys.assignment[tr.varPositions["result"]]
+    check resultVal == 10
+
+    # Verify d2's channel propagation: d2 = (x + 2) * 2
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let d2Val = tr.sys.assignment[tr.varPositions["d2"]]
+    check d2Val == (xVal + 2) * 2

@@ -272,6 +272,9 @@ type
         skillAllocationDefs*: seq[SkillAllocationDef]
         # Detected atMost-through-reification patterns (int_lin_le on int_eq_reif outputs)
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
+        # Rescued defined vars: originally defined-var-only, but appear in var-indexed arrays
+        # so need positions. Converted to channel variables with single-input MinMaxChannelBindings.
+        rescuedChannelDefs*: seq[tuple[ci: int, varName: string]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -604,6 +607,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.outputSetArrays = initHashSet[string]()
     result.skipSetVarNames = initHashSet[string]()
     result.fixedOnePos = -1
+    result.rescuedChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
@@ -1300,6 +1304,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildOneHotChannelBindings()
     # Build channel bindings for array_int_minimum/maximum defines_var
     result.buildMinMaxChannelBindings()
+    # Build channel bindings for rescued defined vars (from var-indexed arrays)
+    result.buildRescuedChannelBindings()
     # Build channel bindings for set_union defines_var (max of boolean pairs)
     result.buildSetUnionChannelBindings()
     # Build channel bindings for case-analysis channels (constant lookup tables)

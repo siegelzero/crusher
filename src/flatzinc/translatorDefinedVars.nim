@@ -286,6 +286,46 @@ proc collectDefinedVars(tr: var FznTranslator) =
         if nDeadChannels > 0:
             stderr.writeLine(&"[FZN] Eliminated {nDeadChannels} dead element channels (unreferenced)")
 
+    # Rescue defined vars that appear in var-indexed arrays.
+    # These need positions for element constraint channel bindings, so convert
+    # them from defined vars (expression-only) to channel vars with positions.
+    block:
+        var rescueNames = initHashSet[string]()
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
+                                        "array_var_bool_element", "array_var_bool_element_nonshifted"]:
+                continue
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            for elem in elems:
+                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                    rescueNames.incl(elem.ident)
+
+        if rescueNames.len > 0:
+            # Find defining constraints for each rescued var
+            for ci, con in tr.model.constraints:
+                if ci notin tr.definingConstraints: continue
+                if con.hasAnnotation("defines_var"):
+                    let ann = con.getAnnotation("defines_var")
+                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                        let definedName = ann.args[0].ident
+                        if definedName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
+                else:
+                    # Handle int_times without defines_var (detected by collectDefinedVars)
+                    let name = stripSolverPrefix(con.name)
+                    if name == "int_times" and con.args.len >= 3 and
+                         con.args[2].kind == FznIdent:
+                        let cName = con.args[2].ident
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+
+            # Move from definedVarNames to channelVarNames
+            for name in rescueNames:
+                tr.definedVarNames.excl(name)
+                tr.channelVarNames.incl(name)
+            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from var-indexed arrays)")
+
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     ## Tries to build the AlgebraicExpression for one defining constraint.
     ## Returns true if successful, false if a dependency is not yet available.

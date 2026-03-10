@@ -761,6 +761,82 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     if tr.sys.baseArray.minMaxChannelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
 
+proc buildRescuedChannelBindings(tr: var FznTranslator) =
+    ## Builds single-input MinMaxChannelBindings for rescued defined vars.
+    ## These are defined vars that appear in var-indexed arrays and need positions.
+    ## Each gets a channel binding: min(expr) = expr (identity for single input).
+    if tr.rescuedChannelDefs.len == 0: return
+
+    var nBuilt = 0
+    for def in tr.rescuedChannelDefs:
+        if def.varName notin tr.varPositions: continue
+        let channelPos = tr.varPositions[def.varName]
+        let con = tr.model.constraints[def.ci]
+        let name = stripSolverPrefix(con.name)
+
+        var expr: AlgebraicExpression[int]
+
+        if name == "int_lin_eq":
+            # Solve: coeffs . vars = rhs for the rescued var
+            let coeffs = tr.resolveIntArray(con.args[0])
+            let varElems = tr.resolveVarArrayElems(con.args[1])
+            let rhs = tr.resolveIntArg(con.args[2])
+
+            # Find the rescued var's index and coefficient
+            var definedIdx = -1
+            for vi, v in varElems:
+                if v.kind == FznIdent and v.ident == def.varName:
+                    definedIdx = vi
+                    break
+            if definedIdx < 0: continue
+
+            let defCoeff = coeffs[definedIdx]
+            # defined = (rhs - sum(other_coeffs * other_vars)) / defCoeff
+            let sign = if defCoeff == 1: -1 else: 1
+
+            var first = true
+            for vi, v in varElems:
+                if vi == definedIdx: continue
+                let otherExpr = tr.resolveExprArg(v)
+                let scaledCoeff = sign * coeffs[vi]
+                let term = scaledCoeff * otherExpr
+                if first:
+                    expr = term
+                    first = false
+                else:
+                    expr = expr + term
+
+            let constTerm = if defCoeff == 1: rhs else: -rhs
+            if constTerm != 0:
+                if first:
+                    expr = newAlgebraicExpression[int](
+                        positions = initPackedSet[int](),
+                        node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
+                        linear = true
+                    )
+                    first = false
+                else:
+                    expr = expr + constTerm
+
+            if expr.isNil: continue
+
+        elif name == "int_abs":
+            # int_abs(a, b) :: defines_var(b) → b = abs(a)
+            expr = abs(tr.resolveExprArg(con.args[0]))
+
+        elif name == "int_times":
+            # int_times(a, b, c) → c = a * b
+            expr = tr.resolveExprArg(con.args[0]) * tr.resolveExprArg(con.args[1])
+
+        else:
+            continue  # unsupported defining constraint type
+
+        tr.sys.baseArray.addMinMaxChannelBinding(channelPos, true, @[expr])
+        inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} rescued channel bindings (from var-indexed arrays)")
+
 proc buildSetUnionChannelBindings(tr: var FznTranslator) =
     ## Builds channel bindings for set_union patterns:
     ## - Individual unions: max(A_bool, B_bool) per boolean
