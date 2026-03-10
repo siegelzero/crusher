@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, strformat, tables]
+import std/[packedsets, random, sequtils, strformat, tables, times]
 import constraints/[stateful, algebraic, ordering, types, tableConstraint]
 import constraints/constraintNode
 import constraints/relationalConstraint
@@ -1880,7 +1880,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     # Collect small-arity constraints for GAC
     const MAX_GAC_ARITY = 12
-    const MAX_GAC_COMBOS = 1_000_000
+    const MAX_GAC_COMBOS = 50_000
+    const GAC_TIME_BUDGET = 1.0  # seconds per outer iteration
     var gacConstraints: seq[int]  # indices into carray.constraints
     for i, cons in carray.constraints:
         if cons.stateType in {AlgebraicType, RelationalType, BooleanType}:
@@ -2060,6 +2061,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     outerChanged = true
                     stderr.writeLine(&"[DomRed] IntDiv: x@{pat.posX} {oldXSize}->{newXSize}, z@{pat.posZ} {oldZSize}->{newZSize}")
 
+        let gacStartTime = epochTime()
         # Phase GAC: Generalized Arc Consistency for small-arity constraints
         # For each constraint, enumerate all value combinations and keep only
         # values that appear in at least one satisfying tuple.
@@ -2072,6 +2074,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         break
 
             for consIdx in gacConstraints:
+                # Time budget check
+                if epochTime() - gacStartTime > GAC_TIME_BUDGET:
+                    break
+
                 let cons = carray.constraints[consIdx]
                 let positions = toSeq(cons.positions.items)
 

@@ -556,11 +556,40 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.definingConstraints.incl(ci)
         tr.leReifChannelDefs.add(ci)
 
+    # Seventh pass: find int_lin_le_reif with defines_var
+    # These define boolean variables as channels: b <-> sum(coeffs*vars) <= rhs
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le_reif" or not con.hasAnnotation("defines_var"):
+            continue
+        # int_lin_le_reif(coeffs, vars, rhs, b) — b is args[3]
+        if con.args.len < 4 or con.args[3].kind != FznIdent:
+            continue
+
+        let bName = con.args[3].ident
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName:
+            continue
+
+        if bName in tr.channelVarNames:
+            continue
+
+        # All variables in args[1] are resolvable: they'll either get a position
+        # (non-defined vars), have a defining expression (definedVarNames from
+        # int_lin_eq etc.), or be a channel variable. No resolvability check needed.
+
+        tr.channelVarNames.incl(bName)
+        tr.definingConstraints.incl(ci)
+        tr.linLeReifChannelDefs.add(ci)
+
     if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or
          tr.boolNotChannelDefs.len > 0 or
          tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
-         tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0:
-        stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolNotChannelDefs.len} bool_not, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif")
+         tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0 or
+         tr.linLeReifChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolNotChannelDefs.len} bool_not, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif, {tr.linLeReifChannelDefs.len} int_lin_le_reif")
 
 
 proc detectSetUnionChannels(tr: var FznTranslator) =

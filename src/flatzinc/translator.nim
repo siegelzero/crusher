@@ -165,6 +165,7 @@ type
         reifChannelDefs*: seq[int]      # int_eq_reif constraint indices (ordered first)
         bool2intChannelDefs*: seq[int]  # bool2int constraint indices (ordered after reif)
         leReifChannelDefs*: seq[int]    # int_le_reif/int_lt_reif channel constraint indices
+        linLeReifChannelDefs*: seq[int] # int_lin_le_reif channel constraint indices
         # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
         implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
         # One-hot channel defs: indicator vars to convert to channels of integer vars
@@ -623,6 +624,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect atMost-through-reification: int_lin_le([1,...,1], [int_eq_reif outputs]) → direct atMost
     # (MUST run after skill-allocation detection and before detectReifChannels)
     result.detectAtMostThroughReif()
+    # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
+    # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
+    result.detectDisjunctivePairs()
+    # Detect disjunctive resource groups (cliques of pairs → cumulative)
+    result.detectDisjunctiveResources()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
     result.detectReifChannels()
     # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -643,10 +649,6 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectImplicationPatterns()
     # Detect conditional gain patterns (reified value assignment → element channel)
     result.detectConditionalGainChannels()
-    # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
-    result.detectDisjunctivePairs()
-    # Detect disjunctive resource groups (cliques of pairs → cumulative)
-    result.detectDisjunctiveResources()
     # Detect NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
     result.detectNoOverlapPatterns()
     # Detect DFA-to-geost pattern (needs paramValues for DFA data)
