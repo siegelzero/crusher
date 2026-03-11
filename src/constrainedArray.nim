@@ -1,5 +1,6 @@
 import std/[packedsets, random, sequtils, strformat, tables, times]
-import constraints/[stateful, algebraic, ordering, types, tableConstraint]
+import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular]
+from constraints/globalCardinality import ExactCounts, BoundedCounts
 import constraints/constraintNode
 import constraints/relationalConstraint
 import constraints/elementState
@@ -2285,6 +2286,175 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if currentDomain[pos].len > 1:
                             currentDomain[pos] = toPackedSet[T]([T(target)])
                             outerChanged = true
+
+        # Phase 5d: GCC (Global Cardinality) domain reduction
+        var gccPruned = 0
+        for cons in carray.constraints:
+            if cons.stateType != GlobalCardinalityType: continue
+            let gcc = cons.globalCardinalityState
+            if gcc.evalMethod != PositionBased: continue
+
+            # Collect non-skipped positions
+            var gccPositions: seq[int]
+            for pos in gcc.positions.items:
+                if pos notin skippedPositions:
+                    gccPositions.add(pos)
+            let nPositions = gccPositions.len
+            if nPositions == 0: continue
+
+            case gcc.constraintType
+            of ExactCounts:
+                var totalTarget = 0
+                for coverVal in gcc.cover:
+                    let target = gcc.targetCounts[coverVal]
+                    totalTarget += target
+                    var forced = 0
+                    var possiblePositions: seq[int]
+                    for pos in gccPositions:
+                        if currentDomain[pos].len == 1 and coverVal in currentDomain[pos]:
+                            forced += 1
+                        if coverVal in currentDomain[pos]:
+                            possiblePositions.add(pos)
+
+                    if forced >= target:
+                        # Value fully assigned — remove from non-singleton positions
+                        for pos in possiblePositions:
+                            if currentDomain[pos].len > 1:
+                                currentDomain[pos].excl(coverVal)
+                                outerChanged = true
+                                inc gccPruned
+
+                    elif possiblePositions.len == target:
+                        # All positions that can take coverVal must take it
+                        for pos in possiblePositions:
+                            if currentDomain[pos].len > 1:
+                                currentDomain[pos] = toPackedSet[T]([coverVal])
+                                outerChanged = true
+
+                # Closed-world: if sum of targets == nPositions, remove non-cover values
+                if totalTarget == nPositions:
+                    let coverSet = toPackedSet[T](gcc.cover)
+                    for pos in gccPositions:
+                        if currentDomain[pos].len > 1:
+                            var pruned = false
+                            for v in toSeq(currentDomain[pos].items):
+                                if v notin coverSet:
+                                    currentDomain[pos].excl(v)
+                                    pruned = true
+                            if pruned:
+                                outerChanged = true
+
+            of BoundedCounts:
+                var totalLB = 0
+                for coverVal in gcc.cover:
+                    let ub = gcc.upperBounds[coverVal]
+                    let lb = gcc.lowerBounds[coverVal]
+                    totalLB += lb
+                    var forced = 0
+                    var possiblePositions: seq[int]
+                    for pos in gccPositions:
+                        if currentDomain[pos].len == 1 and coverVal in currentDomain[pos]:
+                            forced += 1
+                        if coverVal in currentDomain[pos]:
+                            possiblePositions.add(pos)
+
+                    if forced >= ub:
+                        # Upper bound reached — remove from non-singleton positions
+                        for pos in possiblePositions:
+                            if currentDomain[pos].len > 1:
+                                currentDomain[pos].excl(coverVal)
+                                outerChanged = true
+
+                    elif possiblePositions.len <= lb:
+                        # All positions that can take coverVal must take it
+                        for pos in possiblePositions:
+                            if currentDomain[pos].len > 1:
+                                currentDomain[pos] = toPackedSet[T]([coverVal])
+                                outerChanged = true
+
+                # Closed-world: if sum of lower bounds >= nPositions, remove non-cover values
+                if totalLB >= nPositions:
+                    let coverSet = toPackedSet[T](gcc.cover)
+                    for pos in gccPositions:
+                        if currentDomain[pos].len > 1:
+                            var pruned = false
+                            for v in toSeq(currentDomain[pos].items):
+                                if v notin coverSet:
+                                    currentDomain[pos].excl(v)
+                                    pruned = true
+                            if pruned:
+                                outerChanged = true
+
+        # Phase Regular: DFA reachability domain reduction
+        var regPruned, regSkipped = 0
+        for cons in carray.constraints:
+            if cons.stateType != RegularType: continue
+            let reg = cons.regularState
+            let n = reg.n
+            if n == 0: continue
+
+            # Skip if any position is in skippedPositions
+            var hasSkipped = false
+            var maxDomSize = 0
+            for pos in reg.positions.items:
+                if pos in skippedPositions:
+                    hasSkipped = true
+                    break
+                if currentDomain[pos].len > maxDomSize:
+                    maxDomSize = currentDomain[pos].len
+            if hasSkipped:
+                inc regSkipped
+                continue
+
+            # Guard against pathological cases
+            if n * maxDomSize * reg.nStates > 1_000_000:
+                inc regSkipped
+                continue
+
+            # Forward pass: compute reachable states at each position
+            var forwardStates = newSeq[PackedSet[int]](n + 1)
+            forwardStates[0].incl(reg.initialState)
+            for i in 0..<n:
+                let pos = reg.sortedPositions[i]
+                for s in forwardStates[i].items:
+                    for v in currentDomain[pos].items:
+                        let ns = reg.getNextState(s, v)
+                        if ns != 0:
+                            forwardStates[i + 1].incl(ns)
+                if forwardStates[i + 1].len == 0:
+                    break  # Dead end — no reachable states
+
+            # Backward pass: compute states that can reach final states
+            var backwardStates = newSeq[PackedSet[int]](n + 1)
+            backwardStates[n] = reg.finalStates
+            for i in countdown(n - 1, 0):
+                let pos = reg.sortedPositions[i]
+                for s in forwardStates[i].items:
+                    for v in currentDomain[pos].items:
+                        let ns = reg.getNextState(s, v)
+                        if ns != 0 and ns in backwardStates[i + 1]:
+                            backwardStates[i].incl(s)
+
+            # Filter: remove unsupported values
+            for i in 0..<n:
+                let pos = reg.sortedPositions[i]
+                if currentDomain[pos].len <= 1: continue
+                var supported: PackedSet[T]
+                for v in currentDomain[pos].items:
+                    var hasSupport = false
+                    for s in forwardStates[i].items:
+                        let ns = reg.getNextState(s, v)
+                        if ns != 0 and ns in backwardStates[i + 1]:
+                            hasSupport = true
+                            break
+                    if hasSupport:
+                        supported.incl(v)
+                if supported.len < currentDomain[pos].len:
+                    regPruned += currentDomain[pos].len - supported.len
+                    currentDomain[pos] = supported
+                    outerChanged = true
+
+        discard (gccPruned, regPruned, regSkipped)
 
         # Phase: Time-table domain reduction for disjunctive cumulative (limit=1)
         # For each cumulative constraint with limit=1 and all heights=1:

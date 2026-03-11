@@ -2,6 +2,7 @@ import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity]
+from ../constraints/globalCardinality import ExactCounts, BoundedCounts
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -111,6 +112,9 @@ type
         chanPosToDepConstraintIdx: Table[int, seq[int]]
         # Level 2: per constraint, list of one-hot (searchPos, domainIdx) entries it touches
         depConstraintOneHotEntries: seq[seq[tuple[pos: int, domainIdx: int]]]
+
+        # GCC-preserving swap structures
+        gccGroupPositions*: seq[seq[int]]  # search positions per GCC constraint (for GCC-preserving swaps)
 
         # Swap move structures for binary variables
         swapEnabled*: bool
@@ -1825,6 +1829,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.initFlowStructure()
     state.initInverseStructures()
 
+    # Initialize GCC group positions for GCC-preserving swaps
+    state.gccGroupPositions = @[]
+    for constraint in state.constraints:
+        if constraint.stateType == GlobalCardinalityType:
+            let gcc = constraint.globalCardinalityState
+            if gcc.evalMethod == PositionBased:
+                var groupPositions: seq[int]
+                for pos in gcc.positions.items:
+                    if pos notin carray.channelPositions:
+                        groupPositions.add(pos)
+                if groupPositions.len >= 2:
+                    state.gccGroupPositions.add(groupPositions)
+    if state.gccGroupPositions.len > 0 and verbose and id == 0:
+        echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
+            $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len)
+
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
@@ -2572,6 +2592,21 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via chain")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Try GCC-preserving swap moves periodically during stagnation
+        if state.gccGroupPositions.len > 0 and
+           state.iteration - lastImprovement >= 10 and
+           (state.iteration - lastImprovement) mod 10 == 0:
+            if state.tryGCCSwapMoves():
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via GCC swap")
                         state.lastImprovementIter = lastImprovement
                         return state
 

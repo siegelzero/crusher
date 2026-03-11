@@ -322,3 +322,88 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
     if oldIdx2 >= 0 and not state.isLazy[p2]:
         state.tabu[p2][oldIdx2] = tabuTenure
     return true
+
+
+proc tryGCCSwapMoves[T](state: TabuState[T]): bool =
+    ## Try value-exchange swaps within GCC groups.
+    ## Swapping values between positions in the same GCC group preserves
+    ## GCC cardinality counts by construction, allowing the search to fix
+    ## other constraints without disturbing GCC satisfaction.
+    const MAX_SWAP_EVALS = 3000
+
+    var bestDelta = 0
+    var bestSwaps: seq[(int, int)] = @[]
+    var evalsCount = 0
+
+    for group in state.gccGroupPositions:
+        for i in 0..<group.len:
+            let p1 = group[i]
+            # Only consider violated positions as sources
+            if state.violationCount[p1] == 0 and
+               (p1 >= state.channelDepPenalties.len or
+                state.channelDepPenalties[p1].len == 0):
+                continue
+            let val1 = state.assignment[p1]
+
+            for j in (i+1)..<group.len:
+                let p2 = group[j]
+                let val2 = state.assignment[p2]
+                if val1 == val2:
+                    continue
+
+                # Check both values are in each other's domain
+                let idx1 = state.domainIndex[p1].getOrDefault(val2, -1)
+                let idx2 = state.domainIndex[p2].getOrDefault(val1, -1)
+                if idx1 < 0 or idx2 < 0:
+                    continue
+
+                # Simulate swap via assignValueLean
+                let origCost = state.cost
+                state.assignValueLean(p1, val2)
+                state.assignValueLean(p2, val1)
+                let delta = state.cost - origCost
+                # Restore
+                state.assignValueLean(p2, val2)
+                state.assignValueLean(p1, val1)
+
+                inc evalsCount
+
+                # Tabu check
+                let tabu1 = not state.isLazy[p1] and state.tabu[p1][idx1] > state.iteration
+                let tabu2 = not state.isLazy[p2] and state.tabu[p2][idx2] > state.iteration
+                let aspiration = origCost + delta < state.bestCost
+                if tabu1 and tabu2 and not aspiration:
+                    continue
+
+                if delta < bestDelta:
+                    bestDelta = delta
+                    bestSwaps = @[(p1, p2)]
+                elif delta == bestDelta and delta < 0:
+                    bestSwaps.add((p1, p2))
+
+                if evalsCount >= MAX_SWAP_EVALS:
+                    break
+            if evalsCount >= MAX_SWAP_EVALS:
+                break
+        if evalsCount >= MAX_SWAP_EVALS:
+            break
+
+    if bestSwaps.len == 0:
+        return false
+
+    # Apply the best swap
+    let (p1, p2) = sample(bestSwaps)
+    let oldVal1 = state.assignment[p1]
+    let oldVal2 = state.assignment[p2]
+    state.assignValue(p1, oldVal2)
+    state.assignValue(p2, oldVal1)
+
+    # Set tabu on old values
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
+    if oldIdx1 >= 0 and not state.isLazy[p1]:
+        state.tabu[p1][oldIdx1] = tabuTenure
+    let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
+    if oldIdx2 >= 0 and not state.isLazy[p2]:
+        state.tabu[p2][oldIdx2] = tabuTenure
+    return true

@@ -80,7 +80,7 @@ proc newRegularConstraint*[T](positions: openArray[int],
 # DFA simulation
 ################################################################################
 
-proc getNextState[T](state: RegularConstraint[T], dfaState: int, inputVal: T): int {.inline.} =
+proc getNextState*[T](state: RegularConstraint[T], dfaState: int, inputVal: T): int {.inline.} =
     ## Returns next DFA state given current state and input value.
     ## Returns 0 (fail state) if input is out of range or state is invalid.
     if dfaState <= 0 or dfaState > state.nStates:
