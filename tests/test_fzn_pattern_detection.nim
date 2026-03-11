@@ -356,6 +356,110 @@ solve satisfy;
         # 15 - 27 = -12 <= 0 → true
         check bVal == 1
 
+    test "int_lin_eq_reif channel — true case":
+        ## int_lin_eq_reif([2,1], [x,y], 4, b) :: defines_var(b) → b = (2x+y == 4)
+        let src = """
+var 1..5: x :: output_var;
+var 1..5: y :: output_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq_reif([2,1],[x,y],4,b) :: defines_var(b);
+constraint int_eq(x, 1);
+constraint int_eq(y, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+        check tr.linEqReifChannelDefs.len >= 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        check bVal == 1  # 2*1 + 2 = 4 == 4 → true
+
+    test "int_lin_eq_reif channel — false case":
+        ## int_lin_eq_reif([3,1], [x,y], 5, b) :: defines_var(b) → b = (3x+y == 5)
+        let src = """
+var 1..5: x :: output_var;
+var 1..5: y :: output_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq_reif([3,1],[x,y],5,b) :: defines_var(b);
+constraint int_eq(x, 2);
+constraint int_eq(y, 3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        check bVal == 0  # 3*2 + 3 = 9 != 5 → false
+
+    test "int_lin_eq_reif channel — with defined var inputs":
+        ## Variables in the linear expression are defined vars (from int_lin_eq).
+        ## b = (pad1 - pad2 == 0) where pad = 13*row + col
+        let src = """
+var 1..3: r1 :: output_var;
+var 1..5: c1 :: output_var;
+var 1..3: r2 :: output_var;
+var 1..5: c2 :: output_var;
+var int: pad1 :: is_defined_var;
+var int: pad2 :: is_defined_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq([13,1,-1],[r1,c1,pad1],0) :: defines_var(pad1);
+constraint int_lin_eq([13,1,-1],[r2,c2,pad2],0) :: defines_var(pad2);
+constraint int_lin_eq_reif([1,-1],[pad1,pad2],0,b) :: defines_var(b);
+constraint int_eq(r1, 2);
+constraint int_eq(c1, 3);
+constraint int_eq(r2, 2);
+constraint int_eq(c2, 3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+        check "pad1" in tr.definedVarNames
+        check "pad2" in tr.definedVarNames
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        # pad1 = 13*2 + 3 = 29, pad2 = 13*2 + 3 = 29
+        # 29 - 29 = 0 == 0 → true
+        check bVal == 1
+
+    test "int_lin_eq_reif channel — with defined var inputs (false)":
+        ## b = (pad1 - pad2 == 0) where pads differ
+        let src = """
+var 1..3: r1 :: output_var;
+var 1..5: c1 :: output_var;
+var 1..3: r2 :: output_var;
+var 1..5: c2 :: output_var;
+var int: pad1 :: is_defined_var;
+var int: pad2 :: is_defined_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq([13,1,-1],[r1,c1,pad1],0) :: defines_var(pad1);
+constraint int_lin_eq([13,1,-1],[r2,c2,pad2],0) :: defines_var(pad2);
+constraint int_lin_eq_reif([1,-1],[pad1,pad2],0,b) :: defines_var(b);
+constraint int_eq(r1, 1);
+constraint int_eq(c1, 2);
+constraint int_eq(r2, 2);
+constraint int_eq(c2, 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        # pad1 = 13*1 + 2 = 15, pad2 = 13*2 + 1 = 27
+        # 15 - 27 = -12 != 0 → false
+        check bVal == 0
+
     test "bool_clause_reif channel":
         ## bool_clause_reif([a], [b], r) :: defines_var(r) → r is a channel (r = a OR NOT b)
         let src = """
