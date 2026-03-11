@@ -4,7 +4,8 @@
 ##   detectImplicationPatterns, detectDisjunctivePairs,
 ##   detectDisjunctiveResources, detectRedundantOrderings,
 ##   detectInversePatterns, detectInverseChannelPatterns,
-##   tryTableFunctionalDep (generalized key column detection).
+##   tryTableFunctionalDep (generalized key column detection),
+##   detectMaxFromLinLe, tightenDiffnTimeProfile.
 
 import unittest
 import std/[sequtils, algorithm, sets, tables, strutils, packedsets]
@@ -916,3 +917,347 @@ solve satisfy;
 
         # Missing ne2's lin_le_reif → pattern should NOT be detected
         check tr.argmaxPatterns.len == 0
+
+suite "FlatZinc Max-from-LinLe Detection":
+
+    test "detectMaxFromLinLe: basic D = max(y_i + offset_i) pattern":
+        ## 4 constraints: int_lin_le([1,-1], [y_i, D], -offset_i)
+        ## encode D >= y_i + offset_i. With minimize objective = D,
+        ## D becomes a max channel = max(y1+3, y2+2, y3+4, y4+1).
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: y4 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_le([1,-1],[y4,D],-1);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+constraint int_eq(y1, 5);
+constraint int_eq(y2, 10);
+constraint int_eq(y3, 3);
+constraint int_eq(y4, 15);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D should be detected as a max channel
+        check tr.maxFromLinLeDefs.len == 1
+        check tr.maxFromLinLeDefs[0].ceilingVarName == "D"
+        check tr.maxFromLinLeDefs[0].sourceVarNames.len == 4
+        check "D" in tr.channelVarNames
+        # D should NOT be in definedVarNames (needs a position for channel binding)
+        check "D" notin tr.definedVarNames
+
+        # The 4 int_lin_le constraints should be consumed
+        for ci in tr.maxFromLinLeDefs[0].consumedCIs:
+            check ci in tr.definingConstraints
+
+        # Solve and verify: D = max(5+3, 10+2, 3+4, 15+1) = max(8,12,7,16) = 16
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let dVal = tr.sys.assignment[tr.varPositions["D"]]
+        check dVal == 16
+
+    test "detectMaxFromLinLe: reversed coefficient order [−1, 1]":
+        ## Same pattern but with coefficients [-1, 1] instead of [1, -1].
+        ## int_lin_le([-1,1], [D, y_i], -offset_i) → -D + y_i <= -offset → D >= y_i + offset
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([-1,1],[D,y1],-3);
+constraint int_lin_le([-1,1],[D,y2],-5);
+constraint int_lin_le([-1,1],[D,y3],-2);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+constraint int_eq(y1, 4);
+constraint int_eq(y2, 6);
+constraint int_eq(y3, 10);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 1
+        check tr.maxFromLinLeDefs[0].ceilingVarName == "D"
+
+        # D = max(4+3, 6+5, 10+2) = max(7, 11, 12) = 12
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let dVal = tr.sys.assignment[tr.varPositions["D"]]
+        check dVal == 12
+
+    test "detectMaxFromLinLe: not detected for satisfy problems":
+        ## The pattern should only activate for minimize problems.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" notin tr.channelVarNames
+
+    test "detectMaxFromLinLe: not detected when ceiling is not minimized":
+        ## D does not appear in the objective at all — only Z does.
+        ## Pattern should not match because D is not a minimized variable.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var 1..50: Z :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_eq([1,-1],[objective,Z],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D is not in the objective, so it's not a minimized variable
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" notin tr.channelVarNames
+
+    test "detectMaxFromLinLe: group too small (2 constraints) is not detected":
+        ## Need at least 3 int_lin_le constraints to qualify.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 0
+
+    test "detectMaxFromLinLe: multi-component objective":
+        ## objective = D + S where both D and S are minimized.
+        ## Only D has the int_lin_le pattern; S is just a plain variable.
+        ## D should be detected, S should not.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var 1..50: S :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_eq([1,-1,-1],[objective,D,S],0) :: defines_var(objective);
+constraint int_eq(y1, 5);
+constraint int_eq(y2, 10);
+constraint int_eq(y3, 3);
+constraint int_eq(S, 7);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 1
+        check tr.maxFromLinLeDefs[0].ceilingVarName == "D"
+        check "D" in tr.channelVarNames
+        check "S" notin tr.channelVarNames
+
+        # D = max(5+3, 10+2, 3+4) = 12, objective = D + S = 12 + 7 = 19
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let dVal = tr.sys.assignment[tr.varPositions["D"]]
+        check dVal == 12
+
+    test "detectMaxFromLinLe: zero offset handled correctly":
+        ## int_lin_le([1,-1], [y_i, D], 0) → D >= y_i (offset = 0)
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],0);
+constraint int_lin_le([1,-1],[y2,D],0);
+constraint int_lin_le([1,-1],[y3,D],0);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+constraint int_eq(y1, 5);
+constraint int_eq(y2, 10);
+constraint int_eq(y3, 3);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 1
+        # All offsets should be 0
+        for o in tr.maxFromLinLeDefs[0].offsets:
+            check o == 0
+
+        # D = max(5, 10, 3) = 10
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let dVal = tr.sys.assignment[tr.varPositions["D"]]
+        check dVal == 10
+
+suite "FlatZinc Diffn Time Profile Tightening":
+
+    test "tightenDiffnTimeProfile: constant x/dx/dy tightens ceiling domain":
+        ## 3 rectangles with constant x, dx, dy placed at x=0..9:
+        ##   rect 0: x=0, dx=5, dy=3  (covers x=[0,5), contributes 3 to load)
+        ##   rect 1: x=3, dx=4, dy=2  (covers x=[3,7), contributes 2 to load)
+        ##   rect 2: x=6, dx=4, dy=4  (covers x=[6,10), contributes 4 to load)
+        ## Time profile: at x=3..5 load=5 (rects 0+1), at x=6..7 load=6 (rects 1+2)
+        ## max_load = 6. So D (ceiling) domain should be tightened to >= 6.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint fzn_diffn([0,3,6],[y1,y2,y3],[5,4,4],[3,2,4]);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D should be a max channel
+        check tr.maxFromLinLeDefs.len == 1
+        check "D" in tr.channelVarNames
+
+        # D's domain should be tightened: values < 6 removed
+        let dPos = tr.varPositions["D"]
+        let dDom = tr.sys.baseArray.domain[dPos]
+        check dDom[0] >= 6  # first value in domain is at least 6
+
+    test "tightenDiffnTimeProfile: no tightening without max-from-lin-le":
+        ## If there's no max-from-lin-le pattern, tightenDiffnTimeProfile
+        ## should not crash or modify anything (satisfy problem).
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+constraint fzn_diffn([0,3],[y1,y2],[5,4],[3,2]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 0
+        # Should solve without errors
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    test "tightenDiffnTimeProfile: non-constant x/dx skipped":
+        ## When x or dx are variables (not constants), the time profile
+        ## tightening should be skipped (only applies to all-constant cases).
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: x1 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint fzn_diffn([x1,3,6],[y1,y2,y3],[5,4,4],[3,2,4]);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D is still a max channel (from int_lin_le pattern)
+        check tr.maxFromLinLeDefs.len == 1
+        # But domain is NOT tightened by time profile (x1 is variable)
+        let dPos = tr.varPositions["D"]
+        let dDom = tr.sys.baseArray.domain[dPos]
+        check dDom[0] == 1  # domain starts at 1, no tightening
+
+suite "FlatZinc int_lin_le_reif Multi-Position Bounds":
+
+    test "int_lin_le_reif channel — 3-position defined var input":
+        ## b = (pad1 - pad2 <= 0) where pad = 7*r + 3*c + z
+        ## pad has 3 positions (r, c, z). The bounds computation must
+        ## linearize the multi-position expression correctly.
+        let src = """
+var 1..3: r1 :: output_var;
+var 1..5: c1 :: output_var;
+var 1..2: z1 :: output_var;
+var 1..3: r2 :: output_var;
+var 1..5: c2 :: output_var;
+var 1..2: z2 :: output_var;
+var int: pad1 :: is_defined_var;
+var int: pad2 :: is_defined_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq([7,3,1,-1],[r1,c1,z1,pad1],0) :: defines_var(pad1);
+constraint int_lin_eq([7,3,1,-1],[r2,c2,z2,pad2],0) :: defines_var(pad2);
+constraint int_lin_le_reif([1,-1],[pad1,pad2],0,b) :: defines_var(b);
+constraint int_eq(r1, 1);
+constraint int_eq(c1, 1);
+constraint int_eq(z1, 1);
+constraint int_eq(r2, 3);
+constraint int_eq(c2, 5);
+constraint int_eq(z2, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+
+        # pad1 = 7*1 + 3*1 + 1 = 11, pad2 = 7*3 + 3*5 + 2 = 38
+        # 11 - 38 = -27 <= 0 → true
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        check bVal == 1
+
+    test "int_lin_le_reif channel — 3-position false case":
+        ## Same structure but values arranged so the reif result is false.
+        let src = """
+var 1..3: r1 :: output_var;
+var 1..5: c1 :: output_var;
+var 1..2: z1 :: output_var;
+var 1..3: r2 :: output_var;
+var 1..5: c2 :: output_var;
+var 1..2: z2 :: output_var;
+var int: pad1 :: is_defined_var;
+var int: pad2 :: is_defined_var;
+var bool: b :: output_var :: is_defined_var;
+constraint int_lin_eq([7,3,1,-1],[r1,c1,z1,pad1],0) :: defines_var(pad1);
+constraint int_lin_eq([7,3,1,-1],[r2,c2,z2,pad2],0) :: defines_var(pad2);
+constraint int_lin_le_reif([1,-1],[pad1,pad2],0,b) :: defines_var(b);
+constraint int_eq(r1, 3);
+constraint int_eq(c1, 5);
+constraint int_eq(z1, 2);
+constraint int_eq(r2, 1);
+constraint int_eq(c2, 1);
+constraint int_eq(z2, 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check "b" in tr.channelVarNames
+
+        # pad1 = 7*3 + 3*5 + 2 = 38, pad2 = 7*1 + 3*1 + 1 = 11
+        # 38 - 11 = 27 > 0 → false
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let bVal = tr.sys.assignment[tr.varPositions["b"]]
+        check bVal == 0
