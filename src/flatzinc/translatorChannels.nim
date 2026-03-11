@@ -2224,7 +2224,7 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
             else:
                 indexExpr = indexExpr + term
         if not hasTerms:
-            # Only one condition (n=1): index is always 0
+            # n=1 should not occur (detection requires entries.len >= 2), but handle defensively
             indexExpr = newAlgebraicExpression[int](
                 positions=initPackedSet[int](),
                 node=ExpressionNode[int](kind: LiteralNode, value: 0),

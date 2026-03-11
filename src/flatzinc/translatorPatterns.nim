@@ -4203,8 +4203,12 @@ proc detectConditionalImplicationChannels*(tr: var FznTranslator) =
             if e0.condChannel notin linLeReifMap or e1.condChannel notin linLeReifMap: continue
             let info0 = linLeReifMap[e0.condChannel]
             let info1 = linLeReifMap[e1.condChannel]
-            # Check complementarity: swapped variable order, same rhs
-            if not (info0.varA == info1.varB and info0.varB == info1.varA and info0.rhs == info1.rhs):
+            # Check complementarity: swapped variable order, rhs=-1 (strict <)
+            # rhs=-1 ensures A-B <= -1 i.e. A < B, making the two conditions truly
+            # complementary (exactly one is true). Other rhs values (e.g. 0 for <=)
+            # would allow both conditions to be true when A == B.
+            if info0.rhs != -1 or info1.rhs != -1: continue
+            if not (info0.varA == info1.varB and info0.varB == info1.varA):
                 continue
             # e0.condChannel = (info0.varA < info0.varB)  [rhs=-1 means strict <]
             # When cond0=1: target = e0.testVal

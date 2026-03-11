@@ -234,7 +234,6 @@ type
             cdCascadeFallbackTime*: float
             cdCascadeCalls*: int64
             cdFastPathCalls*: int64
-            cdElemDepCalls*: int64
             cdIncCalls*: int64          # incremental cascade eval calls
             cdIncSkipped*: int64        # total entries×domvals skipped (used cached)
             cdIncEvaluated*: int64      # total entries×domvals actually evaluated
@@ -2691,7 +2690,6 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         state.cdCascadeFallbackTime = 0
         state.cdCascadeCalls = 0
         state.cdFastPathCalls = 0
-        state.cdElemDepCalls = 0
         state.cdIncCalls = 0
         state.cdIncSkipped = 0
         state.cdIncEvaluated = 0

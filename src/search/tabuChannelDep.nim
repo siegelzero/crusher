@@ -779,6 +779,19 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
                 state.penaltyMap[pos][i] += delta
         when ProfileIteration: state.cdCascadeCalls += 1
         return
+    if anyDepChanged:
+        # External deps changed but no min/max entries to fast-path — full cascade recompute.
+        # (Shouldn't happen: min/max-only deps imply min/max entries, but handle defensively.)
+        let domain = state.sharedDomain[][pos]
+        var oldPenalties = newSeq[int](domain.len)
+        for i in 0..<domain.len:
+            oldPenalties[i] = state.channelDepPenalties[pos][i]
+        state.computeChannelDepPenaltiesAt(pos)
+        for i in 0..<domain.len:
+            let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
+            if delta != 0:
+                state.penaltyMap[pos][i] += delta
+        return
     if not anyDepChanged:
         # No external deps changed — uniform delta is exact
         when ProfileIteration: state.cdUniformCalls += 1
