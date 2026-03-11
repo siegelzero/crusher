@@ -3436,20 +3436,14 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
     if tr.argmaxPatterns.len > 0:
         stderr.writeLine(&"[FZN] Argmax detection: {tr.argmaxPatterns.len} groups, consumed {totalConsumedLinLeReif} int_lin_le_reif + {totalConsumedNeReif} int_ne_reif channels")
 
-proc detectMaxFromLinLe*(tr: var FznTranslator) =
-    ## Detects max-from-lin-le patterns:
-    ## Multiple int_lin_le([1,-1], [source, ceiling], -offset) encode ceiling >= source + offset.
-    ## When the ceiling variable is minimized, it equals max(source_i + offset_i).
-    ## Makes ceiling a max channel, eliminating all those constraints.
+proc findMinimizedVarNames*(tr: FznTranslator): HashSet[string] =
+    ## Finds variables that are minimized in the objective function.
+    ## Scans for the objective's defining int_lin_eq and returns the set of variable names
+    ## whose coefficients have the opposite sign to the objective variable's coefficient.
     if tr.model.solve.kind != Minimize: return
     if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent: return
     let objName = tr.model.solve.objective.ident
 
-    # Find the objective's defining int_lin_eq to identify minimized variables.
-    # int_lin_eq(coeffs, vars, rhs) with defines_var(objName):
-    # objName = rhs - sum(coeff_i * var_i for i != obj) / coeff_obj
-    # Variables with negative coefficients (when obj has positive coeff) are minimized.
-    var minimizedVarNames: HashSet[string]
     for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
@@ -3473,14 +3467,18 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
         for i, v in varElems:
             if i == objIdx: continue
             if v.kind != FznIdent: continue
-            # For minimize: obj * objCoeff + var * coeff = rhs
-            # obj = (rhs - var * coeff) / objCoeff
-            # If objCoeff > 0 and coeff < 0 → obj grows with var (var is added), so var is minimized
-            # If objCoeff < 0 and coeff > 0 → same logic (negated)
             if (objCoeff > 0 and coeffs[i] < 0) or (objCoeff < 0 and coeffs[i] > 0):
-                minimizedVarNames.incl(v.ident)
+                result.incl(v.ident)
         break
 
+proc detectMaxFromLinLe*(tr: var FznTranslator) =
+    ## Detects max-from-lin-le patterns:
+    ## Multiple int_lin_le([1,-1], [source, ceiling], -offset) encode ceiling >= source + offset.
+    ## When the ceiling variable is minimized, it equals max(source_i + offset_i).
+    ## Makes ceiling a max channel, eliminating all those constraints.
+    if tr.model.solve.kind != Minimize: return
+
+    var minimizedVarNames = tr.findMinimizedVarNames()
     if minimizedVarNames.len == 0: return
 
     # Scan all unconsumed int_lin_le constraints.
@@ -3563,7 +3561,6 @@ proc emitMaxFromLinLeChannels*(tr: var FznTranslator) =
         let ceilingPos = tr.varPositions[def.ceilingVarName]
 
         var inputExprs: seq[AlgebraicExpression[int]]
-        var allResolved = true
         for i, srcName in def.sourceVarNames:
             let srcExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: srcName))
             if def.offsets[i] != 0:
@@ -3571,7 +3568,6 @@ proc emitMaxFromLinLeChannels*(tr: var FznTranslator) =
             else:
                 inputExprs.add(srcExpr)
 
-        if not allResolved: continue
         tr.sys.baseArray.addMinMaxChannelBinding(ceilingPos, isMin = false, inputExprs)
         inc nEmitted
 
@@ -3585,33 +3581,8 @@ proc detectSpreadPattern*(tr: var FznTranslator) =
     ## When S is minimized, replaced by: topVar = max(y_i + offset_i), botVar = min(y_i + offset_i),
     ## and a single constraint topVar - botVar <= S.
     if tr.model.solve.kind != Minimize: return
-    if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent: return
-    let objName = tr.model.solve.objective.ident
 
-    # Build minimizedVarNames set (same logic as detectMaxFromLinLe)
-    var minimizedVarNames: HashSet[string]
-    for ci, con in tr.model.constraints:
-        let name = stripSolverPrefix(con.name)
-        if name != "int_lin_eq": continue
-        if not con.hasAnnotation("defines_var"): continue
-        let ann = con.getAnnotation("defines_var")
-        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
-        if ann.args[0].ident != objName: continue
-        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
-        let varElems = tr.resolveVarArrayElems(con.args[1])
-        if coeffs.len != varElems.len: continue
-        var objIdx = -1
-        for i, v in varElems:
-            if v.kind == FznIdent and v.ident == objName:
-                objIdx = i; break
-        if objIdx < 0: continue
-        let objCoeff = coeffs[objIdx]
-        for i, v in varElems:
-            if i == objIdx: continue
-            if v.kind != FznIdent: continue
-            if (objCoeff > 0 and coeffs[i] < 0) or (objCoeff < 0 and coeffs[i] > 0):
-                minimizedVarNames.incl(v.ident)
-        break
+    var minimizedVarNames = tr.findMinimizedVarNames()
 
     # Also include variables that are already detected as max-from-lin-le ceilings
     # (they contribute to objective through the max channel)
@@ -3637,8 +3608,10 @@ proc detectSpreadPattern*(tr: var FznTranslator) =
 
         let varElems = tr.resolveVarArrayElems(con.args[1])
         if varElems.len != 3: continue
+        var allIdent = true
         for v in varElems:
-            if v.kind != FznIdent: continue
+            if v.kind != FznIdent: allIdent = false; break
+        if not allIdent: continue
 
         let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
 
@@ -3745,7 +3718,6 @@ proc emitSpreadPatternChannels*(tr: var FznTranslator) =
         # Build input expressions for max and min channels
         var topInputExprs: seq[AlgebraicExpression[int]]
         var botInputExprs: seq[AlgebraicExpression[int]]
-        var allResolved = true
         for i, srcName in def.sourceVarNames:
             let srcExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: srcName))
             if def.offsets[i] != 0:
@@ -3753,8 +3725,6 @@ proc emitSpreadPatternChannels*(tr: var FznTranslator) =
             else:
                 topInputExprs.add(srcExpr)
             botInputExprs.add(srcExpr)
-
-        if not allResolved: continue
 
         # Create auxiliary max channel variable (topVar)
         let topPos = tr.sys.baseArray.len
@@ -3821,13 +3791,25 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
         if xVals.len != dxVals.len or xVals.len != dyVals.len: continue
         if xVals.len == 0: continue
 
+        # Collect y-variable names from the diffn constraint for source matching
+        let yElems = tr.resolveVarArrayElems(con.args[1])
+        var diffnYVarNames: HashSet[string]
+        for elem in yElems:
+            if elem.kind == FznIdent:
+                diffnYVarNames.incl(elem.ident)
+
         # Compute time profile via sweep-line
         type Event = tuple[time, delta: int]
         var events: seq[Event]
         for i in 0..<xVals.len:
             events.add((time: xVals[i], delta: dyVals[i]))
             events.add((time: xVals[i] + dxVals[i], delta: -dyVals[i]))
-        events.sort(proc(a, b: Event): int = cmp(a.time, b.time))
+        events.sort(proc(a, b: Event): int =
+            result = cmp(a.time, b.time)
+            if result == 0:
+                # Process end events (negative delta) before start events (positive delta)
+                result = cmp(a.delta, b.delta)
+        )
 
         var maxLoad = 0
         var currentLoad = 0
@@ -3840,8 +3822,14 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Diffn time profile: max_load = {maxLoad} ({xVals.len} rectangles)")
 
         # Tighten ceiling variable domains from max-from-lin-le patterns
+        # Only apply when the pattern's source variables overlap with the diffn's y-variables
         for def in tr.maxFromLinLeDefs:
             if def.ceilingVarName notin tr.varPositions: continue
+            var hasOverlap = false
+            for srcName in def.sourceVarNames:
+                if srcName in diffnYVarNames:
+                    hasOverlap = true; break
+            if not hasOverlap: continue
             let ceilingPos = tr.varPositions[def.ceilingVarName]
             let currentDom = tr.sys.baseArray.domain[ceilingPos]
             if currentDom.len == 0: continue

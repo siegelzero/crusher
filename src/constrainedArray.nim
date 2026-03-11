@@ -1750,10 +1750,12 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     eventDeltas.add(dy)
                     eventTimes.add(x + dx)
                     eventDeltas.add(-dy)
-                # Insertion sort by time (small arrays, avoids closure issues)
+                # Insertion sort by time, then by delta (end events before start events
+                # at the same time to avoid inflating max load)
                 for i in 1..<eventTimes.len:
                     var j = i
-                    while j > 0 and eventTimes[j] < eventTimes[j-1]:
+                    while j > 0 and (eventTimes[j] < eventTimes[j-1] or
+                                     (eventTimes[j] == eventTimes[j-1] and eventDeltas[j] < eventDeltas[j-1])):
                         swap(eventTimes[j], eventTimes[j-1])
                         swap(eventDeltas[j], eventDeltas[j-1])
                         dec j

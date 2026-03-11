@@ -652,6 +652,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectCountPatterns()
     # Detect max-from-lin-le patterns (ceiling >= source + offset → max channel)
     result.detectMaxFromLinLe()
+    # NOTE: detectSpreadPattern is intentionally NOT called here.
+    # It removes pairwise int_lin_le constraints that provide useful gradient information
+    # for tabu search. The max/min channel replacement loses per-pair penalty signals.
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
     # Detect skill-allocation disjunctive patterns (MUST run before detectReifChannels
@@ -717,6 +720,7 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit max channels for detected max-from-lin-le patterns
     if result.maxFromLinLeDefs.len > 0:
         result.emitMaxFromLinLeChannels()
+    # NOTE: emitSpreadPatternChannels intentionally not called (see detection note above)
     # Tighten domains from diffn time profile analysis
     result.tightenDiffnTimeProfile()
     # Prune admission domains using zero-capacity day detection
