@@ -193,6 +193,7 @@ type
         bool2intChannelDefs*: seq[int]  # bool2int constraint indices (ordered after reif)
         leReifChannelDefs*: seq[int]    # int_le_reif/int_lt_reif channel constraint indices
         linLeReifChannelDefs*: seq[int] # int_lin_le_reif channel constraint indices
+        linEqReifChannelDefs*: seq[int] # int_lin_eq_reif channel constraint indices
         # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
         implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
         # One-hot channel defs: indicator vars to convert to channels of integer vars
@@ -686,6 +687,18 @@ proc translate*(model: FznModel): FznTranslator =
             prevCount = result.caseAnalysisDefs.len
             result.detectCaseAnalysisChannels()
             inc iterations
+    # Detect int_lin_eq_reif defines_var patterns → channel variables
+    # MUST run after case-analysis fixpoint (which uses int_lin_eq_reif via linEqReifMap)
+    result.detectLinEqReifChannels()
+    # Re-run case-analysis: new int_lin_eq_reif channels may enable
+    # additional case-analysis detection (e.g., alone predicate outputs)
+    block:
+        var prevCount = -1
+        var iterations = 0
+        while result.caseAnalysisDefs.len != prevCount and iterations < 10:
+            prevCount = result.caseAnalysisDefs.len
+            result.detectCaseAnalysisChannels()
+            inc iterations
     # Detect implication-to-table and one-hot channel patterns
     result.detectImplicationPatterns()
     # Detect conditional gain patterns (reified value assignment → element channel)
@@ -723,6 +736,8 @@ proc translate*(model: FznModel): FznTranslator =
     # NOTE: emitSpreadPatternChannels intentionally not called (see detection note above)
     # Tighten domains from diffn time profile analysis
     result.tightenDiffnTimeProfile()
+    # Bidirectional ceiling/source domain tightening for max-from-lin-le patterns
+    result.tightenMaxFromLinLeBounds()
     # Prune admission domains using zero-capacity day detection
     result.pruneZeroCapacityDays()
     # Build expressions for defined variables using the now-created positions

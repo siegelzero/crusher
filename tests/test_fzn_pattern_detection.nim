@@ -1185,10 +1185,11 @@ solve minimize objective;
 
         # D is still a max channel (from int_lin_le pattern)
         check tr.maxFromLinLeDefs.len == 1
-        # But domain is NOT tightened by time profile (x1 is variable)
+        # Domain is NOT tightened by diffn time profile (x1 is variable),
+        # but IS tightened by max channel bounds: D >= max(min(y_i) + offset_i) = max(1+3,1+2,1+4) = 5
         let dPos = tr.varPositions["D"]
         let dDom = tr.sys.baseArray.domain[dPos]
-        check dDom[0] == 1  # domain starts at 1, no tightening
+        check dDom[0] == 5  # tightened by source lower bounds, not by diffn time profile
 
 suite "FlatZinc int_lin_le_reif Multi-Position Bounds":
 

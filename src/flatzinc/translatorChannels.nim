@@ -618,10 +618,137 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 filtered.add(ci)
         tr.linLeReifChannelDefs = filtered
 
+    # Process int_lin_eq_reif channels
+    # b <-> sum(coeffs[i] * vars[i]) == rhs
+    # Compute the linear expression, determine its domain range, build a 0/1 lookup table.
+    var skippedLinEqReifCIs: HashSet[int]
+    for ci in tr.linEqReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let bName = con.args[3].ident
+        if bName notin tr.varPositions:
+            skippedLinEqReifCIs.incl(ci)
+            continue
+        let bPos = tr.varPositions[bName]
+        let coeffs = tr.resolveIntArray(con.args[0])
+        let rhs = tr.resolveIntArg(con.args[2])
+
+        # Build the scalar product expression
+        let exprs = tr.resolveExprArray(con.args[1])
+        if exprs.len != coeffs.len:
+            skippedLinEqReifCIs.incl(ci)
+            continue
+
+        # Build the linear expression as AlgebraicExpression
+        var sp = coeffs[0] * exprs[0]
+        for i in 1..<coeffs.len:
+            sp = sp + coeffs[i] * exprs[i]
+
+        # Compute bounds of the expression from variable domains
+        var exprMin, exprMax: int = 0
+        var boundsOk = true
+        for i in 0..<coeffs.len:
+            let positions = toSeq(exprs[i].positions.items)
+            var lo, hi: int
+            if positions.len == 1:
+                let dom = tr.sys.baseArray.domain[positions[0]]
+                if dom.len == 0:
+                    boundsOk = false
+                    break
+                lo = dom[0]
+                hi = dom[^1]
+            elif positions.len == 0:
+                # Constant expression
+                lo = exprs[i].evaluate(newSeq[int](0))
+                hi = lo
+            else:
+                # Multi-position expression — compute bounds from linear decomposition
+                if exprs[i].linear:
+                    let lin = linearize(exprs[i])
+                    var minVal = lin.constant
+                    var maxVal = lin.constant
+                    var linOk = true
+                    for pos in lin.coefficient.keys:
+                        let c = lin.coefficient[pos]
+                        let dom = tr.sys.baseArray.domain[pos]
+                        if dom.len == 0:
+                            linOk = false; break
+                        if c > 0:
+                            minVal += c * dom[0]
+                            maxVal += c * dom[^1]
+                        else:
+                            minVal += c * dom[^1]
+                            maxVal += c * dom[0]
+                    if not linOk:
+                        boundsOk = false; break
+                    lo = minVal
+                    hi = maxVal
+                else:
+                    # Non-linear multi-position — try declared domain as fallback
+                    let argExpr = con.args[1]
+                    if argExpr.kind == FznArrayLit:
+                        let elem = argExpr.elems[i]
+                        if elem.kind == FznIdent:
+                            let dom = tr.lookupVarDomain(elem.ident)
+                            if dom.len == 0:
+                                boundsOk = false; break
+                            lo = dom[0]
+                            hi = dom[^1]
+                        else:
+                            boundsOk = false; break
+                    else:
+                        boundsOk = false; break
+            if coeffs[i] > 0:
+                exprMin += coeffs[i] * lo
+                exprMax += coeffs[i] * hi
+            else:
+                exprMin += coeffs[i] * hi
+                exprMax += coeffs[i] * lo
+
+        if not boundsOk or exprMax - exprMin + 1 > 100_000:
+            skippedLinEqReifCIs.incl(ci)
+            continue
+
+        # Build lookup table: for each value v of the expression, b = (v == rhs)
+        var arrayElems: seq[ArrayElement[int]]
+        for v in exprMin..exprMax:
+            arrayElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if v == rhs: 1 else: 0))
+
+        let indexExpr = sp - exprMin
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+    # Un-channel skipped int_lin_eq_reif vars
+    if skippedLinEqReifCIs.len > 0:
+        for ci in skippedLinEqReifCIs:
+            let con = tr.model.constraints[ci]
+            if con.args.len >= 4 and con.args[3].kind == FznIdent:
+                let bName = con.args[3].ident
+                tr.channelVarNames.excl(bName)
+            tr.definingConstraints.excl(ci)
+        var filtered: seq[int]
+        for ci in tr.linEqReifChannelDefs:
+            if ci notin skippedLinEqReifCIs:
+                filtered.add(ci)
+        tr.linEqReifChannelDefs = filtered
+
     let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
                                                     tr.boolNotChannelDefs.len +
                                                     tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
-                                                    tr.leReifChannelDefs.len + tr.linLeReifChannelDefs.len
+                                                    tr.leReifChannelDefs.len + tr.linLeReifChannelDefs.len +
+                                                    tr.linEqReifChannelDefs.len
     if totalReifChannels > 0:
         stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
                                           &"(total channels: {tr.sys.baseArray.channelBindings.len})")

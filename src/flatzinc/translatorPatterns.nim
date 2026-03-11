@@ -588,8 +588,28 @@ proc detectReifChannels(tr: var FznTranslator) =
          tr.boolNotChannelDefs.len > 0 or
          tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
          tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0 or
-         tr.linLeReifChannelDefs.len > 0:
+         tr.linLeReifChannelDefs.len > 0 or tr.linEqReifChannelDefs.len > 0:
         stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolNotChannelDefs.len} bool_not, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif, {tr.linLeReifChannelDefs.len} int_lin_le_reif")
+
+
+proc detectLinEqReifChannels*(tr: var FznTranslator) =
+    ## Detect int_lin_eq_reif(coeffs, vars, rhs, b) :: defines_var(b) patterns.
+    ## b becomes a channel: b = (sum(coeffs*vars) == rhs) ? 1 : 0
+    ## Must run AFTER detectCaseAnalysisChannels (which uses int_lin_eq_reif via linEqReifMap).
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+        let bName = con.args[3].ident
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName: continue
+        if bName in tr.channelVarNames: continue
+        tr.channelVarNames.incl(bName)
+        tr.definingConstraints.incl(ci)
+        tr.linEqReifChannelDefs.add(ci)
+    if tr.linEqReifChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.linEqReifChannelDefs.len} int_lin_eq_reif channels")
 
 
 proc detectSetUnionChannels(tr: var FznTranslator) =
@@ -3841,3 +3861,184 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
             if newDom.len > 0 and newDom.len < currentDom.len:
                 tr.sys.baseArray.setDomain(ceilingPos, newDom)
                 stderr.writeLine(&"[FZN] Diffn time profile: tightened '{def.ceilingVarName}' domain from {currentDom.len} to {newDom.len} values (>= {maxLoad})")
+
+        # Per-rectangle time-table reasoning: compute compulsory y-interval profile
+        # from other x-overlapping rectangles, then tighten each y_i domain.
+        # Compulsory part of rect j: if latest_start_j < earliest_end_j, then
+        # rect j MUST occupy y-interval [latest_start_j, earliest_end_j) regardless of placement.
+        # At each y-height, the sum of dx_j for rects with compulsory parts there is "locked width".
+        # For rect i at x-interval [x_i, x_i+dx_i): if locked width from other rects >= D at some
+        # y-height h, then rect i cannot overlap h, constraining y_i.
+        if yElems.len == xVals.len:
+            # Build per-rectangle compulsory parts
+            type CompulsoryRect = object
+                idx: int
+                xStart, xEnd: int  # x-interval [xStart, xEnd)
+                dy: int
+                yLo, yHi: int     # current domain bounds for y
+                compStart, compEnd: int  # compulsory y-interval
+                hasCompulsory: bool
+            var rects: seq[CompulsoryRect]
+            for i in 0..<xVals.len:
+                var cr = CompulsoryRect(
+                    idx: i, xStart: xVals[i], xEnd: xVals[i] + dxVals[i], dy: dyVals[i])
+                if yElems[i].kind == FznIdent and yElems[i].ident in tr.varPositions:
+                    let yPos = tr.varPositions[yElems[i].ident]
+                    let yDom = tr.sys.baseArray.domain[yPos]
+                    if yDom.len > 0:
+                        cr.yLo = yDom[0]
+                        cr.yHi = yDom[^1]
+                        # Compulsory part: [latest_start, earliest_end)
+                        cr.compStart = cr.yHi        # latest start
+                        cr.compEnd = cr.yLo + cr.dy   # earliest end
+                        cr.hasCompulsory = cr.compEnd > cr.compStart
+                rects.add(cr)
+
+            var anyTightened = true
+            var iteration = 0
+            while anyTightened and iteration < 5:
+                anyTightened = false
+                inc iteration
+                for i in 0..<rects.len:
+                    if yElems[i].kind != FznIdent: continue
+                    if yElems[i].ident notin tr.varPositions: continue
+                    let yPos = tr.varPositions[yElems[i].ident]
+                    let yDom = tr.sys.baseArray.domain[yPos]
+                    if yDom.len == 0: continue
+
+                    # Compute compulsory load profile from OTHER rects that overlap in x with rect i
+                    # For each y-height, sum dy_j of rects j (j != i) whose compulsory part covers that height
+                    # and whose x-interval overlaps with rect i's x-interval.
+                    # Use sweep-line on compulsory intervals.
+                    type YEvent = tuple[y, delta: int]
+                    var yEvents: seq[YEvent]
+                    for j in 0..<rects.len:
+                        if j == i: continue
+                        if not rects[j].hasCompulsory: continue
+                        # Check x-overlap: [x_i, x_i+dx_i) ∩ [x_j, x_j+dx_j) non-empty
+                        if rects[j].xEnd <= rects[i].xStart or rects[i].xEnd <= rects[j].xStart:
+                            continue
+                        yEvents.add((y: rects[j].compStart, delta: rects[j].dy))
+                        yEvents.add((y: rects[j].compEnd, delta: -rects[j].dy))
+
+                    if yEvents.len == 0: continue
+                    yEvents.sort(proc(a, b: YEvent): int =
+                        result = cmp(a.y, b.y)
+                        if result == 0: result = cmp(a.delta, b.delta))
+
+                    # Find y-intervals where compulsory load makes rect i impossible to place
+                    # Rect i needs dy_i contiguous height units. Find the maximum compulsory load
+                    # within any window of size dy_i in rect i's feasible range.
+                    # Simpler: find y-heights where load >= maxLoad - dy_i + 1 (rect i can't overlap)
+                    # and use these as "forbidden" zones to tighten rect i's domain.
+
+                    # Build the load profile as (y, load) breakpoints
+                    type Breakpoint = tuple[y, load: int]
+                    var profile: seq[Breakpoint]
+                    var curLoad = 0
+                    for ev in yEvents:
+                        curLoad += ev.delta
+                        if profile.len > 0 and profile[^1].y == ev.y:
+                            profile[^1].load = curLoad
+                        else:
+                            profile.add((y: ev.y, load: curLoad))
+
+                    # For rect i at position y_i, it occupies [y_i, y_i + dy_i).
+                    # Infeasible if at any point in [y_i, y_i + dy_i), the compulsory load
+                    # plus dy_i > maxLoad (since rect i adds dy_i to the load at its position).
+                    # So rect i can't start at y_i if max_load_in([y_i, y_i+dy_i)) + dy_i > maxLoad.
+                    # Equivalently: if max_load_in([y_i, y_i+dy_i)) > maxLoad - dy_i.
+                    let threshold = maxLoad - rects[i].dy
+
+                    # Compute max compulsory load in sliding window [y, y+dy_i) for each domain value
+                    var newDom: seq[int]
+                    for v in yDom:
+                        let winStart = v
+                        let winEnd = v + rects[i].dy
+                        # Find max load in [winStart, winEnd) from profile breakpoints
+                        var windowMax = 0
+                        for bp in profile:
+                            if bp.y >= winEnd: break
+                            if bp.load > windowMax:
+                                windowMax = bp.load
+                        # Also check initial load at winStart (before first breakpoint)
+                        if windowMax <= threshold:
+                            newDom.add(v)
+
+                    if newDom.len > 0 and newDom.len < yDom.len:
+                        tr.sys.baseArray.setDomain(yPos, newDom)
+                        stderr.writeLine(&"[FZN] Diffn time-table: tightened '{yElems[i].ident}' domain from {yDom.len} to {newDom.len} values")
+                        # Update compulsory part for this rect
+                        rects[i].yLo = newDom[0]
+                        rects[i].yHi = newDom[^1]
+                        rects[i].compStart = rects[i].yHi
+                        rects[i].compEnd = rects[i].yLo + rects[i].dy
+                        rects[i].hasCompulsory = rects[i].compEnd > rects[i].compStart
+                        anyTightened = true
+
+            if iteration > 1:
+                stderr.writeLine(&"[FZN] Diffn time-table: {iteration} fixpoint iterations")
+
+proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
+    ## Bidirectional domain tightening for max-from-lin-le patterns.
+    ## Given D = max(y_i + offset_i):
+    ##   - Upper bound on sources: y_i <= max(dom(D)) - offset_i
+    ##   - Lower bound on ceiling: D >= max_i(min(dom(y_i)) + offset_i)
+    ## Iterates to fixpoint since tightening one side can enable the other.
+    if tr.maxFromLinLeDefs.len == 0: return
+
+    var anyTightened = true
+    var iteration = 0
+    while anyTightened and iteration < 10:
+        anyTightened = false
+        inc iteration
+
+        for def in tr.maxFromLinLeDefs:
+            if def.ceilingVarName notin tr.varPositions: continue
+            let ceilingPos = tr.varPositions[def.ceilingVarName]
+            let ceilingDom = tr.sys.baseArray.domain[ceilingPos]
+            if ceilingDom.len == 0: continue
+            let maxCeiling = ceilingDom[^1]
+
+            # Phase 1: Tighten source upper bounds from ceiling max
+            # y_i + offset_i <= D, so y_i <= max(dom(D)) - offset_i
+            for i, srcName in def.sourceVarNames:
+                if srcName notin tr.varPositions: continue
+                let srcPos = tr.varPositions[srcName]
+                let srcDom = tr.sys.baseArray.domain[srcPos]
+                if srcDom.len == 0: continue
+                let upperBound = maxCeiling - def.offsets[i]
+                if srcDom[^1] <= upperBound: continue
+                var newDom: seq[int]
+                for v in srcDom:
+                    if v <= upperBound:
+                        newDom.add(v)
+                if newDom.len > 0 and newDom.len < srcDom.len:
+                    tr.sys.baseArray.setDomain(srcPos, newDom)
+                    stderr.writeLine(&"[FZN] Max channel: tightened '{srcName}' upper bound to <= {upperBound} ({srcDom.len} -> {newDom.len})")
+                    anyTightened = true
+
+            # Phase 2: Tighten ceiling lower bound from source minimums
+            # D = max(y_i + offset_i) >= min(dom(y_i)) + offset_i for each i
+            # So D >= max_i(min(dom(y_i)) + offset_i)
+            var minCeiling = low(int)
+            for i, srcName in def.sourceVarNames:
+                if srcName notin tr.varPositions: continue
+                let srcPos = tr.varPositions[srcName]
+                let srcDom = tr.sys.baseArray.domain[srcPos]
+                if srcDom.len == 0: continue
+                let lb = srcDom[0] + def.offsets[i]
+                if lb > minCeiling:
+                    minCeiling = lb
+            if minCeiling > ceilingDom[0]:
+                var newDom: seq[int]
+                for v in ceilingDom:
+                    if v >= minCeiling:
+                        newDom.add(v)
+                if newDom.len > 0 and newDom.len < ceilingDom.len:
+                    tr.sys.baseArray.setDomain(ceilingPos, newDom)
+                    stderr.writeLine(&"[FZN] Max channel: tightened '{def.ceilingVarName}' lower bound to >= {minCeiling} ({ceilingDom.len} -> {newDom.len})")
+                    anyTightened = true
+
+    if iteration > 1:
+        stderr.writeLine(&"[FZN] Max channel bounds: {iteration} fixpoint iterations")
