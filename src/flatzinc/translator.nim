@@ -313,6 +313,12 @@ type
         # Detected bool AND channel defs: bool_clause([b],[c1,...,cn]) where all ci are channels
         # and b appears as positive literal in exactly one bool_clause. b = AND(c1,...,cn).
         boolAndChannelDefs*: seq[tuple[ci: int, resultVar: string, condVars: seq[string]]]
+        # Binary conditional channel defs: Z = element(cond, [valWhen0, valWhen1])
+        # Detected from complementary bool_clause([eq_reif(Z, X)], [lt_reif]) patterns.
+        binaryCondChannelDefs*: seq[tuple[targetVar: string, condChannel: string, val0Var: string, val1Var: string, consumedCIs: seq[int]]]
+        # One-hot conditional channel defs: Z = element(weightedIndex, constTable)
+        # Detected from exhaustive bool_clause([eq_reif(Z, v_i)], [eq_reif(X_i, c)]) patterns.
+        oneHotCondChannelDefs*: seq[tuple[targetVar: string, condChannels: seq[string], targetVals: seq[int], consumedCIs: seq[int]]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -648,6 +654,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.fixedOnePos = -1
     result.rescuedChannelDefs = @[]
     result.boolAndChannelDefs = @[]
+    result.binaryCondChannelDefs = @[]
+    result.oneHotCondChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
@@ -678,6 +686,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
     # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
     result.detectBoolAndChannels()
+    # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
+    # MUST run after detectReifChannels() and detectBoolAndChannels()
+    result.detectConditionalImplicationChannels()
     # Detect argmax decomposition patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
     result.detectArgmaxPattern()
     # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -1380,6 +1391,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildReifChannelBindings()
     # Build channel bindings for bool AND channels (b = AND(c1,...,cn) from bool_clause)
     result.buildBoolAndChannelBindings()
+    # Build channel bindings for conditional implication channels (binary + one-hot)
+    result.buildConditionalImplicationChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for one-hot indicator variables

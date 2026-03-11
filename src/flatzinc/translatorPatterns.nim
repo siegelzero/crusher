@@ -4110,3 +4110,176 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
 
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool AND channels (b = AND(ci) from bool_clause)")
+
+proc detectConditionalImplicationChannels*(tr: var FznTranslator) =
+    ## Detects patterns where a variable is fully determined by implications through
+    ## bool_clause([eq_reif(target, val)], [cond_channel]).
+    ##
+    ## Pattern A (Binary conditional / min-max pair):
+    ##   bool_clause([eq_reif(Z, X)], [cond_lt]) + bool_clause([eq_reif(Z, Y)], [cond_gt])
+    ##   where cond_lt and cond_gt are complementary int_lin_le_reif channels.
+    ##   Result: Z = element(cond_lt, [Y, X]) — conditional assignment channel.
+    ##
+    ## Pattern B (One-hot conditional from allDifferent array):
+    ##   bool_clause([eq_reif(Z, v_i)], [eq_reif(X_i, c)]) for i=1..N
+    ##   where X_i are N different variables with same domain of size N (allDifferent),
+    ##   c is a constant, and the conditions form a one-hot encoding.
+    ##   Result: Z = element(weighted_one_hot_index, [v_0, ..., v_{N-1}])
+    ##
+    ## Requires: detectReifChannels() and detectBoolAndChannels() must have run first.
+
+    # Step 1: Build eq_reif reverse map: output bool var → (sourceVar, testVal)
+    var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        eqReifMap[con.args[2].ident] = (sourceVar: con.args[0].ident, testVal: con.args[1])
+
+    # Step 2: Build int_lin_le_reif reverse map for complementarity checking
+    # Maps output bool var → (varA, varB, rhs) for [1,-1] coefficient patterns
+    type LinLeInfo = tuple[varA: string, varB: string, rhs: int]
+    var linLeReifMap: Table[string, LinLeInfo]
+    for ci in tr.linLeReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if coeffs.len != 2 or coeffs[0] != 1 or coeffs[1] != -1: continue
+        let varArr = con.args[1]
+        if varArr.kind != FznArrayLit or varArr.elems.len != 2: continue
+        if varArr.elems[0].kind != FznIdent or varArr.elems[1].kind != FznIdent: continue
+        linLeReifMap[con.args[3].ident] = (varA: varArr.elems[0].ident,
+                                            varB: varArr.elems[1].ident,
+                                            rhs: rhs)
+
+    # Step 3: Scan non-consumed bool_clause([A], [B]) and group by target variable
+    type ImplEntry = object
+        boolClauseCI: int
+        condChannel: string    # negative literal (the condition)
+        testVal: FznExpr       # value from eq_reif (constant or variable)
+
+    var implByTarget: Table[string, seq[ImplEntry]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1 or negArg.elems.len != 1: continue
+        let posLit = posArg.elems[0]
+        let negLit = negArg.elems[0]
+        if posLit.kind != FznIdent or negLit.kind != FznIdent: continue
+        # posLit must be an eq_reif output
+        if posLit.ident notin eqReifMap: continue
+        # negLit must be a channel variable
+        if negLit.ident notin tr.channelVarNames: continue
+        let eqInfo = eqReifMap[posLit.ident]
+        let targetVar = eqInfo.sourceVar
+        # Skip if target is already channel or defined
+        if targetVar in tr.channelVarNames or targetVar in tr.definedVarNames: continue
+        implByTarget.mgetOrPut(targetVar, @[]).add(ImplEntry(
+            boolClauseCI: ci,
+            condChannel: negLit.ident,
+            testVal: eqInfo.testVal))
+
+    if implByTarget.len == 0: return
+
+    var nBinary = 0
+    var nOneHot = 0
+
+    for targetVar, entries in implByTarget:
+        if targetVar in tr.channelVarNames: continue  # may have been channelized in this loop
+
+        # Pattern A: Binary conditional (exactly 2 entries with variable test values)
+        if entries.len == 2:
+            let e0 = entries[0]
+            let e1 = entries[1]
+            # Both test values must be variable references
+            if e0.testVal.kind != FznIdent or e1.testVal.kind != FznIdent: continue
+            # Both conditions must be int_lin_le_reif with [1,-1] coefficients
+            if e0.condChannel notin linLeReifMap or e1.condChannel notin linLeReifMap: continue
+            let info0 = linLeReifMap[e0.condChannel]
+            let info1 = linLeReifMap[e1.condChannel]
+            # Check complementarity: swapped variable order, same rhs
+            if not (info0.varA == info1.varB and info0.varB == info1.varA and info0.rhs == info1.rhs):
+                continue
+            # e0.condChannel = (info0.varA < info0.varB)  [rhs=-1 means strict <]
+            # When cond0=1: target = e0.testVal
+            # When cond0=0 (so cond1=1): target = e1.testVal
+            tr.binaryCondChannelDefs.add((
+                targetVar: targetVar,
+                condChannel: e0.condChannel,
+                val0Var: e1.testVal.ident,  # value when cond0=0
+                val1Var: e0.testVal.ident,  # value when cond0=1
+                consumedCIs: @[e0.boolClauseCI, e1.boolClauseCI]))
+            tr.channelVarNames.incl(targetVar)
+            tr.definingConstraints.incl(e0.boolClauseCI)
+            tr.definingConstraints.incl(e1.boolClauseCI)
+            inc nBinary
+            continue
+
+        # Pattern B: One-hot conditional (N entries with constant test values, different cond vars)
+        if entries.len < 2: continue
+        # All test values must be constants
+        var allConst = true
+        for e in entries:
+            if e.testVal.kind != FznIntLit:
+                allConst = false
+                break
+        if not allConst: continue
+        # All conditions must be eq_reif channels from different source variables
+        # with the SAME test constant value
+        var condSourceVars: seq[string]
+        var condConstVal: int = -1
+        var condSourceOk = true
+        for i, e in entries:
+            if e.condChannel notin eqReifMap:
+                condSourceOk = false
+                break
+            let condInfo = eqReifMap[e.condChannel]
+            if condInfo.testVal.kind != FznIntLit:
+                condSourceOk = false
+                break
+            if i == 0:
+                condConstVal = condInfo.testVal.intVal
+            elif condInfo.testVal.intVal != condConstVal:
+                condSourceOk = false
+                break
+            if condInfo.sourceVar in condSourceVars:
+                condSourceOk = false  # duplicate source var
+                break
+            condSourceVars.add(condInfo.sourceVar)
+        if not condSourceOk: continue
+        # Check completeness: N conditions should equal the domain size of the source vars
+        # (ensures exactly one condition is true under allDifferent)
+        let firstDom = tr.lookupVarDomain(condSourceVars[0])
+        if firstDom.len == 0 or entries.len != firstDom.len: continue
+        # Build ordered channels and values (sort by source var for deterministic ordering)
+        type CondPair = tuple[sourceVar: string, condChannel: string, targetVal: int, ci: int]
+        var pairs: seq[CondPair]
+        for i, e in entries:
+            pairs.add((sourceVar: condSourceVars[i], condChannel: e.condChannel,
+                        targetVal: e.testVal.intVal, ci: e.boolClauseCI))
+        pairs.sort(proc(a, b: CondPair): int = cmp(a.sourceVar, b.sourceVar))
+        var orderedChannels: seq[string]
+        var orderedVals: seq[int]
+        var consumedCIs: seq[int]
+        for p in pairs:
+            orderedChannels.add(p.condChannel)
+            orderedVals.add(p.targetVal)
+            consumedCIs.add(p.ci)
+        tr.oneHotCondChannelDefs.add((
+            targetVar: targetVar,
+            condChannels: orderedChannels,
+            targetVals: orderedVals,
+            consumedCIs: consumedCIs))
+        tr.channelVarNames.incl(targetVar)
+        for ci in consumedCIs:
+            tr.definingConstraints.incl(ci)
+        inc nOneHot
+
+    if nBinary > 0 or nOneHot > 0:
+        stderr.writeLine(&"[FZN] Detected conditional implication channels: {nBinary} binary (min/max pair), {nOneHot} one-hot (permutation lookup)")

@@ -2144,3 +2144,114 @@ proc buildBoolAndChannelBindings*(tr: var FznTranslator) =
     if built > 0:
         stderr.writeLine(&"[FZN] Built {built} bool AND channel bindings")
 
+proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for conditional implication patterns detected by
+    ## detectConditionalImplicationChannels().
+    ##
+    ## Binary conditional: Z = element(cond, [val_when_0, val_when_1])
+    ##   where val_when_0/1 are variable positions (e.g., min/max of two vars).
+    ##
+    ## One-hot conditional: Z = element(weighted_sum, [v_0, ..., v_{N-1}])
+    ##   where weighted_sum = sum(i * cond_i), cond_i are boolean eq_reif channels.
+    ## Must be called after translateVariables() and buildReifChannelBindings().
+
+    var nBinary = 0
+    var nOneHot = 0
+
+    # Build binary conditional channel bindings
+    for def in tr.binaryCondChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.condChannel notin tr.varPositions: continue
+        if def.val0Var notin tr.varPositions: continue
+        if def.val1Var notin tr.varPositions: continue
+        let targetPos = tr.varPositions[def.targetVar]
+        let condPos = tr.varPositions[def.condChannel]
+        let val0Pos = tr.varPositions[def.val0Var]
+        let val1Pos = tr.varPositions[def.val1Var]
+
+        let indexExpr = tr.getExpr(condPos)
+        var arrayElems: seq[ArrayElement[int]]
+        arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: val0Pos))
+        arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: val1Pos))
+
+        let binding = ChannelBinding[int](
+            channelPosition: targetPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(targetPos)
+
+        # Register source positions: condition channel + both value positions
+        for pos in [condPos, val0Pos, val1Pos]:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc nBinary
+
+    # Build one-hot conditional channel bindings
+    for def in tr.oneHotCondChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        let targetPos = tr.varPositions[def.targetVar]
+        let n = def.condChannels.len
+
+        # Build index expression: sum(i * cond_i) for i=0..N-1
+        # Since cond_i is boolean (0/1), exactly one is 1 under allDifferent
+        # Index = the i for which cond_i = 1
+        var condExprs: seq[AlgebraicExpression[int]]
+        var allValid = true
+        for cName in def.condChannels:
+            if cName in tr.varPositions:
+                condExprs.add(tr.getExpr(tr.varPositions[cName]))
+            elif cName in tr.definedVarExprs:
+                condExprs.add(tr.definedVarExprs[cName])
+            else:
+                allValid = false
+                break
+        if not allValid or condExprs.len == 0: continue
+
+        # weighted_sum = 0*cond_0 + 1*cond_1 + 2*cond_2 + ... + (N-1)*cond_{N-1}
+        # = cond_1 + 2*cond_2 + ... + (N-1)*cond_{N-1}
+        var indexExpr: AlgebraicExpression[int]
+        var hasTerms = false
+        for i in 1..<n:  # skip i=0 (coefficient 0)
+            let term = i * condExprs[i]
+            if not hasTerms:
+                indexExpr = term
+                hasTerms = true
+            else:
+                indexExpr = indexExpr + term
+        if not hasTerms:
+            # Only one condition (n=1): index is always 0
+            indexExpr = newAlgebraicExpression[int](
+                positions=initPackedSet[int](),
+                node=ExpressionNode[int](kind: LiteralNode, value: 0),
+                linear=true)
+
+        # Build constant array: [val_0, val_1, ..., val_{N-1}]
+        var arrayElems: seq[ArrayElement[int]]
+        for v in def.targetVals:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        let binding = ChannelBinding[int](
+            channelPosition: targetPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(targetPos)
+
+        # Register source positions for incremental propagation
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc nOneHot
+
+    if nBinary > 0 or nOneHot > 0:
+        stderr.writeLine(&"[FZN] Built conditional implication channel bindings: {nBinary} binary, {nOneHot} one-hot")
+
