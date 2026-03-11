@@ -124,7 +124,6 @@ type
         towerVarName*: string         # argmax result (search variable)
         maxVarName*: string           # max(signals) channel variable
         signalVarNames*: seq[string]  # signal array elements (ordered by tower index 1..N)
-        triggerCI*: int               # first lin_le_reif CI (emission trigger)
 
     FznTranslator* = object
         sys*: ConstraintSystem[int]

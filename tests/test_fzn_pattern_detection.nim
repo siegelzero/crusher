@@ -809,3 +809,110 @@ solve satisfy;
         check ucost1 == 5
         check ucost2 == 2
         check bcost == 1
+
+suite "FlatZinc Argmax Pattern Detection":
+
+    test "detectArgmaxPattern: 3-signal argmax → element constraint":
+        ## Encodes tower = argmax([s1, s2, s3]) via MiniZinc's decomposition:
+        ##   int_ne_reif(tower, t, ne_t) :: defines_var(ne_t)  for t = 1..3
+        ##   int_lin_le_reif([1, -1], [s_t, max_s], 0, ne_t)  for t = 1..3
+        ##   array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s)
+        ## The detector should replace this with: s[tower-1] == max_s (element constraint).
+        let src = """
+var 1..3: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s2, max_s], 0, ne2);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+constraint int_eq(s1, 3);
+constraint int_eq(s2, 7);
+constraint int_eq(s3, 5);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Verify argmax pattern was detected
+        check tr.argmaxPatterns.len == 1
+        for _, pat in tr.argmaxPatterns:
+            check pat.towerVarName == "tower"
+            check pat.maxVarName == "max_s"
+            check pat.signalVarNames == @["s1", "s2", "s3"]
+
+        # ne_vars should be removed from channelVarNames (dead channels)
+        check "ne1" notin tr.channelVarNames
+        check "ne2" notin tr.channelVarNames
+        check "ne3" notin tr.channelVarNames
+
+        # max_s should remain a channel (array_int_maximum is NOT consumed)
+        check "max_s" in tr.channelVarNames
+
+        # Solve and verify: s2=7 is the max, so tower should be 2
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let towerVal = tr.sys.assignment[tr.varPositions["tower"]]
+        check towerVal == 2
+        let maxVal = tr.sys.assignment[tr.varPositions["max_s"]]
+        check maxVal == 7
+
+    test "detectArgmaxPattern: non-contiguous tower values are not matched":
+        ## If the ne_reif constants are not contiguous (e.g., 1, 3, 5), the pattern
+        ## should NOT be detected.
+        let src = """
+var 1..5: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+var bool: ne5 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_ne_reif(tower, 5, ne5) :: defines_var(ne5);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s2, max_s], 0, ne3);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne5);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Non-contiguous values: pattern should NOT be detected
+        check tr.argmaxPatterns.len == 0
+
+    test "detectArgmaxPattern: incomplete group (missing lin_le_reif) not matched":
+        ## If one of the ne_reif booleans has no matching int_lin_le_reif, the
+        ## entire group should be skipped.
+        let src = """
+var 1..3: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Missing ne2's lin_le_reif → pattern should NOT be detected
+        check tr.argmaxPatterns.len == 0

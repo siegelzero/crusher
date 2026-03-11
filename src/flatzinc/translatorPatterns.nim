@@ -3331,8 +3331,11 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
                 break
 
             # Find the max_var among the variables (should have negative coefficient)
-            let coeffs = try: tr.resolveIntArray(linLeCon.args[0]) except ValueError, KeyError: (valid = false; @[0])
-            if not valid:
+            var coeffs: seq[int]
+            try:
+                coeffs = tr.resolveIntArray(linLeCon.args[0])
+            except ValueError, KeyError:
+                valid = false
                 break
             if coeffs.len != varElems.len or varElems.len < 2:
                 valid = false
@@ -3399,12 +3402,13 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
             continue
 
         # Pattern detected! Use first lin_le_reif CI as trigger, consume the rest.
+        # Note: array_int_maximum is intentionally NOT consumed — the element constraint
+        # needs max_var to be channeled, so we keep its MinMaxChannelBinding active.
         let triggerCI = linLeCIs[0]
         tr.argmaxPatterns[triggerCI] = ArgmaxPattern(
             towerVarName: towerVarName,
             maxVarName: matchedMaxVar,
             signalVarNames: signalVarNames,
-            triggerCI: triggerCI
         )
 
         # Consume all lin_le_reif CIs except the trigger
@@ -3416,7 +3420,7 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
             tr.channelVarNames.excl(neVarNames[i])
             tr.definedVarNames.incl(neVarNames[i])
         # Remove ne_reif CIs from reifChannelDefs
-        var neCIset: PackedSet[int]
+        var neCIset: HashSet[int]
         for ci in neCIs:
             neCIset.incl(ci)
         var filteredReifDefs: seq[int]
