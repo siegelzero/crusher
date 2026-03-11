@@ -1725,6 +1725,64 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 ))
                 diffnBoundForms += 1
 
+        # Time profile bound for all-constant x/dx/dy diffn:
+        # When all x, dx, and dy are constants, compute exact max load via sweep-line.
+        # This gives limitVar >= maxLoad for any variable-limit cumulative sharing positions.
+        block timeProfile:
+            var allConst = true
+            for i in 0..<n:
+                if ds.xExprs[i].positions.len > 0 or
+                   ds.dxExprs[i].positions.len > 0 or
+                   ds.dyExprs[i].positions.len > 0:
+                    allConst = false
+                    break
+            if allConst:
+                # Compute time profile via sweep-line
+                # Use int arrays to avoid generic closure issues
+                var eventTimes: seq[int]
+                var eventDeltas: seq[int]
+                let emptyAssign = initTable[int, T]()
+                for i in 0..<n:
+                    let x = int(ds.xExprs[i].node.evaluate(emptyAssign))
+                    let dx = int(ds.dxExprs[i].node.evaluate(emptyAssign))
+                    let dy = int(ds.dyExprs[i].node.evaluate(emptyAssign))
+                    eventTimes.add(x)
+                    eventDeltas.add(dy)
+                    eventTimes.add(x + dx)
+                    eventDeltas.add(-dy)
+                # Insertion sort by time (small arrays, avoids closure issues)
+                for i in 1..<eventTimes.len:
+                    var j = i
+                    while j > 0 and eventTimes[j] < eventTimes[j-1]:
+                        swap(eventTimes[j], eventTimes[j-1])
+                        swap(eventDeltas[j], eventDeltas[j-1])
+                        dec j
+                var maxLoad: T = T(0)
+                var currentLoad: T = T(0)
+                for i in 0..<eventTimes.len:
+                    currentLoad += T(eventDeltas[i])
+                    if currentLoad > maxLoad:
+                        maxLoad = currentLoad
+                if maxLoad > T(0):
+                    for cons3 in carray.constraints:
+                        if cons3.stateType != CumulativeType: continue
+                        let cumState3 = cons3.cumulativeState
+                        if cumState3.limitPosition < 0: continue
+                        var shared3 = false
+                        for pos in cons3.positions.items:
+                            if pos in cons.positions:
+                                shared3 = true; break
+                        if not shared3: continue
+                        var coeffs: Table[int, T]
+                        coeffs[cumState3.limitPosition] = T(1)
+                        linearForms.add(LinearForm[T](
+                            coefficients: coeffs,
+                            constant: -maxLoad,
+                            relation: GreaterThanEq
+                        ))
+                        diffnBoundForms += 1
+                    stderr.writeLine(&"[DomRed] Diffn time profile: max_load = {maxLoad} ({n} all-const rects)")
+
     if diffnBoundForms > 0:
         stderr.writeLine(&"[DomRed] Diffn area/strip bounds: {diffnBoundForms} linear forms")
 

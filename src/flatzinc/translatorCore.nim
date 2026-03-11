@@ -1026,6 +1026,13 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let dxExprs = tr.resolveExprArray(con.args[2])
         let dyExprs = tr.resolveExprArray(con.args[3])
         tr.sys.addConstraint(diffn[int](xExprs, yExprs, dxExprs, dyExprs))
+        # Check if all x/dx are constants (y-only moves → sweep-line fast path)
+        var allXDXConst = true
+        for i in 0..<xExprs.len:
+            if xExprs[i].positions.len > 0 or dxExprs[i].positions.len > 0:
+                allXDXConst = false; break
+        if allXDXConst:
+            stderr.writeLine(&"[FZN] Diffn: all x/dx constant ({xExprs.len} rects), y-only moves")
 
     of "fzn_crusher_diffn_k":
         let n = tr.resolveIntArg(con.args[0])

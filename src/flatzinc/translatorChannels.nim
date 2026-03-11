@@ -535,23 +535,42 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 lo = exprs[i].evaluate(newSeq[int](0))
                 hi = lo
             else:
-                # Multi-position expression — use declared domain
-                let argExpr = con.args[1]
-                if argExpr.kind == FznArrayLit:
-                    let elem = argExpr.elems[i]
-                    if elem.kind == FznIdent:
-                        let dom = tr.lookupVarDomain(elem.ident)
+                # Multi-position expression — compute bounds from linear decomposition
+                if exprs[i].linear:
+                    let lin = linearize(exprs[i])
+                    var minVal = lin.constant
+                    var maxVal = lin.constant
+                    var linOk = true
+                    for pos in lin.coefficient.keys:
+                        let c = lin.coefficient[pos]
+                        let dom = tr.sys.baseArray.domain[pos]
                         if dom.len == 0:
-                            boundsOk = false
-                            break
-                        lo = dom[0]
-                        hi = dom[^1]
-                    else:
-                        boundsOk = false
-                        break
+                            linOk = false; break
+                        if c > 0:
+                            minVal += c * dom[0]
+                            maxVal += c * dom[^1]
+                        else:
+                            minVal += c * dom[^1]
+                            maxVal += c * dom[0]
+                    if not linOk:
+                        boundsOk = false; break
+                    lo = minVal
+                    hi = maxVal
                 else:
-                    boundsOk = false
-                    break
+                    # Non-linear multi-position — try declared domain as fallback
+                    let argExpr = con.args[1]
+                    if argExpr.kind == FznArrayLit:
+                        let elem = argExpr.elems[i]
+                        if elem.kind == FznIdent:
+                            let dom = tr.lookupVarDomain(elem.ident)
+                            if dom.len == 0:
+                                boundsOk = false; break
+                            lo = dom[0]
+                            hi = dom[^1]
+                        else:
+                            boundsOk = false; break
+                    else:
+                        boundsOk = false; break
             if coeffs[i] > 0:
                 exprMin += coeffs[i] * lo
                 exprMax += coeffs[i] * hi

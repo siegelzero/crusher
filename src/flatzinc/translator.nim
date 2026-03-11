@@ -125,6 +125,24 @@ type
         maxVarName*: string           # max(signals) channel variable
         signalVarNames*: seq[string]  # signal array elements (ordered by tower index 1..N)
 
+    MaxFromLinLeDef* = object
+        ## A detected max-from-lin-le pattern:
+        ## Multiple int_lin_le([1,-1], [source, ceiling], -offset) encode ceiling >= source + offset.
+        ## When the ceiling variable is minimized, it equals max(source_i + offset_i).
+        ceilingVarName*: string         # the ceiling (max) variable
+        sourceVarNames*: seq[string]    # source variable names
+        offsets*: seq[int]              # per-source offsets
+        consumedCIs*: seq[int]          # consumed constraint indices
+
+    SpreadPatternDef* = object
+        ## A detected spread pattern:
+        ## Pairwise int_lin_le([1,-1,-1], [y_i, y_j, S], c) encode S >= (y_i + offset_i) - (y_j + offset_j).
+        ## Replaced by max/min channels + 1 simple constraint per group.
+        spreadVarName*: string          # the spread variable
+        sourceVarNames*: seq[string]    # source variable names
+        offsets*: seq[int]              # per-source offsets
+        consumedCIs*: seq[int]          # consumed constraint indices
+
     FznTranslator* = object
         sys*: ConstraintSystem[int]
         # Maps FZN variable name -> position in the ConstrainedArray
@@ -287,6 +305,10 @@ type
         # Rescued defined vars: originally defined-var-only, but appear in var-indexed arrays
         # so need positions. Converted to channel variables with single-input MinMaxChannelBindings.
         rescuedChannelDefs*: seq[tuple[ci: int, varName: string]]
+        # Detected max-from-lin-le patterns (int_lin_le encoding ceiling >= source + offset)
+        maxFromLinLeDefs*: seq[MaxFromLinLeDef]
+        # Detected spread patterns (pairwise int_lin_le → max/min channels + simple constraint)
+        spreadPatternDefs*: seq[SpreadPatternDef]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -628,6 +650,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.collectDefinedVars()
     # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
     result.detectCountPatterns()
+    # Detect max-from-lin-le patterns (ceiling >= source + offset → max channel)
+    result.detectMaxFromLinLe()
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
     # Detect skill-allocation disjunctive patterns (MUST run before detectReifChannels
@@ -690,6 +714,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit direct atMost constraints for detected atMost-through-reification patterns
     if result.atMostThroughReifDefs.len > 0:
         result.emitAtMostThroughReif()
+    # Emit max channels for detected max-from-lin-le patterns
+    if result.maxFromLinLeDefs.len > 0:
+        result.emitMaxFromLinLeChannels()
+    # Tighten domains from diffn time profile analysis
+    result.tightenDiffnTimeProfile()
     # Prune admission domains using zero-capacity day detection
     result.pruneZeroCapacityDays()
     # Build expressions for defined variables using the now-created positions
