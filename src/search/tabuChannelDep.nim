@@ -479,6 +479,118 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                 state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
         penalties[di] = totalDelta
 
+proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExternals: ptr PackedSet[int]) =
+    ## Incremental cascade evaluation: only re-evaluate entries affected by changed
+    ## external positions. Uses cached values for unaffected entries, with dirty
+    ## propagation through forward deps when an entry's value changes.
+    let domain = state.sharedDomain[][pos]
+    let cascadeIdx = state.cdCascadePos[pos]
+    let nChans = state.cdCascadeChans[cascadeIdx].len
+    let nDom = domain.len
+    let chans = state.cdCascadeChans[cascadeIdx]
+    let bindings = state.cdCascadeBindings[cascadeIdx]
+    let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
+    let forwardDeps = state.cdCascadeForwardDeps[cascadeIdx]
+    let extPosToEntries = state.cdCascadeExtPosToEntries[cascadeIdx]
+
+    when ProfileIteration:
+        let tBind0 = epochTime()
+
+    # Determine initially dirty entries from changed externals
+    for ci in 0..<nChans:
+        state.cdCascadeDirtyBase[ci] = false
+    for chanPos in changedExternals[].items:
+        if chanPos in extPosToEntries:
+            for ci in extPosToEntries[chanPos]:
+                state.cdCascadeDirtyBase[ci] = true
+
+    # Propagate dirty forward to find maximal dirty set (superset across all domain values)
+    for ci in 0..<nChans:
+        state.cdCascadeDirtyDV[ci] = state.cdCascadeDirtyBase[ci]
+    for ci in 0..<nChans:
+        if state.cdCascadeDirtyDV[ci]:
+            for downstream in forwardDeps[ci]:
+                state.cdCascadeDirtyDV[downstream] = true
+
+    # Build compact work list: maxDirty entries + needed clean predecessors
+    # A clean entry is "needed" if it has a maxDirty entry downstream (via forwardDeps)
+    var workListLen = 0
+    for ci in 0..<nChans:
+        if state.cdCascadeDirtyDV[ci]:
+            state.cdCascadeInWorkList[ci] = true
+        else:
+            state.cdCascadeInWorkList[ci] = false
+            for downstream in forwardDeps[ci]:
+                if state.cdCascadeDirtyDV[downstream]:
+                    state.cdCascadeInWorkList[ci] = true
+                    break
+    for ci in 0..<nChans:
+        if state.cdCascadeInWorkList[ci]:
+            state.cdCascadeWorkList[workListLen] = ci
+            inc workListLen
+
+    # Save original assignment values only for work list entries
+    let savedPos = state.assignment[pos]
+    for wi in 0..<workListLen:
+        let ci = state.cdCascadeWorkList[wi]
+        state.cdBatchSaved[ci] = state.assignment[chans[ci]]
+
+    # Incremental evaluation: iterate only work list entries per domain value.
+    # Write dirty entry results directly to the cache (cdCascadeCachedValues)
+    # and pass cache to computeCascadePenalties — no cdBatchValues needed.
+    for di in 0..<nDom:
+        state.assignment[pos] = domain[di]
+        # Reset per-domain-value dirty for maxDirty entries only
+        for wi in 0..<workListLen:
+            let ci = state.cdCascadeWorkList[wi]
+            state.cdCascadeDirtyDV[ci] = state.cdCascadeDirtyBase[ci]
+        for wi in 0..<workListLen:
+            let ci = state.cdCascadeWorkList[wi]
+            if not state.cdCascadeDirtyDV[ci]:
+                # Clean predecessor: set assignment from cache
+                state.assignment[chans[ci]] = state.cdCascadeCachedValues[cascadeIdx][ci][di]
+                when ProfileIteration: state.cdIncSkipped += 1
+            else:
+                # Dirty: re-evaluate
+                when ProfileIteration: state.cdIncEvaluated += 1
+                var newVal: T
+                if isMinMax[ci]:
+                    let fb = state.flatMinMaxBindings[bindings[ci]]
+                    newVal = evaluateFlatMinMax(fb, state.assignment)
+                else:
+                    let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
+                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                        let elem = bindingPtr.arrayElements[idxVal]
+                        newVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition]
+                    else:
+                        newVal = state.cdBatchSaved[ci]
+                state.assignment[chans[ci]] = newVal
+                # Propagate dirtiness if value changed from cache
+                if newVal != state.cdCascadeCachedValues[cascadeIdx][ci][di]:
+                    state.cdCascadeCachedValues[cascadeIdx][ci][di] = newVal
+                    for downstream in forwardDeps[ci]:
+                        state.cdCascadeDirtyDV[downstream] = true
+
+    # Restore assignment only for work list entries
+    state.assignment[pos] = savedPos
+    for wi in 0..<workListLen:
+        let ci = state.cdCascadeWorkList[wi]
+        state.assignment[chans[ci]] = state.cdBatchSaved[ci]
+
+    when ProfileIteration:
+        state.cdCascadeBindingTime += epochTime() - tBind0
+        let tPen0 = epochTime()
+
+    # Compute penalties using cached values (updated in-place for dirty entries)
+    state.computeCascadePenalties(cascadeIdx,
+        state.cdCascadeCachedValues[cascadeIdx], domain, state.channelDepPenalties[pos])
+
+    when ProfileIteration:
+        state.cdCascadePenaltyTime += epochTime() - tPen0
+        state.cdCascadeCalls += 1
+
 proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
     ## Compute channelDepPenalties[pos] for all domain values.
     ## Uses cascade topology for batch evaluation (both static and dynamic).
@@ -502,6 +614,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             # Dynamic cascade: evaluate bindings at runtime for all domain values
             let chans = state.cdCascadeChans[cascadeIdx]
             let bindings = state.cdCascadeBindings[cascadeIdx]
+            let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
 
             # Save original assignment values
             let savedPos = state.assignment[pos]
@@ -512,20 +625,31 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             for di in 0..<nDom:
                 state.assignment[pos] = domain[di]
                 for ci in 0..<nChans:
-                    let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
-                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
-                    if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
-                        let elem = bindingPtr.arrayElements[idxVal]
-                        state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
-                                                       else: state.assignment[elem.variablePosition]
+                    if isMinMax[ci]:
+                        # Min/max binding: evaluate using flat linear representation
+                        let fb = state.flatMinMaxBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
                     else:
-                        state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
+                        # Element binding: evaluate index expression and look up array
+                        let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
+                        let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                        if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                            let elem = bindingPtr.arrayElements[idxVal]
+                            state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
+                                                           else: state.assignment[elem.variablePosition]
+                        else:
+                            state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
                     state.assignment[chans[ci]] = state.cdBatchValues[ci][di]
 
             # Restore assignment
             state.assignment[pos] = savedPos
             for ci in 0..<nChans:
                 state.assignment[chans[ci]] = state.cdBatchSaved[ci]
+
+            # Cache batch values for incremental cascade eval and min/max fast-path
+            for ci in 0..<nChans:
+                for di in 0..<nDom:
+                    state.cdCascadeCachedValues[cascadeIdx][ci][di] = state.cdBatchValues[ci][di]
 
             when ProfileIteration:
                 let tBind1CD = epochTime()
@@ -560,14 +684,15 @@ proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
                 state.penaltyMap[pos][i] += newDep - oldDep
                 state.channelDepPenalties[pos][i] = newDep
 
-proc applyUniformDelta[T](state: TabuState[T], pos: int) {.inline.} =
+proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[int]) {.inline.} =
     ## Apply uniform cost delta for channel-dep penalties at position.
-    ## For cascade positions: the penalty change is exactly (savedCost - newCost)
-    ## applied uniformly to all domain values (exact for element-only cascades).
-    ## For non-cascade positions (minMax/inverse): falls back to full per-value
-    ## recomputation since cascade values are state-dependent.
+    ## For cascade positions: checks if external dependencies changed. If not,
+    ## applies uniform delta (exact). If only min/max external deps changed (not
+    ## element deps), re-evaluates only the min/max entries using cached element
+    ## cascade values. Falls back to full cascade recomputation if element deps changed.
+    ## For non-cascade positions: falls back to full per-value recomputation.
     if pos notin state.cdCascadePos:
-        # Non-cascade: full recomputation (minMax/inverse cascade values depend on state)
+        # Non-cascade: full recomputation
         let domain = state.sharedDomain[][pos]
         for i in 0..<domain.len:
             let newDep = state.computeChannelDepDelta(pos, domain[i])
@@ -577,19 +702,99 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int) {.inline.} =
                 state.channelDepPenalties[pos][i] = newDep
         return
     let cascadeIdx = state.cdCascadePos[pos]
-    let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
-    var uniformDelta = 0
-    for ci in constraintIds:
-        if not state.channelDepConstraintActive[ci]: continue
-        let newCost = state.channelDepConstraints[ci].penalty()
-        let savedCost = state.cdSavedConstraintCosts[ci]
-        if savedCost != newCost:
-            uniformDelta += savedCost - newCost
-    if uniformDelta != 0:
+    # Check which external deps changed: element deps vs min/max-only deps
+    var elemDepChanged = false
+    var anyDepChanged = false
+    let elemExtDeps = state.cdCascadeElemExtDeps[cascadeIdx]
+    let externalDeps = state.cdCascadeExternalDeps[cascadeIdx]
+    if externalDeps.len > 0:
+        for chanPos in changedChannels:
+            if chanPos in externalDeps:
+                anyDepChanged = true
+                if chanPos in elemExtDeps:
+                    elemDepChanged = true
+                    break
+    if elemDepChanged:
+        # Element deps changed — incremental cascade recomputation
+        when ProfileIteration: state.cdIncCalls += 1
+        # Collect changed external positions
+        var changedExternals: PackedSet[int]
+        for chanPos in changedChannels:
+            if chanPos in externalDeps:
+                changedExternals.incl(chanPos)
         let domain = state.sharedDomain[][pos]
+        var oldPenalties = newSeq[int](domain.len)
         for i in 0..<domain.len:
-            state.channelDepPenalties[pos][i] += uniformDelta
-            state.penaltyMap[pos][i] += uniformDelta
+            oldPenalties[i] = state.channelDepPenalties[pos][i]
+        state.computeChannelDepPenaltiesInc(pos, addr changedExternals)
+        for i in 0..<domain.len:
+            let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
+            if delta != 0:
+                state.penaltyMap[pos][i] += delta
+        return
+    if anyDepChanged and state.cdCascadeMinMaxIdx[cascadeIdx].len > 0:
+        # Only min/max deps changed — use cached element values, re-evaluate min/max only.
+        when ProfileIteration: state.cdFastPathCalls += 1
+        # Element cascade values are stable (no element deps changed). For each domain value,
+        # set the min/max's cascade inputs from cache, evaluate min/max, store in cache.
+        # Pass cache directly to computeCascadePenalties (it only reads min/max entries).
+        let domain = state.sharedDomain[][pos]
+        let nDom = domain.len
+        let chans = state.cdCascadeChans[cascadeIdx]
+        let bindings = state.cdCascadeBindings[cascadeIdx]
+        let mmIndices = state.cdCascadeMinMaxIdx[cascadeIdx]
+        let mmInputs = state.cdCascadeMinMaxInputs[cascadeIdx]
+        # Save assignment values at positions that will be temporarily modified
+        var savedAssignment: seq[tuple[pos: int, val: T]]
+        var savedSet: PackedSet[int]
+        for mmLocalIdx in 0..<mmIndices.len:
+            let mmTopoIdx = mmIndices[mmLocalIdx]
+            let fb = state.flatMinMaxBindings[bindings[mmTopoIdx]]
+            for (linearIdx, topoIdx) in mmInputs[mmLocalIdx]:
+                let lp = fb.linearPositions[linearIdx]
+                if lp notin savedSet:
+                    savedSet.incl(lp)
+                    savedAssignment.add((pos: lp, val: state.assignment[lp]))
+        for di in 0..<nDom:
+            for mmLocalIdx in 0..<mmIndices.len:
+                let mmTopoIdx = mmIndices[mmLocalIdx]
+                let fb = state.flatMinMaxBindings[bindings[mmTopoIdx]]
+                # Set cascade inputs from cache for this domain value
+                for (linearIdx, topoIdx) in mmInputs[mmLocalIdx]:
+                    state.assignment[fb.linearPositions[linearIdx]] = state.cdCascadeCachedValues[cascadeIdx][topoIdx][di]
+                # Re-evaluate min/max (reads cached cascade + current external from assignment)
+                state.cdCascadeCachedValues[cascadeIdx][mmTopoIdx][di] = evaluateFlatMinMax(fb, state.assignment)
+        # Restore assignment
+        for (p, v) in savedAssignment:
+            state.assignment[p] = v
+        # Compute penalties using cached values (min/max updated, elements unchanged)
+        var oldPenalties = newSeq[int](nDom)
+        for i in 0..<nDom:
+            oldPenalties[i] = state.channelDepPenalties[pos][i]
+        state.computeCascadePenalties(cascadeIdx,
+            state.cdCascadeCachedValues[cascadeIdx], domain, state.channelDepPenalties[pos])
+        for i in 0..<nDom:
+            let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
+            if delta != 0:
+                state.penaltyMap[pos][i] += delta
+        when ProfileIteration: state.cdCascadeCalls += 1
+        return
+    if not anyDepChanged:
+        # No external deps changed — uniform delta is exact
+        when ProfileIteration: state.cdUniformCalls += 1
+        let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
+        var uniformDelta = 0
+        for ci in constraintIds:
+            if not state.channelDepConstraintActive[ci]: continue
+            let newCost = state.channelDepConstraints[ci].penalty()
+            let savedCost = state.cdSavedConstraintCosts[ci]
+            if savedCost != newCost:
+                uniformDelta += savedCost - newCost
+        if uniformDelta != 0:
+            let domain = state.sharedDomain[][pos]
+            for i in 0..<domain.len:
+                state.channelDepPenalties[pos][i] += uniformDelta
+                state.penaltyMap[pos][i] += uniformDelta
 
 proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannels: seq[int], movedPosition: int = -1) =
     ## Targeted recomputation: update channel-dep penalties at search positions
@@ -626,7 +831,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
             if currentIdx >= 0 and currentIdx in affectedIndices:
                 # Full recomputation — use uniform delta
                 when ProfileIteration: state.cdFullPos += 1
-                state.applyUniformDelta(pos)
+                state.applyUniformDelta(pos, changedChannels)
             else:
                 # Targeted recomputation — only affected domain values
                 when ProfileIteration: state.cdTargetedPos += 1
@@ -649,7 +854,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos in nonOneHotPositions.items:
             if state.isLazy[pos]: continue
             when ProfileIteration: state.cdNonOneHotPos += 1
-            state.applyUniformDelta(pos)
+            state.applyUniformDelta(pos, changedChannels)
     else:
         # No reverse index — use channelDepPosForChannel with uniform delta
         var affectedPositions: PackedSet[int]
@@ -660,4 +865,4 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos in affectedPositions.items:
             if pos == movedPosition: continue
             if state.isLazy[pos]: continue
-            state.applyUniformDelta(pos)
+            state.applyUniformDelta(pos, changedChannels)

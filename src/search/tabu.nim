@@ -165,7 +165,21 @@ type
         # This enables batch evaluation: walk topology once, evaluate all domain values at once.
         cdCascadePos: Table[int, int]             # source position -> index into cdCascade*
         cdCascadeChans: seq[seq[int]]             # [cascadeIdx] -> channel positions in topological order
-        cdCascadeBindings: seq[seq[int]]          # [cascadeIdx] -> binding index for each channel position
+        cdCascadeBindings: seq[seq[int]]          # [cascadeIdx] -> binding index for each channel position (element or flatMinMax index)
+        cdCascadeIsMinMax: seq[seq[bool]]         # [cascadeIdx][entryIdx] -> true if entry is a min/max binding
+        cdCascadeExternalDeps: seq[PackedSet[int]]    # [cascadeIdx] -> ALL external dependency positions
+        cdCascadeElemExtDeps: seq[PackedSet[int]]     # [cascadeIdx] -> external deps from element entries only
+        cdCascadeMinMaxIdx: seq[seq[int]]             # [cascadeIdx] -> indices into topoOrder that are min/max entries
+        # Min/max fast-path: cached cascade values and precomputed input mapping
+        cdCascadeCachedValues: seq[seq[seq[T]]]      # [cascadeIdx][chanIdx][domainIdx] -> cached from last full eval
+        cdCascadeMinMaxInputs: seq[seq[seq[tuple[linearIdx: int, topoIdx: int]]]] # [cascadeIdx][mmLocalIdx] -> (linearPositions index, cascade topoIdx)
+        # Incremental cascade evaluation: forward deps and per-entry external inputs
+        cdCascadeForwardDeps: seq[seq[seq[int]]]    # [cascadeIdx][ci] -> downstream entry indices that read from chans[ci]
+        cdCascadeExtPosToEntries: seq[Table[int, seq[int]]]  # [cascadeIdx] -> extPos -> [entry indices that read extPos]
+        cdCascadeDirtyBase: seq[bool]               # reusable buffer for incremental eval dirty tracking
+        cdCascadeDirtyDV: seq[bool]                 # reusable buffer for per-domain-value dirty tracking
+        cdCascadeInWorkList: seq[bool]              # reusable buffer for work list membership
+        cdCascadeWorkList: seq[int]                 # reusable buffer for work list indices
         cdCascadeValues: seq[seq[seq[T]]]         # [cascadeIdx][chanIdx][domainIdx] -> absolute channel value (empty for dynamic)
         cdCascadeIsStatic: seq[bool]              # true if values are precomputed (constant arrays)
         # Per-constraint mapping into cascade channels (for fast penalty computation)
@@ -219,6 +233,12 @@ type
             cdCascadePenaltyTime*: float
             cdCascadeFallbackTime*: float
             cdCascadeCalls*: int64
+            cdFastPathCalls*: int64
+            cdElemDepCalls*: int64
+            cdIncCalls*: int64          # incremental cascade eval calls
+            cdIncSkipped*: int64        # total entries×domvals skipped (used cached)
+            cdIncEvaluated*: int64      # total entries×domvals actually evaluated
+            cdUniformCalls*: int64
 
 
 # Forward declarations
@@ -1537,6 +1557,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadePos = initTable[int, int]()
         state.cdCascadeChans = @[]
         state.cdCascadeBindings = @[]
+        state.cdCascadeIsMinMax = @[]
+        state.cdCascadeExternalDeps = @[]
+        state.cdCascadeElemExtDeps = @[]
+        state.cdCascadeMinMaxIdx = @[]
+        state.cdCascadeCachedValues = @[]
+        state.cdCascadeMinMaxInputs = @[]
         state.cdCascadeValues = @[]
         state.cdCascadeIsStatic = @[]
         state.cdCascadeConstraintL = @[]
@@ -1552,26 +1578,30 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # Skip positions with inverse groups (forced changes not captured by cascade)
             if state.inverseEnabled and state.posToInverseGroup[pos] >= 0: continue
 
-            # Walk topology from this position
+            # Walk topology from this position using BFS (FIFO queue) for correct
+            # topological ordering. BFS ensures parents are visited before children,
+            # which handles diamond patterns (multiple paths to same channel) correctly.
             var topoOrder: seq[int] = @[]
             var topoBindingIdx: seq[int] = @[]
+            var topoIsMinMax: seq[bool] = @[]
             var topoSet: PackedSet[int]
-            var worklist = @[pos]
+            var bfsQueue: seq[int] = @[pos]
+            var bfsHead = 0
             var visited: PackedSet[int]
             visited.incl(pos)
             var canBuild = true       # can build topology at all
             var canStatic = true      # can precompute values (constant arrays + local index deps)
 
-            while worklist.len > 0 and canBuild:
-                let p = worklist.pop()
+            while bfsHead < bfsQueue.len and canBuild:
+                let p = bfsQueue[bfsHead]
+                inc bfsHead
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
                         let bindingPtr = addr carray.channelBindings[bi]
                         let chanPos = bindingPtr.channelPosition
                         if chanPos in topoSet:
-                            # Duplicate channel — reject entirely
-                            canBuild = false
-                            break
+                            # Diamond pattern — channel already in cascade, skip
+                            continue
                         # Check static eligibility
                         if canStatic:
                             for ipos in bindingPtr.indexExpression.positions.items:
@@ -1585,12 +1615,26 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoSet.incl(chanPos)
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)
+                        topoIsMinMax.add(false)
                         if chanPos notin visited:
                             visited.incl(chanPos)
-                            worklist.add(chanPos)
-                # MinMax/countEq/inverse channels can't be batched — reject topology entirely
+                            bfsQueue.add(chanPos)
+                # Min/max channel bindings: include in cascade as dynamic entries
                 if p in carray.minMaxChannelsAtPosition:
-                    canBuild = false
+                    for bi in carray.minMaxChannelsAtPosition[p]:
+                        let fb = state.flatMinMaxBindings[bi]
+                        let chanPos = fb.channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false  # min/max depends on non-local positions
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)  # index into flatMinMaxBindings
+                        topoIsMinMax.add(true)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
+                # countEq/inverse channels can't be batched — reject topology entirely
                 if p in carray.countEqChannelsAtPosition:
                     canBuild = false
                 if p in carray.inverseChannelsAtPosition:
@@ -1667,10 +1711,92 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             constraintCoeffL.add(coeffsL)
                             constraintCoeffR.add(coeffsR)
 
+            # Compute external dependencies: positions read by cascade entries that
+            # are outside the cascade. Separate element vs min/max deps to allow
+            # fast-path when only min/max deps changed (skip element re-evaluation).
+            var externalDeps: PackedSet[int]
+            var elemExtDeps: PackedSet[int]
+            var minMaxIndices: seq[int]
+            for ci in 0..<topoOrder.len:
+                if topoIsMinMax[ci]:
+                    minMaxIndices.add(ci)
+                    let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
+                    for j in 0..<fb.linearPositions.len:
+                        let lp = fb.linearPositions[j]
+                        if lp != pos and lp notin topoSet:
+                            externalDeps.incl(lp)
+                    for expr in fb.complexExprs:
+                        for ep in expr.positions.items:
+                            if ep != pos and ep notin topoSet:
+                                externalDeps.incl(ep)
+                else:
+                    let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
+                    for ipos in bindingPtr.indexExpression.positions.items:
+                        if ipos != pos and ipos notin topoSet:
+                            externalDeps.incl(ipos)
+                            elemExtDeps.incl(ipos)
+                    for elem in bindingPtr.arrayElements:
+                        if not elem.isConstant:
+                            if elem.variablePosition != pos and elem.variablePosition notin topoSet:
+                                externalDeps.incl(elem.variablePosition)
+                                elemExtDeps.incl(elem.variablePosition)
+
             let cascadeIdx = state.cdCascadeChans.len
             state.cdCascadePos[pos] = cascadeIdx
             state.cdCascadeChans.add(topoOrder)
             state.cdCascadeBindings.add(topoBindingIdx)
+            state.cdCascadeIsMinMax.add(topoIsMinMax)
+            state.cdCascadeExternalDeps.add(externalDeps)
+            state.cdCascadeElemExtDeps.add(elemExtDeps)
+            state.cdCascadeMinMaxIdx.add(minMaxIndices)
+            # Precompute min/max input mapping: which linearPositions are cascade positions
+            var mmInputs: seq[seq[tuple[linearIdx: int, topoIdx: int]]]
+            for mmIdx in minMaxIndices:
+                let fb = state.flatMinMaxBindings[topoBindingIdx[mmIdx]]
+                var inputs: seq[tuple[linearIdx: int, topoIdx: int]]
+                for j in 0..<fb.linearPositions.len:
+                    let lp = fb.linearPositions[j]
+                    if lp in chanToIdx:
+                        inputs.add((linearIdx: j, topoIdx: chanToIdx[lp]))
+                mmInputs.add(inputs)
+            state.cdCascadeMinMaxInputs.add(mmInputs)
+            # Precompute per-entry inputs and forward deps for incremental cascade eval
+            # entryInputs[ci] = set of positions entry ci reads from (excluding pos itself)
+            var posToReaders = initTable[int, seq[int]]()  # cascade pos -> entry indices that read it
+            var extPosToEntries = initTable[int, seq[int]]()  # external pos -> entry indices
+            for ci in 0..<topoOrder.len:
+                var inputs: PackedSet[int]
+                if topoIsMinMax[ci]:
+                    let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
+                    for lp in fb.linearPositions:
+                        if lp != pos: inputs.incl(lp)
+                    for expr in fb.complexExprs:
+                        for ep in expr.positions.items:
+                            if ep != pos: inputs.incl(ep)
+                else:
+                    let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
+                    for ipos in bindingPtr.indexExpression.positions.items:
+                        if ipos != pos: inputs.incl(ipos)
+                    for elem in bindingPtr.arrayElements:
+                        if not elem.isConstant and elem.variablePosition != pos:
+                            inputs.incl(elem.variablePosition)
+                # Register in posToReaders (cascade-internal deps) and extPosToEntries
+                for p in inputs.items:
+                    if p in topoSet:
+                        posToReaders.mgetOrPut(p, @[]).add(ci)
+                    else:
+                        extPosToEntries.mgetOrPut(p, @[]).add(ci)
+            # Build forward deps: from entry ci to entries that read chans[ci]
+            var forwardDeps = newSeq[seq[int]](topoOrder.len)
+            for ci in 0..<topoOrder.len:
+                if topoOrder[ci] in posToReaders:
+                    forwardDeps[ci] = posToReaders[topoOrder[ci]]
+            state.cdCascadeForwardDeps.add(forwardDeps)
+            state.cdCascadeExtPosToEntries.add(extPosToEntries)
+            # Allocate cache for this cascade
+            state.cdCascadeCachedValues.add(newSeq[seq[T]](topoOrder.len))
+            for ci in 0..<topoOrder.len:
+                state.cdCascadeCachedValues[^1][ci] = newSeq[T](domain.len)
             state.cdCascadeValues.add(chanValues)
             state.cdCascadeIsStatic.add(canStatic)
             state.cdCascadeConstraintIds.add(constraintLocalIds)
@@ -1689,18 +1815,29 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             for ci in 0..<maxChans:
                 state.cdBatchValues[ci] = newSeq[T](maxDom)
             state.cdBatchSaved = newSeq[T](maxChans)
+            # Reusable dirty tracking buffers for incremental cascade eval
+            state.cdCascadeDirtyBase = newSeq[bool](maxChans)
+            state.cdCascadeDirtyDV = newSeq[bool](maxChans)
+            state.cdCascadeInWorkList = newSeq[bool](maxChans)
+            state.cdCascadeWorkList = newSeq[int](maxChans)  # worst case: all entries in work list
 
         if verbose and id == 0:
             var totalChans, totalMem = 0
+            var elemExtCount, mmExtCount, noExtCount = 0
             for ci in 0..<state.cdCascadeChans.len:
                 totalChans += state.cdCascadeChans[ci].len
                 for v in state.cdCascadeValues[ci]:
                     totalMem += v.len * sizeof(T)
+                if state.cdCascadeElemExtDeps[ci].len > 0: inc elemExtCount
+                elif state.cdCascadeExternalDeps[ci].len > 0: inc mmExtCount
+                else: inc noExtCount
             echo "[Init] Cascade tables: " & $staticCount & " static + " & $dynamicCount &
                  " dynamic / " & $(staticCount + dynamicCount + cascadeFail) &
                  " positions (fail=" & $cascadeFail &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
                  " mem=" & $(totalMem div 1024) & "KB" &
+                 " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &
+                 " noExt=" & $noExtCount &
                  " built in " & $(epochTime() - cascadeStart) & "s)"
 
     # Skip penalty maps, channel-dep penalties, and element implied structures for relinking
@@ -2508,6 +2645,9 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Profile S{state.id}] cdDomainEvals={state.cdDomainEvals} cdWorklistEntryCalls={state.cdWorklistEntryCalls} ({cdEvalPerCall:.1f} dirty/domainEval)"
         echo &"[Profile S{state.id}] cdWorklist={state.cdWorklistTime:.3f}s cdPenalty={state.cdPenaltyTime:.3f}s"
         echo &"[Profile S{state.id}] cdCascade: binding={state.cdCascadeBindingTime:.3f}s penalty={state.cdCascadePenaltyTime:.3f}s fallback={state.cdCascadeFallbackTime:.3f}s calls={state.cdCascadeCalls}"
+        echo &"[Profile S{state.id}] cdPaths: inc={state.cdIncCalls} fastPath={state.cdFastPathCalls} uniform={state.cdUniformCalls}"
+        if state.cdIncCalls > 0:
+            echo &"[Profile S{state.id}] cdInc: skipped={state.cdIncSkipped} evaluated={state.cdIncEvaluated} ({state.cdIncSkipped.float/(state.cdIncSkipped.float+state.cdIncEvaluated.float)*100:.1f}% cached)"
         echo "[Profile S" & $state.id & "] Neighbor by type:"
         for ct in StatefulConstraintType:
             if state.neighborByType[ct] > 0:
@@ -2546,6 +2686,16 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         state.propagateNeighborCalls = 0
         state.cdDomainEvals = 0
         state.cdWorklistEntryCalls = 0
+        state.cdCascadeBindingTime = 0
+        state.cdCascadePenaltyTime = 0
+        state.cdCascadeFallbackTime = 0
+        state.cdCascadeCalls = 0
+        state.cdFastPathCalls = 0
+        state.cdElemDepCalls = 0
+        state.cdIncCalls = 0
+        state.cdIncSkipped = 0
+        state.cdIncEvaluated = 0
+        state.cdUniformCalls = 0
         for ct in StatefulConstraintType:
             state.neighborByType[ct] = 0
             state.neighborTimeByType[ct] = 0
