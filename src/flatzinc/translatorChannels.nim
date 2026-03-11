@@ -2085,3 +2085,62 @@ proc detectGccCountChannels(tr: var FznTranslator) =
     if totalChannels > 0:
         stderr.writeLine(&"[FZN] Detected {totalChannels} GCC count channels")
 
+proc buildBoolAndChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for bool AND patterns detected by detectBoolAndChannels().
+    ## For bool_clause([b], [c1, ..., cn]): b = AND(c1, ..., cn)
+    ##   index = c1 + c2 + ... + cn  (sum of n boolean channels, range 0..n)
+    ##   array = [0, 0, ..., 0, 1]   (size n+1, value 1 only when all n conditions are 1)
+    ## Must be called after translateVariables() and buildReifChannelBindings().
+
+    var built = 0
+    for pattern in tr.boolAndChannelDefs:
+        let bName = pattern.resultVar
+        if bName notin tr.varPositions:
+            continue  # Variable was eliminated — skip
+        let bPos = tr.varPositions[bName]
+        let n = pattern.condVars.len
+
+        # Build index expression: sum of all condition channels
+        var condExprs: seq[AlgebraicExpression[int]]
+        var allValid = true
+        for cName in pattern.condVars:
+            if cName in tr.varPositions:
+                condExprs.add(tr.getExpr(tr.varPositions[cName]))
+            elif cName in tr.definedVarExprs:
+                condExprs.add(tr.definedVarExprs[cName])
+            else:
+                allValid = false
+                break
+        if not allValid or condExprs.len == 0: continue
+
+        # Build linear sum: c1 + c2 + ... + cn as AlgebraicExpression
+        var indexExpr = condExprs[0]
+        for i in 1..<condExprs.len:
+            indexExpr = indexExpr + condExprs[i]
+
+        # Build array: [0, 0, ..., 0, 1] — true only when ALL n conditions are 1
+        var arrayElems: seq[ArrayElement[int]]
+        for i in 0..n:
+            arrayElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if i == n: 1 else: 0))
+
+        let binding = ChannelBinding[int](
+            channelPosition: bPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(bPos)
+
+        # Register source positions for incremental propagation
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc built
+
+    if built > 0:
+        stderr.writeLine(&"[FZN] Built {built} bool AND channel bindings")
+

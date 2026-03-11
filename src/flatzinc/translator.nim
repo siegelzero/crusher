@@ -310,6 +310,9 @@ type
         maxFromLinLeDefs*: seq[MaxFromLinLeDef]
         # Detected spread patterns (pairwise int_lin_le → max/min channels + simple constraint)
         spreadPatternDefs*: seq[SpreadPatternDef]
+        # Detected bool AND channel defs: bool_clause([b],[c1,...,cn]) where all ci are channels
+        # and b appears as positive literal in exactly one bool_clause. b = AND(c1,...,cn).
+        boolAndChannelDefs*: seq[tuple[ci: int, resultVar: string, condVars: seq[string]]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -644,6 +647,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.skipSetVarNames = initHashSet[string]()
     result.fixedOnePos = -1
     result.rescuedChannelDefs = @[]
+    result.boolAndChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
@@ -671,6 +675,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
     result.detectReifChannels()
+    # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
+    # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
+    result.detectBoolAndChannels()
     # Detect argmax decomposition patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
     result.detectArgmaxPattern()
     # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -1371,6 +1378,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildSyntheticElementChannelBindings()
     # Build channel bindings for int_eq_reif/bool2int reification channels
     result.buildReifChannelBindings()
+    # Build channel bindings for bool AND channels (b = AND(c1,...,cn) from bool_clause)
+    result.buildBoolAndChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for one-hot indicator variables

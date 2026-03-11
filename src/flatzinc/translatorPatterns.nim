@@ -4042,3 +4042,71 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
 
     if iteration > 1:
         stderr.writeLine(&"[FZN] Max channel bounds: {iteration} fixpoint iterations")
+
+proc detectBoolAndChannels*(tr: var FznTranslator) =
+    ## Detects bool_clause([b], [c1, ..., cn]) where:
+    ##   - b is a plain var bool appearing as positive literal in EXACTLY ONE bool_clause
+    ##   - all ci are already channel variables (in channelVarNames)
+    ##   - n >= 1
+    ## These encode b = AND(c1, ..., cn). The constraint is consumed; b becomes a channel.
+    ##
+    ## In graph-clear: encodes var_i[e,t] = (var_l[e]<=t) AND (var_u[e]>=t) AND (var_t[i]!=t) AND (var_t[j]!=t)
+    ## Requires: detectReifChannels() must have run first (to populate channelVarNames).
+
+    # Pass 1: count how many bool_clause constraints have each var as sole positive literal
+    var posLiteralCount = initTable[string, int]()
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        if posArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1: continue  # must have exactly 1 positive literal
+        let posElem = posArg.elems[0]
+        if posElem.kind != FznIdent: continue
+        let bName = posElem.ident
+        posLiteralCount[bName] = posLiteralCount.getOrDefault(bName, 0) + 1
+
+    # Pass 2: for constraints where the positive literal appears exactly once and
+    # all negative literals are channel variables, detect the AND pattern
+    var detected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+
+        let posArg = con.args[0]
+        if posArg.kind != FznArrayLit or posArg.elems.len != 1: continue
+        let posElem = posArg.elems[0]
+        if posElem.kind != FznIdent: continue
+        let bName = posElem.ident
+
+        # b must appear as positive literal in exactly one bool_clause
+        if posLiteralCount.getOrDefault(bName, 0) != 1: continue
+
+        # b must not already be a channel or defined var
+        if bName in tr.channelVarNames: continue
+        if bName in tr.definedVarNames: continue
+
+        # Gather negative literals — all must be channel variables
+        let negArg = con.args[1]
+        if negArg.kind != FznArrayLit: continue
+        if negArg.elems.len == 0: continue  # need at least 1 condition
+
+        var condNames: seq[string]
+        var allChannels = true
+        for elem in negArg.elems:
+            if elem.kind != FznIdent or elem.ident notin tr.channelVarNames:
+                allChannels = false
+                break
+            condNames.add(elem.ident)
+        if not allChannels: continue
+
+        # All checks passed: b = AND(c1, ..., cn)
+        tr.boolAndChannelDefs.add((ci: ci, resultVar: bName, condVars: condNames))
+        tr.channelVarNames.incl(bName)
+        tr.definingConstraints.incl(ci)
+        inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} bool AND channels (b = AND(ci) from bool_clause)")
