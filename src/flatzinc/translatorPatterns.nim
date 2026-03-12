@@ -1,5 +1,299 @@
 ## Included from translator.nim -- not a standalone module.
 
+proc detectConditionalCountPatterns(tr: var FznTranslator) =
+    ## Detects int_lin_eq → bool2int → array_bool_and → (int_eq_reif × 2) chains.
+    ## Pattern: conditional count where each indicator checks TWO conditions:
+    ##   int_eq_reif(x_primary_j, targetVal, b_primary_j) :: defines_var(b_primary_j)
+    ##   int_eq_reif(x_filter_j, filterVal, b_filter_j) :: defines_var(b_filter_j)
+    ##   array_bool_and([b_primary_j, b_filter_j], b_both_j) :: defines_var(b_both_j)
+    ##   bool2int(b_both_j, ind_j) :: defines_var(ind_j)
+    ##   int_lin_eq(coeffs, [ind_1, ..., ind_n, target], rhs) :: defines_var(target)
+    ## Replaces deep cascade chains with a single conditional count channel binding.
+
+    # Build maps: variable name → defining constraint index
+    var bool2intDefs: Table[string, int]  # intVar name → constraint index
+    var intEqReifDefs: Table[string, int]  # boolVar name → constraint index
+    var arrayBoolAndDefs: Table[string, int]  # AND output var name → constraint index
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name == "bool2int" and con.hasAnnotation("defines_var"):
+            if con.args.len >= 2 and con.args[1].kind == FznIdent:
+                bool2intDefs[con.args[1].ident] = ci
+        elif name == "int_eq_reif" and con.hasAnnotation("defines_var"):
+            if con.args.len >= 3 and con.args[2].kind == FznIdent:
+                intEqReifDefs[con.args[2].ident] = ci
+        elif name == "array_bool_and" and con.hasAnnotation("defines_var"):
+            if con.args.len >= 2 and con.args[1].kind == FznIdent:
+                arrayBoolAndDefs[con.args[1].ident] = ci
+
+    # Scan for int_lin_eq constraints that match the conditional count pattern.
+    # Note: also check definingConstraints — collectDefinedVars may have claimed the
+    # int_lin_eq for expression inlining, but we want to convert it to a channel instead.
+    var nCandidates = 0
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
+            continue
+
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len < 3:  # Need at least 2 indicators + target
+            continue
+        inc nCandidates
+
+        # Extract variable names
+        let vars = con.args[1]
+        var varElems: seq[FznExpr]
+        if vars.kind == FznArrayLit:
+            varElems = vars.elems
+        elif vars.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+                    varElems = decl.value.elems
+                    found = true
+                    break
+            if not found: continue
+        else:
+            continue
+
+        if varElems.len != coeffs.len: continue
+
+        # Find the defines_var target position in the vars array
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0: continue
+        var targetIdent: string
+        if ann.args[0].kind == FznIdent:
+            targetIdent = ann.args[0].ident
+        elif ann.args[0].kind == FznStringLit:
+            targetIdent = ann.args[0].strVal
+        else:
+            continue
+        var targetIdx = -1
+        for i in 0..<varElems.len:
+            if varElems[i].kind == FznIdent and varElems[i].ident == targetIdent:
+                targetIdx = i
+                break
+        if targetIdx < 0: continue
+
+        let targetCoeff = coeffs[targetIdx]
+        if targetCoeff != 1 and targetCoeff != -1: continue
+
+        # All indicator coefficients must be the opposite sign
+        let indCoeff = -targetCoeff
+        var allMatch = true
+        for i in 0..<coeffs.len:
+            if i == targetIdx: continue
+            if coeffs[i] != indCoeff:
+                allMatch = false
+                break
+        if not allMatch: continue
+
+        # Trace each indicator through one of two paths:
+        # A) Conditional: bool2int → array_bool_and → two int_eq_reif
+        # B) Direct: bool2int → int_eq_reif (single condition, no filter)
+        type CondPair = tuple
+            primaryVar: string   # variable name in primary int_eq_reif
+            primaryVal: int      # constant value in primary int_eq_reif
+            filterVar: string    # variable name in filter int_eq_reif ("" for direct path)
+            filterVal: int       # constant value in filter int_eq_reif
+            isDirect: bool       # true if this indicator uses the direct (single-condition) path
+
+        var condPairs: seq[CondPair]
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+        var valid = true
+        var hasConditional = false
+
+        for i in 0..<varElems.len:
+            if i == targetIdx: continue
+            let indArg = varElems[i]
+            if indArg.kind != FznIdent:
+                valid = false; break
+            let indName = indArg.ident
+
+            # Trace: indVar → bool2int → boolVar
+            if indName notin bool2intDefs:
+                valid = false; break
+            let b2iIdx = bool2intDefs[indName]
+            let b2iCon = tr.model.constraints[b2iIdx]
+            if b2iCon.args[0].kind != FznIdent:
+                valid = false; break
+            let boolVarName = b2iCon.args[0].ident
+
+            if boolVarName in arrayBoolAndDefs:
+                # Conditional path: boolVar → array_bool_and → [b1, b2] → two int_eq_reif
+                let andIdx = arrayBoolAndDefs[boolVarName]
+                let andCon = tr.model.constraints[andIdx]
+                if andCon.args[0].kind != FznArrayLit:
+                    valid = false; break
+                let andInputs = andCon.args[0].elems
+                if andInputs.len != 2:
+                    valid = false; break
+                if andInputs[0].kind != FznIdent or andInputs[1].kind != FznIdent:
+                    valid = false; break
+
+                var pair: CondPair
+                pair.isDirect = false
+                # Only consume bool2int + array_bool_and, NOT the int_eq_reif constraints
+                # or their output boolVars — those may be referenced by other constraints
+                # (e.g., bool_clause) and need reification channel positions.
+                var pairConsumed: seq[int] = @[b2iIdx, andIdx]
+                var pairVarNames: seq[string] = @[indName, boolVarName]
+                var gotBoth = true
+
+                for bi in 0..1:
+                    let boolName = andInputs[bi].ident
+                    if boolName notin intEqReifDefs:
+                        gotBoth = false; break
+                    let eqReifIdx = intEqReifDefs[boolName]
+                    let eqReifCon = tr.model.constraints[eqReifIdx]
+                    if eqReifCon.args[0].kind != FznIdent:
+                        gotBoth = false; break
+                    let xName = eqReifCon.args[0].ident
+                    let val = try: tr.resolveIntArg(eqReifCon.args[1])
+                               except ValueError, KeyError: (gotBoth = false; 0)
+                    if not gotBoth: break
+                    if bi == 0:
+                        pair.primaryVar = xName
+                        pair.primaryVal = val
+                    else:
+                        pair.filterVar = xName
+                        pair.filterVal = val
+
+                if not gotBoth:
+                    valid = false; break
+
+                condPairs.add(pair)
+                consumedConstraints.add(pairConsumed)
+                consumedVarNames.add(pairVarNames)
+                hasConditional = true
+
+            elif boolVarName in intEqReifDefs:
+                # Direct path: boolVar → int_eq_reif (single condition, no filter)
+                let eqReifIdx = intEqReifDefs[boolVarName]
+                let eqReifCon = tr.model.constraints[eqReifIdx]
+                if eqReifCon.args[0].kind != FznIdent:
+                    valid = false; break
+                let xName = eqReifCon.args[0].ident
+                let val = try: tr.resolveIntArg(eqReifCon.args[1])
+                           except ValueError, KeyError: (valid = false; 0)
+                if not valid: break
+                condPairs.add((primaryVar: xName, primaryVal: val,
+                               filterVar: "", filterVal: 0, isDirect: true))
+                # Only consume bool2int, not int_eq_reif (may be shared)
+                consumedConstraints.add(@[b2iIdx])
+                consumedVarNames.add(@[indName])
+            else:
+                valid = false; break
+
+        if not valid or not hasConditional or condPairs.len < 2:
+            continue
+
+        # Determine the target value (all indicators must count the same value)
+        # and the filter value (all conditional indicators must share the same filter value).
+        # For conditional pairs, we need to figure out which of the two conditions is
+        # the "primary" (matching the direct path value) and which is the "filter".
+
+        # First, collect direct-path values to establish the target value
+        var directVal = -1
+        var directValSet = false
+        for cp in condPairs:
+            if cp.isDirect:
+                if not directValSet:
+                    directVal = cp.primaryVal
+                    directValSet = true
+                elif cp.primaryVal != directVal:
+                    valid = false; break
+        if not valid: continue
+
+        # For conditional pairs, determine which condition matches the target value
+        # Try both orderings: primary-first or filter-first
+        var targetValue, filterValue: int
+        var primaryVarNames, filterVarNames, directVarNames: seq[string]
+        var identified = false
+
+        for swapOrder in 0..1:
+            var tryValid = true
+            var tryTarget, tryFilter: int
+            var tryPrimary, tryFilterNames, tryDirect: seq[string]
+            var targetSet = directValSet
+            if targetSet:
+                tryTarget = directVal
+
+            for cp in condPairs:
+                if cp.isDirect:
+                    tryDirect.add(cp.primaryVar)
+                    continue
+                let (pVar, pVal, fVar, fVal) = if swapOrder == 0:
+                    (cp.primaryVar, cp.primaryVal, cp.filterVar, cp.filterVal)
+                else:
+                    (cp.filterVar, cp.filterVal, cp.primaryVar, cp.primaryVal)
+                if not targetSet:
+                    tryTarget = pVal
+                    tryFilter = fVal
+                    targetSet = true
+                elif pVal != tryTarget:
+                    tryValid = false; break
+                if tryFilterNames.len == 0:
+                    tryFilter = fVal
+                elif fVal != tryFilter:
+                    tryValid = false; break
+                tryPrimary.add(pVar)
+                tryFilterNames.add(fVar)
+
+            if tryValid and targetSet:
+                # If we had direct indicators, verify their value matches
+                if directValSet and tryTarget != directVal:
+                    continue
+                targetValue = tryTarget
+                filterValue = tryFilter
+                primaryVarNames = tryPrimary
+                filterVarNames = tryFilterNames
+                directVarNames = tryDirect
+                identified = true
+                break
+
+        if not identified: continue
+
+        # Compute constant offset: target = (rhs - sum(indCoeff * ind_j)) / targetCoeff
+        # Since ind_j are 0/1: target = (rhs - indCoeff * count) / targetCoeff
+        # When count = 0: target = rhs / targetCoeff
+        # For targetCoeff=-1, indCoeff=1: target = count - rhs, so constantOffset = -rhs
+        # For targetCoeff=1, indCoeff=-1: target = rhs + count, so constantOffset = rhs
+        let constantOffset = rhs * targetCoeff  # rhs/targetCoeff = rhs*targetCoeff since |targetCoeff|=1
+
+        # Record the pattern
+        tr.conditionalCountEqPatterns[ci] = ConditionalCountEqPattern(
+            linEqIdx: ci,
+            targetValue: targetValue,
+            filterValue: filterValue,
+            targetVarName: targetIdent,
+            primaryVarNames: primaryVarNames,
+            filterVarNames: filterVarNames,
+            primaryOnlyVarNames: directVarNames,
+            constantOffset: constantOffset
+        )
+
+        # If the int_lin_eq was already claimed by collectDefinedVars, undo that:
+        # remove the target from definedVarNames/Exprs so it becomes a channel variable instead
+        if ci in tr.definingConstraints:
+            tr.definingConstraints.excl(ci)
+            tr.definedVarNames.excl(targetIdent)
+            if targetIdent in tr.definedVarExprs:
+                tr.definedVarExprs.del(targetIdent)
+
+        # Mark consumed constraints and variable names
+        for idx in consumedConstraints:
+            tr.definingConstraints.incl(idx)
+        for vn in consumedVarNames:
+            tr.definedVarNames.incl(vn)
+
+        stderr.writeLine(&"[FZN] Detected conditional count_eq pattern: count_if({primaryVarNames.len} pairs + {directVarNames.len} direct, primary=={targetValue} AND filter=={filterValue}) + {constantOffset} -> {targetIdent}")
+
 proc detectCountPatterns(tr: var FznTranslator) =
     ## Detects int_lin_eq → bool2int → int_eq_reif chains that implement count_eq.
     ## Pattern: for each value v, n constraints of form:

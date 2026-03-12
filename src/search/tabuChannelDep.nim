@@ -107,6 +107,20 @@ proc evaluateCountEq[T](binding: CountEqChannelBinding[T], assignment: seq[T]): 
             inc count
     count
 
+proc evaluateConditionalCountEq[T](binding: ConditionalCountEqChannelBinding[T],
+                                    assignment: seq[T]): T {.inline.} =
+    ## Evaluate a conditional count-equals channel:
+    ## constantOffset + #{paired: primary==target AND filter==filterVal} + #{primaryOnly: ==target}.
+    var count: T = binding.constantOffset
+    for i in 0..<binding.primaryPositions.len:
+        if assignment[binding.primaryPositions[i]] == binding.targetValue and
+           assignment[binding.filterPositions[i]] == binding.filterValue:
+            inc count
+    for pos in binding.primaryOnlyPositions:
+        if assignment[pos] == binding.targetValue:
+            inc count
+    count
+
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.
     ## Saves original value on first change; cdDirtyPositions stays deduplicated.
@@ -124,6 +138,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     if pos notin state.carray.channelsAtPosition and
        pos notin state.carray.minMaxChannelsAtPosition and
        pos notin state.carray.countEqChannelsAtPosition and
+       pos notin state.carray.conditionalCountEqChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition:
         return 0
 
@@ -272,6 +287,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            if p in state.carray.conditionalCountEqChannelsAtPosition:
+                for bi in state.carray.conditionalCountEqChannelsAtPosition[p]:
+                    let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                    let newChanVal = evaluateConditionalCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
                     let group = state.carray.inverseChannelGroups[gi]
@@ -323,6 +348,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 for bi in state.carray.countEqChannelsAtPosition[p]:
                     let binding = state.carray.countEqChannelBindings[bi]
                     let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            if p in state.carray.conditionalCountEqChannelsAtPosition:
+                for bi in state.carray.conditionalCountEqChannelsAtPosition[p]:
+                    let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                    let newChanVal = evaluateConditionalCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)

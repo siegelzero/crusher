@@ -34,6 +34,15 @@ type
         inputPositions*: seq[int]            # Positions to scan
         constantOffset*: T                   # Fixed count from constant elements in the array
 
+    ConditionalCountEqChannelBinding*[T] = object
+        channelPosition*: int       # Output position (e.g., uses[p])
+        targetValue*: T             # Value counted on primary positions
+        primaryPositions*: seq[int] # Paired positions checked == targetValue
+        filterPositions*: seq[int]  # Paired positions checked == filterValue
+        filterValue*: T             # Required value at filter positions
+        primaryOnlyPositions*: seq[int]  # Positions checked only against targetValue (no filter)
+        constantOffset*: T          # Count from constant matches
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -67,6 +76,8 @@ type
         minMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [minMax binding indices]
         countEqChannelBindings*: seq[CountEqChannelBinding[T]]
         countEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [countEq binding indices]
+        conditionalCountEqChannelBindings*: seq[ConditionalCountEqChannelBinding[T]]
+        conditionalCountEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [condCountEq binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -246,6 +257,48 @@ proc addCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.countEqChannelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.countEqChannelsAtPosition[pos].add(bindingIdx)
+
+proc addConditionalCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
+                                               channelPos: int,
+                                               targetValue: T,
+                                               primaryPositions: seq[int],
+                                               filterPositions: seq[int],
+                                               filterValue: T,
+                                               primaryOnlyPositions: seq[int] = @[],
+                                               constantOffset: T = T(0)) =
+    ## Register a conditional count-equals channel:
+    ## channelPos = constantOffset +
+    ##   #{i : assignment[primaryPositions[i]] == targetValue AND assignment[filterPositions[i]] == filterValue} +
+    ##   #{p in primaryOnlyPositions : assignment[p] == targetValue}.
+    ## primaryOnlyPositions are checked only against targetValue (filter is trivially true).
+    assert primaryPositions.len == filterPositions.len
+    let bindingIdx = arr.conditionalCountEqChannelBindings.len
+    arr.conditionalCountEqChannelBindings.add(ConditionalCountEqChannelBinding[T](
+        channelPosition: channelPos,
+        targetValue: targetValue,
+        primaryPositions: primaryPositions,
+        filterPositions: filterPositions,
+        filterValue: filterValue,
+        primaryOnlyPositions: primaryOnlyPositions,
+        constantOffset: constantOffset
+    ))
+    arr.channelPositions.incl(channelPos)
+    # Register at primary, filter, and primary-only positions
+    for pos in primaryPositions:
+        if pos notin arr.conditionalCountEqChannelsAtPosition:
+            arr.conditionalCountEqChannelsAtPosition[pos] = @[bindingIdx]
+        elif bindingIdx notin arr.conditionalCountEqChannelsAtPosition[pos]:
+            arr.conditionalCountEqChannelsAtPosition[pos].add(bindingIdx)
+    for pos in filterPositions:
+        if pos notin arr.conditionalCountEqChannelsAtPosition:
+            arr.conditionalCountEqChannelsAtPosition[pos] = @[bindingIdx]
+        elif bindingIdx notin arr.conditionalCountEqChannelsAtPosition[pos]:
+            arr.conditionalCountEqChannelsAtPosition[pos].add(bindingIdx)
+    for pos in primaryOnlyPositions:
+        if pos notin arr.conditionalCountEqChannelsAtPosition:
+            arr.conditionalCountEqChannelsAtPosition[pos] = @[bindingIdx]
+        elif bindingIdx notin arr.conditionalCountEqChannelsAtPosition[pos]:
+            arr.conditionalCountEqChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -3515,6 +3568,10 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Count-equals channel bindings are all value types — shallow copy is fine
     result.countEqChannelBindings = arr.countEqChannelBindings
     result.countEqChannelsAtPosition = arr.countEqChannelsAtPosition
+
+    # Conditional count-equals channel bindings are all value types — shallow copy is fine
+    result.conditionalCountEqChannelBindings = arr.conditionalCountEqChannelBindings
+    result.conditionalCountEqChannelsAtPosition = arr.conditionalCountEqChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups

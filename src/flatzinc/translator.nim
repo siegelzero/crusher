@@ -22,6 +22,18 @@ type
         targetVarName*: string   # name of the target variable (the count)
         arrayVarNames*: seq[string]  # names of the array variables being counted over
 
+    ConditionalCountEqPattern* = object
+        ## A detected conditional count_eq pattern:
+        ## int_lin_eq → bool2int → array_bool_and → (int_eq_reif × 2) chains
+        linEqIdx*: int           # index of the int_lin_eq constraint
+        targetValue*: int        # value counted on primary positions
+        filterValue*: int        # required value at filter positions
+        targetVarName*: string   # name of the target variable (the count)
+        primaryVarNames*: seq[string]  # names of primary condition variables (paired with filter)
+        filterVarNames*: seq[string]   # names of filter condition variables (paired with primary)
+        primaryOnlyVarNames*: seq[string]  # names of direct-path variables (no filter check)
+        constantOffset*: int     # constant added to the count
+
     MatrixInfo* = object
         ## Info about a known matrix (square output array) for matrix_element detection
         arrayName*: string
@@ -176,6 +188,8 @@ type
         arrayElementNames*: Table[string, seq[string]]
         # Detected count_eq patterns (mapped by int_lin_eq constraint index)
         countEqPatterns*: Table[int, CountEqPattern]
+        # Detected conditional count_eq patterns (mapped by int_lin_eq constraint index)
+        conditionalCountEqPatterns*: Table[int, ConditionalCountEqPattern]
         # Geost conversion (active if tileValues.len > 0)
         geostConversion*: GeostConversion
         # Matrix infos for matrix_element pattern detection
@@ -637,6 +651,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
     result.arrayElementNames = initTable[string, seq[string]]()
     result.countEqPatterns = initTable[int, CountEqPattern]()
+    result.conditionalCountEqPatterns = initTable[int, ConditionalCountEqPattern]()
     result.argmaxPatterns = initTable[int, ArgmaxPattern]()
     result.matrixInfos = initTable[string, MatrixInfo]()
     result.definedVarBounds = initTable[string, (int, int)]()
@@ -667,6 +682,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.collectDefinedVars()
     # Detect int_mod channel patterns (Z = X mod C → element channel)
     result.detectIntModChannels()
+    # Detect conditional count_eq patterns (int_lin_eq → bool2int → array_bool_and → int_eq_reif × 2)
+    result.detectConditionalCountPatterns()
     # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
     result.detectCountPatterns()
     # Detect max-from-lin-le patterns (ceiling >= source + offset → max channel)
@@ -915,7 +932,35 @@ proc translate*(model: FznModel): FznTranslator =
         if ci in result.redundantOrderings:
             inc nSkippedRedundant
             continue
-        if ci in result.countEqPatterns:
+        if ci in result.conditionalCountEqPatterns:
+            # Emit conditional count_eq channel binding for detected pattern
+            let pattern = result.conditionalCountEqPatterns[ci]
+            proc resolveVarPos(tr: FznTranslator, vn: string): int =
+                if vn in tr.varPositions:
+                    return tr.varPositions[vn]
+                elif vn in tr.definedVarExprs:
+                    let expr = tr.definedVarExprs[vn]
+                    if expr.node.kind == RefNode:
+                        return expr.node.position
+                raise newException(KeyError, &"Unknown/non-position var '{vn}' in conditional count_eq pattern")
+            var primaryPos, filterPos, primaryOnlyPos: seq[int]
+            for vn in pattern.primaryVarNames:
+                primaryPos.add(result.resolveVarPos(vn))
+            for vn in pattern.filterVarNames:
+                filterPos.add(result.resolveVarPos(vn))
+            for vn in pattern.primaryOnlyVarNames:
+                primaryOnlyPos.add(result.resolveVarPos(vn))
+            let targetPos = result.varPositions[pattern.targetVarName]
+            result.sys.baseArray.addConditionalCountEqChannelBinding(
+                targetPos, pattern.targetValue, primaryPos, filterPos,
+                pattern.filterValue, primaryOnlyPos, pattern.constantOffset)
+            result.channelVarNames.incl(pattern.targetVarName)
+            # Set domain to valid range for this channel
+            let totalIndicators = primaryPos.len + primaryOnlyPos.len
+            let maxCount = totalIndicators + pattern.constantOffset
+            let minCount = pattern.constantOffset
+            result.sys.baseArray.domain[targetPos] = toSeq(minCount..maxCount)
+        elif ci in result.countEqPatterns:
             # Emit count_eq for detected pattern
             let pattern = result.countEqPatterns[ci]
             var arrayPos: seq[int]
