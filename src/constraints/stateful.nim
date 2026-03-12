@@ -294,6 +294,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ConditionalNoOverlapPair Constraint"
         of ConditionalDayCapacityType:
             return "ConditionalDayCapacity Constraint"
+        of DisjunctiveClauseType:
+            return "DisjunctiveClause Constraint"
 
 ################################################################################
 # Evaluation
@@ -359,6 +361,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.conditionalNoOverlapPairState.cost
         of ConditionalDayCapacityType:
             return constraint.conditionalDayCapacityState.cost
+        of DisjunctiveClauseType:
+            return constraint.disjunctiveClauseState.cost
 
 ################################################################################
 # Computed Constraints
@@ -972,6 +976,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.conditionalNoOverlapPairState.initialize(assignment)
         of ConditionalDayCapacityType:
             constraint.conditionalDayCapacityState.initialize(assignment)
+        of DisjunctiveClauseType:
+            constraint.disjunctiveClauseState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1034,6 +1040,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.conditionalNoOverlapPairState.moveDelta(position, oldValue, newValue)
         of ConditionalDayCapacityType:
             constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
+        of DisjunctiveClauseType:
+            constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1096,6 +1104,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.conditionalNoOverlapPairState.updatePosition(position, newValue)
         of ConditionalDayCapacityType:
             constraint.conditionalDayCapacityState.updatePosition(position, newValue)
+        of DisjunctiveClauseType:
+            constraint.disjunctiveClauseState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1725,6 +1735,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: ConditionalDayCapacityType,
                 conditionalDayCapacityState: constraint.conditionalDayCapacityState.deepCopy()
+            )
+        of DisjunctiveClauseType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: DisjunctiveClauseType,
+                disjunctiveClauseState: constraint.disjunctiveClauseState.deepCopy()
             )
 
 

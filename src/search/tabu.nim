@@ -322,6 +322,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.conditionalNoOverlapPairState.moveDelta(position, oldValue, newValue)
         of ConditionalDayCapacityType:
             result = constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
+        of DisjunctiveClauseType:
+            result = constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -400,6 +402,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ConditionalDayCapacityType:
             let p = constraint.conditionalDayCapacityState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == DisjunctiveClauseType:
+            let p = constraint.disjunctiveClauseState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         else:
@@ -484,6 +490,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == ConditionalDayCapacityType:
             let penalties = constraint.conditionalDayCapacityState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == DisjunctiveClauseType:
+            let penalties = constraint.disjunctiveClauseState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -576,6 +588,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             state.constraintPenalties[position][localIdx][i] = newP
     elif constraint.stateType == ConditionalDayCapacityType:
         let penalties = constraint.conditionalDayCapacityState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == DisjunctiveClauseType:
+        let penalties = constraint.disjunctiveClauseState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]

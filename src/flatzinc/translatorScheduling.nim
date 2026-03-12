@@ -1,5 +1,29 @@
 ## Included from translator.nim -- not a standalone module.
 
+proc extractLinLeReifTerm(tr: FznTranslator, reifCi: int):
+    tuple[ok: bool, term: DisjunctiveClauseTerm] =
+    ## Extract coefficients, variable names, and RHS from int_lin_le_reif constraint.
+    let reifCon = tr.model.constraints[reifCi]
+    let coeffs = try: tr.resolveIntArray(reifCon.args[0]) except ValueError, KeyError: return
+    let rhs = try: tr.resolveIntArg(reifCon.args[2]) except ValueError, KeyError: return
+    let varArr = reifCon.args[1]
+    var varNames: seq[string]
+    case varArr.kind
+    of FznArrayLit:
+        for e in varArr.elems:
+            if e.kind == FznIdent:
+                varNames.add(e.ident)
+            else:
+                return
+    of FznIdent:
+        if varArr.ident in tr.arrayElementNames:
+            varNames = tr.arrayElementNames[varArr.ident]
+        else:
+            return
+    else: return
+    if varNames.len != coeffs.len: return
+    result = (ok: true, term: DisjunctiveClauseTerm(coeffs: coeffs, varNames: varNames, rhs: rhs))
+
 proc detectDisjunctivePairs(tr: var FznTranslator) =
     ## Detects disjunctive pair patterns:
     ##   int_lin_le_reif(coeffs1, vars1, rhs1, b1) :: defines_var(b1)
@@ -9,6 +33,10 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     ## Replaces all 3 constraints + 2 bool variables with:
     ##   min(max(0, expr1), max(0, expr2)) == 0
     ## where expr_i = scalar_product(coeffs_i, vars_i) - rhs_i.
+    ##
+    ## Also detects generalized disjunctive clauses:
+    ##   Pattern A: bool_clause([b1, b2, b3], []) — 3 literals from int_lin_le_reif
+    ##   Pattern B: bool_clause([a, d], []) where d = array_bool_and([b, c]) and a,b,c from int_lin_le_reif
 
     # Step 1: Build mapping from result var name → constraint index for
     # all int_lin_le_reif with defines_var annotation
@@ -25,23 +53,57 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
 
     if linLeReifDefines.len == 0: return
 
+    # Step 1b: Build mapping from result var name → (constraint index, input var names)
+    # for all array_bool_and with defines_var annotation
+    var arrayBoolAndDefines: Table[string, tuple[ci: int, inputs: seq[string]]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_and": continue
+        if con.args.len < 2: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let resultArg = con.args[1]
+        if resultArg.kind != FznIdent: continue
+        var inputs: seq[string]
+        let inputArr = con.args[0]
+        if inputArr.kind != FznArrayLit: continue
+        var allIdents = true
+        for elem in inputArr.elems:
+            if elem.kind != FznIdent:
+                allIdents = false
+                break
+            inputs.add(elem.ident)
+        if allIdents and inputs.len > 0:
+            arrayBoolAndDefines[resultArg.ident] = (ci: ci, inputs: inputs)
+
     # Step 2: Count references to each bool var in non-defining constraints.
-    # We only count references in bool_clause positive/negative literal lists.
+    # Count references in bool_clause AND array_bool_and/array_bool_or input arrays.
     var varRefCount: Table[string, int]
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
-        if name != "bool_clause": continue
-        if con.args.len < 2: continue
-        # Count each literal mentioned in positive and negative arrays
-        for argIdx in 0..1:
-            let arr = con.args[argIdx]
-            if arr.kind != FznArrayLit: continue
-            for elem in arr.elems:
+        if name == "bool_clause":
+            if con.args.len < 2: continue
+            for argIdx in 0..1:
+                let arr = con.args[argIdx]
+                if arr.kind != FznArrayLit: continue
+                for elem in arr.elems:
+                    if elem.kind == FznIdent:
+                        varRefCount.mgetOrPut(elem.ident, 0) += 1
+        elif name == "array_bool_and" or name == "array_bool_or":
+            if con.args.len < 1: continue
+            let inputArr = con.args[0]
+            if inputArr.kind != FznArrayLit: continue
+            for elem in inputArr.elems:
                 if elem.kind == FznIdent:
                     varRefCount.mgetOrPut(elem.ident, 0) += 1
 
-    # Step 3: Scan bool_clause([b1, b2], []) constraints
+    # Step 3: Scan bool_clause constraints for disjunctive patterns.
+    # A bool var from int_lin_le_reif with refcount=1 can be fully consumed.
+    # A bool var with refcount=2 can still be consumed if BOTH its references
+    # are in bool_clause constraints we'll consume (shared var between Pattern A and B).
+    # For shared vars, we don't eliminate the var or its defining constraint — it becomes
+    # a channel — but we still emit the algebraic constraint using the underlying vars.
     var nConsumed = 0
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
@@ -51,81 +113,281 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
         let posArg = con.args[0]
         let negArg = con.args[1]
         if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
-        # Pattern: exactly 2 positive literals, no negative literals
-        if posArg.elems.len != 2 or negArg.elems.len != 0: continue
-        let b1 = posArg.elems[0]
-        let b2 = posArg.elems[1]
-        if b1.kind != FznIdent or b2.kind != FznIdent: continue
-        # Check both are defined by int_lin_le_reif
-        if b1.ident notin linLeReifDefines or b2.ident notin linLeReifDefines: continue
-        # Check both are only used in this one clause
-        if varRefCount.getOrDefault(b1.ident) != 1 or varRefCount.getOrDefault(b2.ident) != 1: continue
+        if negArg.elems.len != 0: continue
 
-        # Extract coefficients, variables, and RHS from both reif constraints
-        let reifIdx1 = linLeReifDefines[b1.ident]
-        let reifIdx2 = linLeReifDefines[b2.ident]
-        let reifCon1 = tr.model.constraints[reifIdx1]
-        let reifCon2 = tr.model.constraints[reifIdx2]
+        if posArg.elems.len == 2:
+            # Original 2-literal pattern: bool_clause([b1, b2], [])
+            let b1 = posArg.elems[0]
+            let b2 = posArg.elems[1]
+            if b1.kind != FznIdent or b2.kind != FznIdent: continue
+            # Check both are defined by int_lin_le_reif
+            if b1.ident notin linLeReifDefines or b2.ident notin linLeReifDefines: continue
+            # Check both are only used in this one clause
+            if varRefCount.getOrDefault(b1.ident) != 1 or varRefCount.getOrDefault(b2.ident) != 1: continue
 
-        let coeffs1 = try: tr.resolveIntArray(reifCon1.args[0]) except ValueError, KeyError: continue
-        let coeffs2 = try: tr.resolveIntArray(reifCon2.args[0]) except ValueError, KeyError: continue
-        let rhs1 = try: tr.resolveIntArg(reifCon1.args[2]) except ValueError, KeyError: continue
-        let rhs2 = try: tr.resolveIntArg(reifCon2.args[2]) except ValueError, KeyError: continue
+            let (ok1, term1) = tr.extractLinLeReifTerm(linLeReifDefines[b1.ident])
+            let (ok2, term2) = tr.extractLinLeReifTerm(linLeReifDefines[b2.ident])
+            if not ok1 or not ok2: continue
 
-        # Resolve variable names from the args
-        var varNames1: seq[string]
-        var varNames2: seq[string]
-        let varArr1 = reifCon1.args[1]
-        let varArr2 = reifCon2.args[1]
+            # Consume all 3 constraints and both bool variables
+            tr.definingConstraints.incl(ci)
+            tr.definingConstraints.incl(linLeReifDefines[b1.ident])
+            tr.definingConstraints.incl(linLeReifDefines[b2.ident])
+            tr.definedVarNames.incl(b1.ident)
+            tr.definedVarNames.incl(b2.ident)
 
-        block extractVars1:
-            case varArr1.kind
-            of FznArrayLit:
-                for e in varArr1.elems:
-                    if e.kind == FznIdent:
-                        varNames1.add(e.ident)
-                    else:
-                        break extractVars1
-            of FznIdent:
-                if varArr1.ident in tr.arrayElementNames:
-                    varNames1 = tr.arrayElementNames[varArr1.ident]
-                else:
-                    continue
-            else: continue
+            tr.disjunctivePairs.add((
+                coeffs1: term1.coeffs, varNames1: term1.varNames, rhs1: term1.rhs,
+                coeffs2: term2.coeffs, varNames2: term2.varNames, rhs2: term2.rhs))
+            nConsumed += 3
 
-        block extractVars2:
-            case varArr2.kind
-            of FznArrayLit:
-                for e in varArr2.elems:
-                    if e.kind == FznIdent:
-                        varNames2.add(e.ident)
-                    else:
-                        break extractVars2
-            of FznIdent:
-                if varArr2.ident in tr.arrayElementNames:
-                    varNames2 = tr.arrayElementNames[varArr2.ident]
-                else:
-                    continue
-            else: continue
+        elif posArg.elems.len == 3:
+            # Pattern A: bool_clause([b1, b2, b3], []) — 3 literals from int_lin_le_reif
+            var allIdent = true
+            for e in posArg.elems:
+                if e.kind != FznIdent:
+                    allIdent = false
+                    break
+            if not allIdent: continue
+            let b1 = posArg.elems[0].ident
+            let b2 = posArg.elems[1].ident
+            let b3 = posArg.elems[2].ident
+            # Check all three are defined by int_lin_le_reif
+            if b1 notin linLeReifDefines or b2 notin linLeReifDefines or b3 notin linLeReifDefines: continue
+            # Allow refcount <= 2: vars with refcount=2 are shared between Pattern A and B
+            # and will be consumed by both. Don't eliminate shared vars (they become channels).
+            if varRefCount.getOrDefault(b1) > 2 or varRefCount.getOrDefault(b2) > 2 or varRefCount.getOrDefault(b3) > 2: continue
 
-        if varNames1.len != coeffs1.len or varNames2.len != coeffs2.len: continue
+            let (ok1, term1) = tr.extractLinLeReifTerm(linLeReifDefines[b1])
+            let (ok2, term2) = tr.extractLinLeReifTerm(linLeReifDefines[b2])
+            let (ok3, term3) = tr.extractLinLeReifTerm(linLeReifDefines[b3])
+            if not ok1 or not ok2 or not ok3: continue
 
-        # Consume all 3 constraints and both bool variables
-        tr.definingConstraints.incl(ci)        # bool_clause
-        tr.definingConstraints.incl(reifIdx1)  # int_lin_le_reif for b1
-        tr.definingConstraints.incl(reifIdx2)  # int_lin_le_reif for b2
-        tr.definedVarNames.incl(b1.ident)
-        tr.definedVarNames.incl(b2.ident)
+            # Consume the bool_clause and int_lin_le_reif constraints.
+            # For shared vars (refcount=2), keep the defining constraint and var alive.
+            tr.definingConstraints.incl(ci)
+            for bIdent in [b1, b2, b3]:
+                if varRefCount.getOrDefault(bIdent) == 1:
+                    tr.definingConstraints.incl(linLeReifDefines[bIdent])
+                    tr.definedVarNames.incl(bIdent)
 
-        tr.disjunctivePairs.add((
-            coeffs1: coeffs1, varNames1: varNames1, rhs1: rhs1,
-            coeffs2: coeffs2, varNames2: varNames2, rhs2: rhs2))
-        nConsumed += 3
+            tr.disjunctiveClauses.add(DisjunctiveClause(
+                disjuncts: @[@[term1], @[term2], @[term3]]))
+            nConsumed += 4
 
     if tr.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.disjunctivePairs.len} disjunctive pairs, " &
-                                          &"{nConsumed} constraints consumed, " &
+                                          &"{nConsumed - tr.disjunctiveClauses.len * 4} constraints consumed, " &
                                           &"{tr.disjunctivePairs.len * 2} bool variables eliminated")
+
+    # Step 4: Scan bool_clause for Pattern B: bool_clause([a, d], [])
+    # where a is from int_lin_le_reif and d is from array_bool_and([b, c, ...])
+    # with all inputs from int_lin_le_reif
+    var nPatternB = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 0: continue
+        if posArg.elems.len != 2: continue
+        let e0 = posArg.elems[0]
+        let e1 = posArg.elems[1]
+        if e0.kind != FznIdent or e1.kind != FznIdent: continue
+
+        # Try both orderings: (a=reif, d=and) or (d=and, a=reif)
+        var reifIdent, andIdent: string
+        if e0.ident in linLeReifDefines and e1.ident in arrayBoolAndDefines:
+            reifIdent = e0.ident
+            andIdent = e1.ident
+        elif e1.ident in linLeReifDefines and e0.ident in arrayBoolAndDefines:
+            reifIdent = e1.ident
+            andIdent = e0.ident
+        else:
+            continue
+
+        # Allow refcount <= 2 for reif var (may be shared with Pattern A clause)
+        if varRefCount.getOrDefault(reifIdent) > 2: continue
+        if varRefCount.getOrDefault(andIdent) != 1: continue
+
+        let andInfo = arrayBoolAndDefines[andIdent]
+        # Check all inputs of array_bool_and are from int_lin_le_reif with refcount 1
+        var allInputsValid = true
+        for inp in andInfo.inputs:
+            if inp notin linLeReifDefines or varRefCount.getOrDefault(inp) != 1:
+                allInputsValid = false
+                break
+        if not allInputsValid: continue
+
+        # Extract terms
+        let (okA, termA) = tr.extractLinLeReifTerm(linLeReifDefines[reifIdent])
+        if not okA: continue
+        var conjTerms: seq[DisjunctiveClauseTerm]
+        var allOk = true
+        for inp in andInfo.inputs:
+            let (okInp, termInp) = tr.extractLinLeReifTerm(linLeReifDefines[inp])
+            if not okInp:
+                allOk = false
+                break
+            conjTerms.add(termInp)
+        if not allOk: continue
+
+        # Consume: 1 bool_clause + 1 array_bool_and + int_lin_le_reif constraints
+        tr.definingConstraints.incl(ci)            # bool_clause
+        tr.definingConstraints.incl(andInfo.ci)    # array_bool_and
+        tr.definedVarNames.incl(andIdent)
+        # For reif var: only consume if refcount=1 (not shared with Pattern A)
+        if varRefCount.getOrDefault(reifIdent) == 1:
+            tr.definingConstraints.incl(linLeReifDefines[reifIdent])
+            tr.definedVarNames.incl(reifIdent)
+        for inp in andInfo.inputs:
+            tr.definingConstraints.incl(linLeReifDefines[inp])
+            tr.definedVarNames.incl(inp)
+
+        tr.disjunctiveClauses.add(DisjunctiveClause(
+            disjuncts: @[@[termA], conjTerms]))
+        nPatternB += 1
+
+    if tr.disjunctiveClauses.len > 0:
+        let nPatternA = tr.disjunctiveClauses.len - nPatternB
+        stderr.writeLine(&"[FZN] Detected {tr.disjunctiveClauses.len} generalized disjunctive clauses " &
+                                          &"({nPatternA} 3-way, {nPatternB} AND-of-reif)")
+
+
+proc referencesIdent(expr: FznExpr, name: string): bool =
+    ## Check if a FznExpr tree references a given identifier name.
+    case expr.kind
+    of FznIdent: return expr.ident == name
+    of FznArrayLit:
+        for e in expr.elems:
+            if referencesIdent(e, name): return true
+    else: discard
+    return false
+
+proc detectSmallDomainProducts(tr: var FznTranslator) =
+    ## Detects int_times(a, b, prod) :: defines_var(prod) where one operand has
+    ## a small domain (≤8 values), and ALL non-defining references to prod are in
+    ## int_lin_le constraints. Decomposes into DisjunctiveClause with |smallDomain|
+    ## disjuncts (case-splitting on each value of the small operand).
+    ## Also emits synthetic relaxation constraints for bounds propagation.
+    const MaxSmallDomainSize = 8
+
+    # Step 1: Find all int_times defining constraints with a small-domain operand
+    type ProductInfo = tuple[timesCi: int, smallVar, largeVar, prodVar: string, smallDomain: seq[int]]
+    var products: seq[ProductInfo]
+
+    for ci in tr.definingConstraints.items:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_times": continue
+        if con.args.len < 3: continue
+        if con.args[2].kind != FznIdent: continue
+        let prodName = con.args[2].ident
+        if prodName notin tr.definedVarNames: continue
+        if prodName in tr.channelVarNames: continue  # defensive
+        for (si, li) in [(0, 1), (1, 0)]:
+            let sArg = con.args[si]
+            let lArg = con.args[li]
+            if sArg.kind != FznIdent or lArg.kind != FznIdent: continue
+            let dom = tr.lookupVarDomain(sArg.ident)
+            if dom.len >= 2 and dom.len <= MaxSmallDomainSize:
+                products.add((timesCi: ci, smallVar: sArg.ident,
+                              largeVar: lArg.ident, prodVar: prodName, smallDomain: dom))
+                break
+
+    if products.len == 0: return
+
+    # Step 2: For each product, find ALL non-defining constraints referencing it
+    var consumedLinLe = initPackedSet[int]()
+    var nDecomposed = 0
+    var nLinLeConsumed = 0
+    for product in products:
+        var linLeCIs: seq[int]
+        var allLinLe = true
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            if ci in consumedLinLe: continue
+            var refsProd = false
+            for arg in con.args:
+                if referencesIdent(arg, product.prodVar):
+                    refsProd = true; break
+            if not refsProd: continue
+            let cname = stripSolverPrefix(con.name)
+            if cname != "int_lin_le":
+                allLinLe = false; break
+            linLeCIs.add(ci)
+        if not allLinLe or linLeCIs.len == 0: continue
+
+        # Step 3: Build DisjunctiveClause with |smallDomain| disjuncts
+        var disjuncts: seq[seq[DisjunctiveClauseTerm]]
+
+        for k in product.smallDomain:
+            var terms: seq[DisjunctiveClauseTerm]
+            # B[i] == k: encoded as two inequality terms (smallVar <= k AND smallVar >= k)
+            terms.add(DisjunctiveClauseTerm(coeffs: @[1], varNames: @[product.smallVar], rhs: k))
+            terms.add(DisjunctiveClauseTerm(coeffs: @[-1], varNames: @[product.smallVar], rhs: -k))
+
+            for lci in linLeCIs:
+                let con = tr.model.constraints[lci]
+                let coeffs = tr.resolveIntArray(con.args[0])
+                let rhs = tr.resolveIntArg(con.args[2])
+                var varNames: seq[string]
+                let varArr = con.args[1]
+                if varArr.kind == FznArrayLit:
+                    for elem in varArr.elems:
+                        varNames.add(elem.ident)
+                elif varArr.kind == FznIdent and varArr.ident in tr.arrayElementNames:
+                    varNames = tr.arrayElementNames[varArr.ident]
+                else:
+                    continue
+
+                # Substitute prod = k * largeVar
+                var newCoeffs: seq[int]
+                var newVarNames: seq[string]
+                var largeCoeff = 0
+                var prodCoeff = 0
+                for vi in 0..<coeffs.len:
+                    if varNames[vi] == product.prodVar:
+                        prodCoeff = coeffs[vi]
+                        largeCoeff += coeffs[vi] * k
+                    elif varNames[vi] == product.largeVar:
+                        largeCoeff += coeffs[vi]
+                    else:
+                        newCoeffs.add(coeffs[vi])
+                        newVarNames.add(varNames[vi])
+                if largeCoeff != 0:
+                    newCoeffs.add(largeCoeff)
+                    newVarNames.add(product.largeVar)
+                terms.add(DisjunctiveClauseTerm(coeffs: newCoeffs, varNames: newVarNames, rhs: rhs))
+
+                # Synthetic relaxation: for positive prodCoeff (upper-bound on product),
+                # dropping prod >= 0 is a valid relaxation
+                if k == product.smallDomain[0] and prodCoeff > 0:
+                    var synCoeffs: seq[int]
+                    var synVarNames: seq[string]
+                    for vi in 0..<coeffs.len:
+                        if varNames[vi] != product.prodVar:
+                            synCoeffs.add(coeffs[vi])
+                            synVarNames.add(varNames[vi])
+                    if synCoeffs.len > 0:
+                        tr.syntheticRelaxations.add(DisjunctiveClauseTerm(
+                            coeffs: synCoeffs, varNames: synVarNames, rhs: rhs))
+
+            disjuncts.add(terms)
+
+        for lci in linLeCIs:
+            tr.definingConstraints.incl(lci)
+            consumedLinLe.incl(lci)
+        tr.disjunctiveClauses.add(DisjunctiveClause(disjuncts: disjuncts))
+        nDecomposed += 1
+        nLinLeConsumed += linLeCIs.len
+
+    if nDecomposed > 0:
+        stderr.writeLine(&"[FZN] Decomposed {nDecomposed} small-domain products " &
+                          &"({nLinLeConsumed} int_lin_le consumed)")
 
 
 proc detectDisjunctiveResources(tr: var FznTranslator) =

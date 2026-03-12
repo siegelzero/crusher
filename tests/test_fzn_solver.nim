@@ -887,3 +887,353 @@ solve satisfy;
     check xVal == 14
     check yVal == 3
     check zVal == 2  # 14 mod 3 = 2
+
+  test "3-way disjunctive clause detection":
+    # int_lin_le_reif([-1],[x],−5,b1) means -x <= -5 → x >= 5 → b1=true when x>=5
+    # bool_clause([b1,b2,b3],[]) means b1 OR b2 OR b3
+    # Penalty: min(max(0,-x-(-5)), min(max(0,-y-(-3)), max(0,-z-(-7)))) == 0
+    #        = min(max(0,5-x), min(max(0,3-y), max(0,7-z))) == 0
+    # Satisfied when x>=5 OR y>=3 OR z>=7
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var 0..10: z;
+var bool: b1;
+var bool: b2;
+var bool: b3;
+constraint int_lin_le_reif([-1],[x],-5,b1):: defines_var(b1);
+constraint int_lin_le_reif([-1],[y],-3,b2):: defines_var(b2);
+constraint int_lin_le_reif([-1],[z],-7,b3):: defines_var(b3);
+constraint bool_clause([b1,b2,b3],[]);
+constraint int_lin_le([1],[x],4);
+constraint int_lin_le([1],[y],2);
+solve satisfy;
+"""
+    # x <= 4 AND y <= 2 forces x<5 and y<3, so only z>=7 can satisfy
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "b1" in tr.definedVarNames
+    check "b2" in tr.definedVarNames
+    check "b3" in tr.definedVarNames
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 3
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal <= 4
+    check yVal <= 2
+    check zVal >= 7
+
+  test "AND-of-reif disjunctive clause (Pattern B)":
+    # bool_clause([a, d], []) where a from int_lin_le_reif, d = array_bool_and([b,c])
+    # a: -x <= -5 → x >= 5
+    # b: -y <= -3 → y >= 3
+    # c: -z <= -7 → z >= 7
+    # d = b AND c → (y>=3 AND z>=7)
+    # clause: x>=5 OR (y>=3 AND z>=7)
+    # With x<=4 forcing first branch false, need y>=3 AND z>=7
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var 0..10: z;
+var bool: a;
+var bool: b;
+var bool: c;
+var bool: d;
+constraint int_lin_le_reif([-1],[x],-5,a):: defines_var(a);
+constraint int_lin_le_reif([-1],[y],-3,b):: defines_var(b);
+constraint int_lin_le_reif([-1],[z],-7,c):: defines_var(c);
+constraint array_bool_and([b,c],d):: defines_var(d);
+constraint bool_clause([a,d],[]);
+constraint int_lin_le([1],[x],4);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "a" in tr.definedVarNames
+    check "b" in tr.definedVarNames
+    check "c" in tr.definedVarNames
+    check "d" in tr.definedVarNames
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 2
+    # First disjunct: 1 term (x >= 5)
+    check tr.disjunctiveClauses[0].disjuncts[0].len == 1
+    # Second disjunct: 2 terms (y >= 3 AND z >= 7)
+    check tr.disjunctiveClauses[0].disjuncts[1].len == 2
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal <= 4
+    check yVal >= 3
+    check zVal >= 7
+
+suite "FlatZinc Small-Domain Product Decomposition":
+
+  test "small-domain product decomposition — structural checks":
+    # Verify detection: 1 product, 3 disjuncts (b in {0,1,2}),
+    # 2 int_lin_le consumed, 1 synthetic relaxation (positive-coeff upper bound)
+    let src = """
+var 10..100: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..200: prod :: var_is_introduced :: is_defined_var;
+var 5..50: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([-1, -1], [r, prod], -20);
+constraint int_lin_le([1, 1], [r, prod], 80);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # 1 disjunctive clause from product decomposition
+    check tr.disjunctiveClauses.len == 1
+    # 3 disjuncts: one per value in {0,1,2}
+    check tr.disjunctiveClauses[0].disjuncts.len == 3
+    # Each disjunct: 2 equality terms (b<=k, b>=-k) + 2 substituted int_lin_le = 4 terms
+    for d in tr.disjunctiveClauses[0].disjuncts:
+      check d.len == 4
+    # 1 synthetic relaxation: only the [1,1] constraint has positive prodCoeff
+    check tr.syntheticRelaxations.len == 1
+    check tr.syntheticRelaxations[0].varNames == @["r"]
+    check tr.syntheticRelaxations[0].coeffs == @[1]
+    check tr.syntheticRelaxations[0].rhs == 80
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal + objVal * bVal >= 20
+    check rVal + objVal * bVal <= 80
+
+  test "small-domain product — k=0 eliminates large var":
+    # When b=0, prod=0 regardless of obj, so the substituted int_lin_le
+    # should have largeCoeff=0 and the obj variable should not appear.
+    # b in {0,1}, so 2 disjuncts.
+    # Constraint: r + 2*prod <= 100 → when b=0: r <= 100; when b=1: r + 2*obj <= 100
+    let src = """
+var 10..80: obj :: output_var;
+var 0..1: b :: output_var;
+var 0..160: prod :: var_is_introduced :: is_defined_var;
+var 5..50: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([1, 2], [r, prod], 100);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 2
+
+    # k=0 disjunct: equality terms + substituted term with only r (no obj)
+    let d0 = tr.disjunctiveClauses[0].disjuncts[0]
+    check d0.len == 3  # b<=0, b>=0, r<=100
+    let subst0 = d0[2]
+    check subst0.varNames == @["r"]
+    check subst0.coeffs == @[1]
+    check subst0.rhs == 100
+
+    # k=1 disjunct: equality terms + substituted term with r and obj
+    let d1 = tr.disjunctiveClauses[0].disjuncts[1]
+    check d1.len == 3  # b<=1, b>=-1, 1*r + 2*obj <= 100
+    let subst1 = d1[2]
+    check subst1.varNames.len == 2
+    check "r" in subst1.varNames
+    check "obj" in subst1.varNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal + 2 * objVal * bVal <= 100
+
+  test "small-domain product — coefficient merging":
+    # largeVar (obj) appears both as itself and via prod in the int_lin_le.
+    # int_lin_le([3, 1, 2], [obj, r, prod], 200) → when b=k:
+    #   prodCoeff=2, largeCoeff = 3 + 2*k (merge obj's own coeff + prod's contribution)
+    let src = """
+var 10..50: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..100: prod :: var_is_introduced :: is_defined_var;
+var 5..30: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([3, 1, 2], [obj, r, prod], 200);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 3
+
+    # k=0: largeCoeff = 3 + 2*0 = 3 → [1*r, 3*obj] <= 200
+    let d0sub = tr.disjunctiveClauses[0].disjuncts[0][2]
+    check d0sub.varNames.len == 2
+    for i, vn in d0sub.varNames:
+      if vn == "obj": check d0sub.coeffs[i] == 3
+      elif vn == "r": check d0sub.coeffs[i] == 1
+
+    # k=1: largeCoeff = 3 + 2*1 = 5 → [1*r, 5*obj] <= 200
+    let d1sub = tr.disjunctiveClauses[0].disjuncts[1][2]
+    for i, vn in d1sub.varNames:
+      if vn == "obj": check d1sub.coeffs[i] == 5
+
+    # k=2: largeCoeff = 3 + 2*2 = 7 → [1*r, 7*obj] <= 200
+    let d2sub = tr.disjunctiveClauses[0].disjuncts[2][2]
+    for i, vn in d2sub.varNames:
+      if vn == "obj": check d2sub.coeffs[i] == 7
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check 3 * objVal + rVal + 2 * objVal * bVal <= 200
+
+  test "small-domain product — non-int_lin_le reference blocks decomposition":
+    # prod referenced in int_ne (not int_lin_le) → decomposition should NOT fire
+    let src = """
+var 10..50: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..100: prod :: var_is_introduced :: is_defined_var;
+var 5..30: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([1, 1], [r, prod], 80);
+constraint int_ne(prod, 0);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # No decomposition: int_ne blocks it
+    check tr.disjunctiveClauses.len == 0
+    check tr.syntheticRelaxations.len == 0
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    let prodVal = objVal * bVal
+    check rVal + prodVal <= 80
+    check prodVal != 0
+
+  test "small-domain product — multiple independent products":
+    # Two products: prod1 = obj * b1, prod2 = obj * b2
+    # Each with its own int_lin_le constraints
+    let src = """
+var 10..50: obj :: output_var;
+var 0..1: b1 :: output_var;
+var 0..1: b2 :: output_var;
+var 0..50: prod1 :: var_is_introduced :: is_defined_var;
+var 0..50: prod2 :: var_is_introduced :: is_defined_var;
+var 5..30: r1 :: output_var;
+var 5..30: r2 :: output_var;
+constraint int_times(obj, b1, prod1) :: defines_var(prod1);
+constraint int_times(obj, b2, prod2) :: defines_var(prod2);
+constraint int_lin_le([1, 1], [r1, prod1], 60);
+constraint int_lin_le([1, 1], [r2, prod2], 60);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Both products decomposed → 2 disjunctive clauses
+    check tr.disjunctiveClauses.len == 2
+    # Each has 2 disjuncts (b in {0,1})
+    check tr.disjunctiveClauses[0].disjuncts.len == 2
+    check tr.disjunctiveClauses[1].disjuncts.len == 2
+    # 2 synthetic relaxations (one per product's positive-coeff int_lin_le)
+    check tr.syntheticRelaxations.len == 2
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let b1Val = tr.sys.assignment[tr.varPositions["b1"]]
+    let b2Val = tr.sys.assignment[tr.varPositions["b2"]]
+    let r1Val = tr.sys.assignment[tr.varPositions["r1"]]
+    let r2Val = tr.sys.assignment[tr.varPositions["r2"]]
+    check r1Val + objVal * b1Val <= 60
+    check r2Val + objVal * b2Val <= 60
+
+  test "small-domain product — small var as second operand":
+    # int_times(obj, b, prod) but also test int_times(b, obj, prod)
+    # The detection should handle both orderings.
+    let src = """
+var 10..50: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..100: prod :: var_is_introduced :: is_defined_var;
+var 5..30: r :: output_var;
+constraint int_times(b, obj, prod) :: defines_var(prod);
+constraint int_lin_le([1, 1], [r, prod], 80);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Should still detect: b is the small-domain operand
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 3
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal + objVal * bVal <= 80
+
+  test "small-domain product — domain too large blocks detection":
+    # b has domain of 10 values (> MaxSmallDomainSize=8) — should NOT decompose
+    let src = """
+var 10..50: obj :: output_var;
+var 0..9: b :: output_var;
+var 0..500: prod :: var_is_introduced :: is_defined_var;
+var 5..30: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([1, 1], [r, prod], 300);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.disjunctiveClauses.len == 0
+    check tr.syntheticRelaxations.len == 0
+
+  test "small-domain product — synthetic relaxation only for positive coeff":
+    # Two int_lin_le: one with positive prodCoeff (+1), one with negative (-1).
+    # Only the positive-coeff one should generate a synthetic relaxation.
+    let src = """
+var 10..100: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..200: prod :: var_is_introduced :: is_defined_var;
+var 5..50: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([1, 1], [r, prod], 120);
+constraint int_lin_le([-1, -1], [r, prod], -10);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.disjunctiveClauses.len == 1
+    # Only the [1,1] constraint (prodCoeff=+1) generates synthetic; [-1,-1] (prodCoeff=-1) does not
+    check tr.syntheticRelaxations.len == 1
+    check tr.syntheticRelaxations[0].rhs == 120
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal + objVal * bVal <= 120
+    check rVal + objVal * bVal >= 10

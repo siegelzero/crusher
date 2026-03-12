@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -155,6 +155,16 @@ type
         offsets*: seq[int]              # per-source offsets
         consumedCIs*: seq[int]          # consumed constraint indices
 
+    DisjunctiveClauseTerm* = object
+        coeffs*: seq[int]
+        varNames*: seq[string]
+        rhs*: int
+
+    DisjunctiveClause* = object
+        ## Each disjunct is a seq of terms (conjunction of linear inequalities).
+        ## Satisfied when at least one disjunct has all its terms satisfied.
+        disjuncts*: seq[seq[DisjunctiveClauseTerm]]
+
     FznTranslator* = object
         sys*: ConstraintSystem[int]
         # Maps FZN variable name -> position in the ConstrainedArray
@@ -218,6 +228,10 @@ type
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[int], varNames1: seq[string], rhs1: int,
             coeffs2: seq[int], varNames2: seq[string], rhs2: int]]
+        # Generalized disjunctive clauses (3+ literal bool_clause and AND-of-reif patterns)
+        disjunctiveClauses*: seq[DisjunctiveClause]
+        # Synthetic relaxation constraints from product decomposition (for bounds propagation)
+        syntheticRelaxations*: seq[DisjunctiveClauseTerm]
         # Min/max channel defs: array_int_minimum/maximum with defines_var → channel variables
         minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
         # Case-analysis channel defs: bool_clause case analysis → constant lookup channel
@@ -702,6 +716,8 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
     # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
     result.detectDisjunctivePairs()
+    # Detect small-domain product patterns (int_times with small operand → case-split)
+    result.detectSmallDomainProducts()
     # Detect disjunctive resource groups (cliques of pairs → cumulative)
     result.detectDisjunctiveResources()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
@@ -1098,6 +1114,81 @@ proc translate*(model: FznModel): FznTranslator =
 
     if result.sys.baseArray.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Disjunctive pairs for domain reduction: {result.sys.baseArray.disjunctivePairs.len}")
+
+    # Add generalized disjunctive clause constraints using dedicated DisjunctiveClauseType
+    for clause in result.disjunctiveClauses:
+        var disjuncts: seq[seq[tuple[coeffs: seq[int], positions: seq[int], rhs: int]]]
+        var allPositions = initPackedSet[int]()
+        var skip = false
+        for disjunct in clause.disjuncts:
+            var terms: seq[tuple[coeffs: seq[int], positions: seq[int], rhs: int]]
+            for term in disjunct:
+                var termPositions: seq[int]
+                for vn in term.varNames:
+                    if vn in result.varPositions:
+                        termPositions.add(result.varPositions[vn])
+                    elif vn in result.definedVarExprs:
+                        # Defined var — can't use dedicated type, fall back
+                        skip = true
+                        break
+                    else:
+                        skip = true
+                        break
+                if skip: break
+                terms.add((coeffs: term.coeffs, positions: termPositions, rhs: term.rhs))
+                for p in termPositions:
+                    allPositions.incl(p)
+            if skip: break
+            disjuncts.add(terms)
+
+        if skip:
+            # Fallback to algebraic expression for this clause
+            let zero = newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: 0),
+                linear = true)
+            var disjunctExprs: seq[AlgebraicExpression[int]]
+            for disjunct in clause.disjuncts:
+                var conjPenalty = zero
+                for term in disjunct:
+                    var linExpr = newAlgebraicExpression[int](
+                        positions = initPackedSet[int](),
+                        node = ExpressionNode[int](kind: LiteralNode, value: -term.rhs),
+                        linear = true)
+                    for i in 0..<term.coeffs.len:
+                        let varExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: term.varNames[i]))
+                        linExpr = linExpr + term.coeffs[i] * varExpr
+                    conjPenalty = conjPenalty + binaryMax(zero, linExpr)
+                disjunctExprs.add(conjPenalty)
+            var disjPenalty = disjunctExprs[0]
+            for i in 1..<disjunctExprs.len:
+                disjPenalty = binaryMin(disjPenalty, disjunctExprs[i])
+            result.sys.addConstraint(disjPenalty == 0)
+        else:
+            # Emit dedicated DisjunctiveClauseConstraint
+            let dcState = newDisjunctiveClauseConstraint[int](disjuncts)
+            let constraint = StatefulConstraint[int](
+                positions: allPositions,
+                stateType: DisjunctiveClauseType,
+                disjunctiveClauseState: dcState)
+            result.sys.addConstraint(constraint)
+
+    if result.disjunctiveClauses.len > 0:
+        stderr.writeLine(&"[FZN] Emitted {result.disjunctiveClauses.len} generalized disjunctive clause constraints")
+
+    # Emit synthetic relaxation constraints from product decomposition (for bounds propagation)
+    for synTerm in result.syntheticRelaxations:
+        var linExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true)
+        for i in 0..<synTerm.coeffs.len:
+            let varExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: synTerm.varNames[i]))
+            linExpr = linExpr + synTerm.coeffs[i] * varExpr
+        result.sys.addConstraint(linExpr <= synTerm.rhs)
+    if result.syntheticRelaxations.len > 0:
+        stderr.writeLine(&"[FZN] Added {result.syntheticRelaxations.len} synthetic relaxation " &
+                          &"constraints for bounds propagation")
 
     # Emit cumulative constraints for detected disjunctive resource groups
     for group in result.disjunctiveResourceGroups:
