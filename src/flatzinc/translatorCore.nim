@@ -719,13 +719,26 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 if zArg.kind == FznIdent and zArg.ident in tr.varPositions:
                     tr.sys.baseArray.setDomain(tr.varPositions[zArg.ident], @[result])
         elif yArg.kind != FznIntLit:
-            # Variable C: add approximate bounds constraints
+            # Variable C: introduce quotient variable q, enforce x == y * q + z, 0 <= z < y
             let x = tr.resolveExprArg(xArg)
             let y = tr.resolveExprArg(yArg)
             let z = tr.resolveExprArg(zArg)
+            let xDomain = if xArg.kind == FznIdent and xArg.ident in tr.varPositions:
+                              tr.sys.baseArray.domain[tr.varPositions[xArg.ident]].sorted()
+                          elif xArg.kind == FznIntLit: @[xArg.intVal]
+                          else: @[0]
+            let yDomain = if yArg.kind == FznIdent and yArg.ident in tr.varPositions:
+                              tr.sys.baseArray.domain[tr.varPositions[yArg.ident]].sorted()
+                          elif yArg.kind == FznIntLit: @[yArg.intVal]
+                          else: @[1]
+            let qVar = tr.sys.newConstrainedVariable()
+            let qLo = if yDomain[^1] > 0: xDomain[0] div yDomain[^1] else: 0
+            let qHi = if yDomain[0] > 0: xDomain[^1] div yDomain[0] else: xDomain[^1]
+            tr.sys.baseArray.setDomain(qVar.offset, toSeq(qLo..qHi))
+            let q = tr.getExpr(qVar.offset)
+            tr.sys.addConstraint(x == y * q + z)
             tr.sys.addConstraint(z >= 0)
             tr.sys.addConstraint(z < y)
-            tr.sys.addConstraint(x - z >= 0)
 
     # ===== All-different =====
     of "fzn_all_different_int", "all_different_int":

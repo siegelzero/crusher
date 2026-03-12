@@ -379,14 +379,14 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
                 # x is a constant: b = S.bools[x - lo] (direct identity channel)
                 let xVal = tr.resolveIntArg(xArg)
-                let bpos = getSetBoolPosition(sInfo, xVal)
-                if bpos >= 0:
+                let sBoolPos = getSetBoolPosition(sInfo, xVal)
+                if sBoolPos >= 0:
                     # b = element(0, [S.bools[x-lo]])
                     indexExpr = newAlgebraicExpression[int](
                         positions = initPackedSet[int](),
                         node = ExpressionNode[int](kind: LiteralNode, value: 0),
                         linear = true)
-                    arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
+                    arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: sBoolPos))
                 else:
                     # x outside set universe: b = 0
                     tr.sys.baseArray.setDomain(bPos, @[0])

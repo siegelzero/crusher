@@ -862,3 +862,28 @@ solve satisfy;
     check zVal == 3
     check (xVal - 10) mod 5 == 3
     check xVal in [13, 18]
+
+  test "int_mod with variable divisor":
+    ## int_mod(x, y, z) where both x and y are variables.
+    ## x in 10..15, y in 3..4, z = x mod y.
+    ## Fix x=14, y=3 → z = 14 mod 3 = 2.
+    let src = """
+var 10..15: x :: output_var;
+var 3..4: y :: output_var;
+var 0..4: z :: output_var;
+constraint int_mod(x, y, z);
+constraint int_eq(x, 14);
+constraint int_eq(y, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal == 14
+    check yVal == 3
+    check zVal == 2  # 14 mod 3 = 2

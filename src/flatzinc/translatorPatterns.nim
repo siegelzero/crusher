@@ -4387,10 +4387,7 @@ proc detectSingletonSetChannels(tr: var FznTranslator) =
         let info = tr.setVarBoolPositions[sName]
         if info.positions.len == 0: continue
 
-        # Mark S's bools as channels and both constraints as defining
-        for bpos in info.positions:
-            # These will be populated by addChannelBinding later
-            discard
+        # Mark both constraints as defining
         tr.definingConstraints.incl(ci)  # set_in
         tr.definingConstraints.incl(cardOneSets[sName])  # set_card
         tr.singletonSetChannelDefs.add((
@@ -4403,4 +4400,8 @@ proc detectSingletonSetChannels(tr: var FznTranslator) =
         inc nDetected
 
     if nDetected > 0:
-        stderr.writeLine(&"[FZN] Detected {nDetected} singleton set channels ({nDetected * 12} bools → channels)")
+        var totalBools = 0
+        for def in tr.singletonSetChannelDefs:
+            if def.setName in tr.setVarBoolPositions:
+                totalBools += tr.setVarBoolPositions[def.setName].positions.len
+        stderr.writeLine(&"[FZN] Detected {nDetected} singleton set channels ({totalBools} bools → channels)")

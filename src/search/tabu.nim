@@ -1252,8 +1252,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             elif d <= 10: bin3to10 += 1
             elif d <= 50: bin11to50 += 1
             else: binLarge += 1
-        echo "[Init] Search positions by domain: d<=2: " & $bin2 & " d<=10: " & $bin3to10 &
-             " d<=50: " & $bin11to50 & " d>50: " & $binLarge
+        stderr.writeLine("[Init] Search positions by domain: d<=2: " & $bin2 & " d<=10: " & $bin3to10 &
+             " d<=50: " & $bin11to50 & " d>50: " & $binLarge)
 
     # Initialize dormancy support
     state.isDormant = newSeq[bool](carray.len)
@@ -1933,14 +1933,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for p, idx in state.cdCascadePos.pairs:
                         if idx == ci: maxChansPos = p; break
                 if nco > maxConstraints: maxConstraints = nco
-            echo "[Init] Cascade size distribution:"
+            stderr.writeLine("[Init] Cascade size distribution:")
             var sizes: seq[int]
             for s in sizeHist.keys: sizes.add(s)
             algorithm.sort(sizes)
             for s in sizes:
-                echo "[Init]   " & $s & " chans: " & $sizeHist[s] & " cascades"
-            echo "[Init] Max cascade: " & $maxChansCnt & " chans at pos " & $maxChansPos &
-                 " max_constraints=" & $maxConstraints
+                stderr.writeLine("[Init]   " & $s & " chans: " & $sizeHist[s] & " cascades")
+            stderr.writeLine("[Init] Max cascade: " & $maxChansCnt & " chans at pos " & $maxChansPos &
+                 " max_constraints=" & $maxConstraints)
 
     # Skip penalty maps, channel-dep penalties, and element implied structures for relinking
     if forRelinking:
@@ -2032,7 +2032,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             tautByType[ct] += 1
                     for ct in StatefulConstraintType:
                         if tautByType[ct] > 0 or activeByType[ct] > 0:
-                            echo "[Init]   " & $ct & ": active=" & $activeByType[ct] & " taut=" & $tautByType[ct]
+                            stderr.writeLine("[Init]   " & $ct & ": active=" & $activeByType[ct] & " taut=" & $tautByType[ct])
                 if tautCount == state.channelDepConstraints.len:
                     state.hasChannelDeps = false
 
