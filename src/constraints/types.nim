@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport
 
 ################################################################################
 # Shared constraint type definitions
@@ -38,7 +38,8 @@ type
         ConditionalCumulativeType,
         ConditionalNoOverlapPairType,
         ConditionalDayCapacityType,
-        DisjunctiveClauseType
+        DisjunctiveClauseType,
+        ValueSupportType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -131,3 +132,5 @@ type
                 conditionalDayCapacityState*: ConditionalDayCapacityConstraint[T]
             of DisjunctiveClauseType:
                 disjunctiveClauseState*: DisjunctiveClauseConstraint[T]
+            of ValueSupportType:
+                valueSupportState*: ValueSupportConstraint[T]

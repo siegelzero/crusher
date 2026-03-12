@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -164,6 +164,13 @@ type
         ## Each disjunct is a seq of terms (conjunction of linear inequalities).
         ## Satisfied when at least one disjunct has all its terms satisfied.
         disjuncts*: seq[seq[DisjunctiveClauseTerm]]
+
+    ValueSupportDef* = object
+        ## A detected value-support pattern: if cell has value N>1, neighbours must include 1..N-1.
+        cellVarName*: string
+        neighbourVarNames*: seq[string]
+        maxVal*: int
+        consumedCIs*: seq[int]
 
     FznTranslator* = object
         sys*: ConstraintSystem[int]
@@ -351,6 +358,10 @@ type
         # One-hot conditional channel defs: Z = element(weightedIndex, constTable)
         # Detected from exhaustive bool_clause([eq_reif(Z, v_i)], [eq_reif(X_i, c)]) patterns.
         oneHotCondChannelDefs*: seq[tuple[targetVar: string, condChannels: seq[string], targetVals: seq[int], consumedCIs: seq[int]]]
+        # Detected value-support patterns (bool_clause + int_eq_reif + int_le_reif → native constraint)
+        valueSupportDefs*: seq[ValueSupportDef]
+        # Bool vars consumed by value-support detection (skip in channel detection)
+        valueSupportConsumedBools*: HashSet[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -707,6 +718,9 @@ proc translate*(model: FznModel): FznTranslator =
     # for tabu search. The max/min channel replacement loses per-pair penalty signals.
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
+    # Detect value-support patterns (bool_clause + int_eq_reif + int_le_reif → native constraint)
+    # MUST run before detectReifChannels to prevent consumed booleans from being channeled
+    result.detectValueSupportPattern()
     # Detect skill-allocation disjunctive patterns (MUST run before detectReifChannels
     # to prevent intermediate booleans from being wastefully channeled)
     result.detectSkillAllocationPattern()
@@ -1175,6 +1189,16 @@ proc translate*(model: FznModel): FznTranslator =
 
     if result.disjunctiveClauses.len > 0:
         stderr.writeLine(&"[FZN] Emitted {result.disjunctiveClauses.len} generalized disjunctive clause constraints")
+
+    # Emit value-support constraints
+    for def in result.valueSupportDefs:
+        let cellPos = result.varPositions[def.cellVarName]
+        var neighbourPos: seq[int]
+        for vn in def.neighbourVarNames:
+            neighbourPos.add(result.varPositions[vn])
+        result.sys.addConstraint(valueSupport[int](cellPos, neighbourPos, def.maxVal))
+    if result.valueSupportDefs.len > 0:
+        stderr.writeLine(&"[FZN] Emitted {result.valueSupportDefs.len} value-support constraints")
 
     # Emit synthetic relaxation constraints from product decomposition (for bounds propagation)
     for synTerm in result.syntheticRelaxations:

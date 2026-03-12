@@ -1264,3 +1264,69 @@ solve satisfy;
     let bVal = tr.sys.assignment[tr.varPositions["b"]]
     let rVal = tr.sys.assignment[tr.varPositions["r"]]
     check rVal + objVal * bVal <= 80
+
+  test "value-support pattern detection — 2x2 grid":
+    # 2x2 grid: cells c0..c3, each with domain 1..3
+    # Neighbours: c0↔c1, c0↔c2, c1↔c3, c2↔c3
+    # For each cell with value N>1, neighbours must contain all 1..N-1
+    # Encoded as bool_clause + int_eq_reif + int_le_reif
+    let src = """
+var 1..3: c0;
+var 1..3: c1;
+var 1..3: c2;
+var 1..3: c3;
+var bool: eq_c1_1;
+var bool: eq_c2_1;
+var bool: le_c0_1;
+var bool: eq_c0_1;
+var bool: eq_c3_1;
+var bool: le_c1_1;
+var bool: eq_c0_1b;
+var bool: eq_c3_1b;
+var bool: le_c2_1;
+var bool: eq_c1_1b;
+var bool: eq_c2_1b;
+var bool: le_c3_1;
+constraint int_eq_reif(c1, 1, eq_c1_1) :: defines_var(eq_c1_1);
+constraint int_eq_reif(c2, 1, eq_c2_1) :: defines_var(eq_c2_1);
+constraint int_le_reif(c0, 1, le_c0_1) :: defines_var(le_c0_1);
+constraint bool_clause([le_c0_1, eq_c1_1, eq_c2_1], []);
+constraint int_eq_reif(c0, 1, eq_c0_1) :: defines_var(eq_c0_1);
+constraint int_eq_reif(c3, 1, eq_c3_1) :: defines_var(eq_c3_1);
+constraint int_le_reif(c1, 1, le_c1_1) :: defines_var(le_c1_1);
+constraint bool_clause([le_c1_1, eq_c0_1, eq_c3_1], []);
+constraint int_eq_reif(c0, 1, eq_c0_1b) :: defines_var(eq_c0_1b);
+constraint int_eq_reif(c3, 1, eq_c3_1b) :: defines_var(eq_c3_1b);
+constraint int_le_reif(c2, 1, le_c2_1) :: defines_var(le_c2_1);
+constraint bool_clause([le_c2_1, eq_c0_1b, eq_c3_1b], []);
+constraint int_eq_reif(c1, 1, eq_c1_1b) :: defines_var(eq_c1_1b);
+constraint int_eq_reif(c2, 1, eq_c2_1b) :: defines_var(eq_c2_1b);
+constraint int_le_reif(c3, 1, le_c3_1) :: defines_var(le_c3_1);
+constraint bool_clause([le_c3_1, eq_c1_1b, eq_c2_1b], []);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.valueSupportDefs.len == 4
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 5000, verbose = false)
+
+    # Verify value-support property: for each cell with value N>1,
+    # neighbours must contain all 1..N-1
+    let vals = [
+      tr.sys.assignment[tr.varPositions["c0"]],
+      tr.sys.assignment[tr.varPositions["c1"]],
+      tr.sys.assignment[tr.varPositions["c2"]],
+      tr.sys.assignment[tr.varPositions["c3"]],
+    ]
+    let nbrs = [@[1, 2], @[0, 3], @[0, 3], @[1, 2]]
+    for i in 0..3:
+      let cv = vals[i]
+      if cv > 1:
+        for v in 1..<cv:
+          var found = false
+          for ni in nbrs[i]:
+            if vals[ni] == v:
+              found = true
+          check found

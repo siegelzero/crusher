@@ -4699,3 +4699,225 @@ proc detectSingletonSetChannels(tr: var FznTranslator) =
             if def.setName in tr.setVarBoolPositions:
                 totalBools += tr.setVarBoolPositions[def.setName].positions.len
         stderr.writeLine(&"[FZN] Detected {nDetected} singleton set channels ({totalBools} bools → channels)")
+
+proc detectValueSupportPattern(tr: var FznTranslator) =
+    ## Detects the "neighbours" value-support pattern:
+    ## For each cell, a set of bool_clause constraints encoding:
+    ##   x[i,j] >= num -> exists(neighbour == num-1)
+    ## decomposed as: bool_clause([b_le, b_eq_1, ..., b_eq_k], [])
+    ## where b_le <- int_le_reif(cell, num-1, b_le) and b_eq_k <- int_eq_reif(neigh_k, num-1, b_eq_k)
+    ##
+    ## These are replaced by a single ValueSupport constraint per cell.
+
+    # Step 1: Build reverse maps from bool var name -> defining info
+    type
+        EqReifInfo = object
+            sourceVar: string
+            value: int
+            ci: int
+        LeReifInfo = object
+            sourceVar: string
+            threshold: int
+            ci: int
+
+    var eqReifByBool: Table[string, EqReifInfo]   # b -> (x, v) from int_eq_reif(x, v, b)
+    var leReifByBool: Table[string, LeReifInfo]   # b -> (x, t) from int_le_reif(x, t, b)
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        if con.args[2].kind != FznIdent: continue
+        let boolVar = con.args[2].ident
+
+        if name == "int_eq_reif":
+            # int_eq_reif(x, val, b) :: defines_var(b)
+            if con.args[0].kind != FznIdent: continue
+            let val = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+            eqReifByBool[boolVar] = EqReifInfo(sourceVar: con.args[0].ident, value: val, ci: ci)
+        elif name == "int_le_reif":
+            # int_le_reif(x, threshold, b) :: defines_var(b)
+            if con.args[0].kind != FznIdent: continue
+            let threshold = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+            leReifByBool[boolVar] = LeReifInfo(sourceVar: con.args[0].ident, threshold: threshold, ci: ci)
+
+    # Step 2: Scan each unconsumed bool_clause for the value-support pattern
+    type
+        ClauseMatch = object
+            cellVar: string
+            value: int          # the value being constrained (threshold + 1)
+            neighbourVars: seq[string]
+            boolClauseCI: int
+            consumedBools: seq[string]  # bool vars consumed by this clause
+            leReifCI: int
+            eqReifCIs: seq[int]
+
+    var matches: seq[ClauseMatch]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause" or con.args.len < 2: continue
+
+        # Must have all-positive literals and no negative literals
+        if con.args[1].kind == FznArrayLit and con.args[1].elems.len > 0: continue
+        if con.args[0].kind != FznArrayLit: continue
+        let posLits = con.args[0].elems
+        if posLits.len < 2: continue  # need at least escape + one neighbour
+
+        # Classify each literal
+        var leCount = 0
+        var cellVar = ""
+        var threshold = -1
+        var leCI = -1
+        var neighbourVars: seq[string]
+        var eqValue = -1
+        var valid = true
+        var consumedBools: seq[string]
+        var eqCIs: seq[int]
+
+        for lit in posLits:
+            if lit.kind != FznIdent:
+                valid = false
+                break
+            let boolName = lit.ident
+
+            if boolName in leReifByBool:
+                let info = leReifByBool[boolName]
+                leCount += 1
+                if leCount > 1:
+                    valid = false
+                    break
+                cellVar = info.sourceVar
+                threshold = info.threshold
+                leCI = info.ci
+                consumedBools.add(boolName)
+            elif boolName in eqReifByBool:
+                let info = eqReifByBool[boolName]
+                if eqValue < 0:
+                    eqValue = info.value
+                elif info.value != eqValue:
+                    valid = false  # inconsistent eq values
+                    break
+                neighbourVars.add(info.sourceVar)
+                eqCIs.add(info.ci)
+                consumedBools.add(boolName)
+            else:
+                valid = false  # unknown literal
+                break
+
+        if not valid or leCount != 1 or neighbourVars.len == 0: continue
+        # The escape is int_le_reif(cell, threshold, b) meaning cell <= threshold
+        # The eq literals check for value = threshold (the predecessor of threshold+1)
+        if eqValue != threshold: continue
+
+        matches.add(ClauseMatch(
+            cellVar: cellVar,
+            value: threshold + 1,  # the cell value that triggers the constraint
+            neighbourVars: neighbourVars,
+            boolClauseCI: ci,
+            consumedBools: consumedBools,
+            leReifCI: leCI,
+            eqReifCIs: eqCIs))
+
+    if matches.len == 0: return
+
+    # Step 3: Group by cellVar
+    var byCellVar: Table[string, seq[ClauseMatch]]
+    for m in matches:
+        byCellVar.mgetOrPut(m.cellVar, @[]).add(m)
+
+    var nConsumedBoolClauses = 0
+
+    for cellVar, cellMatches in byCellVar.pairs:
+        # Sort by value
+        var sorted = cellMatches
+        sorted.sort(proc(a, b: ClauseMatch): int = cmp(a.value, b.value))
+
+        # Values should form 2..maxVal
+        if sorted[0].value != 2: continue
+        var maxVal = sorted[^1].value
+        if sorted.len != maxVal - 1: continue  # missing values
+        var consecutive = true
+        for i in 0..<sorted.len:
+            if sorted[i].value != i + 2:
+                consecutive = false
+                break
+        if not consecutive: continue
+
+        # Verify neighbour sets are consistent across all values
+        # (they should all reference the same set of neighbour variables)
+        let refNeighbours = sorted[0].neighbourVars.sorted()
+        var consistent = true
+        for i in 1..<sorted.len:
+            if sorted[i].neighbourVars.sorted() != refNeighbours:
+                consistent = false
+                break
+        if not consistent: continue
+
+        # Create ValueSupportDef — only consume bool_clause CIs, not the reif CIs,
+        # because reif constraints may be shared across multiple bool_clauses via CSE
+        # (e.g., int_eq_reif(x, v, b) used by both this cell's clause and a neighbour cell's clause)
+        var consumedCIs: seq[int]
+        for m in sorted:
+            consumedCIs.add(m.boolClauseCI)
+
+        tr.valueSupportDefs.add(ValueSupportDef(
+            cellVarName: cellVar,
+            neighbourVarNames: sorted[0].neighbourVars,
+            maxVal: maxVal,
+            consumedCIs: consumedCIs))
+
+        # Mark only bool_clause constraints as consumed
+        for ci in consumedCIs:
+            tr.definingConstraints.incl(ci)
+
+        nConsumedBoolClauses += sorted.len
+
+    if tr.valueSupportDefs.len == 0: return
+
+    # Step 4: Consume orphaned reif constraints whose booleans are ONLY used by consumed bool_clauses.
+    # A bool is "orphaned" if no non-consumed constraint (other than its defining reif) references it.
+
+    # Collect all bools from consumed matches and build bool→definingCI map
+    var valueSupportBools: HashSet[string]
+    var boolDefCI: Table[string, int]  # bool var name → its defining reif CI
+    for m in matches:
+        if m.boolClauseCI in tr.definingConstraints:
+            for b in m.consumedBools:
+                valueSupportBools.incl(b)
+                if b in eqReifByBool:
+                    boolDefCI[b] = eqReifByBool[b].ci
+                elif b in leReifByBool:
+                    boolDefCI[b] = leReifByBool[b].ci
+
+    # Scan all non-consumed constraints for references to value-support bools
+    var boolInUse: HashSet[string]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        for ai in 0..<con.args.len:
+            let arg = con.args[ai]
+            if arg.kind == FznIdent and arg.ident in valueSupportBools:
+                # Skip if this is the bool's own defining constraint
+                if ci != boolDefCI.getOrDefault(arg.ident, -1):
+                    boolInUse.incl(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for elem in arg.elems:
+                    if elem.kind == FznIdent and elem.ident in valueSupportBools:
+                        if ci != boolDefCI.getOrDefault(elem.ident, -1):
+                            boolInUse.incl(elem.ident)
+
+    # Consume orphaned bools' defining reif CIs and mark bools as defined (no position creation)
+    var nOrphanedReifs = 0
+    for b in valueSupportBools:
+        if b notin boolInUse and b in boolDefCI:
+            let reifCI = boolDefCI[b]
+            if reifCI notin tr.definingConstraints:
+                tr.definingConstraints.incl(reifCI)
+                tr.valueSupportConsumedBools.incl(b)
+                inc nOrphanedReifs
+            # Mark bool as defined-var so no position is created
+            tr.definedVarNames.incl(b)
+
+    stderr.writeLine(&"[FZN] Detected {tr.valueSupportDefs.len} value-support constraints (consumed {nConsumedBoolClauses} bool_clause, {nOrphanedReifs} orphaned reifs)")

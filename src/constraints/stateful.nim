@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -296,6 +296,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ConditionalDayCapacity Constraint"
         of DisjunctiveClauseType:
             return "DisjunctiveClause Constraint"
+        of ValueSupportType:
+            return "ValueSupport Constraint"
 
 ################################################################################
 # Evaluation
@@ -363,6 +365,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.conditionalDayCapacityState.cost
         of DisjunctiveClauseType:
             return constraint.disjunctiveClauseState.cost
+        of ValueSupportType:
+            return constraint.valueSupportState.cost
 
 ################################################################################
 # Computed Constraints
@@ -978,6 +982,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.conditionalDayCapacityState.initialize(assignment)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.initialize(assignment)
+        of ValueSupportType:
+            constraint.valueSupportState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1042,6 +1048,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
+        of ValueSupportType:
+            constraint.valueSupportState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1106,6 +1114,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.conditionalDayCapacityState.updatePosition(position, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.updatePosition(position, newValue)
+        of ValueSupportType:
+            constraint.valueSupportState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1741,6 +1751,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: DisjunctiveClauseType,
                 disjunctiveClauseState: constraint.disjunctiveClauseState.deepCopy()
+            )
+        of ValueSupportType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ValueSupportType,
+                valueSupportState: constraint.valueSupportState.deepCopy()
             )
 
 
@@ -2392,3 +2408,16 @@ MixedBooleanOp(`iff`, Iff)
 # More intuitive syntax for implies and iff with mixed types
 MixedBooleanOp(`->`, Implies)   # Implies operator: A -> B means "if A then B"
 MixedBooleanOp(`<->`, Iff)      # If-and-only-if operator: A <-> B means "A iff B"
+
+################################################################################
+# ValueSupport wrapper function
+################################################################################
+
+func valueSupport*[T](cellPos: int, neighbourPositions: seq[int], maxVal: T): StatefulConstraint[T] =
+    ## Creates a ValueSupport constraint: if cell has value N>1, neighbours must include all 1..N-1.
+    let c = newValueSupportConstraint[T](cellPos, neighbourPositions, maxVal)
+    return StatefulConstraint[T](
+        positions: c.allPositions,
+        stateType: ValueSupportType,
+        valueSupportState: c
+    )
