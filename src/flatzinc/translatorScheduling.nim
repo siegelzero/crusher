@@ -104,7 +104,7 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # are in bool_clause constraints we'll consume (shared var between Pattern A and B).
     # For shared vars, we don't eliminate the var or its defining constraint — it becomes
     # a channel — but we still emit the algebraic constraint using the underlying vars.
-    var nConsumed = 0
+    var nPairConsumed = 0
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
@@ -139,7 +139,7 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             tr.disjunctivePairs.add((
                 coeffs1: term1.coeffs, varNames1: term1.varNames, rhs1: term1.rhs,
                 coeffs2: term2.coeffs, varNames2: term2.varNames, rhs2: term2.rhs))
-            nConsumed += 3
+            nPairConsumed += 3
 
         elif posArg.elems.len == 3:
             # Pattern A: bool_clause([b1, b2, b3], []) — 3 literals from int_lin_le_reif
@@ -173,11 +173,10 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
 
             tr.disjunctiveClauses.add(DisjunctiveClause(
                 disjuncts: @[@[term1], @[term2], @[term3]]))
-            nConsumed += 4
 
     if tr.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.disjunctivePairs.len} disjunctive pairs, " &
-                                          &"{nConsumed - tr.disjunctiveClauses.len * 4} constraints consumed, " &
+                                          &"{nPairConsumed} constraints consumed, " &
                                           &"{tr.disjunctivePairs.len * 2} bool variables eliminated")
 
     # Step 4: Scan bool_clause for Pattern B: bool_clause([a, d], [])
@@ -336,13 +335,18 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
                 let rhs = tr.resolveIntArg(con.args[2])
                 var varNames: seq[string]
                 let varArr = con.args[1]
+                var varExtractOk = true
                 if varArr.kind == FznArrayLit:
                     for elem in varArr.elems:
+                        if elem.kind != FznIdent:
+                            varExtractOk = false
+                            break
                         varNames.add(elem.ident)
                 elif varArr.kind == FznIdent and varArr.ident in tr.arrayElementNames:
                     varNames = tr.arrayElementNames[varArr.ident]
                 else:
-                    continue
+                    varExtractOk = false
+                if not varExtractOk: continue
 
                 # Substitute prod = k * largeVar
                 var newCoeffs: seq[int]
@@ -364,7 +368,9 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
                 terms.add(DisjunctiveClauseTerm(coeffs: newCoeffs, varNames: newVarNames, rhs: rhs))
 
                 # Synthetic relaxation: for positive prodCoeff (upper-bound on product),
-                # dropping prod >= 0 is a valid relaxation
+                # dropping prod >= 0 is a valid relaxation.
+                # Emit once per int_lin_le (relaxation is the same for all k values);
+                # k == smallDomain[0] serves as a "first iteration" guard.
                 if k == product.smallDomain[0] and prodCoeff > 0:
                     var synCoeffs: seq[int]
                     var synVarNames: seq[string]

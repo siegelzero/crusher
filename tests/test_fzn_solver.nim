@@ -1237,3 +1237,30 @@ solve satisfy;
     let rVal = tr.sys.assignment[tr.varPositions["r"]]
     check rVal + objVal * bVal <= 120
     check rVal + objVal * bVal >= 10
+
+  test "small-domain product — int literal in var array skips gracefully":
+    # int_lin_le([1, 2], [r, prod], 80) but also an int_lin_le with a literal
+    # in the var array: int_lin_le([1], [5], 10) — should not crash.
+    # The product decomposition should still fire for the valid int_lin_le.
+    let src = """
+var 10..50: obj :: output_var;
+var 0..2: b :: output_var;
+var 0..100: prod :: var_is_introduced :: is_defined_var;
+var 5..30: r :: output_var;
+constraint int_times(obj, b, prod) :: defines_var(prod);
+constraint int_lin_le([1, 1], [r, prod], 80);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Should decompose without crashing
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 3
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal + objVal * bVal <= 80

@@ -21,6 +21,8 @@ type
         cost*: int
         # Maps position -> list of (disjunctIdx, termIdx, coefficient) for incremental update
         positionEntries*: Table[int, seq[tuple[di, ti: int, coeff: T]]]
+        # Maps position -> disjunctIdx -> list of (termIdx, coefficient) for fast moveDelta lookup
+        positionByDisjunct*: Table[int, seq[seq[tuple[ti: int, coeff: T]]]]
         # Current assignment values for positions in this constraint (for updatePosition old value)
         currentAssignment*: Table[int, T]
 
@@ -55,6 +57,13 @@ func newDisjunctiveClauseConstraint*[T](
                 let pos = term.positions[ci]
                 result.positionEntries.mgetOrPut(pos, @[]).add(
                     (di: d, ti: t, coeff: term.coeffs[ci]))
+    # Build per-disjunct index for fast moveDelta lookup
+    let nDisjuncts = result.disjuncts.len
+    for pos, entries in result.positionEntries.pairs:
+        var byD = newSeq[seq[tuple[ti: int, coeff: T]]](nDisjuncts)
+        for entry in entries:
+            byD[entry.di].add((ti: entry.ti, coeff: entry.coeff))
+        result.positionByDisjunct[pos] = byD
 
 func initialize*[T](state: DisjunctiveClauseConstraint[T], assignment: seq[T]) =
     for d in 0..<state.disjuncts.len:
@@ -72,10 +81,10 @@ func moveDelta*[T](state: DisjunctiveClauseConstraint[T],
     let valueDelta = newValue - oldValue
     if valueDelta == 0: return 0
 
-    if position notin state.positionEntries:
+    if position notin state.positionByDisjunct:
         return 0
 
-    let entries = state.positionEntries[position]
+    let byD = state.positionByDisjunct[position]
 
     # Compute new penalty with affected terms updated
     var newPenalty = high(int)
@@ -85,14 +94,13 @@ func moveDelta*[T](state: DisjunctiveClauseConstraint[T],
             let violation = state.disjuncts[d][t].currentSum - state.disjuncts[d][t].rhs
             if violation > 0:
                 conjPenalty += violation
-        # Adjust for affected terms in this disjunct
-        for entry in entries:
-            if entry.di == d:
-                let oldS = state.disjuncts[d][entry.ti].currentSum
-                let newS = oldS + entry.coeff * valueDelta
-                let oldViolation = max(T(0), oldS - state.disjuncts[d][entry.ti].rhs)
-                let newViolation = max(T(0), newS - state.disjuncts[d][entry.ti].rhs)
-                conjPenalty += int(newViolation - oldViolation)
+        # Adjust for affected terms in this disjunct (O(affected) not O(all entries))
+        for entry in byD[d]:
+            let oldS = state.disjuncts[d][entry.ti].currentSum
+            let newS = oldS + entry.coeff * valueDelta
+            let oldViolation = max(T(0), oldS - state.disjuncts[d][entry.ti].rhs)
+            let newViolation = max(T(0), newS - state.disjuncts[d][entry.ti].rhs)
+            conjPenalty += int(newViolation - oldViolation)
         if conjPenalty < newPenalty:
             newPenalty = conjPenalty
             if newPenalty == 0:
@@ -168,7 +176,9 @@ proc deepCopy*[T](state: DisjunctiveClauseConstraint[T]): DisjunctiveClauseConst
                 rhs: state.disjuncts[d][t].rhs,
                 currentSum: state.disjuncts[d][t].currentSum)
     result.cost = state.cost
-    result.positionEntries = state.positionEntries  # shared (immutable after construction)
+    # Both are immutable after construction; Nim Table assignment deep-copies
+    result.positionEntries = state.positionEntries
+    result.positionByDisjunct = state.positionByDisjunct
     result.currentAssignment = initTable[int, T]()
     for k, v in state.currentAssignment.pairs:
         result.currentAssignment[k] = v
