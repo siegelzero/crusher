@@ -1330,3 +1330,63 @@ solve satisfy;
             if vals[ni] == v:
               found = true
           check found
+
+  test "value-support pattern detection — multi-value grouping (domain 1..4)":
+    # Single cell x with 3 neighbours n1,n2,n3, domain 1..4
+    # Requires clauses for values 2, 3, and 4 to exercise consecutive grouping
+    # value=2: x<=1 OR n1==1 OR n2==1 OR n3==1
+    # value=3: x<=2 OR n1==2 OR n2==2 OR n3==2
+    # value=4: x<=3 OR n1==3 OR n2==3 OR n3==3
+    let src = """
+var 1..4: x;
+var 1..4: n1;
+var 1..4: n2;
+var 1..4: n3;
+var bool: le_x_1;
+var bool: le_x_2;
+var bool: le_x_3;
+var bool: eq_n1_1;
+var bool: eq_n2_1;
+var bool: eq_n3_1;
+var bool: eq_n1_2;
+var bool: eq_n2_2;
+var bool: eq_n3_2;
+var bool: eq_n1_3;
+var bool: eq_n2_3;
+var bool: eq_n3_3;
+constraint int_le_reif(x, 1, le_x_1) :: defines_var(le_x_1);
+constraint int_eq_reif(n1, 1, eq_n1_1) :: defines_var(eq_n1_1);
+constraint int_eq_reif(n2, 1, eq_n2_1) :: defines_var(eq_n2_1);
+constraint int_eq_reif(n3, 1, eq_n3_1) :: defines_var(eq_n3_1);
+constraint bool_clause([le_x_1, eq_n1_1, eq_n2_1, eq_n3_1], []);
+constraint int_le_reif(x, 2, le_x_2) :: defines_var(le_x_2);
+constraint int_eq_reif(n1, 2, eq_n1_2) :: defines_var(eq_n1_2);
+constraint int_eq_reif(n2, 2, eq_n2_2) :: defines_var(eq_n2_2);
+constraint int_eq_reif(n3, 2, eq_n3_2) :: defines_var(eq_n3_2);
+constraint bool_clause([le_x_2, eq_n1_2, eq_n2_2, eq_n3_2], []);
+constraint int_le_reif(x, 3, le_x_3) :: defines_var(le_x_3);
+constraint int_eq_reif(n1, 3, eq_n1_3) :: defines_var(eq_n1_3);
+constraint int_eq_reif(n2, 3, eq_n2_3) :: defines_var(eq_n2_3);
+constraint int_eq_reif(n3, 3, eq_n3_3) :: defines_var(eq_n3_3);
+constraint bool_clause([le_x_3, eq_n1_3, eq_n2_3, eq_n3_3], []);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Should detect 1 value-support constraint with maxVal=4 (values 2,3,4 grouped)
+    check tr.valueSupportDefs.len == 1
+    check tr.valueSupportDefs[0].maxVal == 4
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 5000, verbose = false)
+
+    let xv = tr.sys.assignment[tr.varPositions["x"]]
+    let n1v = tr.sys.assignment[tr.varPositions["n1"]]
+    let n2v = tr.sys.assignment[tr.varPositions["n2"]]
+    let n3v = tr.sys.assignment[tr.varPositions["n3"]]
+    let nvals = @[n1v, n2v, n3v]
+
+    # Verify: for x=N>1, all 1..N-1 must appear among neighbours
+    if xv > 1:
+      for v in 1..<xv:
+        check v in nvals

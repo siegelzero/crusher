@@ -142,15 +142,11 @@ proc batchMovePenalty*[T](state: ValueSupportConstraint[T],
             var delta = 0
             # Losing currentValue
             if losingCurrent:
-                if nv != curV:  # already checked above but explicit
-                    delta += 1
+                delta += 1
             # Gaining newValue
             if nv >= 1 and nv < cv:
                 if state.valueCounts[nv] == 0:
                     delta -= 1
-                elif nv == curV and state.valueCounts[nv] == 1:
-                    # We'd be removing curV and adding nv==curV — net zero for this value
-                    discard
             result[i] = delta
 
 proc deepCopy*[T](state: ValueSupportConstraint[T]): ValueSupportConstraint[T] =

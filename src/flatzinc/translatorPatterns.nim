@@ -4861,7 +4861,9 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
         # (e.g., int_eq_reif(x, v, b) used by both this cell's clause and a neighbour cell's clause)
         var consumedCIs: seq[int]
         for m in sorted:
+            if m.boolClauseCI in tr.definingConstraints: continue  # already consumed
             consumedCIs.add(m.boolClauseCI)
+        if consumedCIs.len != sorted.len: continue  # some clauses already consumed
 
         tr.valueSupportDefs.add(ValueSupportDef(
             cellVarName: cellVar,
