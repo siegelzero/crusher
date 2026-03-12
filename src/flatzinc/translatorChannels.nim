@@ -335,36 +335,71 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         let xArg = con.args[0]
         let setArg = con.args[1]
 
-        # Build the set of values for membership test
-        var setValues: seq[int]
-        case setArg.kind
-        of FznRange:
-            for v in setArg.lo..setArg.hi:
-                setValues.add(v)
-        of FznSetLit:
-            setValues = setArg.setElems
-        else:
-            continue
-
-        let setAsHashSet = toHashSet(setValues)
-
-        let xExpr = tr.resolveExprArg(xArg)
-        let domain = tr.resolveActualDomain(xExpr, xArg.ident)
-        if domain.len == 0:
-            skippedSetInReifCIs.incl(ci)
-            continue
-        let lo = domain[0]
-        let hi = domain[^1]
-        if hi - lo + 1 > 100_000:
-            skippedSetInReifCIs.incl(ci)
-            continue
-
-        # b = element(x - lo, [1 if v in S else 0 for v in lo..hi])
-        let indexExpr = xExpr - lo
+        # Build the set membership channel binding
+        var indexExpr: AlgebraicExpression[int]
         var arrayElems: seq[ArrayElement[int]]
-        for v in lo..hi:
-            arrayElems.add(ArrayElement[int](isConstant: true,
-                    constantValue: if v in setAsHashSet: 1 else: 0))
+
+        case setArg.kind
+        of FznRange, FznSetLit:
+            # S is a constant set: b = element(x - lo, [1 if v in S else 0 for v in lo..hi])
+            var setValues: seq[int]
+            if setArg.kind == FznRange:
+                for v in setArg.lo..setArg.hi:
+                    setValues.add(v)
+            else:
+                setValues = setArg.setElems
+            let setAsHashSet = toHashSet(setValues)
+
+            let xExpr = tr.resolveExprArg(xArg)
+            let domain = tr.resolveActualDomain(xExpr, xArg.ident)
+            if domain.len == 0:
+                skippedSetInReifCIs.incl(ci)
+                continue
+            let lo = domain[0]
+            let hi = domain[^1]
+            if hi - lo + 1 > 100_000:
+                skippedSetInReifCIs.incl(ci)
+                continue
+
+            indexExpr = xExpr - lo
+            for v in lo..hi:
+                arrayElems.add(ArrayElement[int](isConstant: true,
+                        constantValue: if v in setAsHashSet: 1 else: 0))
+        of FznIdent:
+            # S is a set variable: b = element(x - lo, S.bools)
+            let sName = setArg.ident
+            if sName notin tr.setVarBoolPositions:
+                skippedSetInReifCIs.incl(ci)
+                continue
+            let sInfo = tr.setVarBoolPositions[sName]
+            if sInfo.positions.len == 0:
+                skippedSetInReifCIs.incl(ci)
+                continue
+
+            if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
+                # x is a constant: b = S.bools[x - lo] (direct identity channel)
+                let xVal = tr.resolveIntArg(xArg)
+                let bpos = getSetBoolPosition(sInfo, xVal)
+                if bpos >= 0:
+                    # b = element(0, [S.bools[x-lo]])
+                    indexExpr = newAlgebraicExpression[int](
+                        positions = initPackedSet[int](),
+                        node = ExpressionNode[int](kind: LiteralNode, value: 0),
+                        linear = true)
+                    arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
+                else:
+                    # x outside set universe: b = 0
+                    tr.sys.baseArray.setDomain(bPos, @[0])
+                    continue
+            else:
+                # x is a variable: b = element(x - lo, S.bools)
+                let xExpr = tr.resolveExprArg(xArg)
+                indexExpr = xExpr - sInfo.lo
+                for pos in sInfo.positions:
+                    arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: pos))
+        else:
+            skippedSetInReifCIs.incl(ci)
+            continue
 
         let binding = ChannelBinding[int](
             channelPosition: bPos,
@@ -708,11 +743,12 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             skippedLinEqReifCIs.incl(ci)
             continue
 
-        # Build lookup table: for each value v of the expression, b = (v == rhs)
+        # Build lookup table: for each value v of the expression, b = (v == rhs) or (v != rhs)
+        let isLinEq = stripSolverPrefix(con.name) == "int_lin_eq_reif"
         var arrayElems: seq[ArrayElement[int]]
         for v in exprMin..exprMax:
             arrayElems.add(ArrayElement[int](isConstant: true,
-                    constantValue: if v == rhs: 1 else: 0))
+                    constantValue: if (v == rhs) == isLinEq: 1 else: 0))
 
         let indexExpr = sp - exprMin
         let binding = ChannelBinding[int](
@@ -989,6 +1025,74 @@ proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
                 tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
             else:
                 tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
+proc buildSingletonSetChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for singleton set booleans detected by detectSingletonSetChannels.
+    ## For set_card(S, 1) + set_in(x, S): S.bools[e] = element(x - lo, indicator_e)
+    ## where indicator_e[i] = 1 if (i + lo) == e, else 0.
+    var nBuilt = 0
+    for def in tr.singletonSetChannelDefs:
+        if def.setName notin tr.setVarBoolPositions: continue
+        let info = tr.setVarBoolPositions[def.setName]
+        if info.positions.len == 0: continue
+
+        # Resolve x expression
+        if def.xVarName notin tr.varPositions and
+           def.xVarName notin tr.definedVarExprs: continue
+        let xExpr = if def.xVarName in tr.varPositions:
+                        tr.getExpr(tr.varPositions[def.xVarName])
+                    else:
+                        tr.definedVarExprs[def.xVarName]
+
+        # Get x's domain range for the lookup table size
+        let xDomain = tr.lookupVarDomain(def.xVarName)
+        if xDomain.len == 0: continue
+        let xLo = xDomain[0]
+        let xHi = xDomain[^1]
+        let indexExpr = xExpr - xLo
+
+        # For each boolean in S's universe, create a channel binding
+        for idx in 0..<info.positions.len:
+            let e = info.lo + idx
+            let boolPos = info.positions[idx]
+            # Build indicator lookup table: 1 at position (e - xLo), 0 elsewhere
+            var arrayElems: seq[ArrayElement[int]]
+            for v in xLo..xHi:
+                arrayElems.add(ArrayElement[int](isConstant: true,
+                    constantValue: if v == e: 1 else: 0))
+            tr.sys.baseArray.addChannelBinding(boolPos, indexExpr, arrayElems)
+            inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} singleton set channel bindings")
+
+proc buildIntModChannelBindings(tr: var FznTranslator) =
+    ## Builds element channel bindings for int_mod channels (Z = X mod C).
+    ## Uses precomputed lookup tables from detectIntModChannels.
+    var nBuilt = 0
+    for def in tr.intModChannelDefs:
+        if def.varName notin tr.varPositions:
+            continue
+        let channelPos = tr.varPositions[def.varName]
+
+        # Resolve origin variable: may be a position or a defined-var expression
+        var indexExpr: AlgebraicExpression[int]
+        if def.originVar in tr.varPositions:
+            indexExpr = tr.getExpr(tr.varPositions[def.originVar]) - def.offset
+        elif def.originVar in tr.definedVarExprs:
+            indexExpr = tr.definedVarExprs[def.originVar] - def.offset
+        else:
+            continue
+
+        var arrayElems: seq[ArrayElement[int]]
+        for v in def.lookupTable:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
+        inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} int_mod channel bindings")
 
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max

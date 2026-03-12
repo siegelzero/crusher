@@ -471,21 +471,28 @@ proc detectReifChannels(tr: var FznTranslator) =
         if bName in tr.definedVarNames or bName in tr.channelVarNames:
             continue
 
-        # args[0] must be a positioned variable
         let xArg = con.args[0]
-        if xArg.kind != FznIdent:
-            continue
-        if xArg.ident in tr.definedVarNames:
-            continue
-
-        # args[1] must be a set literal or range
         let setArg = con.args[1]
-        if setArg.kind != FznSetLit and setArg.kind != FznRange:
-            continue
 
-        tr.channelVarNames.incl(bName)
-        tr.definingConstraints.incl(ci)
-        tr.setInReifChannelDefs.add(ci)
+        if xArg.kind == FznIdent and xArg.ident notin tr.definedVarNames:
+            # set_in_reif(var, constSet, b): x is variable, S is constant set
+            if setArg.kind == FznSetLit or setArg.kind == FznRange:
+                tr.channelVarNames.incl(bName)
+                tr.definingConstraints.incl(ci)
+                tr.setInReifChannelDefs.add(ci)
+                continue
+        if (xArg.kind == FznIntLit or
+            (xArg.kind == FznIdent and xArg.ident in tr.paramValues)):
+            # set_in_reif(const, varSet, b): x is constant, S is set variable
+            # b = S.bools[x - lo] (identity channel)
+            # Note: setVarBoolPositions not yet populated; check it's a var by excluding params
+            if setArg.kind == FznIdent and
+               setArg.ident notin tr.paramValues and
+               setArg.ident notin tr.setParamValues:
+                tr.channelVarNames.incl(bName)
+                tr.definingConstraints.incl(ci)
+                tr.setInReifChannelDefs.add(ci)
+                continue
 
     # Fifth pass: find array_bool_and/array_bool_or with defines_var
     for ci, con in tr.model.constraints:
@@ -593,13 +600,15 @@ proc detectReifChannels(tr: var FznTranslator) =
 
 
 proc detectLinEqReifChannels*(tr: var FznTranslator) =
-    ## Detect int_lin_eq_reif(coeffs, vars, rhs, b) :: defines_var(b) patterns.
-    ## b becomes a channel: b = (sum(coeffs*vars) == rhs) ? 1 : 0
+    ## Detect int_lin_eq_reif/int_lin_ne_reif(coeffs, vars, rhs, b) :: defines_var(b) patterns.
+    ## b becomes a channel: b = (sum(coeffs*vars) == rhs) ? 1 : 0  (or != for ne)
     ## Must run AFTER detectCaseAnalysisChannels (which uses int_lin_eq_reif via linEqReifMap).
+    var nEq, nNe = 0
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
-        if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
+        if name != "int_lin_eq_reif" and name != "int_lin_ne_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
         if con.args.len < 4 or con.args[3].kind != FznIdent: continue
         let bName = con.args[3].ident
         let ann = con.getAnnotation("defines_var")
@@ -608,8 +617,10 @@ proc detectLinEqReifChannels*(tr: var FznTranslator) =
         tr.channelVarNames.incl(bName)
         tr.definingConstraints.incl(ci)
         tr.linEqReifChannelDefs.add(ci)
+        if name == "int_lin_eq_reif": inc nEq
+        else: inc nNe
     if tr.linEqReifChannelDefs.len > 0:
-        stderr.writeLine(&"[FZN] Detected {tr.linEqReifChannelDefs.len} int_lin_eq_reif channels")
+        stderr.writeLine(&"[FZN] Detected {tr.linEqReifChannelDefs.len} int_lin_eq/ne_reif channels (eq={nEq} ne={nNe})")
 
 
 proc detectSetUnionChannels(tr: var FznTranslator) =
@@ -4287,3 +4298,109 @@ proc detectConditionalImplicationChannels*(tr: var FznTranslator) =
 
     if nBinary > 0 or nOneHot > 0:
         stderr.writeLine(&"[FZN] Detected conditional implication channels: {nBinary} binary (min/max pair), {nOneHot} one-hot (permutation lookup)")
+
+
+proc detectIntModChannels(tr: var FznTranslator) =
+    ## Detects int_mod(X, C, Z) where X is a variable and C is a constant.
+    ## These can be implemented as element channel bindings with a precomputed
+    ## lookup table: Z = table[X - xLo] where table[i] = (xLo + i) mod C.
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_mod": continue
+
+        let xArg = con.args[0]
+        let yArg = con.args[1]
+        let zArg = con.args[2]
+
+        # Only handle: variable X, constant C, variable Z
+        if yArg.kind != FznIntLit: continue
+        if xArg.kind != FznIdent: continue
+        if zArg.kind != FznIdent: continue
+
+        let cVal = yArg.intVal
+        if cVal <= 0: continue  # mod by non-positive is degenerate
+
+        let xDomain = tr.lookupVarDomain(xArg.ident)
+        if xDomain.len == 0: continue
+
+        let xLo = xDomain[0]  # domains are sorted, first element is min
+        let xHi = xDomain[^1]
+
+        # Build lookup table: for each value in xLo..xHi, compute ((v mod c) + c) mod c
+        var lookupTable: seq[int]
+        for v in xLo..xHi:
+            lookupTable.add(((v mod cVal) + cVal) mod cVal)
+
+        # Mark Z as a channel variable
+        tr.channelVarNames.incl(zArg.ident)
+        tr.definedVarNames.excl(zArg.ident)
+        tr.definingConstraints.incl(ci)
+
+        tr.intModChannelDefs.add((
+            varName: zArg.ident,
+            originVar: xArg.ident,
+            lookupTable: lookupTable,
+            offset: xLo))
+
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} int_mod channel bindings")
+
+proc detectSingletonSetChannels(tr: var FznTranslator) =
+    ## Detects set_card(S, 1) + set_in(x, S) where x is a variable.
+    ## Makes S.bools into indicator channels: S.bools[e] = (x == e) ? 1 : 0.
+    ## This eliminates |universe| binary search variables per singleton set.
+
+    # Step 1: Find all set_card(S, 1) constraints
+    var cardOneSets: Table[string, int]  # set name -> constraint index
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_card" or con.args.len < 2: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[1].kind == FznIntLit and con.args[1].intVal == 1:
+            cardOneSets[con.args[0].ident] = ci
+        elif con.args[1].kind == FznIdent and con.args[1].ident in tr.paramValues:
+            if tr.paramValues[con.args[1].ident] == 1:
+                cardOneSets[con.args[0].ident] = ci
+
+    # Step 2: Find matching set_in(x, S) where S is in cardOneSets and x is a variable
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_in" or con.args.len < 2: continue
+        let xArg = con.args[0]
+        let sArg = con.args[1]
+        if sArg.kind != FznIdent: continue
+        let sName = sArg.ident
+        if sName notin cardOneSets: continue
+
+        # x must be a variable (not constant — constant case already handled by set_in)
+        if xArg.kind != FznIdent: continue
+        if xArg.ident in tr.paramValues: continue
+
+        # S must be a set variable with bool positions
+        if sName notin tr.setVarBoolPositions: continue
+        let info = tr.setVarBoolPositions[sName]
+        if info.positions.len == 0: continue
+
+        # Mark S's bools as channels and both constraints as defining
+        for bpos in info.positions:
+            # These will be populated by addChannelBinding later
+            discard
+        tr.definingConstraints.incl(ci)  # set_in
+        tr.definingConstraints.incl(cardOneSets[sName])  # set_card
+        tr.singletonSetChannelDefs.add((
+            setName: sName,
+            xVarName: xArg.ident,
+            cardCI: cardOneSets[sName],
+            inCI: ci))
+        # Remove S from cardOneSets to prevent double matching
+        cardOneSets.del(sName)
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} singleton set channels ({nDetected * 12} bools → channels)")

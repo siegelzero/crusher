@@ -705,9 +705,27 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             tr.sys.addConstraint(z * y == x)
 
     of "int_mod":
-        # x mod y = z => x = y * q + z for some q, and 0 <= z < |y|
-        # For local search, this is hard to model exactly; skip for now
-        discard
+        # x mod y = z
+        # Channel cases (variable X, constant C) are handled by detectIntModChannels.
+        # Here we handle remaining cases: both constants, or variable C.
+        let xArg = con.args[0]
+        let yArg = con.args[1]
+        let zArg = con.args[2]
+        if xArg.kind == FznIntLit and yArg.kind == FznIntLit:
+            # Both constants: compute result and fix Z's domain
+            let cVal = yArg.intVal
+            if cVal > 0:
+                let result = ((xArg.intVal mod cVal) + cVal) mod cVal
+                if zArg.kind == FznIdent and zArg.ident in tr.varPositions:
+                    tr.sys.baseArray.setDomain(tr.varPositions[zArg.ident], @[result])
+        elif yArg.kind != FznIntLit:
+            # Variable C: add approximate bounds constraints
+            let x = tr.resolveExprArg(xArg)
+            let y = tr.resolveExprArg(yArg)
+            let z = tr.resolveExprArg(zArg)
+            tr.sys.addConstraint(z >= 0)
+            tr.sys.addConstraint(z < y)
+            tr.sys.addConstraint(x - z >= 0)
 
     # ===== All-different =====
     of "fzn_all_different_int", "all_different_int":
@@ -1479,13 +1497,23 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         newDom.add(v)
                 if newDom.len > 0 and newDom.len < currentDom.len:
                     tr.sys.baseArray.setDomain(xPos, newDom)
-                # Build element constraint: element(x - lo, S.bools) == 1
+                # Channel binding: membership = element(x - lo, S.bools)
+                # Then constraint: membership == 1
+                # This ensures proper cascade propagation through channel-dep.
+                let membershipVar = tr.sys.newConstrainedVariable()
+                tr.sys.baseArray.setDomain(membershipVar.offset, @[0, 1])
                 let xExpr = tr.getExpr(xPos)
                 let indexExpr = xExpr - info.lo
                 var arrayElems: seq[ArrayElement[int]]
                 for bpos in info.positions:
                     arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: bpos))
-                tr.sys.baseArray.addChannelBinding(tr.getFixedOnePos(), indexExpr, arrayElems)
+                tr.sys.baseArray.addChannelBinding(membershipVar.offset, indexExpr, arrayElems)
+                let membershipExpr = tr.getExpr(membershipVar.offset)
+                let oneExpr = newAlgebraicExpression[int](
+                    positions = initPackedSet[int](),
+                    node = ExpressionNode[int](kind: LiteralNode, value: 1),
+                    linear = true)
+                tr.sys.addConstraint(membershipExpr == oneExpr)
 
     of "set_card":
         # set_card(S, c) means |S| == c
@@ -1565,13 +1593,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             # S is a set variable, x is int/bool
             let info = sInfo.varInfo
             if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
-                # x is a constant: b = S.bools[x - lo]
+                # x is a constant: b = S.bools[x - lo] (identity channel)
                 let xVal = tr.resolveIntArg(xArg)
-                let bpos = getSetBoolPosition(info, xVal)
-                if bpos >= 0:
-                    let bExpr = tr.resolveExprArg(bArg)
-                    let sBoolExpr = tr.getExpr(bpos)
-                    tr.sys.addConstraint(bExpr == sBoolExpr)
+                let sbpos = getSetBoolPosition(info, xVal)
+                if sbpos >= 0:
+                    if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+                        let bPos = tr.varPositions[bArg.ident]
+                        let zeroExpr = newAlgebraicExpression[int](
+                            positions = initPackedSet[int](),
+                            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+                            linear = true)
+                        tr.sys.baseArray.addChannelBinding(bPos, zeroExpr,
+                            @[ArrayElement[int](isConstant: false, variablePosition: sbpos)])
                 else:
                     # x outside universe — b must be 0
                     if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
@@ -1677,6 +1710,59 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                                 arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
 
                     # R.bools[elem] = element(idx - 1, [array of bools for this element])
+                    tr.sys.baseArray.addChannelBinding(rBoolPos, indexExpr, arrayElems)
+
+    of "array_set_element":
+        # array_set_element(idx, [S1, S2, ...], R) means R = array[idx]
+        # Simpler version of array_var_set_element: all sets in the array are constants.
+        # For each element e in R's universe: R.bools[e-lo] = element(idx-1, [e in S1, e in S2, ...])
+        let idxArg = con.args[0]
+        let arrArg = con.args[1]
+        let rArg = con.args[2]
+
+        let rInfo = tr.resolveSetArg(rArg)
+        if not rInfo.isConst:
+            let rVar = rInfo.varInfo
+
+            # Resolve the array of constant sets
+            var constSets: seq[seq[int]]
+            case arrArg.kind
+            of FznIdent:
+                if arrArg.ident in tr.setArrayValues:
+                    constSets = tr.setArrayValues[arrArg.ident]
+            of FznArrayLit:
+                for e in arrArg.elems:
+                    case e.kind
+                    of FznSetLit, FznRange:
+                        constSets.add(extractSetValues(e))
+                    of FznIdent:
+                        if e.ident in tr.setParamValues:
+                            constSets.add(tr.setParamValues[e.ident])
+                        else:
+                            constSets.add(@[])
+                    else:
+                        constSets.add(@[])
+            else:
+                discard
+
+            if constSets.len > 0:
+                # Convert to HashSets for O(1) membership tests
+                var setHashSets: seq[HashSet[int]]
+                for s in constSets:
+                    setHashSets.add(toHashSet(s))
+
+                let idxExpr = tr.resolveExprArg(idxArg)
+                let indexExpr = idxExpr - 1  # FZN 1-based → 0-based
+
+                for idx in 0..<rVar.positions.len:
+                    let elem = rVar.lo + idx
+                    let rBoolPos = rVar.positions[idx]
+
+                    var arrayElems: seq[ArrayElement[int]]
+                    for hs in setHashSets:
+                        arrayElems.add(ArrayElement[int](isConstant: true,
+                                constantValue: if elem in hs: 1 else: 0))
+
                     tr.sys.baseArray.addChannelBinding(rBoolPos, indexExpr, arrayElems)
 
     of "set_diff":

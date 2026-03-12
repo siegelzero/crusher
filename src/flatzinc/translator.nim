@@ -262,6 +262,10 @@ type
         varDomainIndex*: Table[string, int]
         # Synthetic element channels: precomputed lookup tables for conditional gain variables
         syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
+        # int_mod channel defs: Z = X mod C implemented as element channel with lookup table
+        intModChannelDefs*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int], offset: int]]
+        # Singleton set channel defs: set_card(S,1) + set_in(x, S) → S.bools = indicator(x)
+        singletonSetChannelDefs*: seq[tuple[setName: string, xVarName: string, cardCI: int, inCI: int]]
         # Detected weighted same-value pattern for objective
         weightedSameValuePairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
         weightedSameValueConstant*: int
@@ -661,6 +665,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.translateParameters()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
+    # Detect int_mod channel patterns (Z = X mod C → element channel)
+    result.detectIntModChannels()
     # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
     result.detectCountPatterns()
     # Detect max-from-lin-le patterns (ceiling >= source + offset → max channel)
@@ -739,6 +745,12 @@ proc translate*(model: FznModel): FznTranslator =
     for vn in result.channelVarNames:
         if vn in result.varPositions:
             result.sys.baseArray.channelPositions.incl(result.varPositions[vn])
+    # Detect singleton set channels: set_card(S,1) + set_in(x,S) → S.bools become channels
+    result.detectSingletonSetChannels()
+    for def in result.singletonSetChannelDefs:
+        if def.setName in result.setVarBoolPositions:
+            for bpos in result.setVarBoolPositions[def.setName].positions:
+                result.sys.baseArray.channelPositions.incl(bpos)
     # Prune unreferenced domain values from variables in skill-allocation patterns
     if result.skillAllocationDefs.len > 0:
         result.pruneUnreferencedSkillValues()
@@ -895,10 +907,13 @@ proc translate*(model: FznModel): FznTranslator =
             v.setDomain(toSeq(0..<gc.allPlacements[t].len))
             result.geostConversion.tileVarPositions.add(pos)
 
+    var nSkippedDefining, nSkippedRedundant, nTranslated = 0
     for ci, con in model.constraints:
         if ci in result.definingConstraints:
+            inc nSkippedDefining
             continue
         if ci in result.redundantOrderings:
+            inc nSkippedRedundant
             continue
         if ci in result.countEqPatterns:
             # Emit count_eq for detected pattern
@@ -921,7 +936,10 @@ proc translate*(model: FznModel): FznTranslator =
             let maxExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.maxVarName))
             result.sys.addConstraint(elementExpr(indexExpr, signalExprs, maxExpr))
         else:
+            inc nTranslated
             result.translateConstraint(con)
+
+    stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {nTranslated} translated")
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0
@@ -1383,10 +1401,17 @@ proc translate*(model: FznModel): FznTranslator =
             result.geostConversion.allPlacements
         ))
 
+    # Record binding count from constraint loop (table_int functional deps, array_set_element, etc.)
+    let constraintLoopBindingCount = result.sys.baseArray.channelBindings.len
+
     # Build channel bindings for element defines_var
     result.buildChannelBindings()
     # Build channel bindings for synthetic element channels (conditional gain variables)
     result.buildSyntheticElementChannelBindings()
+    # Build channel bindings for int_mod channels (Z = X mod C → element lookup)
+    result.buildIntModChannelBindings()
+    # Build channel bindings for singleton set booleans (S.bools = indicator(x))
+    result.buildSingletonSetChannelBindings()
     # Build channel bindings for int_eq_reif/bool2int reification channels
     result.buildReifChannelBindings()
     # Build channel bindings for bool AND channels (b = AND(c1,...,cn) from bool_clause)
@@ -1409,6 +1434,43 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildInverseChannelBindings()
     # Detect dormant positions in diffnK constraints (don't-care placements)
     result.detectDormantPositions()
+
+    # Deduplicate element channel bindings: remove builder-phase bindings that conflict
+    # with constraint-loop bindings (e.g., table_int creates a functional dep channel,
+    # then buildReifChannelBindings creates a bool2int for the same position).
+    # Only dedup builder bindings against constraint-loop ones, not within either phase.
+    block:
+        # Collect positions claimed by constraint-loop bindings
+        var constraintLoopPositions: PackedSet[int]
+        for i in 0..<constraintLoopBindingCount:
+            constraintLoopPositions.incl(result.sys.baseArray.channelBindings[i].channelPosition)
+
+        var dedupCount = 0
+        var kept: seq[ChannelBinding[int]]
+        for i, binding in result.sys.baseArray.channelBindings:
+            if i >= constraintLoopBindingCount and binding.channelPosition in constraintLoopPositions:
+                # Builder binding conflicts with constraint-loop binding — skip
+                inc dedupCount
+            else:
+                kept.add(binding)
+        if dedupCount > 0:
+            result.sys.baseArray.channelBindings = kept
+            # Rebuild channelsAtPosition from scratch
+            result.sys.baseArray.channelsAtPosition.clear()
+            for bi, binding in result.sys.baseArray.channelBindings:
+                for pos in binding.indexExpression.positions.items:
+                    if pos notin result.sys.baseArray.channelsAtPosition:
+                        result.sys.baseArray.channelsAtPosition[pos] = @[bi]
+                    else:
+                        result.sys.baseArray.channelsAtPosition[pos].add(bi)
+                for elem in binding.arrayElements:
+                    if not elem.isConstant:
+                        let pos = elem.variablePosition
+                        if pos notin result.sys.baseArray.channelsAtPosition:
+                            result.sys.baseArray.channelsAtPosition[pos] = @[bi]
+                        elif bi notin result.sys.baseArray.channelsAtPosition[pos]:
+                            result.sys.baseArray.channelsAtPosition[pos].add(bi)
+            stderr.writeLine(&"[FZN] Deduplicated {dedupCount} element channel bindings ({kept.len} remaining)")
 
     result.translateSolve()
 

@@ -1,4 +1,4 @@
-import std/[math, packedsets, random, sequtils, tables, atomics, strformat]
+import std/[algorithm, math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity]
@@ -909,6 +909,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.neighbors[pos] = @[]
 
     if verbose and id == 0:
+        stderr.writeLine("[Init] Neighbor init done")
+        stderr.flushFile()
         initStart = epochTime()
 
     state.assignment = newSeq[T](carray.len)
@@ -1001,13 +1003,43 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     if initialAssignment.len == 0:
         state.balanceBinarySums()
 
+    if verbose and id == 0:
+        stderr.writeLine("[Init] Assignment init done, starting channel fixed-point (" & $carray.channelBindings.len & " bindings)...")
+        stderr.flushFile()
+
     # Compute channel variable initial values from their defining element constraints.
     # Iterate to fixed point: bindings may not be in topological order (e.g., bool2int
     # bindings for i_k are created before int_le_reif bindings for b_k that i_k depends on).
     # A single pass would leave downstream channels stale.
     var channelChanged = true
+    var fpIter = 0
+    # Check for duplicate channel bindings (multiple bindings targeting same position)
+    if verbose and id == 0:
+        var bindingsPerPos = initTable[int, seq[int]]()
+        for bi, binding in carray.channelBindings:
+            bindingsPerPos.mgetOrPut(binding.channelPosition, @[]).add(bi)
+        var dups = 0
+        for pos, indices in bindingsPerPos.pairs:
+            if indices.len > 1:
+                inc dups
+                if dups <= 3:
+                    stderr.writeLine("[Init] WARNING: position " & $pos & " has " & $indices.len & " element channel bindings (indices: " & $indices & ")")
+                    for bi in indices:
+                        let b = carray.channelBindings[bi]
+                        let nConst = block:
+                            var c = 0
+                            for e in b.arrayElements:
+                                if e.isConstant: inc c
+                            c
+                        stderr.writeLine("[Init]   binding[" & $bi & "]: arrLen=" & $b.arrayElements.len &
+                                         " const=" & $nConst & "/" & $b.arrayElements.len &
+                                         " idxPositions=" & $b.indexExpression.positions.len)
+        if dups > 3:
+            stderr.writeLine("[Init] WARNING: ... and " & $(dups - 3) & " more duplicate positions")
+        stderr.flushFile()
     while channelChanged:
         channelChanged = false
+        fpIter += 1
         for binding in carray.channelBindings:
             let idxVal = binding.indexExpression.evaluate(state.assignment)
             if idxVal >= 0 and idxVal < binding.arrayElements.len:
@@ -1017,6 +1049,26 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     channelChanged = true
+        if fpIter > 20:
+            if verbose and id == 0:
+                stderr.writeLine("[Init] WARNING: channel fixed-point exceeded 20 iterations, breaking")
+                # Report which positions are still changing
+                var changingPos: seq[int]
+                for binding in carray.channelBindings:
+                    let idxVal = binding.indexExpression.evaluate(state.assignment)
+                    if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                        let elem = binding.arrayElements[idxVal]
+                        let newVal = if elem.isConstant: elem.constantValue
+                                     else: state.assignment[elem.variablePosition]
+                        if newVal != state.assignment[binding.channelPosition]:
+                            changingPos.add(binding.channelPosition)
+                stderr.writeLine("[Init]   Still-changing positions: " & $changingPos[0..min(9, changingPos.len-1)])
+                stderr.flushFile()
+            break
+
+    if verbose and id == 0:
+        stderr.writeLine("[Init] Channel fixed-point done in " & $fpIter & " iterations")
+        stderr.flushFile()
 
     # Compute count-equals channel initial values
     for binding in carray.countEqChannelBindings:
@@ -1111,7 +1163,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for i in 0..<inWorklist.len: inWorklist[i] = true
 
         var fpEvals = 0
+        var combinedIter = 0
         while true:
+            inc combinedIter
+            if combinedIter > 50:
+                if verbose and id == 0:
+                    stderr.writeLine("[Init] WARNING: combined elem+minmax fixed-point exceeded 50 iterations, breaking")
+                    stderr.flushFile()
+                break
             # Min/max fixed-point pass
             while worklist.len > 0:
                 let bi = worklist.pop()
@@ -1185,6 +1244,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         else:
             state.totalDomainSize += dsize
 
+    if verbose and id == 0:
+        var bin2, bin3to10, bin11to50, binLarge = 0
+        for pos in state.searchPositions:
+            let d = state.sharedDomain[][pos].len
+            if d <= 2: bin2 += 1
+            elif d <= 10: bin3to10 += 1
+            elif d <= 50: bin11to50 += 1
+            else: binLarge += 1
+        echo "[Init] Search positions by domain: d<=2: " & $bin2 & " d<=10: " & $bin3to10 &
+             " d<=50: " & $bin11to50 & " d>50: " & $binLarge
+
     # Initialize dormancy support
     state.isDormant = newSeq[bool](carray.len)
     state.hasDormancy = carray.dormancyBindings.len > 0
@@ -1212,6 +1282,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if pos notin carray.channelPositions and pos notin carray.fixedPositions:
                 searchPos.incl(pos)
         state.constraintSearchPos[cast[pointer](c)] = searchPos
+
+    if verbose and id == 0:
+        stderr.writeLine("[Init] Starting channel-dep identification...")
+        flushFile(stderr)
 
     # Identify channel-dep constraints:
     # 1. Pure-channel constraints (all positions are channels)
@@ -1547,6 +1621,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  " channel positions, " & $state.depConstraintOneHotEntries.len &
                  " constraints, " & $totalEntries & " one-hot entries"
 
+    if verbose and id == 0:
+        stderr.writeLine("[Init] Starting cascade topology build...")
+        flushFile(stderr)
+
     # Build cascade topologies for channel-dep search positions.
     # For ALL element-only positions (no minMax/inverse), store the channel topology.
     # For positions with constant arrays, also precompute values (static cascade).
@@ -1838,6 +1916,31 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &
                  " noExt=" & $noExtCount &
                  " built in " & $(epochTime() - cascadeStart) & "s)"
+            # Distribution of cascade sizes and constraint counts
+            var sizeHist: Table[int, int]
+            var constraintHist: Table[int, int]
+            var maxConstraints = 0
+            var maxChansPos = -1
+            var maxChansCnt = 0
+            for ci in 0..<state.cdCascadeChans.len:
+                let nch = state.cdCascadeChans[ci].len
+                sizeHist.mgetOrPut(nch, 0) += 1
+                let nco = state.cdCascadeConstraintIds[ci].len
+                constraintHist.mgetOrPut(nco, 0) += 1
+                if nch > maxChansCnt:
+                    maxChansCnt = nch
+                    # find the pos
+                    for p, idx in state.cdCascadePos.pairs:
+                        if idx == ci: maxChansPos = p; break
+                if nco > maxConstraints: maxConstraints = nco
+            echo "[Init] Cascade size distribution:"
+            var sizes: seq[int]
+            for s in sizeHist.keys: sizes.add(s)
+            algorithm.sort(sizes)
+            for s in sizes:
+                echo "[Init]   " & $s & " chans: " & $sizeHist[s] & " cascades"
+            echo "[Init] Max cascade: " & $maxChansCnt & " chans at pos " & $maxChansPos &
+                 " max_constraints=" & $maxConstraints
 
     # Skip penalty maps, channel-dep penalties, and element implied structures for relinking
     if forRelinking:
@@ -1846,6 +1949,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.initFlowStructure()
         state.initInverseStructures()
         return
+
+    if verbose and id == 0:
+        stderr.writeLine("[Init] Cascade topology done, initializing penalty arrays...")
+        flushFile(stderr)
 
     # Initialize dense penalty arrays — only for search positions (not channels)
     state.penaltyMap = newSeq[seq[int]](carray.len)
@@ -1916,6 +2023,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if verbose and id == 0:
                     echo "[Init] Disabled " & $tautCount & "/" & $state.channelDepConstraints.len &
                          " tautological channel-dep constraints (zero delta across all moves)"
+                    var tautByType, activeByType: array[StatefulConstraintType, int]
+                    for ci in 0..<state.channelDepConstraints.len:
+                        let ct = state.channelDepConstraints[ci].stateType
+                        if state.channelDepConstraintActive[ci]:
+                            activeByType[ct] += 1
+                        else:
+                            tautByType[ct] += 1
+                    for ct in StatefulConstraintType:
+                        if tautByType[ct] > 0 or activeByType[ct] > 0:
+                            echo "[Init]   " & $ct & ": active=" & $activeByType[ct] & " taut=" & $tautByType[ct]
                 if tautCount == state.channelDepConstraints.len:
                     state.hasChannelDeps = false
 
@@ -1930,10 +2047,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             typeCounts[c.stateType] += 1
             if c.positions.len > typeMaxPos[c.stateType]:
                 typeMaxPos[c.stateType] = c.positions.len
-        echo "[Init] Constraint type counts:"
+        var typePenalty: array[StatefulConstraintType, int]
+        for c in state.constraints:
+            if c.penalty() > 0:
+                typePenalty[c.stateType] += c.penalty()
+        echo "[Init] Constraint type counts (violated cost):"
         for ct in StatefulConstraintType:
             if typeCounts[ct] > 0:
-                echo "  " & $ct & ": " & $typeCounts[ct] & " (max_pos=" & $typeMaxPos[ct] & ")"
+                echo "  " & $ct & ": " & $typeCounts[ct] & " (max_pos=" & $typeMaxPos[ct] & " violated_cost=" & $typePenalty[ct] & ")"
         let searchCount = state.searchPositions.len
         var lazyCount = 0
         for pos in state.searchPositions:

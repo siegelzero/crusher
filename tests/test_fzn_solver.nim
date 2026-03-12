@@ -571,3 +571,294 @@ solve satisfy;
     let xVal = tr.sys.assignment[tr.varPositions["x"]]
     let d2Val = tr.sys.assignment[tr.varPositions["d2"]]
     check d2Val == (xVal + 2) * 2
+
+suite "FlatZinc int_mod Channel Bindings":
+
+  test "int_mod with direct variable origin":
+    ## int_mod(X, 3, Z) where X is a direct variable (not defined).
+    ## Z should become a channel: Z = X mod 3.
+    let src = """
+var 0..8: x :: output_var;
+var 0..2: z :: output_var;
+constraint int_mod(x, 3, z);
+constraint int_eq(x, 7);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # z should be a channel variable
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal == 7
+    check zVal == 1  # 7 mod 3 = 1
+
+  test "int_mod with defined-var origin (regression)":
+    ## int_mod(Y, 12, Z) where Y is defined by int_lin_eq as Y = X - 1.
+    ## This is the exact pattern from the harmony model that was broken:
+    ## the channel binding builder skipped defined-var origins.
+    let src = """
+var 60..72: x :: output_var;
+var 0..127: y :: var_is_introduced :: is_defined_var;
+var 0..11: z :: output_var;
+constraint int_lin_eq([1,-1],[x,y],1) :: defines_var(y);
+constraint int_mod(y, 12, z);
+constraint int_eq(x, 65);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # y should be a defined var (no position), z should be a channel
+    check "y" in tr.definedVarNames
+    check "z" in tr.channelVarNames
+    # z's channel binding must exist (this was the bug — it was silently skipped)
+    check "z" in tr.varPositions
+    let zPos = tr.varPositions["z"]
+    check zPos in tr.sys.baseArray.channelPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[zPos]
+    check xVal == 65
+    # y = 65 - 1 = 64, z = 64 mod 12 = 4
+    check zVal == 4
+
+  test "int_mod with constant X":
+    ## int_mod(72, 12, Z) — constant X. Z should be fixed to 72 mod 12 = 0.
+    let src = """
+var 0..11: z :: output_var;
+constraint int_mod(72, 12, z);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check zVal == 0  # 72 mod 12 = 0
+
+  test "int_mod channel propagates through cascade":
+    ## int_mod defines Z as channel of X. A constraint on Z should
+    ## guide the solver to pick the right X value.
+    ## X in 0..11, Z = X mod 4, constraint Z == 3.
+    ## Valid X values: 3, 7, 11.
+    let src = """
+var 0..11: x :: output_var;
+var 0..3: z :: output_var;
+constraint int_mod(x, 4, z);
+constraint int_eq(z, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check zVal == 3
+    check xVal mod 4 == 3
+    check xVal in [3, 7, 11]
+
+suite "FlatZinc array_set_element":
+
+  test "array_set_element with constant set array":
+    ## array_set_element(idx, [{0,4,7},{2,5,9},{4,7,11}], S)
+    ## Choosing idx selects which set of values S contains.
+    ## With idx=2, S should be {2,5,9}.
+    let src = """
+var 1..3: idx :: output_var;
+var set of 0..11: s :: output_var;
+constraint array_set_element(idx, [{0,4,7},{2,5,9},{4,7,11}], s);
+constraint int_eq(idx, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let idxVal = tr.sys.assignment[tr.varPositions["idx"]]
+    check idxVal == 2
+
+    # Check set membership via boolean decomposition
+    let sInfo = tr.setVarBoolPositions["s"]
+    var members: seq[int]
+    for i in 0..<sInfo.positions.len:
+      if tr.sys.assignment[sInfo.positions[i]] == 1:
+        members.add(sInfo.lo + i)
+
+    check members.sorted == @[2, 5, 9]
+
+  test "array_set_element channels respond to idx changes":
+    ## Constraint that the chosen set must contain value 7.
+    ## Chord defs: {0,4,7}, {2,5,9}, {4,7,11}
+    ## Only chords 1 and 3 contain 7, so idx must be 1 or 3.
+    let src = """
+var 1..3: idx :: output_var;
+var set of 0..11: s :: output_var;
+constraint array_set_element(idx, [{0,4,7},{2,5,9},{4,7,11}], s);
+constraint set_in(7, s);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let idxVal = tr.sys.assignment[tr.varPositions["idx"]]
+    check idxVal in [1, 3]
+
+    # Verify set contains 7
+    let sInfo = tr.setVarBoolPositions["s"]
+    let pos7 = sInfo.positions[7 - sInfo.lo]
+    check tr.sys.assignment[pos7] == 1
+
+suite "FlatZinc int_lin_ne_reif Channeling":
+
+  test "int_lin_ne_reif detected as channel":
+    ## int_lin_ne_reif([1,-1], [a,b], 0, r) :: defines_var(r)
+    ## r = (a != b) ? 1 : 0
+    let src = """
+var 1..3: a :: output_var;
+var 1..3: b :: output_var;
+var 0..1: r :: output_var :: is_defined_var;
+constraint int_lin_ne_reif([1,-1],[a,b],0,r) :: defines_var(r);
+constraint int_eq(a, 2);
+constraint int_eq(b, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "r" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let aVal = tr.sys.assignment[tr.varPositions["a"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check aVal == 2
+    check bVal == 2
+    check rVal == 0  # a == b → r = 0
+
+  test "int_lin_ne_reif channel with unequal values":
+    let src = """
+var 1..3: a :: output_var;
+var 1..3: b :: output_var;
+var 0..1: r :: output_var :: is_defined_var;
+constraint int_lin_ne_reif([1,-1],[a,b],0,r) :: defines_var(r);
+constraint int_eq(a, 1);
+constraint int_eq(b, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "r" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let rVal = tr.sys.assignment[tr.varPositions["r"]]
+    check rVal == 1  # a != b → r = 1
+
+suite "FlatZinc Harmony-like Chain: int_mod → singleton → set_union → array_set_element":
+
+  test "pitch class membership via int_mod + set_in + array_set_element":
+    ## Mini harmony model: 2 voices, 1 timestep, 3 possible chords.
+    ## Each voice pitch mod 4 must be in the chosen chord's pitch class set.
+    ## Chords: {0,1}, {1,2}, {2,3} (pitch classes mod 4).
+    ## Voice pitches: v1 in 4..7, v2 in 4..7.
+    ##
+    ## Chain per voice:
+    ##   y = v - 4 (defined var, to get 0-based)
+    ##   int_mod(y, 4, pc) — pc = pitch class
+    ##   set_in(pc, singleton) + set_card(singleton, 1) — singleton channeling
+    ##   set_union(singleton1, singleton2, result) — union of voice pitch classes
+    ##   array_set_element(chord, [{0,1},{1,2},{2,3}], target) — chord defines target set
+    ##   result must equal target (via set_union equality constraints)
+    let src = """
+var 4..7: v1 :: output_var;
+var 4..7: v2 :: output_var;
+var 1..3: chord :: output_var;
+var 0..127: y1 :: var_is_introduced :: is_defined_var;
+var 0..127: y2 :: var_is_introduced :: is_defined_var;
+var 0..3: pc1 :: var_is_introduced;
+var 0..3: pc2 :: var_is_introduced;
+var set of 0..3: sing1 :: var_is_introduced;
+var set of 0..3: sing2 :: var_is_introduced;
+var set of 0..3: voice_union :: var_is_introduced :: is_defined_var;
+var set of 0..3: target :: var_is_introduced;
+constraint int_lin_eq([1,-1],[v1,y1],4) :: defines_var(y1);
+constraint int_lin_eq([1,-1],[v2,y2],4) :: defines_var(y2);
+constraint int_mod(y1, 4, pc1);
+constraint int_mod(y2, 4, pc2);
+constraint set_in(pc1, sing1);
+constraint set_card(sing1, 1);
+constraint set_in(pc2, sing2);
+constraint set_card(sing2, 1);
+constraint set_union(sing1, sing2, voice_union) :: defines_var(voice_union);
+constraint array_set_element(chord, [{0,1},{1,2},{2,3}], target);
+constraint set_eq(voice_union, target);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Verify key channel detections
+    check "pc1" in tr.channelVarNames  # int_mod channel
+    check "pc2" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let v1Val = tr.sys.assignment[tr.varPositions["v1"]]
+    let v2Val = tr.sys.assignment[tr.varPositions["v2"]]
+    let chordVal = tr.sys.assignment[tr.varPositions["chord"]]
+
+    # Verify pitch classes match the chord
+    let pc1Val = (v1Val - 4) mod 4
+    let pc2Val = (v2Val - 4) mod 4
+    let chordSets = [@[0, 1], @[1, 2], @[2, 3]]
+    let chordSet = chordSets[chordVal - 1]
+
+    check pc1Val in chordSet
+    check pc2Val in chordSet
+
+  test "int_mod defined-var chain with downstream constraint":
+    ## The critical regression pattern: int_mod with defined-var origin
+    ## must propagate through the cascade so the solver can navigate
+    ## constraints on the mod result.
+    ##
+    ## x in 10..19, y = x - 10 (defined), z = y mod 5, constraint z == 3.
+    ## Valid x: 13, 18.
+    let src = """
+var 10..19: x :: output_var;
+var 0..127: y :: var_is_introduced :: is_defined_var;
+var 0..4: z :: output_var;
+constraint int_lin_eq([1,-1],[x,y],10) :: defines_var(y);
+constraint int_mod(y, 5, z);
+constraint int_eq(z, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "y" in tr.definedVarNames
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check zVal == 3
+    check (xVal - 10) mod 5 == 3
+    check xVal in [13, 18]
