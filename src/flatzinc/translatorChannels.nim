@@ -260,6 +260,29 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             else:
                 tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
 
+    # Process bool_xor negation channels: result = 1 - input = element(input, [1, 0])
+    for def in tr.boolXorNegDefs:
+        if def.resultVar notin tr.varPositions: continue
+        let rPos = tr.varPositions[def.resultVar]
+        let aExpr = tr.resolveExprArg(def.inputArg)
+        let arrayElems = @[
+            ArrayElement[int](isConstant: true, constantValue: 1),
+            ArrayElement[int](isConstant: true, constantValue: 0)
+        ]
+        let binding = ChannelBinding[int](
+            channelPosition: rPos,
+            indexExpression: aExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(rPos)
+        for pos in aExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+
     # Process bool_clause_reif channels
     for ci in tr.boolClauseReifChannelDefs:
         let con = tr.model.constraints[ci]

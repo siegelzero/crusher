@@ -376,6 +376,8 @@ type
             overlapVarName: string,
             assignPairNames: seq[(string, string)],  # (assign[i,r], assign[j,r]) per resource
             consumedCIs: seq[int]]]
+        # Bool_xor negation defs: bool_xor(const, var, result) where const=true → result = 1-var
+        boolXorNegDefs*: seq[tuple[inputArg: FznExpr, resultVar: string]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -751,6 +753,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectSmallDomainProducts()
     # Detect disjunctive resource groups (cliques of pairs → cumulative)
     result.detectDisjunctiveResources()
+    # Fold bool_xor constraints with constant inputs (before reif channel detection)
+    result.detectBoolXorSimplification()
     # Detect int_eq_reif/bool2int defines_var patterns → channel variables
     result.detectReifChannels()
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
@@ -1619,6 +1623,10 @@ proc translate*(model: FznModel): FznTranslator =
             result.geostConversion.tileVarPositions,
             result.geostConversion.allPlacements
         ))
+
+    # Consolidate shared-index element channels into table constraints
+    # MUST run after translateVariables (positions exist) and before buildChannelBindings
+    result.detectSharedIndexConsolidation()
 
     # Record binding count from constraint loop (table_int functional deps, array_set_element, etc.)
     let constraintLoopBindingCount = result.sys.baseArray.channelBindings.len

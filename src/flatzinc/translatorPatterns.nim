@@ -1808,9 +1808,98 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         let threshold = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
         leReifMap[resultVar] = LeReifEntry(condVar: condVar, threshold: threshold)
 
+    # Step 1d: Build setInReifCondMap from set_in_reif :: defines_var for use as conditions.
+    # set_in_reif(var, S, bool) → bool = (var ∈ S)
+    # In bool_clause as positive literal: bool true means var ∈ S → covers those domain values
+    # In bool_clause as negative literal: ¬bool means var ∉ S → covers complement domain values
+    type SetInReifEntry = object
+        condVar: string
+        inSet: seq[int]    # sorted set of values where bool = true
+    var setInReifCondMap: Table[string, SetInReifEntry]
+
+    for ci in tr.setInReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "set_in_reif": continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let resultVar = con.args[2].ident
+        if con.args[0].kind != FznIdent: continue
+        let condVar = con.args[0].ident
+        var setVals: seq[int]
+        let setArg = con.args[1]
+        if setArg.kind == FznSetLit:
+            setVals = setArg.setElems.sorted()
+        elif setArg.kind == FznRange:
+            for v in setArg.lo..setArg.hi:
+                setVals.add(v)
+        else:
+            continue
+        if setVals.len > 0:
+            setInReifCondMap[resultVar] = SetInReifEntry(condVar: condVar, inSet: setVals)
+
+    # Step 1e: Build linEqReifCondMap from int_lin_eq_reif :: defines_var for use as conditions.
+    # When int_lin_eq_reif has a single variable (coeffs=[1], vars=[x], rhs=v), it's just x == v.
+    # When it encodes a multi-variable check, we can't simplify it to a single-variable condition,
+    # but we can still use it as a combined condition.
+    type LinEqReifCondEntry = object
+        condVars: seq[string]
+        condCoeffs: seq[int]
+        rhs: int
+    var linEqReifCondMap: Table[string, LinEqReifCondEntry]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+        let boolVar = con.args[3].ident
+        # Skip if already in linEqReifMap (target var resolution)
+        if boolVar in linEqReifMap: continue
+        if boolVar in tr.definedVarNames or boolVar in tr.channelVarNames: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if coeffs.len != varElems.len: continue
+        # Check all elements are variables (not constants)
+        var condVars: seq[string]
+        var condCoeffs: seq[int]
+        var allIdent = true
+        for i in 0..<varElems.len:
+            if varElems[i].kind == FznIdent:
+                # Resolve constants inline
+                if varElems[i].ident in tr.paramValues:
+                    # Subtract constant*coeff from rhs equivalent
+                    continue
+                condVars.add(varElems[i].ident)
+                condCoeffs.add(coeffs[i])
+            elif varElems[i].kind == FznIntLit:
+                continue
+            else:
+                allIdent = false
+                break
+        if not allIdent or condVars.len == 0: continue
+        # For single-variable case (coeffs=[c], vars=[x], rhs=r): x == r/c
+        if condVars.len == 1 and condCoeffs[0] != 0:
+            var adjustedRhs = rhs
+            # Subtract constants from rhs
+            for i in 0..<varElems.len:
+                if varElems[i].kind == FznIdent and varElems[i].ident in tr.paramValues:
+                    adjustedRhs -= coeffs[i] * tr.paramValues[varElems[i].ident]
+                elif varElems[i].kind == FznIntLit:
+                    adjustedRhs -= coeffs[i] * varElems[i].intVal
+            if adjustedRhs mod condCoeffs[0] == 0:
+                let testVal = adjustedRhs div condCoeffs[0]
+                # Add to eqReifMap as simple equality test
+                if boolVar notin eqReifMap:
+                    eqReifMap[boolVar] = (sourceVar: condVars[0],
+                                          testVal: FznExpr(kind: FznIntLit, intVal: testVal))
+        # Store the full condition for multi-variable use
+        linEqReifCondMap[boolVar] = LinEqReifCondEntry(
+            condVars: condVars, condCoeffs: condCoeffs, rhs: rhs)
+
     if eqReifMap.len == 0 and linEqReifMap.len == 0: return
 
-    # Step 2: Scan non-consumed bool_clause constraints with 2-3 positive literals
+    # Step 2: Scan non-consumed bool_clause constraints
     type CaseEntryKind = enum cekSimple, cekLinear
     type CaseEntry = object
         condVarVals: seq[(string, int)]
@@ -1835,11 +1924,11 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         let posArg = con.args[0]
         let negArg = con.args[1]
         if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
-        if negArg.elems.len > 1: continue
+        let nNegLits = negArg.elems.len
         let nLits = posArg.elems.len
 
         # Handle 1-positive-1-negative case: bool_clause([A], [B]) = A ∨ ¬B = B → A
-        if nLits == 1 and negArg.elems.len == 1:
+        if nLits == 1 and nNegLits == 1:
             let posLit = posArg.elems[0]
             let negLit = negArg.elems[0]
             if posLit.kind != FznIdent or negLit.kind != FznIdent: continue
@@ -1868,10 +1957,13 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     linReifIdx: linEntry.constraintIdx))
             continue
 
-        if negArg.elems.len != 0: continue
-        if nLits < 2 or nLits > 3: continue
+        # Multi-literal case: up to 6 positive literals + any number of negative literals
+        let totalLits = nLits + nNegLits
+        if totalLits < 2 or nLits > 6 or nLits < 1: continue
 
-        # Classify literals: exactly 1 eq_reif (or lin_eq_reif) + rest ne_reif (or le_reif)
+        # Classify literals: exactly 1 eq_reif (or lin_eq_reif) + rest are conditions
+        # Positive condition literals: ne_reif, le_reif, set_in_reif (positive = condition NOT met → case applies)
+        # Negative literals: eq_reif means condition IS met (negation of eq_reif = condVar == condVal)
         var eqLitVar = ""
         var eqSourceVar = ""
         var eqTestVal: FznExpr
@@ -1879,8 +1971,10 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         var eqLinEntry: LinEqReifEntry
         var neLits: seq[(string, int)]
         var leEntries: seq[LeReifEntry]
+        var setInEntries: seq[SetInReifEntry]
         var allValid = true
 
+        # Process positive literals
         for elem in posArg.elems:
             if elem.kind != FznIdent:
                 allValid = false
@@ -1899,17 +1993,50 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 neLits.add((info.condVar, info.condVal))
             elif elem.ident in leReifMap:
                 leEntries.add(leReifMap[elem.ident])
+            elif elem.ident in setInReifCondMap:
+                # set_in_reif as positive literal in bool_clause:
+                # bool_clause([..., set_in_reif_bool, ...], [...]) means:
+                # if set_in_reif_bool is true (var ∈ S), the clause is satisfied.
+                # So for the case to apply, set_in_reif_bool must be false → var ∉ S
+                setInEntries.add(setInReifCondMap[elem.ident])
             else:
                 allValid = false
                 break
 
-        if not allValid or eqLitVar == "": continue
-        if neLits.len + leEntries.len != nLits - 1: continue
+        # Process negative literals as conditions
+        if allValid:
+            for elem in negArg.elems:
+                if elem.kind != FznIdent:
+                    allValid = false
+                    break
+                # Negative literal: ¬B in bool_clause means B must be true for case to apply
+                if elem.ident in eqReifMap:
+                    # ¬eq_reif(condVar, condVal, B) → B is true → condVar == condVal
+                    let condInfo = eqReifMap[elem.ident]
+                    let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError:
+                        allValid = false
+                        break
+                    neLits.add((condInfo.sourceVar, condVal))
+                elif elem.ident in setInReifCondMap:
+                    # ¬set_in_reif_bool means bool is true → var ∈ S
+                    # This constrains the condition variable to be in S
+                    # We handle this as a positive set_in_reif condition (inverted below)
+                    # For now, skip this pattern — too complex
+                    allValid = false
+                    break
+                else:
+                    allValid = false
+                    break
 
-        # For le_reif conditions, expand to individual condition values.
+        if not allValid or eqLitVar == "": continue
+        # All literals except the target eq_reif must be condition literals
+        let nCondLits = neLits.len + leEntries.len + setInEntries.len
+        if nCondLits != totalLits - 1: continue
+
+        # For le_reif or set_in_reif conditions, expand to individual condition values.
         # int_le_reif(var, threshold, bool) in bool_clause means: var > threshold → eq holds.
-        # So the case applies for all domain values > threshold.
-        if leEntries.len > 0:
+        # set_in_reif(var, S, bool) as positive literal: case applies when var ∉ S
+        if leEntries.len > 0 or setInEntries.len > 0:
             # Get condition variable domains for le_reif entries
             var expandedNeLists: seq[seq[(string, int)]]
             expandedNeLists.add(neLits.mapIt(@[it]))
@@ -1923,6 +2050,24 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 for v in dom:
                     if v > le.threshold:
                         vals.add((le.condVar, v))
+                if vals.len == 0:
+                    allValid = false
+                    break
+                expandedNeLists.add(vals)
+
+            if not allValid: continue
+
+            # Expand set_in_reif conditions: case applies when var ∉ S (complement)
+            for sir in setInEntries:
+                let dom = tr.lookupVarDomain(sir.condVar)
+                if dom.len == 0:
+                    allValid = false
+                    break
+                var vals: seq[(string, int)]
+                let inSetHS = sir.inSet.toHashSet()
+                for v in dom:
+                    if v notin inSetHS:
+                        vals.add((sir.condVar, v))
                 if vals.len == 0:
                     allValid = false
                     break
@@ -5422,3 +5567,168 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
             tr.netFlowDomainBound = max(tr.netFlowDomainBound, dom[^1])
 
     stderr.writeLine(&"[FZN] Net flow pairs: consumed {stoichConstraints.len} stoichiometry + {revConstraints.len} reversibility constraints")
+
+
+proc detectSharedIndexConsolidation(tr: var FznTranslator) =
+    ## Detects groups of element channel constraints that share the same index variable
+    ## and all use constant arrays. Consolidates each group into a single table constraint
+    ## with functional dependency channels, reducing the number of channel bindings.
+    ##
+    ## Pattern:
+    ##   array_int_element(idx, constArr1, out1) :: defines_var(out1)
+    ##   array_int_element(idx, constArr2, out2) :: defines_var(out2)
+    ##   ...
+    ## → table constraint over (idx, out1, out2, ...) + functional dep channels
+
+    # Group channelConstraints by index variable
+    type ElementGroup = object
+        indexVar: string
+        entries: seq[tuple[ci: int, outputVar: string, constArray: seq[int]]]
+
+    var groupsByIndex = initTable[string, ElementGroup]()
+
+    for ci, defName in tr.channelConstraints:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_int_element", "array_int_element_nonshifted",
+                        "array_bool_element"]:
+            continue
+        if con.args[0].kind != FznIdent: continue
+        let indexVar = con.args[0].ident
+        # Try to resolve the array as constant
+        let constArray = try: tr.resolveIntArray(con.args[1])
+                         except ValueError, KeyError: continue
+        if indexVar notin groupsByIndex:
+            groupsByIndex[indexVar] = ElementGroup(indexVar: indexVar, entries: @[])
+        groupsByIndex[indexVar].entries.add((ci: ci, outputVar: defName, constArray: constArray))
+
+    var nConsolidated = 0
+    var nBindingsRemoved = 0
+
+    for indexVar, group in groupsByIndex:
+        if group.entries.len < 2: continue
+
+        # All entries share the same index variable and have constant arrays
+        # Verify the index variable has a position
+        if indexVar notin tr.varPositions: continue
+        let idxPos = tr.varPositions[indexVar]
+
+        # Verify all output variables have positions
+        var allHavePos = true
+        for entry in group.entries:
+            if entry.outputVar notin tr.varPositions:
+                allHavePos = false
+                break
+        if not allHavePos: continue
+
+        # All arrays must have the same length
+        let arrLen = group.entries[0].constArray.len
+        if not group.entries.allIt(it.constArray.len == arrLen): continue
+
+        # Get index variable domain to determine valid index range
+        let idxDomain = tr.lookupVarDomain(indexVar)
+        if idxDomain.len == 0: continue
+
+        # Build tuples: (index_val, out1_val, out2_val, ...)
+        # FlatZinc uses 1-based indexing for element constraints
+        var positions: seq[int] = @[idxPos]
+        for entry in group.entries:
+            positions.add(tr.varPositions[entry.outputVar])
+
+        var tuples: seq[seq[int]]
+        for idxVal in idxDomain:
+            let arrIdx = idxVal - 1  # FZN 1-based to 0-based
+            if arrIdx < 0 or arrIdx >= arrLen: continue
+            var row = @[idxVal]
+            for entry in group.entries:
+                row.add(entry.constArray[arrIdx])
+            tuples.add(row)
+
+        if tuples.len == 0: continue
+
+        # Try functional dependency detection (index column is the key)
+        # This will create channel bindings for the output columns
+        if tr.tryTableFunctionalDep(positions, tuples):
+            # Success: remove individual channel constraint entries
+            for entry in group.entries:
+                tr.channelConstraints.del(entry.ci)
+                # channelVarNames and channelPositions are already set
+            nBindingsRemoved += group.entries.len
+            inc nConsolidated
+
+    if nConsolidated > 0:
+        stderr.writeLine(&"[FZN] Consolidated {nConsolidated} shared-index element groups ({nBindingsRemoved} bindings → {nConsolidated} tables)")
+
+
+proc detectBoolXorSimplification(tr: var FznTranslator) =
+    ## Detects bool_xor constraints where inputs are constants and folds them.
+    ## - bool_xor(const_a, const_b, result) → result becomes a defined constant
+    ## - bool_xor(const_a, var_b, result) → result = var_b (if a=false) or result = 1-var_b (if a=true)
+    ## - bool_xor(var_a, const_b, result) → similarly
+    var nFolded = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_xor": continue
+        if con.args.len < 3: continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args[2].kind != FznIdent: continue
+        let resultVar = con.args[2].ident
+        if resultVar in tr.channelVarNames or resultVar in tr.definedVarNames: continue
+
+        # Resolve arguments — check if they are constants
+        var aConst = false
+        var aVal = 0
+        var bConst = false
+        var bVal = 0
+        let argA = con.args[0]
+        let argB = con.args[1]
+
+        if argA.kind == FznBoolLit:
+            aConst = true; aVal = if argA.boolVal: 1 else: 0
+        elif argA.kind == FznIntLit:
+            aConst = true; aVal = argA.intVal
+        elif argA.kind == FznIdent and argA.ident in tr.paramValues:
+            aConst = true; aVal = tr.paramValues[argA.ident]
+
+        if argB.kind == FznBoolLit:
+            bConst = true; bVal = if argB.boolVal: 1 else: 0
+        elif argB.kind == FznIntLit:
+            bConst = true; bVal = argB.intVal
+        elif argB.kind == FznIdent and argB.ident in tr.paramValues:
+            bConst = true; bVal = tr.paramValues[argB.ident]
+
+        if aConst and bConst:
+            # Both constants: result is known
+            let xorVal = if aVal != bVal: 1 else: 0
+            tr.paramValues[resultVar] = xorVal
+            tr.definedVarNames.incl(resultVar)
+            tr.definingConstraints.incl(ci)
+            inc nFolded
+        elif aConst:
+            # One constant: result is identity or negation of the other variable
+            tr.channelVarNames.incl(resultVar)
+            tr.definingConstraints.incl(ci)
+            if aVal != 0:
+                # result = 1 - b (negation) — store (inputVarArg, resultVar) for channel building
+                tr.boolXorNegDefs.add((inputArg: argB, resultVar: resultVar))
+            else:
+                # result = b (identity)
+                if argB.kind == FznIdent:
+                    tr.equalityCopyAliases[resultVar] = argB.ident
+            inc nFolded
+        elif bConst:
+            # One constant: result is identity or negation of the other variable
+            tr.channelVarNames.incl(resultVar)
+            tr.definingConstraints.incl(ci)
+            if bVal != 0:
+                # result = 1 - a (negation)
+                tr.boolXorNegDefs.add((inputArg: argA, resultVar: resultVar))
+            else:
+                # result = a (identity)
+                if argA.kind == FznIdent:
+                    tr.equalityCopyAliases[resultVar] = argA.ident
+            inc nFolded
+
+    if nFolded > 0:
+        stderr.writeLine(&"[FZN] Folded {nFolded} bool_xor constraints with constant inputs")
