@@ -2211,7 +2211,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # Phase GAC: Generalized Arc Consistency for small-arity constraints
         # For each constraint, enumerate all value combinations and keep only
         # values that appear in at least one satisfying tuple.
-        var gacTotalPruned = 0
         if gacConstraints.len > 0:
             var tempAssignment = newSeq[T](carray.len)
             for i in 0..<carray.len:
@@ -2287,7 +2286,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[pos].excl(v)
                             outerChanged = true
                             pruned += 1
-                gacTotalPruned += pruned
 
         # Phase 4: Geost pairwise arc consistency
         for cons in carray.constraints:
@@ -3228,7 +3226,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # For each channel binding with all-constant array elements, propagate domain
         # restrictions bidirectionally between key positions and channel position.
         var cbProcessed, cbPruned = 0
-        var cbSkipNonConst, cbSkipIdx0 = 0
         for binding in carray.channelBindings:
             let chPos = binding.channelPosition
             let arrElems = binding.arrayElements
@@ -3241,12 +3238,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     allConstant = false
                     break
             if not allConstant:
-                inc cbSkipNonConst
                 continue
 
             let idxPositions = toSeq(binding.indexExpression.positions.items)
             if idxPositions.len == 0:
-                inc cbSkipIdx0
                 continue
             if idxPositions.len > 6:
                 continue
@@ -3458,77 +3453,75 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                 if anySkipped or product == 0 or product > MAX_CB_MULTI_PRODUCT:
                     discard  # skip this binding
+                elif chPos in skippedPositions or currentDomain[chPos].len == 0:
+                    discard
                 else:
-                    let chSkipped2 = chPos in skippedPositions
-                    if not chSkipped2:
-                        if currentDomain[chPos].len == 0:
-                            discard
-                        else:
-                            var tempAssign = initTable[int, T]()
-                            let nPos = idxPositions.len
+                    var tempAssign = initTable[int, T]()
+                    let nPos = idxPositions.len
 
-                            # Forward: compute reachable channel values
-                            var reachableValues = initPackedSet[T]()
-                            var indices = newSeq[int](nPos)
-                            for combo in 0..<product:
-                                for i in 0..<nPos:
-                                    tempAssign[idxPositions[i]] = posDomains[i][indices[i]]
+                    # Forward: compute reachable channel values
+                    var reachableValues = initPackedSet[T]()
+                    var indices = newSeq[int](nPos)
+                    for combo in 0..<product:
+                        for i in 0..<nPos:
+                            tempAssign[idxPositions[i]] = posDomains[i][indices[i]]
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < arrLen:
+                            reachableValues.incl(arrElems[idx].constantValue)
+                        # Advance odometer
+                        var carry = nPos - 1
+                        while carry >= 0:
+                            indices[carry] += 1
+                            if indices[carry] >= posDomains[carry].len:
+                                indices[carry] = 0
+                                carry -= 1
+                            else:
+                                break
+
+                    let newChDom = currentDomain[chPos] * reachableValues
+                    if newChDom.len < currentDomain[chPos].len:
+                        cbPruned += currentDomain[chPos].len - newChDom.len
+                        currentDomain[chPos] = newChDom
+                        outerChanged = true
+
+                    # Backward: for each key position, check if value has support
+                    for ki in 0..<nPos:
+                        let kPos = idxPositions[ki]
+                        # Precompute other positions and domains (invariant per ki)
+                        var otherDomains: seq[seq[T]]
+                        var otherPositions: seq[int]
+                        var otherProduct = 1
+                        for oi in 0..<nPos:
+                            if oi == ki: continue
+                            otherPositions.add(idxPositions[oi])
+                            otherDomains.add(posDomains[oi])
+                            otherProduct *= posDomains[oi].len
+                        var oIndices = newSeq[int](otherPositions.len)
+                        for v in toSeq(currentDomain[kPos].items):
+                            tempAssign[kPos] = v
+                            var hasSupport = false
+                            # Reset odometer indices
+                            for i in 0..<oIndices.len: oIndices[i] = 0
+                            for combo in 0..<otherProduct:
+                                for i in 0..<otherPositions.len:
+                                    tempAssign[otherPositions[i]] = otherDomains[i][oIndices[i]]
                                 let idx = binding.indexExpression.evaluate(tempAssign)
                                 if idx >= 0 and idx < arrLen:
-                                    reachableValues.incl(arrElems[idx].constantValue)
-                                # Advance odometer
-                                var carry = nPos - 1
+                                    if arrElems[idx].constantValue in currentDomain[chPos]:
+                                        hasSupport = true
+                                        break
+                                var carry = otherPositions.len - 1
                                 while carry >= 0:
-                                    indices[carry] += 1
-                                    if indices[carry] >= posDomains[carry].len:
-                                        indices[carry] = 0
+                                    oIndices[carry] += 1
+                                    if oIndices[carry] >= otherDomains[carry].len:
+                                        oIndices[carry] = 0
                                         carry -= 1
                                     else:
                                         break
-
-                            let newChDom = currentDomain[chPos] * reachableValues
-                            if newChDom.len < currentDomain[chPos].len:
-                                cbPruned += currentDomain[chPos].len - newChDom.len
-                                currentDomain[chPos] = newChDom
+                            if not hasSupport:
+                                currentDomain[kPos].excl(v)
+                                cbPruned += 1
                                 outerChanged = true
-
-                            # Backward: for each key position, check if value has support
-                            for ki in 0..<nPos:
-                                let kPos = idxPositions[ki]
-                                for v in toSeq(currentDomain[kPos].items):
-                                    tempAssign[kPos] = v
-                                    var hasSupport = false
-                                    # Enumerate all other positions
-                                    var otherDomains: seq[seq[T]]
-                                    var otherPositions: seq[int]
-                                    var otherProduct = 1
-                                    for oi in 0..<nPos:
-                                        if oi == ki: continue
-                                        otherPositions.add(idxPositions[oi])
-                                        otherDomains.add(posDomains[oi])
-                                        otherProduct *= posDomains[oi].len
-
-                                    var oIndices = newSeq[int](otherPositions.len)
-                                    for combo in 0..<otherProduct:
-                                        for i in 0..<otherPositions.len:
-                                            tempAssign[otherPositions[i]] = otherDomains[i][oIndices[i]]
-                                        let idx = binding.indexExpression.evaluate(tempAssign)
-                                        if idx >= 0 and idx < arrLen:
-                                            if arrElems[idx].constantValue in currentDomain[chPos]:
-                                                hasSupport = true
-                                                break
-                                        var carry = otherPositions.len - 1
-                                        while carry >= 0:
-                                            oIndices[carry] += 1
-                                            if oIndices[carry] >= otherDomains[carry].len:
-                                                oIndices[carry] = 0
-                                                carry -= 1
-                                            else:
-                                                break
-                                    if not hasSupport:
-                                        currentDomain[kPos].excl(v)
-                                        cbPruned += 1
-                                        outerChanged = true
 
         if cbPruned > 0:
             stderr.writeLine(&"[DomRed] Channel AC: {cbPruned} values pruned ({cbProcessed} bindings)")

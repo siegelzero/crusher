@@ -1837,65 +1837,46 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         if setVals.len > 0:
             setInReifCondMap[resultVar] = SetInReifEntry(condVar: condVar, inSet: setVals)
 
-    # Step 1e: Build linEqReifCondMap from int_lin_eq_reif :: defines_var for use as conditions.
-    # When int_lin_eq_reif has a single variable (coeffs=[1], vars=[x], rhs=v), it's just x == v.
-    # When it encodes a multi-variable check, we can't simplify it to a single-variable condition,
-    # but we can still use it as a combined condition.
-    type LinEqReifCondEntry = object
-        condVars: seq[string]
-        condCoeffs: seq[int]
-        rhs: int
-    var linEqReifCondMap: Table[string, LinEqReifCondEntry]
-
+    # Step 1e: Extract single-variable int_lin_eq_reif :: defines_var into eqReifMap.
+    # When int_lin_eq_reif has a single variable (coeffs=[c], vars=[x], rhs=r): x == r/c.
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
         if con.args.len < 4 or con.args[3].kind != FznIdent: continue
         let boolVar = con.args[3].ident
-        # Skip if already in linEqReifMap (target var resolution)
         if boolVar in linEqReifMap: continue
         if boolVar in tr.definedVarNames or boolVar in tr.channelVarNames: continue
         let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
         let varElems = tr.resolveVarArrayElems(con.args[1])
         let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
         if coeffs.len != varElems.len: continue
-        # Check all elements are variables (not constants)
-        var condVars: seq[string]
-        var condCoeffs: seq[int]
+        # Extract the single non-constant variable
+        var condVar = ""
+        var condCoeff = 0
         var allIdent = true
+        var adjustedRhs = rhs
         for i in 0..<varElems.len:
             if varElems[i].kind == FznIdent:
-                # Resolve constants inline
                 if varElems[i].ident in tr.paramValues:
-                    # Subtract constant*coeff from rhs equivalent
-                    continue
-                condVars.add(varElems[i].ident)
-                condCoeffs.add(coeffs[i])
+                    adjustedRhs -= coeffs[i] * tr.paramValues[varElems[i].ident]
+                elif condVar == "":
+                    condVar = varElems[i].ident
+                    condCoeff = coeffs[i]
+                else:
+                    allIdent = false  # multi-variable — skip
+                    break
             elif varElems[i].kind == FznIntLit:
-                continue
+                adjustedRhs -= coeffs[i] * varElems[i].intVal
             else:
                 allIdent = false
                 break
-        if not allIdent or condVars.len == 0: continue
-        # For single-variable case (coeffs=[c], vars=[x], rhs=r): x == r/c
-        if condVars.len == 1 and condCoeffs[0] != 0:
-            var adjustedRhs = rhs
-            # Subtract constants from rhs
-            for i in 0..<varElems.len:
-                if varElems[i].kind == FznIdent and varElems[i].ident in tr.paramValues:
-                    adjustedRhs -= coeffs[i] * tr.paramValues[varElems[i].ident]
-                elif varElems[i].kind == FznIntLit:
-                    adjustedRhs -= coeffs[i] * varElems[i].intVal
-            if adjustedRhs mod condCoeffs[0] == 0:
-                let testVal = adjustedRhs div condCoeffs[0]
-                # Add to eqReifMap as simple equality test
-                if boolVar notin eqReifMap:
-                    eqReifMap[boolVar] = (sourceVar: condVars[0],
-                                          testVal: FznExpr(kind: FznIntLit, intVal: testVal))
-        # Store the full condition for multi-variable use
-        linEqReifCondMap[boolVar] = LinEqReifCondEntry(
-            condVars: condVars, condCoeffs: condCoeffs, rhs: rhs)
+        if not allIdent or condVar == "" or condCoeff == 0: continue
+        if adjustedRhs mod condCoeff == 0:
+            let testVal = adjustedRhs div condCoeff
+            if boolVar notin eqReifMap:
+                eqReifMap[boolVar] = (sourceVar: condVar,
+                                      testVal: FznExpr(kind: FznIntLit, intVal: testVal))
 
     if eqReifMap.len == 0 and linEqReifMap.len == 0: return
 
@@ -1969,7 +1950,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         var eqTestVal: FznExpr
         var eqIsLinear = false
         var eqLinEntry: LinEqReifEntry
-        var neLits: seq[(string, int)]
+        var condLits: seq[(string, int)]  # (condVar, condVal) pairs: case applies when condVar == condVal
         var leEntries: seq[LeReifEntry]
         var setInEntries: seq[SetInReifEntry]
         var allValid = true
@@ -1990,7 +1971,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 eqIsLinear = true
             elif elem.ident in neReifMap:
                 let info = neReifMap[elem.ident]
-                neLits.add((info.condVar, info.condVal))
+                condLits.add((info.condVar, info.condVal))
             elif elem.ident in leReifMap:
                 leEntries.add(leReifMap[elem.ident])
             elif elem.ident in setInReifCondMap:
@@ -2016,7 +1997,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError:
                         allValid = false
                         break
-                    neLits.add((condInfo.sourceVar, condVal))
+                    condLits.add((condInfo.sourceVar, condVal))
                 elif elem.ident in setInReifCondMap:
                     # ¬set_in_reif_bool means bool is true → var ∈ S
                     # This constrains the condition variable to be in S
@@ -2030,7 +2011,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
 
         if not allValid or eqLitVar == "": continue
         # All literals except the target eq_reif must be condition literals
-        let nCondLits = neLits.len + leEntries.len + setInEntries.len
+        let nCondLits = condLits.len + leEntries.len + setInEntries.len
         if nCondLits != totalLits - 1: continue
 
         # For le_reif or set_in_reif conditions, expand to individual condition values.
@@ -2038,8 +2019,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         # set_in_reif(var, S, bool) as positive literal: case applies when var ∉ S
         if leEntries.len > 0 or setInEntries.len > 0:
             # Get condition variable domains for le_reif entries
-            var expandedNeLists: seq[seq[(string, int)]]
-            expandedNeLists.add(neLits.mapIt(@[it]))
+            var expandedCondLists: seq[seq[(string, int)]]
+            expandedCondLists.add(condLits.mapIt(@[it]))
 
             for le in leEntries:
                 let dom = tr.lookupVarDomain(le.condVar)
@@ -2053,7 +2034,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 if vals.len == 0:
                     allValid = false
                     break
-                expandedNeLists.add(vals)
+                expandedCondLists.add(vals)
 
             if not allValid: continue
 
@@ -2071,13 +2052,13 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 if vals.len == 0:
                     allValid = false
                     break
-                expandedNeLists.add(vals)
+                expandedCondLists.add(vals)
 
             if not allValid: continue
 
             # Build cross-product of all condition combinations
             var combos: seq[seq[(string, int)]] = @[@[]]
-            for group in expandedNeLists:
+            for group in expandedCondLists:
                 var newCombos: seq[seq[(string, int)]]
                 for existing in combos:
                     for item in group:
@@ -2104,13 +2085,13 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             # Standard case: all conditions are ne_reif
             if eqIsLinear:
                 casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
-                    kind: cekLinear, condVarVals: neLits, boolClauseIdx: ci,
+                    kind: cekLinear, condVarVals: condLits, boolClauseIdx: ci,
                     linOtherVars: eqLinEntry.otherVars, linOtherCoeffs: eqLinEntry.otherCoeffs,
                     linRhs: eqLinEntry.rhs, linTargetCoeff: eqLinEntry.targetCoeff,
                     linReifIdx: eqLinEntry.constraintIdx))
             else:
                 casesByTarget.mgetOrPut(eqSourceVar, @[]).add(CaseEntry(
-                    kind: cekSimple, condVarVals: neLits, boolClauseIdx: ci,
+                    kind: cekSimple, condVarVals: condLits, boolClauseIdx: ci,
                     testVal: eqTestVal))
 
     if casesByTarget.len == 0: return
