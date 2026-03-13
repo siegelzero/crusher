@@ -2359,3 +2359,233 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
     if nBinary > 0 or nOneHot > 0:
         stderr.writeLine(&"[FZN] Built conditional implication channel bindings: {nBinary} binary, {nOneHot} one-hot")
 
+proc buildNetFlowVariables*(tr: var FznTranslator) =
+    ## Creates net_flow search variables for free pairs, defined expressions for dependent
+    ## pairs, and channel bindings for V_in/V_out from net_flow.
+    ##
+    ## After this proc:
+    ## - Free net_flow vars have positions in varPositions (search variables)
+    ## - Dependent net_flow vars have expressions in definedVarExprs
+    ## - V_in/V_out positions are channel-bound to their net_flow expression
+    ## - Existing int_le_reif + bool2int detection will chain Z/Zint from V_in/V_out
+
+    let D = tr.netFlowDomainBound  # e.g., 50
+    let nPairs = tr.netFlowPairInVar.len
+
+    # Map pair index → net_flow variable name
+    var pairNetFlowName = newSeq[string](nPairs)
+    for pid in 0..<nPairs:
+        pairNetFlowName[pid] = "net_flow_" & $pid
+
+    # Step 1: Create free net_flow search variables with domain [-D, D]
+    for pid in tr.netFlowFreePairs:
+        let nfName = pairNetFlowName[pid]
+        let pos = tr.sys.baseArray.len
+        let v = tr.sys.newConstrainedVariable()
+        v.setDomain(toSeq(-D..D))
+        tr.varPositions[nfName] = pos
+
+    stderr.writeLine(&"[FZN] Created {tr.netFlowFreePairs.len} free net_flow search positions (domain [{-D}..{D}])")
+
+    # Step 2: Build defined expressions for dependent net_flow pairs (topo order)
+    # Each dependent pair d: net_flow[d] = sum(coeff[j] * net_flow[j])
+    var nDepBuilt = 0
+    for di in 0..<tr.netFlowDependentPairs.len:
+        let depPid = tr.netFlowDependentPairs[di]
+        let nfName = pairNetFlowName[depPid]
+        let terms = tr.netFlowDepTerms[di]
+        # Build expression: sum of coeff * net_flow[other_pair]
+        var expr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true
+        )
+        for term in terms:
+            let otherName = pairNetFlowName[term.pairId]
+            let otherExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: otherName))
+            if term.coeff == 1:
+                expr = expr + otherExpr
+            elif term.coeff == -1:
+                expr = expr - otherExpr
+            else:
+                expr = expr + term.coeff * otherExpr
+        tr.definedVarExprs[nfName] = expr
+        inc nDepBuilt
+
+    stderr.writeLine(&"[FZN] Built {nDepBuilt} dependent net_flow defined expressions")
+
+    # Step 3: Domain reduction through tree propagation
+    # Every pair's net_flow must be in [-D, D] (V_in/V_out must be in [0, D]).
+    # For dependent pairs that are sums of other pairs, the unconstrained range
+    # can exceed [-D, D]. Propagate backwards to tighten free pair domains.
+    type PairRange = tuple[lo, hi: int]
+
+    var pairRange = newSeq[PairRange](nPairs)
+    # Initialize free pairs to [-D, D]
+    for pid in tr.netFlowFreePairs:
+        pairRange[pid] = (-D, D)
+
+    # Initialize dependent pair ranges to 0 (will be computed)
+    for pid in tr.netFlowDependentPairs:
+        pairRange[pid] = (0, 0)
+
+    # Forward pass: compute dependent pair ranges in topo order
+    for di in 0..<tr.netFlowDependentPairs.len:
+        let depPid = tr.netFlowDependentPairs[di]
+        let terms = tr.netFlowDepTerms[di]
+        var lo, hi = 0
+        for term in terms:
+            let r = pairRange[term.pairId]
+            if term.coeff > 0:
+                lo += term.coeff * r.lo
+                hi += term.coeff * r.hi
+            else:
+                lo += term.coeff * r.hi
+                hi += term.coeff * r.lo
+        pairRange[depPid] = (lo, hi)
+
+    # Iterate: clamp dependent ranges to [-D, D] and propagate backward
+    var changed = true
+    var iterations = 0
+    while changed and iterations < 100:
+        changed = false
+        inc iterations
+
+        # Backward pass: process dependent pairs in reverse topo order
+        for di in countdown(tr.netFlowDependentPairs.len - 1, 0):
+            let depPid = tr.netFlowDependentPairs[di]
+            let terms = tr.netFlowDepTerms[di]
+
+            # Clamp this pair's range to [-D, D]
+            var r = pairRange[depPid]
+            if r.lo < -D: r.lo = -D; changed = true
+            if r.hi > D: r.hi = D; changed = true
+            pairRange[depPid] = r
+
+            # Propagate to contributing pairs
+            for ti, term in terms:
+                # Compute range of all OTHER terms
+                var othersLo, othersHi = 0
+                for tj, otherTerm in terms:
+                    if tj == ti: continue
+                    let oRange = pairRange[otherTerm.pairId]
+                    if otherTerm.coeff > 0:
+                        othersLo += otherTerm.coeff * oRange.lo
+                        othersHi += otherTerm.coeff * oRange.hi
+                    else:
+                        othersLo += otherTerm.coeff * oRange.hi
+                        othersHi += otherTerm.coeff * oRange.lo
+
+                # depRange.lo <= coeff * term_val + others <= depRange.hi
+                # => (depRange.lo - othersHi) / coeff <= term_val <= (depRange.hi - othersLo) / coeff
+                var newLo, newHi: int
+                if term.coeff > 0:  # coeff = 1
+                    newLo = r.lo - othersHi
+                    newHi = r.hi - othersLo
+                else:  # coeff = -1
+                    newLo = othersLo - r.hi
+                    newHi = othersHi - r.lo
+
+                # Intersect with current range
+                let cur = pairRange[term.pairId]
+                let tLo = max(cur.lo, newLo)
+                let tHi = min(cur.hi, newHi)
+                if tLo > cur.lo or tHi < cur.hi:
+                    pairRange[term.pairId] = (tLo, tHi)
+                    changed = true
+
+        # Forward pass: recompute dependent pair ranges with tightened inputs
+        for di in 0..<tr.netFlowDependentPairs.len:
+            let depPid = tr.netFlowDependentPairs[di]
+            let terms = tr.netFlowDepTerms[di]
+            var lo, hi = 0
+            for term in terms:
+                let r = pairRange[term.pairId]
+                if term.coeff > 0:
+                    lo += term.coeff * r.lo
+                    hi += term.coeff * r.hi
+                else:
+                    lo += term.coeff * r.hi
+                    hi += term.coeff * r.lo
+            # Clamp to [-D, D]
+            lo = max(-D, lo)
+            hi = min(D, hi)
+            let prev = pairRange[depPid]
+            if lo != prev.lo or hi != prev.hi:
+                pairRange[depPid] = (lo, hi)
+                changed = true
+
+    # Apply domain reductions to free pair positions
+    var nDomainReductions = 0
+    var totalSaved = 0
+    for pid in tr.netFlowFreePairs:
+        let r = pairRange[pid]
+        if r.lo > -D or r.hi < D:
+            let nfName = pairNetFlowName[pid]
+            let pos = tr.varPositions[nfName]
+            let oldSize = 2 * D + 1
+            tr.sys.baseArray.setDomain(pos, toSeq(r.lo..r.hi))
+            totalSaved += oldSize - (r.hi - r.lo + 1)
+            inc nDomainReductions
+
+    # Add range constraints for dependent pairs whose unclamped range exceeds [-D, D]
+    # These enforce |net_flow[d]| ≤ D which is required for V_in/V_out ∈ [0, D]
+    # Recompute unclamped ranges to check which pairs actually need constraints
+    var nRangeConstraints = 0
+    for di in 0..<tr.netFlowDependentPairs.len:
+        let depPid = tr.netFlowDependentPairs[di]
+        let terms = tr.netFlowDepTerms[di]
+        var uLo, uHi = 0  # unclamped range
+        for term in terms:
+            let r = pairRange[term.pairId]
+            if term.coeff > 0:
+                uLo += term.coeff * r.lo
+                uHi += term.coeff * r.hi
+            else:
+                uLo += term.coeff * r.hi
+                uHi += term.coeff * r.lo
+        if uLo < -D or uHi > D:
+            let nfName = pairNetFlowName[depPid]
+            let expr = tr.definedVarExprs[nfName]
+            if uLo < -D:
+                tr.sys.addConstraint(expr >= -D)
+            if uHi > D:
+                tr.sys.addConstraint(expr <= D)
+            inc nRangeConstraints
+
+    stderr.writeLine(&"[FZN] Net flow domain reduction: {nDomainReductions}/{tr.netFlowFreePairs.len} free pairs tightened, {nRangeConstraints} range constraints added ({iterations} iterations, {totalSaved} values removed)")
+
+    # Step 4: Build channel bindings for V_in/V_out from net_flow
+    # Per-pair tables cover the actual range [lo, hi] of each pair's net_flow
+    # V_in = max(0, net_flow) = element(net_flow - lo, [max(0, v) for v in lo..hi])
+    # V_out = max(0, -net_flow) = element(net_flow - lo, [max(0, -v) for v in lo..hi])
+    var nChannelBindings = 0
+    for pid in 0..<nPairs:
+        let nfName = pairNetFlowName[pid]
+        let nfExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: nfName))
+        let r = pairRange[pid]
+        let indexExpr = nfExpr - r.lo  # shift to 0-based
+
+        # Build per-pair lookup tables
+        var tableVin: seq[ArrayElement[int]]
+        var tableVout: seq[ArrayElement[int]]
+        for v in r.lo..r.hi:
+            tableVin.add(ArrayElement[int](isConstant: true, constantValue: max(0, v)))
+            tableVout.add(ArrayElement[int](isConstant: true, constantValue: max(0, -v)))
+
+        # V_in channel binding
+        let inVarName = tr.netFlowPairInVar[pid]
+        if inVarName in tr.varPositions:
+            let inPos = tr.varPositions[inVarName]
+            tr.sys.baseArray.addChannelBinding(inPos, indexExpr, tableVin)
+            inc nChannelBindings
+
+        # V_out channel binding
+        let outVarName = tr.netFlowPairOutVar[pid]
+        if outVarName in tr.varPositions:
+            let outPos = tr.varPositions[outVarName]
+            tr.sys.baseArray.addChannelBinding(outPos, indexExpr, tableVout)
+            inc nChannelBindings
+
+    stderr.writeLine(&"[FZN] Built {nChannelBindings} V_in/V_out channel bindings from net_flow")
+

@@ -362,6 +362,13 @@ type
         valueSupportDefs*: seq[ValueSupportDef]
         # Bool vars consumed by value-support detection (skip in channel detection)
         valueSupportConsumedBools*: HashSet[string]
+        # Net flow pair detection (EFM / metabolic network patterns)
+        netFlowPairInVar*: seq[string]     # pair index → V_in name
+        netFlowPairOutVar*: seq[string]    # pair index → V_out name
+        netFlowFreePairs*: seq[int]        # free pair indices (search variables)
+        netFlowDependentPairs*: seq[int]   # dependent pair indices (channels, in topo order)
+        netFlowDepTerms*: seq[seq[tuple[pairId: int, coeff: int]]]  # dependency terms per dependent pair
+        netFlowDomainBound*: int           # flux domain upper bound (e.g., 50)
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -705,6 +712,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.translateParameters()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
+    # Detect net flow pairs (EFM / metabolic network: paired vars with tree-structured constraints)
+    # MUST run before other detection to consume stoichiometry + reversibility constraints early
+    result.detectNetFlowPairs()
     # Detect int_mod channel patterns (Z = X mod C → element channel)
     result.detectIntModChannels()
     # Detect conditional count_eq patterns (int_lin_eq → bool2int → array_bool_and → int_eq_reif × 2)
@@ -787,6 +797,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
     result.translateVariables()
+    # Create net flow variables and channel bindings (after translateVariables so V positions exist)
+    if result.netFlowFreePairs.len > 0:
+        result.buildNetFlowVariables()
     # Mark channelVarNames positions as channelPositions (for vars like ra vars
     # that are marked as channels during detection but don't have channel bindings)
     for vn in result.channelVarNames:

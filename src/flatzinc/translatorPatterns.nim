@@ -4923,3 +4923,367 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
             tr.definedVarNames.incl(b)
 
     stderr.writeLine(&"[FZN] Detected {tr.valueSupportDefs.len} value-support constraints (consumed {nConsumedBoolClauses} bool_clause, {nOrphanedReifs} orphaned reifs)")
+
+proc detectNetFlowPairs*(tr: var FznTranslator) =
+    ## Detects EFM / metabolic network patterns: paired variables with opposite-sign
+    ## coefficients in int_lin_eq constraints forming a tree-structured constraint graph.
+    ##
+    ## Pattern:
+    ##   - int_lin_eq with all +-1 coefficients, variables in consecutive pairs
+    ##   - int_le_reif(1, V, Z) + bool2int(Z, Zint) channeling per variable
+    ##   - int_lin_le([1,1], [Zint_in, Zint_out], 1) reversibility per pair
+    ##
+    ## Reformulation:
+    ##   - Replace each (V_in, V_out) pair with net_flow = V_in - V_out
+    ##   - Tree-eliminate dependent pairs via channels
+    ##   - Channel V_in, V_out, Z_in, Z_out from net_flow
+
+    # Step 1: Find int_lin_eq constraints with paired structure
+    type
+        PairId = int  # index into pairs array
+
+    # Scan for candidate stoichiometry constraints (int_lin_eq with +-1 coeffs, rhs=0, paired vars)
+    var stoichConstraints: seq[int]  # constraint indices
+    var stoichCoeffs: seq[seq[int]]
+    var stoichVarNames: seq[seq[string]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq":
+            continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != 0:
+            continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len < 4 or coeffs.len mod 2 != 0:
+            continue
+        # Check all coefficients are +-1
+        var allUnit = true
+        for c in coeffs:
+            if c != 1 and c != -1:
+                allUnit = false
+                break
+        if not allUnit:
+            continue
+        # Check variables are all identifiers
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != coeffs.len:
+            continue
+        var allIdents = true
+        var varNames: seq[string]
+        for e in varElems:
+            if e.kind != FznIdent:
+                allIdents = false
+                break
+            varNames.add(e.ident)
+        if not allIdents:
+            continue
+        # Check paired structure: consecutive pairs with opposite-sign coefficients
+        var isPaired = true
+        for i in countup(0, coeffs.len - 1, 2):
+            if coeffs[i] != -coeffs[i + 1]:
+                isPaired = false
+                break
+        if not isPaired:
+            continue
+        stoichConstraints.add(ci)
+        stoichCoeffs.add(coeffs)
+        stoichVarNames.add(varNames)
+
+    if stoichConstraints.len < 10:
+        return  # Not enough stoichiometry constraints to be a network
+
+    # Step 2: Build pair map from stoichiometry constraints
+    # A "pair" is (V_in, V_out) that always appear with opposite-sign coefficients
+    var pairOf: Table[string, PairId]  # variable name → pair index
+    var pairInVar: seq[string]   # pair index → V_in name
+    var pairOutVar: seq[string]  # pair index → V_out name
+    var nPairs = 0
+
+    for si in 0..<stoichConstraints.len:
+        let coeffs = stoichCoeffs[si]
+        let varNames = stoichVarNames[si]
+        for i in countup(0, coeffs.len - 1, 2):
+            let v1 = varNames[i]
+            let v2 = varNames[i + 1]
+            if v1 notin pairOf and v2 notin pairOf:
+                # New pair: v1 has coeffs[i], v2 has coeffs[i+1] = -coeffs[i]
+                # Convention: "in" has positive coeff in first occurrence
+                let pid = nPairs
+                if coeffs[i] == 1:
+                    pairInVar.add(v1)
+                    pairOutVar.add(v2)
+                else:
+                    pairInVar.add(v2)
+                    pairOutVar.add(v1)
+                pairOf[v1] = pid
+                pairOf[v2] = pid
+                inc nPairs
+            elif v1 in pairOf and v2 in pairOf:
+                # Both already assigned — verify same pair
+                if pairOf[v1] != pairOf[v2]:
+                    return  # Inconsistent pairing
+            else:
+                return  # Mixed — one in pair, other not
+
+    if nPairs < 10:
+        return
+
+    # Verify all stoichiometry constraints use consistent pairs
+    # For each constraint, extract the pair-level representation:
+    # which pairs participate and with what sign
+    type
+        StoichPairTerm = tuple[pairId: PairId, sign: int]  # sign of net_flow in this constraint
+
+    var stoichPairTerms: seq[seq[StoichPairTerm]]
+    for si in 0..<stoichConstraints.len:
+        let coeffs = stoichCoeffs[si]
+        let varNames = stoichVarNames[si]
+        var terms: seq[StoichPairTerm]
+        var valid = true
+        for i in countup(0, coeffs.len - 1, 2):
+            let v1 = varNames[i]
+            let pid = pairOf[v1]
+            # net_flow = V_in - V_out
+            # If v1 is the "in" var (pairInVar[pid]), then v1 coeff = sign of net_flow
+            # If v1 is the "out" var, then v1 coeff = -sign of net_flow
+            let sign = if v1 == pairInVar[pid]: coeffs[i] else: -coeffs[i]
+            terms.add((pairId: pid, sign: sign))
+        if not valid:
+            return
+        stoichPairTerms.add(terms)
+
+    # Step 3: Build bipartite graph (metabolite constraints ↔ pairs) and check tree property
+    # metabolite nodes: indexed 0..<stoichConstraints.len
+    # pair nodes: indexed 0..<nPairs
+    var pairToMetabolites: seq[seq[int]]  # pair → list of metabolite constraint indices (into stoichConstraints)
+    pairToMetabolites.setLen(nPairs)
+    var metaboliteToPairs: seq[seq[PairId]]
+    metaboliteToPairs.setLen(stoichConstraints.len)
+
+    for si in 0..<stoichConstraints.len:
+        for term in stoichPairTerms[si]:
+            pairToMetabolites[term.pairId].add(si)
+            metaboliteToPairs[si].add(term.pairId)
+
+    # Check tree property: edges = metabolites + pairs - 1
+    var totalEdges = 0
+    for si in 0..<stoichConstraints.len:
+        totalEdges += metaboliteToPairs[si].len
+    let totalNodes = stoichConstraints.len + nPairs
+    if totalEdges != totalNodes - 1:
+        stderr.writeLine(&"[FZN] Net flow: not a tree (edges={totalEdges}, nodes={totalNodes})")
+        return
+
+    # Verify connectivity via BFS on pairs
+    var visited = initPackedSet[int]()
+    var queue: seq[int]
+    queue.add(0)
+    visited.incl(0)
+    var head = 0
+    while head < queue.len:
+        let pid = queue[head]
+        inc head
+        for si in pairToMetabolites[pid]:
+            for otherPid in metaboliteToPairs[si]:
+                if otherPid notin visited:
+                    visited.incl(otherPid)
+                    queue.add(otherPid)
+    if visited.len != nPairs:
+        stderr.writeLine(&"[FZN] Net flow: not connected ({visited.len}/{nPairs} pairs reachable)")
+        return
+
+    # Step 4: Tree peeling — classify pairs as free vs dependent
+    # Start from leaf PAIRS (degree 1 = appear in only 1 metabolite constraint).
+    # When a leaf pair is eliminated from a metabolite, that metabolite may become
+    # a "leaf metabolite" (only 1 remaining pair), making that pair dependent.
+    var pairDegree = newSeq[int](nPairs)
+    for pid in 0..<nPairs:
+        pairDegree[pid] = pairToMetabolites[pid].len
+    var metDegree = newSeq[int](stoichConstraints.len)
+    for si in 0..<stoichConstraints.len:
+        metDegree[si] = metaboliteToPairs[si].len
+
+    var dependentPairs: seq[PairId]  # in elimination order (leaves first)
+    var dependentMetabolite: seq[int]  # which metabolite constraint determines this pair
+    var isDependentPair = newSeq[bool](nPairs)
+    var isDependentMet = newSeq[bool](stoichConstraints.len)
+
+    # Seed queue with degree-1 pairs (leaf pairs in the bipartite tree)
+    var pairQueue: seq[PairId]
+    for pid in 0..<nPairs:
+        if pairDegree[pid] == 1:
+            pairQueue.add(pid)
+
+    var pqHead = 0
+    while pqHead < pairQueue.len:
+        let pid = pairQueue[pqHead]
+        inc pqHead
+        if isDependentPair[pid]:
+            continue
+        # Find the single remaining uneliminated metabolite for this pair
+        var activeMet = -1
+        for si in pairToMetabolites[pid]:
+            if not isDependentMet[si]:
+                activeMet = si
+                break
+        if activeMet < 0:
+            continue
+        # This pair is determined by this metabolite constraint
+        isDependentPair[pid] = true
+        isDependentMet[activeMet] = true
+        dependentPairs.add(pid)
+        dependentMetabolite.add(activeMet)
+        # When we eliminate this pair from the metabolite, reduce degree of
+        # all OTHER pairs that share this metabolite. Also reduce degree of
+        # pairs that shared OTHER metabolites with this pair.
+        # Actually: in a bipartite tree, eliminating pair pid removes it from
+        # all its metabolite connections. For the metabolite we just consumed (activeMet),
+        # the other pairs in activeMet lose a neighbor — but that's the metabolite being
+        # consumed, not the pair. Let me think again...
+        #
+        # Tree peeling: we remove the leaf pair pid + its single metabolite edge.
+        # This "consumes" metabolite activeMet. All OTHER pairs connected to activeMet
+        # now have one fewer metabolite neighbor. If any of them drops to degree 0,
+        # that's fine (they become free). If they drop to degree 1, they become leaf pairs.
+        for otherPid in metaboliteToPairs[activeMet]:
+            if otherPid != pid and not isDependentPair[otherPid]:
+                dec pairDegree[otherPid]
+                if pairDegree[otherPid] == 1:
+                    pairQueue.add(otherPid)
+
+    var freePairs: seq[PairId]
+    for pid in 0..<nPairs:
+        if not isDependentPair[pid]:
+            freePairs.add(pid)
+
+    if dependentPairs.len != stoichConstraints.len:
+        stderr.writeLine(&"[FZN] Net flow: tree peel incomplete ({dependentPairs.len} deps vs {stoichConstraints.len} constraints)")
+        return
+
+    stderr.writeLine(&"[FZN] Detected {nPairs} net flow pairs: {freePairs.len} free, {dependentPairs.len} dependent")
+
+    # Step 5: Build dependency expressions for dependent pairs
+    # Each dependent pair d is determined by metabolite constraint si:
+    #   sum_over_pairs(sign[p] * net_flow[p]) = 0
+    #   → sign[d] * net_flow[d] = -sum_over_other_pairs(sign[p] * net_flow[p])
+    #   → net_flow[d] = sign[d] * (-sum_over_other_pairs(sign[p] * net_flow[p]))
+    # = -sign[d] * sum_over_other_pairs(sign[p] * net_flow[p])
+    # Process in elimination order so dependencies are resolved
+    type
+        DepTerm = tuple[pairId: PairId, coeff: int]
+
+    var depTerms: seq[seq[DepTerm]]  # for each dependent pair, list of (other pair, coeff)
+
+    for di in 0..<dependentPairs.len:
+        let depPid = dependentPairs[di]
+        let si = dependentMetabolite[di]
+        var depSign = 0
+        var terms: seq[DepTerm]
+        for term in stoichPairTerms[si]:
+            if term.pairId == depPid:
+                depSign = term.sign
+            else:
+                terms.add((pairId: term.pairId, coeff: term.sign))
+        # net_flow[d] = (-1/depSign) * sum(coeff[p] * net_flow[p])
+        # Since depSign is +-1, -1/depSign = -depSign
+        var finalTerms: seq[DepTerm]
+        for t in terms:
+            finalTerms.add((pairId: t.pairId, coeff: -depSign * t.coeff))
+        depTerms.add(finalTerms)
+
+    # Step 6: Find reversibility constraints: int_lin_le([1,1], [Zint_in, Zint_out], 1)
+    # These are redundant after net_flow reformulation (only one direction active by construction)
+    # Build Zint → V mapping first via int_le_reif + bool2int chains
+    var vToZBool: Table[string, string]
+    var zToZint: Table[string, string]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name == "int_le_reif" and con.args.len >= 3:
+            if con.args[1].kind == FznIdent and con.args[2].kind == FznIdent:
+                let vName = con.args[1].ident
+                let zName = con.args[2].ident
+                if vName in pairOf:
+                    vToZBool[vName] = zName
+        elif name == "bool2int" and con.args.len >= 2:
+            if con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
+                zToZint[con.args[0].ident] = con.args[1].ident
+
+    # Build Zint name → pair index mapping for fast reversibility lookup
+    var zintToPair: Table[string, PairId]
+    for pid in 0..<nPairs:
+        for v in [pairInVar[pid], pairOutVar[pid]]:
+            if v in vToZBool:
+                let z = vToZBool[v]
+                if z in zToZint:
+                    zintToPair[zToZint[z]] = pid
+
+    var revConstraints: seq[int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le":
+            continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len != 2 or coeffs[0] != 1 or coeffs[1] != 1:
+            continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != 1:
+            continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != 2 or varElems[0].kind != FznIdent or varElems[1].kind != FznIdent:
+            continue
+        let zint1 = varElems[0].ident
+        let zint2 = varElems[1].ident
+        if zint1 in zintToPair and zint2 in zintToPair:
+            if zintToPair[zint1] == zintToPair[zint2]:
+                revConstraints.add(ci)
+
+    # Step 7: Register everything
+    # V_in, V_out are channel variables (get positions, but computed from net_flow)
+    # Z/Zint handling is left to existing detectReifChannels() which chains from V positions
+    # Stoichiometry + reversibility constraints are consumed
+
+    # Store pair info for later use
+    # Reverse dependent pairs: tree peeling gives leaves-first (outer-to-inner),
+    # but expression building needs inner-to-outer (dependencies resolved first).
+    tr.netFlowPairInVar = pairInVar
+    tr.netFlowPairOutVar = pairOutVar
+    tr.netFlowFreePairs = freePairs
+    var revDependentPairs = dependentPairs
+    var revDepTerms = depTerms
+    reverse(revDependentPairs)
+    reverse(revDepTerms)
+    tr.netFlowDependentPairs = revDependentPairs
+    tr.netFlowDepTerms = revDepTerms
+
+    # Mark all stoichiometry constraints as defining (skip during translation)
+    for ci in stoichConstraints:
+        tr.definingConstraints.incl(ci)
+
+    # Mark reversibility constraints as defining (redundant after reform)
+    for ci in revConstraints:
+        tr.definingConstraints.incl(ci)
+
+    # Mark V_in, V_out as channel variables — they get positions but won't be searched
+    # (Existing int_le_reif + bool2int detection will chain Z/Zint from V positions)
+    for pid in 0..<nPairs:
+        tr.channelVarNames.incl(pairInVar[pid])
+        tr.channelVarNames.incl(pairOutVar[pid])
+
+    # Determine the flux domain upper bound (typically 50)
+    tr.netFlowDomainBound = 0
+    for pid in 0..<nPairs:
+        for decl in tr.model.variables:
+            if not decl.isArray and decl.name == pairInVar[pid]:
+                if decl.varType.kind == FznIntRange:
+                    tr.netFlowDomainBound = max(tr.netFlowDomainBound, decl.varType.hi)
+                break
+
+    stderr.writeLine(&"[FZN] Net flow pairs: consumed {stoichConstraints.len} stoichiometry + {revConstraints.len} reversibility constraints")

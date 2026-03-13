@@ -1390,3 +1390,392 @@ solve satisfy;
     if xv > 1:
       for v in 1..<xv:
         check v in nvals
+
+suite "Net Flow Pair Detection":
+
+  test "linear chain — detection and classification":
+    # 11 reaction pairs in a linear chain connected by 10 metabolites.
+    # Tree peeling: 10 dependent pairs, 1 free pair.
+    # Each metabolite constraint: coeff * (V_in_i - V_out_i) + coeff * (V_in_{i+1} - V_out_{i+1}) = 0
+    # Alternating signs: [1,-1,-1,1] means net_flow[i] - net_flow[i+1] = 0
+    var lines: seq[string]
+    # Coefficient array (shared)
+    lines.add("array [1..4] of int: c = [1,-1,-1,1];")
+    # 11 pairs → 22 flux variables, domain 0..10
+    for j in 0..<22:
+      lines.add("var 0..10: v" & $j & ";")
+    # 22 bool vars for Z (int_le_reif output)
+    for j in 0..<22:
+      lines.add("var bool: z" & $j & " :: is_defined_var;")
+    # 22 Zint vars (bool2int output)
+    for j in 0..<22:
+      lines.add("var 0..1: zi" & $j & " :: var_is_introduced :: is_defined_var;")
+    # Objective variable
+    lines.add("var 0..22: obj :: is_defined_var;")
+    # 10 stoichiometry constraints (linear chain)
+    for i in 0..<10:
+      let j = i * 2  # pair i starts at variable 2*i
+      let k = (i + 1) * 2  # pair i+1 starts at variable 2*(i+1)
+      lines.add("constraint int_lin_eq(c,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    # int_le_reif for each flux variable
+    for j in 0..<22:
+      lines.add("constraint int_le_reif(1,v" & $j & ",z" & $j & ") :: defines_var(z" & $j & ");")
+    # bool2int for each Z
+    for j in 0..<22:
+      lines.add("constraint bool2int(z" & $j & ",zi" & $j & ") :: defines_var(zi" & $j & ");")
+    # 11 reversibility constraints
+    for i in 0..<11:
+      let j = i * 2
+      lines.add("constraint int_lin_le([1,1],[zi" & $j & ",zi" & $(j+1) & "],1);")
+    # Objective = sum of Zints
+    var objCoeffs = newSeq[string]()
+    var objVars = newSeq[string]()
+    for j in 0..<22:
+      objCoeffs.add("-1")
+      objVars.add("zi" & $j)
+    lines.add("constraint int_lin_eq([1," & objCoeffs.join(",") & "],[obj," &
+              objVars.join(",") & "],0) :: defines_var(obj);")
+    # bool_clause — at least one Z true
+    var zList: seq[string]
+    for j in 0..<22:
+      zList.add("z" & $j)
+    lines.add("constraint bool_clause([" & zList.join(",") & "],[]);")
+    lines.add("solve minimize obj;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Detection should find 11 pairs
+    check tr.netFlowPairInVar.len == 11
+    check tr.netFlowPairOutVar.len == 11
+    # 1 free, 10 dependent
+    check tr.netFlowFreePairs.len == 1
+    check tr.netFlowDependentPairs.len == 10
+    # All V variables should be channel vars
+    for j in 0..<22:
+      check ("v" & $j) in tr.channelVarNames
+    # Free pair should have a search position
+    let freePid = tr.netFlowFreePairs[0]
+    let freeNfName = "net_flow_" & $freePid
+    check freeNfName in tr.varPositions
+    # Dependent pairs should have defined expressions
+    for depPid in tr.netFlowDependentPairs:
+      let depNfName = "net_flow_" & $depPid
+      check depNfName in tr.definedVarExprs
+
+  test "linear chain — solution satisfies Sv=0":
+    # Same model as above but solve and verify all stoichiometry equalities hold.
+    var lines: seq[string]
+    lines.add("array [1..4] of int: c = [1,-1,-1,1];")
+    for j in 0..<22:
+      lines.add("var 0..10: v" & $j & ";")
+    for j in 0..<22:
+      lines.add("var bool: z" & $j & " :: is_defined_var;")
+    for j in 0..<22:
+      lines.add("var 0..1: zi" & $j & " :: var_is_introduced :: is_defined_var;")
+    lines.add("var 0..22: obj :: is_defined_var;")
+    for i in 0..<10:
+      let j = i * 2
+      let k = (i + 1) * 2
+      lines.add("constraint int_lin_eq(c,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    for j in 0..<22:
+      lines.add("constraint int_le_reif(1,v" & $j & ",z" & $j & ") :: defines_var(z" & $j & ");")
+    for j in 0..<22:
+      lines.add("constraint bool2int(z" & $j & ",zi" & $j & ") :: defines_var(zi" & $j & ");")
+    for i in 0..<11:
+      let j = i * 2
+      lines.add("constraint int_lin_le([1,1],[zi" & $j & ",zi" & $(j+1) & "],1);")
+    var objCoeffs = newSeq[string]()
+    var objVars = newSeq[string]()
+    for j in 0..<22:
+      objCoeffs.add("-1")
+      objVars.add("zi" & $j)
+    lines.add("constraint int_lin_eq([1," & objCoeffs.join(",") & "],[obj," &
+              objVars.join(",") & "],0) :: defines_var(obj);")
+    var zList: seq[string]
+    for j in 0..<22:
+      zList.add("z" & $j)
+    lines.add("constraint bool_clause([" & zList.join(",") & "],[]);")
+    lines.add("solve minimize obj;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let objExpr = tr.objectiveDefExpr
+    minimize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+
+    # Read V values from channel positions
+    var vs = newSeq[int](22)
+    for j in 0..<22:
+      let vName = "v" & $j
+      if vName in tr.varPositions:
+        vs[j] = tr.sys.assignment[tr.varPositions[vName]]
+      elif vName in tr.definedVarExprs:
+        vs[j] = tr.definedVarExprs[vName].evaluate(tr.sys.assignment)
+
+    # Verify all 10 stoichiometry constraints: v[2i] - v[2i+1] - v[2i+2] + v[2i+3] = 0
+    for i in 0..<10:
+      let j = i * 2
+      let lhs = vs[j] - vs[j+1] - vs[j+2] + vs[j+3]
+      check lhs == 0
+
+    # Verify V values are in [0, 10]
+    for j in 0..<22:
+      check vs[j] >= 0
+      check vs[j] <= 10
+
+    # Verify reversibility: for each pair, at most one direction active
+    for i in 0..<11:
+      let vIn = vs[2*i]
+      let vOut = vs[2*i + 1]
+      check not (vIn > 0 and vOut > 0)
+
+    # In a linear chain, all net flows must be equal (net_flow[i] = net_flow[i+1]).
+    # With bool_clause requiring at least one active, all 11 pairs are active.
+    # Each active pair contributes 1 to the objective (V_in or V_out > 0, not both).
+    let objVal = objExpr.evaluate(tr.sys.assignment)
+    check objVal == 11
+
+  test "net flow V_in/V_out channel correctness":
+    # Verify channel computation: V_in = max(0, net_flow), V_out = max(0, -net_flow)
+    # Build a minimal 10-constraint chain and check V values match net_flow.
+    var lines: seq[string]
+    lines.add("array [1..4] of int: c = [1,-1,-1,1];")
+    for j in 0..<22:
+      lines.add("var 0..10: v" & $j & ";")
+    for j in 0..<22:
+      lines.add("var bool: z" & $j & " :: is_defined_var;")
+    for j in 0..<22:
+      lines.add("var 0..1: zi" & $j & " :: var_is_introduced :: is_defined_var;")
+    for i in 0..<10:
+      let j = i * 2
+      let k = (i + 1) * 2
+      lines.add("constraint int_lin_eq(c,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    for j in 0..<22:
+      lines.add("constraint int_le_reif(1,v" & $j & ",z" & $j & ") :: defines_var(z" & $j & ");")
+    for j in 0..<22:
+      lines.add("constraint bool2int(z" & $j & ",zi" & $j & ") :: defines_var(zi" & $j & ");")
+    for i in 0..<11:
+      let j = i * 2
+      lines.add("constraint int_lin_le([1,1],[zi" & $j & ",zi" & $(j+1) & "],1);")
+    var zList: seq[string]
+    for j in 0..<22:
+      zList.add("z" & $j)
+    lines.add("constraint bool_clause([" & zList.join(",") & "],[]);")
+    lines.add("solve satisfy;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # For each pair, check V_in = max(0, net_flow) and V_out = max(0, -net_flow)
+    for pid in 0..<11:
+      let inName = tr.netFlowPairInVar[pid]
+      let outName = tr.netFlowPairOutVar[pid]
+      let vIn = tr.sys.assignment[tr.varPositions[inName]]
+      let vOut = tr.sys.assignment[tr.varPositions[outName]]
+      # net_flow = V_in - V_out
+      let netFlow = vIn - vOut
+      check vIn == max(0, netFlow)
+      check vOut == max(0, -netFlow)
+      # Both non-negative
+      check vIn >= 0
+      check vOut >= 0
+
+  test "branching tree — 3-pair metabolite constraint":
+    # A tree where one metabolite connects 3 pairs (degree 3).
+    # This creates a dependent pair whose net_flow is a sum of 2 other pair net_flows,
+    # testing range constraint generation (range exceeds [-D, D]).
+    #
+    # Tree structure (star graph):
+    #   P0 -- M0 -- P1
+    #          |
+    #         P2 -- M1 -- P3
+    #          |
+    #         M2 -- P4 -- M3 -- P5
+    #          |
+    #         ...continuing for 10+ metabolites
+    #
+    # Simpler: build a tree with some degree-3 metabolites.
+    # Use pairs P0..P11 (12 pairs), metabolites M0..M10 (11 constraints).
+    # M0: [1,-1,1,-1,-1,1] on P0, P1, P2 (3 pairs = 6 vars)
+    # M1..M9: [1,-1,-1,1] on P_{i+1}, P_{i+2} (2 pairs each)
+    var lines: seq[string]
+    lines.add("array [1..6] of int: c3 = [1,-1,1,-1,-1,1];")
+    lines.add("array [1..4] of int: c2 = [1,-1,-1,1];")
+    let D = 5
+    # 12 pairs → 24 flux variables
+    for j in 0..<24:
+      lines.add("var 0.." & $D & ": v" & $j & ";")
+    for j in 0..<24:
+      lines.add("var bool: z" & $j & " :: is_defined_var;")
+    for j in 0..<24:
+      lines.add("var 0..1: zi" & $j & " :: var_is_introduced :: is_defined_var;")
+    # M0: 3-pair constraint on pairs 0, 1, 2
+    lines.add("constraint int_lin_eq(c3,[v0,v1,v2,v3,v4,v5],0);")
+    # M1..M10: 2-pair chain starting from pair 2
+    for i in 1..<11:
+      let pairA = i + 1  # pairs 2, 3, 4, ..., 11
+      let pairB = i + 2  # pairs 3, 4, 5, ..., 12
+      if pairB >= 12: break
+      let j = pairA * 2
+      let k = pairB * 2
+      lines.add("constraint int_lin_eq(c2,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    # Need exactly 10 more constraints for pairs 2..11 → constraints on (2,3),(3,4),...,(10,11)
+    # That's 9 constraints. Plus M0 = 1. Total = 10. OK.
+
+    # int_le_reif + bool2int for each flux variable
+    for j in 0..<24:
+      lines.add("constraint int_le_reif(1,v" & $j & ",z" & $j & ") :: defines_var(z" & $j & ");")
+    for j in 0..<24:
+      lines.add("constraint bool2int(z" & $j & ",zi" & $j & ") :: defines_var(zi" & $j & ");")
+    # Reversibility constraints
+    for i in 0..<12:
+      let j = i * 2
+      lines.add("constraint int_lin_le([1,1],[zi" & $j & ",zi" & $(j+1) & "],1);")
+    var zList: seq[string]
+    for j in 0..<24:
+      zList.add("z" & $j)
+    lines.add("constraint bool_clause([" & zList.join(",") & "],[]);")
+    lines.add("solve satisfy;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Should detect 12 pairs with 10 constraints
+    check tr.netFlowPairInVar.len == 12
+    check tr.netFlowFreePairs.len == 2  # 12 pairs - 10 constraints = 2 free
+    check tr.netFlowDependentPairs.len == 10
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # Verify stoichiometry: read V values and check all constraints hold
+    var vs = newSeq[int](24)
+    for j in 0..<24:
+      let vName = "v" & $j
+      vs[j] = tr.sys.assignment[tr.varPositions[vName]]
+
+    # M0: v0 - v1 + v2 - v3 - v4 + v5 = 0
+    check vs[0] - vs[1] + vs[2] - vs[3] - vs[4] + vs[5] == 0
+    # M1..M9: v[2*pA] - v[2*pA+1] - v[2*pB] + v[2*pB+1] = 0
+    for i in 1..<10:
+      let pA = i + 1
+      let pB = i + 2
+      let j = pA * 2
+      let k = pB * 2
+      check vs[j] - vs[j+1] - vs[k] + vs[k+1] == 0
+
+  test "non-tree graph not detected":
+    # A cycle graph (not a tree) should NOT be detected as net flow pairs.
+    # 10 constraints connecting pairs in a cycle: P0-M0-P1-M1-...-P9-M9-P0
+    var lines: seq[string]
+    lines.add("array [1..4] of int: c = [1,-1,-1,1];")
+    for j in 0..<20:
+      lines.add("var 0..10: v" & $j & ";")
+    # 10 constraints forming a cycle (not a tree: edges = nodes)
+    for i in 0..<10:
+      let pA = i
+      let pB = (i + 1) mod 10
+      let j = pA * 2
+      let k = pB * 2
+      lines.add("constraint int_lin_eq(c,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    lines.add("solve satisfy;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Cycle has 10 edges and 10+10=20 nodes → not a tree (20-1=19 ≠ 10)
+    # Actually bipartite: 10 pair nodes + 10 metabolite nodes = 20 nodes, 20 edges
+    # Tree needs 19 edges, but we have 20. Detection should fail.
+    check tr.netFlowFreePairs.len == 0
+    check tr.netFlowDependentPairs.len == 0
+
+  test "fewer than 10 stoichiometry constraints — not detected":
+    # Only 9 constraints — below the threshold.
+    var lines: seq[string]
+    lines.add("array [1..4] of int: c = [1,-1,-1,1];")
+    for j in 0..<20:
+      lines.add("var 0..10: v" & $j & ";")
+    for i in 0..<9:
+      let j = i * 2
+      let k = (i + 1) * 2
+      lines.add("constraint int_lin_eq(c,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    lines.add("solve satisfy;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.netFlowFreePairs.len == 0
+    check tr.netFlowDependentPairs.len == 0
+
+  test "range constraint for out-of-bound dependent pairs":
+    # Build a tree where a dependent pair's unclamped range exceeds [-D, D].
+    # With D=5 and a 3-pair metabolite, a dependent pair = sum of 2 others
+    # has range [-10, 10], exceeding [-5, 5]. Should generate range constraints.
+    var lines: seq[string]
+    lines.add("array [1..6] of int: c3 = [1,-1,1,-1,-1,1];")
+    lines.add("array [1..4] of int: c2 = [1,-1,-1,1];")
+    let D = 5
+    # 12 pairs, 24 flux vars
+    for j in 0..<24:
+      lines.add("var 0.." & $D & ": v" & $j & ";")
+    for j in 0..<24:
+      lines.add("var bool: z" & $j & " :: is_defined_var;")
+    for j in 0..<24:
+      lines.add("var 0..1: zi" & $j & " :: var_is_introduced :: is_defined_var;")
+    # M0: 3-pair constraint
+    lines.add("constraint int_lin_eq(c3,[v0,v1,v2,v3,v4,v5],0);")
+    # Chain from pair 2: (2,3), (3,4), ..., (10,11)
+    for i in 1..<10:
+      let pA = i + 1
+      let pB = i + 2
+      if pB >= 12: break
+      let j = pA * 2
+      let k = pB * 2
+      lines.add("constraint int_lin_eq(c2,[v" & $j & ",v" & $(j+1) &
+                 ",v" & $k & ",v" & $(k+1) & "],0);")
+    for j in 0..<24:
+      lines.add("constraint int_le_reif(1,v" & $j & ",z" & $j & ") :: defines_var(z" & $j & ");")
+    for j in 0..<24:
+      lines.add("constraint bool2int(z" & $j & ",zi" & $j & ") :: defines_var(zi" & $j & ");")
+    for i in 0..<12:
+      let j = i * 2
+      lines.add("constraint int_lin_le([1,1],[zi" & $j & ",zi" & $(j+1) & "],1);")
+    var zList: seq[string]
+    for j in 0..<24:
+      zList.add("z" & $j)
+    lines.add("constraint bool_clause([" & zList.join(",") & "],[]);")
+    lines.add("solve satisfy;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.netFlowPairInVar.len == 12
+    # The system should have range constraints beyond just the 1 bool_clause.
+    # With 3-pair metabolites, some dependent pairs need range clamping.
+    # Total constraints > 1 (the bool_clause) means range constraints were added.
+    check tr.sys.baseArray.constraints.len > 1
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # All V values must be in [0, D]
+    for j in 0..<24:
+      let vName = "v" & $j
+      let v = tr.sys.assignment[tr.varPositions[vName]]
+      check v >= 0
+      check v <= D
