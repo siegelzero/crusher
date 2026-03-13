@@ -975,6 +975,120 @@ solve satisfy;
     check yVal >= 3
     check zVal >= 7
 
+  test "AND-vs-AND disjunctive clause (Pattern C)":
+    # bool_clause([d1, d2], []) where d1 = array_bool_and([a,b]), d2 = array_bool_and([c,d])
+    # a: -x <= -5 → x >= 5
+    # b: -y <= -3 → y >= 3
+    # c: -w <= -2 → w >= 2
+    # d: -z <= -7 → z >= 7
+    # d1 = a AND b → (x>=5 AND y>=3)
+    # d2 = c AND d → (w>=2 AND z>=7)
+    # clause: (x>=5 AND y>=3) OR (w>=2 AND z>=7)
+    # With x<=4 and y<=2 forcing first branch false, need w>=2 AND z>=7
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var 0..10: w;
+var 0..10: z;
+var bool: a;
+var bool: b;
+var bool: c;
+var bool: d;
+var bool: d1;
+var bool: d2;
+constraint int_lin_le_reif([-1],[x],-5,a):: defines_var(a);
+constraint int_lin_le_reif([-1],[y],-3,b):: defines_var(b);
+constraint int_lin_le_reif([-1],[w],-2,c):: defines_var(c);
+constraint int_lin_le_reif([-1],[z],-7,d):: defines_var(d);
+constraint array_bool_and([a,b],d1):: defines_var(d1);
+constraint array_bool_and([c,d],d2):: defines_var(d2);
+constraint bool_clause([d1,d2],[]);
+constraint int_lin_le([1],[x],4);
+constraint int_lin_le([1],[y],2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "a" in tr.definedVarNames
+    check "b" in tr.definedVarNames
+    check "c" in tr.definedVarNames
+    check "d" in tr.definedVarNames
+    check "d1" in tr.definedVarNames
+    check "d2" in tr.definedVarNames
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 2
+    # First disjunct: 2 terms (x >= 5 AND y >= 3)
+    check tr.disjunctiveClauses[0].disjuncts[0].len == 2
+    # Second disjunct: 2 terms (w >= 2 AND z >= 7)
+    check tr.disjunctiveClauses[0].disjuncts[1].len == 2
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let wVal = tr.sys.assignment[tr.varPositions["w"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal <= 4
+    check yVal <= 2
+    check wVal >= 2
+    check zVal >= 7
+
+  test "fixed-value bool variable gets singleton domain":
+    # var bool: X = true creates a position with domain {1}, not {0,1}
+    # var bool: Y = false creates a position with domain {0}, not {0,1}
+    let src = """
+var 0..10: x :: output_var;
+var bool: btrue = true;
+var bool: bfalse = false;
+var 0..10: y :: output_var;
+constraint int_lin_le_reif([1],[x],5,btrue);
+constraint int_lin_le_reif([1],[y],3,bfalse);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Fixed-value bools should be marked as channels
+    check "btrue" in tr.channelVarNames
+    check "bfalse" in tr.channelVarNames
+
+    # Their domains should be singletons
+    let btPos = tr.varPositions["btrue"]
+    let bfPos = tr.varPositions["bfalse"]
+    check tr.sys.baseArray.domain[btPos] == @[1]
+    check tr.sys.baseArray.domain[bfPos] == @[0]
+
+    # They should be channel positions (not searched)
+    check btPos in tr.sys.baseArray.channelPositions
+    check bfPos in tr.sys.baseArray.channelPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    # btrue = true means x <= 5 must hold
+    check tr.sys.assignment[tr.varPositions["x"]] <= 5
+    # bfalse = false means y <= 3 is NOT enforced (reif is false)
+    # y can be anything 0..10
+
+  test "fixed-value int variable gets singleton domain":
+    # var 1..10: X = 5 creates a position with domain {5}
+    let src = """
+var 1..10: x :: output_var;
+var 1..10: fixed_val = 5;
+constraint int_eq(x, fixed_val);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "fixed_val" in tr.channelVarNames
+    let fvPos = tr.varPositions["fixed_val"]
+    check tr.sys.baseArray.domain[fvPos] == @[5]
+    check fvPos in tr.sys.baseArray.channelPositions
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    check tr.sys.assignment[tr.varPositions["x"]] == 5
+
 suite "FlatZinc Small-Domain Product Decomposition":
 
   test "small-domain product decomposition — structural checks":

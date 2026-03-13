@@ -141,19 +141,26 @@ proc translateVariables(tr: var FznTranslator) =
         let v = tr.sys.newConstrainedVariable()
         tr.varPositions[decl.name] = pos
 
-        # Set domain based on type
-        case decl.varType.kind
-        of FznIntRange:
-            v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
-        of FznIntSet:
-            v.setDomain(decl.varType.values)
-        of FznBool:
-            v.setDomain(@[0, 1])
-        of FznInt:
-            # Unbounded int - use a reasonable range
-            v.setDomain(toSeq(-1000..1000))
+        # Set domain based on type, considering fixed values
+        if decl.value != nil and decl.value.kind == FznBoolLit:
+            v.setDomain(@[if decl.value.boolVal: 1 else: 0])
+            tr.channelVarNames.incl(decl.name)
+        elif decl.value != nil and decl.value.kind == FznIntLit:
+            v.setDomain(@[decl.value.intVal])
+            tr.channelVarNames.incl(decl.name)
         else:
-            v.setDomain(toSeq(-100..100))
+            case decl.varType.kind
+            of FznIntRange:
+                v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
+            of FznIntSet:
+                v.setDomain(decl.varType.values)
+            of FznBool:
+                v.setDomain(@[0, 1])
+            of FznInt:
+                # Unbounded int - use a reasonable range
+                v.setDomain(toSeq(-1000..1000))
+            else:
+                v.setDomain(toSeq(-100..100))
 
         # Check for output annotations
         if decl.hasAnnotation("output_var"):

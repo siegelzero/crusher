@@ -1083,6 +1083,96 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     if totalRemoved > 0:
         stderr.writeLine(&"[Solve] Single-var constraint reduction: {totalRemoved} values removed")
 
+    # Phase 1b: Element constraint backward propagation (constant arrays)
+    # For element(idx, const_array, result): restrict idx based on result domain
+    # and restrict result based on idx domain. Runs in a local fixed-point loop.
+    # Handles both PositionBased and ExpressionBased (single-position index/value) elements.
+    block elementProp:
+        var elementTotalRemoved = 0
+        var elementChanged = true
+        var elementIter = 0
+        while elementChanged and elementIter < 10:
+            elementChanged = false
+            inc elementIter
+            for cons in carray.constraints:
+                if cons.stateType != ElementType: continue
+                let es = cons.elementState
+
+                if es.evalMethod == PositionBased and es.isConstantArray:
+                    let idxPos = es.indexPosition
+                    let resPos = es.valuePosition
+                    if idxPos in skippedPositions or resPos in skippedPositions: continue
+
+                    # Forward: restrict result to values reachable from current idx domain
+                    var reachableResults = initPackedSet[T]()
+                    for idx in currentDomain[idxPos].items:
+                        if idx >= 0 and idx < es.constantArray.len:
+                            reachableResults.incl(es.constantArray[idx])
+                    let newResDom = currentDomain[resPos] * reachableResults
+                    if newResDom.len < currentDomain[resPos].len:
+                        elementTotalRemoved += currentDomain[resPos].len - newResDom.len
+                        currentDomain[resPos] = newResDom
+                        elementChanged = true
+
+                    # Backward: restrict idx to values that map to valid result values
+                    var validIndices = initPackedSet[T]()
+                    for idx in currentDomain[idxPos].items:
+                        if idx >= 0 and idx < es.constantArray.len:
+                            if es.constantArray[idx] in currentDomain[resPos]:
+                                validIndices.incl(idx)
+                    if validIndices.len < currentDomain[idxPos].len:
+                        elementTotalRemoved += currentDomain[idxPos].len - validIndices.len
+                        currentDomain[idxPos] = validIndices
+                        elementChanged = true
+
+                elif es.evalMethod == ExpressionBased and es.isConstantArrayEB:
+                    # Expression-based with constant array: common FlatZinc pattern (idx-1 offset)
+                    # Only handle single-position index and value expressions to keep it tractable
+                    let idxPositions = toSeq(es.indexExpression.positions.items)
+                    let valPositions = toSeq(es.valueExpression.positions.items)
+                    if idxPositions.len != 1 or valPositions.len != 1: continue
+                    let idxPos = idxPositions[0]
+                    let resPos = valPositions[0]
+                    if idxPos in skippedPositions or resPos in skippedPositions: continue
+
+                    let arrLen = es.constantArrayEB.len
+                    var tempAssign = initTable[int, T]()
+
+                    # Forward: restrict result to values reachable from current idx domain
+                    var reachableResults = initPackedSet[T]()
+                    for v in currentDomain[idxPos].items:
+                        tempAssign[idxPos] = v
+                        let idx = es.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < arrLen:
+                            reachableResults.incl(es.constantArrayEB[idx])
+                    let newResDom = currentDomain[resPos] * reachableResults
+                    if newResDom.len < currentDomain[resPos].len:
+                        elementTotalRemoved += currentDomain[resPos].len - newResDom.len
+                        currentDomain[resPos] = newResDom
+                        elementChanged = true
+
+                    # Backward: restrict idx position to values that map to valid results
+                    for v in toSeq(currentDomain[idxPos].items):
+                        tempAssign[idxPos] = v
+                        let idx = es.indexExpression.evaluate(tempAssign)
+                        if idx < 0 or idx >= arrLen:
+                            currentDomain[idxPos].excl(v)
+                            elementTotalRemoved += 1
+                            elementChanged = true
+                        else:
+                            # Check if the result value is compatible with current result domain
+                            let arrVal = es.constantArrayEB[idx]
+                            # For value expression like "pos + offset", check what value at resPos
+                            # would make valueExpr == arrVal. For simple RefNode, arrVal must be in domain.
+                            # General approach: check if arrVal is achievable by resPos domain.
+                            if arrVal notin currentDomain[resPos]:
+                                currentDomain[idxPos].excl(v)
+                                elementTotalRemoved += 1
+                                elementChanged = true
+
+        if elementTotalRemoved > 0:
+            stderr.writeLine(&"[DomRed] Element backward propagation: {elementTotalRemoved} values removed in {elementIter} iterations")
+
     # Cumulative constraint domain reduction
     for cons in carray.constraints:
         if cons.stateType != CumulativeType:

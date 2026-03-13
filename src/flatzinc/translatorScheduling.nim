@@ -37,6 +37,7 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     ## Also detects generalized disjunctive clauses:
     ##   Pattern A: bool_clause([b1, b2, b3], []) — 3 literals from int_lin_le_reif
     ##   Pattern B: bool_clause([a, d], []) where d = array_bool_and([b, c]) and a,b,c from int_lin_le_reif
+    ##   Pattern C: bool_clause([d1, d2, ...], []) where all di = array_bool_and(inputs from int_lin_le_reif)
 
     # Step 1: Build mapping from result var name → constraint index for
     # all int_lin_le_reif with defines_var annotation
@@ -312,10 +313,68 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             disjuncts: @[@[termA], conjTerms]))
         nPatternB += 1
 
+    # Step 5: Scan bool_clause for Pattern C: bool_clause([d1, d2, ...], [])
+    # where ALL positive literals are from array_bool_and, each with inputs from int_lin_le_reif.
+    # This handles double-track FIFO patterns: each disjunct is a conjunction of linear inequalities.
+    var nPatternC = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 0: continue
+        if posArg.elems.len < 2: continue
+
+        # Check ALL positive literals are array_bool_and with int_lin_le_reif inputs
+        var allAndReif = true
+        var disjuncts: seq[seq[DisjunctiveClauseTerm]]
+        var allBoolVars: seq[string]  # Track all bool vars to consume
+        for elem in posArg.elems:
+            if elem.kind != FznIdent:
+                allAndReif = false; break
+            let ident = elem.ident
+            if ident notin arrayBoolAndDefines:
+                allAndReif = false; break
+            if varRefCount.getOrDefault(ident) != 1:
+                allAndReif = false; break
+            let andInfo = arrayBoolAndDefines[ident]
+            var terms: seq[DisjunctiveClauseTerm]
+            var inputsOk = true
+            for inp in andInfo.inputs:
+                if inp notin linLeReifDefines or varRefCount.getOrDefault(inp) != 1:
+                    inputsOk = false; break
+                let (ok, term) = tr.extractLinLeReifTerm(linLeReifDefines[inp])
+                if not ok:
+                    inputsOk = false; break
+                terms.add(term)
+            if not inputsOk:
+                allAndReif = false; break
+            disjuncts.add(terms)
+            allBoolVars.add(ident)
+            for inp in andInfo.inputs:
+                allBoolVars.add(inp)
+        if not allAndReif or disjuncts.len < 2: continue
+
+        # Consume bool_clause + all array_bool_and + all int_lin_le_reif constraints and bool vars
+        tr.definingConstraints.incl(ci)
+        for elem in posArg.elems:
+            let andInfo = arrayBoolAndDefines[elem.ident]
+            tr.definingConstraints.incl(andInfo.ci)
+            tr.definedVarNames.incl(elem.ident)
+            for inp in andInfo.inputs:
+                tr.definingConstraints.incl(linLeReifDefines[inp])
+                tr.definedVarNames.incl(inp)
+
+        tr.disjunctiveClauses.add(DisjunctiveClause(disjuncts: disjuncts))
+        nPatternC += 1
+
     if tr.disjunctiveClauses.len > 0:
-        let nPatternA = tr.disjunctiveClauses.len - nPatternB
+        let nPatternA = tr.disjunctiveClauses.len - nPatternB - nPatternC
         stderr.writeLine(&"[FZN] Detected {tr.disjunctiveClauses.len} generalized disjunctive clauses " &
-                                          &"({nPatternA} 3-way, {nPatternB} AND-of-reif)")
+                                          &"({nPatternA} 3-way, {nPatternB} AND-of-reif, {nPatternC} AND-vs-AND)")
 
 
 proc referencesIdent(expr: FznExpr, name: string): bool =
