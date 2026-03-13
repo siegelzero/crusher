@@ -2169,6 +2169,31 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             matrixGroups[key].add(MatrixGroupEntry(
                 indexPos: ms.rowPosition, valPos: ms.valuePosition, matState: ms))
 
+    # Precompute reverse map: position -> element constraints where it's a variable array element
+    # Used for backward propagation (Phase 6b-elem)
+    var elemArrayParticipation: Table[int, seq[int]]  # pos -> constraint indices
+    for ci, cons in carray.constraints:
+        if cons.stateType == ElementType:
+            let es = cons.elementState
+            if es.evalMethod == PositionBased and not es.isConstantArray:
+                for elem in es.arrayElements:
+                    if not elem.isConstant:
+                        elemArrayParticipation.mgetOrPut(elem.variablePosition, @[]).add(ci)
+
+    # Precompute reverse map: position -> channel binding indices where it's a variable array element
+    # Used for backward propagation (Phase CB-var)
+    var channelArrayParticipation: Table[int, seq[int]]  # pos -> binding indices
+    for bi, binding in carray.channelBindings:
+        var hasVariable = false
+        for elem in binding.arrayElements:
+            if not elem.isConstant:
+                hasVariable = true
+                break
+        if hasVariable:
+            for elem in binding.arrayElements:
+                if not elem.isConstant:
+                    channelArrayParticipation.mgetOrPut(elem.variablePosition, @[]).add(bi)
+
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
     var domainMin = newSeq[T](carray.len)
     var domainMax = newSeq[T](carray.len)
@@ -3264,6 +3289,36 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[valPos].excl(v)
                             outerChanged = true
 
+        # Phase 6b-elem: Variable-array element backward propagation
+        # For each position that appears as a variable array element in element constraints,
+        # restrict its domain to the union of value-position domains from those constraints.
+        var elemBackPruned = 0
+        for pos, constraintIndices in elemArrayParticipation.pairs:
+            if currentDomain[pos].len <= 1: continue
+            var allowedValues = initPackedSet[T]()
+            for ci in constraintIndices:
+                let cons = carray.constraints[ci]
+                let es = cons.elementState
+                let valPos = es.valuePosition
+                let idxPos = es.indexPosition
+                let arrSize = es.getArraySize()
+                # Only include values from this constraint if pos is reachable
+                # (i.e., some index in domain(idxPos) maps to this element position)
+                for i in currentDomain[idxPos].items:
+                    if i >= 0 and i < arrSize:
+                        let elem = es.arrayElements[i]
+                        if not elem.isConstant and elem.variablePosition == pos:
+                            allowedValues = allowedValues + currentDomain[valPos]
+                            break  # This constraint can reach pos, included
+            if allowedValues.len > 0:
+                for v in toSeq(currentDomain[pos].items):
+                    if v notin allowedValues:
+                        currentDomain[pos].excl(v)
+                        outerChanged = true
+                        elemBackPruned += 1
+        if elemBackPruned > 0:
+            stderr.writeLine(&"[DomRed] Element backward propagation: {elemBackPruned} values removed in {outerIter+1} iterations")
+
         # Phase 6b: Cross-constraint backward propagation to matrix cells
         # For each group of matrixElement constraints sharing the same matrix row/col,
         # restrict each matrix cell to the union of value domains that could reach it.
@@ -3621,6 +3676,47 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         if cbPruned > 0:
             stderr.writeLine(&"[DomRed] Channel AC: {cbPruned} values pruned ({cbProcessed} bindings)")
+
+        # Phase CB-var: Variable-array channel binding backward propagation
+        # For each position that appears as a variable array element in channel bindings,
+        # restrict its domain to the union of channel-position domains from reachable bindings.
+        var cbVarPruned = 0
+        for pos, bindingIndices in channelArrayParticipation.pairs:
+            if currentDomain[pos].len <= 1: continue
+            if pos in skippedPositions: continue
+            var allowedValues = initPackedSet[T]()
+            for bi in bindingIndices:
+                let binding = carray.channelBindings[bi]
+                let chPos = binding.channelPosition
+                let arrElems = binding.arrayElements
+                let arrLen = arrElems.len
+                let idxPositions = toSeq(binding.indexExpression.positions.items)
+                # Check if this position is reachable from the index domain
+                if idxPositions.len == 1:
+                    let keyPos = idxPositions[0]
+                    var tempAssign = initTable[int, T]()
+                    for v in currentDomain[keyPos].items:
+                        tempAssign[keyPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < arrLen:
+                            let elem = arrElems[idx]
+                            if not elem.isConstant and elem.variablePosition == pos:
+                                # This index reaches our position — include channel domain
+                                if chPos in skippedPositions:
+                                    # Use bounds for skipped channel
+                                    for bv in domainMin[chPos]..domainMax[chPos]:
+                                        allowedValues.incl(bv)
+                                else:
+                                    allowedValues = allowedValues + currentDomain[chPos]
+                                break  # Found a reachable index, this binding contributes
+            if allowedValues.len > 0:
+                for v in toSeq(currentDomain[pos].items):
+                    if v notin allowedValues:
+                        currentDomain[pos].excl(v)
+                        outerChanged = true
+                        cbVarPruned += 1
+        if cbVarPruned > 0:
+            stderr.writeLine(&"[DomRed] Channel var-array backward: {cbVarPruned} values removed in {outerIter+1} iterations")
 
         # Phase 7: Table constraint arc consistency
         # For each TableIn constraint, remove domain values that have no support
