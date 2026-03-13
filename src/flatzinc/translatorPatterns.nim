@@ -1,5 +1,41 @@
 ## Included from translator.nim -- not a standalone module.
 
+proc extractVarElems(tr: FznTranslator, vars: FznExpr): seq[FznExpr] =
+    ## Extracts variable elements from an inline array literal or named array reference.
+    if vars.kind == FznArrayLit:
+        return vars.elems
+    elif vars.kind == FznIdent:
+        for decl in tr.model.variables:
+            if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+                return decl.value.elems
+
+proc traceIndicator(tr: FznTranslator, varElem: FznExpr,
+                    bool2intDefs, intEqReifDefs: Table[string, int]):
+    tuple[valid: bool, countValue: int, arrayVarName: string,
+          b2iIdx, eqReifIdx: int, indName, boolVarName: string] =
+    ## Traces an indicator variable through bool2int → int_eq_reif chain.
+    ## Returns (valid=true, ...) if the chain is complete.
+    result.valid = false
+    if varElem.kind != FznIdent:
+        return
+    result.indName = varElem.ident
+    if result.indName notin bool2intDefs:
+        return
+    result.b2iIdx = bool2intDefs[result.indName]
+    let b2iCon = tr.model.constraints[result.b2iIdx]
+    if b2iCon.args[0].kind != FznIdent:
+        return
+    result.boolVarName = b2iCon.args[0].ident
+    if result.boolVarName notin intEqReifDefs:
+        return
+    result.eqReifIdx = intEqReifDefs[result.boolVarName]
+    let eqReifCon = tr.model.constraints[result.eqReifIdx]
+    if eqReifCon.args[0].kind != FznIdent:
+        return
+    result.countValue = try: tr.resolveIntArg(eqReifCon.args[1]) except ValueError, KeyError: return
+    result.arrayVarName = eqReifCon.args[0].ident
+    result.valid = true
+
 proc detectConditionalCountPatterns(tr: var FznTranslator) =
     ## Detects int_lin_eq → bool2int → array_bool_and → (int_eq_reif × 2) chains.
     ## Pattern: conditional count where each indicator checks TWO conditions:
@@ -45,21 +81,7 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
         inc nCandidates
 
         # Extract variable names
-        let vars = con.args[1]
-        var varElems: seq[FznExpr]
-        if vars.kind == FznArrayLit:
-            varElems = vars.elems
-        elif vars.kind == FznIdent:
-            var found = false
-            for decl in tr.model.variables:
-                if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
-                    varElems = decl.value.elems
-                    found = true
-                    break
-            if not found: continue
-        else:
-            continue
-
+        let varElems = tr.extractVarElems(con.args[1])
         if varElems.len != coeffs.len: continue
 
         # Find the defines_var target position in the vars array
@@ -321,9 +343,12 @@ proc detectCountPatterns(tr: var FznTranslator) =
             if con.args.len >= 3 and con.args[2].kind == FznIdent:
                 intEqReifDefs[con.args[2].ident] = ci
 
-    # Now scan for int_lin_eq constraints that match the pattern
+    # Now scan for int_lin_eq constraints that match the pattern.
+    # Note: we do NOT skip definingConstraints here — collectDefinedVars may have claimed
+    # int_lin_eq constraints with defines_var that are actually countEq patterns.
+    # countEq is a better translation; if detected, we unclaim from definingConstraints.
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints:
+        if ci in tr.countEqPatterns:
             continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq":
@@ -340,39 +365,35 @@ proc detectCountPatterns(tr: var FznTranslator) =
         if coeffs.len < 2:
             continue
 
-        # Check coefficient pattern: first is 1, rest are -1
-        if coeffs[0] != 1:
-            continue
-        var allNegOne = true
-        for i in 1..<coeffs.len:
-            if coeffs[i] != -1:
-                allNegOne = false
-                break
-        if not allNegOne:
+        # Check coefficient pattern:
+        # Branch A: [1, -1, -1, ..., -1] — target first
+        # Branch B: [1, 1, ..., 1, -1] — target last
+        var targetIdx = -1
+        var indStart, indEnd: int
+
+        if coeffs[0] == 1:
+            var allNeg = true
+            for i in 1..<coeffs.len:
+                if coeffs[i] != -1: allNeg = false; break
+            if allNeg:
+                targetIdx = 0; indStart = 1; indEnd = coeffs.len - 1
+
+        if targetIdx < 0 and coeffs[^1] == -1:
+            var allPos = true
+            for i in 0..<coeffs.len - 1:
+                if coeffs[i] != 1: allPos = false; break
+            if allPos:
+                targetIdx = coeffs.len - 1; indStart = 0; indEnd = coeffs.len - 2
+
+        if targetIdx < 0:
             continue
 
         # Extract variable names - handle both inline arrays and named array references
-        let vars = con.args[1]
-        var varElems: seq[FznExpr]
-        if vars.kind == FznArrayLit:
-            varElems = vars.elems
-        elif vars.kind == FznIdent:
-            # Named array reference - find the array declaration
-            var found = false
-            for decl in tr.model.variables:
-                if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
-                    varElems = decl.value.elems
-                    found = true
-                    break
-            if not found:
-                continue
-        else:
+        let varElems = tr.extractVarElems(con.args[1])
+        if varElems.len != coeffs.len:
             continue
 
-        if varElems.len < 2:
-            continue
-
-        let targetArg = varElems[0]
+        let targetArg = varElems[targetIdx]
         if targetArg.kind != FznIdent:
             continue
         let targetName = targetArg.ident
@@ -385,50 +406,21 @@ proc detectCountPatterns(tr: var FznTranslator) =
         var consumedVarNames: seq[string]
         var valid = true
 
-        for i in 1..<varElems.len:
-            let indArg = varElems[i]
-            if indArg.kind != FznIdent:
-                valid = false
-                break
-
-            let indName = indArg.ident
-            if indName notin bool2intDefs:
-                valid = false
-                break
-
-            let b2iIdx = bool2intDefs[indName]
-            let b2iCon = tr.model.constraints[b2iIdx]
-            # bool2int(boolVar, intVar) — extract boolVar
-            if b2iCon.args[0].kind != FznIdent:
-                valid = false
-                break
-            let boolVarName = b2iCon.args[0].ident
-
-            if boolVarName notin intEqReifDefs:
-                valid = false
-                break
-
-            let eqReifIdx = intEqReifDefs[boolVarName]
-            let eqReifCon = tr.model.constraints[eqReifIdx]
-            # int_eq_reif(x, val, boolVar) — extract x and val
-            if eqReifCon.args[0].kind != FznIdent:
-                valid = false
-                break
-            let v = try: tr.resolveIntArg(eqReifCon.args[1]) except ValueError, KeyError: (valid = false; 0)
-            if not valid:
-                break
+        for i in indStart..indEnd:
+            let traced = tr.traceIndicator(varElems[i], bool2intDefs, intEqReifDefs)
+            if not traced.valid:
+                valid = false; break
             if not countValueSet:
-                countValue = v
+                countValue = traced.countValue
                 countValueSet = true
-            elif v != countValue:
-                valid = false
-                break
+            elif traced.countValue != countValue:
+                valid = false; break
 
-            arrayVarNames.add(eqReifCon.args[0].ident)
-            consumedConstraints.add(b2iIdx)
-            consumedConstraints.add(eqReifIdx)
-            consumedVarNames.add(indName)
-            consumedVarNames.add(boolVarName)
+            arrayVarNames.add(traced.arrayVarName)
+            consumedConstraints.add(traced.b2iIdx)
+            consumedConstraints.add(traced.eqReifIdx)
+            consumedVarNames.add(traced.indName)
+            consumedVarNames.add(traced.boolVarName)
 
         if not valid or not countValueSet:
             continue
@@ -441,6 +433,12 @@ proc detectCountPatterns(tr: var FznTranslator) =
             arrayVarNames: arrayVarNames
         )
 
+        # If this int_lin_eq was claimed by collectDefinedVars, unclaim it —
+        # countEq is a better translation than a defined-var expression
+        if ci in tr.definingConstraints:
+            tr.definingConstraints.excl(ci)
+            tr.definedVarNames.excl(targetName)
+
         # Mark consumed constraints (skip during translation)
         # Note: the int_lin_eq itself (ci) is NOT added to definingConstraints —
         # it's handled by the countEqPatterns check in the main loop
@@ -452,6 +450,113 @@ proc detectCountPatterns(tr: var FznTranslator) =
             tr.definedVarNames.incl(vn)
 
         stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
+
+    # Second pass: balanced count patterns (count(A) = count(B))
+    # Pattern: int_lin_eq([1,...,1,-1,...,-1], [indA_1,...,indA_m, indB_1,...,indB_n], 0)
+    # where +1 indicators trace to int_eq_reif(x, valueA, b) and -1 to int_eq_reif(x, valueB, b)
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints or ci in tr.countEqPatterns:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq":
+            continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != 0:
+            continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len < 4:  # Need at least 2+2
+            continue
+
+        # Check coeffs are a mix of +1 and -1 (not a single-target pattern)
+        var posCount, negCount = 0
+        var mixValid = true
+        for c in coeffs:
+            if c == 1: inc posCount
+            elif c == -1: inc negCount
+            else: mixValid = false; break
+        if not mixValid or posCount < 2 or negCount < 2:
+            continue
+
+        # Extract variable elements
+        let varElems = tr.extractVarElems(con.args[1])
+        if varElems.len != coeffs.len:
+            continue
+
+        # Trace +1 group and -1 group separately
+        var valueA, valueB: int
+        var valueASet, valueBSet = false
+        var arrayVarNamesA, arrayVarNamesB: seq[string]
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+        var valid = true
+
+        for i in 0..<coeffs.len:
+            let traced = tr.traceIndicator(varElems[i], bool2intDefs, intEqReifDefs)
+            if not traced.valid:
+                valid = false; break
+
+            if coeffs[i] == 1:
+                if not valueASet:
+                    valueA = traced.countValue
+                    valueASet = true
+                elif traced.countValue != valueA:
+                    valid = false; break
+                arrayVarNamesA.add(traced.arrayVarName)
+            else:  # coeffs[i] == -1
+                if not valueBSet:
+                    valueB = traced.countValue
+                    valueBSet = true
+                elif traced.countValue != valueB:
+                    valid = false; break
+                arrayVarNamesB.add(traced.arrayVarName)
+
+            consumedConstraints.add(traced.b2iIdx)
+            consumedConstraints.add(traced.eqReifIdx)
+            consumedVarNames.add(traced.indName)
+            consumedVarNames.add(traced.boolVarName)
+
+        if not valid or not valueASet or not valueBSet:
+            continue
+        if valueA == valueB:
+            continue
+
+        # Find an existing countEqPattern for one of the values to get the target
+        var targetName = ""
+        var coveredValue, uncoveredValue: int
+        var uncoveredArrayVarNames: seq[string]
+
+        for _, pat in tr.countEqPatterns:
+            if pat.countValue == valueA and pat.arrayVarNames.len == arrayVarNamesA.len:
+                targetName = pat.targetVarName
+                coveredValue = valueA
+                uncoveredValue = valueB
+                uncoveredArrayVarNames = arrayVarNamesB
+                break
+            elif pat.countValue == valueB and pat.arrayVarNames.len == arrayVarNamesB.len:
+                targetName = pat.targetVarName
+                coveredValue = valueB
+                uncoveredValue = valueA
+                uncoveredArrayVarNames = arrayVarNamesA
+                break
+
+        if targetName == "":
+            continue
+
+        # Emit countEq for the uncovered value
+        tr.countEqPatterns[ci] = CountEqPattern(
+            linEqIdx: ci,
+            countValue: uncoveredValue,
+            targetVarName: targetName,
+            arrayVarNames: uncoveredArrayVarNames
+        )
+
+        # Mark consumed constraints (idempotent for already-consumed ones)
+        for idx in consumedConstraints:
+            tr.definingConstraints.incl(idx)
+        for vn in consumedVarNames:
+            tr.definedVarNames.incl(vn)
+
+        stderr.writeLine(&"[FZN] Detected balanced count pattern: count({uncoveredArrayVarNames.len} vars, {uncoveredValue}) == {targetName} (balanced with value {coveredValue})")
 
 proc detectWeightedSameValuePattern(tr: var FznTranslator) =
     ## Detects weighted same-value objective pattern:

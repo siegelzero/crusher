@@ -126,6 +126,132 @@ solve satisfy;
         vals.sort()
         check vals == @[1, 2, 3]
 
+    test "detectCountPatterns: inverted coefficients [1,1,...,1,-1] — target last":
+        ## MiniZinc 2.9.5 generates int_lin_eq([1,1,1,1,-1], [ind1,...,ind4, target], 0)
+        ## instead of the original [1,-1,-1,-1,-1] pattern. Both mean target = sum(indicators).
+        let src = """
+var 1..3: x1 :: output_var;
+var 1..3: x2 :: output_var;
+var 1..3: x3 :: output_var;
+var 1..3: x4 :: output_var;
+var 0..4: target :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: b3 :: var_is_introduced :: is_defined_var;
+var bool: b4 :: var_is_introduced :: is_defined_var;
+var 0..1: ind1 :: var_is_introduced :: is_defined_var;
+var 0..1: ind2 :: var_is_introduced :: is_defined_var;
+var 0..1: ind3 :: var_is_introduced :: is_defined_var;
+var 0..1: ind4 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(x1, 2, b1) :: defines_var(b1);
+constraint int_eq_reif(x2, 2, b2) :: defines_var(b2);
+constraint int_eq_reif(x3, 2, b3) :: defines_var(b3);
+constraint int_eq_reif(x4, 2, b4) :: defines_var(b4);
+constraint bool2int(b1, ind1) :: defines_var(ind1);
+constraint bool2int(b2, ind2) :: defines_var(ind2);
+constraint bool2int(b3, ind3) :: defines_var(ind3);
+constraint bool2int(b4, ind4) :: defines_var(ind4);
+constraint int_lin_eq([1,1,1,1,-1],[ind1,ind2,ind3,ind4,target],0);
+constraint int_eq(target, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Verify count_eq pattern was detected with inverted coefficients
+        check tr.countEqPatterns.len == 1
+        for _, pat in tr.countEqPatterns:
+            check pat.countValue == 2
+            check pat.targetVarName == "target"
+            check pat.arrayVarNames.len == 4
+
+        # Verify it solves correctly
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let targetVal = tr.sys.assignment[tr.varPositions["target"]]
+        check targetVal == 2
+
+        var count = 0
+        for name in ["x1", "x2", "x3", "x4"]:
+            if tr.sys.assignment[tr.varPositions[name]] == 2:
+                inc count
+        check count == 2
+
+    test "detectCountPatterns: balanced count pattern count(A) = count(B)":
+        ## Two patterns:
+        ##   int_lin_eq([1,1,1,1,-1], [ind_b1,...,ind_b4, target], 0) → count(x, 2) == target
+        ##   int_lin_eq([1,1,1,1,-1,-1,-1,-1], [ind_b1,..., ind_w1,...], 0) → count(x, 2) == count(x, 3)
+        ## The second should detect count(x, 3) == target via balanced pattern.
+        let src = """
+var 1..4: x1 :: output_var;
+var 1..4: x2 :: output_var;
+var 1..4: x3 :: output_var;
+var 1..4: x4 :: output_var;
+var 0..4: target :: output_var;
+var bool: bb1 :: var_is_introduced :: is_defined_var;
+var bool: bb2 :: var_is_introduced :: is_defined_var;
+var bool: bb3 :: var_is_introduced :: is_defined_var;
+var bool: bb4 :: var_is_introduced :: is_defined_var;
+var 0..1: ib1 :: var_is_introduced :: is_defined_var;
+var 0..1: ib2 :: var_is_introduced :: is_defined_var;
+var 0..1: ib3 :: var_is_introduced :: is_defined_var;
+var 0..1: ib4 :: var_is_introduced :: is_defined_var;
+var bool: bw1 :: var_is_introduced :: is_defined_var;
+var bool: bw2 :: var_is_introduced :: is_defined_var;
+var bool: bw3 :: var_is_introduced :: is_defined_var;
+var bool: bw4 :: var_is_introduced :: is_defined_var;
+var 0..1: iw1 :: var_is_introduced :: is_defined_var;
+var 0..1: iw2 :: var_is_introduced :: is_defined_var;
+var 0..1: iw3 :: var_is_introduced :: is_defined_var;
+var 0..1: iw4 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(x1, 2, bb1) :: defines_var(bb1);
+constraint int_eq_reif(x2, 2, bb2) :: defines_var(bb2);
+constraint int_eq_reif(x3, 2, bb3) :: defines_var(bb3);
+constraint int_eq_reif(x4, 2, bb4) :: defines_var(bb4);
+constraint bool2int(bb1, ib1) :: defines_var(ib1);
+constraint bool2int(bb2, ib2) :: defines_var(ib2);
+constraint bool2int(bb3, ib3) :: defines_var(ib3);
+constraint bool2int(bb4, ib4) :: defines_var(ib4);
+constraint int_lin_eq([1,1,1,1,-1],[ib1,ib2,ib3,ib4,target],0);
+constraint int_eq_reif(x1, 3, bw1) :: defines_var(bw1);
+constraint int_eq_reif(x2, 3, bw2) :: defines_var(bw2);
+constraint int_eq_reif(x3, 3, bw3) :: defines_var(bw3);
+constraint int_eq_reif(x4, 3, bw4) :: defines_var(bw4);
+constraint bool2int(bw1, iw1) :: defines_var(iw1);
+constraint bool2int(bw2, iw2) :: defines_var(iw2);
+constraint bool2int(bw3, iw3) :: defines_var(iw3);
+constraint bool2int(bw4, iw4) :: defines_var(iw4);
+constraint int_lin_eq([1,1,1,1,-1,-1,-1,-1],[ib1,ib2,ib3,ib4,iw1,iw2,iw3,iw4],0);
+constraint int_ge(target, 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should detect two countEq patterns: value 2 (from inverted) and value 3 (from balanced)
+        check tr.countEqPatterns.len == 2
+
+        var foundVal2, foundVal3 = false
+        for _, pat in tr.countEqPatterns:
+            check pat.targetVarName == "target"
+            check pat.arrayVarNames.len == 4
+            if pat.countValue == 2: foundVal2 = true
+            if pat.countValue == 3: foundVal3 = true
+        check foundVal2
+        check foundVal3
+
+        # Verify it solves correctly: count(x, 2) == count(x, 3) == target >= 1
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let targetVal = tr.sys.assignment[tr.varPositions["target"]]
+        check targetVal >= 1
+
+        var countVal2, countVal3 = 0
+        for name in ["x1", "x2", "x3", "x4"]:
+            let v = tr.sys.assignment[tr.varPositions[name]]
+            if v == 2: inc countVal2
+            if v == 3: inc countVal3
+        check countVal2 == targetVal
+        check countVal3 == targetVal
+
 
 suite "FlatZinc Reification Channel Detection":
 
