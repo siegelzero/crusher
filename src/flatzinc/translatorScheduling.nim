@@ -331,7 +331,6 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
         # Check ALL positive literals are array_bool_and with int_lin_le_reif inputs
         var allAndReif = true
         var disjuncts: seq[seq[DisjunctiveClauseTerm]]
-        var allBoolVars: seq[string]  # Track all bool vars to consume
         for elem in posArg.elems:
             if elem.kind != FznIdent:
                 allAndReif = false; break
@@ -353,9 +352,6 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             if not inputsOk:
                 allAndReif = false; break
             disjuncts.add(terms)
-            allBoolVars.add(ident)
-            for inp in andInfo.inputs:
-                allBoolVars.add(inp)
         if not allAndReif or disjuncts.len < 2: continue
 
         # Consume bool_clause + all array_bool_and + all int_lin_le_reif constraints and bool vars

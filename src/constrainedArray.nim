@@ -1087,7 +1087,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     # For element(idx, const_array, result): restrict idx based on result domain
     # and restrict result based on idx domain. Runs in a local fixed-point loop.
     # Handles both PositionBased and ExpressionBased (single-position index/value) elements.
-    block elementProp:
+    block:
         var elementTotalRemoved = 0
         var elementChanged = true
         var elementIter = 0
@@ -1138,18 +1138,26 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let arrLen = es.constantArrayEB.len
                     var tempAssign = initTable[int, T]()
 
+                    # Forward/backward pruning of result domain is only sound when the
+                    # value expression is a simple RefNode (identity mapping between
+                    # resPos domain values and constraint values). For non-trivial
+                    # expressions (e.g. resPos*2+1), raw domain values != expression
+                    # output, so domain intersection would be incorrect.
+                    let simpleValueExpr = es.valueExpression.node.kind == RefNode
+
                     # Forward: restrict result to values reachable from current idx domain
-                    var reachableResults = initPackedSet[T]()
-                    for v in currentDomain[idxPos].items:
-                        tempAssign[idxPos] = v
-                        let idx = es.indexExpression.evaluate(tempAssign)
-                        if idx >= 0 and idx < arrLen:
-                            reachableResults.incl(es.constantArrayEB[idx])
-                    let newResDom = currentDomain[resPos] * reachableResults
-                    if newResDom.len < currentDomain[resPos].len:
-                        elementTotalRemoved += currentDomain[resPos].len - newResDom.len
-                        currentDomain[resPos] = newResDom
-                        elementChanged = true
+                    if simpleValueExpr:
+                        var reachableResults = initPackedSet[T]()
+                        for v in currentDomain[idxPos].items:
+                            tempAssign[idxPos] = v
+                            let idx = es.indexExpression.evaluate(tempAssign)
+                            if idx >= 0 and idx < arrLen:
+                                reachableResults.incl(es.constantArrayEB[idx])
+                        let newResDom = currentDomain[resPos] * reachableResults
+                        if newResDom.len < currentDomain[resPos].len:
+                            elementTotalRemoved += currentDomain[resPos].len - newResDom.len
+                            currentDomain[resPos] = newResDom
+                            elementChanged = true
 
                     # Backward: restrict idx position to values that map to valid results
                     for v in toSeq(currentDomain[idxPos].items):
@@ -1159,12 +1167,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[idxPos].excl(v)
                             elementTotalRemoved += 1
                             elementChanged = true
-                        else:
-                            # Check if the result value is compatible with current result domain
+                        elif simpleValueExpr:
+                            # Only prune when value expression is identity — otherwise
+                            # arrVal may not directly correspond to resPos domain values
                             let arrVal = es.constantArrayEB[idx]
-                            # For value expression like "pos + offset", check what value at resPos
-                            # would make valueExpr == arrVal. For simple RefNode, arrVal must be in domain.
-                            # General approach: check if arrVal is achievable by resPos domain.
                             if arrVal notin currentDomain[resPos]:
                                 currentDomain[idxPos].excl(v)
                                 elementTotalRemoved += 1
