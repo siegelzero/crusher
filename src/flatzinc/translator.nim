@@ -1010,11 +1010,21 @@ proc translate*(model: FznModel): FznTranslator =
                 targetPos, pattern.targetValue, primaryPos, filterPos,
                 pattern.filterValue, primaryOnlyPos, pattern.constantOffset)
             result.channelVarNames.incl(pattern.targetVarName)
-            # Set domain to valid range for this channel
+            # Set domain to channel range intersected with original declared domain
             let totalIndicators = primaryPos.len + primaryOnlyPos.len
-            let maxCount = totalIndicators + pattern.constantOffset
-            let minCount = pattern.constantOffset
-            result.sys.baseArray.domain[targetPos] = toSeq(minCount..maxCount)
+            let channelMax = totalIndicators + pattern.constantOffset
+            let channelMin = pattern.constantOffset
+            let origDomain = result.sys.baseArray.domain[targetPos]
+            let origMin = if origDomain.len > 0: origDomain[0] else: channelMin
+            let origMax = if origDomain.len > 0: origDomain[^1] else: channelMax
+            let effectiveMin = max(channelMin, origMin)
+            let effectiveMax = min(channelMax, origMax)
+            result.sys.baseArray.domain[targetPos] = toSeq(effectiveMin..effectiveMax)
+            # Add explicit bound constraints when original domain is narrower than channel range
+            if origMin > channelMin:
+                result.sys.addConstraint(result.getExpr(targetPos) >= origMin)
+            if origMax < channelMax:
+                result.sys.addConstraint(result.getExpr(targetPos) <= origMax)
         elif ci in result.countEqPatterns:
             # Emit count_eq for detected pattern
             let pattern = result.countEqPatterns[ci]

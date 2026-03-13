@@ -145,7 +145,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var hi = if upperBound != high(int): upperBound else: safeUpperBound(currentCost)
             var hiProven = upperBound != high(int)  # user-provided bound is trusted
 
-        # Adaptive binary search with escalating solve effort
+        # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
             echo "[Opt] Binary search [", lo, "..", hi, "]"
             flushFile(stdout)
@@ -155,24 +155,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.searchCompleted = false
                 break
 
-            # Check if current cost is already at the proven bound
-            when direction == Minimize:
-                if currentCost <= lo and loProven:
-                    system.optimalityProven = true
-                    break
-                elif currentCost <= lo:
-                    # lo was heuristic — lower it conservatively
-                    lo = max(lowerBound, currentCost div 2)
-                    if lo > hi: break
-            else:
-                if currentCost >= hi and hiProven:
-                    system.optimalityProven = true
-                    break
-                elif currentCost >= hi:
-                    hi = currentCost + currentCost div 2
-                    if lo > hi: break
-
             let bestSolution = system.assignment
+            # Binary search: try the midpoint
             let target = lo + (hi - lo) div 2
 
             if hasBoundConstraint:
@@ -187,22 +171,19 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
             system.baseArray.tightenReducedDomain()
 
-            let remaining = if deadline > 0: deadline - epochTime() else: 120.0
-            if remaining < 5.0:
+            if verbose:
+                echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
+                flushFile(stdout)
+
+            if deadline > 0 and deadline - epochTime() < 5.0:
                 system.searchCompleted = false
                 break
 
-            if verbose:
-                echo "[Opt] Trying ", target, " [", lo, "..", hi, "] (", int(remaining), "s left)"
-                flushFile(stdout)
-
+            # Save constraints/fixedPositions before resolve (which may mutate them
+            # via removeFixedConstraints) so the optimizer can still add/remove bounds
             let savedConstraints = system.baseArray.constraints
             let savedFixed = copyPackedSet(system.baseArray.fixedPositions)
 
-            var probeSucceeded = false
-            var probeInfeasible = false
-
-            # Phase 1: Quick tabu-only probe
             try:
                 system.resolve(
                     parallel=parallel,
@@ -214,57 +195,6 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     verbose=verbose,
                     deadline=deadline,
                 )
-                probeSucceeded = true
-            except TimeLimitExceededError:
-                system.initialize(bestSolution)
-                objective.initialize(system.assignment)
-                system.searchCompleted = false
-                break
-            except InfeasibleError:
-                probeInfeasible = true
-            except NoSolutionFoundError:
-                discard
-            finally:
-                system.baseArray.constraints = savedConstraints
-                system.baseArray.fixedPositions = copyPackedSet(savedFixed)
-
-            # Phase 2: If tabu failed, try scatter with fixed budget
-            if not probeSucceeded and not probeInfeasible:
-                let remaining2 = if deadline > 0: deadline - epochTime() else: 120.0
-                if remaining2 >= 15.0:
-                    # Fixed 30s budget, but no more than 60% of remaining time
-                    let probeBudget = min(30.0, remaining2 * 0.6)
-                    let probeDeadline = if deadline > 0:
-                            epochTime() + probeBudget
-                        else: 0.0
-                    if verbose:
-                        echo "[Opt] Scatter retry (budget: ", int(probeBudget), "s)"
-                        flushFile(stdout)
-                    let savedConstraints2 = system.baseArray.constraints
-                    let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)
-                    try:
-                        system.resolve(
-                            parallel=parallel,
-                            tabuThreshold=tabuThreshold,
-                            scatterThreshold=scatterThreshold,
-                            populationSize=populationSize,
-                            numWorkers=numWorkers,
-                            scatterStrategy=scatterStrategy,
-                            verbose=verbose,
-                            deadline=probeDeadline,
-                        )
-                        probeSucceeded = true
-                    except TimeLimitExceededError:
-                        discard  # used up probe budget, continue to next target
-                    except InfeasibleError:
-                        probeInfeasible = true
-                    except NoSolutionFoundError:
-                        discard
-                    finally:
-                        system.baseArray.constraints = savedConstraints2
-                        system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
-
-            if probeSucceeded:
                 objective.initialize(system.assignment)
                 currentCost = objective.value
                 system.bestAssignmentValid = false
@@ -275,16 +205,18 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 if verbose:
                     echo "[Opt] iters=", system.lastIterations
                     flushFile(stdout)
+                # Found solution at value currentCost — narrow toward better
                 when direction == Minimize:
                     hi = currentCost - 1
-                    # If the new cost is below lo (which was heuristic), reset lo
-                    if currentCost < lo and not loProven:
-                        lo = max(lowerBound, currentCost div 2)
                 else:
                     lo = currentCost + 1
-                    if currentCost > hi and not hiProven:
-                        hi = currentCost + currentCost div 2
-            elif probeInfeasible:
+            except TimeLimitExceededError:
+                system.initialize(bestSolution)
+                objective.initialize(system.assignment)
+                system.searchCompleted = false
+                break
+            except InfeasibleError:
+                # Domain reduction proved no solution at this bound — narrow range
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 when direction == Minimize:
@@ -293,16 +225,108 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     hi = target - 1
                     hiProven = true
-            else:
-                # Both tabu and scatter failed — narrow range and continue
+            except NoSolutionFoundError:
+                # Tabu-only couldn't find — break to retry with scatter search
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
+                break
+            finally:
+                system.baseArray.constraints = savedConstraints
+                system.baseArray.fixedPositions = copyPackedSet(savedFixed)
+
+        # Retry: binary search used fast tabu-only probes until first failure.
+        # Now try to beat the current best with full scatter search, deepening threshold on each failure.
+        var retryThreshold = tabuThreshold
+        block retryLoop:
+            while true:
+                # Check if current cost is already at the known bound.
+                # Only claim proven optimal if the bound was established by
+                # InfeasibleError (domain reduction proof) or user-provided.
                 when direction == Minimize:
-                    lo = target + 1
-                    loProven = false
+                    if currentCost <= lo:
+                        if loProven:
+                            system.optimalityProven = true
+                            break retryLoop
+                        else:
+                            # lo was a heuristic guess — lower it and keep searching
+                            lo = min(safeLowerBound(currentCost), safeLowerBound(lo))
                 else:
-                    hi = target - 1
-                    hiProven = false
+                    if currentCost >= hi:
+                        if hiProven:
+                            system.optimalityProven = true
+                            break retryLoop
+                        else:
+                            # hi was a heuristic guess — raise it and keep searching
+                            hi = max(safeUpperBound(currentCost), safeUpperBound(hi))
+
+                if deadline > 0 and epochTime() > deadline:
+                    system.searchCompleted = false
+                    break retryLoop
+
+                let bestSolution = system.assignment
+                if hasBoundConstraint:
+                    system.removeLastConstraint()
+
+                when direction == Minimize:
+                    system.addConstraint(objective <= currentCost - 1)
+                else:
+                    system.addConstraint(objective >= currentCost + 1)
+                hasBoundConstraint = true
+                system.baseArray.reducedDomain = baseReducedDomain
+                system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
+                system.baseArray.tightenReducedDomain()
+
+                let savedConstraints2 = system.baseArray.constraints
+                let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)
+
+                try:
+                    if verbose:
+                        echo "[Opt] Retry targeting ", (when direction == Minimize: currentCost - 1 else: currentCost + 1)
+                        flushFile(stdout)
+
+                    system.resolve(
+                        parallel=parallel,
+                        tabuThreshold=retryThreshold,
+                        scatterThreshold=scatterThreshold,
+                        populationSize=populationSize,
+                        numWorkers=numWorkers,
+                        scatterStrategy=scatterStrategy,
+                        verbose=verbose,
+                        deadline=deadline,
+                    )
+                    objective.initialize(system.assignment)
+                    currentCost = objective.value
+                    system.bestAssignmentValid = false
+                    system.bestFeasibleAssignment = system.assignment
+                    system.bestAssignmentValid = true
+                    echo "[Opt] Retry improved: ", currentCost
+                    flushFile(stdout)
+                    retryThreshold = tabuThreshold  # reset on success
+                except TimeLimitExceededError:
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    system.searchCompleted = false
+                    break retryLoop
+                except InfeasibleError:
+                    # Domain reduction proved no better solution exists — provably optimal
+                    system.optimalityProven = true
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    break retryLoop
+                except NoSolutionFoundError:
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
+                    retryThreshold = retryThreshold * 2
+                    system.adaptedTabuThreshold = 0  # force using bumped threshold
+                    if verbose:
+                        echo "[Opt] Retry deepening threshold to ", retryThreshold
+                        flushFile(stdout)
+                    if deadline > 0 and epochTime() < deadline:
+                        continue
+                    break retryLoop
+                finally:
+                    system.baseArray.constraints = savedConstraints2
+                    system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
 
         # Clean up the bound constraint and restore best solution
         if hasBoundConstraint:
