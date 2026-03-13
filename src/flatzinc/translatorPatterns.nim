@@ -1878,6 +1878,14 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 eqReifMap[boolVar] = (sourceVar: condVar,
                                       testVal: FznExpr(kind: FznIntLit, intVal: testVal))
 
+    # Step 1f: Extend eqReifMap/neReifMap with bool equivalence aliases.
+    # If aliasVar↔canonicalVar and canonicalVar is in eqReifMap, alias inherits the mapping.
+    for def in tr.boolEquivAliasDefs:
+        if def.canonicalVar in eqReifMap and def.aliasVar notin eqReifMap:
+            eqReifMap[def.aliasVar] = eqReifMap[def.canonicalVar]
+        if def.canonicalVar in neReifMap and def.aliasVar notin neReifMap:
+            neReifMap[def.aliasVar] = neReifMap[def.canonicalVar]
+
     if eqReifMap.len == 0 and linEqReifMap.len == 0: return
 
     # Step 2: Scan non-consumed bool_clause constraints
@@ -2495,7 +2503,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     allResolved = false
                     break
 
-        if not allResolved: continue
+        if not allResolved:
+            continue
 
         # Step 6: Register channel and consume constraints
         tr.channelVarNames.incl(targetVar)
@@ -4646,6 +4655,378 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
 
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool AND channels (b = AND(ci) from bool_clause)")
+
+proc detectBoolEquivalenceChannels*(tr: var FznTranslator) =
+    ## Detects mutual bool_clause implications that establish equivalence between
+    ## boolean variables. For bool_clause([A],[B]) + bool_clause([B],[A]), we have
+    ## A↔B. If one of them is already a channel, the other becomes an alias channel.
+    ##
+    ## Uses union-find for transitive closure: A↔B, B↔C → A↔B↔C.
+    ## Must run after detectBoolAndChannels() so channelVarNames includes AND channels.
+
+    # Step 1: Scan non-consumed bool_clause([X],[Y]) (1 pos, 1 neg) to build implication edges
+    type ImplEdge = object
+        fromVar, toVar: string
+        ci: int
+
+    var forwardImpls = initTable[string, seq[ImplEdge]]()  # from → edges (from→to means "to implies from")
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1 or negArg.elems.len != 1: continue
+        let posLit = posArg.elems[0]
+        let negLit = negArg.elems[0]
+        if posLit.kind != FznIdent or negLit.kind != FznIdent: continue
+        # bool_clause([A],[B]) means B → A (if B is true then A is true)
+        let a = posLit.ident
+        let b = negLit.ident
+        # Skip if either is a constant parameter
+        if a in tr.paramValues or b in tr.paramValues: continue
+        # Skip if either is already consumed by value-support
+        if a in tr.valueSupportConsumedBools or b in tr.valueSupportConsumedBools: continue
+        forwardImpls.mgetOrPut(b, @[]).add(ImplEdge(fromVar: b, toVar: a, ci: ci))
+
+    # Step 2: Find mutual pairs (A→B and B→A both exist)
+    type MutualPair = object
+        varA, varB: string
+        ciAB, ciBA: int  # constraint indices for A→B and B→A
+
+    var mutualPairs: seq[MutualPair]
+    var usedCIs: PackedSet[int]
+
+    for bVar, edges in forwardImpls:
+        for edge in edges:
+            let aVar = edge.toVar
+            # Check if there's a reverse edge: aVar → bVar (i.e., aVar in forwardImpls keys with target bVar)
+            if aVar in forwardImpls:
+                for revEdge in forwardImpls[aVar]:
+                    if revEdge.toVar == bVar and edge.ci notin usedCIs and revEdge.ci notin usedCIs:
+                        mutualPairs.add(MutualPair(varA: aVar, varB: bVar,
+                                                   ciAB: revEdge.ci, ciBA: edge.ci))
+                        usedCIs.incl(edge.ci)
+                        usedCIs.incl(revEdge.ci)
+                        break
+
+    if mutualPairs.len == 0: return
+
+    # Step 3: Union-find for transitive closure
+    var parent = initTable[string, string]()
+
+    proc find(x: string): string =
+        var cur = x
+        while cur in parent and parent[cur] != cur:
+            cur = parent[cur]
+        # Path compression
+        var compress = x
+        while compress in parent and parent[compress] != cur:
+            let next = parent[compress]
+            parent[compress] = cur
+            compress = next
+        result = cur
+
+    proc union(a, b: string) =
+        let ra = find(a)
+        let rb = find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for pair in mutualPairs:
+        if pair.varA notin parent: parent[pair.varA] = pair.varA
+        if pair.varB notin parent: parent[pair.varB] = pair.varB
+        union(pair.varA, pair.varB)
+
+    # Step 4: Group into equivalence classes
+    var classes = initTable[string, seq[string]]()
+    for v in parent.keys:
+        let root = find(v)
+        classes.mgetOrPut(root, @[]).add(v)
+
+    # Step 5: For each class, find if any member is already a channel.
+    # If so, all non-channel members become alias channels.
+    var detected = 0
+    # Build map from pair to consumed CIs for lookup
+    var pairCIs = initTable[(string, string), seq[int]]()
+    for pair in mutualPairs:
+        pairCIs[(pair.varA, pair.varB)] = @[pair.ciAB, pair.ciBA]
+        pairCIs[(pair.varB, pair.varA)] = @[pair.ciAB, pair.ciBA]
+
+    for root, members in classes:
+        # Find canonical (channel) member
+        var canonical = ""
+        for m in members:
+            if m in tr.channelVarNames:
+                canonical = m
+                break
+        if canonical == "":
+            continue  # No channel in this class — skip
+
+        for m in members:
+            if m == canonical: continue
+            if m in tr.channelVarNames: continue
+            if m in tr.definedVarNames: continue
+            # Find the CIs connecting m to canonical (may be indirect through chain)
+            # For simplicity, collect all CIs in the class
+            var consumedCIs: seq[int]
+            if (m, canonical) in pairCIs:
+                consumedCIs = pairCIs[(m, canonical)]
+            else:
+                # Find a chain through the class — collect all pair CIs involving m
+                for pair in mutualPairs:
+                    if pair.varA == m or pair.varB == m:
+                        if find(pair.varA) == find(canonical) or find(pair.varB) == find(canonical):
+                            consumedCIs.add(pair.ciAB)
+                            consumedCIs.add(pair.ciBA)
+                            break
+            if consumedCIs.len == 0: continue
+
+            tr.boolEquivAliasDefs.add((aliasVar: m, canonicalVar: canonical,
+                                       consumedCIs: consumedCIs))
+            tr.channelVarNames.incl(m)
+            for ci in consumedCIs:
+                tr.definingConstraints.incl(ci)
+            inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} bool equivalence alias channels")
+
+proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
+    ## Detects patterns where a variable is conditionally assigned either a variable
+    ## value or a constant, gated by a boolean channel condition:
+    ##   x = if cond then y else constant
+    ##
+    ## Pattern in FlatZinc (via bool_clause implications):
+    ##   int_eq_reif(x, y, B_eq)   :: defines_var(B_eq)  -- B_eq ↔ (x == y)
+    ##   bool_clause([B_eq], [cond])                       -- cond → x == y
+    ##   plus: default value when ¬cond is derivable from target domain + other implications
+    ##
+    ## The condition variable must be a boolean channel. The target must not already
+    ## be a channel or defined. One branch has a variable value, the other a constant.
+    ##
+    ## Must run after detectConditionalImplicationChannels() and detectBoolEquivalenceChannels().
+
+    # Step 1: Build eq_reif reverse map: output bool var → (sourceVar, testVal)
+    var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        eqReifMap[con.args[2].ident] = (sourceVar: con.args[0].ident, testVal: con.args[1])
+
+    # Step 1b: Extend eqReifMap with bool equivalence aliases
+    for def in tr.boolEquivAliasDefs:
+        if def.canonicalVar in eqReifMap and def.aliasVar notin eqReifMap:
+            eqReifMap[def.aliasVar] = eqReifMap[def.canonicalVar]
+
+    # Step 2: Scan non-consumed bool_clause([A],[B1,...,Bn]) where:
+    #   A is eq_reif output with variable testVal → implies cond → target == varValue
+    #   B1..Bn are boolean channels (the conditions forming a conjunction)
+    #   For multi-neg: look up known AND channel for the conjunction
+    type GatedEntry = object
+        boolClauseCI: int
+        condChannel: string     # the boolean condition (single channel or AND channel)
+        valVar: string          # the variable value (from eq_reif testVal)
+        eqReifBool: string      # the eq_reif output bool (positive literal)
+
+    # Build reverse map: sorted condVars → AND channel resultVar
+    var andChannelByInputs = initTable[seq[string], string]()
+    for def in tr.boolAndChannelDefs:
+        var sortedConds = def.condVars.sorted()
+        andChannelByInputs[sortedConds] = def.resultVar
+    # Also include array_bool_and channels
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_and": continue
+        if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+        let resultVar = con.args[1].ident
+        let arrArg = con.args[0]
+        if arrArg.kind != FznArrayLit: continue
+        var condVars: seq[string]
+        var allIdent = true
+        for elem in arrArg.elems:
+            if elem.kind != FznIdent:
+                allIdent = false
+                break
+            condVars.add(elem.ident)
+        if not allIdent: continue
+        var sortedConds = condVars.sorted()
+        andChannelByInputs[sortedConds] = resultVar
+
+    var entriesByTarget = initTable[string, seq[GatedEntry]]()
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1: continue  # exactly 1 positive literal
+        if negArg.elems.len < 1: continue   # at least 1 negative literal
+        let posLit = posArg.elems[0]
+        if posLit.kind != FznIdent: continue
+
+        # posLit must be an eq_reif output
+        if posLit.ident notin eqReifMap: continue
+        let eqInfo = eqReifMap[posLit.ident]
+        let targetVar = eqInfo.sourceVar
+
+        # testVal must be a variable (not constant)
+        if eqInfo.testVal.kind != FznIdent: continue
+        let valVarName = eqInfo.testVal.ident
+        if valVarName in tr.paramValues: continue
+
+        # Skip if target is already channel or defined
+        if targetVar in tr.channelVarNames or targetVar in tr.definedVarNames: continue
+
+        # Determine the effective condition channel
+        var condChannel = ""
+        if negArg.elems.len == 1:
+            # Single negative literal: must be a channel
+            let negLit = negArg.elems[0]
+            if negLit.kind != FznIdent or negLit.ident notin tr.channelVarNames: continue
+            condChannel = negLit.ident
+        else:
+            # Multi-negative: all must be channels, AND their conjunction must be a known channel
+            var negVars: seq[string]
+            var allChannels = true
+            for elem in negArg.elems:
+                if elem.kind != FznIdent or elem.ident notin tr.channelVarNames:
+                    allChannels = false
+                    break
+                negVars.add(elem.ident)
+            if not allChannels: continue
+            var sortedNegs = negVars.sorted()
+            if sortedNegs in andChannelByInputs:
+                condChannel = andChannelByInputs[sortedNegs]
+            else:
+                continue  # no known AND channel for this conjunction
+
+        entriesByTarget.mgetOrPut(targetVar, @[]).add(GatedEntry(
+            boolClauseCI: ci,
+            condChannel: condChannel,
+            valVar: valVarName,
+            eqReifBool: posLit.ident))
+
+    if entriesByTarget.len == 0: return
+
+    # Step 2b: Build equivalence map for boolean channels.
+    # A bool AND channel with a single condition (AND([c]) = c) is equivalent to c.
+    # An equivalence alias is also equivalent. Used to match default clauses.
+    var boolEquivSet = initTable[string, HashSet[string]]()  # condChannel → set of equivalents (including self)
+    for def in tr.boolAndChannelDefs:
+        if def.condVars.len == 1:
+            let src = def.condVars[0]
+            if src notin boolEquivSet:
+                boolEquivSet[src] = [src].toHashSet()
+            boolEquivSet[src].incl(def.resultVar)
+    for def in tr.boolEquivAliasDefs:
+        if def.canonicalVar notin boolEquivSet:
+            boolEquivSet[def.canonicalVar] = [def.canonicalVar].toHashSet()
+        boolEquivSet[def.canonicalVar].incl(def.aliasVar)
+
+    # Step 3: For each target with exactly 1 entry (binary condition):
+    # Check if target has binary domain {constant, ?} and can derive default constant
+    var detected = 0
+    for targetVar, entries in entriesByTarget:
+        if targetVar in tr.channelVarNames: continue  # may have been channelized in this loop
+        if entries.len != 1: continue  # only binary case for now
+
+        let entry = entries[0]
+        let condDomain = tr.lookupVarDomain(entry.condChannel)
+        if condDomain != @[0, 1]: continue  # condition must be boolean
+
+        let targetDomain = tr.lookupVarDomain(targetVar)
+        if targetDomain.len < 2: continue
+
+        # We need the default value when cond=0 (condition is false).
+        # The implication says: cond=1 → target = valVar
+        # When cond=0, target must take a constant value.
+        # For binary target domain {a,b}: if valVar's domain covers one value,
+        # default is the other. But we need a simpler check:
+        # Look for another bool_clause that establishes target = constant when ¬cond.
+        # OR: if target domain is {0, k} and there's an eq_reif for target=0 with
+        # bool_clause([eq_reif_0], [not_cond_or_similar]) — but this gets complicated.
+        #
+        # Simpler approach: Check if 0 is in domain and is the obvious default.
+        # Pattern: visit=0 means "not visited", visit=1 means "visited" with variable val.
+        # The constant branch is typically 0 (the "off" value).
+        # Check: is there a bool_clause that implies target=constVal when cond=false?
+
+        # Look for bool_clause([eq_reif(target, constVal)], [negCond]) where negCond
+        # is in the class of ¬cond (or cond itself appears as negative literal
+        # with eq_reif for a constant value as positive).
+        #
+        # Alternative pattern: bool_clause([B_eq0, cond], []) means ¬cond → B_eq0 → target==0
+        var defaultConstant = int.low
+        var defaultCI = -1
+
+        # Search for bool_clause([eq_reif(target, const), cond], []) meaning ¬cond → target==const
+        for ci2, con2 in tr.model.constraints:
+            if ci2 in tr.definingConstraints: continue
+            if ci2 == entry.boolClauseCI: continue
+            if stripSolverPrefix(con2.name) != "bool_clause": continue
+            if con2.args.len < 2: continue
+            let posArg2 = con2.args[0]
+            let negArg2 = con2.args[1]
+            if posArg2.kind != FznArrayLit or negArg2.kind != FznArrayLit: continue
+
+            # Pattern: bool_clause([B_eq_const, cond], []) — 2 positive, 0 negative
+            # This is a disjunction: B_eq_const OR cond
+            # ¬cond → B_eq_const → target == const
+            if posArg2.elems.len == 2 and negArg2.elems.len == 0:
+                var eqReifLit = ""
+                var condLit = ""
+                let condEquivs = if entry.condChannel in boolEquivSet:
+                    boolEquivSet[entry.condChannel]
+                else:
+                    [entry.condChannel].toHashSet()
+                for elem in posArg2.elems:
+                    if elem.kind != FznIdent: break
+                    if elem.ident in condEquivs:
+                        condLit = elem.ident
+                    elif elem.ident in eqReifMap:
+                        let info = eqReifMap[elem.ident]
+                        if info.sourceVar == targetVar and info.testVal.kind == FznIntLit:
+                            eqReifLit = elem.ident
+                if eqReifLit != "" and condLit != "":
+                    defaultConstant = eqReifMap[eqReifLit].testVal.intVal
+                    defaultCI = ci2
+                    break
+
+            # Pattern: bool_clause([B_eq_const], [neg_cond]) where neg_cond is NOT(cond)
+            # i.e., neg_cond → target == const, and neg_cond is the negation of cond
+            # This is harder to detect without knowing the negation relationship.
+            # Skip for now — the 2-positive pattern above is the common one.
+
+        if defaultConstant == int.low: continue
+        if defaultConstant notin targetDomain: continue
+
+        # Determine which index corresponds to cond=0 (default) and cond=1 (variable)
+        # cond is boolean {0,1}: when cond=1, target=valVar; when cond=0, target=defaultConstant
+        var consumedCIs = @[entry.boolClauseCI]
+        if defaultCI >= 0:
+            consumedCIs.add(defaultCI)
+
+        tr.boolGatedVarChannelDefs.add((
+            targetVar: targetVar,
+            condVar: entry.condChannel,
+            valVar: entry.valVar,
+            constValue: defaultConstant,
+            consumedCIs: consumedCIs))
+        tr.channelVarNames.incl(targetVar)
+        for ci in consumedCIs:
+            tr.definingConstraints.incl(ci)
+        inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} bool-gated variable channels")
 
 proc detectOverlapChannels*(tr: var FznTranslator) =
     ## Detects overlap variables connected to time-separation channels through bool_not.

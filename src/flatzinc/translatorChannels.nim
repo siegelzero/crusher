@@ -2382,6 +2382,111 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
     if nBinary > 0 or nOneHot > 0:
         stderr.writeLine(&"[FZN] Built conditional implication channel bindings: {nBinary} binary, {nOneHot} one-hot")
 
+proc buildBoolEquivAliasBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for bool equivalence alias patterns detected by
+    ## detectBoolEquivalenceChannels().
+    ## For aliasVar ↔ canonicalVar: alias = element(canonical, [0, 1])
+    ## which is an identity channel binding.
+    ## Must be called after translateVariables() and buildReifChannelBindings().
+
+    var built = 0
+    for def in tr.boolEquivAliasDefs:
+        if def.aliasVar notin tr.varPositions: continue
+        if def.canonicalVar notin tr.varPositions:
+            # canonical may be in definedVarExprs
+            if def.canonicalVar notin tr.definedVarExprs: continue
+        let aliasPos = tr.varPositions[def.aliasVar]
+
+        let indexExpr = if def.canonicalVar in tr.varPositions:
+            tr.getExpr(tr.varPositions[def.canonicalVar])
+        else:
+            tr.definedVarExprs[def.canonicalVar]
+
+        # Identity lookup: [0, 1] indexed by canonical value
+        var arrayElems: seq[ArrayElement[int]]
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+        let binding = ChannelBinding[int](
+            channelPosition: aliasPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(aliasPos)
+
+        # Register source positions for incremental propagation
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        inc built
+
+    if built > 0:
+        stderr.writeLine(&"[FZN] Built {built} bool equivalence alias channel bindings")
+
+proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for bool-gated variable channel patterns detected by
+    ## detectBoolGatedVariableChannels().
+    ## For targetVar = if condVar then valVar else constValue:
+    ##   target = element(cond, [constValue, valVarPos])
+    ## where cond=0 → constValue, cond=1 → valVar.
+    ## Must be called after translateVariables() and buildReifChannelBindings().
+
+    var built = 0
+    for def in tr.boolGatedVarChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.condVar notin tr.varPositions:
+            if def.condVar notin tr.definedVarExprs: continue
+        if def.valVar notin tr.varPositions:
+            if def.valVar notin tr.definedVarExprs: continue
+
+        let targetPos = tr.varPositions[def.targetVar]
+
+        let indexExpr = if def.condVar in tr.varPositions:
+            tr.getExpr(tr.varPositions[def.condVar])
+        else:
+            tr.definedVarExprs[def.condVar]
+
+        # Build array: [constValue, valVar] indexed by condition (0=const, 1=var)
+        var arrayElems: seq[ArrayElement[int]]
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: def.constValue))
+        if def.valVar in tr.varPositions:
+            arrayElems.add(ArrayElement[int](isConstant: false,
+                                             variablePosition: tr.varPositions[def.valVar]))
+        else:
+            # valVar is a defined expression — we need a position for it.
+            # Skip this binding if valVar doesn't have a position.
+            continue
+
+        let binding = ChannelBinding[int](
+            channelPosition: targetPos,
+            indexExpression: indexExpr,
+            arrayElements: arrayElems
+        )
+        let bindingIdx = tr.sys.baseArray.channelBindings.len
+        tr.sys.baseArray.channelBindings.add(binding)
+        tr.sys.baseArray.channelPositions.incl(targetPos)
+
+        # Register source positions: condition + value variable
+        for pos in indexExpr.positions.items:
+            if pos notin tr.sys.baseArray.channelsAtPosition:
+                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
+            else:
+                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        # Also register the value variable position
+        let valPos = tr.varPositions[def.valVar]
+        if valPos notin tr.sys.baseArray.channelsAtPosition:
+            tr.sys.baseArray.channelsAtPosition[valPos] = @[bindingIdx]
+        elif bindingIdx notin tr.sys.baseArray.channelsAtPosition[valPos]:
+            tr.sys.baseArray.channelsAtPosition[valPos].add(bindingIdx)
+        inc built
+
+    if built > 0:
+        stderr.writeLine(&"[FZN] Built {built} bool-gated variable channel bindings")
+
 proc buildNetFlowVariables*(tr: var FznTranslator) =
     ## Creates net_flow search variables for free pairs, defined expressions for dependent
     ## pairs, and channel bindings for V_in/V_out from net_flow.

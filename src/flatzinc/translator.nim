@@ -378,6 +378,10 @@ type
             consumedCIs: seq[int]]]
         # Bool_xor negation defs: bool_xor(const, var, result) where const=true → result = 1-var
         boolXorNegDefs*: seq[tuple[inputArg: FznExpr, resultVar: string]]
+        # Bool equivalence alias defs: mutual bool_clause implications → alias channels
+        boolEquivAliasDefs*: seq[tuple[aliasVar, canonicalVar: string, consumedCIs: seq[int]]]
+        # Bool-gated variable channel defs: x = if cond then y else constant
+        boolGatedVarChannelDefs*: seq[tuple[targetVar, condVar, valVar: string, constValue: int, consumedCIs: seq[int]]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -716,6 +720,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.boolAndChannelDefs = @[]
     result.binaryCondChannelDefs = @[]
     result.oneHotCondChannelDefs = @[]
+    result.boolEquivAliasDefs = @[]
+    result.boolGatedVarChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
@@ -760,12 +766,25 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
     # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
     result.detectBoolAndChannels()
+    # Detect bool equivalence alias channels: mutual bool_clause implications → alias
+    # MUST run after detectBoolAndChannels() so channelVarNames includes AND channels.
+    # Run as fixpoint since new aliases may enable further equivalences.
+    block:
+        var prevCount = -1
+        var iterations = 0
+        while result.boolEquivAliasDefs.len != prevCount and iterations < 10:
+            prevCount = result.boolEquivAliasDefs.len
+            result.detectBoolEquivalenceChannels()
+            inc iterations
     # Detect overlap channels: overlap = NOT sep where sep is a bool_clause_reif channel
     # MUST run after detectReifChannels() (which populates boolNotChannelDefs)
     result.detectOverlapChannels()
     # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
     # MUST run after detectReifChannels() and detectBoolAndChannels()
     result.detectConditionalImplicationChannels()
+    # Detect bool-gated variable channels: x = if cond then y else constant
+    # MUST run after detectConditionalImplicationChannels() and detectBoolEquivalenceChannels()
+    result.detectBoolGatedVariableChannels()
     # Detect argmax decomposition patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
     result.detectArgmaxPattern()
     # Detect set_union defines_var patterns → channel variables for set decomposition
@@ -1645,6 +1664,10 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildBoolAndChannelBindings()
     # Build channel bindings for conditional implication channels (binary + one-hot)
     result.buildConditionalImplicationChannelBindings()
+    # Build channel bindings for bool equivalence aliases (identity element channels)
+    result.buildBoolEquivAliasBindings()
+    # Build channel bindings for bool-gated variable channels (x = if cond then y else const)
+    result.buildBoolGatedVarChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for one-hot indicator variables
