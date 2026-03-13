@@ -1663,7 +1663,6 @@ proc detectInversePatterns(tr: var FznTranslator) =
             tr.definingConstraints.incl(ci)
 
         # Find and mark matching fzn_all_different_int constraints on the same positions
-        let posSet = toPackedSet(positions)
         var nAllDiffRemoved = 0
         for ci2, con2 in tr.model.constraints:
             if ci2 in tr.definingConstraints:

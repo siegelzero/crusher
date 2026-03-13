@@ -2333,7 +2333,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     valid = false
                     break
                 depSets[cv] = @[]
-            if not valid: break
+            if not valid: break precompute
 
             for i, sv in sourceVarNames:
                 if domainSizes[i] <= 1: continue
@@ -2436,7 +2436,6 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 # target = (rhs - sum(otherCoeffs[i] * otherVars[i])) / targetCoeff
                 var numerator = entry.linRhs
                 var linOk = true
-                var needMapping = false
                 for j in 0..<entry.linOtherVars.len:
                     let ov = entry.linOtherVars[j]
                     if ov in sourceValues:
@@ -4498,7 +4497,6 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
                     # Compute max compulsory load in sliding window [y, y+dy_i) for each domain value
                     var newDom: seq[int]
                     for v in yDom:
-                        let winStart = v
                         let winEnd = v + rects[i].dy
                         # Find max load in [winStart, winEnd) from profile breakpoints
                         var windowMax = 0

@@ -293,8 +293,6 @@ type
         setComprehensions*: seq[SetComprehensionInfo]
         # Set variable names to skip boolean creation for (singletons + intermediates)
         skipSetVarNames*: HashSet[string]
-        # Reusable position for a variable fixed to 1 (for set_in channel bindings), -1 if not yet created
-        fixedOnePos*: int
         # Index from variable name -> declaration index for O(1) lookupVarDomain
         varDomainIndex*: Table[string, int]
         # Synthetic element channels: precomputed lookup tables for conditional gain variables
@@ -715,7 +713,6 @@ proc translate*(model: FznModel): FznTranslator =
     result.outputSetVars = initHashSet[string]()
     result.outputSetArrays = initHashSet[string]()
     result.skipSetVarNames = initHashSet[string]()
-    result.fixedOnePos = -1
     result.rescuedChannelDefs = @[]
     result.boolAndChannelDefs = @[]
     result.binaryCondChannelDefs = @[]

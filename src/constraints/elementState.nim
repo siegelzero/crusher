@@ -35,7 +35,6 @@
 import std/[packedsets, tables]
 
 import ../expressions/expressions
-import common
 
 ################################################################################
 # Type definitions

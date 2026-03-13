@@ -2085,8 +2085,6 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
         if coeffs.len != vars.len or coeffs.len < 10:
             continue
 
-        let isFirstCandidate = perDayConstraints.len == 0 and nDetected == 0
-
         var tasks: seq[TaskInfo]
         var allValid = true
         var commonDay = -1
@@ -2425,7 +2423,6 @@ proc estimateRangeImpl(tr: FznTranslator, node: ExpressionNode[int],
     let key = cast[pointer](node)
     if key in cache:
         return cache[key]
-    var result: (int, int)
     case node.kind
     of LiteralNode:
         result = (node.value, node.value)

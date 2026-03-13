@@ -12,7 +12,7 @@
 #   sys.addConstraint(allDifferent(x))
 #   sys.addConstraint(circuit(x))
 
-import std/[tables, packedsets, algorithm]
+import std/[tables, packedsets]
 
 ################################################################################
 # Type definitions

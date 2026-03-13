@@ -705,20 +705,6 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             state.cdCascadeFallbackTime += epochTime() - tFall0CD
 
 
-proc recomputeAllChannelDepPenalties[T](state: TabuState[T]) =
-    ## Recompute channel-dep penalties at all relevant search positions and
-    ## adjust penaltyMap by the delta (new - old). Called after propagateChannels
-    ## when channel-dep constraint state has changed.
-    for pos in state.channelDepSearchPositions:
-        if state.isLazy[pos]: continue
-        let domain = state.sharedDomain[][pos]
-        for i in 0..<domain.len:
-            let newDep = state.computeChannelDepDelta(pos, domain[i])
-            let oldDep = state.channelDepPenalties[pos][i]
-            if newDep != oldDep:
-                state.penaltyMap[pos][i] += newDep - oldDep
-                state.channelDepPenalties[pos][i] = newDep
-
 proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[int]) {.inline.} =
     ## Apply uniform cost delta for channel-dep penalties at position.
     ## For cascade positions: checks if external dependencies changed. If not,
@@ -775,7 +761,6 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         # Pass cache directly to computeCascadePenalties (it only reads min/max entries).
         let domain = state.sharedDomain[][pos]
         let nDom = domain.len
-        let chans = state.cdCascadeChans[cascadeIdx]
         let bindings = state.cdCascadeBindings[cascadeIdx]
         let mmIndices = state.cdCascadeMinMaxIdx[cascadeIdx]
         let mmInputs = state.cdCascadeMinMaxInputs[cascadeIdx]

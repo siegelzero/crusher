@@ -260,7 +260,6 @@ proc main() =
     printUnknown()
 
   if stats:
-    let totalTime = cpuTime() - startTime
     let solveTime = cpuTime() - solveStart
     stderr.writeLine(&"%%%mzn-stat: solveTime={solveTime:.3f}")
     stderr.writeLine(&"%%%mzn-stat: initTime={solveStart - startTime:.3f}")

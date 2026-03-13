@@ -1,7 +1,6 @@
 
 import resolution
 from std/times import epochTime
-from std/math import ceil
 import std/packedsets
 
 proc copyPackedSet(src: PackedSet[int]): PackedSet[int] =

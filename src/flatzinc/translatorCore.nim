@@ -497,14 +497,6 @@ proc constSetExpr(info: tuple[isConst: bool, constVals: HashSet[int], varInfo: S
                 node = ExpressionNode[int](kind: LiteralNode, value: 0),
                 linear = true)
 
-proc getFixedOnePos(tr: var FznTranslator): int =
-    ## Returns the position of a reusable variable fixed to 1.
-    ## Creates it on first call, reuses it on subsequent calls.
-    if tr.fixedOnePos < 0:
-        tr.fixedOnePos = tr.sys.baseArray.len
-        let v = tr.sys.newConstrainedVariable()
-        v.setDomain(@[1])
-    return tr.fixedOnePos
 
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     ## Translates a single FlatZinc constraint to a Crusher constraint.

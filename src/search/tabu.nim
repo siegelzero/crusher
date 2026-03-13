@@ -2,7 +2,6 @@ import std/[algorithm, math, packedsets, random, sequtils, tables, atomics, strf
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap]
-from ../constraints/globalCardinality import ExactCounts, BoundedCounts
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -2500,7 +2499,7 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Propagate channel variables affected by this position change
     when ProfileIteration:
         let tProp0 = epochTime()
-    let channelsChanged = state.propagateChannels(position, state.changedChannelsBuf)
+    discard state.propagateChannels(position, state.changedChannelsBuf)
 
     # Also propagate channels for forced positions (using pre-allocated buffer)
     if hasInverseMove:

@@ -3,7 +3,7 @@
 ## For a cell with value N > 1, all values 1..N-1 must appear among the cell's
 ## grid neighbours. Penalty = count of predecessor values missing from neighbours.
 
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, tables]
 
 type
     ValueSupportConstraint*[T] = ref object

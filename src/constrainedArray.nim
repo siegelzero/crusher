@@ -1,4 +1,4 @@
-import std/[packedsets, random, sequtils, strformat, tables, times]
+import std/[packedsets, sequtils, strformat, tables, times]
 import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular]
 from constraints/globalCardinality import ExactCounts, BoundedCounts
 import constraints/constraintNode

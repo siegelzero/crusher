@@ -788,7 +788,6 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     let oldEnd = min(tMax, int(currentValue) + duration)
 
     # Build prefix sum of delta values
-    let prefixDelta = state.prefixDeltaBuf
     state.prefixDeltaBuf[0] = 0
     var baseOveruse: int64 = 0
     for t in 0..<tMax:
