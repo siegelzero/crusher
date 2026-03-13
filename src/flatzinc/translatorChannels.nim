@@ -2387,8 +2387,9 @@ proc buildNetFlowVariables*(tr: var FznTranslator) =
 
     stderr.writeLine(&"[FZN] Created {tr.netFlowFreePairs.len} free net_flow search positions (domain [{-D}..{D}])")
 
-    # Step 2: Build defined expressions for dependent net_flow pairs (topo order)
-    # Each dependent pair d: net_flow[d] = sum(coeff[j] * net_flow[j])
+    # Step 2: Build defined expressions for dependent net_flow pairs (topo order).
+    # Reversed peel order guarantees each term's pair is already resolved (free pair
+    # in varPositions, or earlier dependent pair in definedVarExprs).
     var nDepBuilt = 0
     for di in 0..<tr.netFlowDependentPairs.len:
         let depPid = tr.netFlowDependentPairs[di]
@@ -2402,6 +2403,8 @@ proc buildNetFlowVariables*(tr: var FznTranslator) =
         )
         for term in terms:
             let otherName = pairNetFlowName[term.pairId]
+            assert otherName in tr.varPositions or otherName in tr.definedVarExprs,
+                "net_flow dependency " & otherName & " not yet resolved for " & nfName
             let otherExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: otherName))
             if term.coeff == 1:
                 expr = expr + otherExpr

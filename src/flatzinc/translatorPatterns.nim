@@ -5042,7 +5042,6 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
         let coeffs = stoichCoeffs[si]
         let varNames = stoichVarNames[si]
         var terms: seq[StoichPairTerm]
-        var valid = true
         for i in countup(0, coeffs.len - 1, 2):
             let v1 = varNames[i]
             let pid = pairOf[v1]
@@ -5051,8 +5050,6 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
             # If v1 is the "out" var, then v1 coeff = -sign of net_flow
             let sign = if v1 == pairInVar[pid]: coeffs[i] else: -coeffs[i]
             terms.add((pairId: pid, sign: sign))
-        if not valid:
-            return
         stoichPairTerms.add(terms)
 
     # Step 3: Build bipartite graph (metabolite constraints ↔ pairs) and check tree property
@@ -5159,6 +5156,8 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
         if not isDependentPair[pid]:
             freePairs.add(pid)
 
+    # In a tree with E edges, M metabolite nodes and P pair nodes: E = M + P - 1.
+    # Peeling eliminates exactly M pairs (one per metabolite), leaving P - M free.
     if dependentPairs.len != stoichConstraints.len:
         stderr.writeLine(&"[FZN] Net flow: tree peel incomplete ({dependentPairs.len} deps vs {stoichConstraints.len} constraints)")
         return
@@ -5280,10 +5279,8 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
     # Determine the flux domain upper bound (typically 50)
     tr.netFlowDomainBound = 0
     for pid in 0..<nPairs:
-        for decl in tr.model.variables:
-            if not decl.isArray and decl.name == pairInVar[pid]:
-                if decl.varType.kind == FznIntRange:
-                    tr.netFlowDomainBound = max(tr.netFlowDomainBound, decl.varType.hi)
-                break
+        let dom = tr.lookupVarDomain(pairInVar[pid])
+        if dom.len > 0:
+            tr.netFlowDomainBound = max(tr.netFlowDomainBound, dom[^1])
 
     stderr.writeLine(&"[FZN] Net flow pairs: consumed {stoichConstraints.len} stoichiometry + {revConstraints.len} reversibility constraints")
