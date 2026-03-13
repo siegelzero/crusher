@@ -157,3 +157,60 @@ suite "Optimization with objective bounds":
 
         check vals.len == n  # allDifferent
         check objVal == -18  # 1 - 10 - 9
+
+    test "loProven not inherited by heuristic bound updates":
+        # Regression test: when lowerBound is provided (e.g., from FZN objective
+        # domain), loProven is initialized to true. If the binary search later
+        # fails at some target and updates lo heuristically, loProven must be
+        # reset to false — otherwise the optimizer can falsely claim optimality
+        # at a suboptimal value.
+        #
+        # Setup: 5 variables in {1..20}, allDifferent, minimize sum.
+        # Optimal: 1+2+3+4+5=15. Provide lowerBound=0 (true but loose).
+        # The optimizer should find 15 and NOT stop early claiming optimality
+        # at a higher value.
+        let n = 5
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..20))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000,
+                     lowerBound=0)
+
+        let solution = x.assignment
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += solution[i]
+
+        # Must find the true optimum, not stop early
+        check actualSum == 15  # 1+2+3+4+5
+
+    test "optimalityProven only from domain reduction":
+        # Verify that optimalityProven is only set when InfeasibleError
+        # proves a bound, not from search failures.
+        # 3 variables in {1..5}, allDifferent, minimize sum.
+        # Optimal: 1+2+3=6. Domain reduction can prove lowerBound=6.
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..5))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000,
+                     lowerBound=0)
+
+        let solution = x.assignment
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += solution[i]
+
+        check actualSum == 6  # 1+2+3

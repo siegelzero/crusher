@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -298,6 +298,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "DisjunctiveClause Constraint"
         of ValueSupportType:
             return "ValueSupport Constraint"
+        of MultiResourceNoOverlapType:
+            return "MultiResourceNoOverlap Constraint"
 
 ################################################################################
 # Evaluation
@@ -367,6 +369,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.disjunctiveClauseState.cost
         of ValueSupportType:
             return constraint.valueSupportState.cost
+        of MultiResourceNoOverlapType:
+            return constraint.multiResourceNoOverlapState.cost
 
 ################################################################################
 # Computed Constraints
@@ -984,6 +988,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.disjunctiveClauseState.initialize(assignment)
         of ValueSupportType:
             constraint.valueSupportState.initialize(assignment)
+        of MultiResourceNoOverlapType:
+            constraint.multiResourceNoOverlapState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1050,6 +1056,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
             constraint.valueSupportState.moveDelta(position, oldValue, newValue)
+        of MultiResourceNoOverlapType:
+            constraint.multiResourceNoOverlapState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1116,6 +1124,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.disjunctiveClauseState.updatePosition(position, newValue)
         of ValueSupportType:
             constraint.valueSupportState.updatePosition(position, newValue)
+        of MultiResourceNoOverlapType:
+            constraint.multiResourceNoOverlapState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1159,6 +1169,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.conditionalNoOverlapPairState.getAffectedPositions()
         of ConditionalDayCapacityType:
             return constraint.conditionalDayCapacityState.getAffectedPositions()
+        of MultiResourceNoOverlapType:
+            return constraint.multiResourceNoOverlapState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1758,6 +1770,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: ValueSupportType,
                 valueSupportState: constraint.valueSupportState.deepCopy()
             )
+        of MultiResourceNoOverlapType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: MultiResourceNoOverlapType,
+                multiResourceNoOverlapState: constraint.multiResourceNoOverlapState.deepCopy()
+            )
 
 
 
@@ -1946,6 +1964,28 @@ func conditionalDayCapacity*[T](
     positions: positions,
     stateType: ConditionalDayCapacityType,
     conditionalDayCapacityState: newConditionalDayCapacityConstraint[T](tasks, capacities, maxDay)
+  )
+
+################################################################################
+# MultiResourceNoOverlap wrapper function
+################################################################################
+
+func multiResourceNoOverlap*[T](
+    overlapPos: int,
+    assignPairs: seq[AssignPair]): StatefulConstraint[T] =
+  ## Creates a multi-resource no-overlap pair constraint: if activities overlap
+  ## in time (overlap=1), they cannot share any resource. Penalty = number of
+  ## shared resources when overlapping.
+  var positions = initPackedSet[int]()
+  positions.incl(overlapPos)
+  for pair in assignPairs:
+    positions.incl(pair.posA)
+    positions.incl(pair.posB)
+  return StatefulConstraint[T](
+    positions: positions,
+    stateType: MultiResourceNoOverlapType,
+    multiResourceNoOverlapState: newMultiResourceNoOverlapConstraint[T](
+      overlapPos, assignPairs)
   )
 
 ################################################################################

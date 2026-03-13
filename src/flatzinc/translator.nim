@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport]
+import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -251,6 +251,8 @@ type
         setInReifChannelDefs*: seq[int]
         # array_bool_and/array_bool_or with defines_var → channel variables
         boolAndOrChannelDefs*: seq[int]
+        # Overlap channel defs: overlap = NOT sep via bool_not chain
+        overlapChannelDefs*: seq[tuple[ci: int, overlapVar: string, sepVar: string]]
         # Consumed disjunctive pair indices (replaced by cumulative constraints)
         consumedDisjunctivePairs*: PackedSet[int]
         # Detected disjunctive resource groups (cliques of disjunctive pairs → cumulative)
@@ -369,6 +371,11 @@ type
         netFlowDependentPairs*: seq[int]   # dependent pair indices (channels, in topo order)
         netFlowDepTerms*: seq[seq[tuple[pairId: int, coeff: int]]]  # dependency terms per dependent pair
         netFlowDomainBound*: int           # flux domain upper bound (e.g., 50)
+        # Multi-resource no-overlap pair infos: groups of bool_clause([], [assign_i_r, assign_j_r, overlap_u])
+        multiResourceNoOverlapInfos*: seq[tuple[
+            overlapVarName: string,
+            assignPairNames: seq[(string, string)],  # (assign[i,r], assign[j,r]) per resource
+            consumedCIs: seq[int]]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -749,6 +756,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
     # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
     result.detectBoolAndChannels()
+    # Detect overlap channels: overlap = NOT sep where sep is a bool_clause_reif channel
+    # MUST run after detectReifChannels() (which populates boolNotChannelDefs)
+    result.detectOverlapChannels()
     # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
     # MUST run after detectReifChannels() and detectBoolAndChannels()
     result.detectConditionalImplicationChannels()
@@ -790,6 +800,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDfaGeostPattern()
     # Detect conditional no-overlap pair patterns (room-conflict bool_clause chains)
     result.detectConditionalNoOverlapPairs()
+    # Detect multi-resource no-overlap pairs (groups of bool_clause([], [a, b, overlap]))
+    result.detectMultiResourceNoOverlapPairs()
     # Detect conditional cumulative patterns (room_admission elimination)
     result.detectConditionalCumulativePattern()
     # Detect conditional day capacity patterns (H3/H4 surgeon/OT capacity)
@@ -1308,6 +1320,30 @@ proc translate*(model: FznModel): FznTranslator =
 
     if nBuiltNoOverlap > 0:
         stderr.writeLine(&"[FZN] Built {nBuiltNoOverlap} ConditionalNoOverlapPair constraints")
+
+    # Build MultiResourceNoOverlap constraints from detected patterns
+    var nBuiltMultiRes = 0
+    for info in result.multiResourceNoOverlapInfos:
+        let overlapPos = if info.overlapVarName in result.varPositions:
+            result.varPositions[info.overlapVarName] else: -1
+        if overlapPos < 0: continue
+
+        var pairs: seq[AssignPair]
+        var allResolved = true
+        for (aName, bName) in info.assignPairNames:
+            let aPos = if aName in result.varPositions: result.varPositions[aName] else: -1
+            let bPos = if bName in result.varPositions: result.varPositions[bName] else: -1
+            if aPos < 0 or bPos < 0:
+                allResolved = false
+                break
+            pairs.add(AssignPair(posA: aPos, posB: bPos))
+        if not allResolved: continue
+
+        result.sys.addConstraint(multiResourceNoOverlap[int](overlapPos, pairs))
+        nBuiltMultiRes += 1
+
+    if nBuiltMultiRes > 0:
+        stderr.writeLine(&"[FZN] Built {nBuiltMultiRes} MultiResourceNoOverlap constraints")
 
     # Build ConditionalCumulative constraints from detected patterns
     for ccinfo in result.conditionalCumulativeInfos:

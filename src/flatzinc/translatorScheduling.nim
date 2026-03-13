@@ -77,12 +77,13 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             arrayBoolAndDefines[resultArg.ident] = (ci: ci, inputs: inputs)
 
     # Step 2: Count references to each bool var in non-defining constraints.
-    # Count references in bool_clause AND array_bool_and/array_bool_or input arrays.
+    # Count references in bool_clause, array_bool_and/array_bool_or, bool2int, bool_not, bool_clause_reif.
     var varRefCount: Table[string, int]
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
-        if name == "bool_clause":
+        case name
+        of "bool_clause":
             if con.args.len < 2: continue
             for argIdx in 0..1:
                 let arr = con.args[argIdx]
@@ -90,13 +91,33 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                 for elem in arr.elems:
                     if elem.kind == FznIdent:
                         varRefCount.mgetOrPut(elem.ident, 0) += 1
-        elif name == "array_bool_and" or name == "array_bool_or":
+        of "array_bool_and", "array_bool_or":
             if con.args.len < 1: continue
             let inputArr = con.args[0]
             if inputArr.kind != FznArrayLit: continue
             for elem in inputArr.elems:
                 if elem.kind == FznIdent:
                     varRefCount.mgetOrPut(elem.ident, 0) += 1
+        of "bool2int":
+            # bool2int(boolVar, intVar) — boolVar is referenced
+            if con.args.len >= 1 and con.args[0].kind == FznIdent:
+                varRefCount.mgetOrPut(con.args[0].ident, 0) += 1
+        of "bool_not":
+            # bool_not(a, b) — both a and b are referenced
+            for argIdx in 0..1:
+                if con.args.len > argIdx and con.args[argIdx].kind == FznIdent:
+                    varRefCount.mgetOrPut(con.args[argIdx].ident, 0) += 1
+        of "bool_clause_reif":
+            if con.args.len < 3: continue
+            for argIdx in 0..1:
+                let arr = con.args[argIdx]
+                if arr.kind != FznArrayLit: continue
+                for elem in arr.elems:
+                    if elem.kind == FznIdent:
+                        varRefCount.mgetOrPut(elem.ident, 0) += 1
+            if con.args[2].kind == FznIdent:
+                varRefCount.mgetOrPut(con.args[2].ident, 0) += 1
+        else: discard
 
     # Step 3: Scan bool_clause constraints for disjunctive patterns.
     # A bool var from int_lin_le_reif with refcount=1 can be fully consumed.
@@ -105,6 +126,7 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # For shared vars, we don't eliminate the var or its defining constraint — it becomes
     # a channel — but we still emit the algebraic constraint using the underlying vars.
     var nPairConsumed = 0
+    var nTautological = 0
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
@@ -129,12 +151,50 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             let (ok2, term2) = tr.extractLinLeReifTerm(linLeReifDefines[b2.ident])
             if not ok1 or not ok2: continue
 
+            # Check for tautological pair: the two linear expressions are negations of each other.
+            # E.g., x-y <= 0 OR y-x <= 0 is always true for integers.
+            var isTautology = false
+            if term1.varNames.len == term2.varNames.len:
+                # Check pattern 1: same coefficients, reversed variables
+                var sameCoeffs = true
+                var varsReversed = true
+                for k in 0..<term1.coeffs.len:
+                    if term2.coeffs[k] != term1.coeffs[k]:
+                        sameCoeffs = false
+                        break
+                for k in 0..<term1.varNames.len:
+                    if term2.varNames[k] != term1.varNames[term1.varNames.len - 1 - k]:
+                        varsReversed = false
+                        break
+                if sameCoeffs and varsReversed and term1.rhs + term2.rhs >= 0:
+                    isTautology = true
+
+                # Check pattern 2: negated coefficients, same variables
+                if not isTautology:
+                    var negCoeffs = true
+                    var sameVars = true
+                    for k in 0..<term1.coeffs.len:
+                        if term2.coeffs[k] != -term1.coeffs[k]:
+                            negCoeffs = false
+                            break
+                    for k in 0..<term1.varNames.len:
+                        if term2.varNames[k] != term1.varNames[k]:
+                            sameVars = false
+                            break
+                    if negCoeffs and sameVars and term1.rhs + term2.rhs >= 0:
+                        isTautology = true
+
             # Consume all 3 constraints and both bool variables
             tr.definingConstraints.incl(ci)
             tr.definingConstraints.incl(linLeReifDefines[b1.ident])
             tr.definingConstraints.incl(linLeReifDefines[b2.ident])
             tr.definedVarNames.incl(b1.ident)
             tr.definedVarNames.incl(b2.ident)
+
+            if isTautology:
+                nTautological += 1
+                nPairConsumed += 3
+                continue
 
             tr.disjunctivePairs.add((
                 coeffs1: term1.coeffs, varNames1: term1.varNames, rhs1: term1.rhs,
@@ -174,6 +234,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             tr.disjunctiveClauses.add(DisjunctiveClause(
                 disjuncts: @[@[term1], @[term2], @[term3]]))
 
+    if nTautological > 0:
+        stderr.writeLine(&"[FZN] Skipped {nTautological} tautological disjunctive pairs")
     if tr.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.disjunctivePairs.len} disjunctive pairs, " &
                                           &"{nPairConsumed} constraints consumed, " &
@@ -2635,4 +2697,77 @@ proc detectDormantPositions(tr: var FznTranslator) =
     if nDormant > 0:
         stderr.writeLine(&"[FZN] Detected {nDormant} dormant positions (diffnK don't-care placements)")
 
+
+proc detectMultiResourceNoOverlapPairs*(tr: var FznTranslator) =
+    ## Detects groups of bool_clause([], [a, b, c]) where:
+    ##   - c is an overlap variable (channel or search var)
+    ##   - a, b are assignment boolean variables
+    ## Multiple clauses sharing the same c variable are grouped into a single
+    ## MultiResourceNoOverlapConstraint.
+    ##
+    ## Pattern: for each resource r: NOT(assign[i,r] AND assign[j,r] AND overlap[i,j])
+    ## Encoded as: bool_clause([], [assign[i,r], assign[j,r], overlap[i,j]])
+    ##
+    ## Grouping by overlap variable consolidates ~21 clauses per pair into 1 constraint.
+
+    # Step 1: Collect all bool_clause([], [a, b, c]) with exactly 3 negative literals
+    type ClauseInfo = object
+        ci: int
+        neg0, neg1, neg2: string  # the three negative literal variable names
+
+    var threeNegClauses: seq[ClauseInfo]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 0 or negArg.elems.len != 3: continue
+        let n0 = negArg.elems[0]
+        let n1 = negArg.elems[1]
+        let n2 = negArg.elems[2]
+        if n0.kind != FznIdent or n1.kind != FznIdent or n2.kind != FznIdent: continue
+        threeNegClauses.add(ClauseInfo(ci: ci, neg0: n0.ident, neg1: n1.ident, neg2: n2.ident))
+
+    if threeNegClauses.len == 0: return
+
+    # Step 2: Group by the third variable (overlap variable)
+    # The third variable is the shared overlap variable. It can be a search variable,
+    # an overlap channel, or any bool variable that appears in the third position
+    # of multiple 3-negative-literal clauses.
+    # Group: overlapVar → seq[(assignA, assignB, constraintIdx)]
+    var groups: Table[string, seq[(string, string, int)]]
+    for info in threeNegClauses:
+        let overlapVar = info.neg2
+        # First two are assign variables
+        groups.mgetOrPut(overlapVar, @[]).add((info.neg0, info.neg1, info.ci))
+
+    if groups.len == 0: return
+
+    # Step 3: For each group with multiple clauses, create a MultiResourceNoOverlap info
+    var totalClauses = 0
+    for overlapVar, clauses in groups:
+        if clauses.len < 2: continue  # not worth grouping single clauses
+
+        var assignPairNames: seq[(string, string)]
+        var consumedCIs: seq[int]
+        for (a, b, ci) in clauses:
+            assignPairNames.add((a, b))
+            consumedCIs.add(ci)
+
+        tr.multiResourceNoOverlapInfos.add((
+            overlapVarName: overlapVar,
+            assignPairNames: assignPairNames,
+            consumedCIs: consumedCIs))
+
+        # Consume the individual bool_clause constraints
+        for ci in consumedCIs:
+            tr.definingConstraints.incl(ci)
+        totalClauses += consumedCIs.len
+
+    if tr.multiResourceNoOverlapInfos.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.multiResourceNoOverlapInfos.len} multi-resource no-overlap pairs " &
+                                          &"(from {totalClauses} bool_clause constraints)")
 

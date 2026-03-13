@@ -606,6 +606,11 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
         if rd.len == 0:
             domainMin[pos] = T(0)
             domainMax[pos] = T(0)
+        elif pos in carray.channelPositions and rd.len <= 1 and carray.domain[pos].len > 1:
+            # Channel with placeholder reducedDomain — use original domain bounds
+            # so bounds propagation can tighten through channels correctly
+            domainMin[pos] = carray.domain[pos][0]
+            domainMax[pos] = carray.domain[pos][^1]
         else:
             # Find actual min/max (reducedDomain may not be sorted)
             domainMin[pos] = rd[0]
@@ -647,6 +652,35 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
         let (ok, linearForm) = extractLinearForm[T](cons.relationalState)
         if not ok: continue
         forms.add(normalizeToGe(linearForm))
+
+    # Add min/max channel linear forms for bounds propagation through channels
+    # For max channel ch = max(e1, ..., en): ch >= e_i for all i
+    # For min channel ch = min(e1, ..., en): ch <= e_i for all i
+    for binding in carray.minMaxChannelBindings:
+        let chPos = binding.channelPosition
+        for inputExpr in binding.inputExprs:
+            if inputExpr.linear:
+                let linearized = linearize(inputExpr)
+                if linearized.evalMethod != PositionBased: continue
+                var coeffs: Table[int, T]
+                if not binding.isMin:
+                    # Max: ch >= input → ch - input >= 0
+                    coeffs[chPos] = T(1)
+                    for pos in linearized.coefficient.keys:
+                        if pos in coeffs:
+                            coeffs[pos] = coeffs[pos] - linearized.coefficient[pos]
+                        else:
+                            coeffs[pos] = -linearized.coefficient[pos]
+                    forms.add(NormForm(coefficients: coeffs, constant: -linearized.constant))
+                else:
+                    # Min: ch <= input → input - ch >= 0
+                    coeffs[chPos] = T(-1)
+                    for pos in linearized.coefficient.keys:
+                        if pos in coeffs:
+                            coeffs[pos] = coeffs[pos] + linearized.coefficient[pos]
+                        else:
+                            coeffs[pos] = linearized.coefficient[pos]
+                    forms.add(NormForm(coefficients: coeffs, constant: linearized.constant))
 
     if forms.len == 0: return
 
@@ -693,7 +727,6 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
     # Never produce empty or singleton domains — empty causes crashes,
     # singletons cause removeFixedConstraints to remove constraints that
     # are still needed during optimization.
-    var totalRemoved = 0
     for pos in carray.allPositions():
         let rd = carray.reducedDomain[pos]
         if rd.len <= 2: continue  # keep at least 2 values
@@ -704,7 +737,6 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
                 newDomain.add(v)
         if newDomain.len < 2: continue  # never tighten to singleton or empty
         if newDomain.len < rd.len:
-            totalRemoved += rd.len - newDomain.len
             carray.reducedDomain[pos] = newDomain
 
 proc extractLinearCoeffs[T](expr: Expression[T]): (bool, Table[int, T], T) =
@@ -1040,7 +1072,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType:
                     # Skip these constraint types for domain reduction
                     continue
 

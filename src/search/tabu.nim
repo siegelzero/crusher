@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap]
 from ../constraints/globalCardinality import ExactCounts, BoundedCounts
 import ../constrainedArray
 import ../expressions/expressions
@@ -326,6 +326,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
             result = constraint.valueSupportState.moveDelta(position, oldValue, newValue)
+        of MultiResourceNoOverlapType:
+            result = constraint.multiResourceNoOverlapState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1

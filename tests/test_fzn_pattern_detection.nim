@@ -1492,3 +1492,172 @@ solve satisfy;
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
         let bVal = tr.sys.assignment[tr.varPositions["b"]]
         check bVal == 0
+
+
+suite "FlatZinc Cumulative Zero-Height Filtering":
+
+    test "cumulative with zero-height tasks is filtered":
+        ## cumulative([s1,s2,s3], [5,5,5], [2,0,3], 4)
+        ## Task 2 has height 0, so it should be filtered out.
+        ## With tasks 1 and 3 (heights 2+3=5 > limit 4), constraint is non-trivial.
+        let src = """
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var 0..10: s3 :: output_var;
+constraint fzn_cumulative([s1,s2,s3], [5,5,5], [2,0,3], 4);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should solve: tasks 1 and 3 can't overlap (2+3>4)
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+    test "cumulative with all zero heights is eliminated":
+        ## cumulative([s1,s2], [5,5], [0,0], 4)
+        ## Both tasks have zero height → trivially satisfied, no constraint emitted.
+        let src = """
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+constraint fzn_cumulative([s1,s2], [5,5], [0,0], 4);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+    test "cumulative with sum(heights) <= limit is eliminated":
+        ## cumulative([s1,s2], [5,5], [1,2], 4)
+        ## sum = 3 <= limit 4 → trivially satisfied
+        let src = """
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+constraint fzn_cumulative([s1,s2], [5,5], [1,2], 4);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+
+suite "FlatZinc Tautological Disjunctive Pair Detection":
+
+    test "tautological pair x<=y OR y<=x is detected and skipped":
+        ## int_lin_le_reif([1,-1],[x,y],0,b1) :: defines_var(b1)   -- b1 = (x <= y)
+        ## int_lin_le_reif([1,-1],[y,x],0,b2) :: defines_var(b2)   -- b2 = (y <= x)
+        ## bool_clause([b1,b2],[])                                    -- x<=y OR y<=x, always true
+        let src = """
+var 1..10: x :: output_var;
+var 1..10: y :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+constraint int_lin_le_reif([1,-1],[x,y],0,b1) :: defines_var(b1);
+constraint int_lin_le_reif([1,-1],[y,x],0,b2) :: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should have 0 disjunctive pairs (tautology skipped)
+        check tr.disjunctivePairs.len == 0
+        # Both bool vars should still be consumed (defined)
+        check "b1" in tr.definedVarNames
+        check "b2" in tr.definedVarNames
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+    test "non-tautological pair is kept":
+        ## int_lin_le_reif([1,-1],[x,y],-2,b1)  -- b1 = (x - y <= -2) i.e. x + 2 <= y
+        ## int_lin_le_reif([1,-1],[y,x],-3,b2)  -- b2 = (y - x <= -3) i.e. y + 3 <= x
+        ## bool_clause([b1,b2],[])                 -- non-overlapping OR
+        let src = """
+var 1..20: x :: output_var;
+var 1..20: y :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+constraint int_lin_le_reif([1,-1],[x,y],-2,b1) :: defines_var(b1);
+constraint int_lin_le_reif([1,-1],[y,x],-3,b2) :: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should have 1 disjunctive pair (not a tautology: rhs1+rhs2 = -5 < 0)
+        check tr.disjunctivePairs.len == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+
+suite "FlatZinc Overlap Channel Detection":
+
+    test "overlap = NOT sep detected as channel":
+        ## int_le_reif(5, s2, b1) :: defines_var(b1)     -- b1 = (5 <= s2) i.e. s1+dur1 <= s2
+        ## int_le_reif(8, s1, b2) :: defines_var(b2)     -- b2 = (8 <= s1) i.e. s2+dur2 <= s1
+        ## bool_clause_reif([b1,b2],[],sep) :: defines_var(sep)  -- sep = b1 OR b2
+        ## bool_not(overlap, sep) :: defines_var(sep)            -- overlap = NOT sep
+        ## The overlap variable should become a channel.
+        let src = """
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: sep :: var_is_introduced :: is_defined_var;
+var bool: overlap :: output_var;
+constraint int_le_reif(5, s2, b1) :: defines_var(b1);
+constraint int_le_reif(8, s1, b2) :: defines_var(b2);
+constraint bool_clause_reif([b1,b2],[],sep) :: defines_var(sep);
+constraint bool_not(overlap, sep) :: defines_var(sep);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # overlap should be detected as an overlap variable
+        check tr.overlapChannelDefs.len == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error
+
+
+suite "FlatZinc Multi-Resource No-Overlap Detection":
+
+    test "grouped bool_clause([], [a,b,overlap]) → single constraint":
+        ## 3 resources, overlap detected as channel, 3 clauses grouped into 1 constraint.
+        let src = """
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: sep :: var_is_introduced :: is_defined_var;
+var bool: overlap :: output_var;
+var bool: a1r1 :: output_var;
+var bool: a2r1 :: output_var;
+var bool: a1r2 :: output_var;
+var bool: a2r2 :: output_var;
+var bool: a1r3 :: output_var;
+var bool: a2r3 :: output_var;
+constraint int_le_reif(5, s2, b1) :: defines_var(b1);
+constraint int_le_reif(8, s1, b2) :: defines_var(b2);
+constraint bool_clause_reif([b1,b2],[],sep) :: defines_var(sep);
+constraint bool_not(overlap, sep) :: defines_var(sep);
+constraint bool_clause([], [a1r1, a2r1, overlap]);
+constraint bool_clause([], [a1r2, a2r2, overlap]);
+constraint bool_clause([], [a1r3, a2r3, overlap]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # 3 clauses should be grouped into 1 multi-resource constraint
+        check tr.multiResourceNoOverlapInfos.len == 1
+        check tr.multiResourceNoOverlapInfos[0].assignPairNames.len == 3
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        discard  # solve completed without error

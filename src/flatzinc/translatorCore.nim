@@ -1026,7 +1026,26 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 limit = dom[^1]  # upper bound as initial value
             else:
                 limit = 10  # fallback
-        tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, limit, limitPos))
+        # Filter out tasks with zero height
+        var filteredStarts: seq[AlgebraicExpression[int]]
+        var filteredDurations: seq[int]
+        var filteredHeights: seq[int]
+        for i in 0..<heights.len:
+            if heights[i] > 0:
+                filteredStarts.add(startExprs[i])
+                filteredDurations.add(durations[i])
+                filteredHeights.add(heights[i])
+        let nFiltered = heights.len - filteredHeights.len
+        if nFiltered > 0:
+            stderr.writeLine(&"[FZN] cumulative: filtered {nFiltered} zero-height tasks")
+        # Skip if trivially satisfied
+        var totalHeight = 0
+        for h in filteredHeights: totalHeight += h
+        if filteredStarts.len <= 1 or totalHeight <= limit:
+            if nFiltered > 0:
+                stderr.writeLine(&"[FZN] cumulative: constraint eliminated (trivially satisfied)")
+        else:
+            tr.sys.addConstraint(cumulative[int](filteredStarts, filteredDurations, filteredHeights, limit, limitPos))
 
     of "fzn_disjunctive", "fzn_disjunctive_strict":
         # disjunctive(starts, durations) = cumulative(starts, durations, heights=[1,...], limit=1)

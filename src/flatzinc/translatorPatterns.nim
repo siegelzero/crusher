@@ -4521,6 +4521,39 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool AND channels (b = AND(ci) from bool_clause)")
 
+proc detectOverlapChannels*(tr: var FznTranslator) =
+    ## Detects overlap variables connected to time-separation channels through bool_not.
+    ## Pattern:
+    ##   bool_not(overlap, sep) :: defines_var(sep)   [already consumed, sep is channel]
+    ## Records the overlap variable names for use by multi-resource consolidation.
+    ## The overlap variable itself stays as a search variable (to avoid circular
+    ## channel dependencies).
+    ##
+    ## Must run after detectReifChannels().
+
+    var detected = 0
+    for ci in tr.boolNotChannelDefs:
+        let con = tr.model.constraints[ci]
+        let aArg = con.args[0]  # the 'overlap' variable
+        let bArg = con.args[1]  # the 'sep' variable (already a channel)
+
+        if aArg.kind != FznIdent or bArg.kind != FznIdent: continue
+        let aName = aArg.ident
+        let bName = bArg.ident
+
+        # b must be a channel (the sep variable)
+        if bName notin tr.channelVarNames: continue
+        # a must NOT already be a channel or defined
+        if aName in tr.channelVarNames or aName in tr.definedVarNames: continue
+
+        # Record for multi-resource consolidation (overlap stays as search variable)
+        tr.overlapChannelDefs.add((ci: ci, overlapVar: aName, sepVar: bName))
+        inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} overlap variables (a = NOT sep via bool_not)")
+
+
 proc detectConditionalImplicationChannels*(tr: var FznTranslator) =
     ## Detects patterns where a variable is fully determined by implications through
     ## bool_clause([eq_reif(target, val)], [cond_channel]).
