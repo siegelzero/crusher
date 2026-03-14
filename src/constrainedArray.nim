@@ -2176,8 +2176,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if cons.stateType == ElementType:
             let es = cons.elementState
             if es.evalMethod == PositionBased and not es.isConstantArray:
+                var seen = initPackedSet[int]()  # deduplicate positions within this constraint
                 for elem in es.arrayElements:
-                    if not elem.isConstant:
+                    if not elem.isConstant and elem.variablePosition notin seen:
+                        seen.incl(elem.variablePosition)
                         elemArrayParticipation.mgetOrPut(elem.variablePosition, @[]).add(ci)
 
     # Precompute reverse map: position -> channel binding indices where it's a variable array element
@@ -3295,6 +3297,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         var elemBackPruned = 0
         for pos, constraintIndices in elemArrayParticipation.pairs:
             if currentDomain[pos].len <= 1: continue
+            if pos in skippedPositions: continue
             var allowedValues = initPackedSet[T]()
             for ci in constraintIndices:
                 let cons = carray.constraints[ci]
@@ -3681,6 +3684,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # For each position that appears as a variable array element in channel bindings,
         # restrict its domain to the union of channel-position domains from reachable bindings.
         var cbVarPruned = 0
+        var tempAssign = initTable[int, T]()
         for pos, bindingIndices in channelArrayParticipation.pairs:
             if currentDomain[pos].len <= 1: continue
             if pos in skippedPositions: continue
@@ -3694,7 +3698,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 # Check if this position is reachable from the index domain
                 if idxPositions.len == 1:
                     let keyPos = idxPositions[0]
-                    var tempAssign = initTable[int, T]()
                     for v in currentDomain[keyPos].items:
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)

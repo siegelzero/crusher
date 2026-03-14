@@ -186,36 +186,42 @@ proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
                 expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
             )
 
+func mergeLinearExpressions[T](expressions: openArray[AlgebraicExpression[T]],
+                                weights: openArray[T] = []): SumExpression[T] =
+    ## Merges linear expressions into a single PositionBased SumExpression.
+    ## If weights is non-empty, each expression is scaled by the corresponding weight.
+    var mergedCoeffs = initTable[int, T]()
+    var mergedConst: T = 0
+    let hasWeights = weights.len > 0
+    for i in 0..<expressions.len:
+        let lin = linearize(expressions[i])
+        let w = if hasWeights: weights[i] else: T(1)
+        mergedConst += w * lin.constant
+        for pos, c in lin.coefficient.pairs:
+            mergedCoeffs.mgetOrPut(pos, T(0)) += w * c
+    # Remove zero coefficients
+    var toRemove: seq[int]
+    for pos, c in mergedCoeffs.pairs:
+        if c == T(0): toRemove.add(pos)
+    for pos in toRemove: mergedCoeffs.del(pos)
+    return newSumExpression[T](mergedCoeffs, mergedConst)
+
+func allLinear[T](expressions: openArray[AlgebraicExpression[T]]): bool =
+    for expr in expressions:
+        if not expr.linear: return false
+    return true
+
 func sum*[T](expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
     let (allRefs, positions) = isAllRefs(expressions)
 
     if allRefs:
         # Use more efficient position-based constraint if all expressions are RefNodes
         return newSumExpression[T](positions)
+    elif allLinear(expressions):
+        return mergeLinearExpressions(expressions)
     else:
-        # Check if all expressions are linear -> can still use PositionBased
-        var allLinear = true
-        for expr in expressions:
-            if not expr.linear:
-                allLinear = false
-                break
-        if allLinear:
-            var mergedCoeffs = initTable[int, T]()
-            var mergedConst: T = 0
-            for expr in expressions:
-                let lin = linearize(expr)
-                mergedConst += lin.constant
-                for pos, c in lin.coefficient.pairs:
-                    mergedCoeffs.mgetOrPut(pos, T(0)) += c
-            # Remove zero coefficients
-            var toRemove: seq[int]
-            for pos, c in mergedCoeffs.pairs:
-                if c == T(0): toRemove.add(pos)
-            for pos in toRemove: mergedCoeffs.del(pos)
-            return newSumExpression[T](mergedCoeffs, mergedConst)
-        else:
-            # Use expression-based constraint for complex expressions
-            return newSumExpression[T](expressions)
+        # Use expression-based constraint for complex expressions
+        return newSumExpression[T](expressions)
 
 func scalarProduct*[T](coefficients: openArray[T],
                         expressions: openArray[AlgebraicExpression[T]]): SumExpression[T] =
@@ -233,30 +239,11 @@ func scalarProduct*[T](coefficients: openArray[T],
             else:
                 coeffTable[pos] = coefficients[i]
         return newSumExpression[T](coeffTable)
+    elif allLinear(expressions):
+        return mergeLinearExpressions(expressions, coefficients)
     else:
-        # Check if all expressions are linear -> can still use PositionBased
-        var allLinear = true
-        for expr in expressions:
-            if not expr.linear:
-                allLinear = false
-                break
-        if allLinear:
-            var mergedCoeffs = initTable[int, T]()
-            var mergedConst: T = 0
-            for i in 0..<expressions.len:
-                let lin = linearize(expressions[i])
-                mergedConst += coefficients[i] * lin.constant
-                for pos, c in lin.coefficient.pairs:
-                    mergedCoeffs.mgetOrPut(pos, T(0)) += coefficients[i] * c
-            # Remove zero coefficients
-            var toRemove: seq[int]
-            for pos, c in mergedCoeffs.pairs:
-                if c == T(0): toRemove.add(pos)
-            for pos in toRemove: mergedCoeffs.del(pos)
-            return newSumExpression[T](mergedCoeffs, mergedConst)
-        else:
-            # Create weighted algebraic expressions
-            var weightedExprs = newSeq[AlgebraicExpression[T]](expressions.len)
-            for i in 0..<expressions.len:
-                weightedExprs[i] = expressions[i] * coefficients[i]
-            return newSumExpression[T](weightedExprs)
+        # Create weighted algebraic expressions
+        var weightedExprs = newSeq[AlgebraicExpression[T]](expressions.len)
+        for i in 0..<expressions.len:
+            weightedExprs[i] = expressions[i] * coefficients[i]
+        return newSumExpression[T](weightedExprs)
