@@ -1893,3 +1893,45 @@ suite "Net Flow Pair Detection":
       let v = tr.sys.assignment[tr.varPositions[vName]]
       check v >= 0
       check v <= D
+
+  test "table constraint with defined-var expressions (non-ref columns)":
+    # Regression: fzn_table_int where some columns are defined variables
+    # resolved to linear expressions (not simple variable references).
+    # Previously crashed with: "tableIn currently requires simple variable references"
+    let src = """
+var 1..3: x :: output_var;
+var 1..3: y :: output_var;
+var 2..6: z :: is_defined_var;
+constraint int_lin_eq([1, 1, -1], [x, y, z], 0) :: defines_var(z);
+constraint fzn_table_int([x, z], [1, 2, 2, 4, 3, 6]);
+solve satisfy;
+"""
+    # z = x + y, table says (x,z) in {(1,2),(2,4),(3,6)}.
+    # So x=1→z=2→y=1, x=2→z=4→y=2, x=3→z=6→y=3.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    # z is a defined var (no position), so verify via x and y:
+    # table requires z = 2*x, and z = x+y, so y must equal x
+    check xVal == yVal
+    check xVal in {1, 2, 3}
+
+  test "table constraint with constant expression column":
+    # Table where one column is a literal constant — should filter and project.
+    let src = """
+var 1..3: x :: output_var;
+var 10..30: y :: output_var;
+constraint fzn_table_int([x, 2, y], [1, 2, 10, 2, 2, 20, 3, 2, 30, 1, 3, 99]);
+solve satisfy;
+"""
+    # Column 1 is constant 2, so only rows (1,2,10),(2,2,20),(3,2,30) match.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check (xVal, yVal) in [(1, 10), (2, 20), (3, 30)]

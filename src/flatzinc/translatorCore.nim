@@ -1290,7 +1290,72 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             if not tr.tryTableFunctionalDep(positions, tuples):
                 tr.sys.addConstraint(tableIn[int](positions, tuples))
         else:
-            tr.sys.addConstraint(tableIn[int](exprs, tuples))
+            # Some expressions are not simple variable references (e.g., defined vars
+            # with linear expressions, or constants). Materialize them:
+            # - Constants: filter tuples and project out the column
+            # - Simple refs: use position directly
+            # - Complex expressions: create auxiliary position with equality constraint
+            var constCols: PackedSet[int]
+            var constVals: Table[int, int]
+            for col in 0..<arity:
+                if exprs[col].node.kind == LiteralNode:
+                    constCols.incl(col)
+                    constVals[col] = exprs[col].node.value
+
+            # Filter tuples by constant columns
+            var filteredTuples: seq[seq[int]]
+            for t in tuples:
+                var matches = true
+                for col in constCols.items:
+                    if t[col] != constVals[col]:
+                        matches = false
+                        break
+                if matches:
+                    filteredTuples.add(t)
+
+            if filteredTuples.len == 0:
+                stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after constant filtering — infeasible")
+            else:
+                # Build positions for non-constant columns, materializing complex expressions
+                var tablePositions: seq[int]
+                var projectCols: seq[int]  # original column indices to keep
+                for col in 0..<arity:
+                    if col in constCols:
+                        continue
+                    projectCols.add(col)
+                    let expr = exprs[col]
+                    if expr.node.kind == RefNode:
+                        tablePositions.add(expr.node.position)
+                    else:
+                        # Create auxiliary position constrained to equal this expression
+                        let auxPos = tr.sys.baseArray.len
+                        let auxVar = tr.sys.newConstrainedVariable()
+                        # Domain: unique values in this column from filtered tuples
+                        var colVals: seq[int]
+                        var seen: HashSet[int]
+                        for t in filteredTuples:
+                            if t[col] notin seen:
+                                seen.incl(t[col])
+                                colVals.add(t[col])
+                        colVals.sort()
+                        auxVar.setDomain(colVals)
+                        tr.sys.baseArray.channelPositions.incl(auxPos)
+                        # Constrain: auxPos == expression
+                        let auxExpr = tr.getExpr(auxPos)
+                        tr.sys.addConstraint(auxExpr == expr)
+                        tablePositions.add(auxPos)
+
+                # Project out constant columns from tuples
+                var projectedTuples: seq[seq[int]]
+                for t in filteredTuples:
+                    var projected = newSeq[int](projectCols.len)
+                    for j, col in projectCols:
+                        projected[j] = t[col]
+                    projectedTuples.add(projected)
+
+                if tablePositions.len > 0 and projectedTuples.len > 0:
+                    if not tr.tryTableFunctionalDep(tablePositions, projectedTuples):
+                        tr.sys.addConstraint(tableIn[int](tablePositions, projectedTuples))
 
     of "fzn_global_cardinality":
         # global_cardinality(x, cover, counts)
