@@ -1343,6 +1343,50 @@ solve minimize objective;
         let dVal = tr.sys.assignment[tr.varPositions["D"]]
         check dVal == 10
 
+    test "detectMaxFromLinLe: source variables are defined vars (regression 361662f)":
+        ## When source variables in the max-from-lin-le pattern are defined vars
+        ## (not search vars), emitMaxFromLinLeChannels must resolve them via
+        ## definedVarExprs. This requires buildDefinedExpressions to run first.
+        ## Before the fix, emitMaxFromLinLeChannels ran before buildDefinedExpressions,
+        ## causing a KeyError when resolving the defined source variables.
+        let src = """
+var 1..10: x1 :: output_var;
+var 1..10: x2 :: output_var;
+var 1..10: x3 :: output_var;
+var int: s1 :: is_defined_var;
+var int: s2 :: is_defined_var;
+var int: s3 :: is_defined_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_eq([2,-1],[x1,s1],-1) :: defines_var(s1);
+constraint int_lin_eq([3,-1],[x2,s2],0) :: defines_var(s2);
+constraint int_lin_eq([1,-1],[x3,s3],-5) :: defines_var(s3);
+constraint int_lin_le([1,-1],[s1,D],0);
+constraint int_lin_le([1,-1],[s2,D],0);
+constraint int_lin_le([1,-1],[s3,D],0);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+constraint int_eq(x1, 5);
+constraint int_eq(x2, 4);
+constraint int_eq(x3, 8);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pattern should be detected with defined source vars
+        check tr.maxFromLinLeDefs.len == 1
+        check tr.maxFromLinLeDefs[0].ceilingVarName == "D"
+
+        # s1, s2, s3 should be defined (not search) variables
+        check "s1" in tr.definedVarNames
+        check "s2" in tr.definedVarNames
+        check "s3" in tr.definedVarNames
+
+        # s1=2*5+1=11, s2=3*4=12, s3=8+5=13 → D = max(11,12,13) = 13
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let dVal = tr.sys.assignment[tr.varPositions["D"]]
+        check dVal == 13
+
 suite "FlatZinc Diffn Time Profile Tightening":
 
     test "tightenDiffnTimeProfile: constant x/dx/dy tightens ceiling domain":
