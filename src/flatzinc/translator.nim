@@ -856,17 +856,8 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit direct atMost constraints for detected atMost-through-reification patterns
     if result.atMostThroughReifDefs.len > 0:
         result.emitAtMostThroughReif()
-    # Emit max channels for detected max-from-lin-le patterns
-    if result.maxFromLinLeDefs.len > 0:
-        result.emitMaxFromLinLeChannels()
-    # NOTE: emitSpreadPatternChannels intentionally not called (see detection note above)
-    # Tighten domains from diffn time profile analysis
-    result.tightenDiffnTimeProfile()
-    # Bidirectional ceiling/source domain tightening for max-from-lin-le patterns
-    result.tightenMaxFromLinLeBounds()
-    # Prune admission domains using zero-capacity day detection
-    result.pruneZeroCapacityDays()
     # Build expressions for defined variables using the now-created positions
+    # (must run before emitMaxFromLinLeChannels which resolves source vars as expressions)
     result.buildDefinedExpressions()
     # Build expressions for element channel aliases (duplicate → original channel's position)
     for aliasName, originalName in result.elementChannelAliases:
@@ -880,6 +871,16 @@ proc translate*(model: FznModel): FznTranslator =
             result.definedVarExprs[copyName] = result.getExpr(result.varPositions[originalName])
         elif originalName in result.definedVarExprs:
             result.definedVarExprs[copyName] = result.definedVarExprs[originalName]
+    # Emit max channels for detected max-from-lin-le patterns
+    if result.maxFromLinLeDefs.len > 0:
+        result.emitMaxFromLinLeChannels()
+    # NOTE: emitSpreadPatternChannels intentionally not called (see detection note above)
+    # Tighten domains from diffn time profile analysis
+    result.tightenDiffnTimeProfile()
+    # Bidirectional ceiling/source domain tightening for max-from-lin-le patterns
+    result.tightenMaxFromLinLeBounds()
+    # Prune admission domains using zero-capacity day detection
+    result.pruneZeroCapacityDays()
     # Build set of variable names that are inputs to min/max channels.
     # Bounds on these intermediate variables are MiniZinc domain analysis artifacts,
     # not problem constraints. The min/max channel propagation maintains correct values
