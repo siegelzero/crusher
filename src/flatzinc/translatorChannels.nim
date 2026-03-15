@@ -55,6 +55,26 @@ proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
     stderr.writeLine(&"[FZN] Un-channeled {skipped.len} {label} bindings (domain too large)")
 
 
+proc canComposeConstElement(tr: var FznTranslator, idxArgName: string):
+    tuple[success: bool, indexVar: string, constArray: seq[int], upDomain: seq[int], adjustedIdx: AlgebraicExpression[int]] =
+    ## Helper: check if a const-element channel can be composed, and if so, return the upstream info.
+    ## Caller applies the specific mapping logic based on constraint semantics.
+    if idxArgName.len == 0 or idxArgName notin tr.constElementSources:
+        return (false, "", @[], @[], AlgebraicExpression[int]())
+
+    let sourceInfo = tr.constElementSources[idxArgName]
+    if sourceInfo.indexVar notin tr.varPositions:
+        return (false, "", @[], @[], AlgebraicExpression[int]())
+
+    let upDomain = tr.lookupVarDomain(sourceInfo.indexVar)
+    if upDomain.len == 0 or upDomain.len != sourceInfo.constArray.len:
+        return (false, "", @[], @[], AlgebraicExpression[int]())
+
+    let upPos = tr.varPositions[sourceInfo.indexVar]
+    let adjustedIdx = tr.getExpr(upPos) - upDomain[0]
+
+    return (true, sourceInfo.indexVar, sourceInfo.constArray, upDomain, adjustedIdx)
+
 proc buildReifChannelBindings(tr: var FznTranslator) =
     ## Builds channel bindings for int_eq_reif and bool2int patterns detected
     ## by detectReifChannels. Must be called after translateVariables.
@@ -122,18 +142,16 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             var didCompose = false
 
             # Check if x var is itself a const-element channel — compose directly from upstream
-            if xArg.kind == FznIdent and xArg.ident in tr.constElementSources:
-                let upstream = tr.constElementSources[xArg.ident]
-                if upstream.indexVar in tr.varPositions:
-                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
-                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
-                        let upPos = tr.varPositions[upstream.indexVar]
-                        indexExpr = tr.getExpr(upPos) - upDomain[0]
-                        for v in upDomain:
-                            let mappedVal = upstream.constArray[v - upDomain[0]]
-                            arrayElems.add(ArrayElement[int](isConstant: true,
-                                constantValue: if (mappedVal == val) == isEq: 1 else: 0))
-                        didCompose = true
+            if xArg.kind == FznIdent:
+                let (canCompose, indexVar, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
+                if canCompose:
+                    indexExpr = adjustedIdx
+                    for v in upDomain:
+                        let mappedVal = constArray[v - upDomain[0]]
+                        arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if (mappedVal == val) == isEq: 1 else: 0))
+                    didCompose = true
+                    stderr.writeLine(&"[FZN] Composed int_eq_reif({xArg.ident}, {val}) from upstream element")
 
             if not didCompose:
                 let domain = tr.resolveActualDomain(xExpr, xArg.ident)
@@ -394,18 +412,16 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             var didCompose = false
 
             # Check if x var is itself a const-element channel — compose directly from upstream
-            if xArg.kind == FznIdent and xArg.ident in tr.constElementSources:
-                let upstream = tr.constElementSources[xArg.ident]
-                if upstream.indexVar in tr.varPositions:
-                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
-                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
-                        let upPos = tr.varPositions[upstream.indexVar]
-                        indexExpr = tr.getExpr(upPos) - upDomain[0]
-                        for v in upDomain:
-                            let mappedVal = upstream.constArray[v - upDomain[0]]
-                            arrayElems.add(ArrayElement[int](isConstant: true,
-                                constantValue: if mappedVal in setAsHashSet: 1 else: 0))
-                        didCompose = true
+            if xArg.kind == FznIdent:
+                let (canCompose, indexVar, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
+                if canCompose:
+                    indexExpr = adjustedIdx
+                    for v in upDomain:
+                        let mappedVal = constArray[v - upDomain[0]]
+                        arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if mappedVal in setAsHashSet: 1 else: 0))
+                    didCompose = true
+                    stderr.writeLine(&"[FZN] Composed set_in_reif({xArg.ident}) from upstream element")
 
             if not didCompose:
                 let domain = tr.resolveActualDomain(xExpr, xArg.ident)
@@ -1025,30 +1041,31 @@ proc buildChannelBindings(tr: var FznTranslator) =
             let constArray = tr.resolveIntArray(con.args[1])
 
             # Check if index var is itself a const-element channel — compose if so
+            # (double-hop: upstream var → intermediate element → final array value)
             let idxArgName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
-            var composed = false
-            if idxArgName.len > 0 and idxArgName in tr.constElementSources:
-                let upstream = tr.constElementSources[idxArgName]
-                if upstream.indexVar in tr.varPositions:
-                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
-                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
-                        var composedArr: seq[int]
-                        var valid = true
-                        for v in upDomain:
-                            let midIdx = upstream.constArray[v - upDomain[0]]
-                            let finalIdx = midIdx - 1  # 0-based into constArray
-                            if finalIdx < 0 or finalIdx >= constArray.len:
-                                valid = false
-                                break
-                            composedArr.add(constArray[finalIdx])
-                        if valid and composedArr.len > 0:
-                            let upPos = tr.varPositions[upstream.indexVar]
-                            adjustedIndex = tr.getExpr(upPos) - upDomain[0]
-                            for v in composedArr:
-                                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
-                            composed = true
+            var didCompose = false
+            if idxArgName.len > 0:
+                let (canCompose, indexVar, upstreamConstArray, upDomain, adjustedIdx) = canComposeConstElement(tr, idxArgName)
+                if canCompose:
+                    var composedArr: seq[int]
+                    var valid = true
+                    # Double-hop: upstream constArray values are 1-based indices into constArray
+                    for v in upDomain:
+                        let midIdx = upstreamConstArray[v - upDomain[0]]
+                        let finalIdx = midIdx - 1  # convert to 0-based
+                        if finalIdx < 0 or finalIdx >= constArray.len:
+                            valid = false
+                            break
+                        composedArr.add(constArray[finalIdx])
+                    if valid and composedArr.len > 0:
+                        adjustedIndex = adjustedIdx
+                        for v in composedArr:
+                            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+                        didCompose = true
+                        stderr.writeLine(&"[FZN] Composed element({idxArgName}) from upstream element (double-hop)")
 
-            if not composed:
+            # Fall through if composition failed: build normal binding from constArray
+            if not didCompose:
                 for v in constArray:
                     arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
 

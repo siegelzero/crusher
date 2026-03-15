@@ -6103,6 +6103,11 @@ proc detectConstantElementComposition*(tr: var FznTranslator) =
     ## For each element channel with a constant array and simple ident index var,
     ## stores (indexVar, constArray) in constElementSources so downstream channel
     ## bindings can compose directly from the upstream var instead of through the channel.
+    ##
+    ## This enables eliminating intermediate channel variables from the penalty graph.
+    ## When a constraint (e.g., int_eq_reif, element) uses a var that is itself a const-element
+    ## channel, the binding composes through to the original search variable, skipping the
+    ## intermediate channel. Each composition logs "[FZN] Composed ..." to stderr.
 
     # Direct element channels with constant arrays
     for ci, chanName in tr.channelConstraints:
