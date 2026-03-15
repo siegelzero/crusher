@@ -269,6 +269,9 @@ type
         # Element channel aliases: maps duplicate channel var name → original channel var name
         # (when multiple element constraints share same index var and constant array)
         elementChannelAliases*: Table[string, string]
+        # Maps constant-element channel var name -> (upstream index var name, constant lookup array)
+        # For composing downstream bindings to skip intermediate channel variables.
+        constElementSources*: Table[string, tuple[indexVar: string, constArray: seq[int]]]
         # Equality copy aliases: maps eliminated copy var name → original var name
         equalityCopyAliases*: Table[string, string]
         # Constraint indices of int_eq_reif that are equality copies (skip in buildReifChannelBindings)
@@ -704,6 +707,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.objectiveLoBound = low(int)
     result.objectiveHiBound = high(int)
     result.elementChannelAliases = initTable[string, string]()
+    result.constElementSources = initTable[string, tuple[indexVar: string, constArray: seq[int]]]()
     result.equalityCopyAliases = initTable[string, string]()
     result.equalityCopyReifCIs = initPackedSet[int]()
     result.setVarBoolPositions = initTable[string, SetVarInfo]()
@@ -1639,6 +1643,10 @@ proc translate*(model: FznModel): FznTranslator =
             result.geostConversion.tileVarPositions,
             result.geostConversion.allPlacements
         ))
+
+    # Detect constant-element sources for downstream composition (eliminates cascade hops)
+    # MUST run before detectSharedIndexConsolidation (which removes some element constraints from channelConstraints)
+    result.detectConstantElementComposition()
 
     # Consolidate shared-index element channels into table constraints
     # MUST run after translateVariables (positions exist) and before buildChannelBindings

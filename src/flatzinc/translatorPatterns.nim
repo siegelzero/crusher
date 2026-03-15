@@ -6098,3 +6098,34 @@ proc detectBoolXorSimplification(tr: var FznTranslator) =
 
     if nFolded > 0:
         stderr.writeLine(&"[FZN] Folded {nFolded} bool_xor constraints with constant inputs")
+
+proc detectConstantElementComposition*(tr: var FznTranslator) =
+    ## For each element channel with a constant array and simple ident index var,
+    ## stores (indexVar, constArray) in constElementSources so downstream channel
+    ## bindings can compose directly from the upstream var instead of through the channel.
+
+    # Direct element channels with constant arrays
+    for ci, chanName in tr.channelConstraints:
+        let con = tr.model.constraints[ci]
+        let cname = stripSolverPrefix(con.name)
+        if cname notin ["array_int_element", "array_int_element_nonshifted", "array_bool_element"]:
+            continue
+        if con.args[0].kind != FznIdent:
+            continue
+        let indexVarName = con.args[0].ident
+        # Only vars that have actual positions (search or channel) — skip eliminated vars
+        if indexVarName in tr.definedVarNames and indexVarName notin tr.varPositions:
+            continue
+        try:
+            let constArray = tr.resolveIntArray(con.args[1])
+            tr.constElementSources[chanName] = (indexVar: indexVarName, constArray: constArray)
+        except ValueError, KeyError:
+            discard
+
+    # Propagate to aliases (multiple element vars with same index+array share the source)
+    for aliasName, originalName in tr.elementChannelAliases:
+        if originalName in tr.constElementSources:
+            tr.constElementSources[aliasName] = tr.constElementSources[originalName]
+
+    if tr.constElementSources.len > 0:
+        stderr.writeLine(&"[FZN] ConstElementComposition: {tr.constElementSources.len} element channels eligible for downstream composition")

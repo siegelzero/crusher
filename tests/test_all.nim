@@ -9,6 +9,7 @@ import test_circuit
 import test_conditional_count_eq_channels
 import test_connected
 import test_constrained_variable
+import test_constant_element_composition
 import test_count_eq
 import test_count_eq_channels
 import test_cumulative

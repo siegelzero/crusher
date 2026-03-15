@@ -119,20 +119,37 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             let val = if valArg.kind == FznIntLit: valArg.intVal
                                 else: tr.paramValues[valArg.ident]
             let xExpr = tr.resolveExprArg(xArg)
-            let domain = tr.resolveActualDomain(xExpr, xArg.ident)
-            if domain.len == 0:
-                skippedReifCIs.incl(ci)
-                continue
-            let lo = domain[0]
-            let hi = domain[^1]
-            if hi - lo + 1 > 100_000:
-                skippedReifCIs.incl(ci)
-                continue
+            var didCompose = false
 
-            indexExpr = xExpr - lo
-            for v in lo..hi:
-                arrayElems.add(ArrayElement[int](isConstant: true,
-                        constantValue: if (v == val) == isEq: 1 else: 0))
+            # Check if x var is itself a const-element channel — compose directly from upstream
+            if xArg.kind == FznIdent and xArg.ident in tr.constElementSources:
+                let upstream = tr.constElementSources[xArg.ident]
+                if upstream.indexVar in tr.varPositions:
+                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
+                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
+                        let upPos = tr.varPositions[upstream.indexVar]
+                        indexExpr = tr.getExpr(upPos) - upDomain[0]
+                        for v in upDomain:
+                            let mappedVal = upstream.constArray[v - upDomain[0]]
+                            arrayElems.add(ArrayElement[int](isConstant: true,
+                                constantValue: if (mappedVal == val) == isEq: 1 else: 0))
+                        didCompose = true
+
+            if not didCompose:
+                let domain = tr.resolveActualDomain(xExpr, xArg.ident)
+                if domain.len == 0:
+                    skippedReifCIs.incl(ci)
+                    continue
+                let lo = domain[0]
+                let hi = domain[^1]
+                if hi - lo + 1 > 100_000:
+                    skippedReifCIs.incl(ci)
+                    continue
+
+                indexExpr = xExpr - lo
+                for v in lo..hi:
+                    arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if (v == val) == isEq: 1 else: 0))
 
         elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
             # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
@@ -374,20 +391,37 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             let setAsHashSet = toHashSet(setValues)
 
             let xExpr = tr.resolveExprArg(xArg)
-            let domain = tr.resolveActualDomain(xExpr, xArg.ident)
-            if domain.len == 0:
-                skippedSetInReifCIs.incl(ci)
-                continue
-            let lo = domain[0]
-            let hi = domain[^1]
-            if hi - lo + 1 > 100_000:
-                skippedSetInReifCIs.incl(ci)
-                continue
+            var didCompose = false
 
-            indexExpr = xExpr - lo
-            for v in lo..hi:
-                arrayElems.add(ArrayElement[int](isConstant: true,
-                        constantValue: if v in setAsHashSet: 1 else: 0))
+            # Check if x var is itself a const-element channel — compose directly from upstream
+            if xArg.kind == FznIdent and xArg.ident in tr.constElementSources:
+                let upstream = tr.constElementSources[xArg.ident]
+                if upstream.indexVar in tr.varPositions:
+                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
+                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
+                        let upPos = tr.varPositions[upstream.indexVar]
+                        indexExpr = tr.getExpr(upPos) - upDomain[0]
+                        for v in upDomain:
+                            let mappedVal = upstream.constArray[v - upDomain[0]]
+                            arrayElems.add(ArrayElement[int](isConstant: true,
+                                constantValue: if mappedVal in setAsHashSet: 1 else: 0))
+                        didCompose = true
+
+            if not didCompose:
+                let domain = tr.resolveActualDomain(xExpr, xArg.ident)
+                if domain.len == 0:
+                    skippedSetInReifCIs.incl(ci)
+                    continue
+                let lo = domain[0]
+                let hi = domain[^1]
+                if hi - lo + 1 > 100_000:
+                    skippedSetInReifCIs.incl(ci)
+                    continue
+
+                indexExpr = xExpr - lo
+                for v in lo..hi:
+                    arrayElems.add(ArrayElement[int](isConstant: true,
+                            constantValue: if v in setAsHashSet: 1 else: 0))
         of FznIdent:
             # S is a set variable: b = element(x - lo, S.bools)
             let sName = setArg.ident
@@ -979,7 +1013,7 @@ proc buildChannelBindings(tr: var FznTranslator) =
 
         # Build the adjusted index expression (0-based)
         let indexExpr = tr.resolveExprArg(con.args[0])
-        let adjustedIndex = indexExpr - 1
+        var adjustedIndex = indexExpr - 1
 
         # Build the array elements
         var arrayElems: seq[ArrayElement[int]]
@@ -989,8 +1023,34 @@ proc buildChannelBindings(tr: var FznTranslator) =
         else:
             # array_int_element / array_bool_element: constant array
             let constArray = tr.resolveIntArray(con.args[1])
-            for v in constArray:
-                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+            # Check if index var is itself a const-element channel — compose if so
+            let idxArgName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
+            var composed = false
+            if idxArgName.len > 0 and idxArgName in tr.constElementSources:
+                let upstream = tr.constElementSources[idxArgName]
+                if upstream.indexVar in tr.varPositions:
+                    let upDomain = tr.lookupVarDomain(upstream.indexVar)
+                    if upDomain.len > 0 and upDomain.len == upstream.constArray.len:
+                        var composedArr: seq[int]
+                        var valid = true
+                        for v in upDomain:
+                            let midIdx = upstream.constArray[v - upDomain[0]]
+                            let finalIdx = midIdx - 1  # 0-based into constArray
+                            if finalIdx < 0 or finalIdx >= constArray.len:
+                                valid = false
+                                break
+                            composedArr.add(constArray[finalIdx])
+                        if valid and composedArr.len > 0:
+                            let upPos = tr.varPositions[upstream.indexVar]
+                            adjustedIndex = tr.getExpr(upPos) - upDomain[0]
+                            for v in composedArr:
+                                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+                            composed = true
+
+            if not composed:
+                for v in constArray:
+                    arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
 
         let binding = ChannelBinding[int](
             channelPosition: channelPos,
