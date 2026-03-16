@@ -1034,6 +1034,189 @@ solve satisfy;
     check wVal >= 2
     check zVal >= 7
 
+  test "4-literal mixed reif types disjunctive clause":
+    # bool_clause([b1, b2, b3, b4], []) with mixed int_lin_le_reif + int_le_reif + int_eq_reif
+    # b1: int_lin_le_reif([-1],[x],-5,b1) → x >= 5
+    # b2: int_le_reif(y, 3, b2) → y <= 3
+    # b3: int_eq_reif(z, 7, b3) → z == 7
+    # b4: int_le_reif(2, w, b4) → w >= 2
+    # Clause: x>=5 OR y<=3 OR z==7 OR w>=2
+    # With x<=4, y>=4, z!=7 (z<=6 & z>=8 not possible, use z in {1..6,8..10}), w<=1
+    # → need z==7 ... but z can't be 7. Actually let's simplify:
+    # Force x<=4 (kills b1), y>=5 (kills b2: y<=3), w<=1 (kills b4: w>=2) → only z==7 satisfies
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var 0..10: z;
+var 0..10: w;
+var bool: b1;
+var bool: b2;
+var bool: b3;
+var bool: b4;
+constraint int_lin_le_reif([-1],[x],-5,b1):: defines_var(b1);
+constraint int_le_reif(y, 3, b2):: defines_var(b2);
+constraint int_eq_reif(z, 7, b3):: defines_var(b3);
+constraint int_le_reif(2, w, b4):: defines_var(b4);
+constraint bool_clause([b1,b2,b3,b4],[]);
+constraint int_lin_le([1],[x],4);
+constraint int_lin_le([-1],[y],-5);
+constraint int_lin_le([1],[w],1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # All 4 bools consumed (refcount=1 for all)
+    check "b1" in tr.definedVarNames
+    check "b2" in tr.definedVarNames
+    check "b3" in tr.definedVarNames
+    check "b4" in tr.definedVarNames
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 4
+    # b3 (int_eq_reif) produces a 2-term conjunction disjunct
+    check tr.disjunctiveClauses[0].disjuncts[2].len == 2
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    let wVal = tr.sys.assignment[tr.varPositions["w"]]
+    check xVal <= 4
+    check yVal >= 5
+    check zVal == 7
+    check wVal <= 1
+
+  test "6-literal Unison-style disjunctive clause":
+    # Simulates diffn_nonstrict decomposition: 6-literal clause mixing all reif types
+    # Two tasks (s1,s2) with durations (d1,d2) on two resources (r1,r2)
+    # Non-overlap: s1+d1<=s2 OR s2+d2<=s1 OR r1!=r2 (but using 6 literals for 2D overlap)
+    # b1: int_lin_le_reif([1,-1],[s1,s2],-1,b1)  → s1-s2 <= -1 → s1 < s2
+    # b2: int_lin_le_reif([1,-1],[s2,s1],-1,b2)  → s2-s1 <= -1 → s2 < s1
+    # b3: int_le_reif(s1, 0, b3)                  → s1 <= 0
+    # b4: int_le_reif(5, s2, b4)                  → s2 >= 5
+    # b5: int_eq_reif(r1, 1, b5)                  → r1 == 1
+    # b6: int_eq_reif(r2, 2, b6)                  → r2 == 2
+    # Force: s1=3, s2=3 (kills b1,b2), s1>0 (kills b3), s2<5 (kills b4), r1!=1 (kills b5) → r2==2
+    let src = """
+var 1..5: s1;
+var 1..5: s2;
+var 1..3: r1;
+var 1..3: r2;
+var bool: b1;
+var bool: b2;
+var bool: b3;
+var bool: b4;
+var bool: b5;
+var bool: b6;
+constraint int_lin_le_reif([1,-1],[s1,s2],-1,b1):: defines_var(b1);
+constraint int_lin_le_reif([1,-1],[s2,s1],-1,b2):: defines_var(b2);
+constraint int_le_reif(s1, 0, b3):: defines_var(b3);
+constraint int_le_reif(5, s2, b4):: defines_var(b4);
+constraint int_eq_reif(r1, 1, b5):: defines_var(b5);
+constraint int_eq_reif(r2, 2, b6):: defines_var(b6);
+constraint bool_clause([b1,b2,b3,b4,b5,b6],[]);
+constraint int_eq_reif(s1, 3, true);
+constraint int_eq_reif(s2, 3, true);
+constraint int_lin_le([-1],[r1],-2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 6
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let r2Val = tr.sys.assignment[tr.varPositions["r2"]]
+    check r2Val == 2
+
+  test "mixed refcounts — shared bool not consumed":
+    # b_shared appears in TWO clauses (refcount=2) → defining constraint NOT consumed
+    # b1,b2,b3 have refcount=1 → consumed
+    # Clause 1: b_shared OR b1 OR b2
+    # Clause 2: b_shared OR b3
+    # b_shared: int_lin_le_reif([-1],[x],-10,b_shared) → x >= 10
+    # b1: int_le_reif(y, 3, b1) → y <= 3
+    # b2: int_eq_reif(z, 5, b2) → z == 5
+    # b3: int_le_reif(2, w, b3) → w >= 2
+    let src = """
+var 0..20: x;
+var 0..10: y;
+var 0..10: z;
+var 0..10: w;
+var bool: b_shared;
+var bool: b1;
+var bool: b2;
+var bool: b3;
+constraint int_lin_le_reif([-1],[x],-10,b_shared):: defines_var(b_shared);
+constraint int_le_reif(y, 3, b1):: defines_var(b1);
+constraint int_eq_reif(z, 5, b2):: defines_var(b2);
+constraint int_le_reif(2, w, b3):: defines_var(b3);
+constraint bool_clause([b_shared,b1,b2],[]);
+constraint bool_clause([b_shared,b3],[]);
+constraint int_lin_le([1],[x],9);
+constraint int_lin_le([-1],[y],-4);
+solve satisfy;
+"""
+    # x<=9 kills b_shared (x>=10), y>=4 kills b1 (y<=3) in clause 1 → z==5
+    # x<=9 kills b_shared in clause 2 → w>=2
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # b_shared has refcount=2 → NOT consumed as defined var
+    check "b_shared" notin tr.definedVarNames
+    # b1,b2,b3 have refcount=1 → consumed
+    check "b1" in tr.definedVarNames
+    check "b2" in tr.definedVarNames
+    check "b3" in tr.definedVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    let wVal = tr.sys.assignment[tr.varPositions["w"]]
+    check xVal <= 9
+    check zVal == 5
+    check wVal >= 2
+
+  test "int_eq_reif conjunction disjunct — 2 terms":
+    # Verify int_eq_reif produces a 2-term conjunction (x<=c AND -x<=-c)
+    # bool_clause([b1, b2], [])
+    # b1: int_eq_reif(x, 5, b1) → x == 5 (2 terms: x<=5 AND -x<=-5)
+    # b2: int_le_reif(y, 3, b2) → y <= 3
+    # Force y>=4 → only x==5 satisfies
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var bool: b1;
+var bool: b2;
+constraint int_eq_reif(x, 5, b1):: defines_var(b1);
+constraint int_le_reif(y, 3, b2):: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+constraint int_lin_le([-1],[y],-4);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "b1" in tr.definedVarNames
+    check "b2" in tr.definedVarNames
+    check tr.disjunctiveClauses.len == 1
+    check tr.disjunctiveClauses[0].disjuncts.len == 2
+    # First disjunct (int_eq_reif) should have 2 terms
+    check tr.disjunctiveClauses[0].disjuncts[0].len == 2
+    # Second disjunct (int_le_reif) should have 1 term
+    check tr.disjunctiveClauses[0].disjuncts[1].len == 1
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal == 5
+    check yVal >= 4
+
   test "fixed-value bool variable gets singleton domain":
     # var bool: X = true creates a position with domain {1}, not {0,1}
     # var bool: Y = false creates a position with domain {0}, not {0,1}

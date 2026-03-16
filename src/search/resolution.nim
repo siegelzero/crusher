@@ -99,12 +99,12 @@ proc resolve*[T](system: ConstraintSystem[T],
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
     else:
         var improved = system.baseArray.tabuImprove(tabuThreshold, verbose, deadline = deadline)
-        if improved.cost == 0:
-            system.initialize(improved.assignment)
+        if improved.bestCost == 0:
+            system.initialize(improved.bestAssignment)
             system.lastIterations = improved.iteration
             return
         if verbose:
-            echo &"[Solve] Sequential failed: best cost={improved.cost}"
+            echo &"[Solve] Sequential failed: best cost={improved.bestCost}"
         if deadline > 0 and epochTime() > deadline:
             raise newException(TimeLimitExceededError, "Time limit exceeded")
         raise newException(NoSolutionFoundError, "Can't find satisfying solution")
@@ -128,12 +128,12 @@ proc resolveFromAssignment*[T](system: ConstraintSystem[T],
     system.baseArray.removeFixedConstraints()
     var state = newTabuState[T](system.baseArray, assignment, verbose)
     let improved = state.tabuImprove(tabuThreshold, deadline = deadline)
-    if improved.cost == 0:
-        system.initialize(improved.assignment)
+    if improved.bestCost == 0:
+        system.initialize(improved.bestAssignment)
         system.lastIterations = improved.iteration
         return
     if verbose:
-        echo &"[Solve] Sequential from assignment failed: best cost={improved.cost}"
+        echo &"[Solve] Sequential from assignment failed: best cost={improved.bestCost}"
     if deadline > 0 and epochTime() > deadline:
         raise newException(TimeLimitExceededError, "Time limit exceeded")
     raise newException(NoSolutionFoundError, "Can't find satisfying solution from given assignment")
