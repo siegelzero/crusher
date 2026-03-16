@@ -2350,4 +2350,3 @@ solve minimize objective;
     let expectedCard = expectedSets[selVal - 1].len
     check objVal == expectedCard  # cardinality must match selected set
     check objVal >= 2  # theoretical minimum (s3 has 2 elements)
->>>>>>> a3c0716 (improvements to gt-sort problem)

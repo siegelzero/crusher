@@ -875,7 +875,7 @@ proc applyPresolveResults(tr: var FznTranslator,
     ## Store tightened domains for use during translateVariables. Do NOT mutate
     ## the FznModel — pattern detection needs to see the original model structure.
 
-    # Build varDomainIndex if not already built (O(V) once instead of O(V^2) per lookup)
+    # Build varDomainIndex if not already built (O(1) lookups instead of O(V) scan)
     if tr.varDomainIndex.len == 0:
         for i, decl in tr.model.variables:
             if decl.isArray: continue
@@ -884,18 +884,19 @@ proc applyPresolveResults(tr: var FznTranslator,
     # Store tightened domains in the translator (applied during translateVariables)
     for name, dom in domains:
         if dom.len == 0: continue
-        # Check if domain was actually tightened using O(1) index lookup
-        var originalLen = 0
-        if name in tr.varDomainIndex:
-            let decl = tr.model.variables[tr.varDomainIndex[name]]
-            case decl.varType.kind
-            of FznIntRange:
-                originalLen = decl.varType.hi - decl.varType.lo + 1
-            of FznIntSet:
-                originalLen = decl.varType.values.len
-            of FznBool:
-                originalLen = 2
-            else: discard
+        # Check if domain was actually tightened
+        if name notin tr.varDomainIndex: continue
+        let decl = tr.model.variables[tr.varDomainIndex[name]]
+        var originalLen: int
+        case decl.varType.kind
+        of FznIntRange:
+            originalLen = decl.varType.hi - decl.varType.lo + 1
+        of FznIntSet:
+            originalLen = decl.varType.values.len
+        of FznBool:
+            originalLen = 2
+        else:
+            continue
         if dom.len < originalLen:
             tr.presolveDomains[name] = dom
 
@@ -956,6 +957,7 @@ proc presolve*(tr: var FznTranslator) =
 
     if infeasible:
         stderr.writeLine(&"[FZN] Presolve: infeasibility detected at iteration {totalIterations}")
+        # Still apply what we can — the solver will discover infeasibility
         tr.applyPresolveResults(domains, fixedVars, eliminated)
         return
 
