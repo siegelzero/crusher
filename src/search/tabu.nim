@@ -166,6 +166,7 @@ type
         cdCascadeChans: seq[seq[int]]             # [cascadeIdx] -> channel positions in topological order
         cdCascadeBindings: seq[seq[int]]          # [cascadeIdx] -> binding index for each channel position (element or flatMinMax index)
         cdCascadeIsMinMax: seq[seq[bool]]         # [cascadeIdx][entryIdx] -> true if entry is a min/max binding
+        cdCascadeIsCountEq: seq[seq[bool]]        # [cascadeIdx][entryIdx] -> true if entry is a countEq binding
         cdCascadeExternalDeps: seq[PackedSet[int]]    # [cascadeIdx] -> ALL external dependency positions
         cdCascadeElemExtDeps: seq[PackedSet[int]]     # [cascadeIdx] -> external deps from element entries only
         cdCascadeMinMaxIdx: seq[seq[int]]             # [cascadeIdx] -> indices into topoOrder that are min/max entries
@@ -1690,6 +1691,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadeChans = @[]
         state.cdCascadeBindings = @[]
         state.cdCascadeIsMinMax = @[]
+        state.cdCascadeIsCountEq = @[]
         state.cdCascadeExternalDeps = @[]
         state.cdCascadeElemExtDeps = @[]
         state.cdCascadeMinMaxIdx = @[]
@@ -1716,6 +1718,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var topoOrder: seq[int] = @[]
             var topoBindingIdx: seq[int] = @[]
             var topoIsMinMax: seq[bool] = @[]
+            var topoIsCountEq: seq[bool] = @[]
             var topoSet: PackedSet[int]
             var bfsQueue: seq[int] = @[pos]
             var bfsHead = 0
@@ -1748,6 +1751,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)
                         topoIsMinMax.add(false)
+                        topoIsCountEq.add(false)
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
@@ -1763,12 +1767,27 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)  # index into flatMinMaxBindings
                         topoIsMinMax.add(true)
+                        topoIsCountEq.add(false)
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
-                # countEq/inverse channels can't be batched — reject topology entirely
+                # CountEq channel bindings: include in cascade as dynamic entries
                 if p in carray.countEqChannelsAtPosition:
-                    canBuild = false
+                    for bi in carray.countEqChannelsAtPosition[p]:
+                        let binding = carray.countEqChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false  # countEq depends on non-local positions
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)  # index into countEqChannelBindings
+                        topoIsMinMax.add(false)
+                        topoIsCountEq.add(true)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
+                # conditionalCountEq/inverse channels can't be batched — reject topology
                 if p in carray.conditionalCountEqChannelsAtPosition:
                     canBuild = false
                 if p in carray.inverseChannelsAtPosition:
@@ -1863,6 +1882,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         for ep in expr.positions.items:
                             if ep != pos and ep notin topoSet:
                                 externalDeps.incl(ep)
+                elif topoIsCountEq[ci]:
+                    let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.inputPositions:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)  # treat like element deps for dirty tracking
                 else:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
@@ -1880,6 +1905,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.cdCascadeChans.add(topoOrder)
             state.cdCascadeBindings.add(topoBindingIdx)
             state.cdCascadeIsMinMax.add(topoIsMinMax)
+            state.cdCascadeIsCountEq.add(topoIsCountEq)
             state.cdCascadeExternalDeps.add(externalDeps)
             state.cdCascadeElemExtDeps.add(elemExtDeps)
             state.cdCascadeMinMaxIdx.add(minMaxIndices)
@@ -1907,6 +1933,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for expr in fb.complexExprs:
                         for ep in expr.positions.items:
                             if ep != pos: inputs.incl(ep)
+                elif topoIsCountEq[ci]:
+                    let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.inputPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
                 else:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
@@ -2070,10 +2100,29 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # contributed non-zero delta across ALL (position, domainValue) evaluations.
         # Unlike checking penalty()==0 (which only reflects the current state),
         # this verifies that NO possible move could violate the constraint.
+        # Exception: constraints that reference countEq channel positions are never
+        # marked tautological. CountEq values aggregate across ALL search positions,
+        # so a single-move delta of 0 doesn't guarantee the constraint won't be
+        # violated after multiple moves (e.g., cnt[N] <= 5 when N count is low).
         if state.hasChannelDeps:
+            # Build set of countEq channel positions for tautology exclusion
+            var countEqPositions: PackedSet[int]
+            for binding in carray.countEqChannelBindings:
+                countEqPositions.incl(binding.channelPosition)
+            for binding in carray.conditionalCountEqChannelBindings:
+                countEqPositions.incl(binding.channelPosition)
+
             var tautCount = 0
             for ci in 0..<state.channelDepConstraints.len:
                 if state.cdPerConstraintMaxDelta[ci] == 0:
+                    # Check if constraint references any countEq channel position
+                    var touchesCountEq = false
+                    for p in state.channelDepConstraints[ci].positions.items:
+                        if p in countEqPositions:
+                            touchesCountEq = true
+                            break
+                    if touchesCountEq:
+                        continue  # Don't disable — countEq constraints can become non-tautological
                     state.channelDepConstraintActive[ci] = false
                     tautCount += 1
             if tautCount > 0:

@@ -22,6 +22,11 @@ proc getObjectiveExpr(tr: FznTranslator): AlgebraicExpression[int] =
   elif tr.objectivePos == ObjPosDefinedExpr: tr.objectiveDefExpr
   else: raise newException(ValueError, "No objective")
 
+proc resolveOutputArray(tr: FznTranslator, name: string): seq[int] =
+  let positions = tr.arrayPositions[name]
+  for pos in positions:
+    result.add(tr.sys.assignment[pos])
+
 suite "Incremental Cascade Evaluation":
 
   test "min/max channel optimization with element channels":
@@ -466,3 +471,139 @@ solve minimize z;
         if not perm.nextPermutation:
           break
       check zVal == bestZ
+
+  test "countEq channels in cascade topology":
+    ## CountEq channel entries must be included in the cascade topology
+    ## (not rejected with canBuild=false). This test uses a GCC with variable
+    ## count outputs that feed into a max channel objective.
+    ## Pattern: 6 vars in {1..3}, countEq channels for each value,
+    ## max(counts) minimized. Optimal: balanced (2,2,2), max=2.
+    let src = """
+var 1..3: x1;
+var 1..3: x2;
+var 1..3: x3;
+var 1..3: x4;
+var 1..3: x5;
+var 1..3: x6;
+array [1..6] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6];
+array [1..3] of int: cover = [1,2,3];
+var 0..6: c1 :: var_is_introduced :: is_defined_var;
+var 0..6: c2 :: var_is_introduced :: is_defined_var;
+var 0..6: c3 :: var_is_introduced :: is_defined_var;
+array [1..3] of var int: counts :: var_is_introduced = [c1,c2,c3];
+var 0..6: z :: output_var :: is_defined_var;
+constraint fzn_global_cardinality(xs,cover,counts);
+constraint array_int_maximum(z, counts) :: defines_var(z);
+solve minimize z;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.sys.baseArray.countEqChannelBindings.len == 3
+
+    let objExpr = tr.getObjectiveExpr()
+    tr.sys.minimize(objExpr, parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let values = tr.resolveOutputArray("xs")
+    var counts = [0, 0, 0, 0]
+    for v in values: counts[v] += 1
+
+    let zVal = objExpr.evaluate(tr.sys.assignment)
+    # Balanced: 2 of each value, max = 2
+    check zVal == 2
+    check counts[1] == 2
+    check counts[2] == 2
+    check counts[3] == 2
+
+  test "countEq cascade with element channel indirection":
+    ## Tests the multi-level cascade: y → element → x → countEq → cnt → objective.
+    ## This is the pattern from the chessboard problem where search variables (y)
+    ## map to piece types (x) via element channels, and GCC counts pieces.
+    ##
+    ## 4 search vars y[i] in {1..3}, mapping through svalue = [10,20,30].
+    ## GCC counts occurrences of 10,20,30 in x-values.
+    ## Maximize: 3*c10 + 2*c20 + 1*c30 with c10 <= 2 (domain-encoded).
+    ## Optimal: 2 of value 10 (6) + 2 of value 20 (4) = 10.
+    let src = """
+var 1..3: y1;
+var 1..3: y2;
+var 1..3: y3;
+var 1..3: y4;
+array [1..3] of int: svalue = [10,20,30];
+var int: x1 :: var_is_introduced :: is_defined_var;
+var int: x2 :: var_is_introduced :: is_defined_var;
+var int: x3 :: var_is_introduced :: is_defined_var;
+var int: x4 :: var_is_introduced :: is_defined_var;
+array [1..4] of var int: xs :: var_is_introduced = [x1,x2,x3,x4];
+constraint array_int_element(y1, svalue, x1) :: defines_var(x1);
+constraint array_int_element(y2, svalue, x2) :: defines_var(x2);
+constraint array_int_element(y3, svalue, x3) :: defines_var(x3);
+constraint array_int_element(y4, svalue, x4) :: defines_var(x4);
+array [1..3] of int: cover = [10,20,30];
+var 0..2: c10 :: var_is_introduced;
+var 0..4: c20 :: var_is_introduced;
+var 0..4: c30 :: var_is_introduced;
+array [1..3] of var int: counts :: var_is_introduced = [c10,c20,c30];
+constraint fzn_global_cardinality(xs,cover,counts);
+var int: obj :: output_var;
+constraint int_lin_eq([3, 2, 1, -1], [c10, c20, c30, obj], 0);
+solve maximize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Element channels for x1..x4 + countEq channels for c10,c20,c30
+    check tr.sys.baseArray.countEqChannelBindings.len == 3
+
+    let objExpr = tr.getObjectiveExpr()
+    tr.sys.maximize(objExpr, parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let objVal = objExpr.evaluate(tr.sys.assignment)
+    # c10 <= 2 (domain bound), so optimal: 2*3 + 2*2 = 10
+    check objVal == 10
+
+  test "countEq tautological detection does not suppress bound violations":
+    ## A countEq bound constraint (cnt <= limit) can appear tautological in the
+    ## initial state (single-move delta = 0 when count is far from limit) but
+    ## must not be disabled — it can be violated after multiple moves.
+    ##
+    ## 8 vars in {1..2}, count of 1s limited to <= 3 (domain-encoded).
+    ## GCC count channel for value 1 has domain 0..3.
+    ## Without proper handling, the solver would place all 8 as value 1.
+    let src = """
+var 1..2: x1 :: output_var;
+var 1..2: x2 :: output_var;
+var 1..2: x3 :: output_var;
+var 1..2: x4 :: output_var;
+var 1..2: x5 :: output_var;
+var 1..2: x6 :: output_var;
+var 1..2: x7 :: output_var;
+var 1..2: x8 :: output_var;
+array [1..8] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6,x7,x8];
+array [1..2] of int: cover = [1,2];
+var 0..3: c1 :: var_is_introduced;
+var 0..8: c2 :: var_is_introduced;
+array [1..2] of var int: counts :: var_is_introduced = [c1,c2];
+constraint fzn_global_cardinality(xs,cover,counts);
+var int: obj :: output_var;
+constraint int_lin_eq([1, -1], [c1, obj], 0);
+solve maximize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.sys.baseArray.countEqChannelBindings.len == 2
+
+    let objExpr = tr.getObjectiveExpr()
+    tr.sys.maximize(objExpr, parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let objVal = objExpr.evaluate(tr.sys.assignment)
+    # c1 <= 3 (domain bound), so max(c1) = 3
+    check objVal == 3
+
+    # Verify actual count
+    let positions = tr.arrayPositions["xs"]
+    var count1 = 0
+    for pos in positions:
+      if tr.sys.assignment[pos] == 1: inc count1
+    check count1 == 3

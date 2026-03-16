@@ -29,6 +29,7 @@ import test_fzcrusher
 import test_fzn_solver
 import test_geost
 import test_global_cardinality
+import test_incremental_cascade
 import test_increasing_constraint
 import test_intuitive_operators
 import test_irdcs

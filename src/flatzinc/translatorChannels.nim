@@ -2019,29 +2019,9 @@ proc detectGccCountChannels(tr: var FznTranslator) =
                 allHavePos = false; break
         if not allHavePos: continue
 
-        # Check each count variable is "pure output": only referenced by this GCC,
-        # already-consumed defining constraints (channel defs), and min/max channel defs.
-        var allPureOutput = true
-        for cname in countNames:
-            for ci2, con2 in tr.model.constraints:
-                if ci2 == ci: continue  # skip this GCC itself
-                if ci2 in tr.definingConstraints: continue  # already consumed
-                if ci2 in minMaxCIs: continue  # min/max channel def is fine
-                # Check if con2 references cname in any arg
-                var refersToCount = false
-                for arg in con2.args:
-                    if arg.kind == FznIdent and arg.ident == cname:
-                        refersToCount = true; break
-                    elif arg.kind == FznArrayLit:
-                        for elem in arg.elems:
-                            if elem.kind == FznIdent and elem.ident == cname:
-                                refersToCount = true; break
-                        if refersToCount: break
-                if refersToCount:
-                    allPureOutput = false; break
-            if not allPureOutput: break
-
-        if not allPureOutput: continue
+        # Count variables may be referenced by downstream constraints (e.g., cnt <= limit).
+        # This is fine: they become CountEq channels, and downstream constraints become
+        # channel-dep constraints evaluated through the cascade system.
 
         # All checks passed — convert count outputs to channel bindings
         let cover = tr.resolveIntArray(con.args[1])
@@ -2076,6 +2056,11 @@ proc detectGccCountChannels(tr: var FznTranslator) =
         if not xArgValid or inputPositions.len == 0: continue
         let totalElements = inputPositions.len + constantValues.len
 
+        # Build expressions for input positions (needed for bound constraints)
+        var inputExprs: seq[AlgebraicExpression[int]]
+        for pos in inputPositions:
+            inputExprs.add(tr.getExpr(pos))
+
         for i, cname in countNames:
             let countPos = tr.varPositions[cname]
             # Count how many constant elements match this cover value
@@ -2084,8 +2069,20 @@ proc detectGccCountChannels(tr: var FznTranslator) =
                 if cv == cover[i]: inc constOffset
             tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions, constOffset)
             tr.channelVarNames.incl(cname)
-            # Set domain to valid range for this channel
-            tr.sys.baseArray.domain[countPos] = toSeq(0..totalElements)
+
+            # MiniZinc may have absorbed bound constraints (cnt <= limit) into the
+            # variable domain. Since channel positions don't enforce domains during
+            # search, we must add explicit atMost/atLeast constraints.
+            let dom = tr.sys.baseArray.domain[countPos]
+            if dom.len > 0:
+                let domMin = dom[0]
+                let domMax = dom[^1]
+                let effectiveMax = totalElements - constOffset  # max possible from variable positions
+                if domMax < effectiveMax:
+                    tr.sys.addConstraint(atMost[int](inputExprs, cover[i], domMax - constOffset))
+                if domMin > constOffset:
+                    tr.sys.addConstraint(atLeast[int](inputExprs, cover[i], domMin - constOffset))
+
             inc totalChannels
 
         tr.definingConstraints.incl(ci)  # GCC is consumed — counts are channels now

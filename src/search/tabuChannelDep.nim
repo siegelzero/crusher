@@ -525,6 +525,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
     let chans = state.cdCascadeChans[cascadeIdx]
     let bindings = state.cdCascadeBindings[cascadeIdx]
     let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
+    let isCountEq = state.cdCascadeIsCountEq[cascadeIdx]
     let forwardDeps = state.cdCascadeForwardDeps[cascadeIdx]
     let extPosToEntries = state.cdCascadeExtPosToEntries[cascadeIdx]
 
@@ -592,6 +593,9 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 if isMinMax[ci]:
                     let fb = state.flatMinMaxBindings[bindings[ci]]
                     newVal = evaluateFlatMinMax(fb, state.assignment)
+                elif isCountEq[ci]:
+                    let binding = state.carray.countEqChannelBindings[bindings[ci]]
+                    newVal = evaluateCountEq(binding, state.assignment)
                 else:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                     let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
@@ -650,6 +654,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             let chans = state.cdCascadeChans[cascadeIdx]
             let bindings = state.cdCascadeBindings[cascadeIdx]
             let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
+            let isCountEq = state.cdCascadeIsCountEq[cascadeIdx]
 
             # Save original assignment values
             let savedPos = state.assignment[pos]
@@ -664,6 +669,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         # Min/max binding: evaluate using flat linear representation
                         let fb = state.flatMinMaxBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
+                    elif isCountEq[ci]:
+                        # CountEq binding: count matching values over input positions
+                        let binding = state.carray.countEqChannelBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
                     else:
                         # Element binding: evaluate index expression and look up array
                         let bindingPtr = addr state.carray.channelBindings[bindings[ci]]

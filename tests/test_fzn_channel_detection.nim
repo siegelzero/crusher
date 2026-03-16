@@ -230,9 +230,10 @@ solve satisfy;
     check counts[1] == 2
     check counts[2] == 2
 
-  test "GCC count channels: non-pure outputs not converted":
-    ## If count outputs are used by constraints OTHER than min/max chains,
-    ## they should NOT be converted to channels.
+  test "GCC count channels: non-pure outputs converted with downstream constraints":
+    ## Count outputs used by downstream constraints (e.g., int_le) are still
+    ## converted to CountEq channels. The downstream constraints become
+    ## channel-dep constraints evaluated through the cascade system.
     let src = """
 var 1..3: x1 :: output_var;
 var 1..3: x2 :: output_var;
@@ -250,8 +251,8 @@ solve satisfy;
     let model = parseFzn(src)
     var tr = translate(model)
 
-    # c1 is used by int_le (not just min/max chain), so NOT converted to channel
-    check tr.sys.baseArray.countEqChannelBindings.len == 0
+    # All 3 count vars are converted to CountEq channels
+    check tr.sys.baseArray.countEqChannelBindings.len == 3
 
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
 
@@ -265,6 +266,134 @@ solve satisfy;
     for v in values:
       if v == 1: inc count1
     check count1 <= 2
+
+  test "GCC count channels: domain-encoded bounds are enforced":
+    ## MiniZinc absorbs cnt[p] <= limit[p] into variable domains (e.g., var 0..2
+    ## instead of a separate int_le constraint). The translator must generate
+    ## explicit atMost constraints to enforce these bounds, since channel positions
+    ## don't enforce domain membership during search.
+    let src = """
+var 1..3: x1 :: output_var;
+var 1..3: x2 :: output_var;
+var 1..3: x3 :: output_var;
+var 1..3: x4 :: output_var;
+var 1..3: x5 :: output_var;
+var 1..3: x6 :: output_var;
+array [1..6] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6];
+array [1..3] of int: cover = [1,2,3];
+var 0..2: c1 :: output_var;
+var 0..3: c2 :: output_var;
+var 0..6: c3 :: output_var;
+array [1..3] of var int: counts :: var_is_introduced = [c1,c2,c3];
+constraint fzn_global_cardinality(xs,cover,counts);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # All 3 count vars are converted to CountEq channels
+    check tr.sys.baseArray.countEqChannelBindings.len == 3
+
+    # Solve multiple times to ensure bounds are consistently enforced
+    for trial in 0..<10:
+      var tr2 = translate(model)
+      tr2.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+      let positions = tr2.arrayPositions["xs"]
+      var counts = [0, 0, 0, 0]
+      for pos in positions:
+        counts[tr2.sys.assignment[pos]] += 1
+
+      # Domain-encoded bound: c1 (count of value 1) <= 2
+      check counts[1] <= 2
+      # Domain-encoded bound: c2 (count of value 2) <= 3
+      check counts[2] <= 3
+      # c3 has domain 0..6 which is the full range — no effective bound
+      check counts[3] <= 6
+
+  test "GCC count channels: domain-encoded bounds with maximization":
+    ## Maximization problem where the optimal depends on domain-encoded
+    ## count limits. Without bound enforcement, the solver would place
+    ## too many high-value pieces.
+    ## 6 cells, value 1 is worth 5 (best), value 2 worth 3, value 3 worth 1.
+    ## c1 (count of value 1) domain 0..2: at most 2 of the best piece.
+    ## Without limit: all value 1, obj = 30.
+    ## With limit: c1=2, c2=4, obj = 5*2 + 3*4 = 22.
+    let src = """
+var 1..3: x1;
+var 1..3: x2;
+var 1..3: x3;
+var 1..3: x4;
+var 1..3: x5;
+var 1..3: x6;
+array [1..6] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6];
+array [1..3] of int: cover = [1,2,3];
+var 0..2: c1 :: var_is_introduced;
+var 0..6: c2 :: var_is_introduced;
+var 0..6: c3 :: var_is_introduced;
+array [1..3] of var int: counts :: var_is_introduced = [c1,c2,c3];
+constraint fzn_global_cardinality(xs,cover,counts);
+var int: obj :: output_var;
+constraint int_lin_eq([5, 3, 1, -1], [c1, c2, c3, obj], 0);
+solve maximize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.sys.baseArray.countEqChannelBindings.len == 3
+
+    let objExpr = tr.getObjectiveExpr()
+    tr.sys.maximize(objExpr, parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let positions = tr.arrayPositions["xs"]
+    var counts = [0, 0, 0, 0]
+    for pos in positions:
+      counts[tr.sys.assignment[pos]] += 1
+
+    # Verify domain-encoded limit on value 1 is respected
+    check counts[1] <= 2
+
+    # Optimal objective: 5*2 + 3*4 = 22
+    let objVal = objExpr.evaluate(tr.sys.assignment)
+    check objVal == 22
+
+  test "GCC count channels: lower bound from domain is enforced":
+    ## FZN domain can also encode lower bounds (e.g., var 2..4 means
+    ## at least 2 of this value). Verify atLeast constraints are generated.
+    let src = """
+var 1..2: x1 :: output_var;
+var 1..2: x2 :: output_var;
+var 1..2: x3 :: output_var;
+var 1..2: x4 :: output_var;
+var 1..2: x5 :: output_var;
+var 1..2: x6 :: output_var;
+array [1..6] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6];
+array [1..2] of int: cover = [1,2];
+var 2..4: c1 :: output_var;
+var 2..4: c2 :: output_var;
+array [1..2] of var int: counts :: var_is_introduced = [c1,c2];
+constraint fzn_global_cardinality(xs,cover,counts);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check tr.sys.baseArray.countEqChannelBindings.len == 2
+
+    for trial in 0..<10:
+      var tr2 = translate(model)
+      tr2.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+      let positions = tr2.arrayPositions["xs"]
+      var counts = [0, 0, 0]
+      for pos in positions:
+        counts[tr2.sys.assignment[pos]] += 1
+
+      # Domain-encoded bounds: at least 2 and at most 4 of each value
+      check counts[1] >= 2
+      check counts[1] <= 4
+      check counts[2] >= 2
+      check counts[2] <= 4
 
 suite "FlatZinc Objective Bound Tightening":
 
