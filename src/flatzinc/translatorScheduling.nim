@@ -98,6 +98,7 @@ proc getReifCI(ident: string,
     if ident in linLeReifDefines: return linLeReifDefines[ident]
     if ident in leReifDefines: return leReifDefines[ident]
     if ident in eqReifDefines: return eqReifDefines[ident]
+    assert false, "getReifCI: ident not found in any reif table: " & ident
 
 proc detectDisjunctivePairs(tr: var FznTranslator) =
     ## Detects disjunctive pair patterns:
