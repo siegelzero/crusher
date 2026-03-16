@@ -141,13 +141,19 @@ proc translateVariables(tr: var FznTranslator) =
         let v = tr.sys.newConstrainedVariable()
         tr.varPositions[decl.name] = pos
 
-        # Set domain based on type, considering fixed values
+        # Set domain based on type, considering fixed values and presolve tightening
         if decl.value != nil and decl.value.kind == FznBoolLit:
             v.setDomain(@[if decl.value.boolVal: 1 else: 0])
             tr.channelVarNames.incl(decl.name)
         elif decl.value != nil and decl.value.kind == FznIntLit:
             v.setDomain(@[decl.value.intVal])
             tr.channelVarNames.incl(decl.name)
+        elif decl.name in tr.presolveDomains:
+            # Presolve tightened this domain
+            let pdom = tr.presolveDomains[decl.name]
+            v.setDomain(pdom)
+            if pdom.len == 1:
+                tr.channelVarNames.incl(decl.name)
         else:
             case decl.varType.kind
             of FznIntRange:

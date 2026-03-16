@@ -298,6 +298,8 @@ type
         skipSetVarNames*: HashSet[string]
         # Index from variable name -> declaration index for O(1) lookupVarDomain
         varDomainIndex*: Table[string, int]
+        # Presolve-tightened domains: applied during translateVariables, not during pattern detection
+        presolveDomains*: Table[string, seq[int]]
         # Synthetic element channels: precomputed lookup tables for conditional gain variables
         syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
         # int_mod channel defs: Z = X mod C implemented as element channel with lookup table
@@ -680,6 +682,7 @@ proc extractSetValues(value: FznExpr): seq[int] =
         return @[]
 
 include translatorCore
+include translatorPresolve
 include translatorDefinedVars
 include translatorChannels
 include translatorPatterns
@@ -726,6 +729,8 @@ proc translate*(model: FznModel): FznTranslator =
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
+    # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
+    result.presolve()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
     # Detect net flow pairs (EFM / metabolic network: paired vars with tree-structured constraints)

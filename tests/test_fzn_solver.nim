@@ -369,8 +369,8 @@ solve satisfy;
     let model = parseFzn(src)
     var tr = translate(model)
 
-    # target should NOT be a channel — incomplete case analysis
-    check "target" notin tr.channelVarNames
+    # target should NOT be a case-analysis channel (but presolve may fix it to singleton)
+    check tr.caseAnalysisDefs.len == 0  # no incomplete case-analysis should be detected
 
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
 
@@ -2118,3 +2118,236 @@ solve satisfy;
     let xVal = tr.sys.assignment[tr.varPositions["x"]]
     let yVal = tr.sys.assignment[tr.varPositions["y"]]
     check (xVal, yVal) in [(1, 10), (2, 20), (3, 30)]
+
+suite "Channel Propagation Correctness":
+
+  proc reconstructSet(tr: FznTranslator, name: string): seq[int] =
+    ## Helper: reconstruct set variable membership from boolean assignments.
+    if name in tr.setVarBoolPositions:
+      let info = tr.setVarBoolPositions[name]
+      for i in 0..<info.positions.len:
+        if tr.sys.assignment[info.positions[i]] != 0:
+          result.add(info.lo + i)
+
+  proc verifyChannelConsistency(tr: FznTranslator): int =
+    ## Re-evaluate all channels from scratch and count inconsistencies.
+    for binding in tr.sys.baseArray.channelBindings:
+      let idxVal = binding.indexExpression.evaluate(tr.sys.assignment)
+      if idxVal >= 0 and idxVal < binding.arrayElements.len:
+        let elem = binding.arrayElements[idxVal]
+        let expected = if elem.isConstant: elem.constantValue
+                       else: tr.sys.assignment[elem.variablePosition]
+        if expected != tr.sys.assignment[binding.channelPosition]:
+          inc result
+    for binding in tr.sys.baseArray.minMaxChannelBindings:
+      var best = if binding.isMin: high(int) else: low(int)
+      for expr in binding.inputExprs:
+        let val = expr.evaluate(tr.sys.assignment)
+        if binding.isMin: best = min(best, val)
+        else: best = max(best, val)
+      if best != tr.sys.assignment[binding.channelPosition]:
+        inc result
+
+  test "set_in_reif identity channel: variable set, constant value":
+    ## set_in_reif(literal, set_var, bool) creates an identity channel
+    ## b = S.bools[literal - lo]. When S changes (via array_set_element routing),
+    ## b must update. This tests the addChannelBinding registration fix.
+    let src = """
+var 1..3: sel :: output_var;
+var set of 0..5: s1;
+var set of 0..5: s2;
+var set of 0..5: s3;
+var set of 0..5: chosen :: var_is_introduced;
+var bool: mem3 :: output_var;
+constraint set_eq(s1, {0, 1, 2});
+constraint set_eq(s2, {0, 3, 4});
+constraint set_eq(s3, {0, 2, 5});
+constraint array_var_set_element(sel, [s1, s2, s3], chosen);
+constraint set_in_reif(3, chosen, mem3) :: defines_var(mem3);
+constraint int_eq(sel, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let selVal = tr.sys.assignment[tr.varPositions["sel"]]
+    check selVal == 2
+    # sel=2 → chosen=s2={0,3,4} → 3 in chosen = true → mem3 = 1
+    let mem3Val = tr.sys.assignment[tr.varPositions["mem3"]]
+    check mem3Val == 1
+    check verifyChannelConsistency(tr) == 0
+
+  test "set_in_reif identity channel: value NOT in selected set":
+    ## Same structure but the tested value is NOT in the selected set.
+    let src = """
+var 1..3: sel :: output_var;
+var set of 0..5: s1;
+var set of 0..5: s2;
+var set of 0..5: s3;
+var set of 0..5: chosen :: var_is_introduced;
+var bool: mem3 :: output_var;
+constraint set_eq(s1, {0, 1, 2});
+constraint set_eq(s2, {0, 3, 4});
+constraint set_eq(s3, {0, 2, 5});
+constraint array_var_set_element(sel, [s1, s2, s3], chosen);
+constraint set_in_reif(3, chosen, mem3) :: defines_var(mem3);
+constraint int_eq(sel, 1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let selVal = tr.sys.assignment[tr.varPositions["sel"]]
+    check selVal == 1
+    # sel=1 → chosen=s1={0,1,2} → 3 NOT in chosen → mem3 = 0
+    let mem3Val = tr.sys.assignment[tr.varPositions["mem3"]]
+    check mem3Val == 0
+    check verifyChannelConsistency(tr) == 0
+
+  test "two-layer set comprehension: bounded pairwise sum":
+    ## Minimal reproduction of the gt-sort pattern:
+    ## L1 has 4 fixed sets, y routing selects pairs, L2 = pairwise sums.
+    ## L2 cardinalities feed into objective.
+    ## Tests element → set_in_reif → bool2int → int_times → min/max cascade.
+    ##
+    ## L1: {0,3}, {0,2}, {0,1}, {0} (from c=[3,2,1,0], reversed+sorted)
+    ## With y=[1,3,2,4] (pair L1[1] with L1[3], pair L1[2] with L1[4]):
+    ##   L2[1] = {0+0, 0+1, 3+0, 3+1} = {0, 1, 3, 4}  (card=4)
+    ##   L2[2] = {0+0, 2+0} = {0, 2}  (card=2)
+    ## Total L1 cards: 2+2+2+1 = 7
+    ## Total L2 cards: 4+2+1+1 = 8  (padding={0},{0})
+    ## Objective = 7 + 8 = 15
+    ##
+    ## We use a small FZN model that encodes this structure.
+    ## Since the full set comprehension FZN is complex, we test using
+    ## the actual MiniZinc-style decomposition.
+
+    # Build FZN source for a tiny 2-layer binary tree sort network
+    # n=3, c=[3,2,1,0] (padded to 4), k=5
+    var lines: seq[string]
+    # L1 sets (fixed): {0,3}, {0,2}, {0,1}, {0}
+    let l1Sets = [@[0, 3], @[0, 2], @[0, 1], @[0]]
+    for i in 0..<4:
+      lines.add("var set of 0..5: l1_" & $i & ";")
+      lines.add("constraint set_eq(l1_" & $i & ", {" & l1Sets[i].mapIt($it).join(",") & "});")
+
+    # y routing variables (search)
+    for i in 0..<4:
+      lines.add("var 1..4: y" & $i & " :: output_var;")
+    lines.add("constraint fzn_all_different_int([y0, y1, y2, y3]);")
+    lines.add("constraint int_lt(y0, y1);")  # symmetry breaking
+    lines.add("constraint int_lt(y2, y3);")
+
+    # Working sets via array_var_set_element (routes L1 by y)
+    for i in 0..<4:
+      lines.add("var set of 0..5: ws" & $i & " :: var_is_introduced;")
+      lines.add("constraint array_var_set_element(y" & $i & ", [l1_0, l1_1, l1_2, l1_3], ws" & $i & ");")
+
+    # L2 result sets and cardinalities
+    for p in 0..<2:
+      let a = p * 2      # left child index
+      let b = p * 2 + 1  # right child index
+      lines.add("var set of 0..5: l2_" & $p & " :: output_var;")
+      lines.add("var 0..10: card_l2_" & $p & " :: output_var;")
+      # Bounded pairwise sum: l2[p] = {ai+bi | ai in ws[a], bi in ws[b], ai+bi <= 5}
+      # We encode this with set comprehension decomposition:
+      # For each (av, bv) with av+bv <= 5, create product and union
+      var pairIdx = 0
+      var leafNames: seq[string]
+      for av in 0..5:
+        for bv in 0..5:
+          if av + bv > 5: continue
+          let sumVal = av + bv
+          let prefix = "p" & $p & "_" & $pairIdx
+          # Membership tests
+          lines.add("var bool: " & prefix & "_ma :: var_is_introduced :: is_defined_var;")
+          lines.add("var bool: " & prefix & "_mb :: var_is_introduced :: is_defined_var;")
+          lines.add("constraint set_in_reif(" & $av & ", ws" & $a & ", " & prefix & "_ma) :: defines_var(" & prefix & "_ma);")
+          lines.add("constraint set_in_reif(" & $bv & ", ws" & $b & ", " & prefix & "_mb) :: defines_var(" & prefix & "_mb);")
+          # Bool to int
+          lines.add("var 0..1: " & prefix & "_ia :: var_is_introduced :: is_defined_var;")
+          lines.add("var 0..1: " & prefix & "_ib :: var_is_introduced :: is_defined_var;")
+          lines.add("constraint bool2int(" & prefix & "_ma, " & prefix & "_ia) :: defines_var(" & prefix & "_ia);")
+          lines.add("constraint bool2int(" & prefix & "_mb, " & prefix & "_ib) :: defines_var(" & prefix & "_ib);")
+          # Product (AND)
+          lines.add("var 0..1: " & prefix & "_prod :: var_is_introduced :: is_defined_var;")
+          lines.add("constraint int_times(" & prefix & "_ia, " & prefix & "_ib, " & prefix & "_prod) :: defines_var(" & prefix & "_prod);")
+          # Scaled value: s = sumVal * prod
+          lines.add("var 0..5: " & prefix & "_s :: var_is_introduced :: is_defined_var;")
+          lines.add("constraint int_lin_eq([" & $sumVal & ", -1], [" & prefix & "_prod, " & prefix & "_s], 0) :: defines_var(" & prefix & "_s);")
+          # Singleton set
+          lines.add("var set of 0..5: " & prefix & "_sing :: var_is_introduced;")
+          lines.add("constraint set_in(" & prefix & "_s, " & prefix & "_sing);")
+          lines.add("constraint set_card(" & prefix & "_sing, 1);")
+          leafNames.add(prefix & "_sing")
+          inc pairIdx
+
+      # Union chain: fold all singletons into l2_p
+      var accName = leafNames[0]
+      for j in 1..<leafNames.len:
+        let nextName = if j == leafNames.len - 1: "l2_" & $p
+                       else: "uc" & $p & "_" & $j
+        if j < leafNames.len - 1:
+          lines.add("var set of 0..5: " & nextName & " :: var_is_introduced :: is_defined_var;")
+        lines.add("constraint set_union(" & accName & ", " & leafNames[j] & ", " & nextName & ") :: defines_var(" & nextName & ");")
+        accName = nextName
+
+      # Cardinality constraint
+      lines.add("constraint set_card(l2_" & $p & ", card_l2_" & $p & ");")
+
+    # Objective: sum of all cardinalities
+    lines.add("var 0..100: objective :: output_var :: is_defined_var;")
+    # L1 cards are fixed: 2+2+2+1 = 7, L2 cards are variable
+    lines.add("constraint int_lin_eq([1, -1, -1], [objective, card_l2_0, card_l2_1], 7);")
+    lines.add("solve minimize objective;")
+
+    let src = lines.join("\n")
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    # Verify channel consistency
+    check verifyChannelConsistency(tr) == 0
+
+    # Check objective is at least the theoretical minimum
+    # Best pairing: L1[1]={0,3} + L1[4]={0} → {0,3} (2 elements)
+    #               L1[2]={0,2} + L1[3]={0,1} → {0,1,2,3} (4 elements)
+    # L2 cards: 2+4=6, L1 fixed=7, total: 7+6=13
+    let objVal = tr.sys.assignment[tr.varPositions["objective"]]
+    check objVal >= 13  # at least the true minimum
+
+  test "channel consistency after optimization with bound constraints":
+    ## Tests that channel propagation remains consistent through the
+    ## optimizer's binary search (adding/removing bound constraints).
+    ## Uses a simple set routing pattern with optimization.
+    let src = """
+var 1..3: sel :: output_var;
+var set of 0..4: s1;
+var set of 0..4: s2;
+var set of 0..4: s3;
+var set of 0..4: chosen :: var_is_introduced;
+var 0..5: card_chosen :: output_var :: is_defined_var;
+constraint set_eq(s1, {0, 1, 2, 3, 4});
+constraint set_eq(s2, {0, 2, 4});
+constraint set_eq(s3, {0, 1});
+constraint array_var_set_element(sel, [s1, s2, s3], chosen);
+constraint set_card(chosen, card_chosen);
+var 0..5: objective :: is_defined_var;
+constraint int_lin_eq([1, -1], [objective, card_chosen], 0) :: defines_var(objective);
+solve minimize objective;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    check verifyChannelConsistency(tr) == 0
+    # Verify cardinality matches actual set membership
+    let selVal = tr.sys.assignment[tr.varPositions["sel"]]
+    let objVal = tr.sys.assignment[tr.varPositions["card_chosen"]]
+    let expectedSets = [@[0, 1, 2, 3, 4], @[0, 2, 4], @[0, 1]]
+    let expectedCard = expectedSets[selVal - 1].len
+    check objVal == expectedCard  # cardinality must match selected set
+    check objVal >= 2  # theoretical minimum (s3 has 2 elements)
+>>>>>>> a3c0716 (improvements to gt-sort problem)

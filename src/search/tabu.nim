@@ -2183,13 +2183,17 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
     ## Uses a worklist to handle transitive channel dependencies.
     ## Returns true if any channel values actually changed.
     ## Populates changedChannels with positions of channels whose values changed.
+    ## Uses an inWorklist set (not visited set) to avoid duplicate entries while
+    ## allowing positions to be re-enqueued when their value changes through
+    ## different dependency paths (e.g., multi-layer set comprehension cascades).
     changedChannels.setLen(0)
     var worklist = @[position]
-    var visited: PackedSet[int]
-    visited.incl(position)
+    var inWorklist: PackedSet[int]
+    inWorklist.incl(position)
 
     while worklist.len > 0:
         let pos = worklist.pop()
+        inWorklist.excl(pos)
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
@@ -2221,8 +2225,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(bindingPtr.channelPosition)
-                    if bindingPtr.channelPosition notin visited:
-                        visited.incl(bindingPtr.channelPosition)
+                    if bindingPtr.channelPosition notin inWorklist:
+                        inWorklist.incl(bindingPtr.channelPosition)
                         worklist.add(bindingPtr.channelPosition)
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
@@ -2247,8 +2251,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(fb.channelPosition)
-                    if fb.channelPosition notin visited:
-                        visited.incl(fb.channelPosition)
+                    if fb.channelPosition notin inWorklist:
+                        inWorklist.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
         # Count-equals channel bindings
         if pos in state.carray.countEqChannelsAtPosition:
@@ -2273,8 +2277,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(binding.channelPosition)
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
         # Conditional count-equals channel bindings
         if pos in state.carray.conditionalCountEqChannelsAtPosition:
@@ -2299,8 +2303,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
                     state.updateNeighborPenalties(binding.channelPosition)
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
         # Inverse channel bindings: recompute inverse from forward assignments
         if pos in state.carray.inverseChannelsAtPosition:
@@ -2326,19 +2330,20 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                         when ProfileIteration:
                             state.propagateNeighborCalls += 1
                         state.updateNeighborPenalties(ipos)
-                        if ipos notin visited:
-                            visited.incl(ipos)
+                        if ipos notin inWorklist:
+                            inWorklist.incl(ipos)
                             worklist.add(ipos)
 
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
     ## but skips penalty map updates entirely. For use during path relinking.
     var worklist = @[position]
-    var visited: PackedSet[int]
-    visited.incl(position)
+    var inWorklist: PackedSet[int]
+    inWorklist.incl(position)
 
     while worklist.len > 0:
         let pos = worklist.pop()
+        inWorklist.excl(pos)
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
@@ -2358,8 +2363,8 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         c.updatePosition(bindingPtr.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
-                    if bindingPtr.channelPosition notin visited:
-                        visited.incl(bindingPtr.channelPosition)
+                    if bindingPtr.channelPosition notin inWorklist:
+                        inWorklist.incl(bindingPtr.channelPosition)
                         worklist.add(bindingPtr.channelPosition)
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
@@ -2373,8 +2378,8 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         c.updatePosition(fb.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
-                    if fb.channelPosition notin visited:
-                        visited.incl(fb.channelPosition)
+                    if fb.channelPosition notin inWorklist:
+                        inWorklist.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
         # Count-equals channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.countEqChannelsAtPosition:
@@ -2388,8 +2393,8 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         c.updatePosition(binding.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
         # Conditional count-equals channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.conditionalCountEqChannelsAtPosition:
@@ -2403,8 +2408,8 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         c.updatePosition(binding.channelPosition, newVal)
                         let newPenalty = c.penalty()
                         state.cost += newPenalty - oldPenalty
-                    if binding.channelPosition notin visited:
-                        visited.incl(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
         # Inverse channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.inverseChannelsAtPosition:
@@ -2419,8 +2424,8 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                             c.updatePosition(ipos, newInverse[j])
                             let newPenalty = c.penalty()
                             state.cost += newPenalty - oldPenalty
-                        if ipos notin visited:
-                            visited.incl(ipos)
+                        if ipos notin inWorklist:
+                            inWorklist.incl(ipos)
                             worklist.add(ipos)
 
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =

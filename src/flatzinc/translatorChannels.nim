@@ -202,21 +202,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             skippedReifCIs.incl(ci)
             continue
 
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        # Map source positions to this binding (for channel propagation triggers)
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     tr.unchannelSkippedReifs(skippedReifCIs, tr.reifChannelDefs, "reif")
 
@@ -247,20 +233,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             ArrayElement[int](isConstant: true, constantValue: 1)
         ]
 
-        let binding = ChannelBinding[int](
-            channelPosition: iPos,
-            indexExpression: bExpr,  # b is 0-based (domain {0,1})
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(iPos)
-
-        for pos in bExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(iPos, bExpr, arrayElems)
 
     # Process bool_not channels: b = 1 - a = element(a, [1, 0])
     for ci in tr.boolNotChannelDefs:
@@ -280,20 +253,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             ArrayElement[int](isConstant: true, constantValue: 0)
         ]
 
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: aExpr,  # a is 0-based (domain {0,1})
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        for pos in aExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, aExpr, arrayElems)
 
     # Process bool_xor negation channels: result = 1 - input = element(input, [1, 0])
     for def in tr.boolXorNegDefs:
@@ -304,19 +264,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             ArrayElement[int](isConstant: true, constantValue: 1),
             ArrayElement[int](isConstant: true, constantValue: 0)
         ]
-        let binding = ChannelBinding[int](
-            channelPosition: rPos,
-            indexExpression: aExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(rPos)
-        for pos in aExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(rPos, aExpr, arrayElems)
 
     # Process bool_clause_reif channels
     for ci in tr.boolClauseReifChannelDefs:
@@ -366,20 +314,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         for i in 1..n:
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
 
-        let binding = ChannelBinding[int](
-            channelPosition: rPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(rPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(rPos, indexExpr, arrayElems)
 
     # Process set_in_reif channels
     var skippedSetInReifCIs: HashSet[int]
@@ -474,20 +409,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             skippedSetInReifCIs.incl(ci)
             continue
 
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     tr.unchannelSkippedReifs(skippedSetInReifCIs, tr.setInReifChannelDefs, "set_in_reif")
 
@@ -583,20 +505,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             skippedLeReifCIs.incl(ci)
             continue
 
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     tr.unchannelSkippedReifs(skippedLeReifCIs, tr.leReifChannelDefs, "le_reif")
 
@@ -697,20 +606,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                     constantValue: if v <= rhs: 1 else: 0))
 
         let indexExpr = sp - exprMin
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     # Un-channel skipped int_lin_le_reif vars
     if skippedLinLeReifCIs.len > 0:
@@ -824,20 +720,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                     constantValue: if (v == rhs) == isLinEq: 1 else: 0))
 
         let indexExpr = sp - exprMin
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     # Un-channel skipped int_lin_eq_reif vars
     if skippedLinEqReifCIs.len > 0:
@@ -919,20 +802,7 @@ proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
             for i in 1..n:
                 arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
 
-        let binding = ChannelBinding[int](
-            channelPosition: rPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(rPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(rPos, indexExpr, arrayElems)
 
     if tr.boolAndOrChannelDefs.len > 0:
         stderr.writeLine(&"[FZN] Built {tr.boolAndOrChannelDefs.len} array_bool_and/or channel bindings " &
@@ -968,20 +838,7 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
             arrayElems.add(ArrayElement[int](isConstant: true,
                     constantValue: if v == value: 1 else: 0))
 
-        let binding = ChannelBinding[int](
-            channelPosition: indicatorPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(indicatorPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(indicatorPos, indexExpr, arrayElems)
 
     if tr.oneHotChannelDefs.len > 0:
         stderr.writeLine(&"[FZN] Built {tr.oneHotChannelDefs.len} one-hot channel bindings " &
@@ -999,14 +856,8 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
             node = ExpressionNode[int](kind: LiteralNode, value: 0),
             linear = true
         )
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 0)]
-        )
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-        # No entries in channelsAtPosition — no source positions, binding is constant
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr,
+            @[ArrayElement[int](isConstant: true, constantValue: 0)])
         nConstZero += 1
 
     if nConstZero > 0:
@@ -1069,27 +920,7 @@ proc buildChannelBindings(tr: var FznTranslator) =
                 for v in constArray:
                     arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
 
-        let binding = ChannelBinding[int](
-            channelPosition: channelPos,
-            indexExpression: adjustedIndex,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(channelPos)
-
-        # Map source positions to this binding
-        for pos in adjustedIndex.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
-        for elem in arrayElems:
-            if not elem.isConstant:
-                if elem.variablePosition notin tr.sys.baseArray.channelsAtPosition:
-                    tr.sys.baseArray.channelsAtPosition[elem.variablePosition] = @[bindingIdx]
-                else:
-                    tr.sys.baseArray.channelsAtPosition[elem.variablePosition].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(channelPos, adjustedIndex, arrayElems)
 
     if tr.sys.baseArray.channelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
@@ -1111,20 +942,7 @@ proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
         for v in syn.lookupTable:
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
 
-        let binding = ChannelBinding[int](
-            channelPosition: channelPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(channelPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
 
 proc buildSingletonSetChannelBindings(tr: var FznTranslator) =
     ## Builds channel bindings for singleton set booleans detected by detectSingletonSetChannels.
@@ -1518,20 +1336,7 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
         if not valid: continue
 
         # Create and register channel binding
-        let binding = ChannelBinding[int](
-            channelPosition: channelPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(channelPos)
-
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
         inc nBuilt
 
     if nBuilt > 0:
@@ -2327,21 +2132,7 @@ proc buildBoolAndChannelBindings*(tr: var FznTranslator) =
             arrayElems.add(ArrayElement[int](isConstant: true,
                     constantValue: if i == n: 1 else: 0))
 
-        let binding = ChannelBinding[int](
-            channelPosition: bPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(bPos)
-
-        # Register source positions for incremental propagation
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
         inc built
 
     if built > 0:
@@ -2377,21 +2168,7 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
         arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: val0Pos))
         arrayElems.add(ArrayElement[int](isConstant: false, variablePosition: val1Pos))
 
-        let binding = ChannelBinding[int](
-            channelPosition: targetPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(targetPos)
-
-        # Register source positions: condition channel + both value positions
-        for pos in [condPos, val0Pos, val1Pos]:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
         inc nBinary
 
     # Build one-hot conditional channel bindings
@@ -2438,21 +2215,7 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
         for v in def.targetVals:
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
 
-        let binding = ChannelBinding[int](
-            channelPosition: targetPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(targetPos)
-
-        # Register source positions for incremental propagation
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
         inc nOneHot
 
     if nBinary > 0 or nOneHot > 0:
@@ -2483,21 +2246,7 @@ proc buildBoolEquivAliasBindings*(tr: var FznTranslator) =
         arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
         arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
 
-        let binding = ChannelBinding[int](
-            channelPosition: aliasPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(aliasPos)
-
-        # Register source positions for incremental propagation
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(aliasPos, indexExpr, arrayElems)
         inc built
 
     if built > 0:
@@ -2537,27 +2286,7 @@ proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
             # Skip this binding if valVar doesn't have a position.
             continue
 
-        let binding = ChannelBinding[int](
-            channelPosition: targetPos,
-            indexExpression: indexExpr,
-            arrayElements: arrayElems
-        )
-        let bindingIdx = tr.sys.baseArray.channelBindings.len
-        tr.sys.baseArray.channelBindings.add(binding)
-        tr.sys.baseArray.channelPositions.incl(targetPos)
-
-        # Register source positions: condition + value variable
-        for pos in indexExpr.positions.items:
-            if pos notin tr.sys.baseArray.channelsAtPosition:
-                tr.sys.baseArray.channelsAtPosition[pos] = @[bindingIdx]
-            else:
-                tr.sys.baseArray.channelsAtPosition[pos].add(bindingIdx)
-        # Also register the value variable position
-        let valPos = tr.varPositions[def.valVar]
-        if valPos notin tr.sys.baseArray.channelsAtPosition:
-            tr.sys.baseArray.channelsAtPosition[valPos] = @[bindingIdx]
-        elif bindingIdx notin tr.sys.baseArray.channelsAtPosition[valPos]:
-            tr.sys.baseArray.channelsAtPosition[valPos].add(bindingIdx)
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
         inc built
 
     if built > 0:
