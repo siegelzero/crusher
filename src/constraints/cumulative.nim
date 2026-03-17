@@ -255,8 +255,8 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
 proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue: T) =
     ## Updates the constraint state when a position changes
     ## Uses incremental cost update for O(duration) complexity
-    if position >= state.currentAssignment.len:
-        return
+    assert position < state.currentAssignment.len,
+        "cumulative updatePosition: position " & $position & " >= currentAssignment.len " & $state.currentAssignment.len
     let oldValue = state.currentAssignment[position]
     if oldValue == newValue:
         return
@@ -437,17 +437,20 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
     # If a dur/height changed, all overlapping task origins are affected
     if state.hasVarDurHeight and (state.lastChangedPosition in state.durPosToTask or
                                    state.lastChangedPosition in state.heightPosToTask):
-        let taskIdx = if state.lastChangedPosition in state.durPosToTask:
+        let isDurChange = state.lastChangedPosition in state.durPosToTask
+        let taskIdx = if isDurChange:
                           state.durPosToTask[state.lastChangedPosition]
                       else:
                           state.heightPosToTask[state.lastChangedPosition]
         let origin = state.getTaskOrigin(taskIdx)
         let dur = state.getDuration(taskIdx)
-        # Use max of old and new duration to cover full affected range
-        let oldDur = state.lastOldValue
-        let maxDur = max(dur, oldDur)
         let affectedStart = int(origin)
-        let affectedEnd = int(origin) + int(maxDur)
+        # For duration changes, cover both old and new duration ranges.
+        # For height changes, the time range is just origin..origin+duration.
+        let affectedEnd = if isDurChange:
+                              int(origin) + int(max(dur, state.lastOldValue))
+                          else:
+                              int(origin) + int(dur)
         case state.evalMethod:
             of PositionBased:
                 for i, pos in state.originPositions:
