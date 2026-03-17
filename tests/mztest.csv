@@ -1,0 +1,6 @@
+# MiniZinc Integration Test Definitions
+# name,model,data,type,time_ms,min_obj,max_obj
+# type: minimize | maximize | satisfy
+# Leave min_obj or max_obj empty to skip that bound check
+# For satisfy problems, both bounds are ignored
+gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86

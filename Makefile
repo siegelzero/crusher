@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test fzcrusher
+.PHONY: help test fzcrusher mztest
 
 # Default target
 help:
@@ -14,6 +14,7 @@ help:
 	@echo "  clean        - Clean all compiled executables"
 	@echo "  format       - Strip trailing whitespace from all *.nim files"
 	@echo "  fzcrusher    - Build the FlatZinc solver binary"
+	@echo "  mztest       - Run MiniZinc integration tests"
 	@echo "  all          - Run all targets (currently just test)"
 	@echo ""
 
@@ -26,3 +27,6 @@ test:
 # Build the FlatZinc solver binary
 fzcrusher:
 	nim c --threads:on --mm:arc --deepcopy:on -d:release -o:fzcrusher src/fzcrusher.nim
+
+mztest: fzcrusher
+	@bash tests/mztest.sh
