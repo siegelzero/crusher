@@ -1,4 +1,4 @@
-import std/[sequtils, tables, unittest]
+import std/[sequtils, tables, unittest, packedsets]
 import crusher
 import constraints/connected
 
@@ -308,3 +308,70 @@ suite "Connected Constraint":
         sys.initialize(assignment)
         for c in sys.baseArray.constraints:
             check c.penalty() == 0
+
+    test "removeFixedConstraints preserves connected with mixed channel+fixed positions":
+        # Regression: removeFixedConstraints used to remove constraints where all
+        # positions were either fixed or channel. The connected constraint must be
+        # kept when it has channel positions, since channel values change during search.
+        var sys = initConstraintSystem[int]()
+
+        # 5 node positions: 3 channel + 2 fixed
+        var nodes = sys.newConstrainedSequence(5)
+        nodes.setDomain(0, @[0, 1])  # channel
+        nodes.setDomain(1, @[0, 1])  # channel
+        nodes.setDomain(2, @[0, 1])  # channel
+        nodes.setDomain(3, @[1])     # fixed: always active
+        nodes.setDomain(4, @[0])     # fixed: always inactive
+
+        # 4 edge positions
+        var edges = sys.newConstrainedSequence(4)
+        edges.setDomain(@[0, 1])
+
+        # Mark node positions 0,1,2 as channels
+        sys.baseArray.channelPositions.incl(0)
+        sys.baseArray.channelPositions.incl(1)
+        sys.baseArray.channelPositions.incl(2)
+
+        # Star graph: center=0, edges 0-1, 0-2, 0-3, 0-4
+        sys.addConstraint(connected[int](@[0,1,2,3,4], @[5,6,7,8], @[0,0,0,0], @[1,2,3,4]))
+
+        # Set up reducedDomain (mirrors domain)
+        sys.baseArray.reducedDomain = newSeq[seq[int]](sys.baseArray.len)
+        for i in 0..<sys.baseArray.len:
+            sys.baseArray.reducedDomain[i] = sys.baseArray.domain[i]
+
+        let before = sys.baseArray.constraints.len
+        sys.baseArray.removeFixedConstraints()
+        let after = sys.baseArray.constraints.len
+
+        # Connected constraint must NOT be removed — channel values change during search
+        check after == before
+
+    test "removeFixedConstraints still removes all-fixed constraints":
+        # Verify the fix didn't break removal of truly fixed constraints.
+        var sys = initConstraintSystem[int]()
+
+        # 3 node positions, all fixed (singleton domains)
+        var nodes = sys.newConstrainedSequence(3)
+        nodes.setDomain(0, @[1])
+        nodes.setDomain(1, @[1])
+        nodes.setDomain(2, @[1])
+
+        # 2 edge positions, also fixed
+        var edges = sys.newConstrainedSequence(2)
+        edges.setDomain(0, @[1])
+        edges.setDomain(1, @[0])
+
+        # Path: 0-1-2
+        sys.addConstraint(connected[int](@[0,1,2], @[3,4], @[0,1], @[1,2]))
+
+        sys.baseArray.reducedDomain = newSeq[seq[int]](sys.baseArray.len)
+        for i in 0..<sys.baseArray.len:
+            sys.baseArray.reducedDomain[i] = sys.baseArray.domain[i]
+
+        let before = sys.baseArray.constraints.len
+        sys.baseArray.removeFixedConstraints()
+        let after = sys.baseArray.constraints.len
+
+        # All-fixed constraint SHOULD be removed
+        check after == before - 1

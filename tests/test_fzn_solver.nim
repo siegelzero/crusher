@@ -2350,3 +2350,48 @@ solve minimize objective;
     let expectedCard = expectedSets[selVal - 1].len
     check objVal == expectedCard  # cardinality must match selected set
     check objVal >= 2  # theoretical minimum (s3 has 2 elements)
+
+  test "connected constraint with channel+fixed node positions survives optimization":
+    # Regression: removeFixedConstraints removed the connected constraint because
+    # all its node positions were either channel vars (via bool_not) or fixed
+    # literals (true/false). Without connected, the solver fills the center node
+    # for obj=11, disconnecting the two always-white nodes. With connected, the
+    # center must stay white, capping obj at 1.
+    #
+    # Star graph: center=node1, edges to nodes 2,3,4.
+    # Nodes 2,3 always white (ns=true). Node 4 variable. Node 1 variable.
+    # Nodes 2 and 3 have no edge between them — only connected through center.
+    # Connected constraint's node positions are all channel or fixed → triggers old bug.
+    let src = """
+predicate fzn_connected(array [int] of int: from,array [int] of int: to,array [int] of var bool: ns,array [int] of var bool: es);
+var bool: f1;
+var bool: f4;
+var bool: nf1 ::is_defined_var;
+var bool: nf4 ::is_defined_var;
+constraint bool_not(f1,nf1):: defines_var(nf1);
+constraint bool_not(f4,nf4):: defines_var(nf4);
+array [1..3] of int: from = [1,1,1];
+array [1..3] of int: to = [2,3,4];
+var bool: e12 ::is_defined_var;
+var bool: e13 ::is_defined_var;
+var bool: e14 ::is_defined_var;
+array [1..3] of var bool: edge = [e12,e13,e14];
+constraint array_bool_and([nf1,true],e12):: defines_var(e12);
+constraint array_bool_and([nf1,true],e13):: defines_var(e13);
+constraint array_bool_and([nf1,nf4],e14):: defines_var(e14);
+array [1..4] of var bool: ns ::var_is_introduced = [nf1,true,true,nf4];
+constraint fzn_connected(from,to,ns,edge);
+var 0..11: obj ::output_var;
+constraint int_lin_eq([10,1,-1],[f1,f4,obj],0);
+solve maximize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let objExpr = tr.getExpr(tr.objectivePos)
+    maximize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let objVal = tr.sys.assignment[tr.varPositions["obj"]]
+    # With connected: center must stay white (else nodes 2,3 disconnect), max obj = 1
+    # Without connected (the old bug): fill center for obj = 10 or 11
+    check objVal <= 1

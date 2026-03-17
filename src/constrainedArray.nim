@@ -3799,23 +3799,18 @@ proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
     if carray.fixedPositions.len == 0:
         return
 
-    # 2. Remove constraints where all non-channel positions are fixed,
-    #    but only if the constraint has at least one fixed position.
-    #    Pure-channel constraints are kept (they become channel-dep constraints
-    #    in the tabu search, since their values depend on search variables).
-    let excludedPositions = carray.fixedPositions + carray.channelPositions
+    # 2. Remove constraints where ALL positions are fixed (singleton domain).
+    #    Constraints with any channel position are kept — channel values depend
+    #    on search variables and aren't guaranteed satisfied by domain reduction.
     var newConstraints: seq[StatefulConstraint[T]]
     var removedCount = 0
     for c in carray.constraints:
-        var allExcluded = true
-        var hasFixedPos = false
+        var allFixed = true
         for pos in c.positions.items:
-            if pos notin excludedPositions:
-                allExcluded = false
+            if pos notin carray.fixedPositions:
+                allFixed = false
                 break
-            if pos in carray.fixedPositions:
-                hasFixedPos = true
-        if allExcluded and hasFixedPos:
+        if allFixed and c.positions.card > 0:
             inc removedCount
         else:
             newConstraints.add(c)
