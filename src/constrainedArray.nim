@@ -1205,14 +1205,18 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 if height > cumState.limit:
                     continue
 
-                # Prune negative origins (they place the task partially outside the
-                # tracked resource profile, hiding violations)
-                var toExclude: seq[T] = @[]
-                for v in currentDomain[pos].items:
-                    if v < T(0):
-                        toExclude.add(v)
-                for v in toExclude:
-                    currentDomain[pos].excl(v)
+                # Prune negative origins only when the task has constant positive height.
+                # Variable-height tasks may have height=0 at negative origins (e.g., -1
+                # sentinel meaning "not scheduled"), so pruning would be unsound.
+                let hasConstHeight = cumState.heightPositions.len == 0 or
+                    (taskIdx < cumState.heightPositions.len and cumState.heightPositions[taskIdx] < 0)
+                if hasConstHeight and height > 0:
+                    var toExclude: seq[T] = @[]
+                    for v in currentDomain[pos].items:
+                        if v < T(0):
+                            toExclude.add(v)
+                    for v in toExclude:
+                        currentDomain[pos].excl(v)
 
         of ExpressionBased:
             discard
@@ -2742,10 +2746,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             let cumState = cons.cumulativeState
             if cumState.limit != 1: continue
             if cumState.evalMethod != PositionBased: continue
-            # Verify all heights are 1
+            # Verify all heights are constant 1 (skip if any height is variable)
             var allUnit = true
-            for h in cumState.heights:
+            for i, h in cumState.heights:
                 if h != T(1):
+                    allUnit = false
+                    break
+                if cumState.heightPositions.len > 0 and i < cumState.heightPositions.len and cumState.heightPositions[i] >= 0:
                     allUnit = false
                     break
             if not allUnit: continue

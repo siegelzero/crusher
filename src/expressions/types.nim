@@ -46,6 +46,7 @@ type
 
 # Evaluation
 
+{.push overflowChecks: off.}
 func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     case node.kind:
         of LiteralNode:
@@ -76,6 +77,7 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                     return max(left, right)
                 of Minimum:
                     return min(left, right)
+{.pop.}
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     expression.node.evaluate(assignment)

@@ -842,10 +842,10 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
                 let newOrigin = state.originExpressions[taskIdx].evaluate(state.currentAssignment)
                 let newStart = max(0, int(newOrigin))
                 let newEnd = min(tMax, int(newOrigin) + duration)
-                if newStart >= tMax:
+                if newStart >= tMax or newEnd <= 0:
                     result[i] = int(baseOveruse - currentCost)
                 else:
-                    let addedCost = state.prefixDeltaBuf[newEnd] - state.prefixDeltaBuf[newStart]
+                    let addedCost = state.prefixDeltaBuf[max(newEnd, 0)] - state.prefixDeltaBuf[newStart]
                     result[i] = int(baseOveruse + addedCost - currentCost)
             state.currentAssignment[position] = currentValue
             return
@@ -964,9 +964,11 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     for i, v in domain:
         let newStart = max(0, int(v))
         let newEnd = min(tMax, int(v) + duration)
-        if newStart >= tMax:
+        if newStart >= tMax or newEnd <= 0:
             # Task entirely outside profile — penalty is just base overuse
             result[i] = int(baseOveruse - currentCost)
         else:
-            let addedCost = state.prefixDeltaBuf[newEnd] - state.prefixDeltaBuf[newStart]
+            let clampedStart = max(newStart, 0)
+            let clampedEnd = max(newEnd, 0)
+            let addedCost = state.prefixDeltaBuf[clampedEnd] - state.prefixDeltaBuf[clampedStart]
             result[i] = int(baseOveruse + addedCost - currentCost)
