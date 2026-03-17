@@ -1592,6 +1592,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
                             lastOldValue: constraint.cumulativeState.lastOldValue,
                             limitPosition: constraint.cumulativeState.limitPosition,
+                            durationPositions: constraint.cumulativeState.durationPositions,
+                            heightPositions: constraint.cumulativeState.heightPositions,
+                            durPosToTask: constraint.cumulativeState.durPosToTask,
+                            heightPosToTask: constraint.cumulativeState.heightPosToTask,
                             evalMethod: PositionBased,
                             prefixDeltaBuf: newSeq[int64](constraint.cumulativeState.maxTime + 2),
                             originPositions: constraint.cumulativeState.originPositions,
@@ -1617,6 +1621,10 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                             lastChangedPosition: constraint.cumulativeState.lastChangedPosition,
                             lastOldValue: constraint.cumulativeState.lastOldValue,
                             limitPosition: constraint.cumulativeState.limitPosition,
+                            durationPositions: constraint.cumulativeState.durationPositions,
+                            heightPositions: constraint.cumulativeState.heightPositions,
+                            durPosToTask: constraint.cumulativeState.durPosToTask,
+                            heightPosToTask: constraint.cumulativeState.heightPosToTask,
                             evalMethod: ExpressionBased,
                             prefixDeltaBuf: newSeq[int64](constraint.cumulativeState.maxTime + 2),
                             originExpressions: copiedExpressions,
@@ -1854,30 +1862,52 @@ func sequence*[T](expressions: seq[AlgebraicExpression[T]], minInSet, maxInSet, 
 # Cumulative wrapper functions
 ################################################################################
 
-func cumulative*[T](originPositions: openArray[int], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1): StatefulConstraint[T] =
+func cumulative*[T](originPositions: openArray[int], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1,
+                     durationPositions: seq[int] = @[], heightPositions: seq[int] = @[]): StatefulConstraint[T] =
     ## Creates a cumulative constraint for resource-constrained scheduling.
     ## - originPositions: Variable positions representing task start times
-    ## - durations: Duration of each task (constant)
-    ## - heights: Resource consumption of each task (constant)
+    ## - durations: Duration of each task (constant fallback)
+    ## - heights: Resource consumption of each task (constant fallback)
     ## - limit: Maximum resource capacity (initial value if limitPosition >= 0)
     ## - limitPosition: Position of variable limit (-1 = constant limit)
-    ## Example: cumulative([0,1,2,3,4], [3,9,10,6,2], [1,2,1,1,3], 8) for project scheduling
+    ## - durationPositions: Per-task position of variable duration (-1 = use constant)
+    ## - heightPositions: Per-task position of variable height (-1 = use constant)
     var positions = toPackedSet[int](originPositions)
     if limitPosition >= 0:
         positions.incl(limitPosition)
+    for dp in durationPositions:
+        if dp >= 0: positions.incl(dp)
+    for hp in heightPositions:
+        if hp >= 0: positions.incl(hp)
+    var state = newCumulativeConstraint[T](originPositions, durations, heights, limit, limitPosition = limitPosition)
+    if durationPositions.len > 0:
+        state.durationPositions = durationPositions
+        state.heightPositions = heightPositions
+        for i, dp in durationPositions:
+            if dp >= 0: state.durPosToTask[dp] = i
+        for i, hp in heightPositions:
+            if hp >= 0: state.heightPosToTask[hp] = i
+        # Extend currentAssignment to cover dur/height positions
+        for dp in durationPositions:
+            if dp >= 0 and dp >= state.currentAssignment.len:
+                state.currentAssignment.setLen(dp + 1)
+        for hp in heightPositions:
+            if hp >= 0 and hp >= state.currentAssignment.len:
+                state.currentAssignment.setLen(hp + 1)
     return StatefulConstraint[T](
         positions: positions,
         stateType: CumulativeType,
-        cumulativeState: newCumulativeConstraint[T](originPositions, durations, heights, limit, limitPosition = limitPosition)
+        cumulativeState: state
     )
 
-func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1): StatefulConstraint[T] =
+func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: openArray[T], heights: openArray[T], limit: T, limitPosition: int = -1,
+                     durationPositions: seq[int] = @[], heightPositions: seq[int] = @[]): StatefulConstraint[T] =
     ## Returns cumulative constraint for the given origin expressions.
     let (allRefs, positions) = isAllRefs(originExpressions)
 
     if allRefs:
         # Use more efficient position based constraint if all expressions are refnodes
-        return cumulative[T](positions, durations, heights, limit, limitPosition)
+        return cumulative[T](positions, durations, heights, limit, limitPosition, durationPositions, heightPositions)
     else:
         # Collect all positions from expressions for the constraint positions field
         var allPositions = toPackedSet[int]([])
@@ -1885,11 +1915,31 @@ func cumulative*[T](originExpressions: seq[AlgebraicExpression[T]], durations: o
             allPositions.incl(exp.positions)
         if limitPosition >= 0:
             allPositions.incl(limitPosition)
+        for dp in durationPositions:
+            if dp >= 0: allPositions.incl(dp)
+        for hp in heightPositions:
+            if hp >= 0: allPositions.incl(hp)
+
+        var state = newCumulativeConstraint[T](originExpressions, durations, heights, limit, limitPosition = limitPosition)
+        if durationPositions.len > 0:
+            state.durationPositions = durationPositions
+            state.heightPositions = heightPositions
+            for i, dp in durationPositions:
+                if dp >= 0: state.durPosToTask[dp] = i
+            for i, hp in heightPositions:
+                if hp >= 0: state.heightPosToTask[hp] = i
+            # Extend currentAssignment to cover dur/height positions
+            for dp in durationPositions:
+                if dp >= 0 and dp >= state.currentAssignment.len:
+                    state.currentAssignment.setLen(dp + 1)
+            for hp in heightPositions:
+                if hp >= 0 and hp >= state.currentAssignment.len:
+                    state.currentAssignment.setLen(hp + 1)
 
         return StatefulConstraint[T](
             positions: allPositions,
             stateType: CumulativeType,
-            cumulativeState: newCumulativeConstraint[T](originExpressions, durations, heights, limit, limitPosition = limitPosition)
+            cumulativeState: state
         )
 
 ################################################################################

@@ -868,6 +868,318 @@ proc resolveReifications(tr: FznTranslator,
                     # All literals false — infeasible
                     infeasible = true
 
+proc cpmBoundsPropagate(tr: FznTranslator,
+                        domains: var Table[string, seq[int]],
+                        fixedVars: Table[string, int],
+                        eliminated: PackedSet[int],
+                        infeasible: var bool): bool =
+    ## Critical Path Method: single O(V+E) forward/backward pass for precedence
+    ## constraints. Tightens start variable domains from [0..UB] to [ES(i)..LS(i)].
+    ## Much more effective than iterative boundsPropagate for deep precedence chains.
+    result = false
+
+    # Phase 1: Collect candidate edges from int_lin_le constraints.
+    # Pattern A: coeffs=[1,1,-1], vars=[v0, v1, v2], rhs=0 → v0 + v1 <= v2
+    # Pattern B: coeffs=[c,-c], vars=[a, b], rhs=R → a - b <= R/c → edge a→b weight -R/c
+    type CpmCandidate = object
+        fromVar, toVar, durVar: string  # durVar="" for constant-weight edges
+        constWeight: int                # used when durVar=""
+    var candidates: seq[CpmCandidate]
+    var destVars: HashSet[string]  # vars appearing with coeff=-1
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError:
+            continue
+
+        if not tr.presolveIsFixed(con.args[2], fixedVars): continue
+        let rhs = tr.presolveResolve(con.args[2], fixedVars)
+
+        if con.args[1].kind != FznArrayLit: continue
+        var varNames: seq[string]
+        var allIdent = true
+        for e in con.args[1].elems:
+            if e.kind != FznIdent:
+                allIdent = false
+                break
+            varNames.add(e.ident)
+        if not allIdent or varNames.len != coeffs.len: continue
+
+        if coeffs.len == 3 and coeffs == @[1, 1, -1] and rhs == 0:
+            # Pattern A: v0 + v1 - v2 <= 0 → v2 >= v0 + v1
+            destVars.incl(varNames[2])
+            candidates.add(CpmCandidate(
+                fromVar: varNames[0], toVar: varNames[2],
+                durVar: varNames[1], constWeight: 0))
+        elif coeffs.len == 2:
+            # Pattern B: c*a - c*b <= R → edge a→b weight -R/c
+            if coeffs[0] > 0 and coeffs[1] < 0 and coeffs[0] == -coeffs[1]:
+                let c = coeffs[0]
+                if c > 1 and rhs mod c != 0: continue
+                destVars.incl(varNames[1])
+                candidates.add(CpmCandidate(
+                    fromVar: varNames[0], toVar: varNames[1],
+                    durVar: "", constWeight: -(rhs div c)))
+            elif coeffs[0] < 0 and coeffs[1] > 0 and -coeffs[0] == coeffs[1]:
+                let c = coeffs[1]
+                if c > 1 and rhs mod c != 0: continue
+                destVars.incl(varNames[0])
+                candidates.add(CpmCandidate(
+                    fromVar: varNames[1], toVar: varNames[0],
+                    durVar: "", constWeight: -(rhs div c)))
+
+    if candidates.len == 0: return false
+
+    # Phase 2: Resolve 3-var candidates into edges.
+    # For pattern A, determine which +1 var is start (source) vs duration (weight).
+    # destVars contains all vars that appear with coeff=-1 somewhere — these are start vars.
+    # Among the two +1 vars, if one is in destVars it's the source; otherwise use domain range.
+    type CpmEdge = object
+        toId: int
+        minW, maxW: int
+    var nameToId: Table[string, int]
+    var idToName: seq[string]
+    var nextId = 0
+
+    proc getId(name: string): int =
+        if name in nameToId:
+            return nameToId[name]
+        result = nextId
+        nameToId[name] = nextId
+        idToName.add(name)
+        inc nextId
+
+    var adjFwd: seq[seq[CpmEdge]]  # forward adjacency: succ edges
+    var nEdges = 0
+
+    proc addEdge(fromId, toId, minW, maxW: int) =
+        while adjFwd.len <= max(fromId, toId):
+            adjFwd.add(@[])
+        # Merge parallel edges: keep tightest (max weight)
+        for e in adjFwd[fromId].mitems:
+            if e.toId == toId:
+                e.minW = max(e.minW, minW)
+                e.maxW = max(e.maxW, maxW)
+                return
+        adjFwd[fromId].add(CpmEdge(toId: toId, minW: minW, maxW: maxW))
+        inc nEdges
+
+    for cand in candidates:
+        if cand.durVar == "":
+            # Constant weight edge
+            let fId = getId(cand.fromVar)
+            let tId = getId(cand.toVar)
+            addEdge(fId, tId, cand.constWeight, cand.constWeight)
+        else:
+            # 3-var: determine source vs duration
+            var sourceVar, durVar: string
+            let fromIsDest = cand.fromVar in destVars
+            let durIsDest = cand.durVar in destVars
+            if fromIsDest and not durIsDest:
+                sourceVar = cand.fromVar
+                durVar = cand.durVar
+            elif durIsDest and not fromIsDest:
+                sourceVar = cand.durVar
+                durVar = cand.fromVar
+            else:
+                # Both or neither in destVars — use domain range as tiebreaker.
+                # Start vars have large ranges (0..UB), duration vars have small ranges.
+                let fromDom = domains.getOrDefault(cand.fromVar)
+                let durDom = domains.getOrDefault(cand.durVar)
+                let fromRange = if fromDom.len > 0: fromDom[^1] - fromDom[0] else: 0
+                let durRange = if durDom.len > 0: durDom[^1] - durDom[0] else: 0
+                if fromRange >= durRange:
+                    sourceVar = cand.fromVar
+                    durVar = cand.durVar
+                else:
+                    sourceVar = cand.durVar
+                    durVar = cand.fromVar
+
+            # Get duration domain bounds
+            var minDur, maxDur: int
+            if durVar in fixedVars:
+                minDur = fixedVars[durVar]
+                maxDur = fixedVars[durVar]
+            elif durVar in domains:
+                let dom = domains[durVar]
+                if dom.len == 0: continue
+                minDur = dom[0]
+                maxDur = dom[^1]
+            else:
+                continue
+
+            let fId = getId(sourceVar)
+            let tId = getId(cand.toVar)
+            addEdge(fId, tId, minDur, maxDur)
+
+    let n = nextId
+    if n == 0 or nEdges == 0: return false
+    while adjFwd.len < n:
+        adjFwd.add(@[])
+
+    # Phase 3: Topological sort (Kahn's algorithm)
+    var inDeg = newSeq[int](n)
+    for u in 0..<n:
+        for e in adjFwd[u]:
+            inDeg[e.toId] += 1
+
+    var queue: seq[int]
+    for i in 0..<n:
+        if inDeg[i] == 0:
+            queue.add(i)
+
+    var topoOrder: seq[int]
+    var qi = 0
+    while qi < queue.len:
+        let u = queue[qi]
+        inc qi
+        topoOrder.add(u)
+        for e in adjFwd[u]:
+            inDeg[e.toId] -= 1
+            if inDeg[e.toId] == 0:
+                queue.add(e.toId)
+
+    if topoOrder.len != n:
+        # Cycle detected — skip CPM
+        return false
+
+    # Phase 4: Forward pass — compute earliest start times
+    var es = newSeq[int](n)
+    for i in 0..<n:
+        let nm = idToName[i]
+        if nm in fixedVars:
+            es[i] = fixedVars[nm]
+        elif nm in domains and domains[nm].len > 0:
+            es[i] = domains[nm][0]  # domain min
+        else:
+            es[i] = 0
+
+    for u in topoOrder:
+        for e in adjFwd[u]:
+            let newES = es[u] + e.minW
+            if newES > es[e.toId]:
+                es[e.toId] = newES
+
+    # Phase 5: Backward pass — compute latest start times
+    var ls = newSeq[int](n)
+    for i in 0..<n:
+        let nm = idToName[i]
+        if nm in fixedVars:
+            ls[i] = fixedVars[nm]
+        elif nm in domains and domains[nm].len > 0:
+            ls[i] = domains[nm][^1]  # domain max
+        else:
+            ls[i] = high(int) div 2
+
+    for i in countdown(topoOrder.len - 1, 0):
+        let u = topoOrder[i]
+        for e in adjFwd[u]:
+            let newLS = ls[e.toId] - e.maxW
+            if newLS < ls[u]:
+                ls[u] = newLS
+
+    # Phase 6: Tighten domains
+    var nTightened = 0
+    for i in 0..<n:
+        let nm = idToName[i]
+        if nm in fixedVars: continue
+        if presolveRestrictBounds(domains, nm, es[i], ls[i], infeasible):
+            result = true
+            inc nTightened
+
+    if nTightened > 0:
+        stderr.writeLine(&"[FZN] CPM: tightened {nTightened} start variable domains across {nEdges} precedence edges")
+
+proc nonRenewableResourcePruning(tr: FznTranslator,
+                                  domains: var Table[string, seq[int]],
+                                  fixedVars: Table[string, int],
+                                  eliminated: PackedSet[int],
+                                  infeasible: var bool): bool =
+    ## Prune infeasible domain values from resource demand variables based on
+    ## global capacity limits. For int_lin_le where all coefficients are 1 and
+    ## rhs is fixed (non-renewable resource pattern: sum of demands <= capacity),
+    ## each variable's max feasible value is capacity minus the sum of other mins.
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+        if not tr.presolveIsFixed(con.args[2], fixedVars): continue
+
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError:
+            continue
+
+        # Check all coefficients are 1
+        var allOnes = true
+        for c in coeffs:
+            if c != 1:
+                allOnes = false
+                break
+        if not allOnes: continue
+        if coeffs.len < 2: continue
+
+        if con.args[1].kind != FznArrayLit: continue
+        if con.args[1].elems.len != coeffs.len: continue
+
+        # Collect variable info: need all non-fixed with domain in domains table
+        let cap = tr.presolveResolve(con.args[2], fixedVars)
+        type VInfo = object
+            varName: string
+            fixed: bool
+            fixedVal: int
+            lo: int
+        var vars: seq[VInfo]
+        var valid = true
+        var totalMin = 0
+        var nUnfixed = 0
+        for i in 0..<coeffs.len:
+            let e = con.args[1].elems[i]
+            var vi: VInfo
+            vi.varName = presolveVarName(e)
+            if tr.presolveIsFixed(e, fixedVars):
+                vi.fixed = true
+                vi.fixedVal = tr.presolveResolve(e, fixedVars)
+                vi.lo = vi.fixedVal
+                totalMin += vi.fixedVal
+            elif vi.varName != "" and vi.varName in domains:
+                let dom = domains[vi.varName]
+                if dom.len == 0:
+                    valid = false; break
+                vi.fixed = false
+                vi.lo = dom[0]
+                totalMin += dom[0]
+                inc nUnfixed
+            else:
+                valid = false; break
+            vars.add(vi)
+        if not valid or nUnfixed < 2: continue
+
+        # Prune each unfixed variable
+        for i in 0..<vars.len:
+            if vars[i].fixed: continue
+            let othersMin = totalMin - vars[i].lo
+            let slack = cap - othersMin
+            if presolveRestrictBounds(domains, vars[i].varName, low(int), slack, infeasible):
+                result = true
+                # Update local min for subsequent iterations within this constraint
+                let newDom = domains[vars[i].varName]
+                if newDom.len > 0:
+                    let oldMin = vars[i].lo
+                    vars[i].lo = newDom[0]
+                    totalMin += (newDom[0] - oldMin)
+
 proc applyPresolveResults(tr: var FznTranslator,
                           domains: Table[string, seq[int]],
                           fixedVars: Table[string, int],
@@ -918,6 +1230,11 @@ proc presolve*(tr: var FznTranslator) =
         if dom.len == 1:
             fixedVars[name] = dom[0]
 
+    # CPM: single-pass forward/backward propagation for precedence chains.
+    # Run once before the fixpoint loop — O(V+E) vs O(D) iterations needed by boundsPropagate.
+    if cpmBoundsPropagate(tr, domains, fixedVars, eliminated, infeasible):
+        discard fixSingletons(domains, fixedVars)
+
     var totalIterations = 0
 
     for iteration in 0..<30:
@@ -947,7 +1264,12 @@ proc presolve*(tr: var FznTranslator) =
             changed = true
         if infeasible: break
 
-        # Step 6: Fix any newly-created singletons
+        # Step 6: Non-renewable resource pruning
+        if nonRenewableResourcePruning(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 7: Fix any newly-created singletons
         if fixSingletons(domains, fixedVars):
             changed = true
 

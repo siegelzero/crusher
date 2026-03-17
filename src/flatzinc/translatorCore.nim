@@ -988,35 +988,57 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # Durations/heights might be in variable arrays - try constant first, fall back to extracting from assignment
         var durations: seq[int]
         var heights: seq[int]
+        var durPositions: seq[int]  # per-task position of variable duration (-1 = constant)
+        var heightPositions: seq[int]  # per-task position of variable height (-1 = constant)
+        var hasVarDur = false
+        var hasVarHeight = false
         try:
             durations = tr.resolveIntArray(con.args[1])
+            durPositions = newSeq[int](durations.len)
+            for i in 0..<durPositions.len: durPositions[i] = -1
         except:
-            # Variable array containing constants - extract values from singleton domains
+            # Variable array — extract positions for channel-aware cumulative
             let dExprs = tr.resolveExprArray(con.args[1])
             durations = newSeq[int](dExprs.len)
+            durPositions = newSeq[int](dExprs.len)
             for i, e in dExprs:
                 if e.node.kind == LiteralNode:
                     durations[i] = e.node.value
+                    durPositions[i] = -1
                 elif e.node.kind == RefNode:
+                    durPositions[i] = e.node.position
+                    hasVarDur = true
                     let dom = tr.sys.baseArray.domain[e.node.position]
                     if dom.len == 1:
                         durations[i] = dom[0]
                     else:
-                        durations[i] = dom[dom.len div 2]  # fallback
+                        durations[i] = dom[dom.len div 2]  # fallback for initial value
+                else:
+                    durations[i] = 1  # fallback
+                    durPositions[i] = -1
         try:
             heights = tr.resolveIntArray(con.args[2])
+            heightPositions = newSeq[int](heights.len)
+            for i in 0..<heightPositions.len: heightPositions[i] = -1
         except:
             let hExprs = tr.resolveExprArray(con.args[2])
             heights = newSeq[int](hExprs.len)
+            heightPositions = newSeq[int](hExprs.len)
             for i, e in hExprs:
                 if e.node.kind == LiteralNode:
                     heights[i] = e.node.value
+                    heightPositions[i] = -1
                 elif e.node.kind == RefNode:
+                    heightPositions[i] = e.node.position
+                    hasVarHeight = true
                     let dom = tr.sys.baseArray.domain[e.node.position]
                     if dom.len == 1:
                         heights[i] = dom[0]
                     else:
                         heights[i] = dom[dom.len div 2]
+                else:
+                    heights[i] = 0
+                    heightPositions[i] = -1
         # Limit might be a variable - try constant, fall back to variable limit
         var limit: int
         var limitPos = -1
@@ -1031,26 +1053,34 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 limit = dom[^1]  # upper bound as initial value
             else:
                 limit = 10  # fallback
-        # Filter out tasks with zero height
+        # Filter out tasks with zero height (only if height is constant zero)
         var filteredStarts: seq[AlgebraicExpression[int]]
         var filteredDurations: seq[int]
         var filteredHeights: seq[int]
+        var filteredDurPos: seq[int]
+        var filteredHeightPos: seq[int]
         for i in 0..<heights.len:
-            if heights[i] > 0:
-                filteredStarts.add(startExprs[i])
-                filteredDurations.add(durations[i])
-                filteredHeights.add(heights[i])
+            # Only filter if height is constant zero (position == -1 and value == 0)
+            if heights[i] == 0 and (heightPositions.len == 0 or heightPositions[i] < 0):
+                continue
+            filteredStarts.add(startExprs[i])
+            filteredDurations.add(durations[i])
+            filteredHeights.add(heights[i])
+            if durPositions.len > 0: filteredDurPos.add(durPositions[i])
+            if heightPositions.len > 0: filteredHeightPos.add(heightPositions[i])
         let nFiltered = heights.len - filteredHeights.len
         if nFiltered > 0:
             stderr.writeLine(&"[FZN] cumulative: filtered {nFiltered} zero-height tasks")
-        # Skip if trivially satisfied
+        # Skip if trivially satisfied (only when all heights are constant)
         var totalHeight = 0
         for h in filteredHeights: totalHeight += h
-        if filteredStarts.len <= 1 or totalHeight <= limit:
+        if filteredStarts.len <= 1 or (totalHeight <= limit and not hasVarHeight):
             if nFiltered > 0:
                 stderr.writeLine(&"[FZN] cumulative: constraint eliminated (trivially satisfied)")
         else:
-            tr.sys.addConstraint(cumulative[int](filteredStarts, filteredDurations, filteredHeights, limit, limitPos))
+            if hasVarDur or hasVarHeight:
+                stderr.writeLine(&"[FZN] cumulative: variable dur/height ({filteredStarts.len} tasks, varDur={hasVarDur} varHeight={hasVarHeight})")
+            tr.sys.addConstraint(cumulative[int](filteredStarts, filteredDurations, filteredHeights, limit, limitPos, filteredDurPos, filteredHeightPos))
 
     of "fzn_disjunctive", "fzn_disjunctive_strict":
         # disjunctive(starts, durations) = cumulative(starts, durations, heights=[1,...], limit=1)

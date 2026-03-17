@@ -28,6 +28,11 @@ type
         lastOldValue*: T                 # Track old value for smart affected positions
         limitPosition*: int              # Position of variable limit (-1 = constant limit)
         prefixDeltaBuf*: seq[int64]      # Pre-allocated buffer for batch prefix sums
+        # Variable duration/height support (for channel-dependent scheduling, e.g. MRCPSP)
+        durationPositions*: seq[int]     # per-task: position of dur var (-1 if constant)
+        heightPositions*: seq[int]       # per-task: position of height var (-1 if constant)
+        durPosToTask*: Table[int, int]   # dur position → task index
+        heightPosToTask*: Table[int, int] # height position → task index
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 originPositions*: seq[int]
@@ -39,6 +44,33 @@ type
                 durationsExpr*: seq[T]
                 heightsExpr*: seq[T]
                 expressionsAtPosition*: Table[int, seq[int]]
+
+proc getDuration*[T](state: CumulativeConstraint[T], taskIdx: int): T {.inline.} =
+    ## Read current duration for a task: from assignment if variable, else fixed constant.
+    if state.durationPositions.len > 0 and state.durationPositions[taskIdx] >= 0:
+        state.currentAssignment[state.durationPositions[taskIdx]]
+    else:
+        case state.evalMethod:
+        of PositionBased: state.durations[taskIdx]
+        of ExpressionBased: state.durationsExpr[taskIdx]
+
+proc getHeight*[T](state: CumulativeConstraint[T], taskIdx: int): T {.inline.} =
+    ## Read current height for a task: from assignment if variable, else fixed constant.
+    if state.heightPositions.len > 0 and state.heightPositions[taskIdx] >= 0:
+        state.currentAssignment[state.heightPositions[taskIdx]]
+    else:
+        case state.evalMethod:
+        of PositionBased: state.heights[taskIdx]
+        of ExpressionBased: state.heightsExpr[taskIdx]
+
+proc getTaskOrigin*[T](state: CumulativeConstraint[T], taskIdx: int): T {.inline.} =
+    ## Get current origin for a task.
+    case state.evalMethod:
+    of PositionBased: state.currentAssignment[state.originPositions[taskIdx]]
+    of ExpressionBased: state.originExpressions[taskIdx].evaluate(state.currentAssignment)
+
+proc hasVarDurHeight*[T](state: CumulativeConstraint[T]): bool {.inline.} =
+    state.durationPositions.len > 0
 
 ################################################################################
 # CumulativeConstraint creation
@@ -126,13 +158,8 @@ func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
 
 proc updateResourceProfile[T](state: CumulativeConstraint[T], taskIdx: int, origin: T, isAdding: bool) =
     ## Updates the resource profile for a task being added or removed
-    let duration = case state.evalMethod:
-        of PositionBased: state.durations[taskIdx]
-        of ExpressionBased: state.durationsExpr[taskIdx]
-
-    let height = case state.evalMethod:
-        of PositionBased: state.heights[taskIdx]
-        of ExpressionBased: state.heightsExpr[taskIdx]
+    let duration = state.getDuration(taskIdx)
+    let height = state.getHeight(taskIdx)
 
     # Update resource profile for the time range [origin, origin + duration)
     let startT = int(origin)
@@ -169,22 +196,34 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
         state.limit = assignment[state.limitPosition]
         state.currentAssignment[state.limitPosition] = assignment[state.limitPosition]
 
+    # Store dur/height position values in currentAssignment
+    if state.hasVarDurHeight:
+        for i in 0..<state.durationPositions.len:
+            let dp = state.durationPositions[i]
+            if dp >= 0:
+                state.currentAssignment[dp] = assignment[dp]
+            let hp = state.heightPositions[i]
+            if hp >= 0:
+                state.currentAssignment[hp] = assignment[hp]
+
     # Calculate required maxTime from assignment values and durations
     var requiredMaxTime = state.maxTime
     case state.evalMethod:
         of PositionBased:
             for i, pos in state.originPositions:
                 let origin = assignment[pos]
-                let endTime = int(origin) + int(state.durations[i])
+                state.currentAssignment[pos] = origin
+                let endTime = int(origin) + int(state.getDuration(i))
                 if endTime > requiredMaxTime:
                     requiredMaxTime = endTime
         of ExpressionBased:
+            # Store all relevant position values first
+            for pos in state.expressionsAtPosition.keys:
+                state.currentAssignment[pos] = assignment[pos]
+
             for i, exp in state.originExpressions:
-                var tempAssign = initTable[int, T]()
-                for pos in exp.positions.items:
-                    tempAssign[pos] = assignment[pos]
-                let origin = exp.evaluate(tempAssign)
-                let endTime = int(origin) + int(state.durationsExpr[i])
+                let origin = exp.evaluate(state.currentAssignment)
+                let endTime = int(origin) + int(state.getDuration(i))
                 if endTime > requiredMaxTime:
                     requiredMaxTime = endTime
 
@@ -203,20 +242,12 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
         of PositionBased:
             for i, pos in state.originPositions:
                 let origin = assignment[pos]
-                state.currentAssignment[pos] = origin
                 state.updateResourceProfile(i, origin, isAdding = true)
 
         of ExpressionBased:
-            # Store all relevant position values
-            for pos in state.expressionsAtPosition.keys:
-                state.currentAssignment[pos] = assignment[pos]
-
             # Evaluate each origin expression and build resource profile
             for i, exp in state.originExpressions:
-                var tempAssign = initTable[int, T]()
-                for pos in exp.positions.items:
-                    tempAssign[pos] = assignment[pos]
-                let origin = exp.evaluate(tempAssign)
+                let origin = exp.evaluate(state.currentAssignment)
                 state.updateResourceProfile(i, origin, isAdding = true)
 
     state.recalculateCost()
@@ -224,6 +255,8 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
 proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue: T) =
     ## Updates the constraint state when a position changes
     ## Uses incremental cost update for O(duration) complexity
+    if position >= state.currentAssignment.len:
+        return
     let oldValue = state.currentAssignment[position]
     if oldValue == newValue:
         return
@@ -239,12 +272,57 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
         state.recalculateCost()
         return
 
+    # Handle duration position change: re-profile the affected task
+    if state.hasVarDurHeight and position in state.durPosToTask:
+        let taskIdx = state.durPosToTask[position]
+        let origin = state.getTaskOrigin(taskIdx)
+        let height = state.getHeight(taskIdx)
+        let oldDur = oldValue
+        let newDur = newValue
+        var costDelta = 0
+        let tMax = state.maxTime + 1
+        let startT = max(0, int(origin))
+        # Remove time points that are in old range but not new
+        if newDur < oldDur:
+            for t in max(0, startT + int(newDur)) ..< min(tMax, startT + int(oldDur)):
+                let u = state.resourceProfile[t]
+                state.resourceProfile[t] = u - height
+                costDelta += calculateCostDelta(u, u - height, state.limit)
+        elif newDur > oldDur:
+            for t in max(0, startT + int(oldDur)) ..< min(tMax, startT + int(newDur)):
+                let u = state.resourceProfile[t]
+                state.resourceProfile[t] = u + height
+                costDelta += calculateCostDelta(u, u + height, state.limit)
+        state.currentAssignment[position] = newValue
+        state.cost += costDelta
+        return
+
+    # Handle height position change: adjust resource usage across task's time range
+    if state.hasVarDurHeight and position in state.heightPosToTask:
+        let taskIdx = state.heightPosToTask[position]
+        let origin = state.getTaskOrigin(taskIdx)
+        let duration = state.getDuration(taskIdx)
+        let oldHeight = oldValue
+        let newHeight = newValue
+        let heightDelta = newHeight - oldHeight
+        var costDelta = 0
+        let tMax = state.maxTime + 1
+        let startT = max(0, int(origin))
+        let endT = min(tMax, int(origin) + int(duration))
+        for t in startT ..< endT:
+            let u = state.resourceProfile[t]
+            state.resourceProfile[t] = u + heightDelta
+            costDelta += calculateCostDelta(u, u + heightDelta, state.limit)
+        state.currentAssignment[position] = newValue
+        state.cost += costDelta
+        return
+
     case state.evalMethod:
         of PositionBased:
             if position < state.positionToTask.len and state.positionToTask[position] >= 0:
                 let i = state.positionToTask[position]
-                let duration = state.durations[i]
-                let height = state.heights[i]
+                let duration = state.getDuration(i)
+                let height = state.getHeight(i)
                 var costDelta = 0
 
                 let oldStart = int(oldValue)
@@ -298,11 +376,11 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
                     let newOrigin = state.originExpressions[i].evaluate(tempAssign)
                     if oldOrigin == newOrigin:
                         continue
-                    let duration = state.durationsExpr[i]
+                    let duration = state.getDuration(i)
                     changes.add((
                         oldStart: int(oldOrigin), oldEnd: int(oldOrigin + duration),
                         newStart: int(newOrigin), newEnd: int(newOrigin + duration),
-                        height: state.heightsExpr[i]
+                        height: state.getHeight(i)
                     ))
 
                 # Pass 1: remove "leaving" time points (in old range but not new)
@@ -341,7 +419,7 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
     ## Returns positions of tasks that overlap in time with the last changed task.
     result = initPackedSet[int]()
 
-    # If the limit changed, all task positions and the limit position are affected
+    # If the limit changed, all task/dur/height positions are affected
     if state.limitPosition >= 0 and state.lastChangedPosition == state.limitPosition:
         case state.evalMethod:
             of PositionBased:
@@ -350,7 +428,38 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
             of ExpressionBased:
                 for pos in state.expressionsAtPosition.keys:
                     result.incl(pos)
+        if state.hasVarDurHeight:
+            for pos in state.durPosToTask.keys: result.incl(pos)
+            for pos in state.heightPosToTask.keys: result.incl(pos)
         result.incl(state.limitPosition)
+        return result
+
+    # If a dur/height changed, all overlapping task origins are affected
+    if state.hasVarDurHeight and (state.lastChangedPosition in state.durPosToTask or
+                                   state.lastChangedPosition in state.heightPosToTask):
+        let taskIdx = if state.lastChangedPosition in state.durPosToTask:
+                          state.durPosToTask[state.lastChangedPosition]
+                      else:
+                          state.heightPosToTask[state.lastChangedPosition]
+        let origin = state.getTaskOrigin(taskIdx)
+        let dur = state.getDuration(taskIdx)
+        # Use max of old and new duration to cover full affected range
+        let oldDur = state.lastOldValue
+        let maxDur = max(dur, oldDur)
+        let affectedStart = int(origin)
+        let affectedEnd = int(origin) + int(maxDur)
+        case state.evalMethod:
+            of PositionBased:
+                for i, pos in state.originPositions:
+                    let taskStart = int(state.currentAssignment[pos])
+                    let taskEnd = taskStart + int(state.getDuration(i))
+                    if taskStart < affectedEnd and taskEnd > affectedStart:
+                        result.incl(pos)
+            of ExpressionBased:
+                for pos in state.expressionsAtPosition.keys:
+                    result.incl(pos)
+        if state.limitPosition >= 0:
+            result.incl(state.limitPosition)
         return result
 
     case state.evalMethod:
@@ -360,7 +469,7 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
                 return result
 
             let changedTask = state.positionToTask[state.lastChangedPosition]
-            let changedDuration = state.durations[changedTask]
+            let changedDuration = state.getDuration(changedTask)
             let oldStart = state.lastOldValue
             let newStart = state.currentAssignment[state.lastChangedPosition]
 
@@ -371,7 +480,7 @@ proc getAffectedPositions*[T](state: CumulativeConstraint[T]): PackedSet[int] =
             # Find tasks that overlap with this range
             for i, pos in state.originPositions:
                 let taskStart = state.currentAssignment[pos]
-                let taskEnd = taskStart + state.durations[i]
+                let taskEnd = taskStart + state.getDuration(i)
                 if taskStart < affectedEnd and taskEnd > affectedStart:
                     result.incl(pos)
 
@@ -407,12 +516,12 @@ proc getAffectedDomainValues*[T](state: CumulativeConstraint[T], position: int):
                 return result
 
             let changedTask = state.positionToTask[state.lastChangedPosition]
-            let changedDuration = state.durations[changedTask]
+            let changedDuration = state.getDuration(changedTask)
             let oldStart = state.lastOldValue
             let newStart = state.currentAssignment[state.lastChangedPosition]
 
             let thisTask = state.positionToTask[position]
-            let thisDuration = state.durations[thisTask]
+            let thisDuration = state.getDuration(thisTask)
 
             # Time range affected by the change
             let affectedStart = min(oldStart, newStart)
@@ -448,8 +557,8 @@ proc getGoodStartTimes*[T](state: CumulativeConstraint[T], position: int, maxCan
                 return result
 
             let taskIdx = state.positionToTask[position]
-            let duration = state.durations[taskIdx]
-            let height = state.heights[taskIdx]
+            let duration = state.getDuration(taskIdx)
+            let height = state.getHeight(taskIdx)
             let currentStart = state.currentAssignment[position]
 
             # Always include current position and nearby positions
@@ -517,14 +626,51 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
                 newCost += int(usage - newValue)
         return newCost - state.cost
 
+    # Handle duration position change
+    if state.hasVarDurHeight and position in state.durPosToTask:
+        let taskIdx = state.durPosToTask[position]
+        let origin = state.getTaskOrigin(taskIdx)
+        let height = state.getHeight(taskIdx)
+        let oldDur = oldValue
+        let newDur = newValue
+        var costDelta = 0
+        let tMax = state.maxTime + 1
+        let startT = max(0, int(origin))
+        if newDur < oldDur:
+            # Shorter duration: time points leaving
+            for t in max(0, startT + int(newDur)) ..< min(tMax, startT + int(oldDur)):
+                costDelta += calculateCostDelta(state.resourceProfile[t],
+                    state.resourceProfile[t] - height, state.limit)
+        elif newDur > oldDur:
+            # Longer duration: time points entering
+            for t in max(0, startT + int(oldDur)) ..< min(tMax, startT + int(newDur)):
+                costDelta += calculateCostDelta(state.resourceProfile[t],
+                    state.resourceProfile[t] + height, state.limit)
+        return costDelta
+
+    # Handle height position change
+    if state.hasVarDurHeight and position in state.heightPosToTask:
+        let taskIdx = state.heightPosToTask[position]
+        let origin = state.getTaskOrigin(taskIdx)
+        let duration = state.getDuration(taskIdx)
+        let heightDelta = newValue - oldValue
+        var costDelta = 0
+        let tMax = state.maxTime + 1
+        let startT = max(0, int(origin))
+        let endT = min(tMax, int(origin) + int(duration))
+        for t in startT ..< endT:
+            costDelta += calculateCostDelta(state.resourceProfile[t],
+                state.resourceProfile[t] + heightDelta, state.limit)
+        return costDelta
+
     case state.evalMethod:
         of PositionBased:
             if position >= state.positionToTask.len or state.positionToTask[position] < 0:
                 return 0
 
             let i = state.positionToTask[position]
-            let duration = state.durations[i]
-            let height = state.heights[i]
+            let duration = state.getDuration(i)
+            let height = state.getHeight(i)
             var costDelta = 0
 
             let oldStart = int(oldValue)
@@ -573,11 +719,11 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
                 if oldOrigin == newOrigin:
                     continue
 
-                let duration = state.durationsExpr[i]
+                let duration = state.getDuration(i)
                 changes.add((
                     oldStart: int(oldOrigin), oldEnd: int(oldOrigin + duration),
                     newStart: int(newOrigin), newEnd: int(newOrigin + duration),
-                    height: state.heightsExpr[i]
+                    height: state.getHeight(i)
                 ))
 
             if changes.len == 0:
@@ -645,6 +791,14 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
             result[i] = newCost - state.cost
         return
 
+    # Handle dur/height positions: fall back to per-value moveDelta (small domains)
+    if state.hasVarDurHeight and (position in state.durPosToTask or
+                                   position in state.heightPosToTask):
+        for i, v in domain:
+            if v != currentValue:
+                result[i] = state.moveDelta(position, currentValue, v)
+        return
+
     if state.evalMethod == ExpressionBased:
         if position notin state.expressionsAtPosition:
             return
@@ -652,8 +806,8 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
         if taskIndices.len == 1:
             # Single task affected — use prefix-sum batch approach
             let taskIdx = taskIndices[0]
-            let duration = int(state.durationsExpr[taskIdx])
-            let height = int(state.heightsExpr[taskIdx])
+            let duration = int(state.getDuration(taskIdx))
+            let height = int(state.getHeight(taskIdx))
             let limit = int(state.limit)
             let tMax = state.maxTime + 1
 
@@ -702,8 +856,8 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
             var tasks: seq[TaskInfo]
             for taskIdx in taskIndices:
                 let oldOrigin = state.originExpressions[taskIdx].evaluate(state.currentAssignment)
-                let duration = int(state.durationsExpr[taskIdx])
-                let height = int(state.heightsExpr[taskIdx])
+                let duration = int(state.getDuration(taskIdx))
+                let height = int(state.getHeight(taskIdx))
                 let oldStart = max(0, int(oldOrigin))
                 let oldEnd = min(tMax, int(oldOrigin) + duration)
                 tasks.add((taskIdx: taskIdx, duration: duration, height: height,
@@ -775,8 +929,8 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
         return
 
     let taskIdx = state.positionToTask[position]
-    let duration = int(state.durations[taskIdx])
-    let height = int(state.heights[taskIdx])
+    let duration = int(state.getDuration(taskIdx))
+    let height = int(state.getHeight(taskIdx))
     let limit = int(state.limit)
     let tMax = state.maxTime + 1
 

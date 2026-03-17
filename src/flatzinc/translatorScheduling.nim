@@ -351,6 +351,37 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             let (ok3, term3) = tr.extractLinLeReifTerm(linLeReifDefines[b3])
             if not ok1 or not ok2 or not ok3: continue
 
+            # Check if any disjunct is always satisfied (tautological clause).
+            # A disjunct sum(coeffs[k] * vars[k]) <= rhs is always true when
+            # max possible LHS <= rhs.
+            block checkTautology:
+                var tautological = false
+                for term in [term1, term2, term3]:
+                    var maxLHS = 0
+                    var canCompute = true
+                    for k in 0..<term.varNames.len:
+                        let vn = term.varNames[k]
+                        let dom = if vn in tr.presolveDomains: tr.presolveDomains[vn]
+                                  elif vn in tr.paramValues: @[tr.paramValues[vn]]
+                                  else: tr.lookupVarDomain(vn)
+                        if dom.len == 0:
+                            canCompute = false; break
+                        if term.coeffs[k] > 0:
+                            maxLHS += term.coeffs[k] * dom[^1]
+                        else:
+                            maxLHS += term.coeffs[k] * dom[0]
+                    if canCompute and maxLHS <= term.rhs:
+                        tautological = true
+                        break
+                if tautological:
+                    # Consume the constraints but don't emit
+                    tr.definingConstraints.incl(ci)
+                    for bIdent in [b1, b2, b3]:
+                        tr.definingConstraints.incl(linLeReifDefines[bIdent])
+                        tr.definedVarNames.incl(bIdent)
+                    inc nTautological
+                    continue
+
             # Consume the bool_clause and int_lin_le_reif constraints.
             # For shared vars (refcount=2), keep the defining constraint and var alive.
             tr.definingConstraints.incl(ci)
@@ -398,6 +429,44 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
             disjuncts.add(terms)
         if not allOk or disjuncts.len < 2: continue
 
+        # Tautology check: if any disjunct group is always satisfied, skip clause
+        block checkNLitTautology:
+            var tautological = false
+            for termGroup in disjuncts:
+                # A disjunct group (from one reif var) is always true if ALL its terms are always true.
+                # For int_lin_le_reif/int_le_reif: 1 term. For int_eq_reif: 2 terms (both must hold).
+                var allTermsSatisfied = true
+                for term in termGroup:
+                    var maxLHS = 0
+                    var canCompute = true
+                    for k in 0..<term.varNames.len:
+                        let vn = term.varNames[k]
+                        let dom = if vn in tr.presolveDomains: tr.presolveDomains[vn]
+                                  elif vn in tr.paramValues: @[tr.paramValues[vn]]
+                                  else: tr.lookupVarDomain(vn)
+                        if dom.len == 0:
+                            canCompute = false; break
+                        if term.coeffs[k] > 0:
+                            maxLHS += term.coeffs[k] * dom[^1]
+                        else:
+                            maxLHS += term.coeffs[k] * dom[0]
+                    if not canCompute or maxLHS > term.rhs:
+                        allTermsSatisfied = false
+                        break
+                if allTermsSatisfied:
+                    tautological = true
+                    break
+            if tautological:
+                # Consume the constraints but don't emit
+                tr.definingConstraints.incl(ci)
+                for elem in posArg.elems:
+                    let ident = elem.ident
+                    if varTotalRefCount.getOrDefault(ident) == 1:
+                        tr.definingConstraints.incl(getReifCI(ident, linLeReifDefines, leReifDefines, eqReifDefines))
+                        tr.definedVarNames.incl(ident)
+                inc nTautological
+                continue
+
         # Consume: always consume the bool_clause
         tr.definingConstraints.incl(ci)
         nNLiteralConsumed += 1
@@ -415,7 +484,7 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
         nNLiteralClauses += 1
 
     if nTautological > 0:
-        stderr.writeLine(&"[FZN] Skipped {nTautological} tautological disjunctive pairs")
+        stderr.writeLine(&"[FZN] Eliminated {nTautological} tautological disjunctive clauses")
     if tr.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.disjunctivePairs.len} disjunctive pairs, " &
                                           &"{nPairConsumed} constraints consumed, " &

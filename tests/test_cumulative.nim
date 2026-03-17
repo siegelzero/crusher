@@ -497,6 +497,134 @@ suite "ExpressionBased Cumulative batchMovePenalty":
         let delta2 = cumul.moveDelta(0, 2, 1)
         check delta2 == -4  # overlap reduced from 2 points to 1 point
 
+    test "Variable duration - moveDelta and updatePosition consistency":
+        # 2 tasks with variable durations: verify moveDelta matches actual cost changes
+        var sys = initConstraintSystem[int]()
+        var origins = sys.newConstrainedSequence(2)  # pos 0,1
+        origins.setDomain(toSeq(0..10))
+        var durVars = sys.newConstrainedSequence(2)   # pos 2,3
+        durVars.setDomain(@[2, 4, 6])
+
+        let durations = @[4, 4]  # fallback values
+        let heights = @[3, 3]
+        let limit = 5
+
+        let cumul = newCumulativeConstraint[int](@[0, 1], durations, heights, limit, maxTime = 20)
+        cumul.durationPositions = @[2, 3]
+        cumul.heightPositions = @[-1, -1]
+        cumul.durPosToTask[2] = 0
+        cumul.durPosToTask[3] = 1
+        cumul.currentAssignment.setLen(4)
+
+        var assignment = @[0, 5, 4, 4]  # starts=[0,5], durs=[4,4]
+        cumul.initialize(assignment)
+
+        # Task 0 at [0,4), task 1 at [5,9) — no overlap, cost=0
+        check cumul.cost == 0
+
+        # Test moveDelta for duration change: task 0 dur 4→6
+        # New task 0 at [0,6), task 1 at [5,9) — overlap at [5,6) with height 3+3=6 > limit 5
+        let delta = cumul.moveDelta(2, 4, 6)
+        check delta == 1  # overload of 1 at time 5
+
+        # Actually apply the change
+        cumul.updatePosition(2, 6)
+        check cumul.cost == 1
+
+        # Change back: 6→4
+        let delta2 = cumul.moveDelta(2, 6, 4)
+        check delta2 == -1
+        cumul.updatePosition(2, 4)
+        check cumul.cost == 0
+
+    test "Variable height - moveDelta and updatePosition consistency":
+        # 2 tasks with variable heights
+        var sys = initConstraintSystem[int]()
+        var origins = sys.newConstrainedSequence(2)   # pos 0,1
+        origins.setDomain(toSeq(0..10))
+        var heightVars = sys.newConstrainedSequence(2) # pos 2,3
+        heightVars.setDomain(@[1, 3, 5])
+
+        let durations = @[4, 4]
+        let heights = @[3, 3]  # fallback values
+        let limit = 5
+
+        let cumul = newCumulativeConstraint[int](@[0, 1], durations, heights, limit, maxTime = 20)
+        cumul.durationPositions = @[-1, -1]
+        cumul.heightPositions = @[2, 3]
+        cumul.heightPosToTask[2] = 0
+        cumul.heightPosToTask[3] = 1
+        cumul.currentAssignment.setLen(4)
+
+        # starts=[0,2], heights=[3,3]: overlap [0,4)∩[2,6)=[2,4), usage=6>5
+        var assignment = @[0, 2, 3, 3]
+        cumul.initialize(assignment)
+        check cumul.cost == 2  # overload of 1 at times 2 and 3
+
+        # Change height of task 0 from 3 to 1: overlap still [2,4) but usage=1+3=4<=5
+        let delta = cumul.moveDelta(2, 3, 1)
+        check delta == -2
+        cumul.updatePosition(2, 1)
+        check cumul.cost == 0
+
+    test "Variable dur/height - batchMovePenalty matches moveDelta":
+        var sys = initConstraintSystem[int]()
+        var origins = sys.newConstrainedSequence(2)   # pos 0,1
+        origins.setDomain(toSeq(0..10))
+        var durVars = sys.newConstrainedSequence(2)    # pos 2,3
+        durVars.setDomain(@[2, 4, 6])
+
+        let durations = @[4, 4]
+        let heights = @[3, 3]
+        let limit = 5
+
+        let cumul = newCumulativeConstraint[int](@[0, 1], durations, heights, limit, maxTime = 20)
+        cumul.durationPositions = @[2, 3]
+        cumul.heightPositions = @[-1, -1]
+        cumul.durPosToTask[2] = 0
+        cumul.durPosToTask[3] = 1
+        cumul.currentAssignment.setLen(4)
+
+        var assignment = @[0, 5, 4, 4]
+        cumul.initialize(assignment)
+
+        # batchMovePenalty for duration position should match per-value moveDelta
+        let domain = @[2, 4, 6]
+        let batch = cumul.batchMovePenalty(2, 4, domain)
+        for i, v in domain:
+            let expected = if v == 4: 0 else: cumul.moveDelta(2, 4, v)
+            check batch[i] == expected
+
+    test "Variable dur/height - solving with channel-like structure":
+        # Simulate MRCPSP-like structure: mode variable selects duration and height
+        # 3 tasks, 1 mode variable that controls task 0's duration and height
+        var sys = initConstraintSystem[int]()
+        var origins = sys.newConstrainedSequence(3)   # pos 0,1,2
+        origins.setDomain(toSeq(0..20))
+        var dur0 = sys.newConstrainedVariable()        # pos 3
+        dur0.setDomain(@[2, 5, 8])
+        var height0 = sys.newConstrainedVariable()     # pos 4
+        height0.setDomain(@[4, 2, 1])
+
+        # Task 0: variable dur/height at pos 3,4
+        # Tasks 1,2: fixed dur=4, height=3
+        let durations = @[5, 4, 4]  # fallback for task 0
+        let heights = @[2, 3, 3]    # fallback for task 0
+        let limit = 5
+
+        sys.addConstraint(cumulative[int](@[0, 1, 2], durations, heights, limit,
+                          durationPositions = @[3, -1, -1],
+                          heightPositions = @[4, -1, -1]))
+
+        sys.resolve(parallel=true, tabuThreshold=5000, verbose=false)
+
+        let s = origins.assignment
+        let d0 = dur0.assignment
+        let h0 = height0.assignment
+        let actualDurs = @[d0, 4, 4]
+        let actualHeights = @[h0, 3, 3]
+        check validateCumulativeSolution(s, actualDurs, actualHeights, limit)
+
     test "batchMovePenalty with non-origin position returns zeros":
         # Position not in any origin expression should return all zeros
         var sys = initConstraintSystem[int]()

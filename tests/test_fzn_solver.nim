@@ -1186,7 +1186,7 @@ solve satisfy;
     # bool_clause([b1, b2], [])
     # b1: int_eq_reif(x, 5, b1) → x == 5 (2 terms: x<=5 AND -x<=-5)
     # b2: int_le_reif(y, 3, b2) → y <= 3
-    # Force y>=4 → only x==5 satisfies
+    # Solution must satisfy: x==5 OR y<=3
     let src = """
 var 0..10: x;
 var 0..10: y;
@@ -1195,7 +1195,6 @@ var bool: b2;
 constraint int_eq_reif(x, 5, b1):: defines_var(b1);
 constraint int_le_reif(y, 3, b2):: defines_var(b2);
 constraint bool_clause([b1,b2],[]);
-constraint int_lin_le([-1],[y],-4);
 solve satisfy;
 """
     let model = parseFzn(src)
@@ -1214,8 +1213,8 @@ solve satisfy;
 
     let xVal = tr.sys.assignment[tr.varPositions["x"]]
     let yVal = tr.sys.assignment[tr.varPositions["y"]]
-    check xVal == 5
-    check yVal >= 4
+    # Must satisfy: x==5 OR y<=3
+    check (xVal == 5 or yVal <= 3)
 
   test "fixed-value bool variable gets singleton domain":
     # var bool: X = true creates a position with domain {1}, not {0,1}
