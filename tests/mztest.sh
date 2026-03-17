@@ -65,7 +65,7 @@ while IFS=, read -r name model data type time_limit min_obj max_obj; do
 
     # Optimization: extract _objective from last JSON solution
     obj=$(echo "$output" | grep '"_objective"' | tail -1 |
-          sed 's/.*"_objective"[[:space:]]*:[[:space:]]*\(-\?[0-9]*\).*/\1/')
+          sed -E 's/.*"_objective"[[:space:]]*:[[:space:]]*(-?[0-9]+).*/\1/')
 
     if [ -z "$obj" ]; then
         printf "${RED}FAIL${NC} (no objective in output)\n"
