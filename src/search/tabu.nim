@@ -39,6 +39,11 @@ type
         # Complex inputs requiring expression evaluation (fallback, should be rare)
         complexExprs*: seq[AlgebraicExpression[T]]
 
+    CascadeEntryKind* = enum
+        ceElement    ## Regular element channel binding
+        ceMinMax     ## FlatMinMax channel binding
+        ceCountEq    ## CountEq channel binding
+
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
         carray*: ConstrainedArray[T]
@@ -165,8 +170,7 @@ type
         cdCascadePos: Table[int, int]             # source position -> index into cdCascade*
         cdCascadeChans: seq[seq[int]]             # [cascadeIdx] -> channel positions in topological order
         cdCascadeBindings: seq[seq[int]]          # [cascadeIdx] -> binding index for each channel position (element or flatMinMax index)
-        cdCascadeIsMinMax: seq[seq[bool]]         # [cascadeIdx][entryIdx] -> true if entry is a min/max binding
-        cdCascadeIsCountEq: seq[seq[bool]]        # [cascadeIdx][entryIdx] -> true if entry is a countEq binding
+        cdCascadeEntryKind: seq[seq[CascadeEntryKind]]  # [cascadeIdx][entryIdx] -> binding type
         cdCascadeExternalDeps: seq[PackedSet[int]]    # [cascadeIdx] -> ALL external dependency positions
         cdCascadeElemExtDeps: seq[PackedSet[int]]     # [cascadeIdx] -> external deps from element entries only
         cdCascadeMinMaxIdx: seq[seq[int]]             # [cascadeIdx] -> indices into topoOrder that are min/max entries
@@ -1690,8 +1694,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadePos = initTable[int, int]()
         state.cdCascadeChans = @[]
         state.cdCascadeBindings = @[]
-        state.cdCascadeIsMinMax = @[]
-        state.cdCascadeIsCountEq = @[]
+        state.cdCascadeEntryKind = @[]
         state.cdCascadeExternalDeps = @[]
         state.cdCascadeElemExtDeps = @[]
         state.cdCascadeMinMaxIdx = @[]
@@ -1717,8 +1720,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # which handles diamond patterns (multiple paths to same channel) correctly.
             var topoOrder: seq[int] = @[]
             var topoBindingIdx: seq[int] = @[]
-            var topoIsMinMax: seq[bool] = @[]
-            var topoIsCountEq: seq[bool] = @[]
+            var topoEntryKind: seq[CascadeEntryKind] = @[]
             var topoSet: PackedSet[int]
             var bfsQueue: seq[int] = @[pos]
             var bfsHead = 0
@@ -1750,8 +1752,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoSet.incl(chanPos)
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)
-                        topoIsMinMax.add(false)
-                        topoIsCountEq.add(false)
+                        topoEntryKind.add(ceElement)
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
@@ -1766,8 +1767,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoSet.incl(chanPos)
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)  # index into flatMinMaxBindings
-                        topoIsMinMax.add(true)
-                        topoIsCountEq.add(false)
+                        topoEntryKind.add(ceMinMax)
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
@@ -1782,8 +1782,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoSet.incl(chanPos)
                         topoOrder.add(chanPos)
                         topoBindingIdx.add(bi)  # index into countEqChannelBindings
-                        topoIsMinMax.add(false)
-                        topoIsCountEq.add(true)
+                        topoEntryKind.add(ceCountEq)
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
@@ -1871,7 +1870,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var elemExtDeps: PackedSet[int]
             var minMaxIndices: seq[int]
             for ci in 0..<topoOrder.len:
-                if topoIsMinMax[ci]:
+                case topoEntryKind[ci]
+                of ceMinMax:
                     minMaxIndices.add(ci)
                     let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
                     for j in 0..<fb.linearPositions.len:
@@ -1882,13 +1882,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         for ep in expr.positions.items:
                             if ep != pos and ep notin topoSet:
                                 externalDeps.incl(ep)
-                elif topoIsCountEq[ci]:
+                of ceCountEq:
                     let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)  # treat like element deps for dirty tracking
-                else:
+                of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
                         if ipos != pos and ipos notin topoSet:
@@ -1904,8 +1904,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.cdCascadePos[pos] = cascadeIdx
             state.cdCascadeChans.add(topoOrder)
             state.cdCascadeBindings.add(topoBindingIdx)
-            state.cdCascadeIsMinMax.add(topoIsMinMax)
-            state.cdCascadeIsCountEq.add(topoIsCountEq)
+            state.cdCascadeEntryKind.add(topoEntryKind)
             state.cdCascadeExternalDeps.add(externalDeps)
             state.cdCascadeElemExtDeps.add(elemExtDeps)
             state.cdCascadeMinMaxIdx.add(minMaxIndices)
@@ -1926,18 +1925,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var extPosToEntries = initTable[int, seq[int]]()  # external pos -> entry indices
             for ci in 0..<topoOrder.len:
                 var inputs: PackedSet[int]
-                if topoIsMinMax[ci]:
+                case topoEntryKind[ci]
+                of ceMinMax:
                     let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
                     for lp in fb.linearPositions:
                         if lp != pos: inputs.incl(lp)
                     for expr in fb.complexExprs:
                         for ep in expr.positions.items:
                             if ep != pos: inputs.incl(ep)
-                elif topoIsCountEq[ci]:
+                of ceCountEq:
                     let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
                         if srcPos != pos: inputs.incl(srcPos)
-                else:
+                of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
                         if ipos != pos: inputs.incl(ipos)

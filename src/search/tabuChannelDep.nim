@@ -524,8 +524,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
     let nDom = domain.len
     let chans = state.cdCascadeChans[cascadeIdx]
     let bindings = state.cdCascadeBindings[cascadeIdx]
-    let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
-    let isCountEq = state.cdCascadeIsCountEq[cascadeIdx]
+    let entryKinds = state.cdCascadeEntryKind[cascadeIdx]
     let forwardDeps = state.cdCascadeForwardDeps[cascadeIdx]
     let extPosToEntries = state.cdCascadeExtPosToEntries[cascadeIdx]
 
@@ -590,13 +589,14 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 # Dirty: re-evaluate
                 when ProfileIteration: state.cdIncEvaluated += 1
                 var newVal: T
-                if isMinMax[ci]:
+                case entryKinds[ci]
+                of ceMinMax:
                     let fb = state.flatMinMaxBindings[bindings[ci]]
                     newVal = evaluateFlatMinMax(fb, state.assignment)
-                elif isCountEq[ci]:
+                of ceCountEq:
                     let binding = state.carray.countEqChannelBindings[bindings[ci]]
                     newVal = evaluateCountEq(binding, state.assignment)
-                else:
+                of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                     let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
                     if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
@@ -653,8 +653,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             # Dynamic cascade: evaluate bindings at runtime for all domain values
             let chans = state.cdCascadeChans[cascadeIdx]
             let bindings = state.cdCascadeBindings[cascadeIdx]
-            let isMinMax = state.cdCascadeIsMinMax[cascadeIdx]
-            let isCountEq = state.cdCascadeIsCountEq[cascadeIdx]
+            let entryKinds = state.cdCascadeEntryKind[cascadeIdx]
 
             # Save original assignment values
             let savedPos = state.assignment[pos]
@@ -665,15 +664,16 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             for di in 0..<nDom:
                 state.assignment[pos] = domain[di]
                 for ci in 0..<nChans:
-                    if isMinMax[ci]:
+                    case entryKinds[ci]
+                    of ceMinMax:
                         # Min/max binding: evaluate using flat linear representation
                         let fb = state.flatMinMaxBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
-                    elif isCountEq[ci]:
+                    of ceCountEq:
                         # CountEq binding: count matching values over input positions
                         let binding = state.carray.countEqChannelBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
-                    else:
+                    of ceElement:
                         # Element binding: evaluate index expression and look up array
                         let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                         let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
