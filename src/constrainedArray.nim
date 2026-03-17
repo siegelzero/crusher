@@ -3787,9 +3787,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
 proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
     ## Identifies singleton-domain positions and removes constraints where all
-    ## non-channel positions are fixed (singleton domain). Constraints that only
-    ## involve channel positions are kept — channel values depend on search
-    ## variables and aren't guaranteed satisfied by domain reduction alone.
+    ## positions are fixed (singleton domain). Constraints with any channel
+    ## position are kept — channel values depend on search variables and
+    ## aren't guaranteed satisfied by domain reduction alone.
 
     # 1. Identify singleton positions from reducedDomain
     for pos in carray.allPositions():
