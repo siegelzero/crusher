@@ -11,11 +11,8 @@ help:
 	@echo "Available targets:"
 	@echo "  help         - Show this help message"
 	@echo "  test         - Auto-discover and run all test_*.nim files in tests/"
-	@echo "  clean        - Clean all compiled executables"
-	@echo "  format       - Strip trailing whitespace from all *.nim files"
 	@echo "  fzcrusher    - Build the FlatZinc solver binary"
 	@echo "  mztest       - Run MiniZinc integration tests"
-	@echo "  all          - Run all targets (currently just test)"
 	@echo ""
 
 test:
