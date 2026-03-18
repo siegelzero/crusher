@@ -1447,7 +1447,7 @@ proc gccPropagate(tr: FznTranslator,
                 if dom == @[v]:
                     inc mustCount
                     inc canCount
-                elif v in dom.toPackedSet():
+                elif v in dom:
                     inc canCount
                     canIdxs.add(i)
 
