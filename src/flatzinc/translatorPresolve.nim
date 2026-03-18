@@ -1180,6 +1180,225 @@ proc nonRenewableResourcePruning(tr: FznTranslator,
                     vars[i].lo = newDom[0]
                     totalMin += (newDom[0] - oldMin)
 
+proc tablePropagate(tr: FznTranslator,
+                    domains: var Table[string, seq[int]],
+                    fixedVars: Table[string, int],
+                    eliminated: PackedSet[int],
+                    infeasible: var bool): bool =
+    ## Arc consistency propagation on 2-variable table_int constraints.
+    ## If one variable is fixed, restrict the other to supported values.
+    ## Also remove unsupported values even when neither is fixed.
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_table_int" and name != "table_int": continue
+        if con.args.len < 2: continue
+        let varsArg = con.args[0]
+        let tableArg = con.args[1]
+        if varsArg.kind != FznArrayLit or tableArg.kind != FznArrayLit: continue
+        if varsArg.elems.len != 2: continue  # Only 2-variable tables
+
+        let vn0 = presolveVarName(varsArg.elems[0])
+        let vn1 = presolveVarName(varsArg.elems[1])
+        if vn0 == "" or vn1 == "": continue
+
+        # Parse flat table into tuples
+        let flatElems = tableArg.elems
+        if flatElems.len mod 2 != 0: continue
+        var tuples: seq[(int, int)]
+        for i in countup(0, flatElems.len - 2, 2):
+            if flatElems[i].kind != FznIntLit or flatElems[i+1].kind != FznIntLit: continue
+            tuples.add((flatElems[i].intVal, flatElems[i+1].intVal))
+
+        let fixed0 = tr.presolveIsFixed(varsArg.elems[0], fixedVars)
+        let fixed1 = tr.presolveIsFixed(varsArg.elems[1], fixedVars)
+
+        if fixed0:
+            let val0 = tr.presolveResolve(varsArg.elems[0], fixedVars)
+            var allowed: seq[int]
+            for t in tuples:
+                if t[0] == val0:
+                    allowed.add(t[1])
+            if allowed.len > 0:
+                if presolveTightenDomain(domains, vn1, allowed, infeasible):
+                    result = true
+        elif fixed1:
+            let val1 = tr.presolveResolve(varsArg.elems[1], fixedVars)
+            var allowed: seq[int]
+            for t in tuples:
+                if t[1] == val1:
+                    allowed.add(t[0])
+            if allowed.len > 0:
+                if presolveTightenDomain(domains, vn0, allowed, infeasible):
+                    result = true
+        else:
+            # Neither fixed: domain consistency — remove unsupported values
+            if vn0 in domains and vn1 in domains:
+                let dom0 = domains[vn0].toPackedSet()
+                let dom1 = domains[vn1].toPackedSet()
+                var supported0 = initPackedSet[int]()
+                var supported1 = initPackedSet[int]()
+                for t in tuples:
+                    if t[0] in dom0 and t[1] in dom1:
+                        supported0.incl(t[0])
+                        supported1.incl(t[1])
+                var allowed0: seq[int]
+                for v in domains[vn0]:
+                    if v in supported0:
+                        allowed0.add(v)
+                if allowed0.len < domains[vn0].len and allowed0.len > 0:
+                    if presolveTightenDomain(domains, vn0, allowed0, infeasible):
+                        result = true
+                var allowed1: seq[int]
+                for v in domains[vn1]:
+                    if v in supported1:
+                        allowed1.add(v)
+                if allowed1.len < domains[vn1].len and allowed1.len > 0:
+                    if presolveTightenDomain(domains, vn1, allowed1, infeasible):
+                        result = true
+
+proc partitionPropagate(tr: FznTranslator,
+                        domains: var Table[string, seq[int]],
+                        fixedVars: Table[string, int],
+                        eliminated: PackedSet[int],
+                        infeasible: var bool): bool =
+    ## Propagation for partition constraints (sum-of-indicators == 1).
+    ## Detects int_lin_eq([1,...,1], [sel_1,...,sel_n], 1) where each sel_i
+    ## chains through bool2int → int_ne_reif to a place variable.
+    ## Rules:
+    ## - If a place var's domain excludes nullValue → forced active → all others = {nullValue}
+    ## - If all but one place var have domain = {nullValue} → remove nullValue from remaining
+    result = false
+
+    # Build reverse maps for tracing: sel_var → bool2int source, bool_var → ne_reif source + null value
+    type Bool2IntInfo = object
+        boolVar: string
+    type NeReifInfo = object
+        placeVar: string
+        nullVal: int
+
+    var bool2intMap = initTable[string, Bool2IntInfo]()  # sel_var → bool source
+    var neReifMap = initTable[string, NeReifInfo]()  # bool_var → place source + null value
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name == "bool2int" and con.args.len >= 2:
+            let bArg = con.args[0]
+            let iArg = con.args[1]
+            if bArg.kind == FznIdent and iArg.kind == FznIdent:
+                bool2intMap[iArg.ident] = Bool2IntInfo(boolVar: bArg.ident)
+        elif name == "int_ne_reif" and con.args.len >= 3:
+            let xArg = con.args[0]
+            let valArg = con.args[1]
+            let bArg = con.args[2]
+            if xArg.kind == FznIdent and bArg.kind == FznIdent:
+                let nullVal = if valArg.kind == FznIntLit: valArg.intVal
+                              elif valArg.kind == FznIdent and valArg.ident in fixedVars: fixedVars[valArg.ident]
+                              elif valArg.kind == FznIdent and valArg.ident in tr.paramValues: tr.paramValues[valArg.ident]
+                              else: continue
+                neReifMap[bArg.ident] = NeReifInfo(placeVar: xArg.ident, nullVal: nullVal)
+
+    # Find partition groups: int_lin_eq([1,...,1], [sel_1,...,sel_n], 1)
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+
+        # Check RHS = 1
+        if not tr.presolveIsFixed(con.args[2], fixedVars): continue
+        let rhs = tr.presolveResolve(con.args[2], fixedVars)
+        if rhs != 1: continue
+
+        let coeffs = con.args[0].elems
+        let vars = con.args[1].elems
+        if coeffs.len != vars.len or coeffs.len < 2: continue
+
+        # Check all coefficients are 1
+        var allOnes = true
+        for c in coeffs:
+            if c.kind != FznIntLit or c.intVal != 1:
+                allOnes = false
+                break
+        if not allOnes: continue
+
+        # Trace each sel variable back to place variable
+        type PartMember = object
+            selVar: string
+            placeVar: string
+            nullVal: int
+        var members: seq[PartMember]
+        var valid = true
+        var nullVal = 0
+        var nullValSet = false
+
+        for vExpr in vars:
+            if vExpr.kind != FznIdent:
+                valid = false; break
+            let selVar = vExpr.ident
+            if selVar notin bool2intMap:
+                valid = false; break
+            let boolVar = bool2intMap[selVar].boolVar
+            if boolVar notin neReifMap:
+                valid = false; break
+            let info = neReifMap[boolVar]
+            if nullValSet:
+                if info.nullVal != nullVal:
+                    valid = false; break
+            else:
+                nullVal = info.nullVal
+                nullValSet = true
+            members.add(PartMember(selVar: selVar, placeVar: info.placeVar, nullVal: info.nullVal))
+
+        if not valid or members.len < 2 or not nullValSet: continue
+
+        # Propagation rule 1: forced member (domain excludes nullValue)
+        var forcedIdx = -1
+        var nForceable = 0
+        for i, m in members:
+            if m.placeVar in domains:
+                let dom = domains[m.placeVar]
+                var hasNull = false
+                for v in dom:
+                    if v == nullVal:
+                        hasNull = true; break
+                if not hasNull:
+                    forcedIdx = i
+                    inc nForceable
+        if nForceable == 1:
+            # Force all others to {nullValue}
+            for i, m in members:
+                if i == forcedIdx: continue
+                if m.placeVar in domains and domains[m.placeVar] != @[nullVal]:
+                    if presolveTightenDomain(domains, m.placeVar, @[nullVal], infeasible):
+                        result = true
+        elif nForceable > 1:
+            # Multiple forced — infeasible
+            infeasible = true
+            return
+
+        # Propagation rule 2: singleton remainder
+        var nNull = 0
+        var remainIdx = -1
+        for i, m in members:
+            if m.placeVar in domains and domains[m.placeVar] == @[nullVal]:
+                inc nNull
+            elif m.placeVar in fixedVars and fixedVars[m.placeVar] == nullVal:
+                inc nNull
+            else:
+                remainIdx = i
+        if nNull == members.len - 1 and remainIdx >= 0:
+            # Remove nullValue from the remaining member
+            let m = members[remainIdx]
+            if m.placeVar in domains:
+                if presolveRemoveValue(domains, m.placeVar, nullVal, infeasible):
+                    result = true
+
 proc applyPresolveResults(tr: var FznTranslator,
                           domains: Table[string, seq[int]],
                           fixedVars: Table[string, int],
@@ -1269,7 +1488,17 @@ proc presolve*(tr: var FznTranslator) =
             changed = true
         if infeasible: break
 
-        # Step 7: Fix any newly-created singletons
+        # Step 7: Table constraint propagation (arc consistency)
+        if tablePropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 8: Partition propagation (forced member / singleton remainder)
+        if partitionPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 9: Fix any newly-created singletons
         if fixSingletons(domains, fixedVars):
             changed = true
 

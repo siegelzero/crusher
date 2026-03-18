@@ -50,6 +50,14 @@ type
         positions*: seq[int]   # System positions [index 0 = team 0+offset, etc.]
         valueOffset*: int      # group_index = value + valueOffset (e.g., -1 for 1-based teams)
 
+    PartitionGroup*[T] = object
+        ## A group of search positions forming a partition constraint:
+        ## exactly one member must be "active" (non-null value).
+        ## Used for compound swap moves that simultaneously deactivate one
+        ## member and activate another within the group.
+        searchPositions*: seq[int]  # place variable positions in this group
+        nullValue*: T               # value meaning "not selected"
+
     InverseChannelGroup*[T] = object
         ## A group encoding an inverse relationship: inverse[forward[i]] = i.
         ## Forward positions are searched; inverse positions are channels.
@@ -88,6 +96,7 @@ type
         elementInverseDetected*: bool  # guard: detectElementInverseChannels already ran
         dormancyBindings*: seq[tuple[dormantPos: int, selectorPos: int, activeValue: T]]
         dormancyAtSelector*: Table[int, seq[int]]  # selector_pos → [binding indices]
+        partitionGroups*: seq[PartitionGroup[T]]
 
 ################################################################################
 # Value Extraction
@@ -3901,4 +3910,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Dormancy bindings are all value types — shallow copy is fine
     result.dormancyBindings = arr.dormancyBindings
     result.dormancyAtSelector = arr.dormancyAtSelector
+
+    # Partition groups are all value types — shallow copy is fine
+    result.partitionGroups = arr.partitionGroups
 

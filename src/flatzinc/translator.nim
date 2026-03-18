@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -1776,6 +1776,164 @@ proc translate*(model: FznModel): FznTranslator =
                         result.objectiveLoBound = max(result.objectiveLoBound, 0)
                         if result.objectiveLoBound != oldLo:
                             stderr.writeLine(&"[FZN] Objective lower bound tightened: {oldLo} → {result.objectiveLoBound}")
+
+    # Detect partition groups: sum-of-channels == 1 constraints where channels
+    # trace back through bool2int → int_ne_reif to search positions.
+    # These enable partition-aware swap moves in the tabu search.
+    block:
+        let carray = result.sys.baseArray
+        # Build reverse map: channel position → channel binding index
+        var chanPosToBind = initTable[int, int]()
+        for bi, binding in carray.channelBindings:
+            chanPosToBind[binding.channelPosition] = bi
+
+        var nGroups = 0
+        var totalMembers = 0
+
+        for constraint in carray.constraints:
+            if constraint.stateType != RelationalType: continue
+            let rc = constraint.relationalState
+            if rc.relation != EqualTo: continue
+
+            # Check for sum(channels) == 1 pattern
+            # Left side should be a PositionBased SumExpr, right side constant 1
+            var sumExpr: SumExpression[int] = nil
+            var rhsVal: int = 0
+            if rc.leftExpr.kind == SumExpr and rc.rightExpr.kind == ConstantExpr:
+                sumExpr = rc.leftExpr.sumExpr
+                rhsVal = rc.rightExpr.constantValue
+            elif rc.rightExpr.kind == SumExpr and rc.leftExpr.kind == ConstantExpr:
+                sumExpr = rc.rightExpr.sumExpr
+                rhsVal = rc.leftExpr.constantValue
+            else:
+                continue
+
+            if rhsVal != 1: continue
+            if sumExpr.evalMethod != PositionBased: continue
+
+            # Check all coefficients are 1 and all positions are channels
+            var allOnes = true
+            var allChannels = true
+            var sumPositions: seq[int] = @[]
+            for pos, coeff in sumExpr.coefficient:
+                sumPositions.add(pos)
+                if coeff != 1:
+                    allOnes = false
+                    break
+                if pos notin carray.channelPositions:
+                    allChannels = false
+                    break
+            if not allOnes or not allChannels: continue
+            if sumPositions.len < 2: continue
+
+            # Trace each channel position back to search positions
+            var searchPositions: seq[int] = @[]
+            var nullValue = 0
+            var valid = true
+            var nullValueSet = false
+
+            for chanPos in sumPositions:
+                if chanPos notin chanPosToBind:
+                    valid = false
+                    break
+                let bi1 = chanPosToBind[chanPos]
+                let bind1 = carray.channelBindings[bi1]
+
+                # This should be bool2int: element(boolPos, [0, 1])
+                # The indexExpression should reference one source position
+                var sourcePos1 = -1
+                for p in bind1.indexExpression.positions.items:
+                    if sourcePos1 >= 0:
+                        sourcePos1 = -1  # More than one position — not simple
+                        break
+                    sourcePos1 = p
+
+                if sourcePos1 < 0:
+                    valid = false
+                    break
+
+                # Check if source is itself a channel (ne_reif layer)
+                if sourcePos1 in carray.channelPositions:
+                    if sourcePos1 notin chanPosToBind:
+                        valid = false
+                        break
+                    let bi2 = chanPosToBind[sourcePos1]
+                    let bind2 = carray.channelBindings[bi2]
+
+                    # Extract search position from ne_reif binding
+                    var sourcePos2 = -1
+                    for p in bind2.indexExpression.positions.items:
+                        if sourcePos2 >= 0:
+                            sourcePos2 = -1
+                            break
+                        sourcePos2 = p
+
+                    if sourcePos2 < 0 or sourcePos2 in carray.channelPositions:
+                        valid = false
+                        break
+
+                    # Extract null value from the ne_reif lookup array
+                    # For int_ne_reif(x, val, b): array is [0 if v==val else 1 for v in lo..hi]
+                    # The null value is where array element is 0
+                    var foundNull = false
+                    let domain = carray.domain[sourcePos2]
+                    if domain.len > 0:
+                        let lo = domain[0]
+                        for idx, elem in bind2.arrayElements:
+                            if elem.isConstant and elem.constantValue == 0:
+                                let thisNullVal = lo + idx
+                                if nullValueSet:
+                                    if thisNullVal != nullValue:
+                                        valid = false
+                                        break
+                                else:
+                                    nullValue = thisNullVal
+                                    nullValueSet = true
+                                foundNull = true
+                                break
+
+                    if not valid: break
+                    if not foundNull:
+                        valid = false
+                        break
+
+                    searchPositions.add(sourcePos2)
+                else:
+                    # Source is already a search position — check if this is a
+                    # direct ne_reif binding (single layer)
+                    var foundNull = false
+                    let domain = carray.domain[sourcePos1]
+                    if domain.len > 0:
+                        let lo = domain[0]
+                        for idx, elem in bind1.arrayElements:
+                            if elem.isConstant and elem.constantValue == 0:
+                                let thisNullVal = lo + idx
+                                if nullValueSet:
+                                    if thisNullVal != nullValue:
+                                        valid = false
+                                        break
+                                else:
+                                    nullValue = thisNullVal
+                                    nullValueSet = true
+                                foundNull = true
+                                break
+                    if not valid: break
+                    if not foundNull:
+                        valid = false
+                        break
+
+                    searchPositions.add(sourcePos1)
+
+            if not valid or searchPositions.len < 2 or not nullValueSet:
+                continue
+
+            result.sys.baseArray.partitionGroups.add(
+                PartitionGroup[int](searchPositions: searchPositions, nullValue: nullValue))
+            inc nGroups
+            totalMembers += searchPositions.len
+
+        if nGroups > 0:
+            stderr.writeLine(&"[FZN] Detected {nGroups} partition groups ({totalMembers} total members)")
 
     # Build WeightedSameValueExpression if pattern was detected
     if result.weightedSameValueObjName != "":

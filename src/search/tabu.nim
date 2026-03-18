@@ -1,4 +1,4 @@
-import std/[algorithm, math, packedsets, random, sequtils, tables, atomics, strformat]
+import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap]
@@ -195,6 +195,10 @@ type
         cdBatchSaved: seq[T]                      # saved channel values during batch evaluation
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
+
+        # Partition swap move structures
+        partitionGroups*: seq[PartitionGroup[int]]
+        partitionEnabled*: bool
 
         # Dormancy support: positions that are don't-care based on a selector variable's value
         hasDormancy*: bool
@@ -2208,6 +2212,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
             $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len)
 
+    # Initialize partition swap structures
+    state.partitionGroups = carray.partitionGroups
+    state.partitionEnabled = state.partitionGroups.len > 0
+    if state.partitionEnabled and verbose and id == 0:
+        echo "[Init] Partition groups: " & $state.partitionGroups.len &
+             " groups, members: " & state.partitionGroups.mapIt($it.searchPositions.len).join("/")
+
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
@@ -2810,6 +2821,14 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let tBM = epochTime()
     let moves = state.bestMoves()
     let (swapMoves, swapCost) = state.bestSwapMoves()
+
+    # Evaluate partition swaps periodically (every 3 iterations) to limit overhead
+    # from assignValueLean-based evaluation, but compare properly with other moves.
+    var partMoves: seq[(int, int, int, int)]  # typed as int to match T=int
+    var partCost = high(int)
+    if state.partitionEnabled and state.iteration mod 3 == 0:
+        (partMoves, partCost) = state.bestPartitionSwapMoves()
+
     when ProfileIteration:
         state.timeBestMoves += epochTime() - tBM
 
@@ -2826,7 +2845,42 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
                 if state.inverseEnabled and state.posToInverseGroup[pos] >= 0:
                     singleCost += state.inverseDelta[pos][idx]
 
-    if swapMoves.len > 0 and swapCost < singleCost:
+    # Find overall best among single, swap, and partition moves
+    let bestOfSwapPart = min(swapCost, partCost)
+    if bestOfSwapPart < singleCost:
+        if partCost <= swapCost and partMoves.len > 0:
+            # Apply partition swap move
+            let (deactPos, actPos, newVal, groupIdx) = sample(partMoves)
+            let oldActiveVal = state.assignment[deactPos]
+            let groupNullVal = state.partitionGroups[groupIdx].nullValue
+            state.assignValue(deactPos, groupNullVal)
+            state.assignValue(actPos, newVal)
+            let tabuTenure = state.iteration + 1 + state.iteration mod 10
+            let oldIdx1 = state.domainIndex[deactPos].getOrDefault(oldActiveVal, -1)
+            if oldIdx1 >= 0 and not state.isLazy[deactPos]:
+                state.tabu[deactPos][oldIdx1] = tabuTenure
+            let oldIdx2 = state.domainIndex[actPos].getOrDefault(groupNullVal, -1)
+            if oldIdx2 >= 0 and not state.isLazy[actPos]:
+                state.tabu[actPos][oldIdx2] = tabuTenure
+        elif swapMoves.len > 0:
+            # Apply binary swap move
+            let (p1, p2, newVal1, newVal2) = sample(swapMoves)
+            let oldVal1 = state.assignment[p1]
+            let oldVal2 = state.assignment[p2]
+            state.assignValue(p1, newVal1)
+            state.assignValue(p2, newVal2)
+            let tabuTenure = state.iteration + 1 + state.iteration mod 10
+            if not state.isLazy[p1]:
+                let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
+                if oldIdx1 >= 0:
+                    state.tabu[p1][oldIdx1] = tabuTenure
+            if not state.isLazy[p2]:
+                let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
+                if oldIdx2 >= 0:
+                    state.tabu[p2][oldIdx2] = tabuTenure
+            state.applyElementImpliedMoves(p1)
+            state.applyElementImpliedMoves(p2)
+    elif swapMoves.len > 0 and swapCost < singleCost:
         # Apply swap move
         let (p1, p2, newVal1, newVal2) = sample(swapMoves)
         let oldVal1 = state.assignment[p1]
