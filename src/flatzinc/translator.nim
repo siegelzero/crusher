@@ -263,6 +263,8 @@ type
         inverseChannelPatterns*: seq[tuple[arrayName: string, elementCIs: seq[int],
                                                                              indexVarNames: seq[string], resultValues: seq[int],
                                                                              gccCIs: seq[int]]]
+        # Indices into inverseChannelPatterns to suppress (mutual inverse secondary patterns)
+        suppressedInversePatterns*: HashSet[int]
         # Tracks which output variables/arrays are boolean (for true/false formatting)
         outputBoolVars*: HashSet[string]
         outputBoolArrays*: HashSet[string]

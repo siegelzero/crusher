@@ -1347,7 +1347,8 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
 
 proc buildInverseChannelBindings(tr: var FznTranslator) =
     ## Builds inverse channel groups from patterns detected by detectInverseChannelPatterns.
-    for pattern in tr.inverseChannelPatterns:
+    for pi, pattern in tr.inverseChannelPatterns:
+        if pi in tr.suppressedInversePatterns: continue
         let arrayPositions = tr.arrayPositions[pattern.arrayName]
         # Resolve forward (index) positions
         var forwardPositions: seq[int]
@@ -1727,6 +1728,33 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Detected inverse channel on array '{arrName}': " &
                                           &"{ciList.len} element + {gccCIs.len} GCC/alldiff constraints consumed, " &
                                           &"{arraySize} inverse positions become channels")
+
+    # Detect mutual inverse pairs: patA channels array B using A's elements as indices,
+    # and patB channels array A using B's elements as indices → suppress the secondary.
+    var posToVarName: Table[int, string]
+    for k, v in tr.varPositions: posToVarName[v] = k
+    for i, patA in tr.inverseChannelPatterns:
+        if i in tr.suppressedInversePatterns: continue
+        var channeledByA: HashSet[string]
+        for pos in tr.arrayPositions[patA.arrayName]:
+            if pos in posToVarName: channeledByA.incl(posToVarName[pos])
+        for j, patB in tr.inverseChannelPatterns:
+            if j <= i or j in tr.suppressedInversePatterns: continue
+            var channeledByB: HashSet[string]
+            for pos in tr.arrayPositions[patB.arrayName]:
+                if pos in posToVarName: channeledByB.incl(posToVarName[pos])
+            if patA.indexVarNames.toHashSet() == channeledByB and
+               patB.indexVarNames.toHashSet() == channeledByA:
+                # Mutual inverse pair: keep i (patA), suppress j (patB)
+                tr.suppressedInversePatterns.incl(j)
+                # Un-consume the suppressed pattern's constraints so they remain active
+                for ci in patB.elementCIs:
+                    tr.definingConstraints.excl(ci)
+                for ci in patB.gccCIs:
+                    tr.definingConstraints.excl(ci)
+                stderr.writeLine(&"[FZN] Suppressed mutual-inverse secondary pattern on " &
+                                 &"'{patB.arrayName}' ('{patA.arrayName}' is channel, " &
+                                 &"'{patB.arrayName}' positions remain searchable)")
 
 
 proc detectIfThenElseChannels(tr: var FznTranslator) =

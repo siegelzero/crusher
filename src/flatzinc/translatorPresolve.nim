@@ -1259,6 +1259,219 @@ proc tablePropagate(tr: FznTranslator,
                     if presolveTightenDomain(domains, vn1, allowed1, infeasible):
                         result = true
 
+proc presolveResolveVarElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
+    ## Resolve a constraint arg (FznArrayLit or named var array FznIdent) to its elements.
+    case arg.kind
+    of FznArrayLit: return arg.elems
+    of FznIdent:
+        # Look up the named variable array declaration in the model
+        for decl in tr.model.variables:
+            if decl.isArray and decl.name == arg.ident:
+                if decl.value != nil and decl.value.kind == FznArrayLit:
+                    return decl.value.elems
+                break
+        return @[]
+    else: return @[]
+
+
+proc regularPropagate(tr: FznTranslator,
+                      domains: var Table[string, seq[int]],
+                      fixedVars: Table[string, int],
+                      eliminated: PackedSet[int],
+                      infeasible: var bool): bool =
+    ## Arc consistency propagation for fzn_regular constraints.
+    ## Uses forward/backward DFA reachability to eliminate values unsupported by the DFA.
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_regular": continue
+        if con.args.len < 6: continue
+
+        # Args: vars (array), Q, S, d (transition array), q0, F (set or array)
+        let varElems = tr.presolveResolveVarElems(con.args[0])
+        let n = varElems.len
+        if n == 0: continue
+
+        if con.args[1].kind != FznIntLit or con.args[2].kind != FznIntLit: continue
+        if con.args[4].kind != FznIntLit: continue
+        let Q = con.args[1].intVal
+        let S = con.args[2].intVal
+        let q0 = con.args[4].intVal
+
+        # Guard against slow cases
+        if Q * n > 100_000: continue
+
+        # Extract transition table (flat int array: inline literal or named constant array)
+        var trans: seq[int]  # trans[(q-1)*S + (s-1)] = next state (1-indexed)
+        case con.args[3].kind
+        of FznArrayLit:
+            let transElems = con.args[3].elems
+            if transElems.len != Q * S: continue
+            var ok = true
+            for e in transElems:
+                if e.kind != FznIntLit: ok = false; break
+                trans.add(e.intVal)
+            if not ok: continue
+        of FznIdent:
+            try: trans = tr.resolveIntArray(con.args[3])
+            except CatchableError: continue
+            if trans.len != Q * S: continue
+        else: continue
+
+        # Extract accepting states F (set literal or array literal)
+        var acceptSet: PackedSet[int]
+        let fArg = con.args[5]
+        case fArg.kind
+        of FznArrayLit:
+            for e in fArg.elems:
+                if e.kind == FznIntLit: acceptSet.incl(e.intVal)
+        of FznSetLit:
+            for v in fArg.setElems: acceptSet.incl(v)
+        of FznRange:
+            for v in fArg.lo..fArg.hi: acceptSet.incl(v)
+        else: continue
+
+        # Build var names and check which are fixed
+        var varNames: seq[string]
+        var fixedInput: seq[int]  # -1 means free, else the symbol value
+        for e in varElems:
+            if tr.presolveIsFixed(e, fixedVars):
+                varNames.add("")
+                fixedInput.add(tr.presolveResolve(e, fixedVars))
+                continue
+            let vn = presolveVarName(e)
+            varNames.add(vn)
+            if vn != "" and vn in domains and domains[vn].len == 1:
+                fixedInput.add(domains[vn][0])
+            else:
+                fixedInput.add(-1)
+
+        # Forward pass: fwdReach[i] = set of states reachable before consuming vars[i]
+        var fwdReach = newSeq[PackedSet[int]](n + 1)
+        fwdReach[0].incl(q0)
+        for i in 0..<n:
+            if fwdReach[i].len == 0: break
+            let sym = fixedInput[i]
+            for q in fwdReach[i]:
+                if sym >= 0:
+                    let si = sym - 1
+                    if si >= 0 and si < S:
+                        let nq = trans[(q-1)*S + si]
+                        if nq != 0: fwdReach[i+1].incl(nq)
+                else:
+                    for s in 0..<S:
+                        let nq = trans[(q-1)*S + s]
+                        if nq != 0: fwdReach[i+1].incl(nq)
+
+        # Backward pass: bwdReach[i] = states at position i that can reach acceptance
+        var bwdReach = newSeq[PackedSet[int]](n + 1)
+        for q in acceptSet: bwdReach[n].incl(q)
+        for i in countdown(n-1, 0):
+            let sym = fixedInput[i]
+            for q in 1..Q:
+                if sym >= 0:
+                    let si = sym - 1
+                    if si >= 0 and si < S:
+                        let nq = trans[(q-1)*S + si]
+                        if nq in bwdReach[i+1]: bwdReach[i].incl(q)
+                else:
+                    for s in 0..<S:
+                        let nq = trans[(q-1)*S + s]
+                        if nq in bwdReach[i+1]:
+                            bwdReach[i].incl(q)
+                            break
+
+        # Arc consistency: remove unsupported values from free variables
+        for i in 0..<n:
+            if fixedInput[i] >= 0: continue  # already fixed
+            let vn = varNames[i]
+            if vn == "" or vn notin domains: continue
+            var allowed: seq[int]
+            for v in domains[vn]:
+                let si = v - 1  # 1-indexed symbol → 0-indexed
+                if si < 0 or si >= S: continue
+                for q in fwdReach[i]:
+                    let nq = trans[(q-1)*S + si]
+                    if nq in bwdReach[i+1]:
+                        allowed.add(v)
+                        break
+            if allowed.len < domains[vn].len:
+                if presolveTightenDomain(domains, vn, allowed, infeasible):
+                    result = true
+                    if infeasible: return
+
+
+proc gccPropagate(tr: FznTranslator,
+                  domains: var Table[string, seq[int]],
+                  fixedVars: Table[string, int],
+                  eliminated: PackedSet[int],
+                  infeasible: var bool): bool =
+    ## Arc consistency propagation for fzn_global_cardinality_closed constraints.
+    ## Enforces count bounds: if a value's canCount == requiredCount, all remaining vars
+    ## that can take it must take it; if mustCount == requiredCount, remove from others.
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_global_cardinality_closed" and name != "fzn_global_cardinality": continue
+        if con.args.len < 3: continue
+
+        # Args: vars (array), cover values (array), count values (array)
+        let varElems = tr.presolveResolveVarElems(con.args[0])
+        let coverElems = tr.presolveResolveVarElems(con.args[1])
+        let countElems = tr.presolveResolveVarElems(con.args[2])
+        if coverElems.len != countElems.len: continue
+        if varElems.len == 0: continue
+
+        var varNames: seq[string]
+        for e in varElems:
+            varNames.add(presolveVarName(e))
+
+        # Process each cover value
+        for k in 0..<coverElems.len:
+            if infeasible: return
+            if coverElems[k].kind != FznIntLit or countElems[k].kind != FznIntLit: continue
+            let v = coverElems[k].intVal
+            let required = countElems[k].intVal
+
+            var mustCount = 0  # vars with domain == {v}
+            var canCount = 0   # vars whose domain contains v
+            var canIdxs: seq[int]  # indices of vars that can take v but aren't fixed to it
+
+            for i, vn in varNames:
+                if vn == "" or vn notin domains: continue
+                let dom = domains[vn]
+                if dom == @[v]:
+                    inc mustCount
+                    inc canCount
+                elif v in dom.toPackedSet():
+                    inc canCount
+                    canIdxs.add(i)
+
+            if mustCount > required or canCount < required:
+                infeasible = true
+                return
+
+            if canCount == required:
+                # All vars that can take v must take v
+                for i in canIdxs:
+                    let vn = varNames[i]
+                    if presolveTightenDomain(domains, vn, @[v], infeasible):
+                        result = true
+                    if infeasible: return
+
+            if mustCount == required:
+                # No other var can take v
+                for i in canIdxs:
+                    let vn = varNames[i]
+                    if presolveRemoveValue(domains, vn, v, infeasible):
+                        result = true
+                    if infeasible: return
+
+
 proc partitionPropagate(tr: FznTranslator,
                         domains: var Table[string, seq[int]],
                         fixedVars: Table[string, int],
@@ -1490,6 +1703,16 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 7: Table constraint propagation (arc consistency)
         if tablePropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 7b: Regular (DFA) arc consistency propagation
+        if regularPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 7c: GCC arc consistency propagation
+        if gccPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
