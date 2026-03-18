@@ -1787,6 +1787,17 @@ proc translate*(model: FznModel): FznTranslator =
         for bi, binding in carray.channelBindings:
             chanPosToBind[binding.channelPosition] = bi
 
+        # Extract null value from a ne_reif lookup array.
+        # For int_ne_reif(x, val, b): array is [0 if v==val else 1 for v in lo..hi].
+        # Returns (nullVal, true) on success, (0, false) on failure.
+        proc extractNullValue(binding: ChannelBinding[int], domain: seq[int]): (int, bool) =
+            if domain.len == 0: return (0, false)
+            let lo = domain[0]
+            for idx, elem in binding.arrayElements:
+                if elem.isConstant and elem.constantValue == 0:
+                    return (lo + idx, true)
+            return (0, false)
+
         var nGroups = 0
         var totalMembers = 0
 
@@ -1872,55 +1883,32 @@ proc translate*(model: FznModel): FznTranslator =
                         valid = false
                         break
 
-                    # Extract null value from the ne_reif lookup array
-                    # For int_ne_reif(x, val, b): array is [0 if v==val else 1 for v in lo..hi]
-                    # The null value is where array element is 0
-                    var foundNull = false
-                    let domain = carray.domain[sourcePos2]
-                    if domain.len > 0:
-                        let lo = domain[0]
-                        for idx, elem in bind2.arrayElements:
-                            if elem.isConstant and elem.constantValue == 0:
-                                let thisNullVal = lo + idx
-                                if nullValueSet:
-                                    if thisNullVal != nullValue:
-                                        valid = false
-                                        break
-                                else:
-                                    nullValue = thisNullVal
-                                    nullValueSet = true
-                                foundNull = true
-                                break
-
-                    if not valid: break
+                    let (thisNullVal, foundNull) = extractNullValue(bind2, carray.domain[sourcePos2])
                     if not foundNull:
                         valid = false
                         break
+                    if nullValueSet:
+                        if thisNullVal != nullValue:
+                            valid = false
+                            break
+                    else:
+                        nullValue = thisNullVal
+                        nullValueSet = true
 
                     searchPositions.add(sourcePos2)
                 else:
-                    # Source is already a search position — check if this is a
-                    # direct ne_reif binding (single layer)
-                    var foundNull = false
-                    let domain = carray.domain[sourcePos1]
-                    if domain.len > 0:
-                        let lo = domain[0]
-                        for idx, elem in bind1.arrayElements:
-                            if elem.isConstant and elem.constantValue == 0:
-                                let thisNullVal = lo + idx
-                                if nullValueSet:
-                                    if thisNullVal != nullValue:
-                                        valid = false
-                                        break
-                                else:
-                                    nullValue = thisNullVal
-                                    nullValueSet = true
-                                foundNull = true
-                                break
-                    if not valid: break
+                    # Source is already a search position (single layer)
+                    let (thisNullVal, foundNull) = extractNullValue(bind1, carray.domain[sourcePos1])
                     if not foundNull:
                         valid = false
                         break
+                    if nullValueSet:
+                        if thisNullVal != nullValue:
+                            valid = false
+                            break
+                    else:
+                        nullValue = thisNullVal
+                        nullValueSet = true
 
                     searchPositions.add(sourcePos1)
 

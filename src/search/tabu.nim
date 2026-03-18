@@ -2846,40 +2846,22 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
                     singleCost += state.inverseDelta[pos][idx]
 
     # Find overall best among single, swap, and partition moves
-    let bestOfSwapPart = min(swapCost, partCost)
-    if bestOfSwapPart < singleCost:
-        if partCost <= swapCost and partMoves.len > 0:
-            # Apply partition swap move
-            let (deactPos, actPos, newVal, groupIdx) = sample(partMoves)
-            let oldActiveVal = state.assignment[deactPos]
-            let groupNullVal = state.partitionGroups[groupIdx].nullValue
-            state.assignValue(deactPos, groupNullVal)
-            state.assignValue(actPos, newVal)
-            let tabuTenure = state.iteration + 1 + state.iteration mod 10
-            let oldIdx1 = state.domainIndex[deactPos].getOrDefault(oldActiveVal, -1)
-            if oldIdx1 >= 0 and not state.isLazy[deactPos]:
-                state.tabu[deactPos][oldIdx1] = tabuTenure
-            let oldIdx2 = state.domainIndex[actPos].getOrDefault(groupNullVal, -1)
-            if oldIdx2 >= 0 and not state.isLazy[actPos]:
-                state.tabu[actPos][oldIdx2] = tabuTenure
-        elif swapMoves.len > 0:
-            # Apply binary swap move
-            let (p1, p2, newVal1, newVal2) = sample(swapMoves)
-            let oldVal1 = state.assignment[p1]
-            let oldVal2 = state.assignment[p2]
-            state.assignValue(p1, newVal1)
-            state.assignValue(p2, newVal2)
-            let tabuTenure = state.iteration + 1 + state.iteration mod 10
-            if not state.isLazy[p1]:
-                let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
-                if oldIdx1 >= 0:
-                    state.tabu[p1][oldIdx1] = tabuTenure
-            if not state.isLazy[p2]:
-                let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
-                if oldIdx2 >= 0:
-                    state.tabu[p2][oldIdx2] = tabuTenure
-            state.applyElementImpliedMoves(p1)
-            state.applyElementImpliedMoves(p2)
+    if partMoves.len > 0 and partCost <= swapCost and partCost < singleCost:
+        # Apply partition swap move
+        let (deactPos, actPos, newVal, groupIdx) = sample(partMoves)
+        let oldActiveVal = state.assignment[deactPos]
+        let groupNullVal = state.partitionGroups[groupIdx].nullValue
+        state.assignValue(deactPos, groupNullVal)
+        state.assignValue(actPos, newVal)
+        let tabuTenure = state.iteration + 1 + state.iteration mod 10
+        let oldIdx1 = state.domainIndex[deactPos].getOrDefault(oldActiveVal, -1)
+        if oldIdx1 >= 0 and not state.isLazy[deactPos]:
+            state.tabu[deactPos][oldIdx1] = tabuTenure
+        let oldIdx2 = state.domainIndex[actPos].getOrDefault(groupNullVal, -1)
+        if oldIdx2 >= 0 and not state.isLazy[actPos]:
+            state.tabu[actPos][oldIdx2] = tabuTenure
+        state.applyElementImpliedMoves(deactPos)
+        state.applyElementImpliedMoves(actPos)
     elif swapMoves.len > 0 and swapCost < singleCost:
         # Apply swap move
         let (p1, p2, newVal1, newVal2) = sample(swapMoves)
