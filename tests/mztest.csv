@@ -7,3 +7,4 @@ groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86
 hitori_h5_1,2025/hitori/hitori.mzn,2025/hitori/h5-1.dzn,maximize,10000,17,17
 is_9aGFgDaHX7,2025/is/model.mzn,2025/is/9aGFgDaHX7.dzn,minimize,5000,,688128
+mondoku_8_8_4,2025/mondoku/mondoku-gcc-model-balance.mzn,2025/mondoku/8-8-4.dzn,minimize,10000,0,4

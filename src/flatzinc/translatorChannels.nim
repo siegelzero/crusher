@@ -1745,7 +1745,9 @@ proc detectIfThenElseChannels(tr: var FznTranslator) =
     var linNeReifMap: Table[string, LinNeReifEntry]
 
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
+        # Don't skip definingConstraints: int_lin_ne_reif may already be channelized
+        # by detectLinEqReifChannels, but we still need prevVar/currVar info to detect
+        # the full if-then-else pattern and convert the result to a 2D table channel.
         if con.name != "int_lin_ne_reif": continue
         if not con.hasAnnotation("defines_var"): continue
         if con.args.len < 4: continue
