@@ -1683,6 +1683,10 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for one-hot indicator variables
     result.buildOneHotChannelBindings()
+    # Detect implicit min/max channels: array_int_max/min without defines_var
+    # that are only used as outputs (not referenced as inputs elsewhere).
+    # Must run before buildMinMaxChannelBindings so new entries are processed.
+    result.detectImplicitMaxChannels()
     # Build channel bindings for array_int_minimum/maximum defines_var
     result.buildMinMaxChannelBindings()
     # Build channel bindings for rescued defined vars (from var-indexed arrays)
@@ -1696,23 +1700,55 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect dormant positions in diffnK constraints (don't-care placements)
     result.detectDormantPositions()
 
-    # Deduplicate element channel bindings: remove builder-phase bindings that conflict
-    # with constraint-loop bindings (e.g., table_int creates a functional dep channel,
-    # then buildReifChannelBindings creates a bool2int for the same position).
-    # Only dedup builder bindings against constraint-loop ones, not within either phase.
+    # Deduplicate element channel bindings.
+    # Phase A: remove builder-phase bindings that conflict with constraint-loop bindings
+    #          (e.g., table_int creates a functional dep channel, then buildReifChannelBindings
+    #          creates a bool2int for the same position).
+    # Phase B: remove constraint-loop-vs-constraint-loop duplicates (e.g., two fzn_table_int
+    #          constraints that both claim the same position as a functional dependency).
+    #          The second binding is demoted to a regular element constraint.
     block:
-        # Collect positions claimed by constraint-loop bindings
+        # Phase A: collect positions claimed by constraint-loop bindings
         var constraintLoopPositions: PackedSet[int]
         for i in 0..<constraintLoopBindingCount:
             constraintLoopPositions.incl(result.sys.baseArray.channelBindings[i].channelPosition)
 
         var dedupCount = 0
         var kept: seq[ChannelBinding[int]]
+
+        # Phase B: also track within-constraint-loop duplicates
+        var seenConstraintLoopPositions: PackedSet[int]
+
         for i, binding in result.sys.baseArray.channelBindings:
             if i >= constraintLoopBindingCount and binding.channelPosition in constraintLoopPositions:
                 # Builder binding conflicts with constraint-loop binding — skip
                 inc dedupCount
+            elif i < constraintLoopBindingCount and binding.channelPosition in seenConstraintLoopPositions:
+                # Constraint-loop duplicate: demote to element constraint.
+                # Use elementExpr (supports complex index exprs like BinaryOpNode from composite keys).
+                let channelPosExpr = result.sys.baseArray[binding.channelPosition]
+                var allConst = true
+                for elem in binding.arrayElements:
+                    if not elem.isConstant: allConst = false; break
+                if allConst:
+                    var constArr: seq[int]
+                    for elem in binding.arrayElements: constArr.add(elem.constantValue)
+                    result.sys.addConstraint(elementExpr[int](binding.indexExpression, constArr, channelPosExpr))
+                else:
+                    var arrayExprs: seq[AlgebraicExpression[int]]
+                    for elem in binding.arrayElements:
+                        if elem.isConstant:
+                            arrayExprs.add(newAlgebraicExpression[int](
+                                positions = initPackedSet[int](),
+                                node = ExpressionNode[int](kind: LiteralNode, value: elem.constantValue),
+                                linear = true))
+                        else:
+                            arrayExprs.add(result.sys.baseArray[elem.variablePosition])
+                    result.sys.addConstraint(elementExpr[int](binding.indexExpression, arrayExprs, channelPosExpr))
+                inc dedupCount
             else:
+                if i < constraintLoopBindingCount:
+                    seenConstraintLoopPositions.incl(binding.channelPosition)
                 kept.add(binding)
         if dedupCount > 0:
             result.sys.baseArray.channelBindings = kept

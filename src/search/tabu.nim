@@ -1099,19 +1099,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     channelChanged = true
-        if fpIter > 20:
+        if fpIter > 100:
+            var changingPos: seq[int]
+            for binding in carray.channelBindings:
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    let newVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition]
+                    if newVal != state.assignment[binding.channelPosition]:
+                        changingPos.add(binding.channelPosition)
             if verbose and id == 0:
-                stderr.writeLine("[Init] WARNING: channel fixed-point exceeded 20 iterations, breaking")
-                # Report which positions are still changing
-                var changingPos: seq[int]
-                for binding in carray.channelBindings:
-                    let idxVal = binding.indexExpression.evaluate(state.assignment)
-                    if idxVal >= 0 and idxVal < binding.arrayElements.len:
-                        let elem = binding.arrayElements[idxVal]
-                        let newVal = if elem.isConstant: elem.constantValue
-                                     else: state.assignment[elem.variablePosition]
-                        if newVal != state.assignment[binding.channelPosition]:
-                            changingPos.add(binding.channelPosition)
+                stderr.writeLine("[Init] WARNING: channel fixed-point exceeded 100 iterations, breaking (" &
+                                 $changingPos.len & " positions still changing)")
                 stderr.writeLine("[Init]   Still-changing positions: " & $changingPos[0..min(9, changingPos.len-1)])
                 stderr.flushFile()
             break
@@ -1220,9 +1220,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var combinedIter = 0
         while true:
             inc combinedIter
-            if combinedIter > 50:
+            if combinedIter > 200:
                 if verbose and id == 0:
-                    stderr.writeLine("[Init] WARNING: combined elem+minmax fixed-point exceeded 50 iterations, breaking")
+                    stderr.writeLine("[Init] WARNING: combined elem+minmax fixed-point exceeded 200 iterations, breaking")
                     stderr.flushFile()
                 break
             # Min/max fixed-point pass
@@ -1760,11 +1760,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
-                # Min/max channel bindings: include in cascade as dynamic entries
+                # Min/max channel bindings: include in cascade as dynamic entries.
+                # Implicit channels (detected without defines_var) are cascade-exempt:
+                # they're still computed after each move, but their downstream constraints
+                # are not included in the penalty-map cascade to control build overhead.
                 if p in carray.minMaxChannelsAtPosition:
                     for bi in carray.minMaxChannelsAtPosition[p]:
                         let fb = state.flatMinMaxBindings[bi]
                         let chanPos = fb.channelPosition
+                        if chanPos in carray.implicitMinMaxPositions:
+                            continue  # Cascade-exempt: skip downstream propagation
                         if chanPos in topoSet:
                             continue  # Diamond — skip
                         canStatic = false  # min/max depends on non-local positions

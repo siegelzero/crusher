@@ -482,6 +482,58 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     tr.definedVarExprs[definedName] = expr
     return true
 
+proc detectImplicitMaxChannels(tr: var FznTranslator) =
+    ## Detects array_int_maximum/minimum constraints WITHOUT defines_var that can be treated
+    ## as channel variables. This handles cases like the Unison model where le[v] = max(use_cycles)
+    ## is emitted without a defines_var annotation.
+    ##
+    ## Eligibility criteria for variable m in `array_int_maximum(m, arr)`:
+    ##   1. m is not already in definedVarNames or channelVarNames or paramValues
+    ##   2. m appears as LHS (args[0]) in exactly one array_int_maximum/minimum constraint
+    ##   3. m does not appear as an input in any other constraint
+
+    let targetNames = ["array_int_maximum", "array_int_minimum"]
+
+    # Step 1: collect all candidate LHS variables from array_int_max/min without defines_var
+    # and count how many times each appears as LHS
+    var lhsCount: Table[string, int]     # varName -> # times it is LHS of array_int_max/min
+    var lhsCi: Table[string, int]        # varName -> constraint index of (single) LHS occurrence
+    var lhsIsMin: Table[string, bool]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin targetNames: continue
+        if con.hasAnnotation("defines_var"): continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent: continue
+        let mName = con.args[0].ident
+        lhsCount[mName] = lhsCount.getOrDefault(mName, 0) + 1
+        lhsCi[mName] = ci
+        lhsIsMin[mName] = (name == "array_int_minimum")
+
+    if lhsCount.len == 0:
+        return
+
+    # Step 2: filter candidates and register eligible ones as min/max channels.
+    # A variable is eligible if it is defined by exactly one array_int_max/min constraint
+    # and is not already defined/channeled elsewhere. It is fine for m to appear as an
+    # input to other constraints (cumulative, nooverlap, etc.) — that is normal use.
+    var nDetected = 0
+    for mName, count in lhsCount:
+        if count != 1: continue  # ambiguous: multiple max/min constraints define this var
+        if mName in tr.definedVarNames: continue
+        if mName in tr.channelVarNames: continue
+        if mName in tr.paramValues: continue
+        let ci = lhsCi[mName]
+        let isMin = lhsIsMin[mName]
+        tr.channelVarNames.incl(mName)
+        tr.definingConstraints.incl(ci)
+        tr.minMaxChannelDefs.add((ci: ci, varName: mName, isMin: isMin))
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} implicit min/max channel variables (array_int_max/min without defines_var)")
+
 proc buildDefinedExpressions(tr: var FznTranslator) =
     ## Second pass: build AlgebraicExpressions for defined variables using the positions
     ## of non-defined variables that are already created.

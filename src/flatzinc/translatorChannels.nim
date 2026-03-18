@@ -1031,7 +1031,9 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
             inputExprs = tr.resolveExprArray(con.args[1])
         if inputExprs.len == 0:
             continue
-        tr.sys.baseArray.addMinMaxChannelBinding(channelPos, def.isMin, inputExprs)
+        let defCon = tr.model.constraints[def.ci]
+        let isImplicit = not defCon.hasAnnotation("defines_var")
+        tr.sys.baseArray.addMinMaxChannelBinding(channelPos, def.isMin, inputExprs, isImplicit)
 
     if tr.sys.baseArray.minMaxChannelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")

@@ -82,6 +82,7 @@ type
         channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
         minMaxChannelBindings*: seq[MinMaxChannelBinding[T]]
         minMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [minMax binding indices]
+        implicitMinMaxPositions*: PackedSet[int]  # channel positions from implicit detection (cascade-exempt)
         countEqChannelBindings*: seq[CountEqChannelBinding[T]]
         countEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [countEq binding indices]
         conditionalCountEqChannelBindings*: seq[ConditionalCountEqChannelBinding[T]]
@@ -223,10 +224,13 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
 proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
                                   channelPos: int,
                                   isMin: bool,
-                                  inputExprs: seq[AlgebraicExpression[T]]) =
+                                  inputExprs: seq[AlgebraicExpression[T]],
+                                  isImplicit: bool = false) =
     ## Register a min/max channel: channelPos = min/max(inputExprs).
     ## The channel position is added to channelPositions (not searched).
     ## Source positions are mapped in minMaxChannelsAtPosition.
+    ## isImplicit=true marks channels detected without defines_var as cascade-exempt
+    ## (still computed after each move but not included in channel-dep cascade topology).
     var allPositions: PackedSet[int]
     for expr in inputExprs:
         for pos in expr.positions.items:
@@ -239,6 +243,8 @@ proc addMinMaxChannelBinding*[T](arr: var ConstrainedArray[T],
         inputPositions: allPositions
     ))
     arr.channelPositions.incl(channelPos)
+    if isImplicit:
+        arr.implicitMinMaxPositions.incl(channelPos)
     for pos in allPositions.items:
         if pos notin arr.minMaxChannelsAtPosition:
             arr.minMaxChannelsAtPosition[pos] = @[bindingIdx]
