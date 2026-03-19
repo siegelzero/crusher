@@ -853,9 +853,6 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectConditionalDayCapacityPattern()
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
-    # Consume constraints where ALL variables are channels/defined (redundant)
-    # MUST run after all channel detection is complete
-    result.consumeAllChannelConstraints()
     result.translateVariables()
     # Create net flow variables and channel bindings (after translateVariables so V positions exist)
     if result.netFlowFreePairs.len > 0:

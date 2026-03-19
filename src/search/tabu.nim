@@ -1713,6 +1713,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var staticCount = 0
         var dynamicCount = 0
         var cascadeFail = 0
+        var cascadeDepthFail = 0
 
         for pos in state.channelDepSearchPositions:
             if state.isLazy[pos]: continue
@@ -1812,6 +1813,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # on-demand costDelta evaluation in bestMoves instead.
                 if topoOrder.len >= MaxCascadeChans:
                     state.isLazy[pos] = true
+                    inc cascadeDepthFail
                 continue
 
             # Build channel values
@@ -2015,7 +2017,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 else: inc noExtCount
             echo "[Init] Cascade tables: " & $staticCount & " static + " & $dynamicCount &
                  " dynamic / " & $(staticCount + dynamicCount + cascadeFail) &
-                 " positions (fail=" & $cascadeFail &
+                 " positions (fail=" & $cascadeFail & " depthFail=" & $cascadeDepthFail &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
                  " mem=" & $(totalMem div 1024) & "KB" &
                  " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &

@@ -1364,7 +1364,8 @@ proc buildConditionalSourceChannelBindings(tr: var FznTranslator) =
             var seen: PackedSet[int]
             for si in def.sourceMap:
                 if si notin seen: seen.incl(si); vals.add(si)
-            vals.sorted()
+            vals.sort()
+            vals
 
         let srcIdxPos = tr.sys.baseArray.len
         tr.sys.baseArray.extendArray(1)
@@ -1382,19 +1383,13 @@ proc buildConditionalSourceChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.addChannelBinding(srcIdxPos, indexExpr, srcIdxArray)
 
         # Build variable-element binding: target = var_element(src_idx - 1, sourceArray)
-        # Resolve source array to mixed elements
-        if def.sourceArrayName notin tr.model.variables.mapIt(it.name).toHashSet():
-            # Look up array declaration
-            discard
         var varArrayElems: seq[ArrayElement[int]]
-        var valid = true
         for decl in tr.model.variables:
             if decl.isArray and decl.name == def.sourceArrayName and
                decl.value != nil and decl.value.kind == FznArrayLit:
                 varArrayElems = tr.resolveMixedArray(decl.value)
                 break
-        if varArrayElems.len == 0:
-            valid = false
+        let valid = varArrayElems.len > 0
 
         if valid:
             let srcIdxExpr = tr.sys.baseArray[srcIdxPos] - 1  # 1-based to 0-based

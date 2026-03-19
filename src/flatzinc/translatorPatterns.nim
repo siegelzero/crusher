@@ -2676,6 +2676,47 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             return (true, info.sourceVar, info.condVals)
         return (false, "", @[])
 
+    proc resolveNegLiterals(negArg: FznExpr,
+                            eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]],
+                            setInReifCondMap: Table[string, tuple[sourceVar: string, condVals: seq[int]]],
+                            tr: FznTranslator): tuple[ok: bool, condVar: string, condVals: seq[int]] =
+        ## Resolve all negative literals in a bool_clause and intersect their condition values.
+        var condVar = ""
+        var condVals: seq[int]
+        for ni in 0..<negArg.elems.len:
+            let negLit = negArg.elems[ni]
+            if negLit.kind != FznIdent: return (false, "", @[])
+            let (condOk, cv, cvs) = resolveCondition(negLit.ident, eqReifMap, setInReifCondMap, tr)
+            if not condOk: return (false, "", @[])
+            if condVar == "":
+                condVar = cv
+                condVals = cvs
+            elif cv != condVar:
+                return (false, "", @[])  # different condition variables
+            else:
+                let prevSet = condVals.toHashSet()
+                var intersection: seq[int]
+                for v in cvs:
+                    if v in prevSet: intersection.add(v)
+                condVals = intersection
+                if condVals.len == 0: return (false, "", @[])
+        return (ok: condVals.len > 0, condVar: condVar, condVals: condVals)
+
+    proc mapPosLiterals(posArg: FznExpr, condVar: string, condVals: seq[int],
+                        eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]],
+                        setInReifCondMap: Table[string, tuple[sourceVar: string, condVals: seq[int]]],
+                        boolToCondVals: var Table[string, tuple[condVar: string, condVals: seq[int]]]) =
+        ## Map positive literals of a bool_clause to the resolved condition.
+        for posElem in posArg.elems:
+            if posElem.kind != FznIdent: continue
+            if posElem.ident in boolToCondVals: continue
+            # Skip if this positive literal is on the SAME condition variable
+            if posElem.ident in eqReifMap:
+                if eqReifMap[posElem.ident].sourceVar == condVar: continue
+            if posElem.ident in setInReifCondMap:
+                if setInReifCondMap[posElem.ident].sourceVar == condVar: continue
+            boolToCondVals[posElem.ident] = (condVar: condVar, condVals: condVals)
+
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
@@ -2685,44 +2726,9 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
         let negArg = con.args[1]
         if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
         if negArg.elems.len == 0: continue
-        # Resolve ALL negative literals and intersect their condition values.
-        # bool_clause(pos, [n1, n2, ...]) = (n1 ∧ n2 ∧ ...) → (pos1 ∨ pos2 ∨ ...)
-        var combinedCondVar = ""
-        var combinedCondVals: seq[int]
-        var allNegOk = true
-        for ni in 0..<negArg.elems.len:
-            let negLit = negArg.elems[ni]
-            if negLit.kind != FznIdent: allNegOk = false; break
-            let (condOk, condVar, condVals) = resolveCondition(negLit.ident, eqReifMap, setInReifCondMap, tr)
-            if not condOk: allNegOk = false; break
-            if combinedCondVar == "":
-                combinedCondVar = condVar
-                combinedCondVals = condVals
-            elif condVar != combinedCondVar:
-                allNegOk = false; break  # different condition variables
-            else:
-                # Intersect condition values
-                let prevSet = combinedCondVals.toHashSet()
-                var intersection: seq[int]
-                for v in condVals:
-                    if v in prevSet: intersection.add(v)
-                combinedCondVals = intersection
-                if combinedCondVals.len == 0: allNegOk = false; break
-        if not allNegOk or combinedCondVals.len == 0: continue
-        # Map positive literals to this condition
-        for posElem in posArg.elems:
-            if posElem.kind != FznIdent: continue
-            if posElem.ident in boolToCondVals: continue
-            # Skip if this positive literal is on the SAME condition variable
-            if posElem.ident in eqReifMap:
-                let posInfo = eqReifMap[posElem.ident]
-                if posInfo.sourceVar == combinedCondVar:
-                    continue
-            if posElem.ident in setInReifCondMap:
-                let posInfo = setInReifCondMap[posElem.ident]
-                if posInfo.sourceVar == combinedCondVar:
-                    continue
-            boolToCondVals[posElem.ident] = (condVar: combinedCondVar, condVals: combinedCondVals)
+        let (ok, condVar, condVals) = resolveNegLiterals(negArg, eqReifMap, setInReifCondMap, tr)
+        if not ok: continue
+        mapPosLiterals(posArg, condVar, condVals, eqReifMap, setInReifCondMap, boolToCondVals)
 
     # Step 4: Extend via array_bool_and and fixpoint propagation
 
@@ -2754,34 +2760,9 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             let negArg = con.args[1]
             if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
             if negArg.elems.len == 0: continue
-            var cv2 = ""
-            var cvs2: seq[int]
-            var ok2 = true
-            for ni in 0..<negArg.elems.len:
-                let negLit = negArg.elems[ni]
-                if negLit.kind != FznIdent: ok2 = false; break
-                let (cOk, cVar, cVals) = resolveCondition(negLit.ident, eqReifMap, setInReifCondMap, tr)
-                if not cOk: ok2 = false; break
-                if cv2 == "": cv2 = cVar; cvs2 = cVals
-                elif cVar != cv2: ok2 = false; break
-                else:
-                    let prevSet = cvs2.toHashSet()
-                    var inter: seq[int]
-                    for v in cVals:
-                        if v in prevSet: inter.add(v)
-                    cvs2 = inter
-                    if cvs2.len == 0: ok2 = false; break
-            if not ok2 or cvs2.len == 0: continue
-            for posElem in posArg.elems:
-                if posElem.kind != FznIdent: continue
-                if posElem.ident in boolToCondVals: continue
-                if posElem.ident in eqReifMap:
-                    let posInfo = eqReifMap[posElem.ident]
-                    if posInfo.sourceVar == cv2: continue
-                if posElem.ident in setInReifCondMap:
-                    let posInfo = setInReifCondMap[posElem.ident]
-                    if posInfo.sourceVar == cv2: continue
-                boolToCondVals[posElem.ident] = (condVar: cv2, condVals: cvs2)
+            let (ok, condVar, condVals) = resolveNegLiterals(negArg, eqReifMap, setInReifCondMap, tr)
+            if not ok: continue
+            mapPosLiterals(posArg, condVar, condVals, eqReifMap, setInReifCondMap, boolToCondVals)
 
     # Step 5: Build variable array index
     # A variable may appear in multiple arrays. Track ALL memberships.
@@ -2803,7 +2784,6 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
     # Step 6: For each target, try to build a complete source map
     var nTargets = 0
     var nConsumed = 0
-    var nSyntheticVars = 0
     var dbgNoCondMap = 0
     var dbgTooFewMapped = 0
     var dbgNoArray = 0
@@ -2989,20 +2969,10 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             condDomMin: condDom[0]))
         inc nTargets
 
-    stderr.writeLine(&"[FZN] Conditional-source channels: {nTargets} targets, " &
-        &"{nSyntheticVars} synthetic vars" &
+    stderr.writeLine(&"[FZN] Conditional-source channels: {nTargets} targets" &
         &" (skipped: alreadyChannel={dbgSkippedChannel} fewEqReifs={dbgSkippedFew}" &
         &" fewMapped={dbgTooFewMapped}[noCond={dbgTotalNoCond} noArr={dbgTotalNoArr} diffCond={dbgTotalDiffCond}]" &
         &" noArray={dbgNoArray} other={dbgOther})")
-
-
-proc consumeAllChannelConstraints*(tr: var FznTranslator) =
-    ## Placeholder: all-channel constraint consumption.
-    ## We do NOT consume constraints at translation time even if all their variables are
-    ## channels, because the constraints may encode relationships needed for correctness
-    ## (e.g., bool_clause implications in if-then-else patterns). The solver's init
-    ## already detects tautological channel-dep constraints and disables them at runtime.
-    discard
 
 
 proc detectImplicationPatterns(tr: var FznTranslator) =
