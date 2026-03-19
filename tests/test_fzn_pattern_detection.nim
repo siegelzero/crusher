@@ -176,6 +176,56 @@ solve satisfy;
                 inc count
         check count == 2
 
+    test "detectCountPatterns: bool vars shared with bool_clause constraints":
+        ## Regression test: when the intermediate bool variables from the count_eq
+        ## decomposition are also referenced by other constraints (e.g. bool_clause),
+        ## the translator must NOT mark them as consumed/defined-only. They need
+        ## channel positions so that bool_clause constraints can resolve them.
+        ## Bug: "Unknown identifier 'b1' in expression" when bool_clause references
+        ## a bool var that was consumed by count_eq pattern detection.
+        let src = """
+var 1..3: x1 :: output_var;
+var 1..3: x2 :: output_var;
+var 1..3: x3 :: output_var;
+var 0..3: target :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: b3 :: var_is_introduced :: is_defined_var;
+var 0..1: ind1 :: var_is_introduced :: is_defined_var;
+var 0..1: ind2 :: var_is_introduced :: is_defined_var;
+var 0..1: ind3 :: var_is_introduced :: is_defined_var;
+var bool: other :: output_var;
+constraint int_eq_reif(x1, 2, b1) :: defines_var(b1);
+constraint int_eq_reif(x2, 2, b2) :: defines_var(b2);
+constraint int_eq_reif(x3, 2, b3) :: defines_var(b3);
+constraint bool2int(b1, ind1) :: defines_var(ind1);
+constraint bool2int(b2, ind2) :: defines_var(ind2);
+constraint bool2int(b3, ind3) :: defines_var(ind3);
+constraint int_lin_eq([1,-1,-1,-1],[target,ind1,ind2,ind3],0);
+constraint bool_clause([b1, other], []);
+constraint bool_clause([b2], [other]);
+constraint int_eq(target, 2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Count_eq pattern should still be detected
+        check tr.countEqPatterns.len == 1
+        for _, pat in tr.countEqPatterns:
+            check pat.countValue == 2
+            check pat.targetVarName == "target"
+            check pat.arrayVarNames.len == 3
+
+        # Bool vars must have positions (either channel or search) — not just defined
+        check "b1" in tr.channelVarNames or "b1" in tr.varPositions
+        check "b2" in tr.channelVarNames or "b2" in tr.varPositions
+
+        # Must solve without crashing
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let targetVal = tr.sys.assignment[tr.varPositions["target"]]
+        check targetVal == 2
+
     test "detectCountPatterns: balanced count pattern count(A) = count(B)":
         ## Two patterns:
         ##   int_lin_eq([1,1,1,1,-1], [ind_b1,...,ind_b4, target], 0) → count(x, 2) == target

@@ -418,9 +418,10 @@ proc detectCountPatterns(tr: var FznTranslator) =
 
             arrayVarNames.add(traced.arrayVarName)
             consumedConstraints.add(traced.b2iIdx)
-            consumedConstraints.add(traced.eqReifIdx)
+            # Do NOT consume int_eq_reif or its bool output variable here.
+            # The bool variable may be referenced by other constraints (e.g. bool_clause).
+            # Leave int_eq_reif for detectReifChannels() to create proper channel bindings.
             consumedVarNames.add(traced.indName)
-            consumedVarNames.add(traced.boolVarName)
 
         if not valid or not countValueSet:
             continue
