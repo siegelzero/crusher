@@ -1345,6 +1345,67 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Built {nBuilt} case-analysis channel bindings " &
                                           &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
+proc buildConditionalSourceChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for conditional variable-source patterns.
+    ## Creates two bindings per target:
+    ##   1. src_idx = element(condVar, sourceMap)  (constant-array element)
+    ##   2. target = var_element(src_idx, sourceArray)  (variable-element)
+    var nBuilt = 0
+    for def in tr.conditionalSourceDefs:
+        if def.targetVarName notin tr.varPositions: continue
+        if def.condVarName notin tr.varPositions: continue
+        let targetPos = tr.varPositions[def.targetVarName]
+        let condPos = tr.varPositions[def.condVarName]
+
+        # Create synthetic source-index variable
+        let srcIdxVarName = "CRUSHER_SRC_IDX_" & def.targetVarName
+        let srcIdxDomain = block:
+            var vals: seq[int]
+            var seen: PackedSet[int]
+            for si in def.sourceMap:
+                if si notin seen: seen.incl(si); vals.add(si)
+            vals.sorted()
+
+        let srcIdxPos = tr.sys.baseArray.len
+        tr.sys.baseArray.extendArray(1)
+        tr.sys.baseArray.setDomain(srcIdxPos, srcIdxDomain)
+        tr.varPositions[srcIdxVarName] = srcIdxPos
+        tr.sys.baseArray.channelPositions.incl(srcIdxPos)
+
+        # Build constant-array element binding: src_idx = element(condVar, sourceMap)
+        var srcIdxArray: seq[ArrayElement[int]]
+        for i in 0..<def.sourceMap.len:
+            srcIdxArray.add(ArrayElement[int](isConstant: true,
+                constantValue: def.sourceMap[i]))
+
+        let indexExpr = tr.sys.baseArray[condPos] - def.condDomMin
+        tr.sys.baseArray.addChannelBinding(srcIdxPos, indexExpr, srcIdxArray)
+
+        # Build variable-element binding: target = var_element(src_idx - 1, sourceArray)
+        # Resolve source array to mixed elements
+        if def.sourceArrayName notin tr.model.variables.mapIt(it.name).toHashSet():
+            # Look up array declaration
+            discard
+        var varArrayElems: seq[ArrayElement[int]]
+        var valid = true
+        for decl in tr.model.variables:
+            if decl.isArray and decl.name == def.sourceArrayName and
+               decl.value != nil and decl.value.kind == FznArrayLit:
+                varArrayElems = tr.resolveMixedArray(decl.value)
+                break
+        if varArrayElems.len == 0:
+            valid = false
+
+        if valid:
+            let srcIdxExpr = tr.sys.baseArray[srcIdxPos] - 1  # 1-based to 0-based
+            tr.sys.baseArray.addChannelBinding(targetPos, srcIdxExpr, varArrayElems)
+            inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} conditional-source channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
 proc buildInverseChannelBindings(tr: var FznTranslator) =
     ## Builds inverse channel groups from patterns detected by detectInverseChannelPatterns.
     for pi, pattern in tr.inverseChannelPatterns:

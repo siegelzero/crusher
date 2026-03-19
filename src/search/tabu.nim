@@ -1733,9 +1733,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var canBuild = true       # can build topology at all
             var canStatic = true      # can precompute values (constant arrays + local index deps)
 
+            const MaxCascadeChans = 500  # limit cascade depth to avoid initialization blowup
             while bfsHead < bfsQueue.len and canBuild:
                 let p = bfsQueue[bfsHead]
                 inc bfsHead
+                if topoOrder.len >= MaxCascadeChans:
+                    canBuild = false
+                    break
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
                         let bindingPtr = addr carray.channelBindings[bi]
@@ -1803,6 +1807,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
             if not canBuild or topoOrder.len == 0:
                 cascadeFail += 1
+                # Mark deep-cascade-failed positions as lazy to avoid per-iteration
+                # full recomputation in applyUniformDelta. These positions will use
+                # on-demand costDelta evaluation in bestMoves instead.
+                if topoOrder.len >= MaxCascadeChans:
+                    state.isLazy[pos] = true
                 continue
 
             # Build channel values

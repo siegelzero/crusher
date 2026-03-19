@@ -60,6 +60,15 @@ type
         domainOffsets*: seq[int]         # min value per source (for index computation)
         domainSizes*: seq[int]          # domain size per source (hi - lo + 1)
 
+    ConditionalSourceDef* = object
+        ## A detected conditional variable-source channel: target variable equals
+        ## an element of a source array, selected by a condition variable.
+        targetVarName*: string           # T: the target variable
+        condVarName*: string             # C: the condition variable (e.g., op[i])
+        sourceArrayName*: string         # A: the source variable array name
+        sourceMap*: seq[int]             # sourceMap[i] = 1-based array index for condDom[i]
+        condDomMin*: int                 # min value of condition variable domain
+
     NoOverlapEndpoint* = object
         ## An endpoint in a NoOverlap pattern — either a constant or a variable name
         isFixed*: bool
@@ -243,6 +252,8 @@ type
         minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
         # Case-analysis channel defs: bool_clause case analysis → constant lookup channel
         caseAnalysisDefs*: seq[CaseAnalysisDef]
+        # Conditional variable-source channel defs: target = var_element(element(cond, map), array)
+        conditionalSourceDefs*: seq[ConditionalSourceDef]
         # bool_not with defines_var → channel variables (b = 1 - a)
         boolNotChannelDefs*: seq[int]
         # bool_clause_reif with defines_var → channel variables
@@ -821,6 +832,9 @@ proc translate*(model: FznModel): FznTranslator =
             prevCount = result.caseAnalysisDefs.len
             result.detectCaseAnalysisChannels()
             inc iterations
+    # Detect conditional variable-source channels (EVM step predicate patterns)
+    # MUST run after case-analysis fixpoint (uses same eqReifMap) and before implication patterns
+    result.detectConditionalSourceChannels()
     # Detect implication-to-table and one-hot channel patterns
     result.detectImplicationPatterns()
     # Detect conditional gain patterns (reified value assignment → element channel)
@@ -839,6 +853,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectConditionalDayCapacityPattern()
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
+    # Consume constraints where ALL variables are channels/defined (redundant)
+    # MUST run after all channel detection is complete
+    result.consumeAllChannelConstraints()
     result.translateVariables()
     # Create net flow variables and channel bindings (after translateVariables so V positions exist)
     if result.netFlowFreePairs.len > 0:
@@ -1697,6 +1714,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildSetUnionChannelBindings()
     # Build channel bindings for case-analysis channels (constant lookup tables)
     result.buildCaseAnalysisChannelBindings()
+    # Build conditional-source channel bindings (variable-element channels from step predicates)
+    result.buildConditionalSourceChannelBindings()
     # Build inverse channel groups (inverse relationship: seat[person[p]] = p)
     result.buildInverseChannelBindings()
     # Detect dormant positions in diffnK constraints (don't-care placements)

@@ -1194,6 +1194,87 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         if elementTotalRemoved > 0:
             stderr.writeLine(&"[DomRed] Element backward propagation: {elementTotalRemoved} values removed in {elementIter} iterations")
 
+    # Phase 1c: Channel binding domain propagation
+    # For element channel bindings with constant arrays: restrict channel domain to
+    # reachable values, and restrict index domain to values that produce valid results.
+    # For variable-array bindings: restrict channel domain to union of source domains.
+    # Runs as fixpoint since tightening one channel may tighten downstream channels.
+    block:
+        var channelTotalRemoved = 0
+        var channelChanged = true
+        var channelIter = 0
+        while channelChanged and channelIter < 20:
+            channelChanged = false
+            inc channelIter
+            for binding in carray.channelBindings:
+                let chanPos = binding.channelPosition
+                if chanPos in skippedPositions: continue
+
+                # Collect index positions
+                let idxPositions = toSeq(binding.indexExpression.positions.items)
+                if idxPositions.len != 1: continue  # only single-position index
+                let idxPos = idxPositions[0]
+                if idxPos in skippedPositions: continue
+
+                # Check if constant array
+                var isConstArray = true
+                for elem in binding.arrayElements:
+                    if not elem.isConstant:
+                        isConstArray = false
+                        break
+
+                if isConstArray:
+                    # Forward: channel domain ⊆ {arr[idx] : idx ∈ idxDomain}
+                    var reachable = initPackedSet[T]()
+                    var tempAssign = initTable[int, T]()
+                    for v in currentDomain[idxPos].items:
+                        tempAssign[idxPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < binding.arrayElements.len:
+                            reachable.incl(binding.arrayElements[idx].constantValue)
+                    let newChanDom = currentDomain[chanPos] * reachable
+                    if newChanDom.len < currentDomain[chanPos].len:
+                        channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
+                        currentDomain[chanPos] = newChanDom
+                        channelChanged = true
+
+                    # Backward: index domain restricted to values mapping to valid channel values
+                    for v in toSeq(currentDomain[idxPos].items):
+                        tempAssign[idxPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx < 0 or idx >= binding.arrayElements.len:
+                            currentDomain[idxPos].excl(v)
+                            channelTotalRemoved += 1
+                            channelChanged = true
+                        elif binding.arrayElements[idx].constantValue notin currentDomain[chanPos]:
+                            currentDomain[idxPos].excl(v)
+                            channelTotalRemoved += 1
+                            channelChanged = true
+                else:
+                    # Variable array: channel domain ⊆ union of element domains at reachable indices
+                    var reachable = initPackedSet[T]()
+                    var tempAssign = initTable[int, T]()
+                    for v in currentDomain[idxPos].items:
+                        tempAssign[idxPos] = v
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx >= 0 and idx < binding.arrayElements.len:
+                            let elem = binding.arrayElements[idx]
+                            if elem.isConstant:
+                                reachable.incl(elem.constantValue)
+                            else:
+                                # Include all domain values of the source position
+                                for sv in currentDomain[elem.variablePosition].items:
+                                    reachable.incl(sv)
+                    if reachable.len > 0:
+                        let newChanDom = currentDomain[chanPos] * reachable
+                        if newChanDom.len < currentDomain[chanPos].len:
+                            channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
+                            currentDomain[chanPos] = newChanDom
+                            channelChanged = true
+
+        if channelTotalRemoved > 0:
+            stderr.writeLine(&"[DomRed] Channel binding propagation: {channelTotalRemoved} values removed in {channelIter} iterations")
+
     # Cumulative constraint domain reduction
     for cons in carray.constraints:
         if cons.stateType != CumulativeType:

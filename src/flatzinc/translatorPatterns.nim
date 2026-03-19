@@ -1454,12 +1454,33 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
                 if idxArg.ident in result: idx = result[idxArg.ident]
                 else: continue
             else: continue
+            # Try constant array first
             let arr = try: tr.resolveIntArray(con.args[1])
-                             except ValueError, KeyError: continue
-            let i = idx - 1  # FZN 1-based to 0-based
-            if i < 0 or i >= arr.len: continue
-            result[definedName] = arr[i]
-            changed = true
+                             except ValueError, KeyError: @[]
+            if arr.len > 0:
+                let i = idx - 1  # FZN 1-based to 0-based
+                if i < 0 or i >= arr.len: continue
+                result[definedName] = arr[i]
+                changed = true
+            else:
+                # Variable array (array_var_int_element): resolve individual element
+                let varElems = tr.resolveVarArrayElems(con.args[1])
+                let i = idx - 1  # FZN 1-based to 0-based
+                if i < 0 or i >= varElems.len: continue
+                let elem = varElems[i]
+                if elem.kind == FznIntLit:
+                    result[definedName] = elem.intVal
+                    changed = true
+                elif elem.kind == FznBoolLit:
+                    result[definedName] = if elem.boolVal: 1 else: 0
+                    changed = true
+                elif elem.kind == FznIdent:
+                    if elem.ident in result:
+                        result[definedName] = result[elem.ident]
+                        changed = true
+                    elif elem.ident in tr.paramValues:
+                        result[definedName] = tr.paramValues[elem.ident]
+                        changed = true
         # Evaluate reification channels (int_eq_reif / int_ne_reif)
         for ci in tr.reifChannelDefs:
             let con = tr.model.constraints[ci]
@@ -2111,6 +2132,12 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
 
     var nTargets = 0
     var nConsumed = 0
+    var nRejectedCondVars = 0
+    var nRejectedIncomplete = 0
+    var nRejectedTableSize = 0
+    var nRejectedUnresolved = 0
+    var nRejectedCondSource = 0
+    var nRejectedOther = 0
 
     for targetVar, entries in casesByTarget:
         # All entries must have same set of condition variables
@@ -2128,7 +2155,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             if evNames != condVarNames:
                 valid = false
                 break
-        if not valid: continue
+        if not valid:
+            inc nRejectedCondVars
+            continue
 
         # Look up condition variable domains
         var condDomains: seq[seq[int]]
@@ -2138,7 +2167,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 valid = false
                 break
             condDomains.add(dom)
-        if not valid: continue
+        if not valid:
+            inc nRejectedCondVars
+            continue
 
         # Check completeness: number of cases == product of condition domain sizes
         var expectedCases = 1
@@ -2153,17 +2184,25 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             # only needs to be consistent with the domain, not with external constraints.
             let allSameSimple = entries.allIt(it.kind == cekSimple and
                     it.testVal.kind == FznIntLit)
-            if not allSameSimple: continue
+            if not allSameSimple:
+                inc nRejectedIncomplete
+                continue
             let mappedVal = entries[0].testVal.intVal
-            if not entries.allIt(it.testVal.intVal == mappedVal): continue
+            if not entries.allIt(it.testVal.intVal == mappedVal):
+                inc nRejectedIncomplete
+                continue
             let tdom = tr.lookupVarDomain(targetVar).sorted()
-            if tdom.len < 2: continue
+            if tdom.len < 2:
+                inc nRejectedIncomplete
+                continue
             if tdom.len == 2:
                 discard  # binary domain: default is the other value (handled below)
             else:
                 # Non-binary domain: default to 0 if it's in the domain and
                 # the mapped value is non-zero (conditional activation pattern)
-                if mappedVal == 0 or 0 notin tdom: continue
+                if mappedVal == 0 or 0 notin tdom:
+                    inc nRejectedIncomplete
+                    continue
 
         # Build case map (condValues → CaseEntry)
         var caseMap: Table[seq[int], CaseEntry]
@@ -2248,7 +2287,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     break
                 condSources.add(CondSource(kind: cskDirect, varName: cv))
                 sourceVarNames.add(cv)
-        if not valid: continue
+        if not valid:
+            inc nRejectedCondSource
+            continue
 
         # Add expression variables as additional source variables
         # (channel/defined vars already replaced with transitive sources in exprVarSet)
@@ -2257,7 +2298,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 continue  # Skip residual channel vars — resolved via buildValueMapping
             if ev notin sourceVarNames:
                 sourceVarNames.add(ev)
-        if sourceVarNames.len == 0: continue
+        if sourceVarNames.len == 0:
+            inc nRejectedOther
+            continue
 
         # Validate source variables are unique
         block uniqueCheck:
@@ -2266,7 +2309,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     if sourceVarNames[i] == sourceVarNames[j]:
                         valid = false
                         break uniqueCheck
-        if not valid: continue
+        if not valid:
+            inc nRejectedOther
+            continue
 
         # Get source variable domains
         var sourceDomains: seq[seq[int]]
@@ -2276,7 +2321,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 valid = false
                 break
             sourceDomains.add(dom)
-        if not valid: continue
+        if not valid:
+            inc nRejectedOther
+            continue
 
         # Step 5: Build constant lookup table
         var domainOffsets: seq[int]
@@ -2292,7 +2339,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 tableSizeOk = false
                 break
             tableSize *= ds
-        if not tableSizeOk or tableSize > 100_000: continue
+        if not tableSizeOk or tableSize > 100_000:
+            inc nRejectedTableSize
+            continue
 
         # Pre-compute mini lookup tables for channel variables referenced in linear entries.
         # For each channel var not in caseAnalysisDefs, determine which source variables
@@ -2503,6 +2552,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     break
 
         if not allResolved:
+            inc nRejectedUnresolved
             continue
 
         # Step 6: Register channel and consume constraints
@@ -2527,8 +2577,432 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         ))
         inc nTargets
 
-    if nTargets > 0:
-        stderr.writeLine(&"[FZN] Detected case-analysis channels: {nTargets} target variables, {nConsumed} bool_clause constraints consumed")
+    let nRejected = nRejectedCondVars + nRejectedIncomplete + nRejectedTableSize +
+                    nRejectedUnresolved + nRejectedCondSource + nRejectedOther
+    if nTargets > 0 or nRejected > 0:
+        stderr.writeLine(&"[FZN] Case-analysis channels: {nTargets} detected, {nConsumed} bool_clause consumed" &
+            &" (rejected: {nRejected} = condVars:{nRejectedCondVars} incomplete:{nRejectedIncomplete}" &
+            &" tableSize:{nRejectedTableSize} unresolved:{nRejectedUnresolved}" &
+            &" condSource:{nRejectedCondSource} other:{nRejectedOther})" &
+            &" [candidates: {casesByTarget.len}]")
+
+
+proc detectConditionalSourceChannels(tr: var FznTranslator) =
+    ## Detects conditional variable-source patterns from decomposed step predicates.
+    ##
+    ## For target variable T, groups all int_eq_reif(T, V_k, B_k) constraints where
+    ## V_k is a variable, then traces each B_k to find which condition value it
+    ## corresponds to. Tracing goes through:
+    ##   - Direct: bool_clause([B_k], [D_k]) where D_k = int_eq_reif(C, val_k, D_k)
+    ##   - Via AND: B_k in array_bool_and([...,B_k,...], G), then trace G through
+    ##     bool_clause chains to find the condition value
+    ##
+    ## When all V_k belong to a common variable array A:
+    ##   Creates: src_idx = element(C, source_map)  (constant-array channel)
+    ##            T = var_element(src_idx, A)         (variable-element channel)
+
+    # Step 1: Build eqReifMap
+    var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let resultVar = con.args[2].ident
+        if name == "int_eq_reif":
+            if con.args[0].kind != FznIdent: continue
+            eqReifMap[resultVar] = (sourceVar: con.args[0].ident, testVal: con.args[1])
+
+    if eqReifMap.len == 0: return
+
+    # Step 2: Collect all int_eq_reif(T, V_k, B_k) where both T and V_k are variables
+    # Group by target variable T.
+    type EqReifEntry = object
+        targetVar: string    # T (arg[0])
+        sourceVar: string    # V_k (arg[1])
+        boolVar: string      # B_k (arg[2])
+    var eqReifByTarget: Table[string, seq[EqReifEntry]]
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent or
+           con.args[2].kind != FznIdent: continue
+        let targetVar = con.args[0].ident
+        let sourceVar = con.args[1].ident
+        let boolVar = con.args[2].ident
+        # Only interested in variable-to-variable equality tests
+        if sourceVar in tr.paramValues: continue
+        if targetVar in tr.channelVarNames or targetVar in tr.definedVarNames: continue
+        eqReifByTarget.mgetOrPut(targetVar, @[]).add(
+            EqReifEntry(targetVar: targetVar, sourceVar: sourceVar, boolVar: boolVar))
+
+    if eqReifByTarget.len == 0:
+        return
+
+    # Build set_in_reif condition map: set_in_reif(var, S, bool) → condVar ∈ S
+    var setInReifCondMap: Table[string, tuple[sourceVar: string, condVals: seq[int]]]
+    for ci in tr.setInReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "set_in_reif": continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        if con.args[0].kind != FznIdent: continue
+        let resultVar = con.args[2].ident
+        let condVar = con.args[0].ident
+        let setArg = con.args[1]
+        var vals: seq[int]
+        if setArg.kind == FznRange:
+            for v in setArg.lo..setArg.hi: vals.add(v)
+        elif setArg.kind == FznSetLit:
+            vals = setArg.setElems
+        if vals.len > 0:
+            setInReifCondMap[resultVar] = (sourceVar: condVar, condVals: vals)
+
+    # Step 3: Build index: bool var → which condition values it implies
+    # A boolean may map to multiple condition values (from range set_in_reif)
+    var boolToCondVals: Table[string, tuple[condVar: string, condVals: seq[int]]]
+
+    proc resolveCondition(negIdent: string, eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]],
+                          setInReifCondMap: Table[string, tuple[sourceVar: string, condVals: seq[int]]],
+                          tr: FznTranslator): tuple[ok: bool, condVar: string, condVals: seq[int]] =
+        if negIdent in eqReifMap:
+            let condInfo = eqReifMap[negIdent]
+            let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError: return (false, "", @[])
+            return (true, condInfo.sourceVar, @[condVal])
+        elif negIdent in setInReifCondMap:
+            let info = setInReifCondMap[negIdent]
+            return (true, info.sourceVar, info.condVals)
+        return (false, "", @[])
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len == 0: continue
+        # Resolve ALL negative literals and intersect their condition values.
+        # bool_clause(pos, [n1, n2, ...]) = (n1 ∧ n2 ∧ ...) → (pos1 ∨ pos2 ∨ ...)
+        var combinedCondVar = ""
+        var combinedCondVals: seq[int]
+        var allNegOk = true
+        for ni in 0..<negArg.elems.len:
+            let negLit = negArg.elems[ni]
+            if negLit.kind != FznIdent: allNegOk = false; break
+            let (condOk, condVar, condVals) = resolveCondition(negLit.ident, eqReifMap, setInReifCondMap, tr)
+            if not condOk: allNegOk = false; break
+            if combinedCondVar == "":
+                combinedCondVar = condVar
+                combinedCondVals = condVals
+            elif condVar != combinedCondVar:
+                allNegOk = false; break  # different condition variables
+            else:
+                # Intersect condition values
+                let prevSet = combinedCondVals.toHashSet()
+                var intersection: seq[int]
+                for v in condVals:
+                    if v in prevSet: intersection.add(v)
+                combinedCondVals = intersection
+                if combinedCondVals.len == 0: allNegOk = false; break
+        if not allNegOk or combinedCondVals.len == 0: continue
+        # Map positive literals to this condition
+        for posElem in posArg.elems:
+            if posElem.kind != FznIdent: continue
+            if posElem.ident in boolToCondVals: continue
+            # Skip if this positive literal is on the SAME condition variable
+            if posElem.ident in eqReifMap:
+                let posInfo = eqReifMap[posElem.ident]
+                if posInfo.sourceVar == combinedCondVar:
+                    continue
+            if posElem.ident in setInReifCondMap:
+                let posInfo = setInReifCondMap[posElem.ident]
+                if posInfo.sourceVar == combinedCondVar:
+                    continue
+            boolToCondVals[posElem.ident] = (condVar: combinedCondVar, condVals: combinedCondVals)
+
+    # Step 4: Extend via array_bool_and and fixpoint propagation
+
+    # Propagate: if AND result G has a condition, all its inputs B_k share that condition
+    # Note: do NOT skip definingConstraints — AND constraints may be consumed as channels
+    # but we still need their structure for propagation.
+    # Run as fixpoint since AND results may chain through bool_clause.
+    var prevCondCount = -1
+    while boolToCondVals.len != prevCondCount:
+        prevCondCount = boolToCondVals.len
+        # Propagate through array_bool_and: AND result → inputs
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name != "array_bool_and": continue
+            if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+            let resultVar = con.args[1].ident
+            if resultVar in boolToCondVals:
+                let cv = boolToCondVals[resultVar]
+                let inputElems = tr.resolveVarArrayElems(con.args[0])
+                for elem in inputElems:
+                    if elem.kind == FznIdent and elem.ident notin boolToCondVals:
+                        boolToCondVals[elem.ident] = cv
+        # Also propagate through bool_clause chains (including multi-neg patterns)
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name != "bool_clause": continue
+            if con.args.len < 2: continue
+            let posArg = con.args[0]
+            let negArg = con.args[1]
+            if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+            if negArg.elems.len == 0: continue
+            var cv2 = ""
+            var cvs2: seq[int]
+            var ok2 = true
+            for ni in 0..<negArg.elems.len:
+                let negLit = negArg.elems[ni]
+                if negLit.kind != FznIdent: ok2 = false; break
+                let (cOk, cVar, cVals) = resolveCondition(negLit.ident, eqReifMap, setInReifCondMap, tr)
+                if not cOk: ok2 = false; break
+                if cv2 == "": cv2 = cVar; cvs2 = cVals
+                elif cVar != cv2: ok2 = false; break
+                else:
+                    let prevSet = cvs2.toHashSet()
+                    var inter: seq[int]
+                    for v in cVals:
+                        if v in prevSet: inter.add(v)
+                    cvs2 = inter
+                    if cvs2.len == 0: ok2 = false; break
+            if not ok2 or cvs2.len == 0: continue
+            for posElem in posArg.elems:
+                if posElem.kind != FznIdent: continue
+                if posElem.ident in boolToCondVals: continue
+                if posElem.ident in eqReifMap:
+                    let posInfo = eqReifMap[posElem.ident]
+                    if posInfo.sourceVar == cv2: continue
+                if posElem.ident in setInReifCondMap:
+                    let posInfo = setInReifCondMap[posElem.ident]
+                    if posInfo.sourceVar == cv2: continue
+                boolToCondVals[posElem.ident] = (condVar: cv2, condVals: cvs2)
+
+    # Step 5: Build variable array index
+    # A variable may appear in multiple arrays. Track ALL memberships.
+    var varArrayMembers: Table[string, seq[string]]
+    var varToArrays: Table[string, seq[tuple[arrayName: string, idx: int]]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var members: seq[string]
+            for i, e in decl.value.elems:
+                if e.kind == FznIdent:
+                    members.add(e.ident)
+                    varToArrays.mgetOrPut(e.ident, @[]).add((arrayName: decl.name, idx: i))
+                elif e.kind == FznIntLit:
+                    members.add("")  # constant element placeholder
+                else:
+                    members.add("")
+            varArrayMembers[decl.name] = members
+
+    # Step 6: For each target, try to build a complete source map
+    var nTargets = 0
+    var nConsumed = 0
+    var nSyntheticVars = 0
+    var dbgNoCondMap = 0
+    var dbgTooFewMapped = 0
+    var dbgNoArray = 0
+    var dbgOther = 0
+    var dbgTotalNoCond = 0
+    var dbgTotalNoArr = 0
+    var dbgTotalDiffCond = 0
+
+    var dbgSkippedChannel = 0
+    var dbgSkippedFew = 0
+    for targetVar, eqEntries in eqReifByTarget:
+        if targetVar in tr.channelVarNames:
+            inc dbgSkippedChannel
+            continue
+        if eqEntries.len < 1:
+            inc dbgSkippedFew
+            continue
+
+        # Find condition variable and source array
+        var condVar = ""
+        var allValid = true
+
+        type SourceEntry = object
+            condVal: int
+            arrIdx: int  # 0-based index into array
+            boolClauseIdx: int  # -1 if no direct bool_clause
+
+        var sourceEntries: seq[SourceEntry]
+
+        # First pass: collect all entries with valid condition mappings
+        type CandidateEntry = object
+            condVal: int
+            sourceVar: string
+            arrays: seq[tuple[arrayName: string, idx: int]]
+        var candidates: seq[CandidateEntry]
+        var dbgNoArr = 0
+        var dbgNoCond = 0
+        var dbgDiffCond = 0
+
+        for e in eqEntries:
+            if e.boolVar notin boolToCondVals:
+                inc dbgNoCond
+                continue
+            let cv = boolToCondVals[e.boolVar]
+            if condVar == "":
+                condVar = cv.condVar
+            elif cv.condVar != condVar:
+                inc dbgDiffCond
+                continue
+            if e.sourceVar notin varToArrays:
+                inc dbgNoArr
+                continue
+            # Expand range conditions: create one candidate per condVal
+            for cv2 in cv.condVals:
+                candidates.add(CandidateEntry(
+                    condVal: cv2, sourceVar: e.sourceVar,
+                    arrays: varToArrays[e.sourceVar]))
+
+        # Find common array: an array that contains ALL candidate source vars
+        # For single candidates, require the target to be in the same array (for default)
+        if candidates.len == 0:
+            dbgTotalNoCond += dbgNoCond
+            dbgTotalNoArr += dbgNoArr
+            dbgTotalDiffCond += dbgDiffCond
+            inc dbgTooFewMapped
+            continue
+
+        # Collect all array names that appear in the first candidate
+        var commonArrayCandidates: seq[string]
+        for a in candidates[0].arrays:
+            commonArrayCandidates.add(a.arrayName)
+
+        # Keep only arrays that appear in ALL candidates
+        for i in 1..<candidates.len:
+            var nextArrayNames: seq[string]
+            for a in candidates[i].arrays:
+                if a.arrayName in commonArrayCandidates:
+                    nextArrayNames.add(a.arrayName)
+            commonArrayCandidates = nextArrayNames
+
+        if commonArrayCandidates.len == 0:
+            inc dbgNoArray
+            continue
+
+        # For single candidates: require the target to also be in a common array
+        # (so we can use the target's own index as default for uncovered opcodes).
+        # Without this, using an arbitrary default creates noisy penalty signals.
+        if candidates.len == 1:
+            if targetVar notin varToArrays:
+                inc dbgTooFewMapped
+                continue
+            var found = false
+            for a in varToArrays[targetVar]:
+                if a.arrayName in commonArrayCandidates:
+                    found = true
+                    break
+            if not found:
+                inc dbgTooFewMapped
+                continue
+
+        # Prefer smallest array (most specific)
+        var commonArrayName = commonArrayCandidates[0]
+        var commonArraySize = varArrayMembers.getOrDefault(commonArrayName, @[]).len
+        for arrName in commonArrayCandidates:
+            let size = varArrayMembers.getOrDefault(arrName, @[]).len
+            if size > 0 and size < commonArraySize:
+                commonArrayName = arrName
+                commonArraySize = size
+
+        # Build source entries using the common array
+        for c in candidates:
+            for a in c.arrays:
+                if a.arrayName == commonArrayName:
+                    sourceEntries.add(SourceEntry(
+                        condVal: c.condVal, arrIdx: a.idx, boolClauseIdx: -1))
+                    break
+
+        if sourceEntries.len == 0:
+            inc dbgTooFewMapped
+            continue
+
+        # Get condition variable domain
+        let condDom = tr.lookupVarDomain(condVar)
+        if condDom.len == 0: continue
+
+        # Build source map
+        var sourceMap = newSeq[int](condDom.len)
+        var condValToIdx: Table[int, int]
+        for i, v in condDom:
+            condValToIdx[v] = i
+
+        var coveredCount = 0
+        for e in sourceEntries:
+            if e.condVal notin condValToIdx: continue
+            let di = condValToIdx[e.condVal]
+            sourceMap[di] = e.arrIdx + 1  # 1-based
+            inc coveredCount
+
+        if coveredCount == 0:
+            inc dbgOther
+            continue
+
+        # Fill uncovered slots: use target's own array index if available
+        if coveredCount < condDom.len:
+            var hasDefault = false
+            if targetVar in varToArrays:
+                var tArr = ""
+                var tIdx = -1
+                for a in varToArrays[targetVar]:
+                    if a.arrayName == commonArrayName:
+                        tArr = a.arrayName
+                        tIdx = a.idx
+                        break
+                if tArr == commonArrayName and tIdx >= 0:
+                    for i in 0..<sourceMap.len:
+                        if sourceMap[i] == 0:
+                            sourceMap[i] = tIdx + 1
+                    hasDefault = true
+            if not hasDefault:
+                var defaultIdx = 0
+                for si in sourceMap:
+                    if si > 0: defaultIdx = si; break
+                if defaultIdx > 0:
+                    for i in 0..<sourceMap.len:
+                        if sourceMap[i] == 0: sourceMap[i] = defaultIdx
+                    hasDefault = true
+            if not hasDefault: continue
+
+        # Validate sourceMap
+        let arrayMembers = varArrayMembers[commonArrayName]
+        var valid = true
+        for si in sourceMap:
+            if si < 1 or si > arrayMembers.len: valid = false; break
+        if not valid: continue
+
+        # Record pattern (binding construction happens after translateVariables)
+        tr.channelVarNames.incl(targetVar)
+        tr.conditionalSourceDefs.add(ConditionalSourceDef(
+            targetVarName: targetVar,
+            condVarName: condVar,
+            sourceArrayName: commonArrayName,
+            sourceMap: sourceMap,
+            condDomMin: condDom[0]))
+        inc nTargets
+
+    stderr.writeLine(&"[FZN] Conditional-source channels: {nTargets} targets, " &
+        &"{nSyntheticVars} synthetic vars" &
+        &" (skipped: alreadyChannel={dbgSkippedChannel} fewEqReifs={dbgSkippedFew}" &
+        &" fewMapped={dbgTooFewMapped}[noCond={dbgTotalNoCond} noArr={dbgTotalNoArr} diffCond={dbgTotalDiffCond}]" &
+        &" noArray={dbgNoArray} other={dbgOther})")
+
+
+proc consumeAllChannelConstraints*(tr: var FznTranslator) =
+    ## Placeholder: all-channel constraint consumption.
+    ## We do NOT consume constraints at translation time even if all their variables are
+    ## channels, because the constraints may encode relationships needed for correctness
+    ## (e.g., bool_clause implications in if-then-else patterns). The solver's init
+    ## already detects tautological channel-dep constraints and disables them at runtime.
+    discard
 
 
 proc detectImplicationPatterns(tr: var FznTranslator) =
