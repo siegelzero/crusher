@@ -41,11 +41,22 @@ proc resolve*[T](system: ConstraintSystem[T],
                 echo &"[Solve] Domain reduction: {totalOriginal} -> {totalReduced} values ({100 - totalReduced * 100 div totalOriginal}% reduction)"
 
     # Check for empty domains (infeasible after domain reduction)
+    var domainReductionInfeasible = false
     for pos in system.baseArray.allPositions():
         if system.baseArray.reducedDomain[pos].len == 0:
             if verbose:
                 echo &"[Solve] Empty domain at position {pos} (original domain size: {system.baseArray.domain[pos].len})"
-            raise newException(InfeasibleError, "Domain reduction found infeasibility")
+            if system.baseArray.domain[pos].len == 0:
+                # Truly empty domain (even before reduction) — genuinely infeasible
+                raise newException(InfeasibleError, "Domain reduction found infeasibility")
+            else:
+                # Domain reduction over-pruned — fall back to original domains
+                domainReductionInfeasible = true
+    if domainReductionInfeasible:
+        if verbose:
+            echo "[Solve] Domain reduction produced false infeasibility, falling back to original domains"
+        for pos in system.baseArray.allPositions():
+            system.baseArray.reducedDomain[pos] = system.baseArray.domain[pos]
 
     # Remove constraints where all positions are fixed (singleton domain) or channel
     let constraintsBefore = system.baseArray.constraints.len

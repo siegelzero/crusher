@@ -2500,10 +2500,14 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         else:
                             break
 
-                # Remove unsupported values
+                # Remove unsupported values (skip channel positions — their domains
+                # are defined by channel bindings, not by constraints. GAC treats them
+                # as independent but they're functionally determined, leading to over-pruning.)
                 var pruned = 0
                 for i in 0..<positions.len:
                     let pos = positions[i]
+                    if pos in carray.channelPositions:
+                        continue  # Don't prune channel position domains via GAC
                     for v in toSeq(currentDomain[pos].items):
                         if v notin supported[i]:
                             currentDomain[pos].excl(v)
@@ -3396,7 +3400,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         # Phase 6b-elem: Variable-array element backward propagation
         # For each position that appears as a variable array element in element constraints,
-        # restrict its domain to the union of value-position domains from those constraints.
+        # restrict its domain to the union of value-position domains from constraints
+        # where the index is FORCED to select this position (all reachable index values
+        # map to this position). If some index values map elsewhere, the solver can
+        # avoid selecting this position, so the constraint doesn't constrain it.
         var elemBackPruned = 0
         for pos, constraintIndices in elemArrayParticipation.pairs:
             if currentDomain[pos].len <= 1: continue
@@ -3408,14 +3415,20 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 let valPos = es.valuePosition
                 let idxPos = es.indexPosition
                 let arrSize = es.getArraySize()
-                # Only include values from this constraint if pos is reachable
-                # (i.e., some index in domain(idxPos) maps to this element position)
+                # Check if ALL reachable index values map to this position
+                var allMapToPos = true
+                var anyMapsToPos = false
                 for i in currentDomain[idxPos].items:
                     if i >= 0 and i < arrSize:
                         let elem = es.arrayElements[i]
                         if not elem.isConstant and elem.variablePosition == pos:
-                            allowedValues = allowedValues + currentDomain[valPos]
-                            break  # This constraint can reach pos, included
+                            anyMapsToPos = true
+                        else:
+                            allMapToPos = false
+                    else:
+                        allMapToPos = false
+                if allMapToPos and anyMapsToPos:
+                    allowedValues = allowedValues + currentDomain[valPos]
             if allowedValues.len > 0:
                 for v in toSeq(currentDomain[pos].items):
                     if v notin allowedValues:
@@ -3785,7 +3798,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         # Phase CB-var: Variable-array channel binding backward propagation
         # For each position that appears as a variable array element in channel bindings,
-        # restrict its domain to the union of channel-position domains from reachable bindings.
+        # restrict its domain to the union of channel-position domains from bindings
+        # where the index is FORCED to select this position (all reachable index values
+        # map to this position). If some index values map elsewhere, the solver can
+        # avoid selecting this position, so the binding doesn't constrain it.
         var cbVarPruned = 0
         var tempAssign = initTable[int, T]()
         for pos, bindingIndices in channelArrayParticipation.pairs:
@@ -3798,23 +3814,30 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 let arrElems = binding.arrayElements
                 let arrLen = arrElems.len
                 let idxPositions = toSeq(binding.indexExpression.positions.items)
-                # Check if this position is reachable from the index domain
+                # Check if ALL reachable index values map to this position
+                # (meaning the binding is forced to select this position)
                 if idxPositions.len == 1:
                     let keyPos = idxPositions[0]
+                    var allMapToPos = true
+                    var anyMapsToPos = false
                     for v in currentDomain[keyPos].items:
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx >= 0 and idx < arrLen:
                             let elem = arrElems[idx]
                             if not elem.isConstant and elem.variablePosition == pos:
-                                # This index reaches our position — include channel domain
-                                if chPos in skippedPositions:
-                                    # Use bounds for skipped channel
-                                    for bv in domainMin[chPos]..domainMax[chPos]:
-                                        allowedValues.incl(bv)
-                                else:
-                                    allowedValues = allowedValues + currentDomain[chPos]
-                                break  # Found a reachable index, this binding contributes
+                                anyMapsToPos = true
+                            else:
+                                allMapToPos = false
+                        else:
+                            allMapToPos = false  # out of bounds doesn't map to pos
+                    if allMapToPos and anyMapsToPos:
+                        # All index values forced to select pos — add channel domain
+                        if chPos in skippedPositions:
+                            for bv in domainMin[chPos]..domainMax[chPos]:
+                                allowedValues.incl(bv)
+                        else:
+                            allowedValues = allowedValues + currentDomain[chPos]
             if allowedValues.len > 0:
                 for v in toSeq(currentDomain[pos].items):
                     if v notin allowedValues:
