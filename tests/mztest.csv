@@ -10,3 +10,5 @@ gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize
 hitori_h5_1,2025/hitori/hitori.mzn,2025/hitori/h5-1.dzn,maximize,10000,17,17
 is_9aGFgDaHX7,2025/is/model.mzn,2025/is/9aGFgDaHX7.dzn,minimize,5000,,688128
 mondoku_8_8_4,2025/mondoku/mondoku-gcc-model-balance.mzn,2025/mondoku/8-8-4.dzn,minimize,10000,0,4
+products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,2025/products-and-shelves/ps-25-01.dzn,minimize,10000,5,5
+proteindesign12_1HZ5,2025/proteindesign12/wcsp.mzn,2025/proteindesign12/1HZ5.12p.9aa.usingEref_self.dzn,minimize,10000,1473,1480
