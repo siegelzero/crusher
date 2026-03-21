@@ -765,6 +765,171 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
                           &"({nLinLeConsumed} int_lin_le consumed)")
 
 
+proc substituteChannelVarsInClauses(tr: var FznTranslator) =
+    ## Post-process disjunctive clause terms to substitute known linear channel
+    ## definitions. When a term contains variables that are inputs to a linear
+    ## channel (e.g., pad_xy = 13*y + x + 13), the multi-variable sub-expression
+    ## is replaced with the single channel variable, reducing positions per constraint.
+    ##
+    ## Example: [-13,-1,13,1]*[y1,x1,y2,x2] <= -2  →  [-1,1]*[xy1,xy2] <= -2
+    if tr.disjunctiveClauses.len == 0:
+        return
+
+    # Step 1: Build map of 2-input linear channel definitions from int_lin_eq :: defines_var
+    # Format: channelVar = c1*v1 + c2*v2 + offset
+    type LinearChannelDef = object
+        inputVar1, inputVar2: string
+        coeff1, coeff2: int
+        channelVar: string
+        offset: int  # channelVar = c1*v1 + c2*v2 + offset
+
+    # Map from (v1, v2) sorted pair → channel def
+    var channelDefs: Table[tuple[a, b: string], seq[LinearChannelDef]]
+
+    for ci, con in tr.model.constraints:
+        if con.name != "int_lin_eq": continue
+        # Check for defines_var annotation
+        var definesVar = ""
+        for ann in con.annotations:
+            if ann.name == "defines_var" and ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                definesVar = ann.args[0].ident
+                break
+        if definesVar == "": continue
+
+        # Parse: int_lin_eq(coeffs, vars, rhs) meaning sum(c_i * v_i) = rhs
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let varArr = con.args[1]
+        var varNames: seq[string]
+        case varArr.kind
+        of FznArrayLit:
+            for e in varArr.elems:
+                if e.kind == FznIdent: varNames.add(e.ident)
+                else: break
+        of FznIdent:
+            if varArr.ident in tr.arrayElementNames:
+                varNames = tr.arrayElementNames[varArr.ident]
+        else: continue
+        if varNames.len != coeffs.len: continue
+
+        # Find the defines_var in the variable list (should have coeff -1 or similar)
+        var chIdx = -1
+        for i, vn in varNames:
+            if vn == definesVar:
+                chIdx = i
+                break
+        if chIdx < 0: continue
+
+        # Extract input variables (all except the channel variable)
+        var inputVars: seq[string]
+        var inputCoeffs: seq[int]
+        var chCoeff = coeffs[chIdx]
+        for i, vn in varNames:
+            if i != chIdx:
+                inputVars.add(vn)
+                inputCoeffs.add(coeffs[i])
+
+        # Only handle 2-input channels
+        if inputVars.len != 2: continue
+
+        # channelVar = (-coeff1/chCoeff)*v1 + (-coeff2/chCoeff)*v2 + (-rhs/chCoeff)
+        # Only handle chCoeff = -1 or 1 for integer division
+        if chCoeff != -1 and chCoeff != 1: continue
+        let scale = -chCoeff  # 1 if chCoeff=-1, -1 if chCoeff=1
+        let c1 = scale * inputCoeffs[0]
+        let c2 = scale * inputCoeffs[1]
+        let offset = scale * rhs  # channelVar = c1*v1 + c2*v2 + offset
+
+        let def = LinearChannelDef(
+            inputVar1: inputVars[0], inputVar2: inputVars[1],
+            coeff1: c1, coeff2: c2,
+            channelVar: definesVar, offset: offset)
+
+        # Index by sorted pair
+        let key = if inputVars[0] < inputVars[1]: (inputVars[0], inputVars[1])
+                  else: (inputVars[1], inputVars[0])
+        channelDefs.mgetOrPut(key, @[]).add(def)
+
+    if channelDefs.len == 0: return
+
+    # Step 2: Post-process each disjunctive clause term
+    var nSubstitutions = 0
+    for clauseIdx in 0..<tr.disjunctiveClauses.len:
+        for dIdx in 0..<tr.disjunctiveClauses[clauseIdx].disjuncts.len:
+            for tIdx in 0..<tr.disjunctiveClauses[clauseIdx].disjuncts[dIdx].len:
+                var term = tr.disjunctiveClauses[clauseIdx].disjuncts[dIdx][tIdx]
+                if term.varNames.len < 4: continue  # Need at least 4 vars for 2 substitutions
+
+                # Try to find pairs of variables that match channel inputs
+                var newCoeffs: seq[int]
+                var newVarNames: seq[string]
+                var newRhs = term.rhs
+                var consumed = newSeq[bool](term.varNames.len)
+                var anySubstituted = false
+
+                # For each pair of unconsumed variables, check if they match a channel
+                for i in 0..<term.varNames.len:
+                    if consumed[i]: continue
+                    var substituted = false
+                    for j in (i+1)..<term.varNames.len:
+                        if consumed[j]: continue
+                        let key = if term.varNames[i] < term.varNames[j]:
+                                    (term.varNames[i], term.varNames[j])
+                                  else: (term.varNames[j], term.varNames[i])
+                        if key notin channelDefs: continue
+
+                        for def in channelDefs[key]:
+                            # Check if coefficients match proportionally
+                            # term has coeff_i * v_i + coeff_j * v_j
+                            # channel has c1 * v1 + c2 * v2 + offset = channelVar
+                            # So coeff_i * v_i + coeff_j * v_j = s * (c1*v1 + c2*v2) = s * (channelVar - offset)
+                            # Need: coeff_i/c1 == coeff_j/c2 (same scale factor s)
+
+                            var ci, cj: int
+                            if term.varNames[i] == def.inputVar1:
+                                ci = term.coeffs[i]
+                                cj = term.coeffs[j]
+                            else:
+                                ci = term.coeffs[j]
+                                cj = term.coeffs[i]
+
+                            # Check: ci/def.coeff1 == cj/def.coeff2  (both must be integer)
+                            if def.coeff1 == 0 or def.coeff2 == 0: continue
+                            if ci mod def.coeff1 != 0: continue
+                            let s = ci div def.coeff1
+                            if s * def.coeff2 != cj: continue
+
+                            # Match! Replace with s * channelVar, adjust rhs
+                            # term = ... + s*(channelVar - offset) + ... <= rhs
+                            # → ... + s*channelVar + ... <= rhs + s*offset
+                            newCoeffs.add(s)
+                            newVarNames.add(def.channelVar)
+                            newRhs += s * def.offset
+                            consumed[i] = true
+                            consumed[j] = true
+                            substituted = true
+                            anySubstituted = true
+                            break
+                        if substituted: break
+
+                    if not substituted:
+                        newCoeffs.add(term.coeffs[i])
+                        newVarNames.add(term.varNames[i])
+
+                # Collect remaining unconsumed (shouldn't happen if all pairs matched)
+                for i in 0..<term.varNames.len:
+                    if not consumed[i] and term.varNames[i] notin newVarNames:
+                        newCoeffs.add(term.coeffs[i])
+                        newVarNames.add(term.varNames[i])
+
+                if anySubstituted:
+                    tr.disjunctiveClauses[clauseIdx].disjuncts[dIdx][tIdx] =
+                        DisjunctiveClauseTerm(coeffs: newCoeffs, varNames: newVarNames, rhs: newRhs)
+                    nSubstitutions += 1
+
+    if nSubstitutions > 0:
+        stderr.writeLine(&"[FZN] Channel substitution: {nSubstitutions} clause terms simplified ({channelDefs.len} channel defs)")
+
 proc detectDisjunctiveResources(tr: var FznTranslator) =
     ## Detects disjunctive resource groups among disjunctive pairs and replaces
     ## them with cumulative(limit=1) constraints.

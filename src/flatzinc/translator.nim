@@ -780,6 +780,8 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
     # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
     result.detectDisjunctivePairs()
+    # Substitute linear channel variables in disjunctive clause terms (reduces positions)
+    result.substituteChannelVarsInClauses()
     # Detect small-domain product patterns (int_times with small operand → case-split)
     result.detectSmallDomainProducts()
     # Detect disjunctive resource groups (cliques of pairs → cumulative)

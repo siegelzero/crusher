@@ -2296,6 +2296,37 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 if not elem.isConstant:
                     channelArrayParticipation.mgetOrPut(elem.variablePosition, @[]).add(bi)
 
+    # Precompute reverse map: single-position index -> variable-array channel binding indices
+    # Used for Phase CB-idx (multi-constraint index domain filtering)
+    var idxToVarArrayBindings: Table[int, seq[int]]  # idxPos -> binding indices
+    for bi, binding in carray.channelBindings:
+        var hasVariable = false
+        for elem in binding.arrayElements:
+            if not elem.isConstant:
+                hasVariable = true
+                break
+        if not hasVariable: continue
+        let idxPositions = toSeq(binding.indexExpression.positions.items)
+        if idxPositions.len == 1:
+            let idxPos = idxPositions[0]
+            idxToVarArrayBindings.mgetOrPut(idxPos, @[]).add(bi)
+
+    # Also map: index position -> element constraint indices (for Phase CB-idx)
+    var idxToElementConstraints: Table[int, seq[int]]  # idxPos -> constraint indices
+    for ci, cons in carray.constraints:
+        if cons.stateType == ElementType:
+            let es = cons.elementState
+            if es.evalMethod != PositionBased: continue
+            if es.isConstantArray: continue  # constant arrays handled by Phase 6 already
+            var hasVariable = false
+            for elem in es.arrayElements:
+                if not elem.isConstant:
+                    hasVariable = true
+                    break
+            if not hasVariable: continue
+            let idxPos = es.indexPosition
+            idxToElementConstraints.mgetOrPut(idxPos, @[]).add(ci)
+
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
     var domainMin = newSeq[T](carray.len)
     var domainMax = newSeq[T](carray.len)
@@ -2316,8 +2347,39 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             domainMin[pos] = carray.domain[pos][0]
             domainMax[pos] = carray.domain[pos][^1]
 
-    for outerIter in 0..<20:
+    # Precompute Phase CB constant-array binding metadata (avoids repeated allConstant checks)
+    type CbBindingInfo = tuple[bi: int, chPos: int, idxPositions: seq[int]]
+    var cbConstBindings: seq[CbBindingInfo]
+    var cbParticipantPositions = initPackedSet[int]()
+    for bi, binding in carray.channelBindings:
+        var allConstant = true
+        for elem in binding.arrayElements:
+            if not elem.isConstant:
+                allConstant = false
+                break
+        if not allConstant: continue
+        let idxPos = toSeq(binding.indexExpression.positions.items)
+        if idxPos.len == 0 or idxPos.len > 6: continue
+        cbConstBindings.add((bi: bi, chPos: binding.channelPosition, idxPositions: idxPos))
+        cbParticipantPositions.incl(binding.channelPosition)
+        for p in idxPos:
+            cbParticipantPositions.incl(p)
+
+    # Snapshot of domain sizes for Phase CB dirty detection
+    var cbDomSnapshot = newSeq[int](carray.len)
+    for pos in cbParticipantPositions.items:
+        cbDomSnapshot[pos] = if pos in skippedPositions: -1
+                             else: currentDomain[pos].len
+
+    let domRedStartTime = epochTime()
+    const DomRedTimeBudget = 5.0  # seconds
+
+    for outerIter in 0..<100:
         var outerChanged = false
+
+        if outerIter > 0 and epochTime() - domRedStartTime > DomRedTimeBudget:
+            stderr.writeLine(&"[DomRed] Time budget ({DomRedTimeBudget:.1f}s) reached after {outerIter} iterations")
+            break
 
         # Phase 3: Bounds propagation
         if normalizedForms.len > 0 or carray.disjunctivePairs.len > 0:
@@ -3496,25 +3558,24 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # For each channel binding with all-constant array elements, propagate domain
         # restrictions bidirectionally between key positions and channel position.
         var cbProcessed, cbPruned = 0
-        for binding in carray.channelBindings:
-            let chPos = binding.channelPosition
+
+        # Check if any participant position domain changed since last Phase CB
+        var cbHasChanges = (outerIter == 0)
+        if not cbHasChanges:
+            for pos in cbParticipantPositions.items:
+                let curSize = if pos in skippedPositions: -1
+                              else: currentDomain[pos].len
+                if curSize != cbDomSnapshot[pos]:
+                    cbHasChanges = true
+                    break
+
+        if cbHasChanges:
+         for cbInfo in cbConstBindings:
+            let binding = carray.channelBindings[cbInfo.bi]
+            let chPos = cbInfo.chPos
             let arrElems = binding.arrayElements
             let arrLen = arrElems.len
-
-            # Only process bindings where all arrayElements are constants (functional dep channels)
-            var allConstant = true
-            for elem in arrElems:
-                if not elem.isConstant:
-                    allConstant = false
-                    break
-            if not allConstant:
-                continue
-
-            let idxPositions = toSeq(binding.indexExpression.positions.items)
-            if idxPositions.len == 0:
-                continue
-            if idxPositions.len > 6:
-                continue
+            let idxPositions = cbInfo.idxPositions
 
             let chSkipped = chPos in skippedPositions
             inc cbProcessed
@@ -3793,6 +3854,12 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 cbPruned += 1
                                 outerChanged = true
 
+         # end if cbHasChanges
+         # Update snapshot for next iteration's dirty detection
+         for pos in cbParticipantPositions.items:
+            cbDomSnapshot[pos] = if pos in skippedPositions: -1
+                                 else: currentDomain[pos].len
+
         if cbPruned > 0:
             stderr.writeLine(&"[DomRed] Channel AC: {cbPruned} values pruned ({cbProcessed} bindings)")
 
@@ -3846,6 +3913,105 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         cbVarPruned += 1
         if cbVarPruned > 0:
             stderr.writeLine(&"[DomRed] Channel var-array backward: {cbVarPruned} values removed in {outerIter+1} iterations")
+
+        # Phase CB-idx: Multi-constraint index filtering for shared-index variable-array bindings
+        # For each index position with 2+ constraints (channel bindings + element constraints),
+        # check each candidate index value against ALL constraints. Remove values that fail any.
+        var cbIdxPruned = 0
+        # Collect all index positions that have at least 2 constraints total
+        var cbIdxPositions: PackedSet[int]
+        for idxPos in idxToVarArrayBindings.keys:
+            let nBindings = idxToVarArrayBindings[idxPos].len
+            let nElems = if idxPos in idxToElementConstraints: idxToElementConstraints[idxPos].len else: 0
+            if nBindings + nElems >= 2:
+                cbIdxPositions.incl(idxPos)
+        for idxPos in idxToElementConstraints.keys:
+            if idxPos notin cbIdxPositions:
+                let nBindings = if idxPos in idxToVarArrayBindings: idxToVarArrayBindings[idxPos].len else: 0
+                let nElems = idxToElementConstraints[idxPos].len
+                if nBindings + nElems >= 2:
+                    cbIdxPositions.incl(idxPos)
+
+        discard
+        for idxPos in cbIdxPositions.items:
+            if currentDomain[idxPos].len <= 1: continue
+            if idxPos in skippedPositions: continue
+            let cbBindings = if idxPos in idxToVarArrayBindings: idxToVarArrayBindings[idxPos] else: @[]
+            let elemCons = if idxPos in idxToElementConstraints: idxToElementConstraints[idxPos] else: @[]
+            var tempAssign = initTable[int, T]()
+            for v in toSeq(currentDomain[idxPos].items):
+                tempAssign[idxPos] = v
+                var supported = true
+                # Check channel bindings (e.g., distance, pad_xy)
+                for bi in cbBindings:
+                    let binding = carray.channelBindings[bi]
+                    let idx = binding.indexExpression.evaluate(tempAssign)
+                    let arrLen = binding.arrayElements.len
+                    if idx < 0 or idx >= arrLen:
+                        supported = false
+                        break
+                    let elem = binding.arrayElements[idx]
+                    let chPos = binding.channelPosition
+                    if elem.isConstant:
+                        if chPos in skippedPositions:
+                            if elem.constantValue < domainMin[chPos] or elem.constantValue > domainMax[chPos]:
+                                supported = false
+                                break
+                        else:
+                            if elem.constantValue notin currentDomain[chPos]:
+                                supported = false
+                                break
+                    else:
+                        let elemPos = elem.variablePosition
+                        let epDom = if elemPos in skippedPositions: initPackedSet[T]()
+                                    else: currentDomain[elemPos]
+                        let chDom = if chPos in skippedPositions: initPackedSet[T]()
+                                    else: currentDomain[chPos]
+                        if elemPos in skippedPositions and chPos in skippedPositions:
+                            if domainMin[elemPos] > domainMax[chPos] or domainMax[elemPos] < domainMin[chPos]:
+                                supported = false
+                                break
+                        elif epDom.len > 0 and chDom.len > 0:
+                            if (epDom * chDom).len == 0:
+                                supported = false
+                                break
+                # Check element constraints (e.g., connection, pad_y)
+                if supported:
+                    for ci in elemCons:
+                        let es = carray.constraints[ci].elementState
+                        let arrSize = es.getArraySize()
+                        # Element constraint: arr[idxPos] = valuePos
+                        # v is already the index value (0-based in the constraint)
+                        if v < 0 or v >= arrSize:
+                            supported = false
+                            break
+                        let elem = es.arrayElements[v]
+                        let valPos = es.valuePosition
+                        if elem.isConstant:
+                            if valPos in skippedPositions:
+                                if elem.constantValue < domainMin[valPos] or elem.constantValue > domainMax[valPos]:
+                                    supported = false
+                                    break
+                            else:
+                                if elem.constantValue notin currentDomain[valPos]:
+                                    supported = false
+                                    break
+                        else:
+                            let elemPos = elem.variablePosition
+                            if elemPos in skippedPositions and valPos in skippedPositions:
+                                if domainMin[elemPos] > domainMax[valPos] or domainMax[elemPos] < domainMin[valPos]:
+                                    supported = false
+                                    break
+                            elif elemPos notin skippedPositions and valPos notin skippedPositions:
+                                if (currentDomain[elemPos] * currentDomain[valPos]).len == 0:
+                                    supported = false
+                                    break
+                if not supported:
+                    currentDomain[idxPos].excl(v)
+                    outerChanged = true
+                    cbIdxPruned += 1
+        if cbIdxPruned > 0:
+            stderr.writeLine(&"[DomRed] Channel idx intersection: {cbIdxPruned} values removed in {outerIter+1} iterations")
 
         # Phase 7: Table constraint arc consistency
         # For each TableIn constraint, remove domain values that have no support
