@@ -916,12 +916,6 @@ proc substituteChannelVarsInClauses(tr: var FznTranslator) =
                         newCoeffs.add(term.coeffs[i])
                         newVarNames.add(term.varNames[i])
 
-                # Collect remaining unconsumed (shouldn't happen if all pairs matched)
-                for i in 0..<term.varNames.len:
-                    if not consumed[i] and term.varNames[i] notin newVarNames:
-                        newCoeffs.add(term.coeffs[i])
-                        newVarNames.add(term.varNames[i])
-
                 if anySubstituted:
                     tr.disjunctiveClauses[clauseIdx].disjuncts[dIdx][tIdx] =
                         DisjunctiveClauseTerm(coeffs: newCoeffs, varNames: newVarNames, rhs: newRhs)

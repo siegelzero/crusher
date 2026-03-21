@@ -3932,7 +3932,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 if nBindings + nElems >= 2:
                     cbIdxPositions.incl(idxPos)
 
-        discard
         for idxPos in cbIdxPositions.items:
             if currentDomain[idxPos].len <= 1: continue
             if idxPos in skippedPositions: continue
@@ -3963,18 +3962,43 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 break
                     else:
                         let elemPos = elem.variablePosition
-                        let epDom = if elemPos in skippedPositions: initPackedSet[T]()
-                                    else: currentDomain[elemPos]
-                        let chDom = if chPos in skippedPositions: initPackedSet[T]()
-                                    else: currentDomain[chPos]
                         if elemPos in skippedPositions and chPos in skippedPositions:
+                            # Both skipped: use bounds overlap check
                             if domainMin[elemPos] > domainMax[chPos] or domainMax[elemPos] < domainMin[chPos]:
                                 supported = false
                                 break
-                        elif epDom.len > 0 and chDom.len > 0:
-                            if (epDom * chDom).len == 0:
-                                supported = false
-                                break
+                        elif elemPos in skippedPositions:
+                            # elemPos skipped, chPos has domain: check bounds vs domain overlap
+                            let chDom = currentDomain[chPos]
+                            if chDom.len > 0:
+                                var chMin = T.high
+                                var chMax = T.low
+                                for cv in chDom.items:
+                                    if cv < chMin: chMin = cv
+                                    if cv > chMax: chMax = cv
+                                if domainMin[elemPos] > chMax or domainMax[elemPos] < chMin:
+                                    supported = false
+                                    break
+                        elif chPos in skippedPositions:
+                            # chPos skipped, elemPos has domain: check domain vs bounds overlap
+                            let epDom = currentDomain[elemPos]
+                            if epDom.len > 0:
+                                var epMin = T.high
+                                var epMax = T.low
+                                for ev in epDom.items:
+                                    if ev < epMin: epMin = ev
+                                    if ev > epMax: epMax = ev
+                                if epMin > domainMax[chPos] or epMax < domainMin[chPos]:
+                                    supported = false
+                                    break
+                        else:
+                            # Both have domains: intersection check
+                            let epDom = currentDomain[elemPos]
+                            let chDom = currentDomain[chPos]
+                            if epDom.len > 0 and chDom.len > 0:
+                                if (epDom * chDom).len == 0:
+                                    supported = false
+                                    break
                 # Check element constraints (e.g., connection, pad_y)
                 if supported:
                     for ci in elemCons:
@@ -3999,10 +4023,36 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         else:
                             let elemPos = elem.variablePosition
                             if elemPos in skippedPositions and valPos in skippedPositions:
+                                # Both skipped: use bounds overlap check
                                 if domainMin[elemPos] > domainMax[valPos] or domainMax[elemPos] < domainMin[valPos]:
                                     supported = false
                                     break
-                            elif elemPos notin skippedPositions and valPos notin skippedPositions:
+                            elif elemPos in skippedPositions:
+                                # elemPos skipped, valPos has domain: check bounds vs domain overlap
+                                let valDom = currentDomain[valPos]
+                                if valDom.len > 0:
+                                    var valMin = T.high
+                                    var valMax = T.low
+                                    for vv in valDom.items:
+                                        if vv < valMin: valMin = vv
+                                        if vv > valMax: valMax = vv
+                                    if domainMin[elemPos] > valMax or domainMax[elemPos] < valMin:
+                                        supported = false
+                                        break
+                            elif valPos in skippedPositions:
+                                # valPos skipped, elemPos has domain: check domain vs bounds overlap
+                                let epDom = currentDomain[elemPos]
+                                if epDom.len > 0:
+                                    var epMin = T.high
+                                    var epMax = T.low
+                                    for ev in epDom.items:
+                                        if ev < epMin: epMin = ev
+                                        if ev > epMax: epMax = ev
+                                    if epMin > domainMax[valPos] or epMax < domainMin[valPos]:
+                                        supported = false
+                                        break
+                            else:
+                                # Both have domains: intersection check
                                 if (currentDomain[elemPos] * currentDomain[valPos]).len == 0:
                                     supported = false
                                     break
