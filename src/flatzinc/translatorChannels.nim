@@ -2445,15 +2445,14 @@ proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Built {built} bool-gated variable channel bindings")
 
     # Build variable-default bool-gated channels: target = element(cond, [val0Var, val1Var])
+    # Both val0Var and val1Var must have positions (array elements need positions).
     var builtVV = 0
     for def in tr.boolGatedVarVarChannelDefs:
         if def.targetVar notin tr.varPositions: continue
         if def.condVar notin tr.varPositions:
             if def.condVar notin tr.definedVarExprs: continue
-        if def.val1Var notin tr.varPositions:
-            if def.val1Var notin tr.definedVarExprs: continue
-        if def.val0Var notin tr.varPositions:
-            if def.val0Var notin tr.definedVarExprs: continue
+        if def.val1Var notin tr.varPositions: continue
+        if def.val0Var notin tr.varPositions: continue
 
         let targetPos = tr.varPositions[def.targetVar]
         let indexExpr = if def.condVar in tr.varPositions:
@@ -2462,15 +2461,11 @@ proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
             tr.definedVarExprs[def.condVar]
 
         # array[0] = val0Var (when cond=0), array[1] = val1Var (when cond=1)
-        var arrayElems: seq[ArrayElement[int]]
-        if def.val0Var in tr.varPositions:
-            arrayElems.add(ArrayElement[int](isConstant: false,
-                                             variablePosition: tr.varPositions[def.val0Var]))
-        else: continue
-        if def.val1Var in tr.varPositions:
-            arrayElems.add(ArrayElement[int](isConstant: false,
-                                             variablePosition: tr.varPositions[def.val1Var]))
-        else: continue
+        let arrayElems = @[
+            ArrayElement[int](isConstant: false,
+                              variablePosition: tr.varPositions[def.val0Var]),
+            ArrayElement[int](isConstant: false,
+                              variablePosition: tr.varPositions[def.val1Var])]
 
         tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
         inc builtVV

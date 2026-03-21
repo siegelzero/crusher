@@ -1321,6 +1321,7 @@ proc elementPropagate(tr: FznTranslator,
         let valSet = valDom.toPackedSet()
 
         # Forward: restrict val domain to reachable values from idx domain
+        var reachableValSet: PackedSet[int]
         var reachableVals: seq[int]
         var validIdxValues: seq[int]
         for i in idxDom:
@@ -1328,7 +1329,8 @@ proc elementPropagate(tr: FznTranslator,
             if arrIdx >= 0 and arrIdx < constArray.len:
                 let v = constArray[arrIdx]
                 if v in valSet:
-                    if v notin reachableVals:
+                    if v notin reachableValSet:
+                        reachableValSet.incl(v)
                         reachableVals.add(v)
                     validIdxValues.add(i)
 

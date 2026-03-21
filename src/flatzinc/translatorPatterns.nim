@@ -1114,7 +1114,10 @@ proc detectConditionalBinaryChannels*(tr: var FznTranslator) =
                     posLiteralBoolClauses.mgetOrPut(posVar, @[]).add((negVar, ci))
 
     # Match the complete pattern: X has eqReif1, bool_eq_reif(b1, b2, b3),
-    # bool_clause([b3], [condBool])
+    # bool_clause([b3], [condBool]).
+    # We only verify the forward half (cond => X=b2). The backward half
+    # (¬cond => X=0) must also exist for the model to be satisfiable with
+    # X binary, so MiniZinc always emits both directions together.
     var nDetected = 0
     for b1Name, info in boolEqReifFromB1.pairs:
         let xName = info.xName
