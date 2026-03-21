@@ -4398,20 +4398,24 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
                 for v in tr.sys.baseArray.domain[pos]:
                     allDomainValues.incl(v)
 
-            # Build cover, lbound, ubound
-            var coveredValues: PackedSet[int]
+            # Build cover, lbound, ubound (dedup by target value, take min of max counts)
+            var coveredBounds: Table[int, int]  # targetValue → min(maxCount)
+            for d in defs:
+                if d.targetValue in coveredBounds:
+                    coveredBounds[d.targetValue] = min(coveredBounds[d.targetValue], d.maxCount)
+                else:
+                    coveredBounds[d.targetValue] = d.maxCount
             var cover: seq[int]
             var lbound: seq[int]
             var ubound: seq[int]
-            for d in defs:
-                cover.add(d.targetValue)
+            for value, maxCount in coveredBounds:
+                cover.add(value)
                 lbound.add(0)
-                ubound.add(d.maxCount)
-                coveredValues.incl(d.targetValue)
+                ubound.add(maxCount)
 
             # Add uncovered domain values with trivial bounds to avoid false penalties
             for v in allDomainValues:
-                if v notin coveredValues:
+                if v notin coveredBounds:
                     cover.add(v)
                     lbound.add(0)
                     ubound.add(positions.len)
