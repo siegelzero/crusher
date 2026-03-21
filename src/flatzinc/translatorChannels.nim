@@ -736,13 +736,80 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 filtered.add(ci)
         tr.linEqReifChannelDefs = filtered
 
+    # Process bool_eq_reif / bool_ne_reif channels
+    # bool_eq_reif(a, b, r): r = (a == b) = element(a*2 + b, [1, 0, 0, 1])
+    # bool_ne_reif(a, b, r): r = (a != b) = element(a*2 + b, [0, 1, 1, 0])
+    for ci in tr.boolEqReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let rName = con.args[2].ident
+        if rName notin tr.varPositions:
+            continue
+        let rPos = tr.varPositions[rName]
+        let aArg = con.args[0]
+        let bArg = con.args[1]
+
+        let aExpr = tr.resolveExprArg(aArg)
+        let bExpr = tr.resolveExprArg(bArg)
+
+        let isEq = stripSolverPrefix(con.name) == "bool_eq_reif"
+
+        # index = a*2 + b, domain {0,1} × {0,1} → range 0..3
+        let indexExpr = aExpr * 2 + bExpr
+
+        # eq: [1, 0, 0, 1] — (0,0)→1, (0,1)→0, (1,0)→0, (1,1)→1
+        # ne: [0, 1, 1, 0] — (0,0)→0, (0,1)→1, (1,0)→1, (1,1)→0
+        var arrayElems: seq[ArrayElement[int]]
+        if isEq:
+            arrayElems = @[
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 1)]
+        else:
+            arrayElems = @[
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 0)]
+
+        tr.sys.baseArray.addChannelBinding(rPos, indexExpr, arrayElems)
+
     let totalReifChannels = tr.reifChannelDefs.len + tr.bool2intChannelDefs.len +
                                                     tr.boolNotChannelDefs.len +
                                                     tr.boolClauseReifChannelDefs.len + tr.setInReifChannelDefs.len +
                                                     tr.leReifChannelDefs.len + tr.linLeReifChannelDefs.len +
-                                                    tr.linEqReifChannelDefs.len
+                                                    tr.linEqReifChannelDefs.len +
+                                                    tr.boolEqReifChannelDefs.len
     if totalReifChannels > 0:
         stderr.writeLine(&"[FZN] Built {totalReifChannels} reification channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildConditionalBinaryChannelBindings(tr: var FznTranslator) =
+    ## Builds channel bindings for conditional binary channels detected by
+    ## detectConditionalBinaryChannels.
+    ## X = element(cond*2 + b2, [0, 0, 0, 1])  (AND gate: X = cond AND b2)
+    for def in tr.conditionalBinaryChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.condVar notin tr.varPositions: continue
+        if def.neqVar notin tr.varPositions: continue
+
+        let xPos = tr.varPositions[def.targetVar]
+        let condExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: def.condVar))
+        let b2Expr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: def.neqVar))
+
+        # index = cond*2 + b2, lookup = [0, 0, 0, 1] (AND gate)
+        let indexExpr = condExpr * 2 + b2Expr
+        let arrayElems = @[
+            ArrayElement[int](isConstant: true, constantValue: 0),
+            ArrayElement[int](isConstant: true, constantValue: 0),
+            ArrayElement[int](isConstant: true, constantValue: 0),
+            ArrayElement[int](isConstant: true, constantValue: 1)]
+
+        tr.sys.baseArray.addChannelBinding(xPos, indexExpr, arrayElems)
+
+    if tr.conditionalBinaryChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {tr.conditionalBinaryChannelDefs.len} conditional binary channel bindings " &
                                           &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
@@ -2376,6 +2443,40 @@ proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
 
     if built > 0:
         stderr.writeLine(&"[FZN] Built {built} bool-gated variable channel bindings")
+
+    # Build variable-default bool-gated channels: target = element(cond, [val0Var, val1Var])
+    var builtVV = 0
+    for def in tr.boolGatedVarVarChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.condVar notin tr.varPositions:
+            if def.condVar notin tr.definedVarExprs: continue
+        if def.val1Var notin tr.varPositions:
+            if def.val1Var notin tr.definedVarExprs: continue
+        if def.val0Var notin tr.varPositions:
+            if def.val0Var notin tr.definedVarExprs: continue
+
+        let targetPos = tr.varPositions[def.targetVar]
+        let indexExpr = if def.condVar in tr.varPositions:
+            tr.getExpr(tr.varPositions[def.condVar])
+        else:
+            tr.definedVarExprs[def.condVar]
+
+        # array[0] = val0Var (when cond=0), array[1] = val1Var (when cond=1)
+        var arrayElems: seq[ArrayElement[int]]
+        if def.val0Var in tr.varPositions:
+            arrayElems.add(ArrayElement[int](isConstant: false,
+                                             variablePosition: tr.varPositions[def.val0Var]))
+        else: continue
+        if def.val1Var in tr.varPositions:
+            arrayElems.add(ArrayElement[int](isConstant: false,
+                                             variablePosition: tr.varPositions[def.val1Var]))
+        else: continue
+
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
+        inc builtVV
+
+    if builtVV > 0:
+        stderr.writeLine(&"[FZN] Built {builtVV} bool-gated variable-default channel bindings")
 
 proc buildNetFlowVariables*(tr: var FznTranslator) =
     ## Creates net_flow search variables for free pairs, defined expressions for dependent

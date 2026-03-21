@@ -991,12 +991,150 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.definingConstraints.incl(ci)
         tr.linLeReifChannelDefs.add(ci)
 
+    # Eighth pass: find bool_eq_reif/bool_ne_reif with defines_var
+    # bool_eq_reif(a, b, r): r = (a == b) where a, b are boolean
+    # bool_ne_reif(a, b, r): r = (a != b) where a, b are boolean
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if (name != "bool_eq_reif" and name != "bool_ne_reif") or not con.hasAnnotation("defines_var"):
+            continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent:
+            continue
+
+        let rName = con.args[2].ident
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != rName:
+            continue
+
+        if rName in tr.definedVarNames or rName in tr.channelVarNames:
+            continue
+
+        # Both a and b must be positioned variables (not defined vars)
+        let aArg = con.args[0]
+        let bArg = con.args[1]
+        if aArg.kind != FznIdent or aArg.ident in tr.definedVarNames:
+            continue
+        if bArg.kind != FznIdent or bArg.ident in tr.definedVarNames:
+            continue
+
+        tr.channelVarNames.incl(rName)
+        tr.definingConstraints.incl(ci)
+        tr.boolEqReifChannelDefs.add(ci)
+
     if tr.reifChannelDefs.len > 0 or tr.bool2intChannelDefs.len > 0 or
          tr.boolNotChannelDefs.len > 0 or
          tr.boolClauseReifChannelDefs.len > 0 or tr.setInReifChannelDefs.len > 0 or
          tr.boolAndOrChannelDefs.len > 0 or tr.leReifChannelDefs.len > 0 or
-         tr.linLeReifChannelDefs.len > 0 or tr.linEqReifChannelDefs.len > 0:
-        stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolNotChannelDefs.len} bool_not, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif, {tr.linLeReifChannelDefs.len} int_lin_le_reif")
+         tr.linLeReifChannelDefs.len > 0 or tr.linEqReifChannelDefs.len > 0 or
+         tr.boolEqReifChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Detected reification channels: {tr.reifChannelDefs.len} int_eq/ne_reif, {tr.bool2intChannelDefs.len} bool2int, {tr.boolNotChannelDefs.len} bool_not, {tr.boolClauseReifChannelDefs.len} bool_clause_reif, {tr.setInReifChannelDefs.len} set_in_reif, {tr.boolAndOrChannelDefs.len} array_bool_and/or, {tr.leReifChannelDefs.len} int_le/lt_reif, {tr.linLeReifChannelDefs.len} int_lin_le_reif, {tr.boolEqReifChannelDefs.len} bool_eq/ne_reif")
+
+
+proc detectConditionalBinaryChannels*(tr: var FznTranslator) =
+    ## Detects binary variables X (domain {0,1}) that are functionally determined as:
+    ##   X = condBool AND b2
+    ## where condBool and b2 are both channel variables.
+    ##
+    ## Pattern (from gametes problem):
+    ##   int_eq_reif(X, 1, b1) :: defines_var(b1)   → b1 ≡ X (binary)
+    ##   bool_eq_reif(b1, b2, b3) :: defines_var(b3) → b3 = (b1 == b2)
+    ##   bool_clause([b3], [condBool])                → condBool => b3
+    ##   int_eq_reif(X, 0, b4) :: defines_var(b4)    → b4 = (X==0) ≡ ¬X
+    ##   array_bool_and([..., b4, ...], conj)         → conj includes X=0
+    ##   bool_clause([conj, condBool], [])             → ¬condBool => conj (=> X=0)
+    ##
+    ## Together: X = condBool ? b2 : 0 = condBool AND b2
+    ## Channel binding: X = element(condBool*2 + b2, [0, 0, 0, 1])
+
+    # Build maps for int_eq_reif(X, const, b) :: defines_var(b) where X is binary.
+    # These are ALREADY consumed by detectReifChannels (in reifChannelDefs), so we
+    # scan that list rather than looking for unclaimed constraints.
+    var eqReif1Map: Table[string, tuple[bName: string, ci: int]]  # X → (b1, ci) for val=1
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let val = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        if val != 1: continue
+        let xName = con.args[0].ident
+        let bName = con.args[2].ident
+        # X must be binary (domain {0,1}) and NOT already a channel
+        if xName in tr.channelVarNames or xName in tr.definedVarNames: continue
+        let dom = tr.lookupVarDomain(xName)
+        if dom != @[0, 1]: continue
+        eqReif1Map[xName] = (bName, ci)
+
+    if eqReif1Map.len == 0: return
+
+    # Build reverse map: b1Name → xName for quick lookup
+    var b1ToX: Table[string, string]
+    for xName, entry in eqReif1Map.pairs:
+        b1ToX[entry.bName] = xName
+
+    # Build map: b1 → (X, bool_eq_reif b3 name, b2 name, bool_eq_reif ci)
+    # from bool_eq_reif(b1, b2, b3) :: defines_var(b3) where b1 is from eqReif1Map
+    var boolEqReifFromB1: Table[string, tuple[xName, b3Name, b2Name: string, boolEqCi: int]]
+    for ci in tr.boolEqReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_eq_reif": continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let a = con.args[0].ident
+        let b = con.args[1].ident
+        let r = con.args[2].ident
+        # Check if either side is a b1 from eqReif1Map (the other side is b2, the neq indicator)
+        # Don't require b2 to be channelized yet — int_lin_ne_reif channels may not be
+        # detected until later (detectLinEqReifChannels), but b2 will get a position either way.
+        if a in b1ToX:
+            boolEqReifFromB1[a] = (b1ToX[a], r, b, ci)
+        elif b in b1ToX:
+            boolEqReifFromB1[b] = (b1ToX[b], r, a, ci)
+
+    if boolEqReifFromB1.len == 0: return
+
+    # Build map: positive literal var name → seq of bool_clause indices
+    # for bool_clause([b3], [condBool]) patterns
+    var posLiteralBoolClauses: Table[string, seq[tuple[condVar: string, ci: int]]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posElems = tr.extractVarElems(con.args[0])
+        let negElems = tr.extractVarElems(con.args[1])
+        if posElems.len == 1 and negElems.len == 1:
+            if posElems[0].kind == FznIdent and negElems[0].kind == FznIdent:
+                let posVar = posElems[0].ident
+                let negVar = negElems[0].ident
+                if negVar in tr.channelVarNames:
+                    posLiteralBoolClauses.mgetOrPut(posVar, @[]).add((negVar, ci))
+
+    # Match the complete pattern: X has eqReif1, bool_eq_reif(b1, b2, b3),
+    # bool_clause([b3], [condBool])
+    var nDetected = 0
+    for b1Name, info in boolEqReifFromB1.pairs:
+        let xName = info.xName
+        let b3Name = info.b3Name
+        let b2Name = info.b2Name
+
+        # Check bool_clause([b3], [condBool])
+        if b3Name notin posLiteralBoolClauses: continue
+
+        for clauseEntry in posLiteralBoolClauses[b3Name]:
+            let condVar = clauseEntry.condVar
+
+            # All conditions met: X = condVar AND b2
+            tr.channelVarNames.incl(xName)
+            tr.conditionalBinaryChannelDefs.add((targetVar: xName, condVar: condVar, neqVar: b2Name))
+            inc nDetected
+            break  # Only need one match
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} conditional binary channels (X = cond AND b2)")
 
 
 proc detectLinEqReifChannels*(tr: var FznTranslator) =
@@ -5511,7 +5649,37 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
                         break
             if defaultConstant != int.low: break
 
-        if defaultConstant == int.low: continue
+        if defaultConstant == int.low:
+            # No constant default found. Try variable default: look for another
+            # int_eq_reif(target, otherVar, otherBool) where otherVar is a channel
+            # variable with a position. This handles multi-branch conditionals like
+            # xs = if Node then var_element_result else gamete_lookup.
+            var defaultVar = ""
+            for ci in tr.reifChannelDefs:
+                let rcon = tr.model.constraints[ci]
+                let rname = stripSolverPrefix(rcon.name)
+                if rname != "int_eq_reif": continue
+                if rcon.args.len < 3 or rcon.args[0].kind != FznIdent: continue
+                if rcon.args[0].ident != targetVar: continue
+                if rcon.args[1].kind != FznIdent: continue
+                let otherVar = rcon.args[1].ident
+                if otherVar == entry.valVar: continue  # skip the already-found branch
+                if otherVar in tr.paramValues: continue
+                # otherVar must be a channel or at least have a position
+                if otherVar in tr.channelVarNames or otherVar notin tr.definedVarNames:
+                    defaultVar = otherVar
+                    break
+            if defaultVar != "":
+                tr.boolGatedVarVarChannelDefs.add((
+                    targetVar: targetVar,
+                    condVar: entry.condChannel,
+                    val1Var: entry.valVar,
+                    val0Var: defaultVar))
+                tr.channelVarNames.incl(targetVar)
+                tr.definingConstraints.incl(entry.boolClauseCI)
+                inc detected
+            continue
+
         if defaultConstant notin targetDomain: continue
 
         # Determine which index corresponds to cond=0 (default) and cond=1 (variable)

@@ -1274,6 +1274,79 @@ proc presolveResolveVarElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
     else: return @[]
 
 
+proc elementPropagate(tr: FznTranslator,
+                      domains: var Table[string, seq[int]],
+                      fixedVars: Table[string, int],
+                      eliminated: PackedSet[int],
+                      infeasible: var bool): bool =
+    ## Bidirectional arc consistency for array_int_element(idx, constArr, val)
+    ## and array_bool_element(idx, constArr, val) constraints.
+    ## Forward:  val domain ⊆ {constArr[i-1] : i ∈ domain(idx)}
+    ## Backward: idx domain ⊆ {i : constArr[i-1] ∈ domain(val)}
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_int_element", "array_int_element_nonshifted",
+                        "array_bool_element"]: continue
+        if con.args.len < 3: continue
+
+        # Resolve constant array
+        let constArray = try: tr.resolveIntArray(con.args[1])
+                         except ValueError, KeyError: continue
+
+        if constArray.len == 0: continue
+
+        let idxName = presolveVarName(con.args[0])
+        let valName = presolveVarName(con.args[2])
+
+        # Get current domains
+        var idxDom: seq[int]
+        if idxName != "" and idxName in domains:
+            idxDom = domains[idxName]
+        elif tr.presolveIsFixed(con.args[0], fixedVars):
+            idxDom = @[tr.presolveResolve(con.args[0], fixedVars)]
+        else:
+            continue
+
+        var valDom: seq[int]
+        if valName != "" and valName in domains:
+            valDom = domains[valName]
+        elif tr.presolveIsFixed(con.args[2], fixedVars):
+            valDom = @[tr.presolveResolve(con.args[2], fixedVars)]
+        else:
+            continue
+
+        let valSet = valDom.toPackedSet()
+
+        # Forward: restrict val domain to reachable values from idx domain
+        var reachableVals: seq[int]
+        var validIdxValues: seq[int]
+        for i in idxDom:
+            let arrIdx = i - 1  # FZN 1-based to 0-based
+            if arrIdx >= 0 and arrIdx < constArray.len:
+                let v = constArray[arrIdx]
+                if v in valSet:
+                    if v notin reachableVals:
+                        reachableVals.add(v)
+                    validIdxValues.add(i)
+
+        # Backward: restrict idx domain to indices with valid values
+        if idxName != "" and idxName notin fixedVars:
+            if presolveTightenDomain(domains, idxName, validIdxValues, infeasible):
+                result = true
+            if infeasible: return
+
+        # Forward: restrict val domain to reachable values
+        if valName != "" and valName notin fixedVars:
+            if reachableVals.len > 0:
+                reachableVals.sort()
+                if presolveTightenDomain(domains, valName, reachableVals, infeasible):
+                    result = true
+                if infeasible: return
+
+
 proc regularPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
                       fixedVars: Table[string, int],
@@ -1698,6 +1771,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 6: Non-renewable resource pruning
         if nonRenewableResourcePruning(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6b: Element constraint propagation (bidirectional arc consistency)
+        if elementPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 

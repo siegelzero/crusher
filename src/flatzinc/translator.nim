@@ -398,6 +398,12 @@ type
         boolEquivAliasDefs*: seq[tuple[aliasVar, canonicalVar: string, consumedCIs: seq[int]]]
         # Bool-gated variable channel defs: x = if cond then y else constant
         boolGatedVarChannelDefs*: seq[tuple[targetVar, condVar, valVar: string, constValue: int, consumedCIs: seq[int]]]
+        # Bool-gated variable-default channel defs: x = if cond then y1 else y2 (both variables)
+        boolGatedVarVarChannelDefs*: seq[tuple[targetVar, condVar, val1Var, val0Var: string]]
+        # bool_eq_reif/bool_ne_reif channel defs: r = (a == b) or r = (a != b) for booleans
+        boolEqReifChannelDefs*: seq[int]
+        # Conditional binary channel defs: X = element(cond*2 + b2, [0,0,0,1]) (AND gate)
+        conditionalBinaryChannelDefs*: seq[tuple[targetVar, condVar, neqVar: string]]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -780,8 +786,11 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Fold bool_xor constraints with constant inputs (before reif channel detection)
     result.detectBoolXorSimplification()
-    # Detect int_eq_reif/bool2int defines_var patterns → channel variables
+    # Detect int_eq_reif/bool2int/bool_eq_reif defines_var patterns → channel variables
     result.detectReifChannels()
+    # Detect conditional binary channels: X = cond AND b2 (swap-like patterns)
+    # MUST run after detectReifChannels() so bool_eq_reif channels are detected first
+    result.detectConditionalBinaryChannels()
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
     # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
     result.detectBoolAndChannels()
@@ -1685,8 +1694,10 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildIntModChannelBindings()
     # Build channel bindings for singleton set booleans (S.bools = indicator(x))
     result.buildSingletonSetChannelBindings()
-    # Build channel bindings for int_eq_reif/bool2int reification channels
+    # Build channel bindings for int_eq_reif/bool2int/bool_eq_reif reification channels
     result.buildReifChannelBindings()
+    # Build channel bindings for conditional binary channels (X = cond AND b2)
+    result.buildConditionalBinaryChannelBindings()
     # Build channel bindings for bool AND channels (b = AND(c1,...,cn) from bool_clause)
     result.buildBoolAndChannelBindings()
     # Build channel bindings for conditional implication channels (binary + one-hot)
