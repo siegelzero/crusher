@@ -1171,6 +1171,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.conditionalDayCapacityState.getAffectedPositions()
         of MultiResourceNoOverlapType:
             return constraint.multiResourceNoOverlapState.getAffectedPositions()
+        of GlobalCardinalityType:
+            return constraint.globalCardinalityState.getAffectedPositions()
         else:
             return constraint.positions
 

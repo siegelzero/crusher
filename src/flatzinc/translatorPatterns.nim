@@ -4209,7 +4209,16 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
 
 proc emitAtMostThroughReif*(tr: var FznTranslator) =
     ## Emits direct atMost constraints for detected atMost-through-reification patterns.
-    var nEmitted = 0
+    ## When multiple atMost constraints share the same positions, merges them into a
+    ## single globalCardinalityBounded constraint for better incremental evaluation.
+
+    # Step 1: Resolve all defs to position sequences
+    type ResolvedDef = object
+        positions: seq[int]
+        targetValue: int
+        maxCount: int
+
+    var resolved: seq[ResolvedDef]
     for def in tr.atMostThroughReifDefs:
         var positions: seq[int]
         var allFound = true
@@ -4217,18 +4226,66 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
             if vn in tr.varPositions:
                 positions.add(tr.varPositions[vn])
             elif vn in tr.definedVarExprs:
-                # Shouldn't happen for source vars, but handle gracefully
                 allFound = false
                 break
             else:
                 allFound = false
                 break
         if not allFound or positions.len == 0: continue
-        tr.sys.addConstraint(atMost[int](positions, def.targetValue, def.maxCount))
-        inc nEmitted
+        resolved.add(ResolvedDef(positions: positions.sorted(), targetValue: def.targetValue, maxCount: def.maxCount))
 
-    if nEmitted > 0:
-        stderr.writeLine(&"[FZN] AtMost-through-reif: emitted {nEmitted} direct atMost constraints")
+    # Step 2: Group by sorted position set
+    var groups: Table[seq[int], seq[ResolvedDef]]
+    for rd in resolved:
+        if rd.positions notin groups:
+            groups[rd.positions] = @[]
+        groups[rd.positions].add(rd)
+
+    var nSingleEmitted = 0
+    var nMergedGroups = 0
+    var nMergedDefs = 0
+    for positions, defs in groups:
+        if defs.len == 1:
+            # Single def: emit atMost as before
+            tr.sys.addConstraint(atMost[int](positions, defs[0].targetValue, defs[0].maxCount))
+            inc nSingleEmitted
+        else:
+            # Multiple defs sharing same positions: merge into GCC
+            # Collect all domain values across positions
+            var allDomainValues: PackedSet[int]
+            for pos in positions:
+                for v in tr.sys.baseArray.domain[pos]:
+                    allDomainValues.incl(v)
+
+            # Build cover, lbound, ubound
+            var coveredValues: PackedSet[int]
+            var cover: seq[int]
+            var lbound: seq[int]
+            var ubound: seq[int]
+            for d in defs:
+                cover.add(d.targetValue)
+                lbound.add(0)
+                ubound.add(d.maxCount)
+                coveredValues.incl(d.targetValue)
+
+            # Add uncovered domain values with trivial bounds to avoid false penalties
+            for v in allDomainValues:
+                if v notin coveredValues:
+                    cover.add(v)
+                    lbound.add(0)
+                    ubound.add(positions.len)
+
+            tr.sys.addConstraint(globalCardinalityBounded[int](positions, cover, lbound, ubound))
+            inc nMergedGroups
+            nMergedDefs += defs.len
+
+    if nSingleEmitted > 0 or nMergedGroups > 0:
+        var parts: seq[string]
+        if nSingleEmitted > 0:
+            parts.add(&"{nSingleEmitted} direct atMost")
+        if nMergedGroups > 0:
+            parts.add(&"merged {nMergedDefs} atMost into {nMergedGroups} GCC")
+        stderr.writeLine(&"[FZN] AtMost-through-reif: {parts.join(\", \")}")
 
 proc detectArgmaxPattern(tr: var FznTranslator) =
     ## Detects argmax decomposition patterns from MiniZinc's arg_max:

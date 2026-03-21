@@ -303,6 +303,60 @@ proc moveDelta*[T](state: GlobalCardinalityConstraint[T], position: int, oldValu
             state.currentAssignment[position] = originalValue
 
 
+proc getAffectedPositions*[T](state: GlobalCardinalityConstraint[T]): PackedSet[int] =
+    ## Returns positions needing penalty map updates after the last updatePosition.
+    ## If neither the old nor new value crossed a cost boundary, no neighbor's moveDelta
+    ## will return different values, so return empty set.
+    if state.lastOldValue == state.lastNewValue:
+        return initPackedSet[int]()
+
+    proc crossesBoundary[T](state: GlobalCardinalityConstraint[T], value: T, countDelta: int): bool {.inline.} =
+        ## Check if changing value's count by countDelta crosses a cost boundary.
+        let curCount = getCount(state.countTable, value)
+        # prevCount is the count before the update that already happened
+        let prevCount = curCount - countDelta
+        case state.constraintType:
+            of BoundedCounts:
+                if value in state.lowerBounds:
+                    let lb = state.lowerBounds[value]
+                    let ub = state.upperBounds[value]
+                    # Check if marginal cost of adding/removing this value changed
+                    # Cost function: max(0, lb - count) + max(0, count - ub)
+                    # Marginal of +1 changes at count == lb (from -1 to 0) and count == ub (from 0 to +1)
+                    # We need to check if prevCount or curCount is at a boundary
+                    return (prevCount == lb) or (curCount == lb) or
+                           (prevCount == ub) or (curCount == ub)
+                else:
+                    # Not in cover: cost = count, marginal is always +1, never changes
+                    return false
+            of ExactCounts:
+                if value in state.targetCounts:
+                    let target = state.targetCounts[value]
+                    # Cost function: abs(count - target)
+                    # Marginal of +1 changes at count == target (from -1 to +1)
+                    return (prevCount == target) or (curCount == target)
+                else:
+                    # Not in cover: cost = count, marginal is always +1, never changes
+                    return false
+
+    # oldValue count decreased by 1 (curCount = prevCount - 1, so countDelta = -1)
+    # newValue count increased by 1 (curCount = prevCount + 1, so countDelta = +1)
+    let boundaryCrossed = crossesBoundary(state, state.lastOldValue, -1) or
+                          crossesBoundary(state, state.lastNewValue, +1)
+
+    if not boundaryCrossed:
+        return initPackedSet[int]()
+
+    # A boundary was crossed — return all positions
+    case state.evalMethod:
+        of PositionBased:
+            return state.positions
+        of ExpressionBased:
+            var allPos = initPackedSet[int]()
+            for exp in state.expressions:
+                allPos.incl(exp.positions)
+            return allPos
+
 proc getAffectedDomainValues*[T](state: GlobalCardinalityConstraint[T], position: int): seq[T] =
     ## Returns domain values at `position` that need penalty recalculation.
     ## Only the old and new values from the last update changed their global counts,
