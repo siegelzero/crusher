@@ -11,6 +11,7 @@ is_9aGFgDaHX7,2025/is/model.mzn,2025/is/9aGFgDaHX7.dzn,minimize,5000,,688128
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
 mondoku_8_8_4,2025/mondoku/mondoku-gcc-model-balance.mzn,2025/mondoku/8-8-4.dzn,minimize,10000,0,4
 mrcpsp_j30_25_5,2023/mrcpsp/mrcpsp.mzn,2023/mrcpsp/j30_25_5.dzn,minimize,10000,27,50
+pennies_n5,2023/pennies-opt/pennies.mzn,2023/pennies-opt/n5.dzn,maximize,10000,1,5
 products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,2025/products-and-shelves/ps-25-01.dzn,minimize,10000,5,5
 proteindesign12_1HZ5,2025/proteindesign12/wcsp.mzn,2025/proteindesign12/1HZ5.12p.9aa.usingEref_self.dzn,minimize,10000,1473,1480
 tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.dzn,maximize,10000,25,45
