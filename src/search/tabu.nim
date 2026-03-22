@@ -1767,12 +1767,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             # create long visit-time backward chains. The channel values
                             # still propagate correctly at runtime via the worklist, but
                             # the cascade penalty computation stops here to stay fast.
-                            var isOffset = false
-                            for elem in bindingPtr.arrayElements:
-                                if not elem.isConstant and elem.offset != 0:
-                                    isOffset = true
-                                    break
-                            if not isOffset:
+                            if not bindingPtr.hasOffset:
                                 bfsQueue.add(chanPos)
                 # Min/max channel bindings: include in cascade as dynamic entries.
                 # Implicit channels (detected without defines_var) are cascade-exempt:
@@ -2312,10 +2307,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     # Skip per-change penalty updates for offset channels (visit-time
                     # backward chains) to avoid O(n²) cascade re-evaluations. These
                     # are handled by recomputeAffectedChannelDepPenalties in assignValue.
-                    block checkOffset:
-                        for elem in bindingPtr.arrayElements:
-                            if not elem.isConstant and elem.offset != 0:
-                                break checkOffset
+                    if not bindingPtr.hasOffset:
                         state.updateNeighborPenalties(bindingPtr.channelPosition)
                     if bindingPtr.channelPosition notin inWorklist:
                         inWorklist.incl(bindingPtr.channelPosition)

@@ -21,6 +21,7 @@ type
         channelPosition*: int                # Position of the channel variable
         indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
         arrayElements*: seq[ArrayElement[T]] # The array (constants and/or variable positions)
+        hasOffset*: bool                     # true if any element has non-zero offset
 
     MinMaxChannelBinding*[T] = object
         channelPosition*: int                # Position of the min/max channel variable
@@ -197,11 +198,17 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
                            channelPos: int,
                            indexExpr: AlgebraicExpression[T],
                            arrayElems: seq[ArrayElement[T]]) =
+    var hasOff = false
+    for elem in arrayElems:
+        if not elem.isConstant and elem.offset != 0:
+            hasOff = true
+            break
     let bindingIdx = arr.channelBindings.len
     arr.channelBindings.add(ChannelBinding[T](
         channelPosition: channelPos,
         indexExpression: indexExpr,
-        arrayElements: arrayElems
+        arrayElements: arrayElems,
+        hasOffset: hasOff
     ))
     arr.channelPositions.incl(channelPos)
     # Register at index expression positions (index change → re-evaluate)

@@ -411,6 +411,8 @@ type
         conditionalBinaryChannelDefs*: seq[tuple[targetVar, condVar, neqVar: string]]
         # Counter for tautological constraints skipped during translation
         nSkippedTautological*: int
+        # Counter for redundant NAND constraints skipped during translation
+        nSkippedRedundantNand*: int
         # NAND bool pairs from bool_clause([], [b1, b2]) — for redundancy detection
         nandBoolPairs*: HashSet[tuple[a, b: string]]
         # Maps bool2int output var name → input bool var name
@@ -1120,8 +1122,8 @@ proc translate*(model: FznModel): FznTranslator =
             inc nTranslated
             result.translateConstraint(con)
 
-    nTranslated -= result.nSkippedTautological
-    stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {nTranslated} translated")
+    nTranslated -= result.nSkippedTautological + result.nSkippedRedundantNand
+    stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {result.nSkippedRedundantNand} skipped (redundant NAND), {nTranslated} translated")
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0

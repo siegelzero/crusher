@@ -646,7 +646,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
         # Redundant NAND check: int_lin_le encoding x1+x2<=1 duplicating a bool_clause NAND
         if tr.isRedundantNandLinLe(coeffs, con.args[1], rhs):
-            inc tr.nSkippedTautological  # count together with tautological
+            inc tr.nSkippedRedundantNand
             return
 
         let exprs = tr.resolveExprArray(con.args[1])
