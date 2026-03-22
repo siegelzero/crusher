@@ -121,6 +121,17 @@ proc evaluateConditionalCountEq[T](binding: ConditionalCountEqChannelBinding[T],
             inc count
     count
 
+proc evaluateArgmax[T](binding: ArgmaxChannelBinding[T], assignment: seq[T]): T {.inline.} =
+    ## Evaluate argmax channel: returns valueOffset + index of first maximum in inputExprs.
+    var bestVal = binding.inputExprs[0].evaluate(assignment)
+    var bestIdx = 0
+    for i in 1..<binding.inputExprs.len:
+        let v = binding.inputExprs[i].evaluate(assignment)
+        if v > bestVal:
+            bestVal = v
+            bestIdx = i
+    T(bestIdx + binding.valueOffset)
+
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.
     ## Saves original value on first change; cdDirtyPositions stays deduplicated.
@@ -139,7 +150,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
        pos notin state.carray.minMaxChannelsAtPosition and
        pos notin state.carray.countEqChannelsAtPosition and
        pos notin state.carray.conditionalCountEqChannelsAtPosition and
-       pos notin state.carray.inverseChannelsAtPosition:
+       pos notin state.carray.inverseChannelsAtPosition and
+       pos notin state.carray.argmaxChannelsAtPosition:
         return 0
 
     # Fast path: use precomputed (static) cascade table for single-value lookup
@@ -307,6 +319,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             if ipos notin state.cdVisited:
                                 state.cdVisited.incl(ipos)
                                 state.cdWorklist.add(ipos)
+            if p in state.carray.argmaxChannelsAtPosition:
+                for bi in state.carray.argmaxChannelsAtPosition[p]:
+                    let binding = state.carray.argmaxChannelBindings[bi]
+                    let newChanVal = evaluateArgmax(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
     else:
         # General worklist propagation
         state.cdWorklist.setLen(0)
@@ -374,6 +396,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             if ipos notin state.cdVisited:
                                 state.cdVisited.incl(ipos)
                                 state.cdWorklist.add(ipos)
+            if p in state.carray.argmaxChannelsAtPosition:
+                for bi in state.carray.argmaxChannelsAtPosition[p]:
+                    let binding = state.carray.argmaxChannelBindings[bi]
+                    let newChanVal = evaluateArgmax(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
 
     when ProfileIteration:
         let cdWorklistEnd = epochTime()
@@ -596,6 +628,9 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 of ceCountEq:
                     let binding = state.carray.countEqChannelBindings[bindings[ci]]
                     newVal = evaluateCountEq(binding, state.assignment)
+                of ceArgmax:
+                    let binding = state.carray.argmaxChannelBindings[bindings[ci]]
+                    newVal = evaluateArgmax(binding, state.assignment)
                 of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                     let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
@@ -673,6 +708,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         # CountEq binding: count matching values over input positions
                         let binding = state.carray.countEqChannelBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
+                    of ceArgmax:
+                        # Argmax binding: evaluate input expressions and find max index
+                        let binding = state.carray.argmaxChannelBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateArgmax(binding, state.assignment)
                     of ceElement:
                         # Element binding: evaluate index expression and look up array
                         let bindingPtr = addr state.carray.channelBindings[bindings[ci]]

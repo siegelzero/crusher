@@ -43,6 +43,7 @@ type
         ceElement    ## Regular element channel binding
         ceMinMax     ## FlatMinMax channel binding
         ceCountEq    ## CountEq channel binding
+        ceArgmax     ## Argmax channel binding
 
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
@@ -1128,6 +1129,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for binding in carray.conditionalCountEqChannelBindings:
         state.assignment[binding.channelPosition] = evaluateConditionalCountEq(binding, state.assignment)
 
+    # Compute argmax channel initial values
+    for binding in carray.argmaxChannelBindings:
+        state.assignment[binding.channelPosition] = evaluateArgmax(binding, state.assignment)
+
     # Compute inverse channel initial values from forward assignments
     for group in carray.inverseChannelGroups:
         let newInverse = group.recomputeInverse(state.assignment)
@@ -1367,7 +1372,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for pos in state.searchPositions:
             if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition or
                pos in carray.countEqChannelsAtPosition or pos in carray.conditionalCountEqChannelsAtPosition or
-               pos in carray.inverseChannelsAtPosition:
+               pos in carray.inverseChannelsAtPosition or pos in carray.argmaxChannelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -1435,6 +1440,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             if ipos notin visited:
                                 visited.incl(ipos)
                                 worklist.add(ipos)
+                # Argmax channel bindings
+                if p in carray.argmaxChannelsAtPosition:
+                    for bi in carray.argmaxChannelsAtPosition[p]:
+                        let binding = carray.argmaxChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
             # Collect channel-dep constraints reachable from this position
             var seen: PackedSet[int]  # dedup by constraint pointer
             var relevant: seq[StatefulConstraint[T]] = @[]
@@ -1804,6 +1818,21 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
+                # Argmax channel bindings: include in cascade as dynamic entries
+                if p in carray.argmaxChannelsAtPosition:
+                    for bi in carray.argmaxChannelsAtPosition[p]:
+                        let binding = carray.argmaxChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false  # argmax depends on non-local positions
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)  # index into argmaxChannelBindings
+                        topoEntryKind.add(ceArgmax)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
                 # conditionalCountEq/inverse channels can't be batched — reject topology
                 if p in carray.conditionalCountEqChannelsAtPosition:
                     canBuild = false
@@ -1815,7 +1844,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Mark deep-cascade-failed positions as lazy to avoid per-iteration
                 # full recomputation in applyUniformDelta. These positions will use
                 # on-demand costDelta evaluation in bestMoves instead.
-                if topoOrder.len >= MaxCascadeChans:
+                # Only mark lazy if domain is large enough to justify skipping penalty maps.
+                if topoOrder.len >= MaxCascadeChans and state.sharedDomain[][pos].len > LazyThreshold:
                     state.isLazy[pos] = true
                     inc cascadeDepthFail
                 continue
@@ -1912,6 +1942,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)  # treat like element deps for dirty tracking
+                of ceArgmax:
+                    let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.inputPositions.items:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
                 of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
@@ -1960,6 +1996,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 of ceCountEq:
                     let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
+                of ceArgmax:
+                    let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.inputPositions.items:
                         if srcPos != pos: inputs.incl(srcPos)
                 of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
@@ -2129,11 +2169,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # so a single-move delta of 0 doesn't guarantee the constraint won't be
         # violated after multiple moves (e.g., cnt[N] <= 5 when N count is low).
         if state.hasChannelDeps:
-            # Build set of countEq channel positions for tautology exclusion
+            # Build set of countEq/argmax channel positions for tautology exclusion
             var countEqPositions: PackedSet[int]
             for binding in carray.countEqChannelBindings:
                 countEqPositions.incl(binding.channelPosition)
             for binding in carray.conditionalCountEqChannelBindings:
+                countEqPositions.incl(binding.channelPosition)
+            for binding in carray.argmaxChannelBindings:
                 countEqPositions.incl(binding.channelPosition)
 
             var tautCount = 0
@@ -2390,6 +2432,32 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
+        # Argmax channel bindings
+        if pos in state.carray.argmaxChannelsAtPosition:
+            for bi in state.carray.argmaxChannelsAtPosition[pos]:
+                let binding = state.carray.argmaxChannelBindings[bi]
+                let newVal = evaluateArgmax(binding, state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    result = true
+                    changedChannels.add(binding.channelPosition)
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
+                    state.updateNeighborPenalties(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
         # Inverse channel bindings: recompute inverse from forward assignments
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
@@ -2485,6 +2553,21 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
             for bi in state.carray.conditionalCountEqChannelsAtPosition[pos]:
                 let binding = state.carray.conditionalCountEqChannelBindings[bi]
                 let newVal = evaluateConditionalCountEq(binding, state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
+        # Argmax channel bindings (lean: no penalty maps or violationCount)
+        if pos in state.carray.argmaxChannelsAtPosition:
+            for bi in state.carray.argmaxChannelsAtPosition[pos]:
+                let binding = state.carray.argmaxChannelBindings[bi]
+                let newVal = evaluateArgmax(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     for c in state.constraintsAtPosition[binding.channelPosition]:

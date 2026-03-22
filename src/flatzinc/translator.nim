@@ -1110,14 +1110,25 @@ proc translate*(model: FznModel): FznTranslator =
             let targetPos = result.varPositions[pattern.targetVarName]
             result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
         elif ci in result.argmaxPatterns:
-            # Emit element constraint for detected argmax pattern: signal_array[tower-1] == max_signal
+            # Emit argmax channel binding: tower = argmax(signals) + valueOffset
             let p = result.argmaxPatterns[ci]
-            let indexExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.towerVarName)) - 1
-            var signalExprs: seq[AlgebraicExpression[int]]
-            for sn in p.signalVarNames:
-                signalExprs.add(result.resolveExprArg(FznExpr(kind: FznIdent, ident: sn)))
-            let maxExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.maxVarName))
-            result.sys.addConstraint(elementExpr(indexExpr, signalExprs, maxExpr))
+            if p.towerVarName in result.varPositions:
+                let towerPos = result.varPositions[p.towerVarName]
+                var signalExprs: seq[AlgebraicExpression[int]]
+                for sn in p.signalVarNames:
+                    signalExprs.add(result.resolveExprArg(FznExpr(kind: FznIdent, ident: sn)))
+                let towerDomain = result.sys.baseArray.domain[towerPos]
+                let valueOffset = towerDomain[0]  # min tower value (e.g., 1 for 1-based)
+                result.sys.baseArray.addArgmaxChannelBinding(towerPos, signalExprs, valueOffset)
+                result.channelVarNames.incl(p.towerVarName)
+            else:
+                # Fallback: emit element constraint as before
+                let indexExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.towerVarName)) - 1
+                var signalExprs: seq[AlgebraicExpression[int]]
+                for sn in p.signalVarNames:
+                    signalExprs.add(result.resolveExprArg(FznExpr(kind: FznIdent, ident: sn)))
+                let maxExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.maxVarName))
+                result.sys.addConstraint(elementExpr(indexExpr, signalExprs, maxExpr))
         else:
             inc nTranslated
             result.translateConstraint(con)

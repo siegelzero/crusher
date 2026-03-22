@@ -44,6 +44,12 @@ type
         primaryOnlyPositions*: seq[int]  # Positions checked only against targetValue (no filter)
         constantOffset*: T          # Count from constant matches
 
+    ArgmaxChannelBinding*[T] = object
+        channelPosition*: int       # Position of the argmax result variable
+        inputExprs*: seq[AlgebraicExpression[T]]  # Signal expressions (ordered by index)
+        inputPositions*: PackedSet[int]  # Union of all input expression positions
+        valueOffset*: int           # result = argmax_index + valueOffset (e.g., 1 for 1-based)
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -88,6 +94,8 @@ type
         countEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [countEq binding indices]
         conditionalCountEqChannelBindings*: seq[ConditionalCountEqChannelBinding[T]]
         conditionalCountEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [condCountEq binding indices]
+        argmaxChannelBindings*: seq[ArgmaxChannelBinding[T]]
+        argmaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [argmax binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -321,6 +329,29 @@ proc addConditionalCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.conditionalCountEqChannelsAtPosition[pos] = @[bindingIdx]
         elif bindingIdx notin arr.conditionalCountEqChannelsAtPosition[pos]:
             arr.conditionalCountEqChannelsAtPosition[pos].add(bindingIdx)
+
+proc addArgmaxChannelBinding*[T](arr: var ConstrainedArray[T],
+                                   channelPos: int,
+                                   inputExprs: seq[AlgebraicExpression[T]],
+                                   valueOffset: int) =
+    ## Register an argmax channel: channelPos = valueOffset + index of first maximum in inputExprs.
+    var allPositions: PackedSet[int]
+    for expr in inputExprs:
+        for p in expr.positions.items:
+            allPositions.incl(p)
+    let bindingIdx = arr.argmaxChannelBindings.len
+    arr.argmaxChannelBindings.add(ArgmaxChannelBinding[T](
+        channelPosition: channelPos,
+        inputExprs: inputExprs,
+        inputPositions: allPositions,
+        valueOffset: valueOffset
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in allPositions.items:
+        if pos notin arr.argmaxChannelsAtPosition:
+            arr.argmaxChannelsAtPosition[pos] = @[bindingIdx]
+        elif bindingIdx notin arr.argmaxChannelsAtPosition[pos]:
+            arr.argmaxChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -4238,6 +4269,20 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Conditional count-equals channel bindings are all value types — shallow copy is fine
     result.conditionalCountEqChannelBindings = arr.conditionalCountEqChannelBindings
     result.conditionalCountEqChannelsAtPosition = arr.conditionalCountEqChannelsAtPosition
+
+    # Deep copy argmax channel bindings — AlgebraicExpression refs need deep copy
+    result.argmaxChannelBindings = newSeq[ArgmaxChannelBinding[T]](arr.argmaxChannelBindings.len)
+    for i, binding in arr.argmaxChannelBindings:
+        var exprs = newSeq[AlgebraicExpression[T]](binding.inputExprs.len)
+        for j, expr in binding.inputExprs:
+            exprs[j] = expr.deepCopy()
+        result.argmaxChannelBindings[i] = ArgmaxChannelBinding[T](
+            channelPosition: binding.channelPosition,
+            inputExprs: exprs,
+            inputPositions: binding.inputPositions,
+            valueOffset: binding.valueOffset
+        )
+    result.argmaxChannelsAtPosition = arr.argmaxChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups
