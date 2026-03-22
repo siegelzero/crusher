@@ -832,13 +832,13 @@ proc substituteChannelVarsInClauses(tr: var FznTranslator) =
         # Only handle 2-input channels
         if inputVars.len != 2: continue
 
-        # channelVar = (-coeff1/chCoeff)*v1 + (-coeff2/chCoeff)*v2 + (-rhs/chCoeff)
+        # channelVar = (-coeff1/chCoeff)*v1 + (-coeff2/chCoeff)*v2 + rhs/chCoeff
         # Only handle chCoeff = -1 or 1 for integer division
         if chCoeff != -1 and chCoeff != 1: continue
         let scale = -chCoeff  # 1 if chCoeff=-1, -1 if chCoeff=1
         let c1 = scale * inputCoeffs[0]
         let c2 = scale * inputCoeffs[1]
-        let offset = scale * rhs  # channelVar = c1*v1 + c2*v2 + offset
+        let offset = -scale * rhs  # channelVar = c1*v1 + c2*v2 + offset
 
         let def = LinearChannelDef(
             inputVar1: inputVars[0], inputVar2: inputVars[1],

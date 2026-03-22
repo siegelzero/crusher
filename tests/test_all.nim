@@ -5,6 +5,7 @@ import test_atleast
 import test_atmost
 import test_boolean_constraints
 import test_channel_dependencies
+import test_channel_substitution
 import test_circuit
 import test_conditional_count_eq_channels
 import test_connected
