@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap, circuitTimeProp
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -300,6 +300,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ValueSupport Constraint"
         of MultiResourceNoOverlapType:
             return "MultiResourceNoOverlap Constraint"
+        of CircuitTimePropType:
+            return "CircuitTimeProp Constraint"
 
 ################################################################################
 # Evaluation
@@ -371,6 +373,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.valueSupportState.cost
         of MultiResourceNoOverlapType:
             return constraint.multiResourceNoOverlapState.cost
+        of CircuitTimePropType:
+            return constraint.circuitTimePropState.cost
 
 ################################################################################
 # Computed Constraints
@@ -990,6 +994,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.valueSupportState.initialize(assignment)
         of MultiResourceNoOverlapType:
             constraint.multiResourceNoOverlapState.initialize(assignment)
+        of CircuitTimePropType:
+            constraint.circuitTimePropState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1058,6 +1064,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.valueSupportState.moveDelta(position, oldValue, newValue)
         of MultiResourceNoOverlapType:
             constraint.multiResourceNoOverlapState.moveDelta(position, oldValue, newValue)
+        of CircuitTimePropType:
+            constraint.circuitTimePropState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1126,6 +1134,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.valueSupportState.updatePosition(position, newValue)
         of MultiResourceNoOverlapType:
             constraint.multiResourceNoOverlapState.updatePosition(position, newValue)
+        of CircuitTimePropType:
+            constraint.circuitTimePropState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1785,6 +1795,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: MultiResourceNoOverlapType,
                 multiResourceNoOverlapState: constraint.multiResourceNoOverlapState.deepCopy()
+            )
+        of CircuitTimePropType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: CircuitTimePropType,
+                circuitTimePropState: constraint.circuitTimePropState.deepCopy()
             )
 
 
@@ -2512,4 +2528,26 @@ func valueSupport*[T](cellPos: int, neighbourPositions: seq[int], maxVal: T): St
         positions: c.allPositions,
         stateType: ValueSupportType,
         valueSupportState: c
+    )
+
+################################################################################
+# CircuitTimeProp wrapper function
+################################################################################
+
+func circuitTimeProp*[T](
+        predPositions: openArray[int],
+        distanceMatrix: seq[seq[T]],
+        earlyTimes, lateTimes: seq[T],
+        depotIndex: int,
+        depotDeparture: T,
+        arrivalPositions, departurePositions: seq[int],
+        valueOffset: int = 1
+    ): StatefulConstraint[T] =
+    let c = newCircuitTimePropConstraint[T](
+        predPositions, distanceMatrix, earlyTimes, lateTimes,
+        depotIndex, depotDeparture, arrivalPositions, departurePositions, valueOffset)
+    return StatefulConstraint[T](
+        positions: c.positions,
+        stateType: CircuitTimePropType,
+        circuitTimePropState: c
     )

@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp
 
 ################################################################################
 # Shared constraint type definitions
@@ -40,7 +40,8 @@ type
         ConditionalDayCapacityType,
         DisjunctiveClauseType,
         ValueSupportType,
-        MultiResourceNoOverlapType
+        MultiResourceNoOverlapType,
+        CircuitTimePropType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -137,3 +138,5 @@ type
                 valueSupportState*: ValueSupportConstraint[T]
             of MultiResourceNoOverlapType:
                 multiResourceNoOverlapState*: MultiResourceNoOverlapConstraint[T]
+            of CircuitTimePropType:
+                circuitTimePropState*: CircuitTimePropConstraint[T]

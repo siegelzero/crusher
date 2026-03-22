@@ -417,6 +417,17 @@ type
         nandBoolPairs*: HashSet[tuple[a, b: string]]
         # Maps bool2int output var name → input bool var name
         bool2intSourceMap*: Table[string, string]
+        # Detected circuit-time-propagation pattern (TSPTW/VRP)
+        circuitTimePropDetected*: bool
+        circuitTimePropPredVars*: seq[string]
+        circuitTimePropDistMatrix*: seq[seq[int]]
+        circuitTimePropEarlyTimes*: seq[int]
+        circuitTimePropLateTimes*: seq[int]
+        circuitTimePropDepotIdx*: int
+        circuitTimePropDepotDep*: int
+        circuitTimePropArrivalVars*: seq[string]
+        circuitTimePropDepartureVars*: seq[string]
+        circuitTimePropConsumedCIs*: PackedSet[int]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -719,6 +730,7 @@ include translatorDefinedVars
 include translatorChannels
 include translatorPatterns
 include translatorScheduling
+include translatorCircuitTime
 
 proc translate*(model: FznModel): FznTranslator =
     ## Translates a complete FznModel to a ConstraintSystem.
@@ -765,6 +777,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.presolve()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
+    # Detect circuit-time-propagation pattern (TSPTW/VRP: circuit + element chains + time windows)
+    # MUST run before other detection to consume circuit + element + int_lin_eq + int_max early
+    result.detectCircuitTimePropagation()
     # Detect net flow pairs (EFM / metabolic network: paired vars with tree-structured constraints)
     # MUST run before other detection to consume stoichiometry + reversibility constraints early
     result.detectNetFlowPairs()
@@ -878,6 +893,8 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
     result.translateVariables()
+    # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
+    result.emitCircuitTimePropConstraint()
     # Create net flow variables and channel bindings (after translateVariables so V positions exist)
     if result.netFlowFreePairs.len > 0:
         result.buildNetFlowVariables()

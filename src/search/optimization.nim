@@ -2,6 +2,7 @@
 import resolution
 from std/times import epochTime
 import std/packedsets
+import ../constraints/[types, circuitTimeProp]
 
 proc copyPackedSet(src: PackedSet[int]): PackedSet[int] =
     ## Force a deep copy of a PackedSet to avoid shared Trunk refs under ARC.
@@ -166,6 +167,13 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             else:
                 system.addConstraint(objective >= target)
             hasBoundConstraint = true
+            # Set objective bound on CircuitTimeProp constraints (if any)
+            for c in system.baseArray.constraints:
+                if c.stateType == CircuitTimePropType:
+                    when direction == Minimize:
+                        c.circuitTimePropState.setObjectiveBound(target)
+                    else:
+                        c.circuitTimePropState.clearObjectiveBound()
             system.baseArray.reducedDomain = baseReducedDomain
             system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
             system.baseArray.tightenReducedDomain()
@@ -271,6 +279,13 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     system.addConstraint(objective >= currentCost + 1)
                 hasBoundConstraint = true
+                # Set objective bound on CircuitTimeProp constraints (retry loop)
+                for c in system.baseArray.constraints:
+                    if c.stateType == CircuitTimePropType:
+                        when direction == Minimize:
+                            c.circuitTimePropState.setObjectiveBound(currentCost - 1)
+                        else:
+                            c.circuitTimePropState.clearObjectiveBound()
                 system.baseArray.reducedDomain = baseReducedDomain
                 system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
                 system.baseArray.tightenReducedDomain()

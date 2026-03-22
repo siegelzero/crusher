@@ -1125,7 +1125,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType:
                     # Skip these constraint types for domain reduction
                     continue
 

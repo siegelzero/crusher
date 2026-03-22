@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap, circuitTimeProp]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -153,6 +153,9 @@ type
         inverseForcedChanges*: seq[(int, int, int)]  # buffer: (pos, oldVal, newVal)
         inverseSavedBuf*: seq[(int, T)]           # reusable buffer for computeChannelDepDelta
         forcedChannelsBuf2*: seq[int]             # reusable buffer for forced position channel propagation
+
+        # Circuit-time-prop writeback: after updatePosition, write computed times to assignment
+        circuitTimePropConstraints*: seq[CircuitTimePropConstraint[T]]
 
         # Channel-dep optimized simulation state (position-indexed arrays instead of hash tables)
         cdIsChanged: seq[bool]           # position-indexed, true if changed during simulation
@@ -337,6 +340,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.valueSupportState.moveDelta(position, oldValue, newValue)
         of MultiResourceNoOverlapType:
             result = constraint.multiResourceNoOverlapState.moveDelta(position, oldValue, newValue)
+        of CircuitTimePropType:
+            result = constraint.circuitTimePropState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -926,6 +931,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for constraint in state.constraints:
         for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
+        # Collect CircuitTimeProp constraints for writeback
+        if constraint.stateType == CircuitTimePropType:
+            state.circuitTimePropConstraints.add(constraint.circuitTimePropState)
 
     # Build O(1) constraint index lookup
     state.constraintIdxAt = newSeq[Table[pointer, int]](carray.len)
@@ -2621,6 +2629,15 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
         let newPenalty = constraint.penalty()
         state.cost += newPenalty - oldPenalty
 
+    # Circuit-time-prop writeback (lean path)
+    for ctc in state.circuitTimePropConstraints:
+        if position in ctc.positionToIndex:
+            for i in 0..<ctc.n:
+                if ctc.arrivalPositions[i] >= 0:
+                    state.assignment[ctc.arrivalPositions[i]] = ctc.arrivalTime[i]
+                if ctc.departurePositions[i] >= 0:
+                    state.assignment[ctc.departurePositions[i]] = ctc.departureTime[i]
+
     # Apply forced changes from inverse group compound move
     if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
         state.computeInverseForcedChanges(position, value, oldValueLean, oldValueProvided = true)
@@ -2655,6 +2672,15 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         elif oldPenalty == 0 and newPenalty > 0:
             for pos in constraint.positions.items:
                 state.violationCount[pos] += 1
+
+    # Circuit-time-prop writeback: copy computed times to assignment positions
+    for ctc in state.circuitTimePropConstraints:
+        if position in ctc.positionToIndex:
+            for i in 0..<ctc.n:
+                if ctc.arrivalPositions[i] >= 0:
+                    state.assignment[ctc.arrivalPositions[i]] = ctc.arrivalTime[i]
+                if ctc.departurePositions[i] >= 0:
+                    state.assignment[ctc.departurePositions[i]] = ctc.departureTime[i]
 
     # Apply forced changes from inverse group compound move
     let hasInverseMove = state.inverseEnabled and state.posToInverseGroup[position] >= 0
