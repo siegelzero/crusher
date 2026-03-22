@@ -5623,12 +5623,19 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
         if targetVar in tr.channelVarNames or targetVar in tr.definedVarNames: continue
 
         # Determine the effective condition channel
+        # The condition can be a channel OR a boolean search variable
         var condChannel = ""
         if negArg.elems.len == 1:
-            # Single negative literal: must be a channel
+            # Single negative literal: must be a boolean variable (channel or search)
             let negLit = negArg.elems[0]
-            if negLit.kind != FznIdent or negLit.ident notin tr.channelVarNames: continue
-            condChannel = negLit.ident
+            if negLit.kind != FznIdent: continue
+            let negId = negLit.ident
+            if negId in tr.paramValues or negId in tr.definedVarNames: continue
+            # Verify boolean domain
+            if negId notin tr.channelVarNames:
+                let negDomain = tr.lookupVarDomain(negId)
+                if negDomain != @[0, 1]: continue
+            condChannel = negId
         else:
             # Multi-negative: all must be channels, AND their conjunction must be a known channel
             var negVars: seq[string]
@@ -5797,6 +5804,224 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
 
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool-gated variable channels")
+
+proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
+    ## Detects conditional expression channels from optional variable decomposition:
+    ##   target = if occurs then linear_expression else constant
+    ##
+    ## Pattern in FlatZinc:
+    ##   int_eq_reif(target, constVal, isConstBool)     :: defines_var(isConstBool)
+    ##   int_lin_eq_reif(coeffs, [target,...], rhs, eqBool) :: defines_var(eqBool)
+    ##   bool_clause([occurs, isConstBool], [])           -- ¬occurs → target == constVal
+    ##   array_bool_and([occurs, eqBool], combined)       -- combined = occurs ∧ eqBool
+    ##
+    ## When detected, creates a synthetic channel for the expression value and a
+    ## BoolGated binding for target = element(occurs, [constVal, synthChannel]).
+    ##
+    ## Must run AFTER detectBoolGatedVariableChannels and detectLinEqReifChannels.
+
+    # Step 1: Build map from isConstBool → (targetVar, constVal, constraintIdx)
+    # from int_eq_reif(target, const, isConstBool) :: defines_var(isConstBool)
+    type EqReifConstEntry = object
+        targetVar: string
+        constVal: int
+        ci: int
+
+    var eqReifConstMap: Table[string, EqReifConstEntry]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        if con.args[1].kind != FznIntLit: continue  # must be constant testVal
+        let targetVar = con.args[0].ident
+        let constVal = con.args[1].intVal
+        let boolVar = con.args[2].ident
+        eqReifConstMap[boolVar] = EqReifConstEntry(
+            targetVar: targetVar, constVal: constVal, ci: ci)
+
+    # Step 2: Build map from eqBool → (targetVar, exprVars, exprCoeffs, exprRhs, ci)
+    # from int_lin_eq_reif(coeffs, vars, rhs, eqBool) :: defines_var(eqBool)
+    # where target is one of vars with coefficient ±1.
+    type LinEqReifExprEntry = object
+        targetVar: string
+        exprVars: seq[string]   # other variables (not target)
+        exprCoeffs: seq[int]    # coefficients after isolating target
+        exprRhs: int            # constant offset after isolating target
+        ci: int
+
+    var linEqReifExprMap: Table[string, LinEqReifExprEntry]
+    for ci in tr.linEqReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq_reif": continue
+        if con.args.len < 4: continue
+        if con.args[3].kind != FznIdent: continue
+        let eqBool = con.args[3].ident
+        let coeffsArg = con.args[0]
+        let varsArg = con.args[1]
+        let rhs = tr.resolveIntArg(con.args[2])
+
+        # Resolve coefficients and variable names
+        var coeffs: seq[int]
+        if coeffsArg.kind == FznArrayLit:
+            for e in coeffsArg.elems:
+                if e.kind == FznIntLit: coeffs.add(e.intVal)
+                else: break
+        elif coeffsArg.kind == FznIdent and coeffsArg.ident in tr.paramValues:
+            # Array parameter - skip for now (rare)
+            continue
+        else:
+            let resolved = tr.resolveIntArray(coeffsArg)
+            coeffs = resolved
+        var varNames: seq[string]
+        if varsArg.kind == FznArrayLit:
+            for e in varsArg.elems:
+                if e.kind == FznIdent: varNames.add(e.ident)
+                else: break
+        if coeffs.len != varNames.len or coeffs.len < 2: continue
+
+        # Find a variable with coefficient ±1 that is NOT a channel and NOT a defined var
+        var targetIdx = -1
+        for i in 0..<varNames.len:
+            if (coeffs[i] == 1 or coeffs[i] == -1) and
+               varNames[i] notin tr.channelVarNames and
+               varNames[i] notin tr.definedVarNames:
+                targetIdx = i
+                break
+        if targetIdx < 0: continue
+
+        let targetCoeff = coeffs[targetIdx]
+        let targetVar = varNames[targetIdx]
+
+        # Isolate: target = (rhs - sum of other terms) / targetCoeff
+        var exprVars: seq[string]
+        var exprCoeffs: seq[int]
+        for i in 0..<varNames.len:
+            if i == targetIdx: continue
+            exprVars.add(varNames[i])
+            if targetCoeff == 1:
+                exprCoeffs.add(-coeffs[i])
+            else:  # targetCoeff == -1
+                exprCoeffs.add(coeffs[i])
+        let exprRhs = if targetCoeff == 1: rhs else: -rhs
+
+        linEqReifExprMap[eqBool] = LinEqReifExprEntry(
+            targetVar: targetVar,
+            exprVars: exprVars,
+            exprCoeffs: exprCoeffs,
+            exprRhs: exprRhs,
+            ci: ci)
+
+    if linEqReifExprMap.len == 0: return
+
+    # Step 3: Find bool_clause([occurs, isConstBool], []) patterns and match.
+    # Build a map: targetVar → (occurs, constVal, clauseCI)
+    type DefaultEntry = object
+        occursVar: string
+        constVal: int
+        clauseCI: int
+        eqReifCI: int
+
+    var defaultsByTarget: Table[string, DefaultEntry]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 2 or negArg.elems.len != 0: continue
+        if posArg.elems[0].kind != FznIdent or posArg.elems[1].kind != FznIdent: continue
+
+        # Check both orderings: [occurs, isConstBool] or [isConstBool, occurs]
+        let litA = posArg.elems[0].ident
+        let litB = posArg.elems[1].ident
+
+        for (candidateConst, candidateOccurs) in [(litA, litB), (litB, litA)]:
+            if candidateConst notin eqReifConstMap: continue
+            # occurs variable must be boolean and not a parameter
+            if candidateOccurs in tr.paramValues: continue
+            if candidateOccurs in tr.definedVarNames: continue
+            let occursDomain = tr.lookupVarDomain(candidateOccurs)
+            if occursDomain.len == 0: continue
+            if occursDomain != @[0, 1]: continue
+            let eqEntry = eqReifConstMap[candidateConst]
+            let targetVar = eqEntry.targetVar
+            if targetVar in tr.channelVarNames or targetVar in tr.definedVarNames: continue
+            if targetVar in defaultsByTarget: continue  # already found
+            defaultsByTarget[targetVar] = DefaultEntry(
+                occursVar: candidateOccurs,
+                constVal: eqEntry.constVal,
+                clauseCI: ci,
+                eqReifCI: eqEntry.ci)
+
+    if defaultsByTarget.len == 0: return
+
+    # Step 4: Match targets that appear in BOTH defaultsByTarget and linEqReifExprMap.
+    # Verify that occurs and eqBool are linked via array_bool_and.
+    var andChannelInputs: Table[string, seq[string]]  # resultVar → inputVars
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_and": continue
+        if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+        let resultVar = con.args[1].ident
+        let arrArg = con.args[0]
+        if arrArg.kind != FznArrayLit: continue
+        var inputs: seq[string]
+        for elem in arrArg.elems:
+            if elem.kind == FznIdent: inputs.add(elem.ident)
+        andChannelInputs[resultVar] = inputs
+
+    # Also build reverse: for each pair of inputs, find if there's an AND channel
+    var andByInputPair: Table[tuple[a, b: string], string]
+    for resultVar, inputs in andChannelInputs:
+        if inputs.len == 2:
+            andByInputPair[(inputs[0], inputs[1])] = resultVar
+            andByInputPair[(inputs[1], inputs[0])] = resultVar
+
+    var detected = 0
+    for eqBool, exprEntry in linEqReifExprMap:
+        let targetVar = exprEntry.targetVar
+        if targetVar notin defaultsByTarget: continue
+        if targetVar in tr.channelVarNames: continue  # may have been channelized already
+
+        let defEntry = defaultsByTarget[targetVar]
+
+        # Verify: occurs and eqBool must be linked via array_bool_and
+        let pair = (defEntry.occursVar, eqBool)
+        if pair notin andByInputPair: continue
+
+        # All checks passed. Verify expression variables are resolvable
+        # (must be params, defined vars, channels, or regular vars that will get positions)
+        var allResolvable = true
+        for v in exprEntry.exprVars:
+            if v notin tr.definedVarNames and v notin tr.definedVarExprs and
+               v notin tr.paramValues and v notin tr.channelVarNames:
+                # Must be a known variable (will get a position during translation)
+                let vDomain = tr.lookupVarDomain(v)
+                if vDomain.len == 0:
+                    allResolvable = false
+                    break
+        if not allResolvable: continue
+
+        # Record the detection
+        tr.boolGatedExprChannelDefs.add((
+            targetVar: targetVar,
+            condVar: defEntry.occursVar,
+            exprVars: exprEntry.exprVars,
+            exprCoeffs: exprEntry.exprCoeffs,
+            exprRhs: exprEntry.exprRhs,
+            constValue: defEntry.constVal,
+            consumedCIs: @[defEntry.clauseCI]))
+        tr.channelVarNames.incl(targetVar)
+        tr.definingConstraints.incl(defEntry.clauseCI)
+        inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} conditional expression channels")
 
 proc detectOverlapChannels*(tr: var FznTranslator) =
     ## Detects overlap variables connected to time-separation channels through bool_not.

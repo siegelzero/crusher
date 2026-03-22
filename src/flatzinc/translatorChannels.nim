@@ -2483,6 +2483,142 @@ proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
     if builtVV > 0:
         stderr.writeLine(&"[FZN] Built {builtVV} bool-gated variable-default channel bindings")
 
+proc buildConditionalExpressionChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for conditional expression channels detected by
+    ## detectConditionalExpressionChannels().
+    ##
+    ## For target = if cond then (c1*v1 + c2*v2 + ... + rhs) else constValue:
+    ##   1. Allocate a synthetic channel position for the expression value
+    ##   2. Create identity element binding: synthPos = element(expr, [lo, lo+1, ..., hi])
+    ##   3. Create BoolGated binding: target = element(cond, [constValue, synthPos])
+
+    var built = 0
+    for def in tr.boolGatedExprChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.condVar notin tr.varPositions:
+            if def.condVar notin tr.definedVarExprs: continue
+
+        let targetPos = tr.varPositions[def.targetVar]
+
+        # Build the expression: c1*v1 + c2*v2 + ... + rhs
+        var exprNode: ExpressionNode[int] = nil
+        var exprPositions: PackedSet[int]
+
+        for i in 0..<def.exprVars.len:
+            let v = def.exprVars[i]
+            let c = def.exprCoeffs[i]
+            var termNode: ExpressionNode[int]
+
+            if v in tr.definedVarExprs:
+                let vExpr = tr.definedVarExprs[v]
+                if c == 1:
+                    termNode = vExpr.node
+                elif c == -1:
+                    termNode = ExpressionNode[int](kind: UnaryOpNode, unaryOp: Negation,
+                                                    target: vExpr.node)
+                else:
+                    termNode = ExpressionNode[int](kind: BinaryOpNode, binaryOp: Multiplication,
+                        left: ExpressionNode[int](kind: LiteralNode, value: c),
+                        right: vExpr.node)
+                exprPositions = exprPositions + vExpr.positions
+            elif v in tr.varPositions:
+                let pos = tr.varPositions[v]
+                let refNode = ExpressionNode[int](kind: RefNode, position: pos)
+                if c == 1:
+                    termNode = refNode
+                elif c == -1:
+                    termNode = ExpressionNode[int](kind: UnaryOpNode, unaryOp: Negation,
+                                                    target: refNode)
+                else:
+                    termNode = ExpressionNode[int](kind: BinaryOpNode, binaryOp: Multiplication,
+                        left: ExpressionNode[int](kind: LiteralNode, value: c),
+                        right: refNode)
+                exprPositions.incl(pos)
+            elif v in tr.paramValues:
+                let val = c * tr.paramValues[v]
+                termNode = ExpressionNode[int](kind: LiteralNode, value: val)
+            else:
+                break  # unresolvable variable, skip this def
+
+            if exprNode == nil:
+                exprNode = termNode
+            else:
+                exprNode = ExpressionNode[int](kind: BinaryOpNode, binaryOp: Addition,
+                    left: exprNode, right: termNode)
+
+        if exprNode == nil: continue
+
+        # Add constant offset (rhs)
+        if def.exprRhs != 0:
+            exprNode = ExpressionNode[int](kind: BinaryOpNode, binaryOp: Addition,
+                left: exprNode,
+                right: ExpressionNode[int](kind: LiteralNode, value: def.exprRhs))
+
+        let fullExpr = AlgebraicExpression[int](
+            node: exprNode,
+            positions: exprPositions,
+            linear: true)
+
+        # Compute domain range of the expression for the identity array.
+        # Use the target variable's domain as the range (it was declared with correct bounds).
+        let targetDomain = tr.lookupVarDomain(def.targetVar)
+        if targetDomain.len == 0: continue
+        let domLo = targetDomain[0]
+        let domHi = targetDomain[^1]
+        # Expression domain may differ from target domain (target includes constValue).
+        # Use expression range: exclude constValue, or just use target domain range.
+        # The identity array maps [domLo..domHi] to themselves.
+        let arrayLen = domHi - domLo + 1
+        if arrayLen <= 0 or arrayLen > 100_000: continue  # sanity check
+
+        # Allocate synthetic channel position for expression value
+        let synthPos = tr.sys.baseArray.len
+        let synthVar = tr.sys.newConstrainedVariable()
+        # Set domain to full expression range
+        var synthDomain: seq[int]
+        for v in domLo..domHi:
+            synthDomain.add(v)
+        synthVar.setDomain(synthDomain)
+        tr.sys.baseArray.channelPositions.incl(synthPos)
+
+        # Build identity element binding for synthetic position:
+        # synthPos = element(expr - domLo, [domLo, domLo+1, ..., domHi])
+        var identityArray: seq[ArrayElement[int]]
+        for v in domLo..domHi:
+            identityArray.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        # Adjust expression to be 0-based index into identity array
+        var indexExpr: AlgebraicExpression[int]
+        if domLo != 0:
+            let shiftedNode = ExpressionNode[int](kind: BinaryOpNode, binaryOp: Subtraction,
+                left: fullExpr.node,
+                right: ExpressionNode[int](kind: LiteralNode, value: domLo))
+            indexExpr = AlgebraicExpression[int](
+                node: shiftedNode,
+                positions: exprPositions,
+                linear: true)
+        else:
+            indexExpr = fullExpr
+
+        tr.sys.baseArray.addChannelBinding(synthPos, indexExpr, identityArray)
+
+        # Build BoolGated binding for target: element(cond, [constValue, synthPos])
+        let condExpr = if def.condVar in tr.varPositions:
+            tr.getExpr(tr.varPositions[def.condVar])
+        else:
+            tr.definedVarExprs[def.condVar]
+
+        let gatedArray = @[
+            ArrayElement[int](isConstant: true, constantValue: def.constValue),
+            ArrayElement[int](isConstant: false, variablePosition: synthPos)]
+
+        tr.sys.baseArray.addChannelBinding(targetPos, condExpr, gatedArray)
+        inc built
+
+    if built > 0:
+        let totalChannels = tr.sys.baseArray.channelPositions.len
+        stderr.writeLine(&"[FZN] Built {built} conditional expression channel bindings (total channels: {totalChannels})")
+
 proc buildNetFlowVariables*(tr: var FznTranslator) =
     ## Creates net_flow search variables for free pairs, defined expressions for dependent
     ## pairs, and channel bindings for V_in/V_out from net_flow.

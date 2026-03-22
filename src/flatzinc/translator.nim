@@ -405,6 +405,15 @@ type
         boolGatedVarChannelDefs*: seq[tuple[targetVar, condVar, valVar: string, constValue: int, consumedCIs: seq[int]]]
         # Bool-gated variable-default channel defs: x = if cond then y1 else y2 (both variables)
         boolGatedVarVarChannelDefs*: seq[tuple[targetVar, condVar, val1Var, val0Var: string]]
+        # Bool-gated expression channel defs: x = if cond then expression else constant
+        # Created when int_lin_eq_reif defines a conditional relationship with a linear expression
+        boolGatedExprChannelDefs*: seq[tuple[
+            targetVar, condVar: string,
+            exprVars: seq[string],  # variable names in the expression
+            exprCoeffs: seq[int],   # coefficients for each variable
+            exprRhs: int,           # constant offset (rhs of the linear equation)
+            constValue: int,        # default value when cond=false
+            consumedCIs: seq[int]]]
         # bool_eq_reif/bool_ne_reif channel defs: r = (a == b) or r = (a != b) for booleans
         boolEqReifChannelDefs*: seq[int]
         # Conditional binary channel defs: X = element(cond*2 + b2, [0,0,0,1]) (AND gate)
@@ -871,6 +880,10 @@ proc translate*(model: FznModel): FznTranslator =
             prevCount = result.caseAnalysisDefs.len
             result.detectCaseAnalysisChannels()
             inc iterations
+    # Detect conditional expression channels (optional variable decomposition patterns)
+    # target = if occurs then linear_expr else constant
+    # MUST run after detectLinEqReifChannels and detectBoolGatedVariableChannels
+    result.detectConditionalExpressionChannels()
     # Detect conditional variable-source channels (EVM step predicate patterns)
     # MUST run after case-analysis fixpoint (uses same eqReifMap) and before implication patterns
     result.detectConditionalSourceChannels()
@@ -1753,6 +1766,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildBoolEquivAliasBindings()
     # Build channel bindings for bool-gated variable channels (x = if cond then y else const)
     result.buildBoolGatedVarChannelBindings()
+    # Build channel bindings for conditional expression channels (x = if cond then expr else const)
+    result.buildConditionalExpressionChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for one-hot indicator variables
