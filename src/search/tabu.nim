@@ -1058,6 +1058,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         stderr.writeLine("[Init] Assignment init done, starting channel fixed-point (" & $carray.channelBindings.len & " bindings)...")
         stderr.flushFile()
 
+    # Compute argmax channel initial values early — argmax depends only on search
+    # variables (signal expressions), which are already assigned. Element channels
+    # may read from argmax outputs, so argmax must be set before the element fixed-point.
+    for binding in carray.argmaxChannelBindings:
+        state.assignment[binding.channelPosition] = evaluateArgmax(binding, state.assignment)
+
     # Compute channel variable initial values from their defining element constraints.
     # Iterate to fixed point: bindings may not be in topological order (e.g., bool2int
     # bindings for i_k are created before int_le_reif bindings for b_k that i_k depends on).
@@ -1128,10 +1134,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Compute conditional count-equals channel initial values
     for binding in carray.conditionalCountEqChannelBindings:
         state.assignment[binding.channelPosition] = evaluateConditionalCountEq(binding, state.assignment)
-
-    # Compute argmax channel initial values
-    for binding in carray.argmaxChannelBindings:
-        state.assignment[binding.channelPosition] = evaluateArgmax(binding, state.assignment)
 
     # Compute inverse channel initial values from forward assignments
     for group in carray.inverseChannelGroups:
@@ -1246,7 +1248,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                                 inWorklist[downstream] = true
                                 worklist.add(downstream)
 
-            # Re-evaluate element channels that may read from updated min/max channels
+            # Re-evaluate element and argmax channels that may read from updated min/max channels
             var elemChanged = false
             for binding in carray.channelBindings:
                 let idxVal = binding.indexExpression.evaluate(state.assignment)
@@ -1263,6 +1265,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                                 if not inWorklist[downstream]:
                                     inWorklist[downstream] = true
                                     worklist.add(downstream)
+            for binding in carray.argmaxChannelBindings:
+                let newVal = evaluateArgmax(binding, state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    elemChanged = true
+                    if binding.channelPosition in posToBindings:
+                        for downstream in posToBindings[binding.channelPosition]:
+                            if not inWorklist[downstream]:
+                                inWorklist[downstream] = true
+                                worklist.add(downstream)
             if not elemChanged:
                 break
 
@@ -2164,31 +2176,33 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # contributed non-zero delta across ALL (position, domainValue) evaluations.
         # Unlike checking penalty()==0 (which only reflects the current state),
         # this verifies that NO possible move could violate the constraint.
-        # Exception: constraints that reference countEq channel positions are never
-        # marked tautological. CountEq values aggregate across ALL search positions,
-        # so a single-move delta of 0 doesn't guarantee the constraint won't be
-        # violated after multiple moves (e.g., cnt[N] <= 5 when N count is low).
+        # Exception: constraints that reference aggregate channel positions
+        # (countEq, conditionalCountEq, argmax) are never marked tautological.
+        # These channels aggregate across ALL search positions, so a single-move
+        # delta of 0 doesn't guarantee the constraint won't be violated after
+        # multiple moves (e.g., cnt[N] <= 5 when N count is low, or argmax
+        # shifting when a different signal becomes dominant).
         if state.hasChannelDeps:
-            # Build set of countEq/argmax channel positions for tautology exclusion
-            var countEqPositions: PackedSet[int]
+            # Build set of aggregate channel positions for tautology exclusion
+            var aggregateChannelPositions: PackedSet[int]
             for binding in carray.countEqChannelBindings:
-                countEqPositions.incl(binding.channelPosition)
+                aggregateChannelPositions.incl(binding.channelPosition)
             for binding in carray.conditionalCountEqChannelBindings:
-                countEqPositions.incl(binding.channelPosition)
+                aggregateChannelPositions.incl(binding.channelPosition)
             for binding in carray.argmaxChannelBindings:
-                countEqPositions.incl(binding.channelPosition)
+                aggregateChannelPositions.incl(binding.channelPosition)
 
             var tautCount = 0
             for ci in 0..<state.channelDepConstraints.len:
                 if state.cdPerConstraintMaxDelta[ci] == 0:
-                    # Check if constraint references any countEq channel position
-                    var touchesCountEq = false
+                    # Check if constraint references any aggregate channel position
+                    var touchesAggregate = false
                     for p in state.channelDepConstraints[ci].positions.items:
-                        if p in countEqPositions:
-                            touchesCountEq = true
+                        if p in aggregateChannelPositions:
+                            touchesAggregate = true
                             break
-                    if touchesCountEq:
-                        continue  # Don't disable — countEq constraints can become non-tautological
+                    if touchesAggregate:
+                        continue  # Don't disable — aggregate channels can become non-tautological
                     state.channelDepConstraintActive[ci] = false
                     tautCount += 1
             if tautCount > 0:

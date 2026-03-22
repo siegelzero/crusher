@@ -1,6 +1,7 @@
 # Combined test runner - single compilation for all tests
 import test_agatha
 import test_all_different_except0
+import test_argmax_channels
 import test_atleast
 import test_atmost
 import test_boolean_constraints
