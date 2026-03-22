@@ -4212,7 +4212,8 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
         result.channelBindings[i] = ChannelBinding[T](
             channelPosition: binding.channelPosition,
             indexExpression: binding.indexExpression.deepCopy(),
-            arrayElements: binding.arrayElements
+            arrayElements: binding.arrayElements,
+            hasOffset: binding.hasOffset
         )
     result.channelsAtPosition = arr.channelsAtPosition
 

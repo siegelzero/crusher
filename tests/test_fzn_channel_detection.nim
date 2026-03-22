@@ -608,3 +608,68 @@ solve satisfy;
     check s1 == 4  # sel==1 → size1==4
     check s2 == 0  # sel!=2 → size2==0
     check s3 == 6  # sel==1 → size3==6
+
+
+suite "FlatZinc Element Channel Offset":
+
+  test "hasOffset flag set on binding with variable+offset elements":
+    ## Case-analysis channel where entries are variable+offset:
+    ## target = arr[sel] + 3  (for all sel values)
+    ## Encoded as complete case analysis with both sel==1 and sel==2:
+    ##   int_eq_reif(sel, 1, b_sel1) :: defines_var(b_sel1)
+    ##   int_eq_reif(sel, 2, b_sel2) :: defines_var(b_sel2)
+    ##   array_var_int_element(sel, [x1, x2], ch) :: defines_var(ch)
+    ##   int_lin_eq_reif([1,-1],[target,ch],3, b_lin1) :: defines_var(b_lin1)
+    ##   int_lin_eq_reif([1,-1],[target,ch],3, b_lin2) :: defines_var(b_lin2)
+    ##   bool_clause([b_lin1], [b_sel1])  — sel==1 → target == ch+3
+    ##   bool_clause([b_lin2], [b_sel2])  — sel==2 → target == ch+3
+    ## This should produce a case-analysis with varEntries for both cases.
+    let src = """
+var 1..2: sel :: output_var;
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..20: target :: output_var;
+var 0..10: ch :: var_is_introduced :: is_defined_var;
+var bool: b_sel1 :: var_is_introduced :: is_defined_var;
+var bool: b_sel2 :: var_is_introduced :: is_defined_var;
+var bool: b_lin1 :: var_is_introduced :: is_defined_var;
+var bool: b_lin2 :: var_is_introduced :: is_defined_var;
+array [1..2] of var int: arr :: var_is_introduced = [x1, x2];
+constraint int_eq_reif(sel, 1, b_sel1) :: defines_var(b_sel1);
+constraint int_eq_reif(sel, 2, b_sel2) :: defines_var(b_sel2);
+constraint array_var_int_element(sel, arr, ch) :: defines_var(ch);
+constraint int_lin_eq_reif([1,-1],[target,ch],3,b_lin1) :: defines_var(b_lin1);
+constraint int_lin_eq_reif([1,-1],[target,ch],3,b_lin2) :: defines_var(b_lin2);
+constraint bool_clause([b_lin1], [b_sel1]);
+constraint bool_clause([b_lin2], [b_sel2]);
+constraint int_eq(sel, 1);
+constraint int_eq(x1, 7);
+constraint int_eq(x2, 4);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Verify case-analysis detected variable entries
+    var foundVarEntry = false
+    for def in tr.caseAnalysisDefs:
+      if def.targetVarName == "target" and def.varEntries.len > 0:
+        foundVarEntry = true
+        break
+    check foundVarEntry
+
+    # Verify the hasOffset flag is set on the corresponding channel binding
+    var foundOffset = false
+    for binding in tr.sys.baseArray.channelBindings:
+      if binding.hasOffset:
+        foundOffset = true
+        break
+    check foundOffset
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let selVal = tr.sys.assignment[tr.varPositions["sel"]]
+    let x1Val = tr.sys.assignment[tr.varPositions["x1"]]
+    let tgtVal = tr.sys.assignment[tr.varPositions["target"]]
+    check selVal == 1
+    check x1Val == 7
+    check tgtVal == 10  # arr[1] + 3 = x1 + 3 = 7 + 3 = 10

@@ -1681,6 +1681,118 @@ solve satisfy;
         discard  # solve completed without error
 
 
+suite "FlatZinc int_lin_le Tautological Detection":
+
+    test "int_lin_le always satisfied by domain bounds is skipped":
+        ## x in 1..3, y in 1..3: 1*x + 1*y <= 10 is always true (max 3+3=6 <= 10)
+        let src = """
+var 1..3: x :: output_var;
+var 1..3: y :: output_var;
+constraint int_lin_le([1,1],[x,y],10);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedTautological >= 1
+
+    test "int_lin_le with negative coefficients uses correct bound":
+        ## x in 1..5: -1*x <= -1, i.e. x >= 1. max(-1*x) = -1*1 = -1 <= -1, tautological
+        let src = """
+var 1..5: x :: output_var;
+constraint int_lin_le([-1],[x],-1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedTautological >= 1
+
+    test "int_lin_le not tautological is kept":
+        ## x in 1..5, y in 1..5: 1*x + 1*y <= 3 is NOT always true (max 5+5=10 > 3)
+        let src = """
+var 1..5: x :: output_var;
+var 1..5: y :: output_var;
+constraint int_lin_le([1,1],[x,y],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedTautological == 0
+
+
+suite "FlatZinc NAND Redundancy Detection":
+
+    test "int_lin_le duplicating bool_clause NAND is skipped":
+        ## bool_clause([], [b1, b2]) encodes NOT(b1 AND b2), i.e. b1+b2 <= 1
+        ## int_lin_le([1,1],[i1,i2],1) with bool2int(b1,i1), bool2int(b2,i2) is redundant
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool_clause([], [b1, b2]);
+constraint int_lin_le([1,1],[i1,i2],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand >= 1
+        # The bool_clause NAND should still exist as a constraint
+        check tr.nandBoolPairs.len > 0
+
+    test "int_lin_le with scaled coefficients duplicating NAND is skipped":
+        ## bool_clause([], [b1, b2]) → NAND
+        ## int_lin_le([3,3],[i1,i2],3) → 3*i1 + 3*i2 <= 3 → i1+i2 <= 1, same NAND
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool_clause([], [b1, b2]);
+constraint int_lin_le([3,3],[i1,i2],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand >= 1
+
+    test "int_lin_le without matching bool_clause is not skipped":
+        ## No bool_clause NAND exists, so int_lin_le should be kept
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint int_lin_le([1,1],[i1,i2],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand == 0
+
+    test "int_lin_le with unequal coefficients is not treated as NAND":
+        ## [2,1] != equal coefficients, should not be detected as NAND
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool_clause([], [b1, b2]);
+constraint int_lin_le([2,1],[i1,i2],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand == 0
+
+
 suite "FlatZinc Overlap Channel Detection":
 
     test "overlap = NOT sep detected as channel":
