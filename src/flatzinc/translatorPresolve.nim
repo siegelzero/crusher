@@ -328,9 +328,48 @@ proc boundsPropagate(tr: FznTranslator,
         let isLe = name == "int_lin_le"
         if not isEq and not isLe: continue
         if con.args.len < 3: continue
-        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
-        let nArgs = con.args[0].elems.len
-        if nArgs != con.args[1].elems.len: continue
+        # Resolve coefficients array: handle both inline FznArrayLit and named parameter/variable arrays
+        var coeffsArg = con.args[0]
+        if coeffsArg.kind == FznIdent:
+            let arrName = coeffsArg.ident
+            if arrName in tr.paramValues:
+                continue  # scalar param, not an array
+            var found = false
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == arrName:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        coeffsArg = decl.value
+                        found = true
+                    break
+            if not found:
+                for decl in tr.model.variables:
+                    if decl.isArray and decl.name == arrName:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            coeffsArg = decl.value
+                            found = true
+                        break
+            if not found: continue
+        if coeffsArg.kind != FznArrayLit: continue
+        var varsArg = con.args[1]
+        if varsArg.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varsArg.ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        varsArg = decl.value
+                        found = true
+                    break
+            if not found:
+                for decl in tr.model.parameters:
+                    if decl.isArray and decl.name == varsArg.ident:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            varsArg = decl.value
+                            found = true
+                        break
+            if not found: continue
+        if varsArg.kind != FznArrayLit: continue
+        let nArgs = coeffsArg.elems.len
+        if nArgs != varsArg.elems.len: continue
         if not tr.presolveIsFixed(con.args[2], fixedVars): continue
 
         let rhs = tr.presolveResolve(con.args[2], fixedVars)
@@ -345,10 +384,10 @@ proc boundsPropagate(tr: FznTranslator,
         var vars = newSeq[VarInfo](nArgs)
         var valid = true
         for i in 0..<nArgs:
-            if con.args[0].elems[i].kind != FznIntLit:
+            if coeffsArg.elems[i].kind != FznIntLit:
                 valid = false; break
-            vars[i].coeff = con.args[0].elems[i].intVal
-            let vExpr = con.args[1].elems[i]
+            vars[i].coeff = coeffsArg.elems[i].intVal
+            let vExpr = varsArg.elems[i]
             vars[i].varName = presolveVarName(vExpr)
             if tr.presolveIsFixed(vExpr, fixedVars):
                 vars[i].fixed = true
@@ -1274,6 +1313,219 @@ proc presolveResolveVarElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
     else: return @[]
 
 
+proc intMaxMinPropagate(tr: FznTranslator,
+                        domains: var Table[string, seq[int]],
+                        fixedVars: Table[string, int],
+                        eliminated: PackedSet[int],
+                        infeasible: var bool): bool =
+    ## Bounds propagation for int_max(a, b, c) and int_min(a, b, c).
+    ## int_max: c = max(a, b)
+    ##   Forward:  c ∈ [max(lo_a, lo_b), max(hi_a, hi_b)]
+    ##   Backward: a <= c  (hi_a <= hi_c),  b <= c  (hi_b <= hi_c)
+    ##   Strong:   if hi_b < lo_c then a = c  (lo_a >= lo_c)
+    ## int_min: c = min(a, b)
+    ##   Forward:  c ∈ [min(lo_a, lo_b), min(hi_a, hi_b)]
+    ##   Backward: a >= c  (lo_a >= lo_c),  b >= c  (lo_b >= lo_c)
+    ##   Strong:   if lo_b > hi_c then a = c  (hi_a <= hi_c)
+    result = false
+
+    type ArgInfo = tuple[lo, hi: int, name: string, isFixed: bool]
+    proc getArgBounds(tr: FznTranslator, arg: FznExpr,
+                      domains: Table[string, seq[int]],
+                      fixedVars: Table[string, int]): ArgInfo =
+        let vn = presolveVarName(arg)
+        if tr.presolveIsFixed(arg, fixedVars):
+            let v = tr.presolveResolve(arg, fixedVars)
+            return (lo: v, hi: v, name: vn, isFixed: true)
+        if vn != "" and vn in domains:
+            let dom = domains[vn]
+            if dom.len > 0:
+                return (lo: dom[0], hi: dom[^1], name: vn, isFixed: false)
+        # Unknown bounds — can't propagate
+        return (lo: low(int) div 2, hi: high(int) div 2, name: vn, isFixed: true)
+
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        let isMax = name == "int_max"
+        let isMin = name == "int_min"
+        if not isMax and not isMin: continue
+        if con.args.len < 3: continue
+
+        let a = getArgBounds(tr, con.args[0], domains, fixedVars)
+        let b = getArgBounds(tr, con.args[1], domains, fixedVars)
+        var c = getArgBounds(tr, con.args[2], domains, fixedVars)
+
+        if isMax:
+            # Forward: c = max(a, b)
+            let fwdLo = max(a.lo, b.lo)
+            let fwdHi = max(a.hi, b.hi)
+            if not c.isFixed and c.name != "":
+                if presolveRestrictBounds(domains, c.name, fwdLo, fwdHi, infeasible):
+                    result = true
+                    # Update local c bounds for subsequent backward propagation
+                    c = getArgBounds(tr, con.args[2], domains, fixedVars)
+            if infeasible: return
+
+            # Backward: a <= max(a,b) = c, so a <= hi(c)
+            if not a.isFixed and a.name != "":
+                if presolveRestrictBounds(domains, a.name, low(int), c.hi, infeasible):
+                    result = true
+            if infeasible: return
+            if not b.isFixed and b.name != "":
+                if presolveRestrictBounds(domains, b.name, low(int), c.hi, infeasible):
+                    result = true
+            if infeasible: return
+
+            # Strong backward: if hi(b) < lo(c), then max(a,b) = a = c
+            if b.hi < c.lo and not a.isFixed and a.name != "":
+                if presolveRestrictBounds(domains, a.name, c.lo, c.hi, infeasible):
+                    result = true
+            if infeasible: return
+            if a.hi < c.lo and not b.isFixed and b.name != "":
+                if presolveRestrictBounds(domains, b.name, c.lo, c.hi, infeasible):
+                    result = true
+            if infeasible: return
+
+        elif isMin:
+            # Forward: c = min(a, b)
+            let fwdLo = min(a.lo, b.lo)
+            let fwdHi = min(a.hi, b.hi)
+            if not c.isFixed and c.name != "":
+                if presolveRestrictBounds(domains, c.name, fwdLo, fwdHi, infeasible):
+                    result = true
+                    c = getArgBounds(tr, con.args[2], domains, fixedVars)
+            if infeasible: return
+
+            # Backward: a >= min(a,b) = c, so a >= lo(c)
+            if not a.isFixed and a.name != "":
+                if presolveRestrictBounds(domains, a.name, c.lo, high(int), infeasible):
+                    result = true
+            if infeasible: return
+            if not b.isFixed and b.name != "":
+                if presolveRestrictBounds(domains, b.name, c.lo, high(int), infeasible):
+                    result = true
+            if infeasible: return
+
+            # Strong backward: if lo(b) > hi(c), then min(a,b) = a = c
+            if b.lo > c.hi and not a.isFixed and a.name != "":
+                if presolveRestrictBounds(domains, a.name, c.lo, c.hi, infeasible):
+                    result = true
+            if infeasible: return
+            if a.lo > c.hi and not b.isFixed and b.name != "":
+                if presolveRestrictBounds(domains, b.name, c.lo, c.hi, infeasible):
+                    result = true
+            if infeasible: return
+
+
+proc varElementPropagate(tr: FznTranslator,
+                         domains: var Table[string, seq[int]],
+                         fixedVars: Table[string, int],
+                         eliminated: PackedSet[int],
+                         infeasible: var bool): bool =
+    ## Bounds propagation for array_var_int_element(idx, varArr, val).
+    ## Forward:  val ∈ ∪{arr[i].domain : i ∈ domain(idx)}
+    ## Backward: prune idx values where arr[i].domain ∩ val.domain = ∅
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
+        if con.args.len < 3: continue
+
+        # Resolve array elements (mix of constants and variables)
+        let arrElems = tr.presolveResolveVarElems(con.args[1])
+        if arrElems.len == 0: continue
+
+        let idxName = presolveVarName(con.args[0])
+        let valName = presolveVarName(con.args[2])
+
+        # Get index domain
+        var idxDom: seq[int]
+        if idxName != "" and idxName in domains:
+            idxDom = domains[idxName]
+        elif tr.presolveIsFixed(con.args[0], fixedVars):
+            idxDom = @[tr.presolveResolve(con.args[0], fixedVars)]
+        else:
+            continue
+
+        # Get val domain bounds
+        var valLo, valHi: int
+        if valName != "" and valName in domains:
+            let vd = domains[valName]
+            if vd.len == 0: continue
+            valLo = vd[0]
+            valHi = vd[^1]
+        elif tr.presolveIsFixed(con.args[2], fixedVars):
+            let v = tr.presolveResolve(con.args[2], fixedVars)
+            valLo = v
+            valHi = v
+        else:
+            continue
+
+        # Get element bounds for each array position
+        proc elemBounds(tr: FznTranslator, elem: FznExpr,
+                        domains: Table[string, seq[int]],
+                        fixedVars: Table[string, int]): tuple[lo, hi: int, valid: bool] =
+            if elem.kind == FznIntLit:
+                return (lo: elem.intVal, hi: elem.intVal, valid: true)
+            if elem.kind == FznBoolLit:
+                let v = if elem.boolVal: 1 else: 0
+                return (lo: v, hi: v, valid: true)
+            let vn = presolveVarName(elem)
+            if tr.presolveIsFixed(elem, fixedVars):
+                let v = tr.presolveResolve(elem, fixedVars)
+                return (lo: v, hi: v, valid: true)
+            if vn != "" and vn in domains:
+                let dom = domains[vn]
+                if dom.len > 0:
+                    return (lo: dom[0], hi: dom[^1], valid: true)
+            return (lo: 0, hi: 0, valid: false)
+
+        let isShifted = name == "array_var_int_element"  # 1-based indexing
+        let idxOffset = if isShifted: 1 else: 0
+
+        # Forward: compute reachable value bounds from idx domain
+        var fwdLo = high(int)
+        var fwdHi = low(int)
+        var validIdxValues: seq[int]
+
+        for i in idxDom:
+            let arrIdx = i - idxOffset
+            if arrIdx < 0 or arrIdx >= arrElems.len: continue
+            let eb = elemBounds(tr, arrElems[arrIdx], domains, fixedVars)
+            if not eb.valid:
+                # Unknown element bounds — can't prune this index value
+                validIdxValues.add(i)
+                fwdLo = low(int)
+                fwdHi = high(int)
+                continue
+            # Backward: check if element domain intersects val domain
+            if eb.hi < valLo or eb.lo > valHi:
+                # No overlap — this index value is infeasible
+                discard
+            else:
+                validIdxValues.add(i)
+                fwdLo = min(fwdLo, eb.lo)
+                fwdHi = max(fwdHi, eb.hi)
+
+        # Backward: prune idx domain to valid values
+        if idxName != "" and idxName notin fixedVars:
+            if validIdxValues.len < idxDom.len:
+                if presolveTightenDomain(domains, idxName, validIdxValues, infeasible):
+                    result = true
+                if infeasible: return
+
+        # Forward: tighten val domain bounds
+        if valName != "" and valName notin fixedVars:
+            if fwdLo != low(int) and fwdHi != high(int) and fwdLo <= fwdHi:
+                if presolveRestrictBounds(domains, valName, fwdLo, fwdHi, infeasible):
+                    result = true
+                if infeasible: return
+
+
 proc elementPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
                       fixedVars: Table[string, int],
@@ -1781,6 +2033,16 @@ proc presolve*(tr: var FznTranslator) =
             changed = true
         if infeasible: break
 
+        # Step 6c: Variable element constraint propagation (bounds + index pruning)
+        if varElementPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6d: int_max/int_min bounds propagation
+        if intMaxMinPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
         # Step 7: Table constraint propagation (arc consistency)
         if tablePropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
@@ -1821,7 +2083,7 @@ proc presolve*(tr: var FznTranslator) =
         if name notin tr.paramValues:
             inc nFixed
 
-    if nFixed > 0 or eliminated.len > 0:
-        stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated")
-
     tr.applyPresolveResults(domains, fixedVars, eliminated)
+
+    if nFixed > 0 or eliminated.len > 0 or tr.presolveDomains.len > 0:
+        stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated, {tr.presolveDomains.len} domains tightened")
