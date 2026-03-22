@@ -1146,7 +1146,6 @@ proc detectLinEqReifChannels*(tr: var FznTranslator) =
     ## Must run AFTER detectCaseAnalysisChannels (which uses int_lin_eq_reif via linEqReifMap).
     var nEq, nNe = 0
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" and name != "int_lin_ne_reif": continue
         if not con.hasAnnotation("defines_var"): continue
@@ -1155,9 +1154,12 @@ proc detectLinEqReifChannels*(tr: var FznTranslator) =
         let ann = con.getAnnotation("defines_var")
         if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != bName: continue
         if bName in tr.channelVarNames: continue
+        # Always mark output as channel (even if constraint already consumed by
+        # case-analysis) to prevent orphan search positions with no constraints
         tr.channelVarNames.incl(bName)
-        tr.definingConstraints.incl(ci)
-        tr.linEqReifChannelDefs.add(ci)
+        if ci notin tr.definingConstraints:
+            tr.definingConstraints.incl(ci)
+            tr.linEqReifChannelDefs.add(ci)
         if name == "int_lin_eq_reif": inc nEq
         else: inc nNe
     if tr.linEqReifChannelDefs.len > 0:
@@ -2086,27 +2088,51 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             if posLit.kind != FznIdent or negLit.kind != FznIdent: continue
             # negLit (B) is the condition: eq_reif(condVar, condVal, B)
             # posLit (A) is the consequence: eq_reif(targetVar, val, A)
-            if negLit.ident notin eqReifMap: continue
-            let condInfo = eqReifMap[negLit.ident]
-            let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError: continue
-            if posLit.ident in eqReifMap:
-                let eqInfo = eqReifMap[posLit.ident]
-                casesByTarget.mgetOrPut(eqInfo.sourceVar, @[]).add(CaseEntry(
-                    kind: cekSimple,
-                    condVarVals: @[(condInfo.sourceVar, condVal)],
-                    boolClauseIdx: ci,
-                    testVal: eqInfo.testVal))
-            elif posLit.ident in linEqReifMap:
-                let linEntry = linEqReifMap[posLit.ident]
-                casesByTarget.mgetOrPut(linEntry.targetVar, @[]).add(CaseEntry(
-                    kind: cekLinear,
-                    condVarVals: @[(condInfo.sourceVar, condVal)],
-                    boolClauseIdx: ci,
-                    linOtherVars: linEntry.otherVars,
-                    linOtherCoeffs: linEntry.otherCoeffs,
-                    linRhs: linEntry.rhs,
-                    linTargetCoeff: linEntry.targetCoeff,
-                    linReifIdx: linEntry.constraintIdx))
+            if negLit.ident in eqReifMap:
+                let condInfo = eqReifMap[negLit.ident]
+                let condVal = try: tr.resolveIntArg(condInfo.testVal) except ValueError, KeyError: continue
+                if posLit.ident in eqReifMap:
+                    let eqInfo = eqReifMap[posLit.ident]
+                    casesByTarget.mgetOrPut(eqInfo.sourceVar, @[]).add(CaseEntry(
+                        kind: cekSimple,
+                        condVarVals: @[(condInfo.sourceVar, condVal)],
+                        boolClauseIdx: ci,
+                        testVal: eqInfo.testVal))
+                elif posLit.ident in linEqReifMap:
+                    let linEntry = linEqReifMap[posLit.ident]
+                    casesByTarget.mgetOrPut(linEntry.targetVar, @[]).add(CaseEntry(
+                        kind: cekLinear,
+                        condVarVals: @[(condInfo.sourceVar, condVal)],
+                        boolClauseIdx: ci,
+                        linOtherVars: linEntry.otherVars,
+                        linOtherCoeffs: linEntry.otherCoeffs,
+                        linRhs: linEntry.rhs,
+                        linTargetCoeff: linEntry.targetCoeff,
+                        linReifIdx: linEntry.constraintIdx))
+            elif negLit.ident in neReifMap:
+                let neInfo = neReifMap[negLit.ident]
+                let condDom = tr.lookupVarDomain(neInfo.condVar)
+                if condDom.len > 0 and condDom.len <= 100:
+                    for dv in condDom:
+                        if dv == neInfo.condVal: continue
+                        if posLit.ident in eqReifMap:
+                            let eqInfo = eqReifMap[posLit.ident]
+                            casesByTarget.mgetOrPut(eqInfo.sourceVar, @[]).add(CaseEntry(
+                                kind: cekSimple,
+                                condVarVals: @[(neInfo.condVar, dv)],
+                                boolClauseIdx: ci,
+                                testVal: eqInfo.testVal))
+                        elif posLit.ident in linEqReifMap:
+                            let linEntry = linEqReifMap[posLit.ident]
+                            casesByTarget.mgetOrPut(linEntry.targetVar, @[]).add(CaseEntry(
+                                kind: cekLinear,
+                                condVarVals: @[(neInfo.condVar, dv)],
+                                boolClauseIdx: ci,
+                                linOtherVars: linEntry.otherVars,
+                                linOtherCoeffs: linEntry.otherCoeffs,
+                                linRhs: linEntry.rhs,
+                                linTargetCoeff: linEntry.targetCoeff,
+                                linReifIdx: linEntry.constraintIdx))
             continue
 
         # Multi-literal case: up to 6 positive literals + any number of negative literals
@@ -2382,7 +2408,19 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         var resolvedExprVars: HashSet[string]
         for ev in exprVarSet:
             if ev in tr.channelVarNames or ev in tr.definedVarNames:
-                continue  # buildValueMapping handles these at table-construction time
+                # Trace bool2int channels back to their source search variable
+                var traced = false
+                for b2iCi in tr.bool2intChannelDefs:
+                    let b2iCon = tr.model.constraints[b2iCi]
+                    if b2iCon.args.len >= 2 and b2iCon.args[1].kind == FznIdent and
+                         b2iCon.args[1].ident == ev:
+                        let srcBool = b2iCon.args[0].ident
+                        if srcBool notin tr.channelVarNames and srcBool notin tr.definedVarNames:
+                            resolvedExprVars.incl(srcBool)
+                            traced = true
+                        break
+                if not traced:
+                    continue
             else:
                 resolvedExprVars.incl(ev)
         exprVarSet = resolvedExprVars
@@ -2494,6 +2532,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             srcOffsets: seq[int]
             srcSizes: seq[int]
         var channelMiniTables: Table[string, MiniTable]
+        var varOffsetChannels: HashSet[string]  # channels handled as variable+offset entries
         block precompute:
             var channelVarsNeeded: HashSet[string]
             for e in entries:
@@ -2521,10 +2560,23 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             var depSets: Table[string, seq[int]]
             for cv in channelVarsNeeded:
                 if cv notin baseMapping:
+                    # Check if it's an element channel indexed by a source variable —
+                    # handle as variable+offset entry instead of rejecting
+                    if cv in channelByName:
+                        let elemCi = channelByName[cv]
+                        let elemCon = tr.model.constraints[elemCi]
+                        if elemCon.args.len >= 3 and elemCon.args[0].kind == FznIdent:
+                            let idxVar = elemCon.args[0].ident
+                            if idxVar in sourceVarNames:
+                                varOffsetChannels.incl(cv)
+                                continue
                     valid = false
                     break
                 depSets[cv] = @[]
             if not valid: break precompute
+            # Remove var+offset channels from channelVarsNeeded
+            for cv in varOffsetChannels:
+                channelVarsNeeded.excl(cv)
 
             for i, sv in sourceVarNames:
                 if domainSizes[i] <= 1: continue
@@ -2571,6 +2623,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         if not valid: continue
 
         # For incomplete cases, compute the default value for uncovered cases.
+        var lookupTable = newSeq[int](tableSize)
+        var varEntries = initTable[int, CaseAnalysisVarEntry]()
+
         var defaultVal = 0
         if not isComplete:
             let tdom = tr.lookupVarDomain(targetVar).sorted()
@@ -2582,7 +2637,6 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 # Non-binary domain: default to 0 (conditional assignment pattern)
                 defaultVal = 0
 
-        var lookupTable = newSeq[int](tableSize)
         var allResolved = true
 
         for flatIdx in 0..<tableSize:
@@ -2625,10 +2679,15 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                 # Compute target from linear equation:
                 # targetCoeff * target + sum(otherCoeffs[i] * otherVars[i]) = rhs
                 # target = (rhs - sum(otherCoeffs[i] * otherVars[i])) / targetCoeff
+                # VarOffset channels are deferred — process all others first.
                 var numerator = entry.linRhs
                 var linOk = true
+                var deferredVarOffset = -1
                 for j in 0..<entry.linOtherVars.len:
                     let ov = entry.linOtherVars[j]
+                    if ov in varOffsetChannels:
+                        deferredVarOffset = j
+                        continue
                     if ov in sourceValues:
                         numerator -= entry.linOtherCoeffs[j] * sourceValues[ov]
                     elif ov in tr.paramValues:
@@ -2665,10 +2724,37 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                             else:
                                 linOk = false
                                 break
-                if not linOk or numerator mod entry.linTargetCoeff != 0:
+                if not linOk:
                     allResolved = false
                     break
-                lookupTable[flatIdx] = numerator div entry.linTargetCoeff
+                # Handle deferred varOffset: create a variable+offset entry
+                if deferredVarOffset >= 0:
+                    let j2 = deferredVarOffset
+                    let ov2 = entry.linOtherVars[j2]
+                    let mult = -entry.linOtherCoeffs[j2] * (1 div entry.linTargetCoeff)
+                    if mult != 1 and mult != -1:
+                        allResolved = false
+                        break
+                    let elemCi = channelByName[ov2]
+                    let elemCon = tr.model.constraints[elemCi]
+                    let idxVar = elemCon.args[0].ident
+                    let idxVal = sourceValues[idxVar]
+                    let varElems = tr.resolveVarArrayElems(elemCon.args[1])
+                    let arrIdx = idxVal - 1  # FZN 1-based to 0-based
+                    if arrIdx < 0 or arrIdx >= varElems.len or varElems[arrIdx].kind != FznIdent:
+                        allResolved = false
+                        break
+                    if numerator mod entry.linTargetCoeff != 0:
+                        allResolved = false
+                        break
+                    let offset = numerator div entry.linTargetCoeff
+                    varEntries[flatIdx] = CaseAnalysisVarEntry(varName: varElems[arrIdx].ident, offset: offset)
+                    lookupTable[flatIdx] = 0
+                else:
+                    if numerator mod entry.linTargetCoeff != 0:
+                        allResolved = false
+                        break
+                    lookupTable[flatIdx] = numerator div entry.linTargetCoeff
             else:
                 # Resolve test value to constant (original logic)
                 let testValExpr = entry.testVal
@@ -2715,7 +2801,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             sourceVarNames: sourceVarNames,
             lookupTable: lookupTable,
             domainOffsets: domainOffsets,
-            domainSizes: domainSizes
+            domainSizes: domainSizes,
+            varEntries: varEntries
         ))
         inc nTargets
 
@@ -5281,7 +5368,9 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
         # Gather negative literals — all must be channel variables
         let negArg = con.args[1]
         if negArg.kind != FznArrayLit: continue
-        if negArg.elems.len == 0: continue  # need at least 1 condition
+        if negArg.elems.len < 2: continue  # need at least 2 conditions;
+            # trivial AND(x)=x consumes bool_clause constraints needed by
+            # case-analysis for complete visit-time channel patterns
 
         var condNames: seq[string]
         var allChannels = true

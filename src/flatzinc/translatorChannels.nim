@@ -1382,15 +1382,25 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
         if def.targetVarName notin tr.varPositions: continue
         let channelPos = tr.varPositions[def.targetVarName]
 
-        # Build array elements (all constants from precomputed lookup table)
-        var arrayElems: seq[ArrayElement[int]]
-        for v in def.lookupTable:
-            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
-
         # Build index expression from source positions
         # Row-major: index = (src0 - off0) * size1 * ... * sizeN + ... + (srcN - offN)
         var indexExpr: AlgebraicExpression[int]
         var valid = true
+
+        # Build array elements from lookup table and var entries
+        var arrayElems: seq[ArrayElement[int]]
+        for i, v in def.lookupTable:
+            if i in def.varEntries:
+                let ve = def.varEntries[i]
+                if ve.varName notin tr.varPositions:
+                    valid = false
+                    break
+                let varPos = tr.varPositions[ve.varName]
+                arrayElems.add(ArrayElement[int](isConstant: false,
+                    variablePosition: varPos, offset: ve.offset))
+            else:
+                arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+        if not valid: continue
         for i, srcName in def.sourceVarNames:
             if srcName notin tr.varPositions:
                 valid = false

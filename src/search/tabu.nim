@@ -1095,7 +1095,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if idxVal >= 0 and idxVal < binding.arrayElements.len:
                 let elem = binding.arrayElements[idxVal]
                 let newVal = if elem.isConstant: elem.constantValue
-                             else: state.assignment[elem.variablePosition]
+                             else: state.assignment[elem.variablePosition] + elem.offset
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     channelChanged = true
@@ -1106,7 +1106,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
-                                 else: state.assignment[elem.variablePosition]
+                                 else: state.assignment[elem.variablePosition] + elem.offset
                     if newVal != state.assignment[binding.channelPosition]:
                         changingPos.add(binding.channelPosition)
             if verbose and id == 0:
@@ -1248,7 +1248,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
-                                 else: state.assignment[elem.variablePosition]
+                                 else: state.assignment[elem.variablePosition] + elem.offset
                     if newVal != state.assignment[binding.channelPosition]:
                         state.assignment[binding.channelPosition] = newVal
                         elemChanged = true
@@ -1733,7 +1733,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             visited.incl(pos)
             var canBuild = true       # can build topology at all
             var canStatic = true      # can precompute values (constant arrays + local index deps)
-
             const MaxCascadeChans = 500  # limit cascade depth to avoid initialization blowup
             while bfsHead < bfsQueue.len and canBuild:
                 let p = bfsQueue[bfsHead]
@@ -1764,7 +1763,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         topoEntryKind.add(ceElement)
                         if chanPos notin visited:
                             visited.incl(chanPos)
-                            bfsQueue.add(chanPos)
+                            # Don't propagate downstream from offset channels — they
+                            # create long visit-time backward chains. The channel values
+                            # still propagate correctly at runtime via the worklist, but
+                            # the cascade penalty computation stops here to stay fast.
+                            var isOffset = false
+                            for elem in bindingPtr.arrayElements:
+                                if not elem.isConstant and elem.offset != 0:
+                                    isOffset = true
+                                    break
+                            if not isOffset:
+                                bfsQueue.add(chanPos)
                 # Min/max channel bindings: include in cascade as dynamic entries.
                 # Implicit channels (detected without defines_var) are cascade-exempt:
                 # they're still computed after each move, but their downstream constraints
@@ -2279,7 +2288,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                 if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                     let elem = bindingPtr.arrayElements[idxVal]
                     newVal = if elem.isConstant: elem.constantValue
-                             else: state.assignment[elem.variablePosition]
+                             else: state.assignment[elem.variablePosition] + elem.offset
                 else:
                     continue  # out of bounds, leave as-is
 
@@ -2300,7 +2309,14 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    state.updateNeighborPenalties(bindingPtr.channelPosition)
+                    # Skip per-change penalty updates for offset channels (visit-time
+                    # backward chains) to avoid O(n²) cascade re-evaluations. These
+                    # are handled by recomputeAffectedChannelDepPenalties in assignValue.
+                    block checkOffset:
+                        for elem in bindingPtr.arrayElements:
+                            if not elem.isConstant and elem.offset != 0:
+                                break checkOffset
+                        state.updateNeighborPenalties(bindingPtr.channelPosition)
                     if bindingPtr.channelPosition notin inWorklist:
                         inWorklist.incl(bindingPtr.channelPosition)
                         worklist.add(bindingPtr.channelPosition)
@@ -2429,7 +2445,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                 if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                     let elem = bindingPtr.arrayElements[idxVal]
                     newVal = if elem.isConstant: elem.constantValue
-                             else: state.assignment[elem.variablePosition]
+                             else: state.assignment[elem.variablePosition] + elem.offset
                 else:
                     continue
                 if newVal != state.assignment[bindingPtr.channelPosition]:
@@ -2658,6 +2674,11 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     if hasInverseMove:
         for (fPos, fOld, fNew) in localForced:
             state.updateNeighborPenalties(fPos)
+
+    # Channel neighbor penalty updates are handled by the cascade-dep system
+    # (which simulates channel changes during penalty map evaluation) rather
+    # than explicitly updating after each propagation. This avoids O(n²)
+    # re-evaluations when many channels change per move.
 
     # Recompute inverse deltas for affected positions in the moved group
     if hasInverseMove:

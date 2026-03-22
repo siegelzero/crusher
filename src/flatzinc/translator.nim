@@ -51,6 +51,10 @@ type
         sentinelBoardIndices*: seq[int]   # board array indices that are sentinels
         sentinelValue*: int               # sentinel value (ntiles+1)
 
+    CaseAnalysisVarEntry* = object
+        varName*: string
+        offset*: int
+
     CaseAnalysisDef* = object
         ## A detected case-analysis channel: target variable fully determined by
         ## source variables via exhaustive bool_clause case analysis.
@@ -59,6 +63,7 @@ type
         lookupTable*: seq[int]           # flat constant lookup table
         domainOffsets*: seq[int]         # min value per source (for index computation)
         domainSizes*: seq[int]          # domain size per source (hi - lo + 1)
+        varEntries*: Table[int, CaseAnalysisVarEntry]  # flatIdx → var+offset (overrides lookupTable)
 
     ConditionalSourceDef* = object
         ## A detected conditional variable-source channel: target variable equals
@@ -404,6 +409,12 @@ type
         boolEqReifChannelDefs*: seq[int]
         # Conditional binary channel defs: X = element(cond*2 + b2, [0,0,0,1]) (AND gate)
         conditionalBinaryChannelDefs*: seq[tuple[targetVar, condVar, neqVar: string]]
+        # Counter for tautological constraints skipped during translation
+        nSkippedTautological*: int
+        # NAND bool pairs from bool_clause([], [b1, b2]) — for redundancy detection
+        nandBoolPairs*: HashSet[tuple[a, b: string]]
+        # Maps bool2int output var name → input bool var name
+        bool2intSourceMap*: Table[string, string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -1036,6 +1047,9 @@ proc translate*(model: FznModel): FznTranslator =
             v.setDomain(toSeq(0..<gc.allPlacements[t].len))
             result.geostConversion.tileVarPositions.add(pos)
 
+    # Detect NAND redundancy between int_lin_le and bool_clause
+    result.detectNandRedundancy()
+
     var nSkippedDefining, nSkippedRedundant, nTranslated = 0
     for ci, con in model.constraints:
         if ci in result.definingConstraints:
@@ -1106,7 +1120,8 @@ proc translate*(model: FznModel): FznTranslator =
             inc nTranslated
             result.translateConstraint(con)
 
-    stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {nTranslated} translated")
+    nTranslated -= result.nSkippedTautological
+    stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {nTranslated} translated")
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0

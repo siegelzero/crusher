@@ -47,6 +47,7 @@ type
                 constantValue*: T
             of false:
                 variablePosition*: int
+                offset*: T  ## element value = assignment[variablePosition] + offset
 
     ElementState*[T] = ref object
         currentAssignment*: Table[int, T]

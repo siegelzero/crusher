@@ -260,7 +260,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
                     let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
-                                     else: state.assignment[elem.variablePosition]
+                                     else: state.assignment[elem.variablePosition] + elem.offset
                     let chanPos = bindingPtr.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -327,7 +327,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
                     let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
-                                     else: state.assignment[elem.variablePosition]
+                                     else: state.assignment[elem.variablePosition] + elem.offset
                     let chanPos = bindingPtr.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -602,7 +602,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                     if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                         let elem = bindingPtr.arrayElements[idxVal]
                         newVal = if elem.isConstant: elem.constantValue
-                                 else: state.assignment[elem.variablePosition]
+                                 else: state.assignment[elem.variablePosition] + elem.offset
                     else:
                         newVal = state.cdBatchSaved[ci]
                 state.assignment[chans[ci]] = newVal
@@ -680,7 +680,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                             let elem = bindingPtr.arrayElements[idxVal]
                             state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
-                                                           else: state.assignment[elem.variablePosition]
+                                                           else: state.assignment[elem.variablePosition] + elem.offset
                         else:
                             state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
                     state.assignment[chans[ci]] = state.cdBatchValues[ci][di]

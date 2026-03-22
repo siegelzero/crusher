@@ -504,6 +504,122 @@ proc constSetExpr(info: tuple[isConst: bool, constVals: HashSet[int], varInfo: S
                 linear = true)
 
 
+proc getExprBounds(tr: var FznTranslator, arg: FznExpr): tuple[lo: int, hi: int, known: bool] =
+    ## Returns domain bounds (min, max) for a FznExpr element.
+    ## known=false if bounds cannot be determined.
+    case arg.kind
+    of FznIntLit:
+        return (arg.intVal, arg.intVal, true)
+    of FznBoolLit:
+        let val = if arg.boolVal: 1 else: 0
+        return (val, val, true)
+    of FznIdent:
+        if arg.ident in tr.paramValues:
+            let val = tr.paramValues[arg.ident]
+            return (val, val, true)
+        elif arg.ident in tr.varPositions:
+            let pos = tr.varPositions[arg.ident]
+            let dom = tr.sys.baseArray.domain[pos]
+            if dom.len > 0:
+                return (dom[0], dom[^1], true)
+            else:
+                return (0, 0, false)
+        elif arg.ident in tr.definedVarBounds:
+            let (lo, hi) = tr.definedVarBounds[arg.ident]
+            return (lo, hi, true)
+        else:
+            return (0, 0, false)
+    else:
+        return (0, 0, false)
+
+proc isLinTautological(tr: var FznTranslator, coeffs: seq[int], varArrayArg: FznExpr, rhs: int): bool =
+    ## Check if int_lin_le(coeffs, vars, rhs) is tautological by computing
+    ## the maximum possible value of sum(coeffs*vars) from domain bounds.
+    ## Returns true if the constraint is always satisfied.
+    var elems: seq[FznExpr]
+    case varArrayArg.kind
+    of FznArrayLit:
+        elems = varArrayArg.elems
+    of FznIdent:
+        if varArrayArg.ident in tr.arrayElementNames:
+            let names = tr.arrayElementNames[varArrayArg.ident]
+            for n in names:
+                elems.add(FznExpr(kind: FznIdent, ident: n))
+        else:
+            return false
+    else:
+        return false
+
+    if elems.len != coeffs.len:
+        return false
+
+    var maxLHS = 0
+    for i in 0..<coeffs.len:
+        let (lo, hi, known) = tr.getExprBounds(elems[i])
+        if not known:
+            return false
+        if coeffs[i] > 0:
+            maxLHS += coeffs[i] * hi
+        else:
+            maxLHS += coeffs[i] * lo
+    return maxLHS <= rhs
+
+proc detectNandRedundancy*(tr: var FznTranslator) =
+    ## Pre-compute NAND bool pairs and bool2int source mapping for
+    ## detecting redundant int_lin_le constraints that duplicate bool_clause NANDs.
+
+    # Build bool2int source map from bool2intChannelDefs
+    for ci in tr.bool2intChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len >= 2 and con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
+            tr.bool2intSourceMap[con.args[1].ident] = con.args[0].ident
+
+    # Collect NAND pairs from bool_clause([], [b1, b2])
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 0 or negArg.elems.len != 2: continue
+        let b1 = negArg.elems[0]
+        let b2 = negArg.elems[1]
+        if b1.kind != FznIdent or b2.kind != FznIdent: continue
+        # Store both orderings so lookup is symmetric
+        tr.nandBoolPairs.incl((b1.ident, b2.ident))
+        tr.nandBoolPairs.incl((b2.ident, b1.ident))
+
+    if tr.nandBoolPairs.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.nandBoolPairs.len div 2} NAND bool pairs, {tr.bool2intSourceMap.len} bool2int sources")
+
+proc isRedundantNandLinLe(tr: FznTranslator, coeffs: seq[int], varArrayArg: FznExpr, rhs: int): bool =
+    ## Check if int_lin_le(coeffs, vars, rhs) is a NAND constraint on bool2int outputs
+    ## that duplicates an existing bool_clause([], [b1, b2]) NAND.
+    if tr.nandBoolPairs.len == 0:
+        return false
+
+    # Only handle 2-variable case with equal positive coefficients and rhs = coefficient
+    if coeffs.len != 2: return false
+    if coeffs[0] != coeffs[1] or coeffs[0] <= 0: return false
+    if rhs != coeffs[0]: return false  # rhs = c means c*x1 + c*x2 <= c → x1+x2 <= 1
+
+    var elems: seq[FznExpr]
+    if varArrayArg.kind == FznArrayLit:
+        elems = varArrayArg.elems
+    else:
+        return false
+    if elems.len != 2: return false
+
+    # Both variables must be bool2int outputs
+    for e in elems:
+        if e.kind != FznIdent: return false
+        if e.ident notin tr.bool2intSourceMap: return false
+
+    let boolA = tr.bool2intSourceMap[elems[0].ident]
+    let boolB = tr.bool2intSourceMap[elems[1].ident]
+    return (boolA, boolB) in tr.nandBoolPairs
+
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     ## Translates a single FlatZinc constraint to a Crusher constraint.
     let name = stripSolverPrefix(con.name)
@@ -521,8 +637,19 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     of "int_lin_le":
         # int_lin_le(coeffs, vars, rhs) means sum(coeffs*vars) <= rhs
         let coeffs = tr.resolveIntArray(con.args[0])
-        let exprs = tr.resolveExprArray(con.args[1])
         let rhs = tr.resolveIntArg(con.args[2])
+
+        # Tautological check: if max possible LHS <= rhs, constraint is always satisfied
+        if tr.isLinTautological(coeffs, con.args[1], rhs):
+            inc tr.nSkippedTautological
+            return
+
+        # Redundant NAND check: int_lin_le encoding x1+x2<=1 duplicating a bool_clause NAND
+        if tr.isRedundantNandLinLe(coeffs, con.args[1], rhs):
+            inc tr.nSkippedTautological  # count together with tautological
+            return
+
+        let exprs = tr.resolveExprArray(con.args[1])
 
         # Check for unit-coefficient pattern on binary variables → atMost/atLeast
         var emittedUnitCoeff = false
