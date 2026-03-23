@@ -22,6 +22,16 @@ type
         targetVarName*: string   # name of the target variable (the count)
         arrayVarNames*: seq[string]  # names of the array variables being counted over
 
+    ConstantCountPattern* = object
+        ## A detected constant-count pattern (exactly constraint decomposition):
+        ## int_lin_eq([-1,...,-1], [ind_1,...,ind_n], -k) where each indicator traces
+        ## through bool2int → int_eq_reif(x_j, val, b_j) to the same value.
+        ## Equivalent to: exactly(k, [x_1,...,x_n], val)
+        linEqIdx*: int           # index of the int_lin_eq constraint
+        countValue*: int         # the constant value being counted
+        requiredCount*: int      # the required count (k)
+        arrayVarNames*: seq[string]  # names of the array variables being counted over
+
     ConditionalCountEqPattern* = object
         ## A detected conditional count_eq pattern:
         ## int_lin_eq → bool2int → array_bool_and → (int_eq_reif × 2) chains
@@ -219,6 +229,8 @@ type
         arrayElementNames*: Table[string, seq[string]]
         # Detected count_eq patterns (mapped by int_lin_eq constraint index)
         countEqPatterns*: Table[int, CountEqPattern]
+        # Detected constant-count patterns (exactly decompositions, mapped by constraint index)
+        constantCountPatterns*: Table[int, ConstantCountPattern]
         # Detected conditional count_eq patterns (mapped by int_lin_eq constraint index)
         conditionalCountEqPatterns*: Table[int, ConditionalCountEqPattern]
         # Geost conversion (active if tileValues.len > 0)
@@ -437,6 +449,12 @@ type
         circuitTimePropArrivalVars*: seq[string]
         circuitTimePropDepartureVars*: seq[string]
         circuitTimePropConsumedCIs*: PackedSet[int]
+        # Annotated search variable names (from solve :: int_search annotation)
+        annotatedSearchVarNames*: HashSet[string]
+        # Whether solve annotation was present (to distinguish "no annotation" from "empty annotation")
+        hasSearchAnnotation*: bool
+        # Orphan → annotated variable mapping (built before translateVariables, applied after)
+        orphanToAnnotatedMap*: seq[(string, string)]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -753,6 +771,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
     result.arrayElementNames = initTable[string, seq[string]]()
     result.countEqPatterns = initTable[int, CountEqPattern]()
+    result.constantCountPatterns = initTable[int, ConstantCountPattern]()
     result.conditionalCountEqPatterns = initTable[int, ConditionalCountEqPattern]()
     result.argmaxPatterns = initTable[int, ArgmaxPattern]()
     result.matrixInfos = initTable[string, MatrixInfo]()
@@ -778,10 +797,14 @@ proc translate*(model: FznModel): FznTranslator =
     result.binaryCondChannelDefs = @[]
     result.oneHotCondChannelDefs = @[]
     result.boolEquivAliasDefs = @[]
+    result.annotatedSearchVarNames = initHashSet[string]()
+    result.hasSearchAnnotation = false
     result.boolGatedVarChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
     result.translateParameters()
+    # Extract annotated search variables from solve :: int_search / seq_search
+    result.extractSearchAnnotationVars()
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
     # Collect defined variables before translating variables
@@ -825,6 +848,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Fold bool_xor constraints with constant inputs (before reif channel detection)
     result.detectBoolXorSimplification()
+    # Detect orphan search variables (non-annotated) — records mapping for later channel creation.
+    # Runs before detectReifChannels so reification channels on orphan positions are still created.
+    result.detectOrphanSearchVariables()
     # Detect int_eq_reif/bool2int/bool_eq_reif defines_var patterns → channel variables
     result.detectReifChannels()
     # Detect conditional binary channels: X = cond AND b2 (swap-like patterns)
@@ -916,6 +942,8 @@ proc translate*(model: FznModel): FznTranslator =
     for vn in result.channelVarNames:
         if vn in result.varPositions:
             result.sys.baseArray.channelPositions.incl(result.varPositions[vn])
+    # Build copy channel bindings for orphan variables (after translateVariables + channelPositions)
+    result.buildOrphanEqualityConstraints()
     # Detect singleton set channels: set_card(S,1) + set_in(x,S) → S.bools become channels
     result.detectSingletonSetChannels()
     for def in result.singletonSetChannelDefs:
@@ -1128,6 +1156,19 @@ proc translate*(model: FznModel): FznTranslator =
                 result.sys.addConstraint(result.getExpr(targetPos) >= origMin)
             if origMax < channelMax:
                 result.sys.addConstraint(result.getExpr(targetPos) <= origMax)
+        elif ci in result.constantCountPatterns:
+            # Emit atLeast + atMost for detected constant count (exactly) pattern
+            let pattern = result.constantCountPatterns[ci]
+            var arrayPos: seq[int]
+            for vn in pattern.arrayVarNames:
+                if vn in result.varPositions:
+                    arrayPos.add(result.varPositions[vn])
+                elif vn in result.definedVarExprs:
+                    continue  # variable eliminated as defined expression
+                else:
+                    raise newException(KeyError, &"Unknown variable '{vn}' in constant count pattern")
+            result.sys.addConstraint(atLeast[int](arrayPos, pattern.countValue, pattern.requiredCount))
+            result.sys.addConstraint(atMost[int](arrayPos, pattern.countValue, pattern.requiredCount))
         elif ci in result.countEqPatterns:
             # Emit count_eq for detected pattern
             let pattern = result.countEqPatterns[ci]

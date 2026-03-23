@@ -139,11 +139,16 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         when direction == Minimize:
             var lo = if lowerBound != low(int): lowerBound else: safeLowerBound(currentCost)
             var hi = currentCost - 1
-            var loProven = lowerBound != low(int)  # only proven if user-provided or domain-derived
+            # loProven is ONLY set by InfeasibleError from domain reduction — the sole
+            # mechanism by which a local search solver can prove a lower bound. Domain
+            # bounds from variable declarations are hints, not proofs.
+            var loProven = false
+            let domainLoBound = if lowerBound != low(int): lowerBound else: low(int)
         else:
             var lo = currentCost + 1
             var hi = if upperBound != high(int): upperBound else: safeUpperBound(currentCost)
-            var hiProven = upperBound != high(int)  # user-provided bound is trusted
+            var hiProven = false
+            let domainHiBound = if upperBound != high(int): upperBound else: high(int)
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
@@ -204,6 +209,31 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
+                # Validate: reject solutions that violate the original domain bound.
+                # This catches cases where disconnected variable arrays allow the
+                # solver to find zero-penalty assignments with infeasible objectives.
+                # Only checks against the ORIGINAL domain bound (immutable), not the
+                # dynamic binary search lo/hi which ratchets during no-solution rounds.
+                when direction == Minimize:
+                    if lowerBound != low(int) and currentCost < domainLoBound:
+                        if verbose:
+                            echo "[Opt] Rejected infeasible solution: ", currentCost, " < domain lower bound ", domainLoBound
+                            flushFile(stdout)
+                        system.initialize(bestSolution)
+                        objective.initialize(system.assignment)
+                        currentCost = objective.value
+                        lo = target + 1
+                        continue
+                else:
+                    if upperBound != high(int) and currentCost > domainHiBound:
+                        if verbose:
+                            echo "[Opt] Rejected infeasible solution: ", currentCost, " > domain upper bound ", domainHiBound
+                            flushFile(stdout)
+                        system.initialize(bestSolution)
+                        objective.initialize(system.assignment)
+                        currentCost = objective.value
+                        hi = target - 1
+                        continue
                 system.bestAssignmentValid = false
                 system.bestFeasibleAssignment = system.assignment
                 system.bestAssignmentValid = true
@@ -250,21 +280,26 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 # Only claim proven optimal if the bound was established by
                 # InfeasibleError (domain reduction proof) or user-provided.
                 when direction == Minimize:
-                    if currentCost <= lo:
-                        if loProven:
-                            system.optimalityProven = true
-                            break retryLoop
-                        else:
-                            # lo was a heuristic guess — lower it and keep searching
-                            lo = min(safeLowerBound(currentCost), safeLowerBound(lo))
+                    # Proven optimal if: (a) domain reduction proved lo, or
+                    # (b) current cost matches the domain lower bound (no feasible
+                    # solution can exist below it by definition of the variable domain).
+                    if currentCost <= lo and loProven:
+                        system.optimalityProven = true
+                        break retryLoop
+                    elif domainLoBound != low(int) and currentCost <= domainLoBound:
+                        system.optimalityProven = true
+                        break retryLoop
+                    elif currentCost <= lo:
+                        lo = min(safeLowerBound(currentCost), safeLowerBound(lo))
                 else:
-                    if currentCost >= hi:
-                        if hiProven:
-                            system.optimalityProven = true
-                            break retryLoop
-                        else:
-                            # hi was a heuristic guess — raise it and keep searching
-                            hi = max(safeUpperBound(currentCost), safeUpperBound(hi))
+                    if currentCost >= hi and hiProven:
+                        system.optimalityProven = true
+                        break retryLoop
+                    elif domainHiBound != high(int) and currentCost >= domainHiBound:
+                        system.optimalityProven = true
+                        break retryLoop
+                    elif currentCost >= hi:
+                        hi = max(safeUpperBound(currentCost), safeUpperBound(hi))
 
                 if deadline > 0 and epochTime() > deadline:
                     system.searchCompleted = false
@@ -310,6 +345,31 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
+                    # Reject solutions that violate the domain bound
+                    when direction == Minimize:
+                        if domainLoBound != low(int) and currentCost < domainLoBound:
+                            if verbose:
+                                echo "[Opt] Rejected infeasible retry solution: ", currentCost, " < domain bound ", domainLoBound
+                                flushFile(stdout)
+                            system.initialize(bestSolution)
+                            objective.initialize(system.assignment)
+                            currentCost = objective.value
+                            retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
+                            system.baseArray.constraints = savedConstraints2
+                            system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
+                            continue
+                    else:
+                        if domainHiBound != high(int) and currentCost > domainHiBound:
+                            if verbose:
+                                echo "[Opt] Rejected infeasible retry solution: ", currentCost, " > domain bound ", domainHiBound
+                                flushFile(stdout)
+                            system.initialize(bestSolution)
+                            objective.initialize(system.assignment)
+                            currentCost = objective.value
+                            retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
+                            system.baseArray.constraints = savedConstraints2
+                            system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
+                            continue
                     system.bestAssignmentValid = false
                     system.bestFeasibleAssignment = system.assignment
                     system.bestAssignmentValid = true

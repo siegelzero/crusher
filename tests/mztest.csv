@@ -14,5 +14,8 @@ mrcpsp_j30_25_5,2023/mrcpsp/mrcpsp.mzn,2023/mrcpsp/j30_25_5.dzn,minimize,10000,2
 pennies_n5,2023/pennies-opt/pennies.mzn,2023/pennies-opt/n5.dzn,maximize,10000,1,5
 products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,2025/products-and-shelves/ps-25-01.dzn,minimize,10000,5,5
 proteindesign12_1HZ5,2025/proteindesign12/wcsp.mzn,2025/proteindesign12/1HZ5.12p.9aa.usingEref_self.dzn,minimize,10000,1473,1480
+roster_chicroster_8,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_8.dzn,minimize,10000,7,7
+roster_chicroster_9,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_9.dzn,minimize,10000,13,13
+roster_chicroster_10,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_10.dzn,minimize,10000,18,18
 tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.dzn,maximize,10000,25,45
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320

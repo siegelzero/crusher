@@ -53,6 +53,7 @@ import test_multiknapsack
 import test_n_queens
 import test_negative_domains
 import test_newspaper
+import test_objective_bounds
 import test_ordering_constraint
 import test_parallel_search
 import test_pentominoes_geost

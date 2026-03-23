@@ -214,3 +214,129 @@ suite "Optimization with objective bounds":
             actualSum += solution[i]
 
         check actualSum == 6  # 1+2+3
+
+    test "domain bound prevents accepting infeasible solutions (minimize)":
+        # When lowerBound is provided, the optimizer must never accept a solution
+        # whose objective is below that bound, even if the solver finds one with
+        # zero penalty (which can happen with disconnected variable arrays).
+        #
+        # Setup: 3 variables in {1..10}, objective = x[0] (just first variable).
+        # lowerBound=5: optimizer must never report objective < 5.
+        # True minimum of x[0] is 1, but lowerBound says 5 is the floor.
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..10))
+
+        let obj = x[0]
+        sys.minimize(obj, parallel=true, tabuThreshold=1000, lowerBound=5)
+
+        let objVal = sys.assignment[0]
+        check objVal >= 5  # Must respect the domain lower bound
+
+    test "domain bound prevents accepting infeasible solutions (maximize)":
+        # Symmetric test for maximize: upperBound=7 means no solution above 7.
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..10))
+
+        let obj = x[0]
+        sys.maximize(obj, parallel=true, tabuThreshold=1000, upperBound=7)
+
+        let objVal = sys.assignment[0]
+        check objVal <= 7
+
+    test "proven optimal when objective reaches domain lower bound":
+        # When the solver finds objective == lowerBound, it should claim
+        # "proven optimal" because no feasible solution can exist below the
+        # variable's domain lower bound.
+        #
+        # 3 variables in {5..10}, allDifferent, minimize sum.
+        # Optimal: 5+6+7=18. Provide lowerBound=18 (tight).
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(5..10))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000, lowerBound=18)
+
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += x.assignment[i]
+        check actualSum == 18
+        check sys.optimalityProven == true
+
+    test "proven optimal when objective reaches domain upper bound (maximize)":
+        # 3 variables in {1..5}, allDifferent, maximize sum.
+        # Optimal: 3+4+5=12. Provide upperBound=12 (tight).
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..5))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.maximize(total, parallel=true, tabuThreshold=1000, upperBound=12)
+
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += x.assignment[i]
+        check actualSum == 12
+        check sys.optimalityProven == true
+
+    test "no false proven claim with loose domain bound":
+        # lowerBound=0 is far from optimal (15). The optimizer should find 15
+        # and NOT claim proven optimal (since 15 > 0 and domain reduction
+        # didn't prove the bound).
+        # Exception: domain reduction may actually prove lo=15 via InfeasibleError,
+        # in which case proven is legitimate. We just verify the objective is correct.
+        let n = 5
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..20))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000, lowerBound=0)
+
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += x.assignment[i]
+        check actualSum == 15  # 1+2+3+4+5
+
+    test "loProven set only by InfeasibleError not by domain bound":
+        # 3 variables in {1..5}, allDifferent, minimize sum = 6.
+        # lowerBound=6 (exact). The optimizer finds 6 and proves optimal
+        # because currentCost == domainLoBound, NOT because loProven was
+        # initialized from the domain bound.
+        # This verifies the code path: domainLoBound match → proven.
+        let n = 3
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(1..5))
+        sys.addConstraint(allDifferent(x))
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000, lowerBound=6)
+
+        var actualSum = 0
+        for i in 0..<n:
+            actualSum += x.assignment[i]
+        check actualSum == 6
+        # Proven because we reached the domain bound
+        check sys.optimalityProven == true

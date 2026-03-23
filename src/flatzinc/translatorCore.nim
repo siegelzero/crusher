@@ -2175,3 +2175,218 @@ proc translateSolve(tr: var FznTranslator) =
     of Satisfy:
         tr.objectivePos = ObjPosNone
 
+proc extractSearchAnnotationVars(tr: var FznTranslator) =
+    ## Extracts variable names from solve :: int_search / seq_search annotations.
+    ## Populates tr.annotatedSearchVarNames with all variable names that are
+    ## explicitly listed as search variables by the model's solve annotation.
+
+    proc extractFromAnnotation(tr: var FznTranslator, ann: FznAnnotation) =
+        ## Recursively extract variable names from a single search annotation.
+        case ann.name
+        of "int_search", "bool_search":
+            # int_search(array, varsel, valsel, strategy)
+            # First arg is the array of search variables
+            if ann.args.len >= 1:
+                let arrayArg = ann.args[0]
+                case arrayArg.kind
+                of FznIdent:
+                    # Named array reference — resolve to element variable names
+                    let arrayName = arrayArg.ident
+                    # Look up in model declarations
+                    for decl in tr.model.variables:
+                        if decl.isArray and decl.name == arrayName and decl.value != nil and
+                           decl.value.kind == FznArrayLit:
+                            for elem in decl.value.elems:
+                                if elem.kind == FznIdent:
+                                    tr.annotatedSearchVarNames.incl(elem.ident)
+                            break
+                of FznArrayLit:
+                    # Inline array literal
+                    for elem in arrayArg.elems:
+                        if elem.kind == FznIdent:
+                            tr.annotatedSearchVarNames.incl(elem.ident)
+                else:
+                    discard
+        of "seq_search":
+            # seq_search([ann1, ann2, ...]) — recurse into each sub-annotation
+            if ann.args.len >= 1 and ann.args[0].kind == FznArrayLit:
+                for elem in ann.args[0].elems:
+                    if elem.kind == FznAnnotationExpr:
+                        tr.extractFromAnnotation(FznAnnotation(
+                            name: elem.annName, args: elem.annArgs))
+        else:
+            discard  # Unknown annotation type — ignore
+
+    for ann in tr.model.solve.annotations:
+        tr.extractFromAnnotation(ann)
+        if tr.annotatedSearchVarNames.len > 0:
+            tr.hasSearchAnnotation = true
+
+    if tr.hasSearchAnnotation:
+        stderr.writeLine("[FZN] Solve annotation: " & $tr.annotatedSearchVarNames.len &
+            " annotated search variables")
+
+proc detectOrphanSearchVariables(tr: var FznTranslator) =
+    ## Before translateVariables: detect non-annotated search variables ("orphans") and
+    ## add them to equalityCopyAliases + definedVarNames so they don't get system positions.
+    ##
+    ## Orphan variables KEEP their system positions (needed by constraints that reference
+    ## them, like at_least/at_most and reification channels). But they're marked as
+    ## channel positions (not searched) and get element channel bindings that copy the
+    ## annotated variable's value. This ensures:
+    ## 1. Constraints on orphan positions see the same values as annotated positions
+    ## 2. Channel-dep penalty maps trace through orphan positions correctly
+    ## 3. Reification channels on orphan positions propagate correctly
+    if not tr.hasSearchAnnotation:
+        return
+
+    # Identify orphan search variables: not in annotation, not channels, not defined
+    var orphanVarNames: seq[string]
+    for decl in tr.model.variables:
+        if decl.isArray: continue
+        if not decl.isVar: continue  # skip parameters
+        let vn = decl.name
+        if vn in tr.annotatedSearchVarNames: continue
+        if vn in tr.channelVarNames: continue
+        if vn in tr.definedVarNames: continue
+        case decl.varType.kind
+        of FznIntRange:
+            if decl.varType.lo == 0 and decl.varType.hi == 1:
+                continue  # bool2int output — not an orphan
+        of FznBool:
+            continue
+        else:
+            discard
+        orphanVarNames.add(vn)
+
+    if orphanVarNames.len == 0:
+        return
+
+    stderr.writeLine("[FZN] Warning: " & $orphanVarNames.len &
+        " non-annotated search variables detected (not in solve :: int_search)")
+
+    let orphanSet = toHashSet(orphanVarNames)
+    let annotatedSet = tr.annotatedSearchVarNames
+
+    # Reconstruct variable sequences from overlapping window arrays.
+    var successors: Table[string, string]
+    var predecessors: Table[string, string]
+    var hasMixedArray = false
+
+    for decl in tr.model.variables:
+        if not decl.isArray or decl.value == nil or decl.value.kind != FznArrayLit:
+            continue
+        var hasOrphan, hasAnnotated = false
+        var elems: seq[string]
+        for elem in decl.value.elems:
+            if elem.kind == FznIdent:
+                elems.add(elem.ident)
+                if elem.ident in orphanSet: hasOrphan = true
+                if elem.ident in annotatedSet: hasAnnotated = true
+            else:
+                elems.add("")
+        if hasOrphan and hasAnnotated:
+            hasMixedArray = true
+        if hasOrphan or hasAnnotated:
+            for i in 0..<elems.len - 1:
+                let a = elems[i]
+                let b = elems[i + 1]
+                if a == "" or b == "": continue
+                if a notin successors:
+                    successors[a] = b
+                if b notin predecessors:
+                    predecessors[b] = a
+
+    if not hasMixedArray:
+        stderr.writeLine("[FZN] No overlapping arrays found between orphan and annotated variables")
+        return
+
+    # Find an annotated variable that is preceded by an orphan variable.
+    var boundaryAnnotated = ""
+    var boundaryOrphan = ""
+    for vn in annotatedSet:
+        if vn in predecessors and predecessors[vn] in orphanSet:
+            boundaryAnnotated = vn
+            boundaryOrphan = predecessors[vn]
+            break
+
+    if boundaryAnnotated == "":
+        stderr.writeLine("[FZN] Could not find orphan→annotated boundary in window arrays")
+        return
+
+    # Walk backward from boundary orphan to reconstruct orphan sequence
+    var orphanSeq: seq[string]
+    var cur = boundaryOrphan
+    while cur in orphanSet:
+        orphanSeq.add(cur)
+        if cur in predecessors and predecessors[cur] in orphanSet:
+            cur = predecessors[cur]
+        else:
+            break
+    var orphanForward: seq[string]
+    for i in countdown(orphanSeq.len - 1, 0):
+        orphanForward.add(orphanSeq[i])
+
+    # Build complete annotated sequence
+    var fullAnnotatedSeq: seq[string]
+    cur = boundaryAnnotated
+    var visited: HashSet[string]
+    while cur in annotatedSet and cur notin visited:
+        visited.incl(cur)
+        fullAnnotatedSeq.add(cur)
+        if cur in successors: cur = successors[cur]
+        else: break
+    var prefixAnnotated: seq[string]
+    visited.clear()
+    if boundaryAnnotated in predecessors:
+        cur = predecessors[boundaryAnnotated]
+        while cur in annotatedSet and cur notin visited:
+            visited.incl(cur)
+            prefixAnnotated.add(cur)
+            if cur in predecessors: cur = predecessors[cur]
+            else: break
+    var completeAnnotatedSeq: seq[string]
+    for i in countdown(prefixAnnotated.len - 1, 0):
+        completeAnnotatedSeq.add(prefixAnnotated[i])
+    for vn in fullAnnotatedSeq:
+        completeAnnotatedSeq.add(vn)
+
+    if orphanForward.len != completeAnnotatedSeq.len:
+        stderr.writeLine("[FZN] Orphan sequence length (" & $orphanForward.len &
+            ") != annotated sequence length (" & $completeAnnotatedSeq.len &
+            ") — cannot infer mapping, skipping")
+        return
+
+    # Store the mapping for later: after translateVariables, we create equality
+    # constraints to link orphan positions to annotated positions.
+    tr.orphanToAnnotatedMap = newSeq[(string, string)]()
+    for i in 0..<orphanForward.len:
+        let orphanName = orphanForward[i]
+        let annotatedName = completeAnnotatedSeq[i]
+        if orphanName != annotatedName:
+            tr.orphanToAnnotatedMap.add((orphanName, annotatedName))
+
+    if tr.orphanToAnnotatedMap.len > 0:
+        stderr.writeLine("[FZN] Detected " & $tr.orphanToAnnotatedMap.len &
+            " orphan→annotated variable mappings (will generate equality constraints)")
+
+proc buildOrphanEqualityConstraints(tr: var FznTranslator) =
+    ## After translateVariables: generate equality constraints linking orphan
+    ## positions to annotated positions. These provide penalty signals during
+    ## search to keep the two sets synchronized.
+    if tr.orphanToAnnotatedMap.len == 0:
+        return
+
+    var nEqualities = 0
+    for (orphanName, annotatedName) in tr.orphanToAnnotatedMap:
+        if orphanName notin tr.varPositions or annotatedName notin tr.varPositions:
+            continue
+        let orphanPos = tr.varPositions[orphanName]
+        let annotatedPos = tr.varPositions[annotatedName]
+        tr.sys.addConstraint(tr.getExpr(orphanPos) == tr.getExpr(annotatedPos))
+        inc nEqualities
+
+    if nEqualities > 0:
+        stderr.writeLine("[FZN] Generated " & $nEqualities &
+            " equality constraints linking orphan to annotated search variables")
+

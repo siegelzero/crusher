@@ -559,6 +559,133 @@ proc detectCountPatterns(tr: var FznTranslator) =
 
         stderr.writeLine(&"[FZN] Detected balanced count pattern: count({uncoveredArrayVarNames.len} vars, {uncoveredValue}) == {targetName} (balanced with value {coveredValue})")
 
+    # Third pass: constant-count patterns (exactly constraint decomposition)
+    # Pattern: int_lin_eq([-1,...,-1], [ind_1,...,ind_n], -k) where ALL coefficients are -1
+    # and RHS is -k (a negative constant). Each indicator traces through bool2int → int_eq_reif
+    # to the same value. Equivalent to: exactly(k, [x_1,...,x_n], val)
+    # For k=0: domain reduction (remove val from all x_j domains)
+    # For k>0: emit atLeast + atMost constraints
+    #
+    # Build separate maps that include consumed constraints — the bool2int/int_eq_reif for
+    # zero-count indicators may already be consumed by collectDefinedVars, but we still need
+    # to trace through them for pattern detection.
+    var allBool2intDefs: Table[string, int]
+    var allIntEqReifDefs: Table[string, int]
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name == "bool2int" and con.hasAnnotation("defines_var"):
+            if con.args.len >= 2 and con.args[1].kind == FznIdent:
+                allBool2intDefs[con.args[1].ident] = ci
+        elif name == "int_eq_reif" and con.hasAnnotation("defines_var"):
+            if con.args.len >= 3 and con.args[2].kind == FznIdent:
+                allIntEqReifDefs[con.args[2].ident] = ci
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints or ci in tr.countEqPatterns or ci in tr.constantCountPatterns:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq":
+            continue
+
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len < 1:
+            continue
+
+        # Check that ALL coefficients are the same (-1 or +1) — no target variable
+        var allSame = true
+        let c0 = coeffs[0]
+        if c0 != -1 and c0 != 1:
+            continue
+        for i in 1..<coeffs.len:
+            if coeffs[i] != c0: allSame = false; break
+        if not allSame:
+            continue
+
+        # Compute required count: if coeffs are all -1 and rhs = -k, then sum(inds) = k
+        # If coeffs are all +1 and rhs = k, then sum(inds) = k
+        let requiredCount = if c0 == -1: -rhs else: rhs
+        if requiredCount < 0:
+            continue  # Negative count is infeasible — skip
+
+        # Extract variable names
+        let varElems = tr.extractVarElems(con.args[1])
+        if varElems.len != coeffs.len:
+            continue
+
+        # Trace all indicators through bool2int → int_eq_reif
+        var countValue: int
+        var countValueSet = false
+        var arrayVarNames: seq[string]
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+        var valid = true
+
+        for i in 0..<varElems.len:
+            let traced = tr.traceIndicator(varElems[i], allBool2intDefs, allIntEqReifDefs)
+            if not traced.valid:
+                valid = false; break
+            if not countValueSet:
+                countValue = traced.countValue
+                countValueSet = true
+            elif traced.countValue != countValue:
+                valid = false; break
+
+            arrayVarNames.add(traced.arrayVarName)
+            consumedConstraints.add(traced.b2iIdx)
+            consumedVarNames.add(traced.indName)
+
+        if not valid or not countValueSet:
+            continue
+
+        if requiredCount == 0:
+            # Zero-count: remove countValue from all array variable domains
+            var nReduced = 0
+            for vn in arrayVarNames:
+                if vn in tr.presolveDomains:
+                    let dom = tr.presolveDomains[vn]
+                    var newDom: seq[int]
+                    for v in dom:
+                        if v != countValue:
+                            newDom.add(v)
+                    if newDom.len < dom.len:
+                        tr.presolveDomains[vn] = newDom
+                        inc nReduced
+                else:
+                    # Build domain from declaration and remove countValue
+                    let dom = tr.lookupVarDomain(vn)
+                    if dom.len > 0:
+                        var newDom: seq[int]
+                        for v in dom:
+                            if v != countValue:
+                                newDom.add(v)
+                        if newDom.len < dom.len:
+                            tr.presolveDomains[vn] = newDom
+                            inc nReduced
+            # Mark the int_lin_eq as consumed (it's satisfied by domain reduction)
+            tr.definingConstraints.incl(ci)
+            for idx in consumedConstraints:
+                tr.definingConstraints.incl(idx)
+            for vn in consumedVarNames:
+                tr.definedVarNames.incl(vn)
+            if nReduced > 0:
+                stderr.writeLine(&"[FZN] Zero-count domain reduction: removed value {countValue} from {nReduced}/{arrayVarNames.len} variable domains")
+        else:
+            # Positive count: record pattern for atLeast + atMost emission
+            tr.constantCountPatterns[ci] = ConstantCountPattern(
+                linEqIdx: ci,
+                countValue: countValue,
+                requiredCount: requiredCount,
+                arrayVarNames: arrayVarNames
+            )
+            # Mark the int_lin_eq and bool2int as consumed
+            # Do NOT consume int_eq_reif — bool vars may be shared by other constraints
+            for idx in consumedConstraints:
+                tr.definingConstraints.incl(idx)
+            for vn in consumedVarNames:
+                tr.definedVarNames.incl(vn)
+            stderr.writeLine(&"[FZN] Detected constant count pattern: exactly({requiredCount}, {arrayVarNames.len} vars, {countValue})")
+
 proc detectWeightedSameValuePattern(tr: var FznTranslator) =
     ## Detects weighted same-value objective pattern:
     ##   int_eq_reif(x_i, x_j, b_ij) :: defines_var(b_ij)  -- variable-variable equality

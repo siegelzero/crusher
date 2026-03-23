@@ -2394,3 +2394,54 @@ solve maximize obj;
     # With connected: center must stay white (else nodes 2,3 disconnect), max obj = 1
     # Without connected (the old bug): fill center for obj = 10 or 11
     check objVal <= 1
+
+  test "orphan variable detection links disconnected arrays":
+    # Simplified model with two arrays that should be the same (like roster longflatroster).
+    # Array 'a' is the annotated search array. Array 'b' is an orphan extended copy.
+    # b[4..6] are aliased to a[1..3] (wrap-around). b[1..3] should equal a[1..3] but
+    # are NOT explicitly linked (model bug). The solve annotation only mentions 'a'.
+    # Without orphan detection: b[1..3] are free, solver can exploit them.
+    # With orphan detection: b[1..3] are linked to a[1..3] via equality constraints.
+    let src = """
+var 1..3: a1;
+var 1..3: a2;
+var 1..3: a3;
+var 1..3: b1;
+var 1..3: b2;
+var 1..3: b3;
+array [1..3] of var int: a:: output_array([1..3]) = [a1,a2,a3];
+array [1..3] of var int: win1:: var_is_introduced = [b1,b2,b3];
+array [1..3] of var int: win2:: var_is_introduced = [b2,b3,a1];
+array [1..3] of var int: win3:: var_is_introduced = [b3,a1,a2];
+var 0..3: cost:: output_var:: is_defined_var;
+var bool: r1:: var_is_introduced:: is_defined_var;
+var bool: r2:: var_is_introduced:: is_defined_var;
+var bool: r3:: var_is_introduced:: is_defined_var;
+var 0..1: i1:: var_is_introduced:: is_defined_var;
+var 0..1: i2:: var_is_introduced:: is_defined_var;
+var 0..1: i3:: var_is_introduced:: is_defined_var;
+constraint fzn_at_least_int(1,win1,1);
+constraint fzn_at_least_int(1,win2,1);
+constraint fzn_at_least_int(1,win3,1);
+constraint int_eq_reif(b1,2,r1):: defines_var(r1);
+constraint int_eq_reif(b2,2,r2):: defines_var(r2);
+constraint int_eq_reif(b3,2,r3):: defines_var(r3);
+constraint bool2int(r1,i1):: defines_var(i1);
+constraint bool2int(r2,i2):: defines_var(i2);
+constraint bool2int(r3,i3):: defines_var(i3);
+constraint int_lin_eq([1,-1,-1,-1],[cost,i1,i2,i3],0):: defines_var(cost);
+solve :: int_search(a,first_fail,indomain_min,complete) minimize cost;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Verify solve annotation extraction
+    check tr.hasSearchAnnotation
+    check tr.annotatedSearchVarNames.len == 3
+    check "a1" in tr.annotatedSearchVarNames
+    check "a2" in tr.annotatedSearchVarNames
+    check "a3" in tr.annotatedSearchVarNames
+
+    # Orphan variables have positions and equality constraints (not channels)
+    check "b1" in tr.varPositions
+    check tr.orphanToAnnotatedMap.len == 3
