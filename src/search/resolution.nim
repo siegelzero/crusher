@@ -82,6 +82,7 @@ proc resolve*[T](system: ConstraintSystem[T],
         var adaptedThreshold = effectiveThreshold
         if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, deadline, adaptedThreshold):
             system.adaptedTabuThreshold = adaptedThreshold
+            system.hasFeasibleSolution = true
             return
 
         # Check deadline before continuing with scatter search
@@ -103,6 +104,7 @@ proc resolve*[T](system: ConstraintSystem[T],
                     lnsImprove(system, pool, scatterThreshold, adaptedThreshold, actualWorkers, verbose, deadline)
             # scatter/lns write final adaptedThreshold to system.adaptedTabuThreshold directly
             if improved:
+                system.hasFeasibleSolution = true
                 return
 
         if deadline > 0 and epochTime() > deadline:
@@ -113,6 +115,7 @@ proc resolve*[T](system: ConstraintSystem[T],
         if improved.bestCost == 0:
             system.initialize(improved.bestAssignment)
             system.lastIterations = improved.iteration
+            system.hasFeasibleSolution = true
             return
         if verbose:
             echo &"[Solve] Sequential failed: best cost={improved.bestCost}"

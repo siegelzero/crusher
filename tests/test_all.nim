@@ -8,6 +8,7 @@ import test_boolean_constraints
 import test_channel_dependencies
 import test_channel_substitution
 import test_circuit
+import test_circuit_time_prop
 import test_conditional_count_eq_channels
 import test_connected
 import test_constrained_variable

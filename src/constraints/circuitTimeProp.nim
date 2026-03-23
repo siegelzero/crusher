@@ -127,60 +127,29 @@ proc newCircuitTimePropConstraint*[T](
     result.cost = 0
 
 
-proc computeCircuitPenalty*[T](c: CircuitTimePropConstraint[T],
-                                pred: openArray[int]): int =
-    ## Count nodes NOT reachable from depot via successor traversal.
-    ## This penalty has smooth gradient: each single-variable move that adds
-    ## a node to the depot chain reduces the penalty by 1.
+proc computePenalties*[T](c: CircuitTimePropConstraint[T],
+                           pred: openArray[int],
+                           arrival: var openArray[T],
+                           departure: var openArray[T]): tuple[circPen, twPen: int] =
+    ## Combined circuit penalty + time computation in a single traversal.
+    ## Circuit penalty = nodes NOT reachable from depot (+ 1 if tour doesn't close).
+    ## Time penalty = sum of max(0, departure[l] - late[l]).
     let n = c.n
 
     # Build successor mapping: succ[k] = l where pred[l] = k
-    for i in 0..<n:
-        c.scratchColor[i] = ncWhite  # reuse as "visited" marker
-    # scratchPath reused as successor array
     c.scratchPath.setLen(n)
     for i in 0..<n:
         c.scratchPath[i] = -1
+        c.scratchInAffected[i] = false  # used as "visited" marker
     for l in 0..<n:
         let p = pred[l]
         if p >= 0 and p < n:
             c.scratchPath[p] = l
 
-    # Traverse from depot
-    var visited = 0
-    var current = c.depotIndex
-    for step in 0..<n:
-        if current < 0 or current >= n: break
-        if c.scratchColor[current] != ncWhite: break  # cycle back or revisit
-        c.scratchColor[current] = ncGray  # mark visited
-        inc visited
-        current = c.scratchPath[current]
-
-    # If we visited all n nodes and the last successor leads back to depot,
-    # it's a valid Hamiltonian circuit
-    return n - visited
-
-
-proc computeTimesAndPenalty*[T](c: CircuitTimePropConstraint[T],
-                                 pred: openArray[int],
-                                 arrival: var openArray[T],
-                                 departure: var openArray[T]): int =
-    ## Traverse the tour from depot and compute arrival/departure times.
-    ## Returns the time window penalty (sum of max(0, departure[l] - late[l])).
-    let n = c.n
-
-    # Build successor mapping: succ[pred[l]] = l (O(n))
-    # scratchPath is reused as successor array here
-    c.scratchPath.setLen(n)
-    for i in 0..<n:
-        c.scratchPath[i] = -1
-    for l in 0..<n:
-        let p = pred[l]
-        if p >= 0 and p < n:
-            c.scratchPath[p] = l
-
+    # Traverse from depot computing times
     departure[c.depotIndex] = c.depotDeparture
     arrival[c.depotIndex] = c.depotDeparture
+    c.scratchInAffected[c.depotIndex] = true
 
     var visited = 1
     var current = c.depotIndex
@@ -188,25 +157,29 @@ proc computeTimesAndPenalty*[T](c: CircuitTimePropConstraint[T],
 
     for step in 1..<n:
         let next = c.scratchPath[current]
-        if next < 0 or next >= n:
-            # Circuit broken — can't compute meaningful times
-            # Return 0 time penalty; circuit penalty dominates
-            break
+        if next < 0 or next >= n or c.scratchInAffected[next]:
+            break  # broken or cycle back to non-depot
 
         arrival[next] = departure[current] + c.distanceMatrix[next][current]
         departure[next] = max(arrival[next], c.earlyTimes[next])
         if departure[next] > c.lateTimes[next]:
             twPenalty += int(departure[next] - c.lateTimes[next])
+        c.scratchInAffected[next] = true
         inc visited
         current = next
 
-    # Last node connects back to depot
+    # Check tour closure and compute depot arrival
+    var circPenalty = n - visited
     if visited == n:
-        arrival[c.depotIndex] = departure[current] + c.distanceMatrix[c.depotIndex][current]
-        if arrival[c.depotIndex] > c.lateTimes[c.depotIndex]:
-            twPenalty += int(arrival[c.depotIndex] - c.lateTimes[c.depotIndex])
+        let lastSucc = c.scratchPath[current]
+        if lastSucc != c.depotIndex:
+            circPenalty = 1  # all visited but doesn't close
+        else:
+            arrival[c.depotIndex] = departure[current] + c.distanceMatrix[c.depotIndex][current]
+            if arrival[c.depotIndex] > c.lateTimes[c.depotIndex]:
+                twPenalty += int(arrival[c.depotIndex] - c.lateTimes[c.depotIndex])
 
-    return twPenalty
+    return (circPen: circPenalty, twPen: twPenalty)
 
 
 proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
@@ -216,9 +189,9 @@ proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
         c.currentAssignment[pos] = value
         c.predecessorOf[i] = int(value) - c.valueOffset
 
-    c.circuitPenalty = c.computeCircuitPenalty(c.predecessorOf)
-    c.timeWindowPenalty = c.computeTimesAndPenalty(
-        c.predecessorOf, c.arrivalTime, c.departureTime)
+    let pens = c.computePenalties(c.predecessorOf, c.arrivalTime, c.departureTime)
+    c.circuitPenalty = pens.circPen
+    c.timeWindowPenalty = pens.twPen
     var objPenalty = 0
     if c.objectiveBoundActive:
         let objArrival = c.arrivalTime[c.objectiveNodeIdx]
@@ -258,9 +231,9 @@ proc moveDelta*[T](c: CircuitTimePropConstraint[T],
     c.scratchPred[nodeIdx] = int(newValue) - c.valueOffset
 
     # Compute penalties with the hypothetical change
-    let newCircuitPenalty = c.computeCircuitPenalty(c.scratchPred)
-    let newTimePenalty = c.computeTimesAndPenalty(
-        c.scratchPred, c.scratchArrival, c.scratchDeparture)
+    let newPens = c.computePenalties(c.scratchPred, c.scratchArrival, c.scratchDeparture)
+    let newCircuitPenalty = newPens.circPen
+    let newTimePenalty = newPens.twPen
     var newObjPenalty = 0
     if c.objectiveBoundActive:
         let objArrival = c.scratchArrival[c.objectiveNodeIdx]
@@ -279,9 +252,9 @@ proc updatePosition*[T](c: CircuitTimePropConstraint[T],
     c.currentAssignment[position] = newValue
     c.predecessorOf[nodeIdx] = int(newValue) - c.valueOffset
 
-    c.circuitPenalty = c.computeCircuitPenalty(c.predecessorOf)
-    c.timeWindowPenalty = c.computeTimesAndPenalty(
-        c.predecessorOf, c.arrivalTime, c.departureTime)
+    let pens = c.computePenalties(c.predecessorOf, c.arrivalTime, c.departureTime)
+    c.circuitPenalty = pens.circPen
+    c.timeWindowPenalty = pens.twPen
     var objPenalty = 0
     if c.objectiveBoundActive:
         let objArrival = c.arrivalTime[c.objectiveNodeIdx]
