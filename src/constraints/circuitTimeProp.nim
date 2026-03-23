@@ -10,15 +10,12 @@
 ##    departure[l] = max(arrival[l], early[l])
 ## 3. Penalizes time window violations: departure[l] > late[l]
 ##
-## The circuit penalty is weighted by (max_late + 1) to ensure circuit
+## The circuit penalty is weighted by n (number of nodes) to ensure circuit
 ## repair takes priority over time window adjustments.
 
 import std/[tables, packedsets]
 
 type
-    NodeColor = enum
-        ncWhite, ncGray, ncBlack
-
     CircuitTimePropConstraint*[T] = ref object
         n*: int
         valueOffset*: int                    # 1 for 1-based values, 0 for 0-based
@@ -41,14 +38,6 @@ type
         predecessorOf*: seq[int]             # 0-based predecessor for each node
         cost*: int                           # cached total penalty
 
-        # Circuit tracking
-        componentId*: seq[int]
-        cycleId*: seq[int]
-        numCycles*: int
-        numTailNodes*: int
-        nextComponentId*: int
-        nextCycleId*: int
-
         # Time state
         arrivalTime*: seq[T]
         departureTime*: seq[T]
@@ -57,16 +46,11 @@ type
         circuitWeight*: int                  # weight for circuit violations
 
         # Scratch space
-        scratchColor*: seq[NodeColor]
         scratchInAffected*: seq[bool]
         scratchPath*: seq[int]
         scratchPred*: seq[int]               # temporary predecessor array for moveDelta
         scratchArrival*: seq[T]
         scratchDeparture*: seq[T]
-        savedComponentId*: seq[int]          # save/restore for moveDelta
-        savedCycleId*: seq[int]
-
-        currentAssignment*: Table[int, T]
 
         # Optional objective bound (set by optimizer)
         objectiveNodeIdx*: int               # 0-based node index for objective (arrival at this node)
@@ -90,7 +74,6 @@ proc newCircuitTimePropConstraint*[T](
     result.positionArray = @predPositions
     result.positions = toPackedSet[int](predPositions)
     result.positionToIndex = initTable[int, int]()
-    result.currentAssignment = initTable[int, T]()
     for i, pos in predPositions:
         result.positionToIndex[pos] = i
 
@@ -109,18 +92,13 @@ proc newCircuitTimePropConstraint*[T](
     result.circuitWeight = n
 
     result.predecessorOf = newSeq[int](n)
-    result.componentId = newSeq[int](n)
-    result.cycleId = newSeq[int](n)
     result.arrivalTime = newSeq[T](n)
     result.departureTime = newSeq[T](n)
-    result.scratchColor = newSeq[NodeColor](n)
     result.scratchInAffected = newSeq[bool](n)
     result.scratchPath = newSeqOfCap[int](n)
     result.scratchPred = newSeq[int](n)
     result.scratchArrival = newSeq[T](n)
     result.scratchDeparture = newSeq[T](n)
-    result.savedComponentId = newSeq[int](n)
-    result.savedCycleId = newSeq[int](n)
     result.objectiveNodeIdx = depotIndex  # default: objective = arrival at depot
     result.objectiveUpperBound = T(0)
     result.objectiveBoundActive = false
@@ -186,7 +164,6 @@ proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
     let n = c.n
     for i, pos in c.positionArray:
         let value = assignment[pos]
-        c.currentAssignment[pos] = value
         c.predecessorOf[i] = int(value) - c.valueOffset
 
     let pens = c.computePenalties(c.predecessorOf, c.arrivalTime, c.departureTime)
@@ -249,7 +226,6 @@ proc updatePosition*[T](c: CircuitTimePropConstraint[T],
     if position notin c.positionToIndex:
         return
     let nodeIdx = c.positionToIndex[position]
-    c.currentAssignment[position] = newValue
     c.predecessorOf[nodeIdx] = int(newValue) - c.valueOffset
 
     let pens = c.computePenalties(c.predecessorOf, c.arrivalTime, c.departureTime)
@@ -282,38 +258,23 @@ proc deepCopy*[T](c: CircuitTimePropConstraint[T]): CircuitTimePropConstraint[T]
 
     # Deep copy mutable state
     result.predecessorOf = newSeq[int](c.n)
-    result.componentId = newSeq[int](c.n)
-    result.cycleId = newSeq[int](c.n)
     result.arrivalTime = newSeq[T](c.n)
     result.departureTime = newSeq[T](c.n)
     for i in 0..<c.n:
         result.predecessorOf[i] = c.predecessorOf[i]
-        result.componentId[i] = c.componentId[i]
-        result.cycleId[i] = c.cycleId[i]
         result.arrivalTime[i] = c.arrivalTime[i]
         result.departureTime[i] = c.departureTime[i]
 
     result.cost = c.cost
     result.circuitPenalty = c.circuitPenalty
     result.timeWindowPenalty = c.timeWindowPenalty
-    result.numCycles = c.numCycles
-    result.numTailNodes = c.numTailNodes
-    result.nextComponentId = c.nextComponentId
-    result.nextCycleId = c.nextCycleId
     result.objectiveNodeIdx = c.objectiveNodeIdx
     result.objectiveUpperBound = c.objectiveUpperBound
     result.objectiveBoundActive = c.objectiveBoundActive
 
-    result.currentAssignment = initTable[int, T]()
-    for k, v in c.currentAssignment.pairs:
-        result.currentAssignment[k] = v
-
     # Fresh scratch space
-    result.scratchColor = newSeq[NodeColor](c.n)
     result.scratchInAffected = newSeq[bool](c.n)
     result.scratchPath = newSeqOfCap[int](c.n)
     result.scratchPred = newSeq[int](c.n)
     result.scratchArrival = newSeq[T](c.n)
     result.scratchDeparture = newSeq[T](c.n)
-    result.savedComponentId = newSeq[int](c.n)
-    result.savedCycleId = newSeq[int](c.n)
