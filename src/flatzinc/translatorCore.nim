@@ -681,8 +681,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 if allBinary:
                     let adjustedRhs = rhs - fixedLhsContribution
                     if adjustedRhs < 0:
-                        # Constraint is infeasible (fixed values already exceed rhs)
-                        # Emit as-is so the solver detects the violation
+                        # Infeasible: fixed values already exceed rhs — fall through to generic scalarProduct
                         discard
                     elif unfixedPositions.len == 0:
                         # All positions fixed — constraint is tautological (checked earlier) or infeasible

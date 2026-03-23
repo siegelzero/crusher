@@ -1461,6 +1461,8 @@ proc translate*(model: FznModel): FznTranslator =
             if allResolved:
                 result.sys.addConstraint(atMost[int](positions, 1, 1))
                 inc nEmitted
+            else:
+                stderr.writeLine(&"[FZN] WARNING: AtMost-1 clique of {clique.len} vars could not resolve all positions — consumed pairwise constraints lost")
         stderr.writeLine(&"[FZN] AtMost-1 cliques: {nEmitted} merged constraints emitted")
 
     # Build NoOverlap constraints from detected patterns

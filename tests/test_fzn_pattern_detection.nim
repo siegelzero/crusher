@@ -1966,3 +1966,80 @@ solve satisfy;
         for name in ["b1", "b2", "b3", "b4"]:
             count += tr.sys.assignment[tr.varPositions[name]]
         check count <= 1
+
+    test "fixed binary variables adjust atMost RHS":
+        ## When some binary variables are fixed, their contribution should be
+        ## folded into the RHS. Here x3=1 is fixed, so x1+x2 <= 0.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 1..1: x3;
+constraint int_lin_le([1,1,1],[x1,x2,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        # x3=1 uses the budget, so x1 and x2 must both be 0
+        check tr.sys.assignment[tr.varPositions["x1"]] == 0
+        check tr.sys.assignment[tr.varPositions["x2"]] == 0
+
+    test "fixed-to-zero binary does not change RHS":
+        ## x3=0 contributes nothing, so x1+x2 <= 1 remains.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..0: x3;
+constraint int_lin_le([1,1,1],[x1,x2,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let v1 = tr.sys.assignment[tr.varPositions["x1"]]
+        let v2 = tr.sys.assignment[tr.varPositions["x2"]]
+        check v1 + v2 <= 1
+
+    test "clique with reif bool2int channels (non-aliasable)":
+        ## Bool inputs are reification outputs (is_defined_var) so bool2int
+        ## identity aliasing is skipped. The int outputs become channel vars
+        ## via detectReifChannels and the clique resolves through varPositions.
+        let src = """
+var 0..10: y1 :: output_var;
+var 0..10: y2 :: output_var;
+var 0..10: y3 :: output_var;
+var bool: b1 :: is_defined_var;
+var bool: b2 :: is_defined_var;
+var bool: b3 :: is_defined_var;
+var 0..1: i1 :: is_defined_var;
+var 0..1: i2 :: is_defined_var;
+var 0..1: i3 :: is_defined_var;
+constraint int_le_reif(y1, 5, b1) :: defines_var(b1);
+constraint int_le_reif(y2, 5, b2) :: defines_var(b2);
+constraint int_le_reif(y3, 5, b3) :: defines_var(b3);
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool2int(b3, i3) :: defines_var(i3);
+constraint int_lin_le([1,1],[i1,i2],1);
+constraint int_lin_le([1,1],[i1,i3],1);
+constraint int_lin_le([1,1],[i2,i3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Bool2int identity aliasing should be skipped (bool inputs have is_defined_var)
+        check tr.bool2intIdentityAliases.len == 0
+        # Clique should still be detected (on the int var names before they become channels)
+        check tr.atMostPairCliques.len == 1
+        check tr.atMostPairCliques[0].len == 3
+
+        # Solve — the atMost clique resolves through channel variable positions
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        # At most one of y1,y2,y3 can be <= 5
+        var count = 0
+        for name in ["b1", "b2", "b3"]:
+            count += tr.sys.assignment[tr.varPositions[name]]
+        check count <= 1
