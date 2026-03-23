@@ -2181,6 +2181,411 @@ proc detectIfThenElseChannels(tr: var FznTranslator) =
     if totalChannels > 0:
         stderr.writeLine(&"[FZN] Detected {totalChannels} if-then-else channels")
 
+
+proc detectConditionalCounterChannels*(tr: var FznTranslator) =
+    ## Detects conditional counter (run-length) patterns encoded as:
+    ##   int_eq_reif(Z, c, b1) :: defines_var(b1)
+    ##   int_lin_eq_reif([1,-1], [Z, prevZ], 1, b2) :: defines_var(b2)
+    ##   bool_clause([b1], [cond])          -- cond → Z = c  (reset)
+    ##   bool_clause([cond, b2], [])        -- ¬cond → Z = prevZ + 1  (increment)
+    ## Converts Z to a 2D table channel: Z = element(cond * range + (prevZ - lo), table)
+    ## where table[cond=0, k] = k + lo + 1 and table[cond=1, k] = c.
+
+    # Phase 1: Index int_eq_reif(Z, const, b) :: defines_var(b)
+    # Maps boolVar → (ci, targetVar, constVal)
+    type EqConstEntry = object
+        ci: int
+        targetVar: string
+        constVal: int
+
+    var eqConstMap: Table[string, EqConstEntry]
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[1].kind != FznIntLit: continue
+        if con.args[2].kind != FznIdent: continue
+        eqConstMap[con.args[2].ident] = EqConstEntry(
+            ci: ci, targetVar: con.args[0].ident, constVal: con.args[1].intVal)
+
+    if eqConstMap.len == 0: return
+
+    # Phase 2: Index int_lin_eq_reif([1,-1], [Z, prevZ], 1, b) :: defines_var(b)
+    # Maps boolVar → (ci, targetVar, prevVar)
+    type LinEqIncrEntry = object
+        ci: int
+        targetVar: string
+        prevVar: string
+
+    var linEqIncrMap: Table[string, LinEqIncrEntry]
+
+    for ci, con in tr.model.constraints:
+        let cname = stripSolverPrefix(con.name)
+        if cname != "int_lin_eq_reif": continue
+        if con.args.len < 4: continue
+        if con.args[3].kind != FznIdent: continue
+        # Check coefficients are [1, -1]
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError: continue
+        if coeffs.len != 2: continue
+        if coeffs[0] != 1 or coeffs[1] != -1: continue
+        # Check RHS is 1
+        var rhs: int
+        try:
+            rhs = tr.resolveIntArg(con.args[2])
+        except CatchableError: continue
+        if rhs != 1: continue
+        # Get variable names [Z, prevZ]
+        if con.args[1].kind != FznArrayLit or con.args[1].elems.len != 2: continue
+        if con.args[1].elems[0].kind != FznIdent or con.args[1].elems[1].kind != FznIdent: continue
+        let z = con.args[1].elems[0].ident
+        let prevZ = con.args[1].elems[1].ident
+        linEqIncrMap[con.args[3].ident] = LinEqIncrEntry(
+            ci: ci, targetVar: z, prevVar: prevZ)
+
+    if linEqIncrMap.len == 0: return
+
+    # Phase 3: Index bool_clause constraints
+    type BoolClauseInfo = object
+        ci: int
+        posLits: seq[string]
+        negLits: seq[string]
+
+    var boolClausesByLit: Table[string, seq[BoolClauseInfo]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.name != "bool_clause": continue
+        if con.args.len < 2: continue
+        var posLits, negLits: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.add(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.add(e.ident)
+        let info = BoolClauseInfo(ci: ci, posLits: posLits, negLits: negLits)
+        for lit in posLits:
+            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+            boolClausesByLit[lit].add(info)
+        for lit in negLits:
+            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
+            boolClausesByLit[lit].add(info)
+
+    # Phase 4: Match patterns
+    var totalChannels = 0
+
+    for b1Var, eqEntry in eqConstMap:
+        let targetVar = eqEntry.targetVar
+        if targetVar notin tr.varPositions: continue
+        if targetVar in tr.channelVarNames: continue
+        if targetVar in tr.definedVarNames: continue
+
+        # Find bool_clause([b1], [cond])
+        if b1Var notin boolClausesByLit: continue
+        var condVar = ""
+        var clauseA_ci = -1
+        for bc in boolClausesByLit[b1Var]:
+            if bc.ci in tr.definingConstraints: continue
+            if bc.posLits.len == 1 and bc.negLits.len == 1 and bc.posLits[0] == b1Var:
+                condVar = bc.negLits[0]
+                clauseA_ci = bc.ci
+                break
+        if condVar == "": continue
+
+        # Find bool_clause([cond, b2], []) where b2 is an increment reif for same targetVar
+        if condVar notin boolClausesByLit: continue
+        var b2Var = ""
+        var clauseB_ci = -1
+        for bc in boolClausesByLit[condVar]:
+            if bc.ci in tr.definingConstraints: continue
+            if bc.ci == clauseA_ci: continue
+            if bc.posLits.len == 2 and bc.negLits.len == 0:
+                # One lit is condVar, other is b2
+                var candidateB2 = ""
+                if bc.posLits[0] == condVar:
+                    candidateB2 = bc.posLits[1]
+                elif bc.posLits[1] == condVar:
+                    candidateB2 = bc.posLits[0]
+                else: continue
+                # Verify b2 is a lin_eq_reif increment for the same target
+                if candidateB2 in linEqIncrMap:
+                    let linEntry = linEqIncrMap[candidateB2]
+                    if linEntry.targetVar == targetVar:
+                        b2Var = candidateB2
+                        clauseB_ci = bc.ci
+                        break
+        if b2Var == "": continue
+
+        let linEntry = linEqIncrMap[b2Var]
+        let prevVar = linEntry.prevVar
+        let resetVal = eqEntry.constVal
+
+        # Verify prevVar and condVar have positions or expressions
+        if prevVar notin tr.varPositions and prevVar notin tr.definedVarExprs: continue
+        if condVar notin tr.varPositions and condVar notin tr.definedVarExprs: continue
+
+        let prevExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: prevVar))
+        let condExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: condVar))
+        let targetPos = tr.varPositions[targetVar]
+
+        # Get prevZ's domain for the table
+        var prevPos: int
+        if prevExpr.node.kind == RefNode:
+            prevPos = prevExpr.node.position
+        else: continue
+
+        let prevDom = tr.sys.baseArray.domain[prevPos].sorted()
+        if prevDom.len == 0: continue
+        let lo = prevDom[0]
+        let hi = prevDom[^1]
+        let rangePrev = hi - lo + 1
+
+        # Table size = 2 * rangePrev (cond is boolean: 0 or 1)
+        let tableSize = 2 * rangePrev
+        if tableSize > 100_000: continue
+
+        # Build table: cond=0 → Z = prevZ + 1, cond=1 → Z = resetVal
+        var arrayElems = newSeq[ArrayElement[int]](tableSize)
+        for k in 0..<rangePrev:
+            # cond=0: Z = prevZ + 1 = (lo + k) + 1
+            arrayElems[k] = ArrayElement[int](isConstant: true, constantValue: lo + k + 1)
+            # cond=1: Z = resetVal
+            arrayElems[rangePrev + k] = ArrayElement[int](isConstant: true, constantValue: resetVal)
+
+        # Index expression: cond * rangePrev + (prevZ - lo)
+        let indexExpr = condExpr * rangePrev + (prevExpr - lo)
+
+        # Also tighten Z's domain: Z ∈ {resetVal} ∪ {lo+1..hi+1}
+        var zDom = initHashSet[int]()
+        zDom.incl(resetVal)
+        for k in lo..hi:
+            zDom.incl(k + 1)
+        var zDomSeq: seq[int]
+        for v in zDom: zDomSeq.add(v)
+        zDomSeq.sort()
+        let currentDom = tr.sys.baseArray.domain[targetPos]
+        var tightDom: seq[int]
+        let zSet = zDom
+        for v in currentDom:
+            if v in zSet:
+                tightDom.add(v)
+        if tightDom.len > 0 and tightDom.len < currentDom.len:
+            tr.sys.baseArray.domain[targetPos] = tightDom
+
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
+        tr.channelVarNames.incl(targetVar)
+        tr.sys.baseArray.channelPositions.incl(targetPos)
+
+        # Mark consumed constraints
+        tr.definingConstraints.incl(eqEntry.ci)     # int_eq_reif
+        tr.definingConstraints.incl(linEntry.ci)     # int_lin_eq_reif
+        tr.definingConstraints.incl(clauseA_ci)      # bool_clause pattern A
+        tr.definingConstraints.incl(clauseB_ci)      # bool_clause pattern B
+
+        inc totalChannels
+
+    if totalChannels > 0:
+        stderr.writeLine(&"[FZN] Detected {totalChannels} conditional counter channels")
+
+
+proc detectConditionalElementChannels*(tr: var FznTranslator) =
+    ## Detects conditional element (run-cost) patterns encoded as:
+    ##   array_int_element(idx, table, elemResult)         -- always: elemResult = table[idx]
+    ##   int_eq_reif(X, elemResult, b1) :: defines_var(b1) -- b1 = (X == elemResult)
+    ##   int_eq_reif(X, elseConst, b2) :: defines_var(b2)  -- b2 = (X == elseConst)
+    ##   bool_clause([b1], [cond])                         -- cond → X = elemResult
+    ##   bool_clause([cond, b2], [])                       -- ¬cond → X = elseConst
+    ## Converts X to a combined channel: X = element(cond * tableLen + (idx - 1), extTable)
+    ## where extTable = [elseConst repeated tableLen times, table[1], table[2], ...]
+
+    # Phase 1: Index array_int_element constraints
+    # Maps elemResult var → (ci, idxVar, constTable)
+    type ElemInfo = object
+        ci: int
+        idxVarName: string
+        constTable: seq[int]
+
+    var elemByResult: Table[string, ElemInfo]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
+        if con.args.len < 3: continue
+        let resName = if con.args[2].kind == FznIdent: con.args[2].ident else: ""
+        if resName == "": continue
+        let idxName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
+        if idxName == "": continue
+        let constTable = try: tr.resolveIntArray(con.args[1])
+                         except CatchableError: continue
+        if constTable.len == 0: continue
+        elemByResult[resName] = ElemInfo(ci: ci, idxVarName: idxName, constTable: constTable)
+
+    if elemByResult.len == 0: return
+
+    # Phase 2: Index int_eq_reif with defines_var grouped by first arg (X)
+    type EqReifInfo = object
+        ci: int
+        boolVar: string
+        isConst: bool
+        constVal: int
+        varName: string
+
+    var eqReifByX: Table[string, seq[EqReifInfo]]
+
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[2].kind != FznIdent: continue
+        let xName = con.args[0].ident
+        let bName = con.args[2].ident
+        var entry: EqReifInfo
+        entry.ci = ci
+        entry.boolVar = bName
+        if con.args[1].kind == FznIntLit:
+            entry.isConst = true
+            entry.constVal = con.args[1].intVal
+        elif con.args[1].kind == FznIdent:
+            entry.isConst = false
+            entry.varName = con.args[1].ident
+        else: continue
+        if xName notin eqReifByX: eqReifByX[xName] = @[]
+        eqReifByX[xName].add(entry)
+
+    # Phase 3: Index bool_clause
+    type BCInfo = object
+        ci: int
+        posLits, negLits: seq[string]
+
+    var bcByLit: Table[string, seq[BCInfo]]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.name != "bool_clause": continue
+        if con.args.len < 2: continue
+        var posLits, negLits: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.add(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.add(e.ident)
+        let info = BCInfo(ci: ci, posLits: posLits, negLits: negLits)
+        for lit in posLits:
+            if lit notin bcByLit: bcByLit[lit] = @[]
+            bcByLit[lit].add(info)
+        for lit in negLits:
+            if lit notin bcByLit: bcByLit[lit] = @[]
+            bcByLit[lit].add(info)
+
+    # Phase 4: Match the full pattern
+    var totalChannels = 0
+
+    for xName, entries in eqReifByX:
+        if entries.len != 2: continue
+        if xName notin tr.varPositions: continue
+        if xName in tr.channelVarNames: continue
+        if xName in tr.definedVarNames: continue
+
+        # Identify which entry is the element-result branch and which is the const branch
+        var elemIdx, constIdx: int = -1
+        for i, e in entries:
+            if e.isConst:
+                constIdx = i
+            elif e.varName in elemByResult:
+                elemIdx = i
+        if elemIdx < 0 or constIdx < 0: continue
+
+        let elemEntry = entries[elemIdx]
+        let constEntry = entries[constIdx]
+        let elemResultVar = elemEntry.varName
+        let elseConst = constEntry.constVal
+        let elemInfo = elemByResult[elemResultVar]
+
+        # Find bool_clause pair: cond → b_elem, ¬cond → b_const
+        let b_elem = elemEntry.boolVar
+        let b_const = constEntry.boolVar
+        var condVar = ""
+        var clauseA_ci, clauseB_ci: int = -1
+
+        if b_elem in bcByLit:
+            for bc in bcByLit[b_elem]:
+                if bc.ci in tr.definingConstraints: continue
+                if bc.posLits.len == 1 and bc.negLits.len == 1 and bc.posLits[0] == b_elem:
+                    let candidateCond = bc.negLits[0]
+                    # Verify complementary clause exists
+                    if candidateCond in bcByLit:
+                        for bc2 in bcByLit[candidateCond]:
+                            if bc2.ci in tr.definingConstraints: continue
+                            if bc2.ci == bc.ci: continue
+                            if bc2.posLits.len == 2 and bc2.negLits.len == 0:
+                                if (bc2.posLits[0] == candidateCond and bc2.posLits[1] == b_const) or
+                                   (bc2.posLits[1] == candidateCond and bc2.posLits[0] == b_const):
+                                    condVar = candidateCond
+                                    clauseA_ci = bc.ci
+                                    clauseB_ci = bc2.ci
+                                    break
+                    if condVar != "": break
+
+        if condVar == "": continue
+
+        # Resolve expressions
+        if condVar notin tr.varPositions and condVar notin tr.definedVarExprs: continue
+        let condExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: condVar))
+
+        # Get index expression for the element constraint
+        let idxVarName = elemInfo.idxVarName
+        if idxVarName notin tr.varPositions and idxVarName notin tr.definedVarExprs: continue
+        let idxExpr = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: idxVarName))
+
+        let constTable = elemInfo.constTable
+        let tableLen = constTable.len
+        let xPos = tr.varPositions[xName]
+
+        # Build extended table: [elseConst * tableLen, then constTable]
+        # Index: cond * tableLen + (idx - 1)
+        let extTableSize = 2 * tableLen
+        if extTableSize > 100_000: continue
+
+        var arrayElems = newSeq[ArrayElement[int]](extTableSize)
+        for k in 0..<tableLen:
+            arrayElems[k] = ArrayElement[int](isConstant: true, constantValue: elseConst)
+        for k in 0..<tableLen:
+            arrayElems[tableLen + k] = ArrayElement[int](isConstant: true, constantValue: constTable[k])
+
+        # Index expression: cond * tableLen + (idx - 1)
+        let indexExpr = condExpr * tableLen + (idxExpr - 1)
+
+        tr.sys.baseArray.addChannelBinding(xPos, indexExpr, arrayElems)
+        tr.channelVarNames.incl(xName)
+        tr.sys.baseArray.channelPositions.incl(xPos)
+
+        # Mark consumed constraints
+        tr.definingConstraints.incl(elemEntry.ci)    # int_eq_reif (element branch)
+        tr.definingConstraints.incl(constEntry.ci)   # int_eq_reif (const branch)
+        tr.definingConstraints.incl(elemInfo.ci)      # array_int_element
+        tr.definingConstraints.incl(clauseA_ci)       # bool_clause A
+        tr.definingConstraints.incl(clauseB_ci)       # bool_clause B
+
+        # Also mark elemResult as defined (no longer needed as search var)
+        if elemResultVar in tr.varPositions:
+            let elemPos = tr.varPositions[elemResultVar]
+            tr.channelVarNames.incl(elemResultVar)
+            tr.sys.baseArray.channelPositions.incl(elemPos)
+
+        inc totalChannels
+
+    if totalChannels > 0:
+        stderr.writeLine(&"[FZN] Detected {totalChannels} conditional element channels")
+
+
 proc detectGccCountChannels(tr: var FznTranslator) =
     ## Detects fzn_global_cardinality constraints whose count outputs are pure channels
     ## (only used by the GCC itself and downstream min/max/objective chains).

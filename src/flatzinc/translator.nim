@@ -1119,6 +1119,12 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect if-then-else channels (int_lin_ne_reif + int_eq_reif + bool_clause → 2D table channel)
     result.detectIfThenElseChannels()
 
+    # Detect conditional counter channels (run-length patterns: if cond then Z=c else Z=prevZ+1)
+    result.detectConditionalCounterChannels()
+
+    # Detect conditional element channels (if cond then X=table[idx] else X=const)
+    result.detectConditionalElementChannels()
+
     # Detect GCC count channels (variable-count GCC outputs → count-eq channel bindings)
     result.detectGccCountChannels()
 

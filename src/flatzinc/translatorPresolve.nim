@@ -1939,6 +1939,175 @@ proc partitionPropagate(tr: FznTranslator,
                 if presolveRemoveValue(domains, m.placeVar, nullVal, infeasible):
                     result = true
 
+proc inferUnboundedDomains(tr: FznTranslator,
+                           domains: var Table[string, seq[int]],
+                           fixedVars: var Table[string, int],
+                           eliminated: PackedSet[int],
+                           infeasible: var bool): bool =
+    ## Infer domains for "var int" (unbounded) variables that were skipped
+    ## during initPresolveDomains. Uses two strategies:
+    ##
+    ## 1. Element results: array_int_element(idx, const_table, result)
+    ##    → result domain = set of reachable table values
+    ##
+    ## 2. If-then-else reification: when X appears in exactly 2 int_eq_reif
+    ##    constraints connected by complementary bool_clause (cond → b1, ¬cond → b2),
+    ##    X's domain = union of the two reif target values/domains.
+    result = false
+
+    # --- Strategy 1: Element result inference ---
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
+        if con.args.len < 3: continue
+        let valName = presolveVarName(con.args[2])
+        if valName == "" or valName in domains or valName in fixedVars: continue
+
+        let constArray = try: tr.resolveIntArray(con.args[1])
+                         except CatchableError: continue
+        if constArray.len == 0: continue
+
+        # Get reachable values via index domain
+        var idxDom: seq[int]
+        let idxName = presolveVarName(con.args[0])
+        if idxName != "" and idxName in domains:
+            idxDom = domains[idxName]
+        elif tr.presolveIsFixed(con.args[0], fixedVars):
+            idxDom = @[tr.presolveResolve(con.args[0], fixedVars)]
+        else:
+            idxDom = toSeq(1..constArray.len)  # Full range as fallback
+
+        var seen = initHashSet[int]()
+        var vals: seq[int]
+        for i in idxDom:
+            let arrIdx = i - 1  # FZN 1-based
+            if arrIdx >= 0 and arrIdx < constArray.len:
+                let v = constArray[arrIdx]
+                if v notin seen:
+                    seen.incl(v)
+                    vals.add(v)
+        if vals.len > 0:
+            vals.sort()
+            domains[valName] = vals
+            result = true
+
+    # --- Strategy 2: If-then-else reification inference ---
+    # Collect int_eq_reif constraints grouped by first argument (unbounded vars only)
+    var reifsByVar: Table[string, seq[tuple[boolVar: string, valArg: FznExpr]]]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        let xName = presolveVarName(con.args[0])
+        if xName == "" or xName in fixedVars or xName in domains: continue
+        let bName = presolveVarName(con.args[2])
+        if bName == "": continue
+        if xName notin reifsByVar:
+            reifsByVar[xName] = @[]
+        reifsByVar[xName].add((boolVar: bName, valArg: con.args[1]))
+
+    if reifsByVar.len == 0: return
+
+    # Index bool_clause for implication patterns
+    # Pattern A: bool_clause([b], [cond]) → cond → b
+    # Pattern B: bool_clause([A, B], []) → ¬A → B, ¬B → A
+    var impliedByPos: Table[string, seq[string]]  # b → conds where cond → b
+    var impliedByNeg: Table[string, seq[string]]  # b → conds where ¬cond → b
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        if con.name != "bool_clause": continue
+        if con.args.len < 2: continue
+        var posLits, negLits: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.add(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.add(e.ident)
+
+        if posLits.len == 1 and negLits.len == 1:
+            # cond → b
+            let b = posLits[0]
+            let cond = negLits[0]
+            if b notin impliedByPos: impliedByPos[b] = @[]
+            impliedByPos[b].add(cond)
+        elif posLits.len == 2 and negLits.len == 0:
+            # A ∨ B → ¬A → B and ¬B → A
+            if posLits[0] notin impliedByNeg: impliedByNeg[posLits[0]] = @[]
+            impliedByNeg[posLits[0]].add(posLits[1])
+            if posLits[1] notin impliedByNeg: impliedByNeg[posLits[1]] = @[]
+            impliedByNeg[posLits[1]].add(posLits[0])
+
+    # For each unbounded variable with 2+ reifs, check complementarity
+    for xName, reifs in reifsByVar:
+        if reifs.len < 2: continue
+
+        # Try all pairs of reifs
+        var foundComplement = false
+        var validReifIndices: seq[int]
+
+        for i in 0..<reifs.len:
+            for j in (i+1)..<reifs.len:
+                let b1 = reifs[i].boolVar
+                let b2 = reifs[j].boolVar
+                # Check: ∃ cond such that (cond → b1) and (¬cond → b2)
+                var complementary = false
+                if b1 in impliedByPos:
+                    for cond in impliedByPos[b1]:
+                        if b2 in impliedByNeg and cond in impliedByNeg[b2]:
+                            complementary = true
+                            break
+                if not complementary and b2 in impliedByPos:
+                    for cond in impliedByPos[b2]:
+                        if b1 in impliedByNeg and cond in impliedByNeg[b1]:
+                            complementary = true
+                            break
+                if complementary:
+                    foundComplement = true
+                    validReifIndices = @[i, j]
+                    break
+            if foundComplement: break
+
+        if not foundComplement: continue
+
+        # Collect possible values from the complementary reifs
+        var possibleValues = initHashSet[int]()
+        var incomplete = false
+        for idx in validReifIndices:
+            let valArg = reifs[idx].valArg
+            if valArg.kind == FznIntLit:
+                possibleValues.incl(valArg.intVal)
+            elif valArg.kind == FznIdent:
+                let valName = valArg.ident
+                if valName in fixedVars:
+                    possibleValues.incl(fixedVars[valName])
+                elif valName in domains:
+                    for v in domains[valName]:
+                        possibleValues.incl(v)
+                else:
+                    incomplete = true
+                    break
+            else:
+                incomplete = true
+                break
+
+        if incomplete or possibleValues.len == 0: continue
+        if possibleValues.len > 100_000: continue  # Safety
+
+        var newDom: seq[int]
+        for v in possibleValues: newDom.add(v)
+        newDom.sort()
+        domains[xName] = newDom
+        result = true
+
+    if result:
+        # Re-run singleton detection for newly inferred domains
+        discard fixSingletons(domains, fixedVars)
+
+
 proc applyPresolveResults(tr: var FznTranslator,
                           domains: Table[string, seq[int]],
                           fixedVars: Table[string, int],
@@ -1966,6 +2135,10 @@ proc applyPresolveResults(tr: var FznTranslator,
             originalLen = decl.varType.values.len
         of FznBool:
             originalLen = 2
+        of FznInt:
+            # Unbounded var: any inferred domain is a tightening
+            tr.presolveDomains[name] = dom
+            continue
         else:
             continue
         if dom.len < originalLen:
@@ -2055,6 +2228,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 7c: GCC arc consistency propagation
         if gccPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 7d: Infer domains for unbounded "var int" variables
+        if inferUnboundedDomains(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
