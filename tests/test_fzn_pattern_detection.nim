@@ -1859,3 +1859,110 @@ solve satisfy;
 
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
         discard  # solve completed without error
+
+suite "FlatZinc AtMost-1 Pairwise Clique Merging":
+
+    test "3-variable clique: 3 pairwise → 1 atMost":
+        ## Three binary variables with all 3 pairwise int_lin_le([1,1],[xi,xj],1)
+        ## constraints should be merged into a single atMost(3 vars, 1, 1).
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should detect 1 clique of 3 variables
+        check tr.atMostPairCliques.len == 1
+        check tr.atMostPairCliques[0].len == 3
+
+        # Solve and verify at most 1 is set to 1
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        var count = 0
+        for name in ["x1", "x2", "x3"]:
+            count += tr.sys.assignment[tr.varPositions[name]]
+        check count <= 1
+
+    test "two disjoint cliques":
+        ## 6 variables forming two cliques of 3: {x1,x2,x3} and {y1,y2,y3}
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: y1 :: output_var;
+var 0..1: y2 :: output_var;
+var 0..1: y3 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+constraint int_lin_le([1,1],[y1,y2],1);
+constraint int_lin_le([1,1],[y1,y3],1);
+constraint int_lin_le([1,1],[y2,y3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.atMostPairCliques.len == 2
+        check tr.atMostPairCliques[0].len == 3
+        check tr.atMostPairCliques[1].len == 3
+
+    test "incomplete graph — no clique of size 3":
+        ## Three variables but only 2 of 3 pairs present — no clique possible.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # No clique of size >= 3
+        check tr.atMostPairCliques.len == 0
+
+    test "clique merging with bool2int channels":
+        ## Realistic pattern: bool vars → bool2int → int_lin_le pairwise on int outputs.
+        ## The int outputs of bool2int are channel variables but the clique detection
+        ## should still work because it runs before detectReifChannels.
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var bool: b3 :: output_var;
+var bool: b4 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+var 0..1: i3 :: var_is_introduced :: is_defined_var;
+var 0..1: i4 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool2int(b3, i3) :: defines_var(i3);
+constraint bool2int(b4, i4) :: defines_var(i4);
+constraint int_lin_le([1,1],[i1,i2],1);
+constraint int_lin_le([1,1],[i1,i3],1);
+constraint int_lin_le([1,1],[i1,i4],1);
+constraint int_lin_le([1,1],[i2,i3],1);
+constraint int_lin_le([1,1],[i2,i4],1);
+constraint int_lin_le([1,1],[i3,i4],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Should detect 1 clique of 4 bool2int outputs
+        check tr.atMostPairCliques.len == 1
+        check tr.atMostPairCliques[0].len == 4
+
+        # Solve and verify correctness
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        var count = 0
+        for name in ["b1", "b2", "b3", "b4"]:
+            count += tr.sys.assignment[tr.varPositions[name]]
+        check count <= 1

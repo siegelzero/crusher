@@ -449,6 +449,10 @@ type
         circuitTimePropArrivalVars*: seq[string]
         circuitTimePropDepartureVars*: seq[string]
         circuitTimePropConsumedCIs*: PackedSet[int]
+        # Detected pairwise atMost-1 cliques: groups of binary vars with complete pairwise exclusion
+        atMostPairCliques*: seq[seq[string]]
+        # Bool2int identity aliases: int output → bool input (eliminates identity channels)
+        bool2intIdentityAliases*: Table[string, string]
         # Annotated search variable names (from solve :: int_search annotation)
         annotatedSearchVarNames*: HashSet[string]
         # Whether solve annotation was present (to distinguish "no annotation" from "empty annotation")
@@ -846,6 +850,11 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectSmallDomainProducts()
     # Detect disjunctive resource groups (cliques of pairs → cumulative)
     result.detectDisjunctiveResources()
+    # Detect pairwise atMost-1 cliques (int_lin_le([1,1],[x,y],1) on binary vars → N-var atMost)
+    result.detectAtMostPairCliques()
+    # Detect bool2int identity aliases (MUST run after detectAtMostPairCliques which uses int var names,
+    # and before detectReifChannels which would create channels for these)
+    result.detectBool2intIdentityAliases()
     # Fold bool_xor constraints with constant inputs (before reif channel detection)
     result.detectBoolXorSimplification()
     # Detect orphan search variables (non-annotated) — records mapping for later channel creation.
@@ -959,6 +968,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit direct atMost constraints for detected atMost-through-reification patterns
     if result.atMostThroughReifDefs.len > 0:
         result.emitAtMostThroughReif()
+    # Build expressions for bool2int identity aliases (int output → bool input's position)
+    # MUST run before buildDefinedExpressions which may reference aliased vars
+    for intName, boolName in result.bool2intIdentityAliases:
+        if boolName in result.varPositions:
+            result.definedVarExprs[intName] = result.getExpr(result.varPositions[boolName])
     # Build expressions for defined variables using the now-created positions
     # (must run before emitMaxFromLinLeChannels which resolves source vars as expressions)
     result.buildDefinedExpressions()
@@ -1423,6 +1437,31 @@ proc translate*(model: FznModel): FznTranslator =
             continue
         let heights = newSeqWith(group.durations.len, 1)
         result.sys.addConstraint(cumulative[int](positions, group.durations, heights, 1))
+
+    # Emit merged atMost-1 constraints for detected pairwise cliques
+    if result.atMostPairCliques.len > 0:
+        var nEmitted = 0
+        for clique in result.atMostPairCliques:
+            var positions: seq[int]
+            var allResolved = true
+            for vn in clique:
+                if vn in result.varPositions:
+                    positions.add(result.varPositions[vn])
+                elif vn in result.definedVarExprs:
+                    # Aliased variable (e.g., bool2int identity) — resolve to underlying position
+                    let expr = result.definedVarExprs[vn]
+                    if expr.node.kind == RefNode:
+                        positions.add(expr.node.position)
+                    else:
+                        allResolved = false
+                        break
+                else:
+                    allResolved = false
+                    break
+            if allResolved:
+                result.sys.addConstraint(atMost[int](positions, 1, 1))
+                inc nEmitted
+        stderr.writeLine(&"[FZN] AtMost-1 cliques: {nEmitted} merged constraints emitted")
 
     # Build NoOverlap constraints from detected patterns
     for pattern in result.noOverlapPatterns:

@@ -652,6 +652,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let exprs = tr.resolveExprArray(con.args[1])
 
         # Check for unit-coefficient pattern on binary variables → atMost/atLeast
+        # Positions fixed to 0 or 1 are excluded (they contribute a known constant).
         var emittedUnitCoeff = false
         let (allRefsLe, positionsLe) = isAllRefs(exprs)
         if allRefsLe:
@@ -662,19 +663,38 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 if c != -1: allNegOne = false
             if allPosOne or allNegOne:
                 var allBinary = true
+                var unfixedPositions: seq[int]
+                var fixedLhsContribution = 0  # fixed positions' contribution to LHS
                 for pos in positionsLe:
                     let dom = tr.sys.baseArray.domain[pos]
-                    if dom.len != 2 or dom[0] != 0 or dom[1] != 1:
+                    if dom.len == 2 and dom[0] == 0 and dom[1] == 1:
+                        unfixedPositions.add(pos)
+                    elif dom.len == 1 and (dom[0] == 0 or dom[0] == 1):
+                        # Fixed binary variable — contributes coeff * value to LHS
+                        if allPosOne:
+                            fixedLhsContribution += dom[0]
+                        else:  # allNegOne
+                            fixedLhsContribution -= dom[0]
+                    else:
                         allBinary = false
                         break
                 if allBinary:
-                    if allPosOne:
-                        # sum([1,1,...,1], x) <= rhs  →  atMost(rhs, x, 1)
-                        tr.sys.addConstraint(atMost[int](positionsLe, 1, rhs))
+                    let adjustedRhs = rhs - fixedLhsContribution
+                    if adjustedRhs < 0:
+                        # Constraint is infeasible (fixed values already exceed rhs)
+                        # Emit as-is so the solver detects the violation
+                        discard
+                    elif unfixedPositions.len == 0:
+                        # All positions fixed — constraint is tautological (checked earlier) or infeasible
+                        discard
                     else:
-                        # sum([-1,-1,...,-1], x) <= rhs  →  -sum(x) <= rhs  →  sum(x) >= -rhs
-                        tr.sys.addConstraint(atLeast[int](positionsLe, 1, -rhs))
-                    emittedUnitCoeff = true
+                        if allPosOne:
+                            # sum([1,1,...,1], x) <= rhs  →  atMost(adjustedRhs, unfixed, 1)
+                            tr.sys.addConstraint(atMost[int](unfixedPositions, 1, adjustedRhs))
+                        else:
+                            # sum([-1,-1,...,-1], x) <= rhs  →  sum(x) >= -rhs
+                            tr.sys.addConstraint(atLeast[int](unfixedPositions, 1, -(adjustedRhs)))
+                        emittedUnitCoeff = true
 
         if not emittedUnitCoeff:
             let sp = scalarProduct[int](coeffs, exprs)

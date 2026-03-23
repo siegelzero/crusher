@@ -872,14 +872,16 @@ proc detectReifChannels(tr: var FznTranslator) =
         if xArg.kind != FznIdent:
             continue
         # x must resolve to a position (not a defined variable with no position)
-        # Exception: element channel aliases resolve to a single channel position
-        if xArg.ident in tr.definedVarNames and xArg.ident notin tr.elementChannelAliases:
+        # Exception: element channel aliases and bool2int identity aliases resolve to positions
+        if xArg.ident in tr.definedVarNames and xArg.ident notin tr.elementChannelAliases and
+             xArg.ident notin tr.bool2intIdentityAliases:
             continue
 
         # For var-to-var case, verify args[1] is also a positioned variable
         let valArg = con.args[1]
         if valArg.kind == FznIdent and valArg.ident in tr.definedVarNames and
-             valArg.ident notin tr.elementChannelAliases:
+             valArg.ident notin tr.elementChannelAliases and
+             valArg.ident notin tr.bool2intIdentityAliases:
             continue
 
         tr.channelVarNames.incl(bName)
@@ -7252,3 +7254,204 @@ proc detectConstantElementComposition*(tr: var FznTranslator) =
 
     if tr.constElementSources.len > 0:
         stderr.writeLine(&"[FZN] ConstElementComposition: {tr.constElementSources.len} element channels eligible for downstream composition")
+
+
+proc detectAtMostPairCliques(tr: var FznTranslator) =
+    ## Detects pairwise atMost-1 constraints on binary variables that form cliques,
+    ## and merges each clique into a single N-variable atMost constraint.
+    ## Pattern: int_lin_le([1,1], [x,y], 1) where x,y are binary {0,1} variables.
+    ## This is common when MiniZinc decomposes "at most one" constraints into O(n^2) pairs.
+
+    # Step 1: Collect all pairwise atMost-1 constraints on binary variables
+    type PairInfo = object
+        ci: int
+        varA, varB: string  # Canonical order: varA < varB
+
+    var pairs: seq[PairInfo]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        if ci in tr.redundantOrderings:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le":
+            continue
+
+        # Resolve coefficients and rhs
+        let coeffs = tr.resolveIntArray(con.args[0])
+        if coeffs.len != 2 or coeffs[0] != 1 or coeffs[1] != 1:
+            continue
+        let rhs = tr.resolveIntArg(con.args[2])
+        if rhs != 1:
+            continue
+
+        # Extract variable names
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != 2:
+            continue
+        if varElems[0].kind != FznIdent or varElems[1].kind != FznIdent:
+            continue
+        let nameA = varElems[0].ident
+        let nameB = varElems[1].ident
+
+        # Skip parameters, defined vars, channel vars
+        if nameA in tr.paramValues or nameB in tr.paramValues:
+            continue
+        if nameA in tr.definedVarNames or nameB in tr.definedVarNames:
+            continue
+        if nameA in tr.channelVarNames or nameB in tr.channelVarNames:
+            continue
+
+        # Check both variables are binary {0,1}
+        var domA = tr.lookupVarDomain(nameA)
+        var domB = tr.lookupVarDomain(nameB)
+        # Apply presolve domain tightening
+        if nameA in tr.presolveDomains:
+            domA = tr.presolveDomains[nameA]
+        if nameB in tr.presolveDomains:
+            domB = tr.presolveDomains[nameB]
+        # Skip if either variable is fixed (singleton domain — constraint is tautological)
+        if domA.len <= 1 or domB.len <= 1:
+            continue
+        if domA != @[0, 1] or domB != @[0, 1]:
+            continue
+
+        # Canonical ordering
+        let (canonA, canonB) = if nameA < nameB: (nameA, nameB) else: (nameB, nameA)
+        pairs.add(PairInfo(ci: ci, varA: canonA, varB: canonB))
+
+    if pairs.len < 3:
+        # Need at least 3 pairs to form a clique of size 3
+        return
+
+    # Step 2: Build adjacency graph
+    var adjacency: Table[string, Table[string, int]]  # var -> {partner -> pairIndex}
+    for idx, pi in pairs:
+        if pi.varA notin adjacency:
+            adjacency[pi.varA] = initTable[string, int]()
+        adjacency[pi.varA][pi.varB] = idx
+
+        if pi.varB notin adjacency:
+            adjacency[pi.varB] = initTable[string, int]()
+        adjacency[pi.varB][pi.varA] = idx
+
+    # Step 3: Greedy clique detection
+    # Variables are assigned to at most one clique. Uncovered pairwise constraints
+    # remain as individual 2-var atMost constraints, which provides valuable redundant
+    # penalty signal for the tabu search alongside the clique constraints.
+    var assigned: HashSet[string]
+
+    # Sort variables by degree (highest first) for better clique detection
+    var varsByDegree: seq[(int, string)]
+    for v, partners in adjacency:
+        varsByDegree.add((partners.len, v))
+    varsByDegree.sort(proc(a, b: (int, string)): int = -cmp(a[0], b[0]))
+
+    var totalConsumed = 0
+    var totalVars = 0
+
+    for (_, startVar) in varsByDegree:
+        if startVar in assigned:
+            continue
+
+        # Build clique starting from startVar
+        var clique = @[startVar]
+        var candidates: seq[string]
+        for partner in adjacency[startVar].keys:
+            if partner notin assigned:
+                candidates.add(partner)
+
+        # Sort candidates by degree (descending) to prefer high-connectivity nodes
+        candidates.sort(proc(a, b: string): int =
+            -cmp(adjacency[a].len, adjacency[b].len))
+
+        # Greedily add candidates connected to all current clique members
+        for candidate in candidates:
+            var connectedToAll = true
+            for member in clique:
+                if candidate notin adjacency.getOrDefault(member):
+                    connectedToAll = false
+                    break
+            if connectedToAll:
+                clique.add(candidate)
+
+        if clique.len < 3:
+            # Only merge cliques of size >= 3 (2-var cliques are just original pairs)
+            continue
+
+        # Collect pair indices and mark consumed
+        for i in 0..<clique.len:
+            for j in (i+1)..<clique.len:
+                let a = clique[i]
+                let b = clique[j]
+                if b in adjacency.getOrDefault(a):
+                    let pairIdx = adjacency[a][b]
+                    tr.definingConstraints.incl(pairs[pairIdx].ci)
+                    inc totalConsumed
+
+        for member in clique:
+            assigned.incl(member)
+        tr.atMostPairCliques.add(clique)
+        totalVars += clique.len
+
+    if tr.atMostPairCliques.len > 0:
+        stderr.writeLine(&"[FZN] AtMost-1 clique merging: {tr.atMostPairCliques.len} cliques " &
+                          &"({totalVars} vars), {totalConsumed} pairwise constraints consumed")
+
+
+proc detectBool2intIdentityAliases(tr: var FznTranslator) =
+    ## Detects bool2int(b, i) :: defines_var(i) where b has domain {0,1} (identity mapping).
+    ## Instead of creating an element channel (i = element(b, [0,1])), aliases i to b.
+    ## This eliminates redundant channel positions since i ≡ b for binary bools.
+    ## MUST run after detectAtMostPairCliques (which references int var names)
+    ## and before detectReifChannels (which would otherwise create channels for these).
+    var nAliased = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints:
+            continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool2int" or not con.hasAnnotation("defines_var"):
+            continue
+        if con.args.len < 2 or con.args[0].kind != FznIdent or con.args[1].kind != FznIdent:
+            continue
+
+        let boolName = con.args[0].ident  # bool input
+        let intName = con.args[1].ident   # int output
+
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != intName:
+            continue
+
+        # Skip if already handled
+        if intName in tr.definedVarNames or intName in tr.channelVarNames:
+            continue
+        # Bool input must not be a defined var or parameter
+        if boolName in tr.definedVarNames or boolName in tr.paramValues:
+            continue
+
+        # Don't alias if the bool input is a reification output (has is_defined_var).
+        # Keeping the intermediate channel preserves cascade topology depth for
+        # channel-dep penalty maps (e.g., int_le_reif → bool2int → element chain).
+        tr.buildVarDomainIndex()
+        if boolName in tr.varDomainIndex:
+            let boolDecl = tr.model.variables[tr.varDomainIndex[boolName]]
+            if boolDecl.hasAnnotation("is_defined_var"):
+                continue
+
+        # Verify bool input has binary domain {0,1} (identity mapping)
+        var boolDom = tr.lookupVarDomain(boolName)
+        if boolName in tr.presolveDomains:
+            boolDom = tr.presolveDomains[boolName]
+        if boolDom != @[0, 1]:
+            continue  # Fixed or non-binary — can't alias
+
+        # Alias: i → b (i becomes a defined var expression pointing to b's position)
+        tr.bool2intIdentityAliases[intName] = boolName
+        tr.definedVarNames.incl(intName)
+        tr.definingConstraints.incl(ci)
+        # Populate bool2intSourceMap for NAND redundancy detection
+        tr.bool2intSourceMap[intName] = boolName
+        inc nAliased
+
+    if nAliased > 0:
+        stderr.writeLine(&"[FZN] Bool2int identity aliases: {nAliased} channel positions eliminated")
