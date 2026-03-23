@@ -2240,6 +2240,15 @@ proc detectOrphanSearchVariables(tr: var FznTranslator) =
     if not tr.hasSearchAnnotation:
         return
 
+    # Build set of bool2int output variable names from model constraints.
+    # bool2intSourceMap isn't populated yet (detectNandRedundancy runs later),
+    # so we scan constraints directly.
+    var bool2intOutputs: HashSet[string]
+    for con in tr.model.constraints:
+        if stripSolverPrefix(con.name) == "bool2int" and con.args.len >= 2 and
+           con.args[1].kind == FznIdent:
+            bool2intOutputs.incl(con.args[1].ident)
+
     # Identify orphan search variables: not in annotation, not channels, not defined
     var orphanVarNames: seq[string]
     for decl in tr.model.variables:
@@ -2249,10 +2258,8 @@ proc detectOrphanSearchVariables(tr: var FznTranslator) =
         if vn in tr.annotatedSearchVarNames: continue
         if vn in tr.channelVarNames: continue
         if vn in tr.definedVarNames: continue
+        if vn in bool2intOutputs: continue  # bool2int output — not an orphan
         case decl.varType.kind
-        of FznIntRange:
-            if decl.varType.lo == 0 and decl.varType.hi == 1:
-                continue  # bool2int output — not an orphan
         of FznBool:
             continue
         else:
@@ -2317,7 +2324,9 @@ proc detectOrphanSearchVariables(tr: var FznTranslator) =
     # Walk backward from boundary orphan to reconstruct orphan sequence
     var orphanSeq: seq[string]
     var cur = boundaryOrphan
-    while cur in orphanSet:
+    var visitedOrphans: HashSet[string]
+    while cur in orphanSet and cur notin visitedOrphans:
+        visitedOrphans.incl(cur)
         orphanSeq.add(cur)
         if cur in predecessors and predecessors[cur] in orphanSet:
             cur = predecessors[cur]
@@ -2378,14 +2387,31 @@ proc buildOrphanEqualityConstraints(tr: var FznTranslator) =
         return
 
     var nEqualities = 0
+    var nSkippedDisjoint = 0
     for (orphanName, annotatedName) in tr.orphanToAnnotatedMap:
         if orphanName notin tr.varPositions or annotatedName notin tr.varPositions:
             continue
         let orphanPos = tr.varPositions[orphanName]
         let annotatedPos = tr.varPositions[annotatedName]
+        # Check domain compatibility: skip if domains are completely disjoint,
+        # as an unsatisfiable equality constraint would pollute penalty maps.
+        let orphanDom = tr.sys.baseArray.domain[orphanPos]
+        let annotatedDom = tr.sys.baseArray.domain[annotatedPos]
+        let annotatedSet = annotatedDom.toHashSet()
+        var hasOverlap = false
+        for v in orphanDom:
+            if v in annotatedSet:
+                hasOverlap = true
+                break
+        if not hasOverlap:
+            inc nSkippedDisjoint
+            continue
         tr.sys.addConstraint(tr.getExpr(orphanPos) == tr.getExpr(annotatedPos))
         inc nEqualities
 
+    if nSkippedDisjoint > 0:
+        stderr.writeLine("[FZN] Warning: skipped " & $nSkippedDisjoint &
+            " orphan equality constraints due to disjoint domains")
     if nEqualities > 0:
         stderr.writeLine("[FZN] Generated " & $nEqualities &
             " equality constraints linking orphan to annotated search variables")

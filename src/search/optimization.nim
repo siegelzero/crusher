@@ -346,6 +346,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     objective.initialize(system.assignment)
                     currentCost = objective.value
                     # Reject solutions that violate the domain bound
+                    # Reject solutions that violate the domain bound.
+                    # Note: constraint/fixedPositions restore is handled by the finally block.
                     when direction == Minimize:
                         if domainLoBound != low(int) and currentCost < domainLoBound:
                             if verbose:
@@ -355,8 +357,6 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             objective.initialize(system.assignment)
                             currentCost = objective.value
                             retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
-                            system.baseArray.constraints = savedConstraints2
-                            system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
                             continue
                     else:
                         if domainHiBound != high(int) and currentCost > domainHiBound:
@@ -367,8 +367,6 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             objective.initialize(system.assignment)
                             currentCost = objective.value
                             retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
-                            system.baseArray.constraints = savedConstraints2
-                            system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
                             continue
                     system.bestAssignmentValid = false
                     system.bestFeasibleAssignment = system.assignment
