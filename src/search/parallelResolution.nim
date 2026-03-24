@@ -44,6 +44,7 @@ type
         carrays: ptr UncheckedArray[ConstrainedArray[T]]
         results: ptr UncheckedArray[TabuState[T]]
         strategies: ptr UncheckedArray[InitStrategy]
+        seedAssignment: seq[T]  ## If non-empty, state 0 uses this as initial assignment
         nextTaskIndex: Atomic[int]
         totalTasks: int
         verbose: bool
@@ -61,9 +62,14 @@ proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
             if idx >= pool.totalTasks:
                 break
             try:
-                pool.results[idx] = newTabuState[T](pool.carrays[idx],
-                    verbose = pool.verbose and idx == 0, id = idx,
-                    initStrategy = pool.strategies[idx])
+                if pool.seedAssignment.len > 0 and idx == 0:
+                    pool.results[idx] = newTabuState[T](pool.carrays[idx],
+                        pool.seedAssignment,
+                        verbose = pool.verbose, id = idx)
+                else:
+                    pool.results[idx] = newTabuState[T](pool.carrays[idx],
+                        verbose = pool.verbose and idx == 0, id = idx,
+                        initStrategy = pool.strategies[idx])
             except CatchableError as e:
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Error on state " & $idx & ": " & e.msg)
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
@@ -443,7 +449,8 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
                         verbose: bool = false,
                         failedPool: var CandidatePool[T],
                         deadline: float = 0.0,
-                        adaptedThreshold: var int): bool =
+                        adaptedThreshold: var int,
+                        seedAssignment: seq[T] = @[]): bool =
     ## Run parallel tabu search. Returns true if solution found (system initialized).
     ## On failure, populates failedPool with best results for scatter search continuation.
     let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
@@ -467,10 +474,16 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     for i in 0..<populationSize:
         carrays[i] = templateArray.deepCopy()
 
-    # Assign init strategies: state 0 = min, state 1 = max, rest = random
+    # Assign init strategies. When seed is provided (optimization rounds), state 0 is
+    # seeded (warm start) and states 1/2 get min/max for diversity. Without seed (initial
+    # feasibility solve), all states use random to avoid extreme-init solutions with
+    # terrible objectives dominating the initial solution selection.
     var strategies = newSeq[InitStrategy](populationSize)
-    for i in 0..<populationSize:
-        strategies[i] = initStrategyForPopulation(i, populationSize)
+    if seedAssignment.len > 0:
+        # State 0: seeded (handled separately in initPoolWorker), shift min/max to 1/2
+        for i in 0..<populationSize:
+            strategies[i] = initStrategyForPopulation(i - 1, populationSize - 1)
+    # else: all isRandom (default)
 
     # Initialize TabuStates in parallel using work-stealing pool.
     # Workers grab the next state to init via atomic counter — no batch boundaries.
@@ -480,6 +493,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         carrays: cast[ptr UncheckedArray[ConstrainedArray[T]]](addr carrays[0]),
         results: cast[ptr UncheckedArray[TabuState[T]]](addr population[0]),
         strategies: cast[ptr UncheckedArray[InitStrategy]](addr strategies[0]),
+        seedAssignment: seedAssignment,
         totalTasks: populationSize,
         verbose: verbose
     )

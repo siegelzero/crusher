@@ -206,6 +206,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
                     deadline=deadline,
+                    seedAssignment=bestSolution,
                 )
                 objective.initialize(system.assignment)
                 currentCost = objective.value
@@ -342,6 +343,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
                         deadline=deadline,
+                        seedAssignment=bestSolution,
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value

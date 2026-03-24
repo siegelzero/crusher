@@ -184,8 +184,7 @@ proc buildInitialPopulation*[T](system: ConstraintSystem[T],
     var population = newSeq[TabuState[T]](createSize)
     for i in 0..<createSize:
         let arr = popTemplate.deepCopy()
-        population[i] = newTabuState[T](arr, verbose = false, id = i,
-            initStrategy = initStrategyForPopulation(i, createSize))
+        population[i] = newTabuState[T](arr, verbose = false, id = i)
 
     if verbose:
         echo &"[Scatter] Created {createSize} states in {currentTime() - popStart:.2f}s"

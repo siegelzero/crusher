@@ -21,7 +21,8 @@ proc resolve*[T](system: ConstraintSystem[T],
                 numWorkers: int = 0,
                 scatterStrategy: ScatterStrategy = PathRelinking,
                 verbose: bool = false,
-                deadline: float = 0.0) =
+                deadline: float = 0.0,
+                seedAssignment: seq[T] = @[]) =
     # Detect element constraints that form inverse channel patterns
     system.baseArray.detectElementInverseChannels()
 
@@ -80,7 +81,7 @@ proc resolve*[T](system: ConstraintSystem[T],
             echo &"[Solve] Using adapted threshold: {effectiveThreshold} (original: {tabuThreshold})"
         var pool: CandidatePool[T]
         var adaptedThreshold = effectiveThreshold
-        if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, deadline, adaptedThreshold):
+        if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, deadline, adaptedThreshold, seedAssignment):
             system.adaptedTabuThreshold = adaptedThreshold
             system.hasFeasibleSolution = true
             return
