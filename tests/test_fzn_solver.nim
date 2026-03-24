@@ -2445,3 +2445,90 @@ solve :: int_search(a,first_fail,indomain_min,complete) minimize cost;
     # Orphan variables have positions and equality constraints (not channels)
     check "b1" in tr.varPositions
     check tr.orphanToAnnotatedMap.len == 3
+
+  test "array_bool_xor 3-element channel: result = XNOR(a, b)":
+    # array_bool_xor([r, a, b]) with defines_var(r) means r XOR a XOR b = true
+    # so r = XNOR(a, b) = (a == b)
+    let src = """
+var bool: a;
+var bool: b;
+var bool: r:: var_is_introduced:: is_defined_var;
+var 0..1: obj:: output_var:: is_defined_var;
+array [1..3] of var bool: xarr:: var_is_introduced = [r, a, b];
+constraint array_bool_xor(xarr):: defines_var(r);
+constraint bool2int(r, obj):: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # r should be detected as a channel variable
+    check "r" in tr.channelVarNames
+    check tr.boolXorVarChannelDefs.len == 1
+    check tr.boolXorVarChannelDefs[0].isNe == false  # XNOR / EQ pattern
+
+    # Solve and verify r = XNOR(a, b) = (a == b)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let aPos = tr.varPositions["a"]
+    let bPos = tr.varPositions["b"]
+    let rPos = tr.varPositions["r"]
+    let aVal = tr.sys.assignment[aPos]
+    let bVal = tr.sys.assignment[bPos]
+    let rVal = tr.sys.assignment[rPos]
+    check rVal == (if aVal == bVal: 1 else: 0)
+
+  test "bool_xor variable channel: result = a XOR b":
+    # bool_xor(a, b, result) with defines_var(result) means result = a XOR b
+    let src = """
+var bool: a;
+var bool: b;
+var bool: r:: var_is_introduced:: is_defined_var;
+var 0..1: obj:: output_var:: is_defined_var;
+array [1..3] of var bool: xarr:: var_is_introduced = [r, a, b];
+constraint bool_xor(a, b, r):: defines_var(r);
+constraint bool2int(r, obj):: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # r should be detected as a channel variable
+    check "r" in tr.channelVarNames
+    check tr.boolXorVarChannelDefs.len == 1
+    check tr.boolXorVarChannelDefs[0].isNe == true  # XOR / NE pattern
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let aPos = tr.varPositions["a"]
+    let bPos = tr.varPositions["b"]
+    let rPos = tr.varPositions["r"]
+    let aVal = tr.sys.assignment[aPos]
+    let bVal = tr.sys.assignment[bPos]
+    let rVal = tr.sys.assignment[rPos]
+    check rVal == (if aVal != bVal: 1 else: 0)
+
+  test "array_bool_xor constraint fallback (no defines_var)":
+    # array_bool_xor without defines_var: XOR of all elements must be true
+    let src = """
+var bool: a;
+var bool: b;
+var bool: c;
+array [1..3] of var bool: xarr = [a, b, c];
+constraint array_bool_xor(xarr);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # No channel detection without defines_var
+    check tr.boolXorVarChannelDefs.len == 0
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let aPos = tr.varPositions["a"]
+    let bPos = tr.varPositions["b"]
+    let cPos = tr.varPositions["c"]
+    let aVal = tr.sys.assignment[aPos]
+    let bVal = tr.sys.assignment[bPos]
+    let cVal = tr.sys.assignment[cPos]
+    # XOR = true means odd number of trues
+    let total = aVal + bVal + cVal
+    check (total == 1 or total == 3)

@@ -266,6 +266,17 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
         ]
         tr.sys.baseArray.addChannelBinding(rPos, aExpr, arrayElems)
 
+    # Process bool_xor identity channels: result = input = element(input, [0, 1])
+    for def in tr.boolXorIdentityDefs:
+        if def.resultVar notin tr.varPositions: continue
+        let rPos = tr.varPositions[def.resultVar]
+        let aExpr = tr.resolveExprArg(def.inputArg)
+        let arrayElems = @[
+            ArrayElement[int](isConstant: true, constantValue: 0),
+            ArrayElement[int](isConstant: true, constantValue: 1)
+        ]
+        tr.sys.baseArray.addChannelBinding(rPos, aExpr, arrayElems)
+
     # Process bool_clause_reif channels
     for ci in tr.boolClauseReifChannelDefs:
         let con = tr.model.constraints[ci]
@@ -873,6 +884,45 @@ proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
 
     if tr.boolAndOrChannelDefs.len > 0:
         stderr.writeLine(&"[FZN] Built {tr.boolAndOrChannelDefs.len} array_bool_and/or channel bindings " &
+                                          &"(total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
+proc buildBoolXorVarChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for bool_xor / array_bool_xor variable channel defs.
+    ## bool_xor(a, b, result):        result = a XOR b = element(a*2+b, [0,1,1,0])
+    ## array_bool_xor([result,a,b]):  result = XNOR(a,b) = element(a*2+b, [1,0,0,1])
+    var nBuilt = 0
+    for def in tr.boolXorVarChannelDefs:
+        if def.resultVar notin tr.varPositions: continue
+        let rPos = tr.varPositions[def.resultVar]
+
+        let aExpr = tr.resolveExprArg(def.arg1)
+        let bExpr = tr.resolveExprArg(def.arg2)
+
+        # index = a*2 + b, domain {0,1} × {0,1} → range 0..3
+        let indexExpr = aExpr * 2 + bExpr
+
+        var arrayElems: seq[ArrayElement[int]]
+        if def.isNe:
+            # XOR / NE: [0, 1, 1, 0]
+            arrayElems = @[
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 0)]
+        else:
+            # XNOR / EQ: [1, 0, 0, 1]
+            arrayElems = @[
+                ArrayElement[int](isConstant: true, constantValue: 1),
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 0),
+                ArrayElement[int](isConstant: true, constantValue: 1)]
+
+        tr.sys.baseArray.addChannelBinding(rPos, indexExpr, arrayElems)
+        inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} bool_xor/array_bool_xor variable channel bindings " &
                                           &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 

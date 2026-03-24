@@ -411,6 +411,11 @@ type
             consumedCIs: seq[int]]]
         # Bool_xor negation defs: bool_xor(const, var, result) where const=true → result = 1-var
         boolXorNegDefs*: seq[tuple[inputArg: FznExpr, resultVar: string]]
+        # Bool XOR variable channel defs: bool_xor(var_a, var_b, result) or array_bool_xor([result, a, b])
+        # with defines_var where both inputs are variables → element channel
+        boolXorVarChannelDefs*: seq[tuple[resultVar: string, arg1: FznExpr, arg2: FznExpr, isNe: bool]]
+        # Bool XOR identity channel defs: bool_xor(channel, var, false) → var = channel
+        boolXorIdentityDefs*: seq[tuple[inputArg: FznExpr, resultVar: string]]
         # Bool equivalence alias defs: mutual bool_clause implications → alias channels
         boolEquivAliasDefs*: seq[tuple[aliasVar, canonicalVar: string, consumedCIs: seq[int]]]
         # Bool-gated variable channel defs: x = if cond then y else constant
@@ -857,6 +862,14 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectBool2intIdentityAliases()
     # Fold bool_xor constraints with constant inputs (before reif channel detection)
     result.detectBoolXorSimplification()
+    # Detect bool_xor / array_bool_xor with 2 variable inputs and defines_var → element channel
+    # MUST run after detectBoolXorSimplification (which handles constant-input cases first)
+    result.detectBoolXorVarChannels()
+    # Detect bool_xor(channel, var, false/true) → identity/negation channel
+    # MUST run after detectBoolXorVarChannels so XOR chain intermediates are in channelVarNames.
+    # Runs before detectReifChannels so that identity-channeled vars (e.g. L[i+1]) are known
+    # as channels when reif detection processes bool_eq_reif using them as inputs.
+    result.detectBoolXorConstResultChannels()
     # Detect orphan search variables (non-annotated) — records mapping for later channel creation.
     # Runs before detectReifChannels so reification channels on orphan positions are still created.
     result.detectOrphanSearchVariables()
@@ -1852,6 +1865,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildConditionalExpressionChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
+    # Build channel bindings for bool_xor / array_bool_xor variable channels
+    result.buildBoolXorVarChannelBindings()
     # Build channel bindings for one-hot indicator variables
     result.buildOneHotChannelBindings()
     # Detect implicit min/max channels: array_int_max/min without defines_var

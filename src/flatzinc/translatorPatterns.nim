@@ -7219,6 +7219,155 @@ proc detectBoolXorSimplification(tr: var FznTranslator) =
     if nFolded > 0:
         stderr.writeLine(&"[FZN] Folded {nFolded} bool_xor constraints with constant inputs")
 
+proc detectBoolXorConstResultChannels*(tr: var FznTranslator) =
+    ## Detects bool_xor(a, b, const_result) where the result is a constant and at
+    ## least one of {a, b} is already a channel variable.
+    ## - bool_xor(a, b, false) → a = b → identity channel: target = element(source, [0, 1])
+    ## - bool_xor(a, b, true) → a = NOT b → negation channel: target = element(source, [1, 0])
+    ##
+    ## MUST run AFTER detectBoolXorVarChannels and detectReifChannels so channelVarNames
+    ## is populated.
+    var nIdentity = 0
+    var nNegation = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_xor": continue
+        if con.args.len < 3: continue
+        if con.hasAnnotation("defines_var"): continue
+
+        let argR = con.args[2]
+        var resultConst = -1
+        if argR.kind == FznBoolLit:
+            resultConst = if argR.boolVal: 1 else: 0
+        elif argR.kind == FznIntLit:
+            resultConst = argR.intVal
+        elif argR.kind == FznIdent and argR.ident in tr.paramValues:
+            resultConst = tr.paramValues[argR.ident]
+        if resultConst < 0: continue
+
+        let argA = con.args[0]
+        let argB = con.args[1]
+        if argA.kind != FznIdent or argB.kind != FznIdent: continue
+        let aName = argA.ident
+        let bName = argB.ident
+        if aName in tr.definedVarNames or bName in tr.definedVarNames: continue
+
+        let aIsChannel = aName in tr.channelVarNames
+        let bIsChannel = bName in tr.channelVarNames
+        if not aIsChannel and not bIsChannel: continue
+        if aIsChannel and bIsChannel: continue
+
+        var targetVar: string
+        var sourceArg: FznExpr
+        if aIsChannel and not bIsChannel:
+            targetVar = bName; sourceArg = argA
+        else:
+            targetVar = aName; sourceArg = argB
+
+        tr.channelVarNames.incl(targetVar)
+        tr.definingConstraints.incl(ci)
+
+        if resultConst == 0:
+            # a = b → identity channel: target = element(source, [0, 1])
+            tr.boolXorIdentityDefs.add((inputArg: sourceArg, resultVar: targetVar))
+            inc nIdentity
+        else:
+            # a = NOT b → negation channel: target = element(source, [1, 0])
+            tr.boolXorNegDefs.add((inputArg: sourceArg, resultVar: targetVar))
+            inc nNegation
+
+    if nIdentity > 0 or nNegation > 0:
+        stderr.writeLine(&"[FZN] Detected {nIdentity + nNegation} bool_xor constant-result channels ({nIdentity} identity, {nNegation} negation)")
+
+proc detectBoolXorVarChannels*(tr: var FznTranslator) =
+    ## Detects bool_xor and array_bool_xor constraints with 2 variable inputs and
+    ## defines_var annotation, creating element channel bindings.
+    ##
+    ## bool_xor(a, b, result) with defines_var(result):
+    ##   result = a XOR b = (a != b) → element(a*2 + b, [0, 1, 1, 0])
+    ##
+    ## array_bool_xor([result, a, b]) with defines_var(result):
+    ##   result XOR a XOR b = true → result = XNOR(a, b) = (a == b)
+    ##   → element(a*2 + b, [1, 0, 0, 1])
+    ##
+    ## Must run AFTER detectBoolXorSimplification (handles constant-input cases).
+    var nBoolXor = 0
+    var nArrayBoolXor = 0
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+
+        if name == "bool_xor":
+            # bool_xor(a, b, result) — 3 separate arguments
+            if con.args.len < 3: continue
+            if not con.hasAnnotation("defines_var"): continue
+            if con.args[2].kind != FznIdent: continue
+            let resultVar = con.args[2].ident
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != resultVar:
+                continue
+            if resultVar in tr.channelVarNames or resultVar in tr.definedVarNames: continue
+
+            # Both inputs must be non-constant, non-defined variables
+            let argA = con.args[0]
+            let argB = con.args[1]
+            if argA.kind == FznBoolLit or argA.kind == FznIntLit: continue  # handled by simplification
+            if argB.kind == FznBoolLit or argB.kind == FznIntLit: continue
+            if argA.kind == FznIdent and argA.ident in tr.paramValues: continue
+            if argB.kind == FznIdent and argB.ident in tr.paramValues: continue
+            if argA.kind == FznIdent and argA.ident in tr.definedVarNames: continue
+            if argB.kind == FznIdent and argB.ident in tr.definedVarNames: continue
+
+            tr.channelVarNames.incl(resultVar)
+            tr.definingConstraints.incl(ci)
+            tr.boolXorVarChannelDefs.add((resultVar: resultVar, arg1: argA, arg2: argB, isNe: true))
+            inc nBoolXor
+
+        elif name == "array_bool_xor":
+            # array_bool_xor(array) — single array argument, parity constraint
+            if con.args.len < 1: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+            let resultVar = ann.args[0].ident
+            if resultVar in tr.channelVarNames or resultVar in tr.definedVarNames: continue
+
+            # Resolve the array elements
+            let elems = tr.resolveVarArrayElems(con.args[0])
+            if elems.len != 3: continue  # only handle 3-element (2 inputs + 1 output) for channels
+
+            # Find the two input elements (non-result) and verify they're valid
+            var inputs: seq[FznExpr]
+            for elem in elems:
+                if elem.kind == FznIdent and elem.ident == resultVar:
+                    continue
+                inputs.add(elem)
+
+            if inputs.len != 2: continue  # result var not found in array or duplicate
+
+            # Both inputs must be non-constant, non-defined variables
+            var allValid = true
+            for inp in inputs:
+                if inp.kind == FznBoolLit or inp.kind == FznIntLit:
+                    allValid = false; break
+                if inp.kind == FznIdent and inp.ident in tr.paramValues:
+                    allValid = false; break
+                if inp.kind == FznIdent and inp.ident in tr.definedVarNames:
+                    allValid = false; break
+            if not allValid: continue
+
+            # array_bool_xor([r, a, b]): r XOR a XOR b = true → r = XNOR(a, b) = (a == b)
+            # Channel: element(a*2 + b, [1, 0, 0, 1]) — EQ pattern (isNe=false)
+            tr.channelVarNames.incl(resultVar)
+            tr.definingConstraints.incl(ci)
+            tr.boolXorVarChannelDefs.add((resultVar: resultVar, arg1: inputs[0], arg2: inputs[1], isNe: false))
+            inc nArrayBoolXor
+
+    if nBoolXor > 0 or nArrayBoolXor > 0:
+        stderr.writeLine(&"[FZN] Detected XOR variable channels: {nBoolXor} bool_xor, {nArrayBoolXor} array_bool_xor")
+
 proc detectConstantElementComposition*(tr: var FznTranslator) =
     ## For each element channel with a constant array and simple ident index var,
     ## stores (indexVar, constArray) in constElementSources so downstream channel

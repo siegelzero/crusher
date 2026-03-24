@@ -1121,6 +1121,22 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let s = sum[int](exprs)
         tr.sys.addConstraint((s >= 1) <-> (r == 1))
 
+    of "array_bool_xor":
+        # array_bool_xor(array): XOR (parity) of all elements must be true (odd count)
+        let exprs = tr.resolveExprArray(con.args[0])
+        if exprs.len == 1:
+            tr.sys.addConstraint(exprs[0] == 1)
+        elif exprs.len == 2:
+            # a XOR b = true ↔ a + b == 1 (they differ)
+            tr.sys.addConstraint(exprs[0] + exprs[1] == 1)
+        elif exprs.len >= 3:
+            # Chain XOR of first n-1 elements, assert XOR with last = true
+            # (a XOR b) XOR c = true ↔ (a XOR b) ↔ (c == 0)
+            var xorChain = (exprs[0] == 1) xor (exprs[1] == 1)
+            for i in 2 ..< exprs.len - 1:
+                xorChain = xorChain xor (exprs[i] == 1)
+            tr.sys.addConstraint(xorChain <-> (exprs[^1] == 0))
+
     of "bool_eq_reif":
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
