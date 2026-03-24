@@ -1940,6 +1940,32 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                                  &"'{patB.arrayName}' positions remain searchable)")
 
 
+type BoolClauseEntry = object
+    ci: int
+    posLits: seq[string]
+    negLits: seq[string]
+
+proc indexBoolClauses(tr: FznTranslator): Table[string, seq[BoolClauseEntry]] =
+    ## Index bool_clause constraints by all their literals for efficient lookup.
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.name != "bool_clause": continue
+        if con.args.len < 2: continue
+        var posLits, negLits: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.add(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.add(e.ident)
+        let entry = BoolClauseEntry(ci: ci, posLits: posLits, negLits: negLits)
+        for lit in posLits:
+            if lit notin result: result[lit] = @[]
+            result[lit].add(entry)
+        for lit in negLits:
+            if lit notin result: result[lit] = @[]
+            result[lit].add(entry)
+
 proc detectIfThenElseChannels(tr: var FznTranslator) =
     ## Detects if-then-else patterns encoded as:
     ##   int_lin_ne_reif([1,-1], [prev, curr], 0, b) :: defines_var(b)
@@ -2028,36 +2054,7 @@ proc detectIfThenElseChannels(tr: var FznTranslator) =
         eqReifByResult[resultVar].add(entry)
 
     # Phase 3: Index bool_clause constraints
-    # For each bool_clause, check if it matches one of the two patterns:
-    # Pattern A: bool_clause([b1], [b]) — 1 positive, 1 negative
-    # Pattern B: bool_clause([b, b2], []) — 2 positive, 0 negative
-    type BoolClauseEntry = object
-        ci: int
-        # For Pattern A: posLit is b1 (eq_reif bool), negLit is b (condition bool)
-        # For Pattern B: lit1 is b (condition bool), lit2 is b2 (eq_reif bool)
-        posLits: seq[string]
-        negLits: seq[string]
-
-    var boolClausesByLit: Table[string, seq[BoolClauseEntry]]
-
-    for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
-        if con.name != "bool_clause": continue
-        if con.args.len < 2: continue
-        var posLits, negLits: seq[string]
-        if con.args[0].kind == FznArrayLit:
-            for e in con.args[0].elems:
-                if e.kind == FznIdent: posLits.add(e.ident)
-        if con.args[1].kind == FznArrayLit:
-            for e in con.args[1].elems:
-                if e.kind == FznIdent: negLits.add(e.ident)
-        let entry = BoolClauseEntry(ci: ci, posLits: posLits, negLits: negLits)
-        for lit in posLits:
-            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
-            boolClausesByLit[lit].add(entry)
-        for lit in negLits:
-            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
-            boolClausesByLit[lit].add(entry)
+    let boolClausesByLit = tr.indexBoolClauses()
 
     # Phase 4: Match the full pattern for each candidate result variable
     var totalChannels = 0
@@ -2250,31 +2247,7 @@ proc detectConditionalCounterChannels*(tr: var FznTranslator) =
     if linEqIncrMap.len == 0: return
 
     # Phase 3: Index bool_clause constraints
-    type BoolClauseInfo = object
-        ci: int
-        posLits: seq[string]
-        negLits: seq[string]
-
-    var boolClausesByLit: Table[string, seq[BoolClauseInfo]]
-
-    for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
-        if con.name != "bool_clause": continue
-        if con.args.len < 2: continue
-        var posLits, negLits: seq[string]
-        if con.args[0].kind == FznArrayLit:
-            for e in con.args[0].elems:
-                if e.kind == FznIdent: posLits.add(e.ident)
-        if con.args[1].kind == FznArrayLit:
-            for e in con.args[1].elems:
-                if e.kind == FznIdent: negLits.add(e.ident)
-        let info = BoolClauseInfo(ci: ci, posLits: posLits, negLits: negLits)
-        for lit in posLits:
-            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
-            boolClausesByLit[lit].add(info)
-        for lit in negLits:
-            if lit notin boolClausesByLit: boolClausesByLit[lit] = @[]
-            boolClausesByLit[lit].add(info)
+    let boolClausesByLit = tr.indexBoolClauses()
 
     # Phase 4: Match patterns
     var totalChannels = 0
@@ -2365,14 +2338,10 @@ proc detectConditionalCounterChannels*(tr: var FznTranslator) =
         zDom.incl(resetVal)
         for k in lo..hi:
             zDom.incl(k + 1)
-        var zDomSeq: seq[int]
-        for v in zDom: zDomSeq.add(v)
-        zDomSeq.sort()
         let currentDom = tr.sys.baseArray.domain[targetPos]
         var tightDom: seq[int]
-        let zSet = zDom
         for v in currentDom:
-            if v in zSet:
+            if v in zDom:
                 tightDom.add(v)
         if tightDom.len > 0 and tightDom.len < currentDom.len:
             tr.sys.baseArray.domain[targetPos] = tightDom
@@ -2460,30 +2429,7 @@ proc detectConditionalElementChannels*(tr: var FznTranslator) =
         eqReifByX[xName].add(entry)
 
     # Phase 3: Index bool_clause
-    type BCInfo = object
-        ci: int
-        posLits, negLits: seq[string]
-
-    var bcByLit: Table[string, seq[BCInfo]]
-
-    for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
-        if con.name != "bool_clause": continue
-        if con.args.len < 2: continue
-        var posLits, negLits: seq[string]
-        if con.args[0].kind == FznArrayLit:
-            for e in con.args[0].elems:
-                if e.kind == FznIdent: posLits.add(e.ident)
-        if con.args[1].kind == FznArrayLit:
-            for e in con.args[1].elems:
-                if e.kind == FznIdent: negLits.add(e.ident)
-        let info = BCInfo(ci: ci, posLits: posLits, negLits: negLits)
-        for lit in posLits:
-            if lit notin bcByLit: bcByLit[lit] = @[]
-            bcByLit[lit].add(info)
-        for lit in negLits:
-            if lit notin bcByLit: bcByLit[lit] = @[]
-            bcByLit[lit].add(info)
+    let bcByLit = tr.indexBoolClauses()
 
     # Phase 4: Match the full pattern
     var totalChannels = 0
