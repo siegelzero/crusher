@@ -17,6 +17,8 @@ import crusher
 import flatzinc/[parser, translator, output]
 import expressions/weightedSameValue
 
+proc immediateExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noReturn.}
+
 # Global state for SIGTERM handler — allows graceful output on MiniZinc kill
 var gSavedFd: cint = -1
 var gTranslator: ptr FznTranslator = nil
@@ -33,7 +35,9 @@ proc sigTermHandler(sig: cint) {.noconv.} =
     gTranslator[].printSolution()
   else:
     printUnknown()
-  quit(0)
+  flushFile(stdout)
+  flushFile(stderr)
+  immediateExit(0)
 
 proc redirectStdoutToStderr() =
   ## Redirect stdout to stderr so solver internal output doesn't corrupt FZN output.
@@ -135,6 +139,7 @@ proc main() =
   gHasSolution = addr tr.sys.hasFeasibleSolution
   signal(SIGTERM, sigTermHandler)
   signal(SIGINT, sigTermHandler)
+  signal(SIGPIPE, SIG_IGN)  # Ignore broken pipe (MiniZinc may close stdout early)
 
   # Solve
   let solveStart = cpuTime()
@@ -238,6 +243,13 @@ proc main() =
   # Restore stdout for solution output
   flushFile(stdout)
   restoreStdout(savedFd)
+  gSavedFd = -1  # Mark as restored so signal handler won't use closed fd
+
+  # Ignore signals during output/cleanup — MiniZinc may send SIGTERM
+  # near the time limit boundary. Using SIG_IGN prevents any handler
+  # from running ARC destructors that would crash.
+  signal(SIGTERM, SIG_IGN)
+  signal(SIGINT, SIG_IGN)
 
   if solved:
     # Reconstruct board values from tile placements if geost conversion was used
@@ -265,5 +277,10 @@ proc main() =
     stderr.writeLine(&"%%%mzn-stat: initTime={solveStart - startTime:.3f}")
     stderr.writeLine(&"%%%mzn-stat: nodes={tr.sys.lastIterations}")
     stderr.writeLine("%%%mzn-stat-end")
+
+  # Exit immediately — skip ARC destructors to avoid SIGSEGV during cleanup.
+  flushFile(stdout)
+  flushFile(stderr)
+  immediateExit(0)
 
 main()

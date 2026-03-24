@@ -984,6 +984,50 @@ solve satisfy;
         check a[idx2 - 1] == 2
         check a[idx3 - 1] == 3
 
+    test "inverse channel with constant element in inverse array":
+        ## When the inverse array has a constant element (e.g., order[1] = 1),
+        ## the constant position must NOT become a channel and must retain its
+        ## fixed value. Previously, recomputeInverse() used defaultValue=0 for
+        ## unmapped slots, overwriting the constant with an out-of-domain value.
+        let src = """
+var 1..4: idx1 :: output_var;
+var 1..4: idx2 :: output_var;
+var 1..4: idx3 :: output_var;
+array [1..4] of var int: A :: output_array([1..4]) = [1,a2,a3,a4];
+var 0..4: a2;
+var 0..4: a3;
+var 0..4: a4;
+constraint array_var_int_element(idx1, A, 2);
+constraint array_var_int_element(idx2, A, 3);
+constraint array_var_int_element(idx3, A, 4);
+constraint fzn_all_different_int([idx1, idx2, idx3]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.inverseChannelPatterns.len == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+        let positions = tr.arrayPositions["A"]
+        let a1 = tr.sys.assignment[positions[0]]
+        let a2 = tr.sys.assignment[positions[1]]
+        let a3 = tr.sys.assignment[positions[2]]
+        let a4 = tr.sys.assignment[positions[3]]
+
+        # A[1] is constant 1 — must NOT be overwritten by channel propagation
+        check a1 == 1
+
+        # Inverse relationship holds for variable elements: A[idx_p] = p
+        let idx1 = tr.sys.assignment[tr.varPositions["idx1"]]
+        let idx2 = tr.sys.assignment[tr.varPositions["idx2"]]
+        let idx3 = tr.sys.assignment[tr.varPositions["idx3"]]
+        let a = @[a1, a2, a3, a4]
+        check a[idx1 - 1] == 2
+        check a[idx2 - 1] == 3
+        check a[idx3 - 1] == 4
+
 
 suite "Table Functional Dependency Detection":
 

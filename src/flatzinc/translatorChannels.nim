@@ -1577,8 +1577,17 @@ proc buildInverseChannelBindings(tr: var FznTranslator) =
                     defaultValue = v
                     break
 
+        # Detect constant entries in the inverse array (singleton-domain positions).
+        # These are NOT forward positions but have fixed values that recomputeInverse
+        # must include (e.g., order[1] = City(1) when the first city is fixed).
+        var constantEntries: seq[(int, int)]
+        for j, ipos in arrayPositions:
+            if tr.sys.baseArray.domain[ipos].len == 1:
+                constantEntries.add((j, tr.sys.baseArray.domain[ipos][0]))
+
         tr.sys.baseArray.addInverseChannelGroup(
-            sortedForward, arrayPositions, forwardBase, inverseBase, defaultValue)
+            sortedForward, arrayPositions, forwardBase, inverseBase, defaultValue,
+            constantEntries = constantEntries)
 
         # Domain reduction: if the inverse array has all-constant elements,
         # each forward position is uniquely determined.

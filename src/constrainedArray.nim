@@ -76,6 +76,7 @@ type
         inverseBase*: int            # value representing inversePositions[0] (e.g., 1)
         defaultValue*: T             # value for unmapped inverse slots (e.g., 0)
         forwardValues*: seq[T]       # explicit values per forward position (empty = use i + forwardBase)
+        constantEntries*: seq[(int, T)]  # (inverseIndex, value) for constant inverse positions
 
     ConstrainedArray*[T] = object
         len*: int
@@ -367,10 +368,12 @@ proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
                                  forwardPositions, inversePositions: seq[int],
                                  forwardBase, inverseBase: int,
                                  defaultValue: T,
-                                 forwardValues: seq[T] = @[]) =
+                                 forwardValues: seq[T] = @[],
+                                 constantEntries: seq[(int, T)] = @[]) =
     ## Register an inverse channel group: inverse[forward[i]] = i + forwardBase.
     ## When forwardValues is non-empty, inverse[forward[i]] = forwardValues[i] instead.
-    ## Inverse positions become channel variables.
+    ## Inverse positions become channel variables (except constant entries).
+    ## constantEntries: (inverseIndex, value) pairs for constant elements in the inverse array.
     let gi = arr.inverseChannelGroups.len
     arr.inverseChannelGroups.add(InverseChannelGroup[T](
         forwardPositions: forwardPositions,
@@ -378,11 +381,17 @@ proc addInverseChannelGroup*[T](arr: var ConstrainedArray[T],
         forwardBase: forwardBase,
         inverseBase: inverseBase,
         defaultValue: defaultValue,
-        forwardValues: forwardValues
+        forwardValues: forwardValues,
+        constantEntries: constantEntries
     ))
-    # Mark inverse positions as channels
-    for pos in inversePositions:
-        arr.channelPositions.incl(pos)
+    # Collect constant inverse indices for exclusion
+    var constantIndices: PackedSet[int]
+    for (idx, _) in constantEntries:
+        constantIndices.incl(idx)
+    # Mark inverse positions as channels (skip constants — they keep their fixed values)
+    for j, pos in inversePositions:
+        if j notin constantIndices:
+            arr.channelPositions.incl(pos)
     # Build reverse lookup: forward position → group indices
     for pos in forwardPositions:
         if pos notin arr.inverseChannelsAtPosition:
@@ -396,6 +405,9 @@ proc recomputeInverse*[T](group: InverseChannelGroup[T], assignment: seq[T]): se
     result = newSeq[T](group.inversePositions.len)
     for j in 0..<result.len:
         result[j] = group.defaultValue
+    # Pre-populate constant entries (e.g., order[1] = City(1) when first element is fixed)
+    for (idx, val) in group.constantEntries:
+        result[idx] = val
     for i, fpos in group.forwardPositions:
         let v = assignment[fpos]
         let idx = v - group.inverseBase
@@ -544,6 +556,7 @@ func floorDivPositive[T](a, b: T): T =
 proc tightenFromLe[T](domainMin, domainMax: var seq[T],
                        coeffs: seq[T], positions: seq[int], rhs: T) =
     ## For constraint coeffs · vars <= rhs, tighten domainMin/domainMax bounds.
+    const HalfMax = high(T) div 2
     for j in 0..<positions.len:
         let pos_j = positions[j]
         let a_j = coeffs[j]
@@ -551,14 +564,21 @@ proc tightenFromLe[T](domainMin, domainMax: var seq[T],
 
         # Compute restMin: minimum possible sum of all other terms
         var restMin: T = 0
+        var overflow = false
         for i in 0..<positions.len:
             if i == j: continue
             let a_i = coeffs[i]
             let pos_i = positions[i]
-            if a_i > 0:
-                restMin += a_i * domainMin[pos_i]
-            else:
-                restMin += a_i * domainMax[pos_i]
+            let dVal = if a_i > 0: domainMin[pos_i] else: domainMax[pos_i]
+            let absA = abs(a_i)
+            let absD = abs(dVal)
+            if absA > 0 and absD > high(T) div absA:
+                overflow = true; break
+            let product = a_i * dVal
+            if abs(restMin) > HalfMax:
+                overflow = true; break
+            restMin += product
+        if overflow: continue
 
         # From a_j * x_j + restMin <= rhs  =>  a_j * x_j <= rhs - restMin
         let slack = rhs - restMin
@@ -738,8 +758,10 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
     if forms.len == 0: return
 
     # Fixed-point bounds propagation (same as reduceDomain Phase 3)
-    # Guard against overflow — skip any form where arithmetic would overflow
-    const SafeLimit = high(T) div 4  # conservative bound to prevent overflow
+    # Guard against overflow — skip any form where arithmetic would overflow.
+    # Use safe multiplication/addition checks: verify a*b won't overflow BEFORE
+    # computing it, and verify running sum won't overflow BEFORE adding.
+    const HalfMax = high(T) div 2  # safe accumulation limit
     var changed = true
     for iteration in 0..<50:
         if not changed: break
@@ -755,14 +777,20 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
                     let a_i = form.coefficients[pos_i]
                     if a_i == 0: continue
                     let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
-                    if abs(dVal) > SafeLimit or abs(a_i) > SafeLimit:
+                    # Check product won't overflow: |a_i * dVal| <= high(T)
+                    let absA = abs(a_i)
+                    let absD = abs(dVal)
+                    if absA > 0 and absD > high(T) div absA:
                         overflow = true; break
                     let product = a_i * dVal
-                    if abs(restMax) > SafeLimit:
+                    # Check accumulation won't overflow
+                    if (product > 0 and restMax > HalfMax) or
+                       (product < 0 and restMax < -HalfMax) or
+                       abs(restMax) > HalfMax:
                         overflow = true; break
                     restMax += product
                 if overflow: continue
-                if abs(form.constant) > SafeLimit or abs(restMax) > SafeLimit:
+                if abs(form.constant) > HalfMax or abs(restMax) > HalfMax:
                     continue
                 let bound = -form.constant - restMax
                 if a_j > 0:
@@ -2443,6 +2471,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
             if normalizedForms.len > 0:
                 # Inner fixed-point loop for bounds propagation
+                const HalfMax2 = high(T) div 2
                 for iteration in 0..<100:
                     var changed = false
 
@@ -2452,13 +2481,22 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             if a_j == 0: continue
 
                             var restMax: T = 0
+                            var overflow = false
                             for pos_i in form.coefficients.keys:
                                 if pos_i == pos_j: continue
                                 let a_i = form.coefficients[pos_i]
-                                if a_i > 0:
-                                    restMax += a_i * domainMax[pos_i]
-                                else:
-                                    restMax += a_i * domainMin[pos_i]
+                                let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
+                                let absA = abs(a_i)
+                                let absD = abs(dVal)
+                                if absA > 0 and absD > high(T) div absA:
+                                    overflow = true; break
+                                let product = a_i * dVal
+                                if abs(restMax) > HalfMax2:
+                                    overflow = true; break
+                                restMax += product
+                            if overflow: continue
+                            if abs(form.constant) > HalfMax2 or abs(restMax) > HalfMax2:
+                                continue
 
                             let bound = -form.constant - restMax
 
@@ -3048,22 +3086,37 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 # Compute min/max of each linear expression: coeffs · vars - rhs
                 # Disjunct is satisfied when coeffs · vars - rhs <= 0, i.e. coeffs · vars <= rhs
                 var minE1, maxE1, minE2, maxE2: T = 0
+                var dpOverflow = false
                 for i, pos in dp.positions1:
-                    if dp.coeffs1[i] > 0:
-                        minE1 += dp.coeffs1[i] * domainMin[pos]
-                        maxE1 += dp.coeffs1[i] * domainMax[pos]
+                    let c = dp.coeffs1[i]
+                    let dLo = domainMin[pos]
+                    let dHi = domainMax[pos]
+                    let absC = abs(c)
+                    if absC > 0 and (abs(dLo) > high(T) div absC or abs(dHi) > high(T) div absC):
+                        dpOverflow = true; break
+                    if c > 0:
+                        minE1 += c * dLo
+                        maxE1 += c * dHi
                     else:
-                        minE1 += dp.coeffs1[i] * domainMax[pos]
-                        maxE1 += dp.coeffs1[i] * domainMin[pos]
+                        minE1 += c * dHi
+                        maxE1 += c * dLo
+                if dpOverflow: continue
                 minE1 -= dp.rhs1
                 maxE1 -= dp.rhs1
                 for i, pos in dp.positions2:
-                    if dp.coeffs2[i] > 0:
-                        minE2 += dp.coeffs2[i] * domainMin[pos]
-                        maxE2 += dp.coeffs2[i] * domainMax[pos]
+                    let c = dp.coeffs2[i]
+                    let dLo = domainMin[pos]
+                    let dHi = domainMax[pos]
+                    let absC = abs(c)
+                    if absC > 0 and (abs(dLo) > high(T) div absC or abs(dHi) > high(T) div absC):
+                        dpOverflow = true; break
+                    if c > 0:
+                        minE2 += c * dLo
+                        maxE2 += c * dHi
                     else:
-                        minE2 += dp.coeffs2[i] * domainMax[pos]
-                        maxE2 += dp.coeffs2[i] * domainMin[pos]
+                        minE2 += c * dHi
+                        maxE2 += c * dLo
+                if dpOverflow: continue
                 minE2 -= dp.rhs2
                 maxE2 -= dp.rhs2
 
