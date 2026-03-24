@@ -2107,3 +2107,174 @@ solve satisfy;
         for name in ["b1", "b2", "b3"]:
             count += tr.sys.assignment[tr.varPositions[name]]
         check count <= 1
+
+
+suite "FlatZinc Multi-Machine No-Overlap Detection":
+
+    test "detectMultiMachineNoOverlap: all variable machines":
+        ## 3 tasks × 2 machines.  Each cumulative(limit=1) per machine has heights
+        ## derived from bool2int(int_eq_reif(machine_var, machine_val)).
+        ## The detector should collapse the two cumulatives + reif chains into one
+        ## MultiMachineNoOverlap constraint.
+        let src = """
+var 0..10: s0 :: output_var;
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var 0..1: m0 :: output_var;
+var 0..1: m1 :: output_var;
+var 0..1: m2 :: output_var;
+var bool: b0_eq0 :: var_is_introduced :: is_defined_var;
+var bool: b1_eq0 :: var_is_introduced :: is_defined_var;
+var bool: b2_eq0 :: var_is_introduced :: is_defined_var;
+var 0..1: h0_m0 :: var_is_introduced :: is_defined_var;
+var 0..1: h1_m0 :: var_is_introduced :: is_defined_var;
+var 0..1: h2_m0 :: var_is_introduced :: is_defined_var;
+var bool: b0_eq1 :: var_is_introduced :: is_defined_var;
+var bool: b1_eq1 :: var_is_introduced :: is_defined_var;
+var bool: b2_eq1 :: var_is_introduced :: is_defined_var;
+var 0..1: h0_m1 :: var_is_introduced :: is_defined_var;
+var 0..1: h1_m1 :: var_is_introduced :: is_defined_var;
+var 0..1: h2_m1 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(m0, 0, b0_eq0) :: defines_var(b0_eq0);
+constraint int_eq_reif(m1, 0, b1_eq0) :: defines_var(b1_eq0);
+constraint int_eq_reif(m2, 0, b2_eq0) :: defines_var(b2_eq0);
+constraint bool2int(b0_eq0, h0_m0) :: defines_var(h0_m0);
+constraint bool2int(b1_eq0, h1_m0) :: defines_var(h1_m0);
+constraint bool2int(b2_eq0, h2_m0) :: defines_var(h2_m0);
+constraint int_eq_reif(m0, 1, b0_eq1) :: defines_var(b0_eq1);
+constraint int_eq_reif(m1, 1, b1_eq1) :: defines_var(b1_eq1);
+constraint int_eq_reif(m2, 1, b2_eq1) :: defines_var(b2_eq1);
+constraint bool2int(b0_eq1, h0_m1) :: defines_var(h0_m1);
+constraint bool2int(b1_eq1, h1_m1) :: defines_var(h1_m1);
+constraint bool2int(b2_eq1, h2_m1) :: defines_var(h2_m1);
+constraint fzn_cumulative([s0,s1,s2], [3,2,4], [h0_m0,h1_m0,h2_m0], 1);
+constraint fzn_cumulative([s0,s1,s2], [3,2,4], [h0_m1,h1_m1,h2_m1], 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pattern should be detected
+        check tr.multiMachineNoOverlapInfos.len == 1
+        let info = tr.multiMachineNoOverlapInfos[0]
+        check info.startVarNames == @["s0", "s1", "s2"]
+        check info.durations == @[3, 2, 4]
+        check info.machineVarNames == @["m0", "m1", "m2"]
+        check info.numMachineValues == 2
+        # All variable machines → all fixedMachineValues should be -1
+        check info.fixedMachineValues == @[-1, -1, -1]
+
+        # Intermediate bool/int vars should be consumed
+        for vn in ["b0_eq0", "b1_eq0", "b2_eq0", "h0_m0", "h1_m0", "h2_m0",
+                    "b0_eq1", "b1_eq1", "b2_eq1", "h0_m1", "h1_m1", "h2_m1"]:
+            check vn in tr.definedVarNames
+
+        # Constraint system should contain a MultiMachineNoOverlap constraint
+        var foundMMNO = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == MultiMachineNoOverlapType:
+                foundMMNO = true
+                break
+        check foundMMNO
+
+        # Solve and verify no-overlap semantics
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let starts = [tr.sys.assignment[tr.varPositions["s0"]],
+                      tr.sys.assignment[tr.varPositions["s1"]],
+                      tr.sys.assignment[tr.varPositions["s2"]]]
+        let machines = [tr.sys.assignment[tr.varPositions["m0"]],
+                        tr.sys.assignment[tr.varPositions["m1"]],
+                        tr.sys.assignment[tr.varPositions["m2"]]]
+        let durations = [3, 2, 4]
+
+        # For each machine, verify no two tasks overlap
+        for machine in 0..1:
+            var tasksOnMachine: seq[int]
+            for t in 0..2:
+                if machines[t] == machine:
+                    tasksOnMachine.add(t)
+            for i in 0..<tasksOnMachine.len:
+                for j in (i+1)..<tasksOnMachine.len:
+                    let ti = tasksOnMachine[i]
+                    let tj = tasksOnMachine[j]
+                    # Intervals [s, s+d) must not overlap
+                    check(starts[ti] + durations[ti] <= starts[tj] or
+                          starts[tj] + durations[tj] <= starts[ti])
+
+
+    test "detectMultiMachineNoOverlap: fixed machine task":
+        ## 3 tasks × 2 machines, but task 2 is pre-assigned to machine 1.
+        ## Heights for task 2: constant 0 in machine-0 cumulative, constant 1 in machine-1.
+        ## Verifies the fixed machine value is correctly inferred as 1, not 0.
+        let src = """
+var 0..10: s0 :: output_var;
+var 0..10: s1 :: output_var;
+var 0..10: s2 :: output_var;
+var 0..1: m0 :: output_var;
+var 0..1: m1 :: output_var;
+var bool: b0_eq0 :: var_is_introduced :: is_defined_var;
+var bool: b1_eq0 :: var_is_introduced :: is_defined_var;
+var 0..1: h0_m0 :: var_is_introduced :: is_defined_var;
+var 0..1: h1_m0 :: var_is_introduced :: is_defined_var;
+var bool: b0_eq1 :: var_is_introduced :: is_defined_var;
+var bool: b1_eq1 :: var_is_introduced :: is_defined_var;
+var 0..1: h0_m1 :: var_is_introduced :: is_defined_var;
+var 0..1: h1_m1 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(m0, 0, b0_eq0) :: defines_var(b0_eq0);
+constraint int_eq_reif(m1, 0, b1_eq0) :: defines_var(b1_eq0);
+constraint bool2int(b0_eq0, h0_m0) :: defines_var(h0_m0);
+constraint bool2int(b1_eq0, h1_m0) :: defines_var(h1_m0);
+constraint int_eq_reif(m0, 1, b0_eq1) :: defines_var(b0_eq1);
+constraint int_eq_reif(m1, 1, b1_eq1) :: defines_var(b1_eq1);
+constraint bool2int(b0_eq1, h0_m1) :: defines_var(h0_m1);
+constraint bool2int(b1_eq1, h1_m1) :: defines_var(h1_m1);
+constraint fzn_cumulative([s0,s1,s2], [3,2,4], [h0_m0,h1_m0,0], 1);
+constraint fzn_cumulative([s0,s1,s2], [3,2,4], [h0_m1,h1_m1,1], 1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pattern should be detected
+        check tr.multiMachineNoOverlapInfos.len == 1
+        let info = tr.multiMachineNoOverlapInfos[0]
+        check info.startVarNames == @["s0", "s1", "s2"]
+        check info.machineVarNames[0] == "m0"
+        check info.machineVarNames[1] == "m1"
+        check info.machineVarNames[2] == ""    # task 2 has no machine variable
+
+        # Critical: fixed machine value for task 2 should be 1, not 0
+        check info.fixedMachineValues[0] == -1  # variable
+        check info.fixedMachineValues[1] == -1  # variable
+        check info.fixedMachineValues[2] == 1   # fixed to machine 1
+
+        # Verify the built constraint has the correct fixed machine
+        var foundConstraint = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == MultiMachineNoOverlapType:
+                foundConstraint = true
+                check c.multiMachineNoOverlapState.fixedMachines[2] == 1
+                break
+        check foundConstraint
+
+        # Solve and verify task 2 is always on machine 1 and no overlaps
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let starts = [tr.sys.assignment[tr.varPositions["s0"]],
+                      tr.sys.assignment[tr.varPositions["s1"]],
+                      tr.sys.assignment[tr.varPositions["s2"]]]
+        let machines = [tr.sys.assignment[tr.varPositions["m0"]],
+                        tr.sys.assignment[tr.varPositions["m1"]],
+                        1]  # task 2 is fixed to machine 1
+        let durations = [3, 2, 4]
+
+        for machine in 0..1:
+            var tasksOnMachine: seq[int]
+            for t in 0..2:
+                if machines[t] == machine:
+                    tasksOnMachine.add(t)
+            for i in 0..<tasksOnMachine.len:
+                for j in (i+1)..<tasksOnMachine.len:
+                    let ti = tasksOnMachine[i]
+                    let tj = tasksOnMachine[j]
+                    check(starts[ti] + durations[ti] <= starts[tj] or
+                          starts[tj] + durations[tj] <= starts[ti])

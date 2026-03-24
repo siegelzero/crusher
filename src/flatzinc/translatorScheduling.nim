@@ -3406,6 +3406,18 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
 
         if not patternValid: continue
 
+        # Determine fixed machine values for tasks with constant heights
+        var fixedMachineValues = newSeq[int](nTasks)
+        for t in 0..<nTasks:
+            fixedMachineValues[t] = -1  # not fixed by default
+            if not machineVarInited[t]:
+                # This task has constant heights — find which cumulative has height=1
+                for groupIdx, cumIdx in indices:
+                    let hElem = cumulatives[cumIdx].heightArrayElems[t]
+                    if hElem.kind == FznIntLit and hElem.intVal == 1:
+                        fixedMachineValues[t] = machineValues[groupIdx]
+                        break
+
         # Verify all tasks have machine vars assigned (or are fixed-machine tasks)
         # Tasks without a machineVarName are fixed to a specific machine
         var startVarNames: seq[string]
@@ -3453,6 +3465,7 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
             startVarNames: startVarNames,
             durations: taskDurations,
             machineVarNames: machineVarNames,
+            fixedMachineValues: fixedMachineValues,
             numMachineValues: maxMachineVal + 1,
             consumedCumulativeCIs: consumedCumulativeCIs,
             consumedReifCIs: allReifCIs,

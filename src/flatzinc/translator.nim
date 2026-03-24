@@ -469,6 +469,7 @@ type
             startVarNames: seq[string],   # per-task start time var names
             durations: seq[int],          # per-task constant durations
             machineVarNames: seq[string], # per-task machine assignment var names
+            fixedMachineValues: seq[int], # per-task fixed machine value (-1 if variable)
             numMachineValues: int,        # number of distinct machine values
             consumedCumulativeCIs: seq[int],
             consumedReifCIs: seq[int],
@@ -1682,9 +1683,9 @@ proc translate*(model: FznModel): FznTranslator =
                 if dom.len > 0:
                     maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
             else:
-                # Fixed machine — need to figure out which from the cumulative pattern
+                # Fixed machine — use value determined during pattern detection
                 machinePositions.add(-1)
-                fixedMachines.add(0)  # Will be inferred from domain
+                fixedMachines.add(mminfo.fixedMachineValues[t])
                 let dom = result.sys.baseArray.domain[startPos]
                 if dom.len > 0:
                     maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
