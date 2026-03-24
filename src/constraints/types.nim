@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp
+import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap
 
 ################################################################################
 # Shared constraint type definitions
@@ -41,7 +41,8 @@ type
         DisjunctiveClauseType,
         ValueSupportType,
         MultiResourceNoOverlapType,
-        CircuitTimePropType
+        CircuitTimePropType,
+        MultiMachineNoOverlapType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -140,3 +141,5 @@ type
                 multiResourceNoOverlapState*: MultiResourceNoOverlapConstraint[T]
             of CircuitTimePropType:
                 circuitTimePropState*: CircuitTimePropConstraint[T]
+            of MultiMachineNoOverlapType:
+                multiMachineNoOverlapState*: MultiMachineNoOverlapConstraint[T]

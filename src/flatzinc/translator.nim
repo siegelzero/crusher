@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -464,6 +464,16 @@ type
         hasSearchAnnotation*: bool
         # Orphan → annotated variable mapping (built before translateVariables, applied after)
         orphanToAnnotatedMap*: seq[(string, string)]
+        # Multi-machine no-overlap pattern detection
+        multiMachineNoOverlapInfos*: seq[tuple[
+            startVarNames: seq[string],   # per-task start time var names
+            durations: seq[int],          # per-task constant durations
+            machineVarNames: seq[string], # per-task machine assignment var names
+            numMachineValues: int,        # number of distinct machine values
+            consumedCumulativeCIs: seq[int],
+            consumedReifCIs: seq[int],
+            consumedBool2intCIs: seq[int],
+            consumedVarNames: seq[string]]]  # intermediate vars to suppress
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]
@@ -870,6 +880,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Runs before detectReifChannels so that identity-channeled vars (e.g. L[i+1]) are known
     # as channels when reif detection processes bool_eq_reif using them as inputs.
     result.detectBoolXorConstResultChannels()
+    # Detect multi-machine no-overlap pattern (cumulative limit=1 with reified machine heights)
+    # MUST run before detectReifChannels to prevent bool2int/int_eq_reif channelization
+    result.detectMultiMachineNoOverlap()
     # Detect orphan search variables (non-annotated) — records mapping for later channel creation.
     # Runs before detectReifChannels so reification channels on orphan positions are still created.
     result.detectOrphanSearchVariables()
@@ -1641,6 +1654,60 @@ proc translate*(model: FznModel): FznTranslator =
 
     if result.conditionalCumulativeInfos.len > 0:
         stderr.writeLine(&"[FZN] Built {result.conditionalCumulativeInfos.len} ConditionalCumulative constraints")
+
+    # Build MultiMachineNoOverlap constraints from detected patterns
+    for mminfo in result.multiMachineNoOverlapInfos:
+        var startPositions: seq[int]
+        var machinePositions: seq[int]
+        var fixedMachines: seq[int]
+        var allResolved = true
+        var maxTime = 0
+        for t in 0..<mminfo.startVarNames.len:
+            let startPos = if mminfo.startVarNames[t] != "":
+                result.varPositions.getOrDefault(mminfo.startVarNames[t], -1) else: -1
+            if startPos < 0:
+                allResolved = false
+                break
+            startPositions.add(startPos)
+            # Machine position
+            if mminfo.machineVarNames[t] != "":
+                let machPos = result.varPositions.getOrDefault(mminfo.machineVarNames[t], -1)
+                if machPos < 0:
+                    allResolved = false
+                    break
+                machinePositions.add(machPos)
+                fixedMachines.add(-1)
+                # Estimate maxTime from start domain
+                let dom = result.sys.baseArray.domain[startPos]
+                if dom.len > 0:
+                    maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
+            else:
+                # Fixed machine — need to figure out which from the cumulative pattern
+                machinePositions.add(-1)
+                fixedMachines.add(0)  # Will be inferred from domain
+                let dom = result.sys.baseArray.domain[startPos]
+                if dom.len > 0:
+                    maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
+
+        if not allResolved: continue
+
+        let c = newMultiMachineNoOverlapConstraint[int](
+            startPositions, machinePositions, fixedMachines,
+            mminfo.durations, mminfo.numMachineValues, maxTime)
+
+        var positions = initPackedSet[int]()
+        for t in 0..<startPositions.len:
+            positions.incl(startPositions[t])
+            if machinePositions[t] >= 0:
+                positions.incl(machinePositions[t])
+
+        result.sys.addConstraint(StatefulConstraint[int](
+            positions: positions,
+            stateType: MultiMachineNoOverlapType,
+            multiMachineNoOverlapState: c))
+
+    if result.multiMachineNoOverlapInfos.len > 0:
+        stderr.writeLine(&"[FZN] Built {result.multiMachineNoOverlapInfos.len} MultiMachineNoOverlap constraints")
 
     # Build ConditionalDayCapacity constraints
     for cdcinfo in result.conditionalDayCapacityInfos:

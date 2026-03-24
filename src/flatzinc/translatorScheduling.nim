@@ -3234,3 +3234,233 @@ proc detectMultiResourceNoOverlapPairs*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Detected {tr.multiResourceNoOverlapInfos.len} multi-resource no-overlap pairs " &
                                           &"(from {totalClauses} bool_clause constraints)")
 
+
+proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
+    ## Detect the multi-machine no-overlap pattern:
+    ## Multiple fzn_cumulative constraints with limit=1 sharing start/duration arrays,
+    ## where heights are bool2int(int_eq_reif(machineVar, machineValue)).
+    ## Replaces N cumulatives + O(N*M) reification channels with a single constraint.
+
+    # Step 1: Build defines_var lookup: output_varname → constraint index
+    var definesVarMap: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                definesVarMap[ann.args[0].ident] = ci
+
+    # Step 2: Find all fzn_cumulative constraints with constant limit=1
+    type CumulativeInfo = object
+        ci: int
+        startArrayElems: seq[FznExpr]
+        durationValues: seq[int]
+        heightArrayElems: seq[FznExpr]
+
+    var cumulatives: seq[CumulativeInfo]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["fzn_cumulative", "fzn_cumulatives"]: continue
+        # Check limit = 1
+        if con.args[3].kind != FznIntLit or con.args[3].intVal != 1: continue
+        # Get duration values (must be constant)
+        var durations: seq[int]
+        try:
+            durations = tr.resolveIntArray(con.args[1])
+        except CatchableError:
+            continue
+        # Get start and height array elements
+        let startElems = tr.resolveVarArrayElems(con.args[0])
+        let heightElems = tr.resolveVarArrayElems(con.args[2])
+        if startElems.len == 0 or heightElems.len == 0: continue
+        if startElems.len != durations.len or heightElems.len != durations.len: continue
+        cumulatives.add(CumulativeInfo(ci: ci, startArrayElems: startElems,
+                                        durationValues: durations, heightArrayElems: heightElems))
+
+    if cumulatives.len < 2: return
+
+    # Step 3: Group cumulatives by (start array, duration values)
+    # Two cumulatives are in the same group if they have the same start var names and duration values
+    type GroupKey = object
+        startVarNames: seq[string]
+        durations: seq[int]
+
+    proc getGroupKey(info: CumulativeInfo): GroupKey =
+        var names: seq[string]
+        for e in info.startArrayElems:
+            if e.kind == FznIdent: names.add(e.ident)
+            else: names.add($e.intVal)
+        GroupKey(startVarNames: names, durations: info.durationValues)
+
+    var groups: Table[seq[string], seq[int]]  # key = startVarNames ++ durationStrs → indices into cumulatives
+    for i, info in cumulatives:
+        let key = info.getGroupKey()
+        let keyStr = key.startVarNames & key.durations.mapIt($it)
+        if keyStr notin groups:
+            groups[keyStr] = @[]
+        groups[keyStr].add(i)
+
+    # Step 4: For each group with 2+ cumulatives, trace heights back to machine vars
+    for keyStr, indices in groups:
+        if indices.len < 2: continue
+        let nTasks = cumulatives[indices[0]].startArrayElems.len
+
+        # For each cumulative in the group, trace each height element
+        # Expected pattern: height = bool2int(bool) where bool = int_eq_reif(machineVar, value)
+        # Build: machineVarNames[task] (should be same across all cumulatives)
+        #        machineValue[cumIdx] (different for each cumulative)
+        var machineVarNames: seq[string]  # per-task
+        var machineValues: seq[int]       # per-cumulative
+        var allBool2intCIs: seq[int]
+        var allReifCIs: seq[int]
+        var allIntermediateVars: seq[string]
+        var patternValid = true
+        machineVarNames = newSeq[string](nTasks)
+        var machineVarInited = newSeq[bool](nTasks)
+
+        for groupIdx, cumIdx in indices:
+            let info = cumulatives[cumIdx]
+            var thisMachineValue = -1
+            var thisMachineValueSet = false
+
+            for t in 0..<nTasks:
+                let hElem = info.heightArrayElems[t]
+
+                if hElem.kind == FznIntLit:
+                    # Constant height: 0 (task can't be on this machine) or 1 (task fixed to this machine)
+                    # For constant 0, skip
+                    # For constant 1, this means the task is always on this machine — consistent with fixed machine
+                    continue
+
+                if hElem.kind != FznIdent:
+                    patternValid = false
+                    break
+
+                let heightVar = hElem.ident
+
+                # Trace: heightVar → bool2int(boolVar, heightVar)
+                if heightVar notin definesVarMap:
+                    patternValid = false
+                    break
+                let b2iCi = definesVarMap[heightVar]
+                let b2iCon = tr.model.constraints[b2iCi]
+                if stripSolverPrefix(b2iCon.name) != "bool2int":
+                    patternValid = false
+                    break
+                if b2iCon.args[1].kind != FznIdent or b2iCon.args[1].ident != heightVar:
+                    patternValid = false
+                    break
+                let boolVar = if b2iCon.args[0].kind == FznIdent: b2iCon.args[0].ident else: ""
+                if boolVar == "":
+                    patternValid = false
+                    break
+
+                # Trace: boolVar → int_eq_reif(machineVar, machineValue, boolVar)
+                if boolVar notin definesVarMap:
+                    patternValid = false
+                    break
+                let reifCi = definesVarMap[boolVar]
+                let reifCon = tr.model.constraints[reifCi]
+                if stripSolverPrefix(reifCon.name) != "int_eq_reif":
+                    patternValid = false
+                    break
+                if reifCon.args[2].kind != FznIdent or reifCon.args[2].ident != boolVar:
+                    patternValid = false
+                    break
+                # Extract machine variable and machine value
+                if reifCon.args[0].kind != FznIdent or reifCon.args[1].kind != FznIntLit:
+                    patternValid = false
+                    break
+                let machineVar = reifCon.args[0].ident
+                let machineVal = reifCon.args[1].intVal
+
+                # Check consistency: all tasks in all cumulatives should reference the same machineVar set
+                if machineVarInited[t]:
+                    if machineVarNames[t] != machineVar:
+                        patternValid = false
+                        break
+                else:
+                    machineVarNames[t] = machineVar
+                    machineVarInited[t] = true
+
+                # All height elements in one cumulative should have the same machine value
+                if thisMachineValueSet:
+                    if machineVal != thisMachineValue:
+                        patternValid = false
+                        break
+                else:
+                    thisMachineValue = machineVal
+                    thisMachineValueSet = true
+
+                allBool2intCIs.add(b2iCi)
+                allReifCIs.add(reifCi)
+                allIntermediateVars.add(heightVar)
+                allIntermediateVars.add(boolVar)
+
+            if not patternValid: break
+            if not thisMachineValueSet:
+                patternValid = false
+                break
+            machineValues.add(thisMachineValue)
+
+        if not patternValid: continue
+
+        # Verify all tasks have machine vars assigned (or are fixed-machine tasks)
+        # Tasks without a machineVarName are fixed to a specific machine
+        var startVarNames: seq[string]
+        var taskDurations: seq[int]
+        for t in 0..<nTasks:
+            let sElem = cumulatives[indices[0]].startArrayElems[t]
+            if sElem.kind == FznIdent:
+                startVarNames.add(sElem.ident)
+            else:
+                startVarNames.add("")
+            taskDurations.add(cumulatives[indices[0]].durationValues[t])
+
+        # Compute number of machine values (for sizing machineCosts array)
+        var maxMachineVal = 0
+        for v in machineValues:
+            if v > maxMachineVal: maxMachineVal = v
+        # Also check machine var domains via varDomainIndex
+        for t in 0..<nTasks:
+            if machineVarNames[t] != "" and machineVarNames[t] in tr.varDomainIndex:
+                let di = tr.varDomainIndex[machineVarNames[t]]
+                let decl = tr.model.variables[di]
+                case decl.varType.kind
+                of FznIntRange:
+                    if decl.varType.hi > maxMachineVal: maxMachineVal = decl.varType.hi
+                of FznIntSet:
+                    for v in decl.varType.values:
+                        if v > maxMachineVal: maxMachineVal = v
+                else: discard
+
+        # Consume the cumulative constraints
+        var consumedCumulativeCIs: seq[int]
+        for cumIdx in indices:
+            consumedCumulativeCIs.add(cumulatives[cumIdx].ci)
+            tr.definingConstraints.incl(cumulatives[cumIdx].ci)
+        # Consume the bool2int and int_eq_reif constraints
+        for ci in allBool2intCIs:
+            tr.definingConstraints.incl(ci)
+        for ci in allReifCIs:
+            tr.definingConstraints.incl(ci)
+        # Mark intermediate vars as defined (not to create positions)
+        for varName in allIntermediateVars:
+            tr.definedVarNames.incl(varName)
+
+        tr.multiMachineNoOverlapInfos.add((
+            startVarNames: startVarNames,
+            durations: taskDurations,
+            machineVarNames: machineVarNames,
+            numMachineValues: maxMachineVal + 1,
+            consumedCumulativeCIs: consumedCumulativeCIs,
+            consumedReifCIs: allReifCIs,
+            consumedBool2intCIs: allBool2intCIs,
+            consumedVarNames: allIntermediateVars))
+
+        stderr.writeLine(&"[FZN] Detected multi-machine no-overlap: " &
+            &"{nTasks} tasks × {indices.len} machines " &
+            &"(consuming {consumedCumulativeCIs.len} cumulatives, " &
+            &"{allReifCIs.len} int_eq_reif, {allBool2intCIs.len} bool2int)")
+

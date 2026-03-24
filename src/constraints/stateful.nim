@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap, circuitTimeProp
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -302,6 +302,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "MultiResourceNoOverlap Constraint"
         of CircuitTimePropType:
             return "CircuitTimeProp Constraint"
+        of MultiMachineNoOverlapType:
+            return "MultiMachineNoOverlap Constraint"
 
 ################################################################################
 # Evaluation
@@ -375,6 +377,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.multiResourceNoOverlapState.cost
         of CircuitTimePropType:
             return constraint.circuitTimePropState.cost
+        of MultiMachineNoOverlapType:
+            return constraint.multiMachineNoOverlapState.cost
 
 ################################################################################
 # Computed Constraints
@@ -996,6 +1000,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.multiResourceNoOverlapState.initialize(assignment)
         of CircuitTimePropType:
             constraint.circuitTimePropState.initialize(assignment)
+        of MultiMachineNoOverlapType:
+            constraint.multiMachineNoOverlapState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1066,6 +1072,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.multiResourceNoOverlapState.moveDelta(position, oldValue, newValue)
         of CircuitTimePropType:
             constraint.circuitTimePropState.moveDelta(position, oldValue, newValue)
+        of MultiMachineNoOverlapType:
+            constraint.multiMachineNoOverlapState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1136,6 +1144,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.multiResourceNoOverlapState.updatePosition(position, newValue)
         of CircuitTimePropType:
             constraint.circuitTimePropState.updatePosition(position, newValue)
+        of MultiMachineNoOverlapType:
+            constraint.multiMachineNoOverlapState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1181,6 +1191,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.conditionalDayCapacityState.getAffectedPositions()
         of MultiResourceNoOverlapType:
             return constraint.multiResourceNoOverlapState.getAffectedPositions()
+        of MultiMachineNoOverlapType:
+            return constraint.multiMachineNoOverlapState.getAffectedPositions()
         of GlobalCardinalityType:
             return constraint.globalCardinalityState.getAffectedPositions()
         else:
@@ -1801,6 +1813,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: CircuitTimePropType,
                 circuitTimePropState: constraint.circuitTimePropState.deepCopy()
+            )
+        of MultiMachineNoOverlapType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: MultiMachineNoOverlapType,
+                multiMachineNoOverlapState: constraint.multiMachineNoOverlapState.deepCopy()
             )
 
 

@@ -22,3 +22,4 @@ tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.
 table_layout_small,2023/table-layout/TableLayout.mzn,2023/table-layout/p1000_m3_r100_c10.dzn,minimize,10000,3814,20000
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
 work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,3000
+test_sched_t20m10r10,2023/test-scheduling/test-scheduling.mzn,2023/test-scheduling/t20m10r10-17.dzn,minimize,10000,1069,1200
