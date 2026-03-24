@@ -7225,8 +7225,9 @@ proc detectBoolXorConstResultChannels*(tr: var FznTranslator) =
     ## - bool_xor(a, b, false) → a = b → identity channel: target = element(source, [0, 1])
     ## - bool_xor(a, b, true) → a = NOT b → negation channel: target = element(source, [1, 0])
     ##
-    ## MUST run AFTER detectBoolXorVarChannels and detectReifChannels so channelVarNames
-    ## is populated.
+    ## MUST run AFTER detectBoolXorVarChannels so channelVarNames is populated.
+    ## Runs BEFORE detectReifChannels so that identity-channeled vars are known
+    ## as channels when reif detection processes bool_eq_reif using them as inputs.
     var nIdentity = 0
     var nNegation = 0
     for ci, con in tr.model.constraints:

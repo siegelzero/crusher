@@ -2506,6 +2506,77 @@ solve minimize obj;
     let rVal = tr.sys.assignment[rPos]
     check rVal == (if aVal != bVal: 1 else: 0)
 
+  test "bool_xor constant-result identity channel: bool_xor(channel, var, false)":
+    # When r = a XOR b (channel via defines_var), and bool_xor(r, t, false) with no
+    # defines_var means r = t → t becomes an identity channel of r.
+    let src = """
+var bool: a;
+var bool: b;
+var bool: r:: var_is_introduced:: is_defined_var;
+var bool: t;
+var 0..1: obj:: output_var:: is_defined_var;
+constraint bool_xor(a, b, r):: defines_var(r);
+constraint bool_xor(r, t, false);
+constraint bool2int(t, obj):: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # r detected as XOR var channel, t detected as identity channel of r
+    check "r" in tr.channelVarNames
+    check "t" in tr.channelVarNames
+    check tr.boolXorVarChannelDefs.len == 1
+    check tr.boolXorIdentityDefs.len == 1
+    check tr.boolXorIdentityDefs[0].resultVar == "t"
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let aPos = tr.varPositions["a"]
+    let bPos = tr.varPositions["b"]
+    let rPos = tr.varPositions["r"]
+    let tPos = tr.varPositions["t"]
+    let aVal = tr.sys.assignment[aPos]
+    let bVal = tr.sys.assignment[bPos]
+    let rVal = tr.sys.assignment[rPos]
+    let tVal = tr.sys.assignment[tPos]
+    check rVal == (if aVal != bVal: 1 else: 0)
+    check tVal == rVal  # identity: t = r
+
+  test "bool_xor constant-result negation channel: bool_xor(channel, var, true)":
+    # When r = a XOR b (channel via defines_var), and bool_xor(r, t, true) with no
+    # defines_var means r != t → t becomes a negation channel of r.
+    let src = """
+var bool: a;
+var bool: b;
+var bool: r:: var_is_introduced:: is_defined_var;
+var bool: t;
+var 0..1: obj:: output_var:: is_defined_var;
+constraint bool_xor(a, b, r):: defines_var(r);
+constraint bool_xor(r, t, true);
+constraint bool2int(t, obj):: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # r detected as XOR var channel, t detected as negation channel of r
+    check "r" in tr.channelVarNames
+    check "t" in tr.channelVarNames
+    check tr.boolXorVarChannelDefs.len == 1
+    check tr.boolXorNegDefs.len >= 1  # t is a negation def
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let aPos = tr.varPositions["a"]
+    let bPos = tr.varPositions["b"]
+    let rPos = tr.varPositions["r"]
+    let tPos = tr.varPositions["t"]
+    let aVal = tr.sys.assignment[aPos]
+    let bVal = tr.sys.assignment[bPos]
+    let rVal = tr.sys.assignment[rPos]
+    let tVal = tr.sys.assignment[tPos]
+    check rVal == (if aVal != bVal: 1 else: 0)
+    check tVal == 1 - rVal  # negation: t = NOT r
+
   test "array_bool_xor constraint fallback (no defines_var)":
     # array_bool_xor without defines_var: XOR of all elements must be true
     let src = """
