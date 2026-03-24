@@ -4898,15 +4898,63 @@ proc findMinimizedVarNames*(tr: FznTranslator): HashSet[string] =
                 result.incl(v.ident)
         break
 
+proc findForcedLargeVarNames*(tr: FznTranslator): HashSet[string] =
+    ## Finds objective variables that the solver prefers to be LARGE.
+    ## Making these max channels (= minimum feasible value) would fight the objective.
+    ## For Minimize: variables with same-sign coefficient as objective (increasing them decreases obj).
+    ## For Maximize: variables with opposite-sign coefficient (increasing them increases obj).
+    ## For Satisfy: empty set.
+    if tr.model.solve.kind == Satisfy: return
+    if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent: return
+    let objName = tr.model.solve.objective.ident
+
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        if ann.args[0].ident != objName: continue
+        # Found the objective defining constraint
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if coeffs.len != varElems.len: continue
+        var objIdx = -1
+        for i, v in varElems:
+            if v.kind == FznIdent and v.ident == objName:
+                objIdx = i
+                break
+        if objIdx < 0: continue
+        let objCoeff = coeffs[objIdx]
+        for i, v in varElems:
+            if i == objIdx: continue
+            if v.kind != FznIdent: continue
+            let forcedLarge = case tr.model.solve.kind
+                of Minimize:
+                    # Same sign as objCoeff → increasing var decreases objective → want large
+                    (objCoeff > 0 and coeffs[i] > 0) or (objCoeff < 0 and coeffs[i] < 0)
+                of Maximize:
+                    # Opposite sign to objCoeff → increasing var increases objective → want large
+                    (objCoeff > 0 and coeffs[i] < 0) or (objCoeff < 0 and coeffs[i] > 0)
+                of Satisfy:
+                    false
+            if forcedLarge:
+                result.incl(v.ident)
+        break
+
 proc detectMaxFromLinLe*(tr: var FznTranslator) =
     ## Detects max-from-lin-le patterns:
     ## Multiple int_lin_le([1,-1], [source, ceiling], -offset) encode ceiling >= source + offset.
-    ## When the ceiling variable is minimized, it equals max(source_i + offset_i).
+    ## When the ceiling variable is not forced-large by the objective, it equals max(source_i + offset_i).
     ## Makes ceiling a max channel, eliminating all those constraints.
-    if tr.model.solve.kind != Minimize: return
+    ##
+    ## For non-objective ceilings: max channels with many inputs provide sparse penalty signal
+    ## (only the argmax source affects the ceiling), so we limit group size. Objective-connected
+    ## ceilings get direct signal through the objective expression regardless of input count.
+    const MaxNonObjectiveCeilingInputs = 50
 
+    var forcedLargeVarNames = tr.findForcedLargeVarNames()
     var minimizedVarNames = tr.findMinimizedVarNames()
-    if minimizedVarNames.len == 0: return
 
     # Scan all unconsumed int_lin_le constraints.
     # Group by ceiling variable (negative coefficient).
@@ -4954,11 +5002,18 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
             groups[ceilingName] = @[]
         groups[ceilingName].add((sourceVar: sourceName, offset: offset, ci: ci))
 
-    # Build MaxFromLinLeDefs for groups of size >= 3 where ceiling is minimized
+    # Build MaxFromLinLeDefs for groups of size >= 3 where ceiling is safe to channel.
+    # Non-objective ceilings with many inputs give sparse signal through max channels,
+    # since only the argmax source affects the ceiling value. Keep explicit constraints
+    # for those — they provide per-source penalty feedback.
     var totalConsumed = 0
     for ceilingName, infos in groups:
         if infos.len < 3: continue
-        if ceilingName notin minimizedVarNames: continue
+        if ceilingName in forcedLargeVarNames: continue
+        if ceilingName in tr.definedVarNames: continue
+        if ceilingName in tr.channelVarNames: continue
+        if ceilingName notin minimizedVarNames and infos.len > MaxNonObjectiveCeilingInputs:
+            continue
 
         var def = MaxFromLinLeDef(ceilingVarName: ceilingName)
         for info in infos:

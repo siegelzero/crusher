@@ -1262,8 +1262,8 @@ solve minimize objective;
         let dVal = tr.sys.assignment[tr.varPositions["D"]]
         check dVal == 12
 
-    test "detectMaxFromLinLe: not detected for satisfy problems":
-        ## The pattern should only activate for minimize problems.
+    test "detectMaxFromLinLe: detected for satisfy problems":
+        ## Satisfy has no objective preference, so ceiling is safe to channel.
         let src = """
 var 1..20: y1 :: output_var;
 var 1..20: y2 :: output_var;
@@ -1277,12 +1277,12 @@ solve satisfy;
         let model = parseFzn(src)
         var tr = translate(model)
 
-        check tr.maxFromLinLeDefs.len == 0
-        check "D" notin tr.channelVarNames
+        check tr.maxFromLinLeDefs.len == 1
+        check "D" in tr.channelVarNames
 
-    test "detectMaxFromLinLe: not detected when ceiling is not minimized":
+    test "detectMaxFromLinLe: detected when ceiling is not in objective":
         ## D does not appear in the objective at all — only Z does.
-        ## Pattern should not match because D is not a minimized variable.
+        ## D is not forced-large, so it's safe to channel as max.
         let src = """
 var 1..20: y1 :: output_var;
 var 1..20: y2 :: output_var;
@@ -1299,9 +1299,8 @@ solve minimize objective;
         let model = parseFzn(src)
         var tr = translate(model)
 
-        # D is not in the objective, so it's not a minimized variable
-        check tr.maxFromLinLeDefs.len == 0
-        check "D" notin tr.channelVarNames
+        check tr.maxFromLinLeDefs.len == 1
+        check "D" in tr.channelVarNames
 
     test "detectMaxFromLinLe: group too small (2 constraints) is not detected":
         ## Need at least 3 int_lin_le constraints to qualify.
@@ -1428,6 +1427,71 @@ solve minimize objective;
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
         let dVal = tr.sys.assignment[tr.varPositions["D"]]
         check dVal == 13
+
+    test "detectMaxFromLinLe: not detected when ceiling is forced-large in minimize":
+        ## objective = Z - D, so minimizing wants D large (same-sign coeff as objective).
+        ## Max channel would force D to minimum feasible, fighting the objective.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var 1..50: Z :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_eq([1,1,-1],[objective,D,Z],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D has same-sign coeff as objective → forced-large → not detected
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" notin tr.channelVarNames
+
+    test "detectMaxFromLinLe: not detected when ceiling is forced-large in maximize":
+        ## objective = D + Z, maximizing wants D large (opposite-sign coeff to objective).
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var 1..50: Z :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_eq([1,-1,-1],[objective,D,Z],0) :: defines_var(objective);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D has opposite-sign coeff to objective in maximize → forced-large → not detected
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" notin tr.channelVarNames
+
+    test "detectMaxFromLinLe: not detected when ceiling is already a defined var":
+        ## D is defined by int_lin_eq with defines_var → already has a defining expression.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: x :: output_var;
+var 1..50: D :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_eq([2,-1],[x,D],0) :: defines_var(D);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" in tr.definedVarNames
 
 suite "FlatZinc Diffn Time Profile Tightening":
 

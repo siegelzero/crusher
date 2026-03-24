@@ -19,6 +19,11 @@ const BatchLazyMax* = 10000  # Lazy positions with domain <= this use batch eval
 ################################################################################
 
 type
+    InitStrategy* = enum
+        isRandom     ## Uniform random from domain (default)
+        isDomainMin  ## Minimum domain value — helps sum <= K feasibility
+        isDomainMax  ## Maximum domain value — helps sum >= K feasibility
+
     # Profiling stats per constraint type
     ConstraintProfile* = object
         calls*: int64
@@ -886,7 +891,15 @@ proc balanceBinarySums[T](state: TabuState[T]) =
         for pos in positions:
             fixed.incl(pos)
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], forRelinking: bool = false) =
+proc initStrategyForPopulation*(id, populationSize: int): InitStrategy =
+    ## Assigns init strategies to population members.
+    ## id 0: domain min, id 1: domain max (if population >= 3), rest: random.
+    if populationSize >= 3:
+        if id == 0: return isDomainMin
+        if id == 1: return isDomainMax
+    isRandom
+
+proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false) =
     state.id = id
     state.carray = carray
     # Use shared domain pointer if available (parallel path), otherwise own copy (sequential path)
@@ -990,7 +1003,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # Inverse group positions are initialized below as involutions
             state.assignment[pos] = state.sharedDomain[][pos][0]
         else:
-            state.assignment[pos] = sample(state.sharedDomain[][pos])
+            let dom = state.sharedDomain[][pos]
+            case initStrategy
+            of isRandom: state.assignment[pos] = sample(dom)
+            of isDomainMin: state.assignment[pos] = dom[0]
+            of isDomainMax: state.assignment[pos] = dom[^1]
 
     # Generate random involutions for inverse group positions
     if initialAssignment.len == 0 and carray.inverseGroups.len > 0:
@@ -2304,9 +2321,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
              " groups, members: " & state.partitionGroups.mapIt($it.searchPositions.len).join("/")
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0): TabuState[T] =
+proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom): TabuState[T] =
     new(result)
-    result.init(carray, verbose, id)
+    result.init(carray, verbose, id, initStrategy = initStrategy)
 
 proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)

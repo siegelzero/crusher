@@ -43,6 +43,7 @@ type
     InitPool[T] = object
         carrays: ptr UncheckedArray[ConstrainedArray[T]]
         results: ptr UncheckedArray[TabuState[T]]
+        strategies: ptr UncheckedArray[InitStrategy]
         nextTaskIndex: Atomic[int]
         totalTasks: int
         verbose: bool
@@ -61,7 +62,8 @@ proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
                 break
             try:
                 pool.results[idx] = newTabuState[T](pool.carrays[idx],
-                    verbose = pool.verbose and idx == 0, id = idx)
+                    verbose = pool.verbose and idx == 0, id = idx,
+                    initStrategy = pool.strategies[idx])
             except CatchableError as e:
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Error on state " & $idx & ": " & e.msg)
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
@@ -465,13 +467,19 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     for i in 0..<populationSize:
         carrays[i] = templateArray.deepCopy()
 
+    # Assign init strategies: state 0 = min, state 1 = max, rest = random
+    var strategies = newSeq[InitStrategy](populationSize)
+    for i in 0..<populationSize:
+        strategies[i] = initStrategyForPopulation(i, populationSize)
+
     # Initialize TabuStates in parallel using work-stealing pool.
     # Workers grab the next state to init via atomic counter — no batch boundaries.
-    # SAFETY: population and carrays are pre-allocated to final size above and never
-    # resized, so UncheckedArray access via indices remains valid through joinThreads.
+    # SAFETY: population, carrays, and strategies are pre-allocated to final size above
+    # and never resized, so UncheckedArray access via indices remains valid through joinThreads.
     var initPool = InitPool[T](
         carrays: cast[ptr UncheckedArray[ConstrainedArray[T]]](addr carrays[0]),
         results: cast[ptr UncheckedArray[TabuState[T]]](addr population[0]),
+        strategies: cast[ptr UncheckedArray[InitStrategy]](addr strategies[0]),
         totalTasks: populationSize,
         verbose: verbose
     )
