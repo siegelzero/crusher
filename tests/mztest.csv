@@ -23,3 +23,4 @@ table_layout_small,2023/table-layout/TableLayout.mzn,2023/table-layout/p1000_m3_
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
 work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,3000
 test_sched_t20m10r10,2023/test-scheduling/test-scheduling.mzn,2023/test-scheduling/t20m10r10-17.dzn,minimize,10000,1069,1200
+accap_a4_f30_t15,2022/accap/accap.mzn,2022/accap/accap_a4_f30_t15.json,minimize,10000,103,200

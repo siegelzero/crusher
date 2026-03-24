@@ -5137,7 +5137,7 @@ proc detectSpreadPattern*(tr: var FznTranslator) =
         spreadGroups[spreadVar].add((posVar: posVar, negVar: otherNegVar, rhs: rhs, ci: ci))
 
     # Validate and build SpreadPatternDefs
-    var totalConsumed = 0
+    var totalRetained = 0
     for spreadVarName, infos in spreadGroups:
         if infos.len < 3: continue
 
@@ -5177,16 +5177,15 @@ proc detectSpreadPattern*(tr: var FznTranslator) =
         for info in infos:
             def.consumedCIs.add(info.ci)
 
-        # Mark consumed constraint indices
-        for ci in def.consumedCIs:
-            tr.definingConstraints.incl(ci)
-        totalConsumed += def.consumedCIs.len
+        # Keep all pairwise constraints for gradient signal in tabu search.
+        # Channel replacement loses per-pair gradient, degrading search quality.
+        totalRetained += def.consumedCIs.len
 
         # Do NOT mark spread var as channel — it stays as a search variable
         tr.spreadPatternDefs.add(def)
 
     if tr.spreadPatternDefs.len > 0:
-        stderr.writeLine(&"[FZN] Detected {tr.spreadPatternDefs.len} spread patterns, consumed {totalConsumed} int_lin_le constraints")
+        stderr.writeLine(&"[FZN] Detected {tr.spreadPatternDefs.len} spread patterns ({totalRetained} pairwise constraints retained)")
 
 proc emitSpreadPatternChannels*(tr: var FznTranslator) =
     ## Emits max/min channel bindings + simple constraint for each spread pattern.
@@ -5249,7 +5248,7 @@ proc emitSpreadPatternChannels*(tr: var FznTranslator) =
         tr.sys.addConstraint(topExpr - botExpr <= spreadExpr)
 
         inc nEmitted
-        stderr.writeLine(&"[FZN] Spread pattern '{def.spreadVarName}': replaced {def.consumedCIs.len} pairwise constraints with max/min channels + 1 constraint over {def.sourceVarNames.len} sources")
+        stderr.writeLine(&"[FZN] Spread pattern '{def.spreadVarName}': added max/min channels + 1 constraint over {def.sourceVarNames.len} sources ({def.consumedCIs.len} pairwise constraints retained)")
 
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] Emitted {nEmitted} spread pattern channel groups")
@@ -5503,6 +5502,90 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
 
     if iteration > 1:
         stderr.writeLine(&"[FZN] Max channel bounds: {iteration} fixpoint iterations")
+
+proc tightenSpreadFromDiffnProfile*(tr: var FznTranslator) =
+    ## For each spread pattern group whose sources overlap with a constant-x diffn's
+    ## y-variables, compute the group-only time profile to derive a lower bound on S.
+    ## At peak time t, active group rectangles require sum(dy) vertical units
+    ## non-overlapping, so spread >= groupMaxLoad - 1.
+    if tr.spreadPatternDefs.len == 0: return
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_diffn": continue
+        if con.args.len < 4: continue
+
+        # Try to resolve x, dx, dy as constant arrays
+        let xVals = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let dxVals = try: tr.resolveIntArray(con.args[2]) except ValueError, KeyError: continue
+        let dyVals = try: tr.resolveIntArray(con.args[3]) except ValueError, KeyError: continue
+
+        if xVals.len != dxVals.len or xVals.len != dyVals.len: continue
+        if xVals.len == 0: continue
+
+        # Build yName → rectangle index map
+        let yElems = tr.resolveVarArrayElems(con.args[1])
+        if yElems.len != xVals.len: continue
+        var yNameToIdx: Table[string, int]
+        for i, elem in yElems:
+            if elem.kind == FznIdent:
+                yNameToIdx[elem.ident] = i
+
+        # For each spread pattern, compute group-only time profile
+        for def in tr.spreadPatternDefs:
+            if def.spreadVarName notin tr.varPositions: continue
+
+            # Map spread sources to diffn rectangle indices, verifying offset = dy - 1
+            type GroupRect = tuple[xStart, xEnd, dy: int]
+            var groupRects: seq[GroupRect]
+            var offsetMatchesDy = true
+            for srcIdx, srcName in def.sourceVarNames:
+                if srcName in yNameToIdx:
+                    let rectIdx = yNameToIdx[srcName]
+                    if def.offsets[srcIdx] != dyVals[rectIdx] - 1:
+                        offsetMatchesDy = false
+                        break
+                    groupRects.add((xStart: xVals[rectIdx],
+                                    xEnd: xVals[rectIdx] + dxVals[rectIdx],
+                                    dy: dyVals[rectIdx]))
+
+            if not offsetMatchesDy: continue
+            if groupRects.len < 2: continue
+
+            # Compute group-only time profile via sweep-line
+            type Event = tuple[time, delta: int]
+            var events: seq[Event]
+            for r in groupRects:
+                events.add((time: r.xStart, delta: r.dy))
+                events.add((time: r.xEnd, delta: -r.dy))
+            events.sort(proc(a, b: Event): int =
+                result = cmp(a.time, b.time)
+                if result == 0:
+                    result = cmp(a.delta, b.delta)
+            )
+
+            var groupMaxLoad = 0
+            var currentLoad = 0
+            for ev in events:
+                currentLoad += ev.delta
+                groupMaxLoad = max(groupMaxLoad, currentLoad)
+
+            if groupMaxLoad <= 1: continue
+
+            let spreadLB = groupMaxLoad - 1
+            let spreadPos = tr.varPositions[def.spreadVarName]
+            let currentDom = tr.sys.baseArray.domain[spreadPos]
+            if currentDom.len == 0: continue
+            if currentDom[0] >= spreadLB: continue  # already tight enough
+
+            var newDom: seq[int]
+            for v in currentDom:
+                if v >= spreadLB:
+                    newDom.add(v)
+            if newDom.len > 0 and newDom.len < currentDom.len:
+                tr.sys.baseArray.setDomain(spreadPos, newDom)
+                stderr.writeLine(&"[FZN] Spread time profile: tightened '{def.spreadVarName}' domain from {currentDom.len} to {newDom.len} values (>= {spreadLB}, groupMaxLoad={groupMaxLoad})")
 
 proc detectBoolAndChannels*(tr: var FznTranslator) =
     ## Detects bool_clause([b], [c1, ..., cn]) where:

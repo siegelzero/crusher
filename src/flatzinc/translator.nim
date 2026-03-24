@@ -843,9 +843,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectCountPatterns()
     # Detect max-from-lin-le patterns (ceiling >= source + offset → max channel)
     result.detectMaxFromLinLe()
-    # NOTE: detectSpreadPattern is intentionally NOT called here.
-    # It removes pairwise int_lin_le constraints that provide useful gradient information
-    # for tabu search. The max/min channel replacement loses per-pair penalty signals.
+    # Detect spread patterns (pairwise constraints retained for gradient;
+    # pattern info used for domain tightening only, no runtime channels)
+    result.detectSpreadPattern()
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
     # Detect value-support patterns (bool_clause + int_eq_reif + int_le_reif → native constraint)
@@ -1018,11 +1018,14 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit max channels for detected max-from-lin-le patterns
     if result.maxFromLinLeDefs.len > 0:
         result.emitMaxFromLinLeChannels()
-    # NOTE: emitSpreadPatternChannels intentionally not called (see detection note above)
+    # Spread channels not emitted: the channel cascade overhead and gradient loss
+    # outweigh the constraint reduction benefit. Pairwise constraints retained.
     # Tighten domains from diffn time profile analysis
     result.tightenDiffnTimeProfile()
     # Bidirectional ceiling/source domain tightening for max-from-lin-le patterns
     result.tightenMaxFromLinLeBounds()
+    # Tighten spread variable domains from group-specific diffn time profile analysis
+    result.tightenSpreadFromDiffnProfile()
     # Prune admission domains using zero-capacity day detection
     result.pruneZeroCapacityDays()
     # Build set of variable names that are inputs to min/max channels.
