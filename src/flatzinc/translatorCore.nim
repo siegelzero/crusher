@@ -840,6 +840,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_div":
         # int_div(x, y, z) means z = x div y (integer division, rounding towards zero)
+        # Channel cases (variable X, constant C) are handled by detectIntDivChannels.
         # For non-negative x and positive constant y:
         #   z * y <= x  and  x <= z * y + (y - 1)
         # For local search with variable y, fall back to approximate equality z * y == x

@@ -669,6 +669,158 @@ solve satisfy;
     check xVal mod 4 == 3
     check xVal in [3, 7, 11]
 
+suite "FlatZinc int_div Channel Bindings":
+
+  test "int_div with direct variable origin":
+    ## int_div(X, 3, Z) where X is a direct variable.
+    ## Z should become a channel: Z = X div 3.
+    let src = """
+var 0..8: x :: output_var;
+var 0..2: z :: output_var;
+constraint int_div(x, 3, z);
+constraint int_eq(x, 7);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal == 7
+    check zVal == 2  # 7 div 3 = 2
+
+  test "int_div with defined-var origin":
+    ## int_div(Y, 10, Z) where Y is defined by int_lin_eq as Y = X + 5.
+    let src = """
+var 0..90: x :: output_var;
+var 5..95: y :: var_is_introduced :: is_defined_var;
+var 0..9: z :: output_var;
+constraint int_lin_eq([-1,1],[x,y],5) :: defines_var(y);
+constraint int_div(y, 10, z);
+constraint int_eq(x, 42);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal == 42
+    # y = 42 + 5 = 47, z = 47 div 10 = 4
+    check zVal == 4
+
+  test "int_div channel propagates through cascade":
+    ## int_div defines Z as channel of X. A constraint on Z should
+    ## guide the solver to pick the right X value.
+    ## X in 0..19, Z = X div 5, constraint Z == 3.
+    ## Valid X values: 15, 16, 17, 18, 19.
+    let src = """
+var 0..19: x :: output_var;
+var 0..3: z :: output_var;
+constraint int_div(x, 5, z);
+constraint int_eq(z, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check zVal == 3
+    check xVal div 5 == 3
+    check xVal >= 15 and xVal <= 19
+
+  test "int_div tautological (result always 0)":
+    ## int_div(X, 1000, Z) where X in 0..900 → Z always 0.
+    ## Z should be a channel fixed to 0.
+    let src = """
+var 0..900: x :: output_var;
+var 0..0: z :: output_var;
+constraint int_div(x, 1000, z);
+constraint int_eq(x, 500);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    check "z" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check xVal == 500
+    check zVal == 0  # 500 div 1000 = 0
+
+suite "FlatZinc implication propagation":
+
+  test "bool_clause implication chain propagation":
+    ## a=1 is fixed, a→b, b→c should propagate to fix b=1 and c=1.
+    let src = """
+var 0..1: a :: output_var;
+var 0..1: b :: output_var;
+var 0..1: c :: output_var;
+var 0..1: d :: output_var;
+constraint int_eq(a, 1);
+constraint bool_clause([b],[a]);
+constraint bool_clause([c],[b]);
+constraint bool_clause([d],[c]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let aVal = tr.sys.assignment[tr.varPositions["a"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let cVal = tr.sys.assignment[tr.varPositions["c"]]
+    let dVal = tr.sys.assignment[tr.varPositions["d"]]
+    check aVal == 1
+    check bVal == 1
+    check cVal == 1
+    check dVal == 1
+
+  test "bool_clause contrapositive propagation":
+    ## d=0 is fixed, a→b, b→c, c→d.
+    ## Contrapositive: d=0 → c=0 → b=0 → a=0.
+    let src = """
+var 0..1: a :: output_var;
+var 0..1: b :: output_var;
+var 0..1: c :: output_var;
+var 0..1: d :: output_var;
+constraint int_eq(d, 0);
+constraint bool_clause([b],[a]);
+constraint bool_clause([c],[b]);
+constraint bool_clause([d],[c]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let aVal = tr.sys.assignment[tr.varPositions["a"]]
+    let bVal = tr.sys.assignment[tr.varPositions["b"]]
+    let cVal = tr.sys.assignment[tr.varPositions["c"]]
+    let dVal = tr.sys.assignment[tr.varPositions["d"]]
+    check dVal == 0
+    check cVal == 0
+    check bVal == 0
+    check aVal == 0
+
 suite "FlatZinc array_set_element":
 
   test "array_set_element with constant set array":

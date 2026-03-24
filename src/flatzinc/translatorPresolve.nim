@@ -855,6 +855,71 @@ proc resolveReifications(tr: FznTranslator,
                                 result = true
                             break
 
+        # --- int_div(x, y, z): z = x div y ---
+        elif name == "int_div" and con.args.len >= 3:
+            let xArg = con.args[0]
+            let yArg = con.args[1]
+            let zArg = con.args[2]
+
+            if yArg.kind == FznIntLit and yArg.intVal > 0:
+                let cVal = yArg.intVal
+                # Forward propagation: tighten Z's domain from X's domain bounds
+                let xName = presolveVarName(xArg)
+                let zName = presolveVarName(zArg)
+                if xName != "" and xName in domains and zName != "" and zName in domains:
+                    let xDom = domains[xName]
+                    if xDom.len > 0:
+                        let zLo = xDom[0] div cVal
+                        let zHi = xDom[^1] div cVal
+                        let zMin = min(zLo, zHi)
+                        let zMax = max(zLo, zHi)
+                        var newZDom: seq[int]
+                        for v in domains[zName]:
+                            if v >= zMin and v <= zMax:
+                                newZDom.add(v)
+                        if newZDom.len < domains[zName].len:
+                            if newZDom.len == 0:
+                                infeasible = true
+                            else:
+                                domains[zName] = newZDom
+                                result = true
+                # Reverse propagation: tighten X's domain from Z's domain
+                if not infeasible and xName != "" and xName in domains and zName != "" and zName in domains:
+                    let zDom = domains[zName]
+                    if zDom.len > 0:
+                        # X must be in [z*C, z*C + C-1] for some z in zDom
+                        let xMin = zDom[0] * cVal
+                        let xMax = zDom[^1] * cVal + cVal - 1
+                        var newXDom: seq[int]
+                        for v in domains[xName]:
+                            if v >= xMin and v <= xMax:
+                                newXDom.add(v)
+                        if newXDom.len < domains[xName].len:
+                            if newXDom.len == 0:
+                                infeasible = true
+                            else:
+                                domains[xName] = newXDom
+                                result = true
+                # Elimination: if both fully fixed
+                if not infeasible:
+                    let xFixed = tr.presolveIsFixed(xArg, fixedVars)
+                    let zFixed = zName != "" and zName in domains and domains[zName].len == 1
+                    if xFixed and zFixed and con.canEliminate:
+                        eliminated.incl(ci)
+                        result = true
+            elif tr.presolveIsFixed(xArg, fixedVars) and tr.presolveIsFixed(yArg, fixedVars):
+                let xVal = tr.presolveResolve(xArg, fixedVars)
+                let yVal = tr.presolveResolve(yArg, fixedVars)
+                if yVal != 0:
+                    let zVal = xVal div yVal
+                    let zName = presolveVarName(zArg)
+                    if zName != "" and zName in domains:
+                        if presolveTightenDomain(domains, zName, @[zVal], infeasible):
+                            result = true
+                    if not infeasible and con.canEliminate:
+                        eliminated.incl(ci)
+                        result = true
+
         # --- bool_clause(pos, neg): OR(pos) v OR(NOT neg) ---
         elif name == "bool_clause" and con.args.len >= 2:
             if con.args[0].kind == FznArrayLit and con.args[1].kind == FznArrayLit:
@@ -906,6 +971,178 @@ proc resolveReifications(tr: FznTranslator,
                 elif unfixedPos.len + unfixedNeg.len == 0:
                     # All literals false — infeasible
                     infeasible = true
+
+proc implicationPropagate(tr: FznTranslator,
+                          domains: var Table[string, seq[int]],
+                          fixedVars: var Table[string, int],
+                          eliminated: var PackedSet[int],
+                          infeasible: var bool): bool =
+    ## Builds an implication graph from bool_clause constraints and performs
+    ## BFS propagation from fixed boolean variables.
+    ##
+    ## Pattern: bool_clause([b], [a]) means a → b (if a=1 then b=1).
+    ## When a is fixed to 1, we can immediately fix b to 1, and transitively
+    ## propagate through all downstream implications in a single BFS pass.
+    ##
+    ## This is much more effective than iterative unit propagation for long
+    ## implication chains (common in dominance, reification decompositions).
+    result = false
+
+    # Phase 1: Build implication graph from simple implications (pos=1, neg=1)
+    # bool_clause([b], [a]) = a → b (positive implication: a=1 forces b=1)
+    # bool_clause([a], [b]) with a fixed false and b unfixed is handled by unit prop
+    type ImplEdge = object
+        target: string
+        ci: int  # constraint index for potential elimination
+    var posImplGraph: Table[string, seq[ImplEdge]]  # a=1 → b=1
+    var negImplGraph: Table[string, seq[ImplEdge]]  # a=0 → b=0 (from bool_clause([], [a, b]))
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+
+        let posElems = con.args[0].elems
+        let negElems = con.args[1].elems
+
+        if posElems.len == 1 and negElems.len == 1:
+            # bool_clause([b], [a]) → a=1 implies b=1
+            let aName = presolveVarName(negElems[0])
+            let bName = presolveVarName(posElems[0])
+            if aName != "" and bName != "" and aName != bName:
+                if aName notin posImplGraph:
+                    posImplGraph[aName] = @[]
+                posImplGraph[aName].add(ImplEdge(target: bName, ci: ci))
+
+        elif posElems.len == 0 and negElems.len == 2:
+            # bool_clause([], [a, b]) → NOT(a) OR NOT(b) → a=1 implies b=0
+            let aName = presolveVarName(negElems[0])
+            let bName = presolveVarName(negElems[1])
+            if aName != "" and bName != "" and aName != bName:
+                if aName notin negImplGraph:
+                    negImplGraph[aName] = @[]
+                negImplGraph[aName].add(ImplEdge(target: bName, ci: ci))
+                if bName notin negImplGraph:
+                    negImplGraph[bName] = @[]
+                negImplGraph[bName].add(ImplEdge(target: aName, ci: ci))
+
+    if posImplGraph.len == 0 and negImplGraph.len == 0:
+        return false
+
+    # Phase 2: BFS propagation from variables fixed to 1 (positive implications)
+    var queue: seq[string]
+    var visited: HashSet[string]
+
+    # Seed with all boolean variables currently fixed to 1
+    for name, val in fixedVars:
+        if val == 1 and name in posImplGraph:
+            queue.add(name)
+            visited.incl(name)
+    for name, dom in domains:
+        if dom == @[1] and name notin visited and name in posImplGraph:
+            queue.add(name)
+            visited.incl(name)
+
+    var qi = 0
+    while qi < queue.len:
+        let src = queue[qi]
+        inc qi
+        if src in posImplGraph:
+            for edge in posImplGraph[src]:
+                let tgt = edge.target
+                if tgt in domains:
+                    if domains[tgt] != @[1]:
+                        if domains[tgt] == @[0]:
+                            # a=1 but b must be 0 — contradiction
+                            infeasible = true
+                            return true
+                        domains[tgt] = @[1]
+                        fixedVars[tgt] = 1
+                        result = true
+                    # Continue propagation from newly fixed target
+                    if tgt notin visited:
+                        visited.incl(tgt)
+                        queue.add(tgt)
+
+    if infeasible: return
+
+    # Phase 3: BFS propagation from variables fixed to 1 (negative implications)
+    # a=1 → b=0 (from NAND clauses)
+    visited.clear()
+    queue.setLen(0)
+    qi = 0
+
+    for name, val in fixedVars:
+        if val == 1 and name in negImplGraph:
+            queue.add(name)
+            visited.incl(name)
+    for name, dom in domains:
+        if dom == @[1] and name notin visited and name in negImplGraph:
+            queue.add(name)
+            visited.incl(name)
+
+    while qi < queue.len:
+        let src = queue[qi]
+        inc qi
+        if src in negImplGraph:
+            for edge in negImplGraph[src]:
+                let tgt = edge.target
+                if tgt in domains:
+                    if domains[tgt] != @[0]:
+                        if domains[tgt] == @[1]:
+                            # a=1 but a→NOT(b), b already 1 — contradiction
+                            infeasible = true
+                            return true
+                        domains[tgt] = @[0]
+                        fixedVars[tgt] = 0
+                        result = true
+                    # A var fixed to 0 can trigger positive implications via bool_clause([a],[b])
+                    # where b is now 0 — but that's handled by unit propagation, not here
+
+    if infeasible: return
+
+    # Phase 4: Propagation from variables fixed to 0.
+    # For positive implications, if b is fixed to 0 and we have a → b,
+    # this means a must be 0 (contrapositive). Build reverse graph for this.
+    visited.clear()
+    queue.setLen(0)
+    qi = 0
+
+    # Build reverse positive implication graph: b → a (contrapositive: b=0 → a=0)
+    var revPosGraph: Table[string, seq[string]]
+    for src, edges in posImplGraph:
+        for edge in edges:
+            if edge.target notin revPosGraph:
+                revPosGraph[edge.target] = @[]
+            revPosGraph[edge.target].add(src)
+
+    for name, val in fixedVars:
+        if val == 0 and name in revPosGraph:
+            queue.add(name)
+            visited.incl(name)
+    for name, dom in domains:
+        if dom == @[0] and name notin visited and name in revPosGraph:
+            queue.add(name)
+            visited.incl(name)
+
+    while qi < queue.len:
+        let src = queue[qi]
+        inc qi
+        if src in revPosGraph:
+            for tgt in revPosGraph[src]:
+                if tgt in domains:
+                    if domains[tgt] != @[0]:
+                        if domains[tgt] == @[1]:
+                            infeasible = true
+                            return true
+                        domains[tgt] = @[0]
+                        fixedVars[tgt] = 0
+                        result = true
+                    if tgt notin visited:
+                        visited.incl(tgt)
+                        queue.add(tgt)
 
 proc cpmBoundsPropagate(tr: FznTranslator,
                         domains: var Table[string, seq[int]],
@@ -2183,6 +2420,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 3: Resolve reifications (highest impact for FZN models)
         if resolveReifications(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 3b: Implication transitive propagation (BFS through bool_clause chains)
+        if implicationPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 

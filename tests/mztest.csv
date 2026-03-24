@@ -10,12 +10,13 @@ chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maxim
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
 mrcpsp_j30_25_5,2023/mrcpsp/mrcpsp.mzn,2023/mrcpsp/j30_25_5.dzn,minimize,10000,27,50
 pennies_n5,2023/pennies-opt/pennies.mzn,2023/pennies-opt/n5.dzn,maximize,10000,1,5
-roster_shifts_bool_small,2023/roster-shifts-bool/bool-model.mzn,2023/roster-shifts-bool/small.dzn,maximize,10000,1,5281
+roster_chicroster_10,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_10.dzn,minimize,10000,18,18
 roster_chicroster_8,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_8.dzn,minimize,10000,7,7
 roster_chicroster_9,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_9.dzn,minimize,10000,13,13
-roster_chicroster_10,2023/roster/roster_model.mzn,2023/roster/chicroster_dataset_10.dzn,minimize,10000,18,18
+roster_shifts_bool_small,2023/roster-shifts-bool/bool-model.mzn,2023/roster-shifts-bool/small.dzn,maximize,10000,1,5281
 table_layout_small,2023/table-layout/TableLayout.mzn,2023/table-layout/p1000_m3_r100_c10.dzn,minimize,10000,3814,20000
 test_sched_t20m10r10,2023/test-scheduling/test-scheduling.mzn,2023/test-scheduling/t20m10r10-17.dzn,minimize,10000,1069,1200
+ttp_n10_k3,2023/travelling-thief/ttp.mzn,2023/travelling-thief/data/n10_k3_c5000_l10000_u10100_r46.dzn,maximize,10000,1454500,1454500
 
 groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86

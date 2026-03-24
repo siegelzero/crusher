@@ -1331,6 +1331,53 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
 
+    # Compute maxNetDelta for RelationalType constraints to enable slack-based
+    # getAffectedPositions optimization. For inequality constraints (<=, >=),
+    # if the slack doesn't change enough, penalty map entries are unchanged.
+    block:
+        var nComputed = 0
+        for constraint in state.constraints:
+            if constraint.stateType != RelationalType: continue
+            let rc = constraint.relationalState
+            if rc.relation notin {LessThanEq, GreaterThanEq, LessThan, GreaterThan}: continue
+            # Compute max |leftDelta - rightDelta| for any single position flip
+            var maxDelta: T = 0
+            for pos in rc.positions.items:
+                let domain = state.sharedDomain[][pos]
+                if domain.len < 2: continue
+                let dMin = domain[0]
+                let dMax = domain[^1]
+                let dRange = dMax - dMin
+                if dRange <= 0: continue
+                # Get coefficient in left and right expressions
+                var leftCoeff: T = 0
+                var rightCoeff: T = 0
+                if pos in rc.leftExpr.positions:
+                    case rc.leftExpr.kind
+                    of SumExpr:
+                        if rc.leftExpr.sumExpr.evalMethod == PositionBased:
+                            leftCoeff = rc.leftExpr.sumExpr.coefficient.getOrDefault(pos, T(0))
+                        else: leftCoeff = T(1)  # conservative
+                    of ConstantExpr: discard
+                    else: leftCoeff = T(1)  # conservative for non-sum
+                if pos in rc.rightExpr.positions:
+                    case rc.rightExpr.kind
+                    of SumExpr:
+                        if rc.rightExpr.sumExpr.evalMethod == PositionBased:
+                            rightCoeff = rc.rightExpr.sumExpr.coefficient.getOrDefault(pos, T(0))
+                        else: rightCoeff = T(1)
+                    of ConstantExpr: discard
+                    else: rightCoeff = T(1)
+                let netCoeff = abs(leftCoeff - rightCoeff)
+                let posMaxDelta = netCoeff * dRange
+                if posMaxDelta > maxDelta:
+                    maxDelta = posMaxDelta
+            if maxDelta > 0 and maxDelta < high(T) div 2:
+                rc.maxNetDelta = int(maxDelta)
+                inc nComputed
+        if nComputed > 0 and verbose and id == 0:
+            echo "[Init] Computed maxNetDelta for " & $nComputed & " inequality constraints"
+
     if verbose and id == 0:
         echo "[Init] Initialized constraints in " & $(epochTime() - initStart) & "s"
         initStart = epochTime()

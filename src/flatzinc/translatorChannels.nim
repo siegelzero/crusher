@@ -1129,6 +1129,34 @@ proc buildIntModChannelBindings(tr: var FznTranslator) =
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} int_mod channel bindings")
 
+proc buildIntDivChannelBindings(tr: var FznTranslator) =
+    ## Builds element channel bindings for int_div channels (Z = X div C).
+    ## Uses precomputed lookup tables from detectIntDivChannels.
+    var nBuilt = 0
+    for def in tr.intDivChannelDefs:
+        if def.varName notin tr.varPositions:
+            continue
+        let channelPos = tr.varPositions[def.varName]
+
+        # Resolve origin variable: may be a position or a defined-var expression
+        var indexExpr: AlgebraicExpression[int]
+        if def.originVar in tr.varPositions:
+            indexExpr = tr.getExpr(tr.varPositions[def.originVar]) - def.offset
+        elif def.originVar in tr.definedVarExprs:
+            indexExpr = tr.definedVarExprs[def.originVar] - def.offset
+        else:
+            continue
+
+        var arrayElems: seq[ArrayElement[int]]
+        for v in def.lookupTable:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
+
+        tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
+        inc nBuilt
+
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} int_div channel bindings")
+
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
     ## constraints with defines_var annotations. Must be called after buildDefinedExpressions

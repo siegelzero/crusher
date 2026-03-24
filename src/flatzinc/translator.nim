@@ -334,6 +334,8 @@ type
         syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
         # int_mod channel defs: Z = X mod C implemented as element channel with lookup table
         intModChannelDefs*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int], offset: int]]
+        # int_div channel defs: Z = X div C implemented as element channel with lookup table
+        intDivChannelDefs*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int], offset: int]]
         # Singleton set channel defs: set_card(S,1) + set_in(x, S) → S.bools = indicator(x)
         singletonSetChannelDefs*: seq[tuple[setName: string, xVarName: string, cardCI: int, inCI: int]]
         # Detected weighted same-value pattern for objective
@@ -837,6 +839,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectNetFlowPairs()
     # Detect int_mod channel patterns (Z = X mod C → element channel)
     result.detectIntModChannels()
+    # Detect int_div channel patterns (Z = X div C → element channel)
+    result.detectIntDivChannels()
     # Detect conditional count_eq patterns (int_lin_eq → bool2int → array_bool_and → int_eq_reif × 2)
     result.detectConditionalCountPatterns()
     # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
@@ -1924,6 +1928,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildSyntheticElementChannelBindings()
     # Build channel bindings for int_mod channels (Z = X mod C → element lookup)
     result.buildIntModChannelBindings()
+    # Build channel bindings for int_div channels (Z = X div C → element lookup)
+    result.buildIntDivChannelBindings()
     # Build channel bindings for singleton set booleans (S.bools = indicator(x))
     result.buildSingletonSetChannelBindings()
     # Build channel bindings for int_eq_reif/bool2int/bool_eq_reif reification channels
@@ -2233,3 +2239,11 @@ proc translate*(model: FznModel): FznTranslator =
             wsvPairs.add((posA: posA, posB: posB, coeff: pair.coeff))
         result.weightedSameValueExpr = newWeightedSameValueExpression[int](
             wsvPairs, result.weightedSameValueConstant)
+
+    # Tighten objective bounds via knapsack LP relaxation.
+    # When the objective is a linear sum over binary variables and there's a
+    # knapsack constraint (int_lin_le with positive weights over the same binary vars),
+    # the LP relaxation (greedy fractional knapsack) gives a tight bound.
+    if result.model.solve.kind in {Minimize, Maximize} and
+       (result.objectivePos >= 0 or result.objectivePos == ObjPosDefinedExpr):
+        result.tightenObjectiveBoundsKnapsack()

@@ -6549,6 +6549,58 @@ proc detectIntModChannels(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} int_mod channel bindings")
 
+proc detectIntDivChannels(tr: var FznTranslator) =
+    ## Detects int_div(X, C, Z) where X is a variable and C is a positive constant.
+    ## These can be implemented as element channel bindings with a precomputed
+    ## lookup table: Z = table[X - xLo] where table[i] = (xLo + i) div C.
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_div": continue
+
+        let xArg = con.args[0]
+        let yArg = con.args[1]
+        let zArg = con.args[2]
+
+        # Only handle: variable X, constant C, variable Z
+        if yArg.kind != FznIntLit: continue
+        if xArg.kind != FznIdent: continue
+        if zArg.kind != FznIdent: continue
+
+        let cVal = yArg.intVal
+        if cVal <= 0: continue  # div by non-positive is degenerate
+
+        let xDomain = tr.lookupVarDomain(xArg.ident)
+        if xDomain.len == 0: continue
+
+        let xLo = xDomain[0]  # domains are sorted, first element is min
+        let xHi = xDomain[^1]
+
+        # Skip if lookup table would be too large
+        if xHi - xLo + 1 > 100_000: continue
+
+        # Build lookup table: for each value in xLo..xHi, compute v div C
+        # Nim's div truncates toward zero, matching FlatZinc int_div semantics
+        var lookupTable: seq[int]
+        for v in xLo..xHi:
+            lookupTable.add(v div cVal)
+
+        # Mark Z as a channel variable
+        tr.channelVarNames.incl(zArg.ident)
+        tr.definedVarNames.excl(zArg.ident)
+        tr.definingConstraints.incl(ci)
+
+        tr.intDivChannelDefs.add((
+            varName: zArg.ident,
+            originVar: xArg.ident,
+            lookupTable: lookupTable,
+            offset: xLo))
+
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} int_div channel bindings")
+
 proc detectSingletonSetChannels(tr: var FznTranslator) =
     ## Detects set_card(S, 1) + set_in(x, S) where x is a variable.
     ## Makes S.bools into indicator channels: S.bools[e] = (x == e) ? 1 : 0.
@@ -7743,3 +7795,164 @@ proc detectBool2intIdentityAliases(tr: var FznTranslator) =
 
     if nAliased > 0:
         stderr.writeLine(&"[FZN] Bool2int identity aliases: {nAliased} channel positions eliminated")
+
+proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
+    ## Tightens objective bounds using knapsack LP relaxation.
+    ##
+    ## When the objective is a linear sum over binary (0/1) variables and a
+    ## knapsack constraint (int_lin_le with positive weights) exists over a
+    ## subset of the same variables, the LP relaxation gives a tight upper
+    ## bound (maximize) or lower bound (minimize).
+    ##
+    ## LP relaxation: sort items by profit/weight ratio, greedily pack
+    ## integer items, then fractionally add the next item. This runs in
+    ## O(n log n) and provides a bound that can be orders of magnitude
+    ## tighter than the declared domain.
+
+    if tr.model.solve.kind notin {Minimize, Maximize}: return
+    let isMaximize = tr.model.solve.kind == Maximize
+
+    # Step 1: Find the int_lin_eq that defines the objective variable.
+    # Pattern: int_lin_eq(coeffs, vars, rhs) :: defines_var(objective)
+    # where one var is the objective with coefficient -1 (or 1).
+    let objVarName = if tr.model.solve.objective != nil and
+                        tr.model.solve.objective.kind == FznIdent:
+                       tr.model.solve.objective.ident
+                     else: ""
+    if objVarName == "": return
+
+    var objCoeffs: Table[string, int]  # variable name -> coefficient in objective
+    var objConstant = 0
+    var objFound = false
+
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.args.len < 3: continue
+        if not con.hasAnnotation("defines_var"): continue
+
+        let coeffsArr = tr.resolveIntArray(con.args[0])
+        let varsArr = tr.resolveVarArrayElems(con.args[1])
+        let rhs = tr.resolveIntArg(con.args[2])
+        if coeffsArr.len != varsArr.len: continue
+
+        # Find the objective variable in this constraint
+        var objIdx = -1
+        for vi, v in varsArr:
+            if v.kind == FznIdent and v.ident == objVarName:
+                objIdx = vi
+                break
+        if objIdx < 0: continue
+
+        let objCoeff = coeffsArr[objIdx]
+        if abs(objCoeff) != 1: continue
+
+        # obj = (rhs - sum(other_coeffs * vars)) / objCoeff
+        for vi, v in varsArr:
+            if vi == objIdx: continue
+            if v.kind != FznIdent: continue
+            let c = if objCoeff == 1: -coeffsArr[vi] else: coeffsArr[vi]
+            objCoeffs[v.ident] = c
+        objConstant = if objCoeff == 1: rhs else: -rhs
+        objFound = true
+        break
+
+    if not objFound or objCoeffs.len == 0: return
+
+    # Step 2: Check that all objective variables are binary (domain {0,1}).
+    # Use presolveDomains if available (post-presolve), fall back to FZN domain.
+    var allBinary = true
+    for varName in objCoeffs.keys:
+        var dom: seq[int]
+        if varName in tr.presolveDomains:
+            dom = tr.presolveDomains[varName]
+        else:
+            dom = tr.lookupVarDomain(varName)
+        if dom.len == 0 or dom.len > 2 or dom[0] < 0 or dom[^1] > 1:
+            allBinary = false
+            break
+    if not allBinary: return
+
+    # Step 3: Find knapsack constraints in the FZN model.
+    # Pattern: int_lin_le(weights, vars, capacity) where all weights > 0 and
+    # vars are a subset of the binary objective variables.
+    type KnapsackInfo = object
+        weights: Table[string, int]  # var name -> weight
+        capacity: int
+
+    var knapsacks: seq[KnapsackInfo]
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        let coeffsArr = tr.resolveIntArray(con.args[0])
+        let varsArr = tr.resolveVarArrayElems(con.args[1])
+        let rhs = tr.resolveIntArg(con.args[2])
+        if coeffsArr.len != varsArr.len: continue
+
+        var valid = true
+        var ks: KnapsackInfo
+        ks.capacity = rhs
+
+        for vi, v in varsArr:
+            if v.kind != FznIdent:
+                valid = false; break
+            if coeffsArr[vi] <= 0:
+                valid = false; break
+            if v.ident notin objCoeffs:
+                valid = false; break
+            ks.weights[v.ident] = coeffsArr[vi]
+        if not valid or ks.weights.len < 3 or ks.capacity <= 0: continue
+        knapsacks.add(ks)
+
+    if knapsacks.len == 0: return
+
+    # Step 4: For each knapsack, compute LP relaxation bound.
+    for ks in knapsacks:
+        type Item = tuple[ratio: float, profit, weight: int]
+        var items: seq[Item]
+        for varName, weight in ks.weights:
+            let profit = objCoeffs[varName]
+            items.add((ratio: float(profit) / float(weight), profit: profit, weight: weight))
+
+        if items.len == 0: continue
+
+        if isMaximize:
+            # Sort by profit/weight ratio descending
+            items.sort(proc(a, b: Item): int =
+                if b.ratio > a.ratio: 1
+                elif b.ratio < a.ratio: -1
+                else: 0
+            )
+
+            var totalWeight = 0
+            var totalProfit = 0
+            var lpBound = 0.0
+            var allFit = true
+            for item in items:
+                if item.profit <= 0: continue  # skip non-profitable items
+                if totalWeight + item.weight <= ks.capacity:
+                    totalWeight += item.weight
+                    totalProfit += item.profit
+                else:
+                    let remaining = ks.capacity - totalWeight
+                    lpBound = float(totalProfit) + float(item.profit) * float(remaining) / float(item.weight)
+                    allFit = false
+                    break
+            if allFit:
+                lpBound = float(totalProfit)
+
+            # Non-knapsack objective vars can take their best value
+            var nonKsContrib = 0
+            for varName, coeff in objCoeffs:
+                if varName notin ks.weights:
+                    nonKsContrib += max(0, coeff)
+
+            let upperBound = int(lpBound) + nonKsContrib + objConstant
+            if upperBound < tr.objectiveHiBound:
+                stderr.writeLine(&"[FZN] Knapsack LP relaxation tightened objective upper bound: {tr.objectiveHiBound} → {upperBound}")
+                tr.objectiveHiBound = upperBound
+
+        else:  # Minimize — skip for now (less common pattern)
+            discard
