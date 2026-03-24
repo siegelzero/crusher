@@ -3324,7 +3324,7 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             condVarName: condVar,
             sourceArrayName: commonArrayName,
             sourceMap: sourceMap,
-            condDomMin: condDom[0]))
+            condDomMin: min(condDom)))
         inc nTargets
 
     stderr.writeLine(&"[FZN] Conditional-source channels: {nTargets} targets" &
@@ -4342,8 +4342,8 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
             let learnedPos = learnedPositions[t]
             let learnedDom = tr.sys.baseArray.domain[learnedPos]
             if learnedDom.len == 0: continue
-            let lo = learnedDom[0]
-            let hi = learnedDom[^1]
+            let lo = min(learnedDom)
+            let hi = max(learnedDom)
 
             let eqPos = tr.sys.baseArray.len
             let eqVar = tr.sys.newConstrainedVariable()
@@ -5347,8 +5347,8 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
                     let yPos = tr.varPositions[yElems[i].ident]
                     let yDom = tr.sys.baseArray.domain[yPos]
                     if yDom.len > 0:
-                        cr.yLo = yDom[0]
-                        cr.yHi = yDom[^1]
+                        cr.yLo = min(yDom)
+                        cr.yHi = max(yDom)
                         # Compulsory part: [latest_start, earliest_end)
                         cr.compStart = cr.yHi        # latest start
                         cr.compEnd = cr.yLo + cr.dy   # earliest end
@@ -5458,7 +5458,7 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
             let ceilingPos = tr.varPositions[def.ceilingVarName]
             let ceilingDom = tr.sys.baseArray.domain[ceilingPos]
             if ceilingDom.len == 0: continue
-            let maxCeiling = ceilingDom[^1]
+            let maxCeiling = max(ceilingDom)
 
             # Phase 1: Tighten source upper bounds from ceiling max
             # y_i + offset_i <= D, so y_i <= max(dom(D)) - offset_i
@@ -5468,7 +5468,7 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
                 let srcDom = tr.sys.baseArray.domain[srcPos]
                 if srcDom.len == 0: continue
                 let upperBound = maxCeiling - def.offsets[i]
-                if srcDom[^1] <= upperBound: continue
+                if max(srcDom) <= upperBound: continue
                 var newDom: seq[int]
                 for v in srcDom:
                     if v <= upperBound:
@@ -5487,10 +5487,10 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
                 let srcPos = tr.varPositions[srcName]
                 let srcDom = tr.sys.baseArray.domain[srcPos]
                 if srcDom.len == 0: continue
-                let lb = srcDom[0] + def.offsets[i]
+                let lb = min(srcDom) + def.offsets[i]
                 if lb > minCeiling:
                     minCeiling = lb
-            if minCeiling > ceilingDom[0]:
+            if minCeiling > min(ceilingDom):
                 var newDom: seq[int]
                 for v in ceilingDom:
                     if v >= minCeiling:
@@ -5577,7 +5577,7 @@ proc tightenSpreadFromDiffnProfile*(tr: var FznTranslator) =
             let spreadPos = tr.varPositions[def.spreadVarName]
             let currentDom = tr.sys.baseArray.domain[spreadPos]
             if currentDom.len == 0: continue
-            if currentDom[0] >= spreadLB: continue  # already tight enough
+            if min(currentDom) >= spreadLB: continue  # already tight enough
 
             var newDom: seq[int]
             for v in currentDom:
