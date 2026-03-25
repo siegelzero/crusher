@@ -1968,6 +1968,62 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
             else:
                 result[resultVar] = if linSum != rhs: 1 else: 0
             changed = true
+        # Evaluate int_times/int_div/int_abs/int_mod/int_plus with defines_var
+        for ci, con in tr.model.constraints:
+            if ci notin tr.definingConstraints: continue
+            let cname = stripSolverPrefix(con.name)
+            if cname notin ["int_times", "int_div", "int_abs", "int_mod", "int_plus"]: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let defIdx = if cname == "int_abs": 1 else: 2
+            if con.args[defIdx].kind != FznIdent: continue
+            let definedName = con.args[defIdx].ident
+            if definedName in result: continue
+            var aVal, bVal: int
+            case con.args[0].kind
+            of FznIntLit: aVal = con.args[0].intVal
+            of FznIdent:
+                if con.args[0].ident in result: aVal = result[con.args[0].ident]
+                else: continue
+            else: continue
+            if cname != "int_abs":
+                case con.args[1].kind
+                of FznIntLit: bVal = con.args[1].intVal
+                of FznIdent:
+                    if con.args[1].ident in result: bVal = result[con.args[1].ident]
+                    else: continue
+                else: continue
+            case cname
+            of "int_times": result[definedName] = aVal * bVal
+            of "int_div": result[definedName] = if bVal == 0: 0 else: aVal div bVal
+            of "int_mod": result[definedName] = if bVal == 0: 0 else: aVal mod bVal
+            of "int_plus": result[definedName] = aVal + bVal
+            of "int_abs": result[definedName] = abs(aVal)
+            else: discard
+            changed = true
+        # Evaluate expression channel defs (int_div/int_mod/int_plus detected as channels)
+        for def in tr.expressionChannelDefs:
+            if def.varName in result: continue
+            let con = tr.model.constraints[def.ci]
+            let cname = stripSolverPrefix(con.name)
+            var aVal, bVal: int
+            case con.args[0].kind
+            of FznIntLit: aVal = con.args[0].intVal
+            of FznIdent:
+                if con.args[0].ident in result: aVal = result[con.args[0].ident]
+                else: continue
+            else: continue
+            case con.args[1].kind
+            of FznIntLit: bVal = con.args[1].intVal
+            of FznIdent:
+                if con.args[1].ident in result: bVal = result[con.args[1].ident]
+                else: continue
+            else: continue
+            case cname
+            of "int_div": result[def.varName] = if bVal == 0: 0 else: aVal div bVal
+            of "int_mod": result[def.varName] = if bVal == 0: 0 else: aVal mod bVal
+            of "int_plus": result[def.varName] = aVal + bVal
+            else: discard
+            changed = true
         # Evaluate case analysis channel defs
         for def in tr.caseAnalysisDefs:
             if def.targetVarName in result: continue
@@ -2030,6 +2086,22 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             if con.args[0].kind != FznIdent: continue
             let condVal = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
             neReifMap[resultVar] = (condVar: con.args[0].ident, condVal: condVal)
+
+    # Step 1a: Also pick up int_eq_reif :: defines_var entries where the test value is
+    # a defined variable (these were skipped by detectReifChannels because defined vars
+    # don't have positions, but they're still useful for case analysis pattern matching).
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif" or not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let resultVar = con.args[2].ident
+        if resultVar in eqReifMap: continue  # already handled by reifChannelDefs
+        if con.args[0].kind != FznIdent: continue
+        # Check that valArg is a defined variable (the reason it was skipped earlier)
+        if con.args[1].kind != FznIdent: continue
+        if con.args[1].ident notin tr.definedVarNames: continue
+        eqReifMap[resultVar] = (sourceVar: con.args[0].ident, testVal: con.args[1])
 
     # Step 1b: Build linEqReifMap from int_lin_eq_reif :: defines_var constraints.
     # These encode: sum(coeffs[i]*vars[i]) == rhs <-> bool, allowing us to solve for
@@ -2180,6 +2252,28 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
         if def.canonicalVar in neReifMap and def.aliasVar notin neReifMap:
             neReifMap[def.aliasVar] = neReifMap[def.canonicalVar]
 
+    # Step 1g: Build map from array_bool_and results to their eq_reif/lin_eq_reif component.
+    # When a bool_clause uses an AND result as a positive literal, we "see through" it to
+    # extract the value consequence (eq_reif or lin_eq_reif) wrapped inside the AND.
+    # Pattern: array_bool_and([guard1, guard2, ..., eq_or_lin_reif], and_result)
+    var andToEqReifs: Table[string, seq[string]]   # and_result → [eq_reif_vars inside the AND]
+    var andToLinReifs: Table[string, seq[string]]  # and_result → [lin_eq_reif_vars inside the AND]
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let cname = stripSolverPrefix(con.name)
+        if cname != "array_bool_and": continue
+        if con.args.len < 2: continue
+        let elems = tr.resolveVarArrayElems(con.args[0])
+        if con.args[1].kind != FznIdent: continue
+        let andResult = con.args[1].ident
+        # Collect all eq_reif and lin_eq_reif components inside the AND
+        for elem in elems:
+            if elem.kind != FznIdent: continue
+            if elem.ident in eqReifMap:
+                andToEqReifs.mgetOrPut(andResult, @[]).add(elem.ident)
+            elif elem.ident in linEqReifMap:
+                andToLinReifs.mgetOrPut(andResult, @[]).add(elem.ident)
+
     if eqReifMap.len == 0 and linEqReifMap.len == 0: return
 
     # Step 2: Scan non-consumed bool_clause constraints
@@ -2293,6 +2387,32 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
             elif eqLitVar == "" and elem.ident in linEqReifMap:
                 eqLitVar = elem.ident
                 eqLinEntry = linEqReifMap[elem.ident]
+                eqSourceVar = eqLinEntry.targetVar
+                eqIsLinear = true
+            elif eqLitVar == "" and elem.ident in andToEqReifs:
+                # See through array_bool_and: extract contained eq_reif(s)
+                # Pick the first non-constant-0 eq_reif (skip remainder==0 checks)
+                for innerVar in andToEqReifs[elem.ident]:
+                    let info = eqReifMap[innerVar]
+                    # Prefer eq_reif where testVal is not literal 0 (those are usually
+                    # guard checks like "remainder == 0", not value assignments)
+                    if info.testVal.kind == FznIntLit and info.testVal.intVal == 0:
+                        continue
+                    eqLitVar = innerVar
+                    eqSourceVar = info.sourceVar
+                    eqTestVal = info.testVal
+                    break
+                if eqLitVar == "":
+                    # Fallback: use the first one
+                    let innerVar = andToEqReifs[elem.ident][0]
+                    eqLitVar = innerVar
+                    eqSourceVar = eqReifMap[innerVar].sourceVar
+                    eqTestVal = eqReifMap[innerVar].testVal
+            elif eqLitVar == "" and elem.ident in andToLinReifs:
+                # See through array_bool_and: extract contained lin_eq_reif
+                let innerVar = andToLinReifs[elem.ident][0]
+                eqLitVar = innerVar
+                eqLinEntry = linEqReifMap[innerVar]
                 eqSourceVar = eqLinEntry.targetVar
                 eqIsLinear = true
             elif elem.ident in neReifMap:
@@ -2901,6 +3021,12 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                         let mapping = tr.buildValueMapping(sourceValues)
                         if testValExpr.ident in mapping:
                             lookupTable[flatIdx] = mapping[testValExpr.ident]
+                        elif testValExpr.ident in tr.channelVarNames:
+                            # Variable-valued entry: the test value is a channel variable
+                            # whose value will be computed at runtime. Create a varEntry.
+                            varEntries[flatIdx] = CaseAnalysisVarEntry(
+                                varName: testValExpr.ident, offset: 0)
+                            lookupTable[flatIdx] = 0
                         else:
                             allResolved = false
                             break

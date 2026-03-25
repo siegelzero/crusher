@@ -1065,7 +1065,7 @@ proc buildExpressionChannelBindings(tr: var FznTranslator) =
         tr.sys.baseArray.addExpressionChannelBinding(channelPos, expr)
         inc nBuilt
     if nBuilt > 0:
-        stderr.writeLine(&"[FZN] Built {nBuilt} expression channel bindings (int_div/int_mod/int_plus)")
+        stderr.writeLine(&"[FZN] Built {nBuilt} expression channel bindings (int_times/int_div/int_mod/int_plus)")
 
 proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
     ## Builds element channel bindings for synthetic channels (precomputed lookup tables
