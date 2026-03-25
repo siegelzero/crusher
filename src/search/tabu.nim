@@ -99,7 +99,6 @@ type
         channelDepPenalties*: seq[seq[int]]  # [position][domainIdx] -> channel-dep delta
         channelDepSearchPositions*: seq[int]  # search positions with channel bindings
         channelDepConstraintsForPos*: Table[int, seq[StatefulConstraint[T]]]  # pos -> relevant channel-dep constraints
-        cdConstraintIndicesForPos*: Table[int, seq[int]]  # pos -> indices into channelDepConstraints (for non-cascade uniform delta)
         # One-hot channel fast path: maps source position to array of change entries.
         # For each domain value (array index = value - lo), stores which channel positions
         # change and what their transitions are when the source enters/leaves that value.
@@ -162,11 +161,6 @@ type
 
         # Circuit-time-prop writeback: after updatePosition, write computed times to assignment
         circuitTimePropConstraints*: seq[CircuitTimePropConstraint[T]]
-
-        # Batched channel-neighbor penalty updates: dedup (pos, localIdx) pairs
-        chanNeighDirty: seq[seq[bool]]   # [position][localIdx] -> needs update
-        chanNeighDirtyPos: seq[bool]     # [position] -> has dirty entries
-        chanNeighDirtyPosList: seq[int]  # positions with dirty entries (for iteration)
 
         # Channel-dep optimized simulation state (position-indexed arrays instead of hash tables)
         cdIsChanged: seq[bool]           # position-indexed, true if changed during simulation
@@ -1589,21 +1583,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         state.channelDepPosForChannel[chanPos] = @[]
                     state.channelDepPosForChannel[chanPos].add(pos)
 
-        # Build constraint pointer -> index mapping for uniform delta at non-cascade positions
-        var constraintToIdx = initTable[pointer, int]()
-        for ci, c in state.channelDepConstraints:
-            constraintToIdx[cast[pointer](c)] = ci
-        state.cdConstraintIndicesForPos = initTable[int, seq[int]]()
-        for pos in state.channelDepSearchPositions:
-            if state.isLazy[pos]: continue
-            if pos notin state.channelDepConstraintsForPos: continue
-            var indices: seq[int] = @[]
-            for c in state.channelDepConstraintsForPos[pos]:
-                let ci = constraintToIdx.getOrDefault(cast[pointer](c), -1)
-                if ci >= 0:
-                    indices.add(ci)
-            state.cdConstraintIndicesForPos[pos] = indices
-
         if verbose and id == 0:
             var totalRelevant = 0
             var maxRelevant = 0
@@ -2261,13 +2240,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if state.hasChannelDeps:
             state.channelDepPenalties[pos] = newSeq[int](dsize)
 
-    # Initialize batched channel-neighbor update structures
-    state.chanNeighDirty = newSeq[seq[bool]](carray.len)
-    state.chanNeighDirtyPos = newSeq[bool](carray.len)
-    for pos in state.searchPositions:
-        if not state.isLazy[pos]:
-            state.chanNeighDirty[pos] = newSeq[bool](state.constraintsAtPosition[pos].len)
-
     # Compute initial channel-dep penalties (before penalty map build)
     state.cdInUse = false
     if state.hasChannelDeps:
@@ -2492,9 +2464,11 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    # Channel-neighbor penalty map updates are deferred to a batch pass
-                    # after propagation completes (in assignValue). This avoids O(n²)
-                    # redundant re-evaluations when many channels share constraints.
+                    # Skip per-change penalty updates for offset channels (visit-time
+                    # backward chains) to avoid O(n²) cascade re-evaluations. These
+                    # are handled by recomputeAffectedChannelDepPenalties in assignValue.
+                    if not bindingPtr.hasOffset:
+                        state.updateNeighborPenalties(bindingPtr.channelPosition)
                     if bindingPtr.channelPosition notin inWorklist:
                         inWorklist.incl(bindingPtr.channelPosition)
                         worklist.add(bindingPtr.channelPosition)
@@ -2520,7 +2494,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    # Deferred to batch pass after propagation
+                    state.updateNeighborPenalties(fb.channelPosition)
                     if fb.channelPosition notin inWorklist:
                         inWorklist.incl(fb.channelPosition)
                         worklist.add(fb.channelPosition)
@@ -2546,7 +2520,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    # Deferred to batch pass after propagation
+                    state.updateNeighborPenalties(binding.channelPosition)
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
@@ -2572,7 +2546,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    # Deferred to batch pass after propagation
+                    state.updateNeighborPenalties(binding.channelPosition)
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
@@ -2598,7 +2572,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                 state.violationCount[pos] += 1
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
-                    # Deferred to batch pass after propagation
+                    state.updateNeighborPenalties(binding.channelPosition)
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
@@ -2625,7 +2599,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                                     state.violationCount[pos] += 1
                         when ProfileIteration:
                             state.propagateNeighborCalls += 1
-                        # Deferred to batch pass after propagation
+                        state.updateNeighborPenalties(ipos)
                         if ipos notin inWorklist:
                             inWorklist.incl(ipos)
                             worklist.add(ipos)
@@ -2828,8 +2802,7 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Save channel-dep constraint costs before propagation (for uniform delta recomputation)
     if state.hasChannelDeps:
         for ci in 0..<state.channelDepConstraints.len:
-            if state.channelDepConstraintActive[ci]:
-                state.cdSavedConstraintCosts[ci] = state.channelDepConstraints[ci].penalty()
+            state.cdSavedConstraintCosts[ci] = state.channelDepConstraints[ci].penalty()
 
     # Propagate channel variables affected by this position change
     when ProfileIteration:
@@ -2863,35 +2836,6 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
             for (fPos, fOld, fNew) in localForced:
                 if state.channelDepPenalties[fPos].len > 0:
                     state.computeChannelDepPenaltiesAt(fPos)
-
-    # Batch channel-neighbor penalty updates: update constraintPenalties at search
-    # positions for constraints affected by channel changes, with deduplication.
-    # This replaces per-channel updateNeighborPenalties calls inside propagateChannels,
-    # avoiding O(n²) redundant recomputations when many channels share constraints.
-    if anyChannelsChanged:
-        for chanPos in state.changedChannelsBuf:
-            for constraint in state.constraintsAtPosition[chanPos]:
-                let cptr = cast[pointer](constraint)
-                let searchPos = state.constraintSearchPos.getOrDefault(cptr)
-                if searchPos.len == 0:
-                    continue
-                for spos in searchPos.items:
-                    if spos == position: continue  # Moved pos fully rebuilt below
-                    if state.isLazy[spos]: continue
-                    if state.chanNeighDirty[spos].len == 0: continue
-                    let localIdx = state.constraintIdxAt[spos][cptr]
-                    if not state.chanNeighDirty[spos][localIdx]:
-                        state.chanNeighDirty[spos][localIdx] = true
-                        if not state.chanNeighDirtyPos[spos]:
-                            state.chanNeighDirtyPos[spos] = true
-                            state.chanNeighDirtyPosList.add(spos)
-        for dpos in state.chanNeighDirtyPosList:
-            for ci in 0..<state.chanNeighDirty[dpos].len:
-                if state.chanNeighDirty[dpos][ci]:
-                    state.updateConstraintAtPosition(dpos, ci)
-                    state.chanNeighDirty[dpos][ci] = false
-            state.chanNeighDirtyPos[dpos] = false
-        state.chanNeighDirtyPosList.setLen(0)
 
     when ProfileIteration:
         let tCD1 = epochTime()
@@ -2942,9 +2886,10 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         for (fPos, fOld, fNew) in localForced:
             state.updateNeighborPenalties(fPos)
 
-    # Channel neighbor penalty map updates are handled by the batch pass above
-    # (deduped updateConstraintAtPosition calls), and channel-dep penalties by
-    # the cascade system. This avoids O(n²) redundant re-evaluations.
+    # Channel neighbor penalty updates are handled by the cascade-dep system
+    # (which simulates channel changes during penalty map evaluation) rather
+    # than explicitly updating after each propagation. This avoids O(n²)
+    # re-evaluations when many channels change per move.
 
     # Recompute inverse deltas for affected positions in the moved group
     if hasInverseMove:

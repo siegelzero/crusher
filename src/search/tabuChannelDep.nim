@@ -168,7 +168,6 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             let nChans = chans.len
             for cli in 0..<constraintIds.len:
                 let ci = constraintIds[cli]
-                if not state.channelDepConstraintActive[ci]: continue
                 var delta: int
                 if state.cdConstraintCanFast[ci]:
                     let rc = state.channelDepConstraints[ci].relationalState
@@ -510,7 +509,6 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
         var totalDelta = 0
         for cli in 0..<constraintIds.len:
             let ci = constraintIds[cli]
-            if not state.channelDepConstraintActive[ci]: continue
             var delta: int
             if state.cdConstraintCanFast[ci]:
                 let rc = state.channelDepConstraints[ci].relationalState
@@ -763,23 +761,14 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
     ## cascade values. Falls back to full cascade recomputation if element deps changed.
     ## For non-cascade positions: falls back to full per-value recomputation.
     if pos notin state.cdCascadePos:
-        # Non-cascade: use uniform delta approximation from precomputed constraint indices.
-        # Full per-value recomputation (computeChannelDepDelta) is too expensive when
-        # cascades can't be built (e.g., inverse channels block construction).
-        when ProfileIteration: state.cdUniformCalls += 1
-        if pos in state.cdConstraintIndicesForPos:
-            var uniformDelta = 0
-            for ci in state.cdConstraintIndicesForPos[pos]:
-                if not state.channelDepConstraintActive[ci]: continue
-                let newCost = state.channelDepConstraints[ci].penalty()
-                let savedCost = state.cdSavedConstraintCosts[ci]
-                if savedCost != newCost:
-                    uniformDelta += savedCost - newCost
-            if uniformDelta != 0:
-                let domain = state.sharedDomain[][pos]
-                for i in 0..<domain.len:
-                    state.channelDepPenalties[pos][i] += uniformDelta
-                    state.penaltyMap[pos][i] += uniformDelta
+        # Non-cascade: full recomputation
+        let domain = state.sharedDomain[][pos]
+        for i in 0..<domain.len:
+            let newDep = state.computeChannelDepDelta(pos, domain[i])
+            let oldDep = state.channelDepPenalties[pos][i]
+            if newDep != oldDep:
+                state.penaltyMap[pos][i] += newDep - oldDep
+                state.channelDepPenalties[pos][i] = newDep
         return
     let cascadeIdx = state.cdCascadePos[pos]
     # Check which external deps changed: element deps vs min/max-only deps
