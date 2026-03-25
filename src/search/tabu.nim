@@ -1163,6 +1163,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     channelChanged = true
+        for binding in carray.expressionChannelBindings:
+            let newVal = binding.expression.evaluate(state.assignment)
+            if newVal != state.assignment[binding.channelPosition]:
+                state.assignment[binding.channelPosition] = newVal
+                channelChanged = true
         if fpIter > 100:
             var changingPos: seq[int]
             for binding in carray.channelBindings:
@@ -1488,7 +1493,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for pos in state.searchPositions:
             if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition or
                pos in carray.countEqChannelsAtPosition or pos in carray.conditionalCountEqChannelsAtPosition or
-               pos in carray.inverseChannelsAtPosition or pos in carray.argmaxChannelsAtPosition:
+               pos in carray.inverseChannelsAtPosition or pos in carray.argmaxChannelsAtPosition or
+               pos in carray.expressionChannelsAtPosition:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -1561,6 +1567,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for bi in carray.argmaxChannelsAtPosition[p]:
                         let binding = carray.argmaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
+                # Expression channel bindings
+                if p in carray.expressionChannelsAtPosition:
+                    for bi in carray.expressionChannelsAtPosition[p]:
+                        let chanPos = carray.expressionChannelBindings[bi].channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
                             visited.incl(chanPos)
@@ -2608,6 +2622,32 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                         if ipos notin inWorklist:
                             inWorklist.incl(ipos)
                             worklist.add(ipos)
+        # Expression channel bindings
+        if pos in state.carray.expressionChannelsAtPosition:
+            for bi in state.carray.expressionChannelsAtPosition[pos]:
+                let binding = state.carray.expressionChannelBindings[bi]
+                let newVal = binding.expression.evaluate(state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    result = true
+                    changedChannels.add(binding.channelPosition)
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
+                    state.updateNeighborPenalties(binding.channelPosition)
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
 
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
@@ -2717,6 +2757,21 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         if ipos notin inWorklist:
                             inWorklist.incl(ipos)
                             worklist.add(ipos)
+        # Expression channel bindings (lean: no penalty maps or violationCount)
+        if pos in state.carray.expressionChannelsAtPosition:
+            for bi in state.carray.expressionChannelsAtPosition[pos]:
+                let binding = state.carray.expressionChannelBindings[bi]
+                let newVal = binding.expression.evaluate(state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    for c in state.constraintsAtPosition[binding.channelPosition]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(binding.channelPosition, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if binding.channelPosition notin inWorklist:
+                        inWorklist.incl(binding.channelPosition)
+                        worklist.add(binding.channelPosition)
 
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## Lightweight assignment: updates constraint state and cost but skips

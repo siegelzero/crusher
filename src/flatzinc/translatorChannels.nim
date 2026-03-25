@@ -1042,6 +1042,31 @@ proc buildChannelBindings(tr: var FznTranslator) =
     if tr.sys.baseArray.channelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
+proc buildExpressionChannelBindings(tr: var FznTranslator) =
+    ## Builds expression channel bindings for int_div/int_mod/int_plus with defines_var.
+    var nBuilt = 0
+    for def in tr.expressionChannelDefs:
+        if def.varName notin tr.varPositions:
+            continue
+        let channelPos = tr.varPositions[def.varName]
+        let con = tr.model.constraints[def.ci]
+        let name = stripSolverPrefix(con.name)
+        let arg0 = tr.resolveExprArg(con.args[0])
+        let arg1 = tr.resolveExprArg(con.args[1])
+        var expr: AlgebraicExpression[int]
+        if name == "int_div":
+            expr = intDiv(arg0, arg1)
+        elif name == "int_mod":
+            expr = intMod(arg0, arg1)
+        elif name == "int_plus":
+            expr = arg0 + arg1
+        else:
+            continue
+        tr.sys.baseArray.addExpressionChannelBinding(channelPos, expr)
+        inc nBuilt
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} expression channel bindings (int_div/int_mod/int_plus)")
+
 proc buildSyntheticElementChannelBindings(tr: var FznTranslator) =
     ## Builds element channel bindings for synthetic channels (precomputed lookup tables
     ## from detectConditionalGainChannels).

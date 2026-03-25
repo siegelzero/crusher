@@ -2985,6 +2985,20 @@ proc estimateRangeImpl(tr: FznTranslator, node: ExpressionNode[int],
             result = (max(lMin, rMin), max(lMax, rMax))
         of Minimum:
             result = (min(lMin, rMin), min(lMax, rMax))
+        of IntegerDivision:
+            if rMin > 0:
+                result = (lMin div rMax, lMax div rMin)
+            elif rMax < 0:
+                result = (lMax div rMin, lMin div rMax)
+            else:
+                result = (low(int) div 2, high(int) div 2)  # divisor may be 0
+        of Modulo:
+            if rMin > 0:
+                result = (0, rMax - 1)
+            elif rMax < 0:
+                result = (rMin + 1, 0)
+            else:
+                result = (low(int) div 2, high(int) div 2)
     cache[key] = result
     return result
 

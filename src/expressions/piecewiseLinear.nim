@@ -306,3 +306,5 @@ proc compilePL*(node: ExpressionNode[int], varyingPos: int,
             return (true, plMax(left, right))
         of Minimum:
             return (true, plMin(left, right))
+        of IntegerDivision, Modulo:
+            return (false, PiecewiseLinear())  # non-linear

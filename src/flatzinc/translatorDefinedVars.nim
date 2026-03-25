@@ -59,6 +59,17 @@ proc collectDefinedVars(tr: var FznTranslator) =
                     else:
                         definedVarNames[definedName] = true
                         tr.definingConstraints.incl(ci)
+        # int_div(a, b, c) :: defines_var(c) → expression channel variable (c = a div b)
+        # int_mod(a, b, c) :: defines_var(c) → expression channel variable (c = a mod b)
+        # int_plus(a, b, c) :: defines_var(c) → expression channel variable (c = a + b)
+        elif name in ["int_div", "int_mod", "int_plus"] and con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                let definedName = ann.args[0].ident
+                if con.args[2].kind == FznIdent and con.args[2].ident == definedName:
+                    tr.channelVarNames.incl(definedName)
+                    tr.definingConstraints.incl(ci)
+                    tr.expressionChannelDefs.add((ci: ci, varName: definedName))
         # array_int_minimum(m, array) :: defines_var(m) → channel variable (not searched)
         # array_int_maximum(m, array) :: defines_var(m) → channel variable (not searched)
         elif name in ["array_int_minimum", "array_int_maximum"] and con.hasAnnotation("defines_var"):

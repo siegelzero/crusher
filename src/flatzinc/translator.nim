@@ -272,6 +272,8 @@ type
         syntheticRelaxations*: seq[DisjunctiveClauseTerm]
         # Min/max channel defs: array_int_minimum/maximum with defines_var → channel variables
         minMaxChannelDefs*: seq[tuple[ci: int, varName: string, isMin: bool]]
+        # Expression channel defs: int_div/int_mod/int_plus with defines_var → expression channels
+        expressionChannelDefs*: seq[tuple[ci: int, varName: string]]
         # Case-analysis channel defs: bool_clause case analysis → constant lookup channel
         caseAnalysisDefs*: seq[CaseAnalysisDef]
         # Conditional variable-source channel defs: target = var_element(element(cond, map), array)
@@ -1980,6 +1982,8 @@ proc translate*(model: FznModel): FznTranslator =
 
     # Build channel bindings for element defines_var
     result.buildChannelBindings()
+    # Build expression channel bindings for int_div/int_mod/int_plus defines_var
+    result.buildExpressionChannelBindings()
     # Build channel bindings for synthetic element channels (conditional gain variables)
     result.buildSyntheticElementChannelBindings()
     # Build channel bindings for int_mod channels (Z = X mod C → element lookup)

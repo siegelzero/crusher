@@ -14,7 +14,9 @@ type
         Subtraction,
         Multiplication,
         Maximum,
-        Minimum
+        Minimum,
+        IntegerDivision,
+        Modulo
 
     NodeType* = enum
         LiteralNode,
@@ -77,6 +79,10 @@ func evaluate*[T](node: ExpressionNode[T], assignment: seq[T]|Table[int, T]): T 
                     return max(left, right)
                 of Minimum:
                     return min(left, right)
+                of IntegerDivision:
+                    return if right == 0: T(0) else: left div right
+                of Modulo:
+                    return if right == 0: T(0) else: left mod right
 {.pop.}
 
 func evaluate*[T](expression: AlgebraicExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =

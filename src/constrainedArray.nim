@@ -50,6 +50,10 @@ type
         inputPositions*: PackedSet[int]  # Union of all input expression positions
         valueOffset*: int           # result = argmax_index + valueOffset (e.g., 1 for 1-based)
 
+    ExpressionChannelBinding*[T] = object
+        channelPosition*: int       # Position of the expression channel variable
+        expression*: AlgebraicExpression[T]  # Expression to evaluate
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -97,6 +101,8 @@ type
         conditionalCountEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [condCountEq binding indices]
         argmaxChannelBindings*: seq[ArgmaxChannelBinding[T]]
         argmaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [argmax binding indices]
+        expressionChannelBindings*: seq[ExpressionChannelBinding[T]]
+        expressionChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [expr binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -353,6 +359,24 @@ proc addArgmaxChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.argmaxChannelsAtPosition[pos] = @[bindingIdx]
         elif bindingIdx notin arr.argmaxChannelsAtPosition[pos]:
             arr.argmaxChannelsAtPosition[pos].add(bindingIdx)
+
+proc addExpressionChannelBinding*[T](arr: var ConstrainedArray[T],
+                                      channelPos: int,
+                                      expr: AlgebraicExpression[T]) =
+    ## Register an expression channel: channelPos = expr.evaluate(assignment).
+    ## The channel position is added to channelPositions (not searched).
+    ## Source positions are mapped in expressionChannelsAtPosition.
+    let bindingIdx = arr.expressionChannelBindings.len
+    arr.expressionChannelBindings.add(ExpressionChannelBinding[T](
+        channelPosition: channelPos,
+        expression: expr
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in expr.positions.items:
+        if pos notin arr.expressionChannelsAtPosition:
+            arr.expressionChannelsAtPosition[pos] = @[bindingIdx]
+        elif bindingIdx notin arr.expressionChannelsAtPosition[pos]:
+            arr.expressionChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -4336,6 +4360,15 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             valueOffset: binding.valueOffset
         )
     result.argmaxChannelsAtPosition = arr.argmaxChannelsAtPosition
+
+    # Deep copy expression channel bindings — AlgebraicExpression refs need deep copy
+    result.expressionChannelBindings = newSeq[ExpressionChannelBinding[T]](arr.expressionChannelBindings.len)
+    for i, binding in arr.expressionChannelBindings:
+        result.expressionChannelBindings[i] = ExpressionChannelBinding[T](
+            channelPosition: binding.channelPosition,
+            expression: binding.expression.deepCopy()
+        )
+    result.expressionChannelsAtPosition = arr.expressionChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups

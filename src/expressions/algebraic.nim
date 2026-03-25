@@ -47,6 +47,26 @@ func binaryMin*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] 
         linear=false
     )
 
+func intDiv*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
+    newAlgebraicExpression[T](
+        positions=left.positions + right.positions,
+        node=ExpressionNode[T](
+            kind: BinaryOpNode, binaryOp: IntegerDivision,
+            left: left.node, right: right.node
+        ),
+        linear=false
+    )
+
+func intMod*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
+    newAlgebraicExpression[T](
+        positions=left.positions + right.positions,
+        node=ExpressionNode[T](
+            kind: BinaryOpNode, binaryOp: Modulo,
+            left: left.node, right: right.node
+        ),
+        linear=false
+    )
+
 # Binary (Expression, Expression) Operations
 func `+`*[T](left, right: AlgebraicExpression[T]): AlgebraicExpression[T] {.inline.} =
     # (X - k) + k → X  (when right is literal matching left's subtraction)

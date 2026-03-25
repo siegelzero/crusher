@@ -57,6 +57,16 @@ proc tryExtractLinear[T](node: ExpressionNode[T]): tuple[ok: bool, terms: seq[Li
                 let v = if node.binaryOp == Maximum: max(loff, roff) else: min(loff, roff)
                 return (true, @[], v)
             return (false, @[], T(0))
+        of IntegerDivision, Modulo:
+            # Only fold as constant if both children are purely constant.
+            let (lok, lterms, loff) = tryExtractLinear[T](node.left)
+            if not lok: return (false, @[], T(0))
+            let (rok, rterms, roff) = tryExtractLinear[T](node.right)
+            if not rok: return (false, @[], T(0))
+            if lterms.len == 0 and rterms.len == 0 and roff != 0:
+                let v = if node.binaryOp == IntegerDivision: loff div roff else: loff mod roff
+                return (true, @[], v)
+            return (false, @[], T(0))
     of UnaryOpNode:
         if node.unaryOp == Negation:
             let (ok, terms, off) = tryExtractLinear[T](node.target)
