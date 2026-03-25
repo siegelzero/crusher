@@ -32,7 +32,13 @@ proc initPresolveDomains(tr: FznTranslator): Table[string, seq[int]] =
             else: discard
         case decl.varType.kind
         of FznIntRange:
-            result[decl.name] = toSeq(decl.varType.lo..decl.varType.hi)
+            let rangeSize = decl.varType.hi - decl.varType.lo + 1
+            if rangeSize > 1_000_000:
+                # Skip very large domains — too expensive to enumerate.
+                # These will be handled as unbounded during propagation.
+                discard
+            else:
+                result[decl.name] = toSeq(decl.varType.lo..decl.varType.hi)
         of FznIntSet:
             result[decl.name] = decl.varType.values.sorted()
         of FznBool:
@@ -478,6 +484,183 @@ proc boundsPropagate(tr: FznTranslator,
                                               low(int), upperBound, infeasible):
                         result = true
                         vars[j].hi = min(vars[j].hi, upperBound)
+
+proc bigMDomainPruning(tr: FznTranslator,
+                       domains: var Table[string, seq[int]],
+                       fixedVars: Table[string, int],
+                       eliminated: PackedSet[int],
+                       infeasible: var bool): bool =
+    ## Detect big-M indicator linking patterns and prune infeasible gaps.
+    ##
+    ## Pattern: two int_lin_le constraints on the same (x, indicator) pair where
+    ## indicator is a binary {0,1} variable (often from bool2int):
+    ##   int_lin_le([1, -U], [x, ind], 0)   →  x ≤ U * ind
+    ##   int_lin_le([-1, L], [x, ind], 0)   →  x ≥ L * ind
+    ##
+    ## When ind=0: x ≤ 0 AND x ≥ 0 → x = 0
+    ## When ind=1: x ∈ [L, U]
+    ## Domain should be {0} ∪ [L, U], not [0, U].
+    ##
+    ## More generally, detects any 2-variable int_lin_le([a, b], [x, y], c) where
+    ## one variable has domain {0,1} and creates the disjoint domain.
+    result = false
+
+    # Build index: for each pair of variable names, collect the constraints
+    type LinLePair = tuple[coeffX, coeffY: int, rhs: int, ci: int]
+    var pairConstraints: Table[(string, string), seq[LinLePair]]
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        # Resolve coefficients and variables arrays (may be named parameters)
+        var coeffArr = con.args[0]
+        if coeffArr.kind == FznIdent:
+            var found = false
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == coeffArr.ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        coeffArr = decl.value
+                        found = true
+                    break
+            if not found: continue
+        if coeffArr.kind != FznArrayLit: continue
+        if coeffArr.elems.len != 2: continue  # Only 2-variable constraints
+
+        var varArr = con.args[1]
+        if varArr.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varArr.ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        varArr = decl.value
+                        found = true
+                    break
+            if not found: continue
+        if varArr.kind != FznArrayLit: continue
+        if varArr.elems.len != 2: continue
+
+        let rhsArg = con.args[2]
+        if not tr.presolveIsFixed(rhsArg, fixedVars): continue
+        let rhs = tr.presolveResolve(rhsArg, fixedVars)
+
+        # Resolve variable names (may be param aliases)
+        var varNames: array[2, string]
+        var coeffs: array[2, int]
+        var allOk = true
+        for k in 0..1:
+            if coeffArr.elems[k].kind != FznIntLit:
+                allOk = false; break
+            coeffs[k] = coeffArr.elems[k].intVal
+            let varg = varArr.elems[k]
+            if varg.kind == FznIdent:
+                varNames[k] = varg.ident
+            elif varg.kind == FznIntLit:
+                allOk = false; break  # constant, not interesting
+            else:
+                allOk = false; break
+        if not allOk: continue
+
+        # Skip if either variable is already fixed
+        if varNames[0] in fixedVars or varNames[1] in fixedVars: continue
+
+        let key = if varNames[0] < varNames[1]: (varNames[0], varNames[1])
+                  else: (varNames[1], varNames[0])
+        let entry: LinLePair = if varNames[0] < varNames[1]:
+            (coeffX: coeffs[0], coeffY: coeffs[1], rhs: rhs, ci: ci)
+        else:
+            (coeffX: coeffs[1], coeffY: coeffs[0], rhs: rhs, ci: ci)
+        pairConstraints.mgetOrPut(key, @[]).add(entry)
+
+    # For each pair with 2+ constraints, check for big-M pattern
+    for key, entries in pairConstraints:
+        if entries.len < 2: continue
+        let varX = key[0]
+        let varY = key[1]
+
+        # Check which variable is binary {0,1}
+        let domX = if varX in domains: domains[varX]
+                   elif varX in fixedVars: @[fixedVars[varX]]
+                   else: continue
+        let domY = if varY in domains: domains[varY]
+                   elif varY in fixedVars: @[fixedVars[varY]]
+                   else: continue
+
+        # Identify the binary indicator and the continuous variable
+        var indVar, contVar: string
+        var contDom: seq[int]
+        var indIsX: bool  # true if indicator is varX
+
+        let xIsBin = domX.len == 2 and domX[0] == 0 and domX[1] == 1
+        let yIsBin = domY.len == 2 and domY[0] == 0 and domY[1] == 1
+        if xIsBin:
+            indVar = varX; contVar = varY; contDom = domY; indIsX = true
+        elif yIsBin:
+            indVar = varY; contVar = varX; contDom = domX; indIsX = false
+        else:
+            continue
+
+        # For each constraint, compute bounds on contVar when ind=0 and ind=1
+        # Constraint: coeffX * x + coeffY * y <= rhs
+        # If ind is x: coeffX * ind + coeffY * cont <= rhs
+        #   ind=0: coeffY * cont <= rhs
+        #   ind=1: coeffY * cont <= rhs - coeffX
+        # If ind is y: coeffX * cont + coeffY * ind <= rhs
+        #   ind=0: coeffX * cont <= rhs
+        #   ind=1: coeffX * cont <= rhs - coeffY
+
+        var lo0 = low(int) div 2  # lower bound when ind=0
+        var hi0 = high(int) div 2 # upper bound when ind=0
+        var lo1 = low(int) div 2  # lower bound when ind=1
+        var hi1 = high(int) div 2 # upper bound when ind=1
+
+        for e in entries:
+            let contCoeff = if indIsX: e.coeffY else: e.coeffX
+            let indCoeff = if indIsX: e.coeffX else: e.coeffY
+
+            if contCoeff == 0: continue
+
+            # a * x <= b:
+            #   a > 0 → x <= floor(b / a)
+            #   a < 0 → x >= ceil(b / a)
+            # ceil(b/a) for a < 0: rewrite as ceil(-b / |a|) where |a| = -a > 0
+            proc psCeilDiv(n, d: int): int =
+                ## ceil(n / d) for d > 0
+                if n >= 0: (n + d - 1) div d
+                else: -((-n) div d)
+
+            for indVal in [0, 1]:
+                let r = e.rhs - indCoeff * indVal
+                if contCoeff > 0:
+                    let ub = psFloorDiv(r, contCoeff)
+                    if indVal == 0: hi0 = min(hi0, ub)
+                    else: hi1 = min(hi1, ub)
+                else:
+                    let lb = psCeilDiv(-r, -contCoeff)
+                    if indVal == 0: lo0 = max(lo0, lb)
+                    else: lo1 = max(lo1, lb)
+
+        # Check if we found a useful gap:
+        # When ind=0, cont must be in [lo0, hi0]
+        # When ind=1, cont must be in [lo1, hi1]
+        # If [lo0, hi0] ∩ [lo1, hi1] doesn't cover the full domain, we can prune
+        if hi0 < lo0 or hi1 < lo1: continue  # infeasible case, leave for other propagation
+
+        # Build the disjoint domain: values in [lo0, hi0] ∪ [lo1, hi1]
+        if contVar notin domains: continue
+        let origDom = domains[contVar]
+        if origDom.len <= 2: continue  # already small enough
+
+        var newDom: seq[int]
+        for v in origDom:
+            if (v >= lo0 and v <= hi0) or (v >= lo1 and v <= hi1):
+                newDom.add(v)
+
+        if newDom.len < origDom.len and newDom.len > 0:
+            domains[contVar] = newDom
+            result = true
 
 proc allDiffPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
@@ -2430,6 +2613,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 4: Linear bounds propagation
         if boundsPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 4b: Big-M indicator linking domain pruning
+        if bigMDomainPruning(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 

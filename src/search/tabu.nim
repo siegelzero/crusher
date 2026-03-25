@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -347,6 +347,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             result = constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
+        of ConditionalLinearType:
+            result = constraint.conditionalLinearState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
             result = constraint.valueSupportState.moveDelta(position, oldValue, newValue)
         of MultiResourceNoOverlapType:
@@ -437,6 +439,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == DisjunctiveClauseType:
             let p = constraint.disjunctiveClauseState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == ConditionalLinearType:
+            let p = constraint.conditionalLinearState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ValueSupportType:
@@ -535,6 +541,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == DisjunctiveClauseType:
             let penalties = constraint.disjunctiveClauseState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == ConditionalLinearType:
+            let penalties = constraint.conditionalLinearState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]

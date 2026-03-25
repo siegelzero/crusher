@@ -17,6 +17,8 @@ roster_shifts_bool_small,2023/roster-shifts-bool/bool-model.mzn,2023/roster-shif
 table_layout_small,2023/table-layout/TableLayout.mzn,2023/table-layout/p1000_m3_r100_c10.dzn,minimize,10000,3814,20000
 test_sched_t20m10r10,2023/test-scheduling/test-scheduling.mzn,2023/test-scheduling/t20m10r10-17.dzn,minimize,10000,1069,1200
 ttp_n10_k3,2023/travelling-thief/ttp.mzn,2023/travelling-thief/data/n10_k3_c5000_l10000_u10100_r46.dzn,maximize,10000,1454500,1454500
+unit_commit_L3,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L3-T6G5L5.dzn,minimize,10000,75950,200000
+unit_commit_L7,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L7-T12G5L5.dzn,minimize,10000,130950,300000
 
 groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86

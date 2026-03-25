@@ -2755,3 +2755,91 @@ solve satisfy;
     # XOR = true means odd number of trues
     let total = aVal + bVal + cVal
     check (total == 1 or total == 3)
+
+  test "big-M domain pruning: indicator-linked variable gap removal":
+    # Two int_lin_le constraints link generation (x) to indicator (b) via bool2int:
+    #   x <= 500 * b  →  int_lin_le([1, -500], [x, bi], 0)
+    #   x >= 250 * b  →  int_lin_le([-1, 250], [x, bi], 0)
+    # When b=0: x=0.  When b=1: x ∈ [250,500].
+    # Presolve should prune x's domain from 0..500 to {0} ∪ [250,500].
+    let src = """
+var bool: b;
+var 0..1: bi :: is_defined_var;
+var 0..500: x;
+var 0..500: obj :: is_defined_var;
+constraint bool2int(b, bi) :: defines_var(bi);
+constraint int_lin_le([1, -500], [x, bi], 0);
+constraint int_lin_le([-1, 250], [x, bi], 0);
+constraint int_lin_eq([1, -1], [x, obj], 0) :: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Check that presolve pruned the domain — values 1..249 should be removed
+    let xName = "x"
+    if xName in tr.presolveDomains:
+      let dom = tr.presolveDomains[xName]
+      check 0 in dom        # x=0 when b=0
+      check 250 in dom      # x=250 when b=1
+      check 500 in dom      # x=500 when b=1
+      check 1 notin dom     # gap: infeasible
+      check 249 notin dom   # gap: infeasible
+    else:
+      # Domain should have been tightened
+      check false
+
+  test "conditional linear constraint detection":
+    # Pattern: int_lin_le_reif + bool_clause creates a conditional linear constraint.
+    #   b = (x1 - x2 <= 5)  via int_lin_le_reif
+    #   bool_clause([b, guard], [])  means guard ∨ b, i.e., ¬guard → (x1 - x2 ≤ 5)
+    let src = """
+var 0..20: x1;
+var 0..20: x2;
+var bool: guard;
+var bool: b :: is_defined_var;
+array [1..2] of int: c1 = [1, -1];
+constraint int_lin_le_reif(c1, [x1, x2], 5, b) :: defines_var(b);
+constraint bool_clause([b, guard], []);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Should have detected 1 conditional linear pattern
+    check tr.conditionalLinearPatterns.len == 1
+    # Constraint type should be present in the system
+    var hasCondLinear = false
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == ConditionalLinearType:
+        hasCondLinear = true
+        break
+    check hasCondLinear
+
+  test "conditional linear: solve with ramping":
+    # Simplified unit commitment ramping:
+    # x1, x2 are generation levels, up indicates generator startup.
+    # Ramp constraint: ¬up → (x2 - x1 ≤ 30)
+    # With x1=50, up=false fixed, x2 must satisfy: x2 - 50 ≤ 30 → x2 ≤ 80
+    # Minimize x2 subject to x2 ≥ 70 → optimal x2 = 70.
+    let src = """
+var 0..100: x1;
+var 0..100: x2;
+var bool: up;
+var bool: ramp_ok :: is_defined_var;
+var 0..100: obj :: is_defined_var;
+array [1..2] of int: c_ramp = [1, -1];
+constraint int_eq(x1, 50);
+constraint bool_eq(up, false);
+constraint int_lin_le([-1], [x2], -70);
+constraint int_lin_le_reif(c_ramp, [x2, x1], 30, ramp_ok) :: defines_var(ramp_ok);
+constraint bool_clause([ramp_ok, up], []);
+constraint int_lin_eq([1, -1], [x2, obj], 0) :: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.conditionalLinearPatterns.len == 1
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+    let x2Pos = tr.varPositions["x2"]
+    let x2Val = tr.sys.assignment[x2Pos]
+    check x2Val >= 70
+    check x2Val <= 80

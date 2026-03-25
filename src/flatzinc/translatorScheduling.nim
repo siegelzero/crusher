@@ -625,6 +625,124 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                                           &"({nPatternA} 3-way, {nNLiteralClauses} N-literal, {nPatternB} AND-of-reif, {nPatternC} AND-vs-AND)")
 
 
+proc detectConditionalLinearPatterns(tr: var FznTranslator) =
+    ## Detects conditional linear constraint patterns:
+    ##   int_lin_le_reif(coeffs, vars, rhs, b) :: defines_var(b)
+    ##   bool_clause([b, guard], [])
+    ## where b is only used in this one clause and guard is NOT from int_lin_le_reif.
+    ##
+    ## This creates a ConditionalLinear constraint:
+    ##   penalty = if guard == 0: max(0, sum(coeffs*vars) - rhs) else: 0
+    ##
+    ## Unlike binary bool_clause (0/1 penalty), this gives magnitude-aware penalties.
+
+    # Step 1: Build mapping from result var → constraint index for int_lin_le_reif
+    var linLeReifDefines: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le_reif": continue
+        if con.args.len < 4: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let resultArg = con.args[3]
+        if resultArg.kind != FznIdent: continue
+        linLeReifDefines[resultArg.ident] = ci
+
+    if linLeReifDefines.len == 0: return
+
+    # Step 2: Count references to each bool var in non-defining constraints
+    var varRefCount: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        case name
+        of "bool_clause":
+            if con.args.len < 2: continue
+            for argIdx in 0..1:
+                let arr = con.args[argIdx]
+                if arr.kind == FznArrayLit:
+                    for elem in arr.elems:
+                        if elem.kind == FznIdent:
+                            varRefCount.mgetOrPut(elem.ident, 0) += 1
+        of "array_bool_and", "array_bool_or":
+            if con.args.len >= 1:
+                let inputArr = con.args[0]
+                if inputArr.kind == FznArrayLit:
+                    for elem in inputArr.elems:
+                        if elem.kind == FznIdent:
+                            varRefCount.mgetOrPut(elem.ident, 0) += 1
+        of "bool2int":
+            if con.args.len >= 1 and con.args[0].kind == FznIdent:
+                varRefCount.mgetOrPut(con.args[0].ident, 0) += 1
+        of "bool_not":
+            for argIdx in 0..1:
+                if con.args.len > argIdx and con.args[argIdx].kind == FznIdent:
+                    varRefCount.mgetOrPut(con.args[argIdx].ident, 0) += 1
+        else: discard
+
+    # Step 3: Scan bool_clause([b, guard], []) where b is from int_lin_le_reif
+    # and guard is NOT from int_lin_le_reif.
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 0: continue
+        if posArg.elems.len != 2: continue
+
+        let b1 = posArg.elems[0]
+        let b2 = posArg.elems[1]
+        if b1.kind != FznIdent or b2.kind != FznIdent: continue
+
+        # Identify which is the reif var and which is the guard
+        var reifIdent, guardIdent: string
+        if b1.ident in linLeReifDefines and b2.ident notin linLeReifDefines:
+            reifIdent = b1.ident
+            guardIdent = b2.ident
+        elif b2.ident in linLeReifDefines and b1.ident notin linLeReifDefines:
+            reifIdent = b2.ident
+            guardIdent = b1.ident
+        else:
+            continue  # both or neither from int_lin_le_reif — skip
+
+        # Reif var should be used only in this clause (refcount=1)
+        if varRefCount.getOrDefault(reifIdent) != 1: continue
+
+        # Guard must have a position (be a variable, not eliminated)
+        if guardIdent in tr.definedVarNames: continue
+
+        # Extract the linear term from int_lin_le_reif
+        let reifCi = linLeReifDefines[reifIdent]
+        let (ok, term) = tr.extractLinLeReifTerm(reifCi)
+        if not ok: continue
+
+        # All variables in the linear term must have positions (will be resolved at emit time)
+        # Guard variable must also have a position.
+        # Store for later emission (after translateVariables creates positions).
+        tr.conditionalLinearPatterns.add((
+            coeffs: term.coeffs,
+            varNames: term.varNames,
+            rhs: term.rhs,
+            guardVarName: guardIdent,
+            guardActiveValue: 0,  # constraint enforced when guard=0 (¬guard → linear_le)
+            boolClauseCi: ci,
+            reifCi: reifCi,
+            reifBoolName: reifIdent
+        ))
+
+        # Consume the bool_clause and int_lin_le_reif constraints
+        tr.definingConstraints.incl(ci)
+        tr.definingConstraints.incl(reifCi)
+        tr.definedVarNames.incl(reifIdent)
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} conditional linear constraints (guard → linear_le)")
+
 proc referencesIdent(expr: FznExpr, name: string): bool =
     ## Check if a FznExpr tree references a given identifier name.
     case expr.kind

@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -261,6 +261,11 @@ type
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[int], varNames1: seq[string], rhs1: int,
             coeffs2: seq[int], varNames2: seq[string], rhs2: int]]
+        # Conditional linear patterns: guard → (linear_le)
+        conditionalLinearPatterns*: seq[tuple[
+            coeffs: seq[int], varNames: seq[string], rhs: int,
+            guardVarName: string, guardActiveValue: int,
+            boolClauseCi: int, reifCi: int, reifBoolName: string]]
         # Generalized disjunctive clauses (3+ literal bool_clause and AND-of-reif patterns)
         disjunctiveClauses*: seq[DisjunctiveClause]
         # Synthetic relaxation constraints from product decomposition (for bounds propagation)
@@ -864,6 +869,10 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
     # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
     result.detectDisjunctivePairs()
+    # Detect conditional linear patterns: bool_clause([reif, guard], []) where only reif is from int_lin_le_reif
+    # MUST run after detectDisjunctivePairs (which consumes 2-literal patterns where BOTH are reif)
+    # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
+    result.detectConditionalLinearPatterns()
     # Substitute linear channel variables in disjunctive clause terms (reduces positions)
     result.substituteChannelVarsInClauses()
     # Detect small-domain product patterns (int_times with small operand → case-split)
@@ -1373,6 +1382,49 @@ proc translate*(model: FznModel): FznTranslator =
 
     if result.sys.baseArray.disjunctivePairs.len > 0:
         stderr.writeLine(&"[FZN] Disjunctive pairs for domain reduction: {result.sys.baseArray.disjunctivePairs.len}")
+
+    # Add conditional linear constraints (guard → linear_le)
+    var nCondLinEmitted = 0
+    for pat in result.conditionalLinearPatterns:
+        var linPositions: seq[int]
+        var skip = false
+        for vn in pat.varNames:
+            if vn in result.varPositions:
+                linPositions.add(result.varPositions[vn])
+            elif vn in result.paramValues:
+                # Fixed parameter — fold into rhs
+                skip = true
+                break
+            else:
+                skip = true
+                break
+        if skip: continue
+
+        # Resolve guard position
+        if pat.guardVarName notin result.varPositions: continue
+        let guardPos = result.varPositions[pat.guardVarName]
+
+        # Create the ConditionalLinear constraint
+        let clState = newConditionalLinearConstraint[int](
+            coeffs = pat.coeffs,
+            linPositions = linPositions,
+            rhs = pat.rhs,
+            guardPosition = guardPos,
+            guardActiveValue = pat.guardActiveValue)
+
+        var allPositions = initPackedSet[int]()
+        for p in linPositions: allPositions.incl(p)
+        allPositions.incl(guardPos)
+
+        let constraint = StatefulConstraint[int](
+            positions: allPositions,
+            stateType: ConditionalLinearType,
+            conditionalLinearState: clState)
+        result.sys.addConstraint(constraint)
+        inc nCondLinEmitted
+
+    if nCondLinEmitted > 0:
+        stderr.writeLine(&"[FZN] Emitted {nCondLinEmitted} conditional linear constraints")
 
     # Add generalized disjunctive clause constraints using dedicated DisjunctiveClauseType
     for clause in result.disjunctiveClauses:
