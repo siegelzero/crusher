@@ -2084,8 +2084,71 @@ proc setElementMembershipPropagate(tr: FznTranslator,
 
     if setElemDefs.len == 0: return
 
-    # Step 2: Find set_in_reif(x, R, b) where R is a set variable from setElemDefs
-    # and b is forced true (either fixed to 1 or involved in a forcing clause)
+    # Step 2: Find set_in_reif(x, R, b) where R is a set variable from setElemDefs.
+    # Handles both:
+    #   (a) b forced true: x ∈ union{Si : i ∈ domain(idx)}
+    #   (b) Conditional pattern: bool_eq_reif(x, prev, eq) + forcing clause [eq, ...] []
+    #       means x is either in the set OR equals prev.
+    #       domain(x) ⊆ union{Si : i ∈ domain(idx)} ∪ domain(prev)
+
+    # Step 2a: Build index of bool_eq_reif(x, prev, eq) for default-value detection
+    var boolEqPrevMap = initTable[string, seq[string]]()  # x → [prev1, prev2, ...]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        boolEqPrevMap.mgetOrPut(con.args[0].ident, @[]).add(con.args[1].ident)
+    # Also check int_eq_reif(x, prev, eq) where prev is a variable (not constant)
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        # int_eq_reif(x, val, b) — val must be a variable, not a constant
+        let valArg = con.args[1]
+        if valArg.ident in fixedVars: continue  # constant — skip
+        if valArg.ident notin domains: continue  # not a variable — skip
+        boolEqPrevMap.mgetOrPut(con.args[0].ident, @[]).add(valArg.ident)
+
+    # Step 2b: Build index of implied constant values for variables.
+    # Pattern: int_eq_reif(x, k, eq_k) + bool_clause([eq_k], [...]) where k is constant.
+    # The clause means some_condition → x=k, so k is a valid value when that condition holds.
+    # Used as default values for conditional set membership reduction.
+    var impliedConstVals = initTable[string, HashSet[int]]()  # x → {k1, k2, ...}
+    block:
+        # First: build eq_reif map: eq_k_name → (x_name, k_value)
+        var eqReifConstants: Table[string, tuple[varName: string, constVal: int]]
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            let name = stripSolverPrefix(con.name)
+            if name != "int_eq_reif": continue
+            if con.args.len < 3: continue
+            if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+            # args[1] must be a constant (FznIntLit)
+            if con.args[1].kind != FznIntLit: continue
+            eqReifConstants[con.args[2].ident] = (varName: con.args[0].ident,
+                                                   constVal: con.args[1].intVal)
+
+        # Second: scan bool_clause([eq_k], [...]) where eq_k is sole positive literal
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            let name = stripSolverPrefix(con.name)
+            if name != "bool_clause": continue
+            if con.args.len < 2: continue
+            let posArg = con.args[0]
+            let negArg = con.args[1]
+            if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+            if posArg.elems.len != 1 or negArg.elems.len < 1: continue
+            let posLit = posArg.elems[0]
+            if posLit.kind != FznIdent: continue
+            if posLit.ident in eqReifConstants:
+                let info = eqReifConstants[posLit.ident]
+                impliedConstVals.mgetOrPut(info.varName, initHashSet[int]()).incl(info.constVal)
+
+    # Step 2c: Scan set_in_reif constraints
     for ci, con in tr.model.constraints:
         if infeasible: return
         if ci in eliminated: continue
@@ -2095,10 +2158,26 @@ proc setElementMembershipPropagate(tr: FznTranslator,
         let xName = presolveVarName(con.args[0])
         if xName == "": continue
 
-        # The set argument (args[1]) must be a set variable from setElemDefs
-        if con.args[1].kind != FznIdent: continue
-        let setVarName = con.args[1].ident
-        if setVarName notin setElemDefs: continue
+        # The set argument (args[1]) can be:
+        #   (a) A set variable from setElemDefs (chain through array_set_element)
+        #   (b) A constant set literal (flattened by MiniZinc when idx is fixed)
+        #   (c) A set parameter name
+        var constSetVals: seq[int]  # direct constant set values (cases b,c)
+        var hasDef = false
+        var def: SetElemDef
+
+        if con.args[1].kind == FznIdent and con.args[1].ident in setElemDefs:
+            # Case (a): set variable → use array_set_element chain
+            def = setElemDefs[con.args[1].ident]
+            hasDef = true
+        elif con.args[1].kind in {FznSetLit, FznRange}:
+            # Case (b): constant set literal
+            constSetVals = extractSetValues(con.args[1])
+        elif con.args[1].kind == FznIdent and con.args[1].ident in tr.setParamValues:
+            # Case (c): set parameter name
+            constSetVals = tr.setParamValues[con.args[1].ident]
+        else:
+            continue
 
         # The reification result (args[2]) — check if forced true
         let bName = presolveVarName(con.args[2])
@@ -2106,23 +2185,6 @@ proc setElementMembershipPropagate(tr: FznTranslator,
         if bName != "":
             if bName in fixedVars and fixedVars[bName] == 1:
                 bForcedTrue = true
-            # Also check if b is a channel that depends on constraints
-            # For now, just handle the fixed-true case and the case where
-            # the constraint itself is part of an implication chain
-        else:
-            continue  # b is not a variable — skip
-
-        if not bForcedTrue:
-            continue  # Can't propagate unless b is forced true
-
-        let def = setElemDefs[setVarName]
-
-        # Get idx domain
-        var idxDom: seq[int]
-        if def.idxVarName in fixedVars:
-            idxDom = @[fixedVars[def.idxVarName]]
-        elif def.idxVarName in domains:
-            idxDom = domains[def.idxVarName]
         else:
             continue
 
@@ -2136,32 +2198,86 @@ proc setElementMembershipPropagate(tr: FznTranslator,
 
         let xSet = xDom.toHashSet()
 
-        # Forward: domain(x) ⊆ union{Si : i ∈ domain(idx)}
+        # Compute reachable values from the set
         var reachableVals: HashSet[int]
         var validIdxValues: seq[int]
-        for i in idxDom:
-            let arrIdx = i - 1  # FZN 1-based
-            if arrIdx >= 0 and arrIdx < def.constSets.len:
-                var hasOverlap = false
-                for v in def.constSets[arrIdx]:
-                    if v in xSet:
-                        hasOverlap = true
+
+        if hasDef:
+            # Case (a): compute from array_set_element chain
+            var idxDom: seq[int]
+            if def.idxVarName in fixedVars:
+                idxDom = @[fixedVars[def.idxVarName]]
+            elif def.idxVarName in domains:
+                idxDom = domains[def.idxVarName]
+            else:
+                continue
+            for i in idxDom:
+                let arrIdx = i - 1  # FZN 1-based
+                if arrIdx >= 0 and arrIdx < def.constSets.len:
+                    var hasOverlap = false
+                    for v in def.constSets[arrIdx]:
+                        if v in xSet:
+                            hasOverlap = true
+                        reachableVals.incl(v)
+                    if hasOverlap:
+                        validIdxValues.add(i)
+        else:
+            # Cases (b,c): use constant set values directly
+            for v in constSetVals:
+                reachableVals.incl(v)
+
+        if bForcedTrue:
+            # Case (a): b forced true → x ∈ reachable
+            if xName notin fixedVars:
+                var allowed: seq[int]
+                for v in xDom:
+                    if v in reachableVals:
+                        allowed.add(v)
+                if presolveTightenDomain(domains, xName, allowed, infeasible):
+                    result = true
+                if infeasible: return
+        else:
+            # Case (b): Conditional — x is in reachable OR takes a default value.
+            # The default value comes from the "else" branch of an if-then-else.
+            # Two sources of defaults:
+            #   1. bool_eq_reif(x, prev, eq) — x might equal prev
+            #   2. The idx variable itself — in graph traversal patterns, x can
+            #      stay at the same node as idx (the predecessor)
+            # Combine: domain(x) ⊆ reachable_from_idx ∪ domain(prev) ∪ domain(idx)
+
+            # Add idx domain as default (graph traversal "stay" case)
+            if hasDef:
+                if def.idxVarName in fixedVars:
+                    reachableVals.incl(fixedVars[def.idxVarName])
+                elif def.idxVarName in domains:
+                    for v in domains[def.idxVarName]:
+                        reachableVals.incl(v)
+
+            # Add prev domains from bool_eq_reif
+            if xName in boolEqPrevMap:
+                for prevName in boolEqPrevMap[xName]:
+                    if prevName in fixedVars:
+                        reachableVals.incl(fixedVars[prevName])
+                    elif prevName in domains:
+                        for v in domains[prevName]:
+                            reachableVals.incl(v)
+
+            # Add implied constant values from int_eq_reif + bool_clause patterns
+            if xName in impliedConstVals:
+                for v in impliedConstVals[xName]:
                     reachableVals.incl(v)
-                if hasOverlap:
-                    validIdxValues.add(i)
 
-        # Apply forward propagation: tighten x domain
-        if xName notin fixedVars:
-            var allowed: seq[int]
-            for v in xDom:
-                if v in reachableVals:
-                    allowed.add(v)
-            if presolveTightenDomain(domains, xName, allowed, infeasible):
-                result = true
-            if infeasible: return
+            if xName notin fixedVars:
+                var allowed: seq[int]
+                for v in xDom:
+                    if v in reachableVals:
+                        allowed.add(v)
+                if presolveTightenDomain(domains, xName, allowed, infeasible):
+                    result = true
+                if infeasible: return
 
-        # Apply backward propagation: tighten idx domain
-        if def.idxVarName notin fixedVars:
+        # Backward propagation: tighten idx domain (only when hasDef and b could be true)
+        if hasDef and def.idxVarName notin fixedVars:
             if presolveTightenDomain(domains, def.idxVarName, validIdxValues, infeasible):
                 result = true
             if infeasible: return
@@ -2808,9 +2924,13 @@ proc presolve*(tr: var FznTranslator) =
         if infeasible: break
 
         # Step 6d: Set element + set_in cross-constraint propagation (BFS reachability)
-        if setElementMembershipPropagate(tr, domains, fixedVars, eliminated, infeasible):
-            changed = true
-        if infeasible: break
+        # Disabled: currently hurts optimization for graph-traversal models by removing
+        # penalty signal from "invalid" positions. The feasibility benefit is outweighed
+        # by the loss of gradient information for optimization.
+        # TODO: re-enable when optimization can handle tight domains
+        # if setElementMembershipPropagate(tr, domains, fixedVars, eliminated, infeasible):
+        #     changed = true
+        # if infeasible: break
 
         # Step 6e: int_max/int_min bounds propagation
         if intMaxMinPropagate(tr, domains, fixedVars, eliminated, infeasible):

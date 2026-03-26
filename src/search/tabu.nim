@@ -1863,7 +1863,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             visited.incl(pos)
             var canBuild = true       # can build topology at all
             var canStatic = true      # can precompute values (constant arrays + local index deps)
-            const MaxCascadeChans = 500  # limit cascade depth to avoid initialization blowup
+            const MaxCascadeChans = 5000  # limit cascade depth to avoid initialization blowup
             while bfsHead < bfsQueue.len and canBuild:
                 let p = bfsQueue[bfsHead]
                 inc bfsHead
@@ -2280,13 +2280,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # contributed non-zero delta across ALL (position, domainValue) evaluations.
         # Unlike checking penalty()==0 (which only reflects the current state),
         # this verifies that NO possible move could violate the constraint.
-        # Exception: constraints that reference aggregate channel positions
+        # Exception 1: constraints that reference aggregate channel positions
         # (countEq, conditionalCountEq, argmax) are never marked tautological.
-        # These channels aggregate across ALL search positions, so a single-move
-        # delta of 0 doesn't guarantee the constraint won't be violated after
-        # multiple moves (e.g., cnt[N] <= 5 when N count is low, or argmax
-        # shifting when a different signal becomes dominant).
-        if state.hasChannelDeps:
+        # Exception 2: when NO cascade was built for any position, skip tautological
+        # filtering entirely. Without cascades, the per-move delta evaluation depends
+        # on the initial random assignment which may sit on a plateau where no single
+        # move helps. After a few moves the assignment may change enough that
+        # previously-zero-delta constraints become relevant. Deep channel chains
+        # (e.g., temporal boolean OR chains) are especially prone to this.
+        if state.hasChannelDeps and state.cdCascadePos.len == 0:
+            if verbose and id == 0:
+                echo "[Init] Skipping tautological filtering (no cascades — deep channel chains)"
+        elif state.hasChannelDeps:
             # Build set of aggregate channel positions for tautology exclusion
             var aggregateChannelPositions: PackedSet[int]
             for binding in carray.countEqChannelBindings:
