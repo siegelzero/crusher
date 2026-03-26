@@ -5798,6 +5798,294 @@ proc detectBoolEquivalenceChannels*(tr: var FznTranslator) =
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool equivalence alias channels")
 
+proc detectBoolClauseIffChannels*(tr: var FznTranslator) =
+    ## Detects bool_clause([b],[c]) + bool_clause(pos, [b]) where c is a channel
+    ## defined by bool_clause_reif(pos, neg, c), and the clause literals match c's
+    ## defining clause. This establishes b ↔ c.
+    ##
+    ## Pattern in FlatZinc:
+    ##   bool_clause_reif([x1,...,xn], [y1,...,ym], c)  :: defines_var(c)   -- c ↔ (∨xi ∨ ∨¬yj)
+    ##   bool_clause([b], [c])                                              -- c → b
+    ##   bool_clause([x1,...,xn], [b, y1,...,ym])                          -- b → (∨xi ∨ ∨¬yj)
+    ##
+    ## Proof: c → b (clause 1), b → (∨xi ∨ ∨¬yj) ↔ c (clause 2 + c defn), so b ↔ c.
+    ## Must run after detectReifChannels() so bool_clause_reif channels are known.
+
+    # Step 1: Build a map from channel var name → (posLitNames, negLitNames)
+    # for channels defined by bool_clause_reif
+    var reifChannelLits: Table[string, tuple[posLits, negLits: HashSet[string]]]
+
+    for ci in tr.boolClauseReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let cName = con.args[2].ident
+        var posLits, negLits: HashSet[string]
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind == FznArrayLit:
+            for elem in posArg.elems:
+                if elem.kind == FznIdent: posLits.incl(elem.ident)
+        if negArg.kind == FznArrayLit:
+            for elem in negArg.elems:
+                if elem.kind == FznIdent: negLits.incl(elem.ident)
+        reifChannelLits[cName] = (posLits: posLits, negLits: negLits)
+
+    if reifChannelLits.len == 0: return
+
+    # Step 2: Index bool_clause constraints by negative literal (sole variable in neg position)
+    # For bool_clause([b], [c]): index by c → (b, ci)
+    # For bool_clause([x1,...], [b, ...]): index by b → (posLits, otherNegs, ci)
+    type
+        SimpleImpl = object
+            posVar: string  # b in bool_clause([b],[c])
+            ci: int
+        MultiClause = object
+            posLits: HashSet[string]
+            negLits: HashSet[string]  # other negs excluding the key variable
+            ci: int
+
+    var simpleByNeg = initTable[string, seq[SimpleImpl]]()  # c → [(b, ci)]
+    var multiByNeg = initTable[string, seq[MultiClause]]()   # b → [(posLits, otherNegs, ci)]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+
+        if posArg.elems.len == 1 and negArg.elems.len == 1:
+            # bool_clause([b],[c]) — simple implication c → b
+            if posArg.elems[0].kind == FznIdent and negArg.elems[0].kind == FznIdent:
+                simpleByNeg.mgetOrPut(negArg.elems[0].ident, @[]).add(
+                    SimpleImpl(posVar: posArg.elems[0].ident, ci: ci))
+        elif negArg.elems.len >= 1:
+            # bool_clause(pos, neg) where neg has at least 1 element
+            # Index by each neg literal as potential target variable
+            var posLits: HashSet[string]
+            var allIdent = true
+            for elem in posArg.elems:
+                if elem.kind != FznIdent:
+                    allIdent = false
+                    break
+                posLits.incl(elem.ident)
+            if not allIdent: continue
+
+            var negNames: seq[string]
+            allIdent = true
+            for elem in negArg.elems:
+                if elem.kind != FznIdent:
+                    allIdent = false
+                    break
+                negNames.add(elem.ident)
+            if not allIdent: continue
+
+            for i, nName in negNames:
+                var otherNegs: HashSet[string]
+                for j, nn in negNames:
+                    if j != i: otherNegs.incl(nn)
+                multiByNeg.mgetOrPut(nName, @[]).add(
+                    MultiClause(posLits: posLits, negLits: otherNegs, ci: ci))
+
+    # Step 3: Match patterns. For each simple implication c → b where c is a reif channel:
+    # Look for a multi-literal clause b → (∨pos ∨ ∨¬otherNegs) that matches c's definition.
+    var detected = 0
+    for cName, simples in simpleByNeg:
+        if cName notin reifChannelLits: continue
+        let cDef = reifChannelLits[cName]
+
+        for simpl in simples:
+            let bName = simpl.posVar
+            if bName in tr.channelVarNames: continue
+            if bName in tr.definedVarNames: continue
+            if bName in tr.paramValues: continue
+            if bName in tr.valueSupportConsumedBools: continue
+
+            # Look for matching multi-literal clause with b as negative literal
+            if bName notin multiByNeg: continue
+
+            for multi in multiByNeg[bName]:
+                # Check: posLits match c's posLits, and otherNegs match c's negLits
+                if multi.posLits == cDef.posLits and multi.negLits == cDef.negLits:
+                    # Match! b ↔ c
+                    tr.boolEquivAliasDefs.add((aliasVar: bName, canonicalVar: cName,
+                                               consumedCIs: @[simpl.ci, multi.ci]))
+                    tr.channelVarNames.incl(bName)
+                    tr.definingConstraints.incl(simpl.ci)
+                    tr.definingConstraints.incl(multi.ci)
+                    inc detected
+                    break  # Found match for this b, move on
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} bool clause iff channels (b ↔ reif via two clauses)")
+
+proc detectBoolOrChannels*(tr: var FznTranslator) =
+    ## Detects boolean OR channels: b = c ∨ prev where c and prev are channels.
+    ##
+    ## Pattern in FlatZinc (from if-then-else on booleans):
+    ##   bool_clause([b], [c])                           -- c → b
+    ##   bool_eq_reif(b, prev, eq)  :: defines_var(eq)   -- eq ↔ (b = prev)
+    ##   bool_clause([eq, c1, ..., cn], [])               -- eq ∨ c1 ∨ ... ∨ cn
+    ##
+    ## Where c is a channel defined by bool_clause_reif([c1,...,cn], [], c)
+    ## meaning c ↔ (c1 ∨ ... ∨ cn).
+    ##
+    ## Proof: when c=1, b=1 (from clause 1). When c=0, all ci=0,
+    ## so from clause 3: eq=1, meaning b=prev. So b = c ∨ prev.
+    ##
+    ## More generally: c ↔ (∨ci ∨ ∨¬negj), and the forcing clause is
+    ## [eq, c1, ..., cn, neg1, ..., negm] / [] where ci are the pos literals
+    ## and negj appear as positives (since ¬(¬negj) = negj).
+    ## Wait, actually negj in bool_clause_reif are negated, so in the forcing
+    ## clause they should NOT appear. Let me handle both empty-neg and general cases.
+    ##
+    ## Must run after detectBoolClauseIffChannels() and detectReifChannels().
+    ## Runs in fixpoint loop to cascade through temporal chains.
+
+    # Step 1: Build map from channel var → defining clause literals (same as iff detection)
+    var reifChannelLits: Table[string, tuple[posLits: HashSet[string], negLits: HashSet[string]]]
+
+    for ci in tr.boolClauseReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let cName = con.args[2].ident
+        var posLits, negLits: HashSet[string]
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind == FznArrayLit:
+            for elem in posArg.elems:
+                if elem.kind == FznIdent: posLits.incl(elem.ident)
+        if negArg.kind == FznArrayLit:
+            for elem in negArg.elems:
+                if elem.kind == FznIdent: negLits.incl(elem.ident)
+        reifChannelLits[cName] = (posLits: posLits, negLits: negLits)
+
+    # Also include array_bool_or channels: c = OR(c1, ..., cn)
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_or": continue
+        if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+        let cName = con.args[1].ident
+        let elems = tr.resolveVarArrayElems(con.args[0])
+        var posLits: HashSet[string]
+        for elem in elems:
+            if elem.kind == FznIdent: posLits.incl(elem.ident)
+        reifChannelLits[cName] = (posLits: posLits, negLits: initHashSet[string]())
+
+    if reifChannelLits.len == 0: return
+
+    # Step 2: Build index of simple implications: c → b from bool_clause([b],[c])
+    var implByChannel = initTable[string, seq[tuple[bVar: string, ci: int]]]()
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1 or negArg.elems.len != 1: continue
+        if posArg.elems[0].kind != FznIdent or negArg.elems[0].kind != FznIdent: continue
+        let bName = posArg.elems[0].ident
+        let cName = negArg.elems[0].ident
+        if cName in tr.channelVarNames:
+            implByChannel.mgetOrPut(cName, @[]).add((bVar: bName, ci: ci))
+
+    # Step 3: Build index of bool_eq_reif(b, prev, eq) :: defines_var(eq)
+    # Note: these constraints are already consumed by detectReifChannels (they define eq as
+    # a channel). We scan ALL constraints here — we don't consume them, just use the info.
+    # Maps b → [(prev, eq, ci)]
+    var boolEqReifByFirst = initTable[string, seq[tuple[prevVar, eqVar: string, ci: int]]]()
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_eq_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let bName = con.args[0].ident
+        let prevName = con.args[1].ident
+        let eqName = con.args[2].ident
+        boolEqReifByFirst.mgetOrPut(bName, @[]).add((prevVar: prevName, eqVar: eqName, ci: ci))
+
+    # Step 4: Build index of forcing clauses: bool_clause([eq, ...], [])
+    # Maps eq var → [(allPosLits, ci)]
+    var forcingByEq = initTable[string, seq[tuple[otherLits: HashSet[string], ci: int]]]()
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 0: continue  # Must have empty negative literals
+        if posArg.elems.len < 2: continue   # Need at least eq + one other
+        var posNames: seq[string]
+        var allIdent = true
+        for elem in posArg.elems:
+            if elem.kind != FznIdent:
+                allIdent = false
+                break
+            posNames.add(elem.ident)
+        if not allIdent: continue
+        # Index by each element as potential eq variable
+        for i, eqCandidate in posNames:
+            var others: HashSet[string]
+            for j, name in posNames:
+                if j != i: others.incl(name)
+            forcingByEq.mgetOrPut(eqCandidate, @[]).add((otherLits: others, ci: ci))
+
+    # Step 5: Match the three-constraint pattern
+    var detected = 0
+    for cName, impls in implByChannel:
+        if cName notin reifChannelLits: continue
+        let cDef = reifChannelLits[cName]
+        # Only handle case where c's reif has empty negLits (most common)
+        if cDef.negLits.len > 0: continue
+
+        for impl in impls:
+            let bName = impl.bVar
+            if bName in tr.channelVarNames: continue
+            if bName in tr.definedVarNames: continue
+            if bName in tr.paramValues: continue
+            if bName in tr.valueSupportConsumedBools: continue
+
+            # Look for bool_eq_reif(b, prev, eq)
+            if bName notin boolEqReifByFirst: continue
+
+            for eqDef in boolEqReifByFirst[bName]:
+                let prevName = eqDef.prevVar
+                let eqName = eqDef.eqVar
+
+                # prev must be a channel variable (or will become one via fixpoint)
+                if prevName notin tr.channelVarNames: continue
+
+                # Look for forcing clause: bool_clause([eq, c1, ..., cn], [])
+                if eqName notin forcingByEq: continue
+
+                for forcing in forcingByEq[eqName]:
+                    # The other literals in the forcing clause should match c's pos literals
+                    if forcing.otherLits == cDef.posLits:
+                        # Match! b = c ∨ prev
+                        tr.boolOrChannelDefs.add((
+                            targetVar: bName,
+                            condChannel: cName,
+                            prevChannel: prevName,
+                            consumedCIs: @[impl.ci, forcing.ci]))
+                        tr.channelVarNames.incl(bName)
+                        tr.definingConstraints.incl(impl.ci)
+                        tr.definingConstraints.incl(forcing.ci)
+                        # Note: we do NOT consume the bool_eq_reif constraint — it defines
+                        # eq which may be used in other reif chains. But eq's channel was
+                        # already built by detectReifChannels. We just don't need it for b.
+                        inc detected
+                        break  # Found match
+                if bName in tr.channelVarNames: break  # Already matched
+            if bName in tr.channelVarNames: discard  # Already matched
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} bool OR channels (b = c ∨ prev from if-then-else)")
+
 proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
     ## Detects patterns where a variable is conditionally assigned either a variable
     ## value or a constant, gated by a boolean channel condition:

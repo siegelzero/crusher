@@ -2852,6 +2852,48 @@ proc buildBoolEquivAliasBindings*(tr: var FznTranslator) =
     if built > 0:
         stderr.writeLine(&"[FZN] Built {built} bool equivalence alias channel bindings")
 
+proc buildBoolOrChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for bool OR channels detected by detectBoolOrChannels().
+    ## For targetVar = condChannel ∨ prevChannel:
+    ##   target = element(cond, [prev, 1])
+    ## When cond=0 (nobody opens), target=prev (state persistence).
+    ## When cond=1 (someone opens), target=1 (forced true).
+    ## Must be called after translateVariables() and buildReifChannelBindings().
+
+    var built = 0
+    for def in tr.boolOrChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        let targetPos = tr.varPositions[def.targetVar]
+
+        # Get condition channel expression
+        let condExpr = if def.condChannel in tr.varPositions:
+            tr.getExpr(tr.varPositions[def.condChannel])
+        elif def.condChannel in tr.definedVarExprs:
+            tr.definedVarExprs[def.condChannel]
+        else:
+            continue
+
+        # Get prev channel position
+        if def.prevChannel notin tr.varPositions:
+            if def.prevChannel notin tr.definedVarExprs: continue
+
+        # Build array: [prev, 1] indexed by condition
+        # cond=0 → prev (variable), cond=1 → 1 (constant)
+        var arrayElems: seq[ArrayElement[int]]
+        if def.prevChannel in tr.varPositions:
+            arrayElems.add(ArrayElement[int](isConstant: false,
+                                             variablePosition: tr.varPositions[def.prevChannel]))
+        else:
+            # prev is a defined expression — try to get its value... skip for safety
+            continue
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+        tr.sys.baseArray.addChannelBinding(targetPos, condExpr, arrayElems)
+        inc built
+
+    if built > 0:
+        stderr.writeLine(&"[FZN] Built {built} bool OR channel bindings (b = c ∨ prev)")
+
 proc buildBoolGatedVarChannelBindings*(tr: var FznTranslator) =
     ## Builds channel bindings for bool-gated variable channel patterns detected by
     ## detectBoolGatedVariableChannels().

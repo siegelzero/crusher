@@ -425,6 +425,8 @@ type
         boolXorIdentityDefs*: seq[tuple[inputArg: FznExpr, resultVar: string]]
         # Bool equivalence alias defs: mutual bool_clause implications → alias channels
         boolEquivAliasDefs*: seq[tuple[aliasVar, canonicalVar: string, consumedCIs: seq[int]]]
+        # Bool OR channel defs: b = c ∨ prev (from if-then-else on booleans)
+        boolOrChannelDefs*: seq[tuple[targetVar, condChannel, prevChannel: string, consumedCIs: seq[int]]]
         # Bool-gated variable channel defs: x = if cond then y else constant
         boolGatedVarChannelDefs*: seq[tuple[targetVar, condVar, valVar: string, constValue: int, consumedCIs: seq[int]]]
         # Bool-gated variable-default channel defs: x = if cond then y1 else y2 (both variables)
@@ -908,15 +910,17 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect bool AND channels: bool_clause([b],[c1,...,cn]) where all ci are channels
     # MUST run after detectReifChannels() so channelVarNames is populated with reif channels
     result.detectBoolAndChannels()
-    # Detect bool equivalence alias channels: mutual bool_clause implications → alias
+    # Detect bool equivalence alias channels, bool clause iff channels, and bool OR channels.
     # MUST run after detectBoolAndChannels() so channelVarNames includes AND channels.
-    # Run as fixpoint since new aliases may enable further equivalences.
+    # Run as fixpoint since new channels may enable further detections (temporal chains).
     block:
         var prevCount = -1
         var iterations = 0
-        while result.boolEquivAliasDefs.len != prevCount and iterations < 10:
-            prevCount = result.boolEquivAliasDefs.len
+        while (result.boolEquivAliasDefs.len + result.boolOrChannelDefs.len) != prevCount and iterations < 20:
+            prevCount = result.boolEquivAliasDefs.len + result.boolOrChannelDefs.len
             result.detectBoolEquivalenceChannels()
+            result.detectBoolClauseIffChannels()
+            result.detectBoolOrChannels()
             inc iterations
     # Detect overlap channels: overlap = NOT sep where sep is a bool_clause_reif channel
     # MUST run after detectReifChannels() (which populates boolNotChannelDefs)
@@ -1994,6 +1998,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildConditionalImplicationChannelBindings()
     # Build channel bindings for bool equivalence aliases (identity element channels)
     result.buildBoolEquivAliasBindings()
+    # Build channel bindings for bool OR channels (b = c ∨ prev)
+    result.buildBoolOrChannelBindings()
     # Build channel bindings for bool-gated variable channels (x = if cond then y else const)
     result.buildBoolGatedVarChannelBindings()
     # Build channel bindings for conditional expression channels (x = if cond then expr else const)

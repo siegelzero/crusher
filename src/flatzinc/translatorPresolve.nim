@@ -2021,6 +2021,172 @@ proc elementPropagate(tr: FznTranslator,
                 if infeasible: return
 
 
+proc setElementMembershipPropagate(tr: FznTranslator,
+                                    domains: var Table[string, seq[int]],
+                                    fixedVars: Table[string, int],
+                                    eliminated: PackedSet[int],
+                                    infeasible: var bool): bool =
+    ## Cross-constraint propagation for array_set_element + set_in_reif chains.
+    ##
+    ## Pattern: array_set_element(idx, [S1,...,Sn], R) defines result set R.
+    ##          set_in_reif(x, R, b) where b is forced true constrains x ∈ R.
+    ##
+    ## Propagation:
+    ##   Forward: domain(x) ⊆ union{Si : i ∈ domain(idx)}
+    ##   Backward: domain(idx) ⊆ {i : Si ∩ domain(x) ≠ ∅}
+    ##
+    ## Also handles the direct case: if idx is fixed, x must be in S[idx].
+    ## Runs in the presolve fixpoint so multi-step chains propagate iteratively.
+    result = false
+
+    # Step 1: Build map from set result variable → (idx var name, constant set array)
+    type SetElemDef = object
+        idxVarName: string
+        constSets: seq[seq[int]]  # 0-indexed (constSets[i] = S_{i+1} in 1-based FZN)
+        ci: int
+
+    var setElemDefs = initTable[string, SetElemDef]()
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "array_set_element": continue
+        if con.args.len < 3: continue
+        let idxName = presolveVarName(con.args[0])
+        if idxName == "": continue
+        let resultArg = con.args[2]
+        if resultArg.kind != FznIdent: continue
+        let resultName = resultArg.ident
+
+        # Resolve the constant set array
+        let arrArg = con.args[1]
+        var constSets: seq[seq[int]]
+        if arrArg.kind == FznIdent:
+            if arrArg.ident in tr.setArrayValues:
+                constSets = tr.setArrayValues[arrArg.ident]
+            else:
+                continue
+        elif arrArg.kind == FznArrayLit:
+            for elem in arrArg.elems:
+                if elem.kind in {FznSetLit, FznRange}:
+                    constSets.add(extractSetValues(elem))
+                elif elem.kind == FznIdent and elem.ident in tr.setParamValues:
+                    constSets.add(tr.setParamValues[elem.ident])
+                else:
+                    constSets = @[]
+                    break
+            if constSets.len == 0: continue
+        else:
+            continue
+
+        setElemDefs[resultName] = SetElemDef(idxVarName: idxName,
+                                              constSets: constSets, ci: ci)
+
+    if setElemDefs.len == 0: return
+
+    # Step 2: Find set_in_reif(x, R, b) where R is a set variable from setElemDefs
+    # and b is forced true (either fixed to 1 or involved in a forcing clause)
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_in_reif": continue
+        if con.args.len < 3: continue
+        let xName = presolveVarName(con.args[0])
+        if xName == "": continue
+
+        # The set argument (args[1]) must be a set variable from setElemDefs
+        if con.args[1].kind != FznIdent: continue
+        let setVarName = con.args[1].ident
+        if setVarName notin setElemDefs: continue
+
+        # The reification result (args[2]) — check if forced true
+        let bName = presolveVarName(con.args[2])
+        var bForcedTrue = false
+        if bName != "":
+            if bName in fixedVars and fixedVars[bName] == 1:
+                bForcedTrue = true
+            # Also check if b is a channel that depends on constraints
+            # For now, just handle the fixed-true case and the case where
+            # the constraint itself is part of an implication chain
+        else:
+            continue  # b is not a variable — skip
+
+        if not bForcedTrue:
+            continue  # Can't propagate unless b is forced true
+
+        let def = setElemDefs[setVarName]
+
+        # Get idx domain
+        var idxDom: seq[int]
+        if def.idxVarName in fixedVars:
+            idxDom = @[fixedVars[def.idxVarName]]
+        elif def.idxVarName in domains:
+            idxDom = domains[def.idxVarName]
+        else:
+            continue
+
+        # Get x domain
+        if xName notin domains and xName notin fixedVars: continue
+        var xDom: seq[int]
+        if xName in fixedVars:
+            xDom = @[fixedVars[xName]]
+        else:
+            xDom = domains[xName]
+
+        let xSet = xDom.toHashSet()
+
+        # Forward: domain(x) ⊆ union{Si : i ∈ domain(idx)}
+        var reachableVals: HashSet[int]
+        var validIdxValues: seq[int]
+        for i in idxDom:
+            let arrIdx = i - 1  # FZN 1-based
+            if arrIdx >= 0 and arrIdx < def.constSets.len:
+                var hasOverlap = false
+                for v in def.constSets[arrIdx]:
+                    if v in xSet:
+                        hasOverlap = true
+                    reachableVals.incl(v)
+                if hasOverlap:
+                    validIdxValues.add(i)
+
+        # Apply forward propagation: tighten x domain
+        if xName notin fixedVars:
+            var allowed: seq[int]
+            for v in xDom:
+                if v in reachableVals:
+                    allowed.add(v)
+            if presolveTightenDomain(domains, xName, allowed, infeasible):
+                result = true
+            if infeasible: return
+
+        # Apply backward propagation: tighten idx domain
+        if def.idxVarName notin fixedVars:
+            if presolveTightenDomain(domains, def.idxVarName, validIdxValues, infeasible):
+                result = true
+            if infeasible: return
+
+    # Step 3: Even without set_in_reif, we can still do idx→union propagation.
+    # If a set result variable is used in other constraints, the sets it can take
+    # are restricted by the idx domain. This step just handles backward propagation
+    # of idx through the constant sets themselves (removing idx values for empty sets).
+    for resultName, def in setElemDefs:
+        if infeasible: return
+        if def.idxVarName in fixedVars: continue
+        if def.idxVarName notin domains: continue
+        let idxDom = domains[def.idxVarName]
+
+        var validIdx: seq[int]
+        for i in idxDom:
+            let arrIdx = i - 1
+            if arrIdx >= 0 and arrIdx < def.constSets.len:
+                if def.constSets[arrIdx].len > 0:
+                    validIdx.add(i)
+        if presolveTightenDomain(domains, def.idxVarName, validIdx, infeasible):
+            result = true
+        if infeasible: return
+
+
 proc regularPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
                       fixedVars: Table[string, int],
@@ -2641,7 +2807,12 @@ proc presolve*(tr: var FznTranslator) =
             changed = true
         if infeasible: break
 
-        # Step 6d: int_max/int_min bounds propagation
+        # Step 6d: Set element + set_in cross-constraint propagation (BFS reachability)
+        if setElementMembershipPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6e: int_max/int_min bounds propagation
         if intMaxMinPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
