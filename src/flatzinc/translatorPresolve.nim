@@ -2276,8 +2276,11 @@ proc setElementMembershipPropagate(tr: FznTranslator,
                     result = true
                 if infeasible: return
 
-        # Backward propagation: tighten idx domain (only when hasDef and b could be true)
-        if hasDef and def.idxVarName notin fixedVars:
+        # Backward propagation: tighten idx domain
+        # Only valid when b is forced true (x must be in R), so idx values
+        # whose sets have no overlap with domain(x) are infeasible.
+        # When b is not forced true, idx can take any value (it just makes b=false).
+        if hasDef and bForcedTrue and def.idxVarName notin fixedVars:
             if presolveTightenDomain(domains, def.idxVarName, validIdxValues, infeasible):
                 result = true
             if infeasible: return

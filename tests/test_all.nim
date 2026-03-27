@@ -4,6 +4,8 @@ import test_all_different_except0
 import test_argmax_channels
 import test_atleast
 import test_atmost
+import test_bool_equiv_gated_channels
+import test_bool_iff_or_channels
 import test_boolean_constraints
 import test_channel_dependencies
 import test_channel_substitution

@@ -6081,7 +6081,6 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
                         inc detected
                         break  # Found match
                 if bName in tr.channelVarNames: break  # Already matched
-            if bName in tr.channelVarNames: discard  # Already matched
 
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool OR channels (b = c ∨ prev from if-then-else)")
