@@ -2282,6 +2282,143 @@ proc varElementPropagate(tr: FznTranslator,
                 if infeasible: return
 
 
+proc varElementArrayBackwardPropagate(tr: FznTranslator,
+                                      domains: var Table[string, seq[int]],
+                                      fixedVars: Table[string, int],
+                                      eliminated: PackedSet[int],
+                                      infeasible: var bool): bool =
+    ## Backward propagation from element result domains to array element domains.
+    ## For array_var_int_element(idx, varArr, val):
+    ##   Each array position g that may be accessed (g ∈ domain(idx)) must support
+    ##   all possible result values when accessed. Combined with the observation that
+    ##   the domain minimum (e.g. 0 = "unused") is always preserved as a sentinel,
+    ##   we can remove intermediate values that fall between the sentinel and the
+    ##   minimum required result value.
+    ##
+    ## For each array element varArr[g]:
+    ##   - Compute L = max of (min result domain) across all elements accessing g
+    ##   - If L > domain_min + 1, remove values in (domain_min, L) from varArr[g]
+    result = false
+
+    # Step 1: Group element constraints by array argument name
+    type AccessInfo = object
+        resultLo: int
+        resultHi: int
+
+    # Map: (arrayArgIdent, arrayIndex) → seq of result bounds from accessing elements
+    var arrayAccessors: Table[string, Table[int, seq[AccessInfo]]]
+
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
+        if con.args.len < 3: continue
+
+        let isShifted = name == "array_var_int_element"
+        let idxOffset = if isShifted: 1 else: 0
+
+        # Get array argument identifier
+        let arrArg = con.args[1]
+        var arrIdent = ""
+        if arrArg.kind == FznIdent:
+            arrIdent = arrArg.ident
+        else:
+            continue  # array literal, not a named variable array
+
+        # Get index domain
+        let idxName = presolveVarName(con.args[0])
+        var idxDom: seq[int]
+        if idxName != "" and idxName in domains:
+            idxDom = domains[idxName]
+        elif tr.presolveIsFixed(con.args[0], fixedVars):
+            idxDom = @[tr.presolveResolve(con.args[0], fixedVars)]
+        else:
+            continue
+
+        # Get result domain bounds
+        let valName = presolveVarName(con.args[2])
+        var valLo, valHi: int
+        if valName != "" and valName in domains:
+            let vd = domains[valName]
+            if vd.len == 0: continue
+            valLo = vd[0]
+            valHi = vd[^1]
+        elif tr.presolveIsFixed(con.args[2], fixedVars):
+            let v = tr.presolveResolve(con.args[2], fixedVars)
+            valLo = v
+            valHi = v
+        else:
+            continue
+
+        # Record this element's access to each array position
+        if arrIdent notin arrayAccessors:
+            arrayAccessors[arrIdent] = initTable[int, seq[AccessInfo]]()
+
+        for idx in idxDom:
+            let arrIdx = idx - idxOffset
+            if arrIdx < 0: continue
+            if arrIdx notin arrayAccessors[arrIdent]:
+                arrayAccessors[arrIdent][arrIdx] = @[]
+            arrayAccessors[arrIdent][arrIdx].add(AccessInfo(resultLo: valLo, resultHi: valHi))
+
+    if arrayAccessors.len == 0: return
+
+    # Step 2: Resolve array element names
+    var totalRemoved = 0
+    for arrIdent, posAccessors in arrayAccessors:
+        # Resolve the array to get element variable names from model declarations
+        let arrElems = tr.presolveResolveVarElems(FznExpr(kind: FznIdent, ident: arrIdent))
+        if arrElems.len == 0: continue
+        var elemNames: seq[string]
+        for e in arrElems:
+            if e.kind == FznIdent:
+                elemNames.add(e.ident)
+            else:
+                elemNames.add("")  # constant element, not a variable
+
+        for arrIdx, accessors in posAccessors:
+            if arrIdx >= elemNames.len: continue
+            let elemName = elemNames[arrIdx]
+            if elemName notin domains or elemName in fixedVars: continue
+
+            # Compute intersection of result bounds: the tightest requirement
+            var reqLo = low(int)
+            var reqHi = high(int)
+            for acc in accessors:
+                reqLo = max(reqLo, acc.resultLo)
+                reqHi = min(reqHi, acc.resultHi)
+
+            if reqLo > reqHi: continue  # conflicting requirements, skip
+
+            # Tighten: remove values between domain_min and reqLo
+            # This preserves domain_min (sentinel like 0 for unused) and values >= reqLo
+            let elemDom = domains[elemName]
+            if elemDom.len == 0: continue
+            let domMin = elemDom[0]
+
+            if reqLo > domMin + 1:
+                # There's a gap between the sentinel (domMin) and the required range
+                var newDom: seq[int]
+                for v in elemDom:
+                    if v == domMin or v >= reqLo:
+                        if reqHi < high(int):
+                            if v == domMin or v <= reqHi:
+                                newDom.add(v)
+                        else:
+                            newDom.add(v)
+                if newDom.len < elemDom.len:
+                    totalRemoved += elemDom.len - newDom.len
+                    domains[elemName] = newDom
+                    result = true
+                    if newDom.len == 0:
+                        infeasible = true
+                        return
+
+    if totalRemoved > 0:
+        stderr.writeLine(&"[Presolve] Element array backward: {totalRemoved} domain values removed")
+
+
 proc elementPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
                       fixedVars: Table[string, int],
@@ -3259,6 +3396,12 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 6c: Variable element constraint propagation (bounds + index pruning)
         if varElementPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6c2: Variable element backward array propagation
+        # Tighten array element domains using result domain intersection
+        if varElementArrayBackwardPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
