@@ -46,7 +46,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       parallel=true,
                       tabuThreshold=1000,
                       scatterThreshold=1,
-                      populationSize=8,
+                      populationSize=0,  # 0 = auto: 2 * worker threads
                       numWorkers=0,
                       scatterStrategy: ScatterStrategy = PathRelinking,
                       verbose=false,

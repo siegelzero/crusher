@@ -2288,25 +2288,20 @@ proc varElementArrayBackwardPropagate(tr: FznTranslator,
                                       eliminated: PackedSet[int],
                                       infeasible: var bool): bool =
     ## Backward propagation from element result domains to array element domains.
-    ## For array_var_int_element(idx, varArr, val):
-    ##   Each array position g that may be accessed (g ∈ domain(idx)) must support
-    ##   all possible result values when accessed. Combined with the observation that
-    ##   the domain minimum (e.g. 0 = "unused") is always preserved as a sentinel,
-    ##   we can remove intermediate values that fall between the sentinel and the
-    ##   minimum required result value.
-    ##
-    ## For each array element varArr[g]:
-    ##   - Compute L = max of (min result domain) across all elements accessing g
-    ##   - If L > domain_min + 1, remove values in (domain_min, L) from varArr[g]
+    ## For array_var_int_element(idx, varArr, val) where idx is fixed (singleton):
+    ##   varArr[idx] = val is forced, so domain(varArr[idx]) ⊆ domain(val).
+    ## When multiple element constraints have fixed indices pointing to the same
+    ## position, the intersection of all result domains applies (all are forced).
+    ## Non-singleton indices are skipped: the position may not be accessed, so the
+    ## element constraint alone cannot restrict the array variable's domain.
     result = false
 
-    # Step 1: Group element constraints by array argument name
-    type AccessInfo = object
-        resultLo: int
-        resultHi: int
+    # Map: (arrayArgIdent, arrayIndex) → intersected result bounds from forced accesses
+    type BoundsInfo = object
+        reqLo: int
+        reqHi: int
 
-    # Map: (arrayArgIdent, arrayIndex) → seq of result bounds from accessing elements
-    var arrayAccessors: Table[string, Table[int, seq[AccessInfo]]]
+    var arrayAccessors: Table[string, Table[int, BoundsInfo]]
 
     for ci, con in tr.model.constraints:
         if infeasible: return
@@ -2326,15 +2321,18 @@ proc varElementArrayBackwardPropagate(tr: FznTranslator,
         else:
             continue  # array literal, not a named variable array
 
-        # Get index domain
+        # Only propagate for fixed (singleton) indices — non-singleton means the
+        # position may not be accessed, so the element constraint can't restrict it.
         let idxName = presolveVarName(con.args[0])
-        var idxDom: seq[int]
-        if idxName != "" and idxName in domains:
-            idxDom = domains[idxName]
+        var idxVal: int
+        if idxName != "" and idxName in fixedVars:
+            idxVal = fixedVars[idxName]
+        elif idxName != "" and idxName in domains and domains[idxName].len == 1:
+            idxVal = domains[idxName][0]
         elif tr.presolveIsFixed(con.args[0], fixedVars):
-            idxDom = @[tr.presolveResolve(con.args[0], fixedVars)]
+            idxVal = tr.presolveResolve(con.args[0], fixedVars)
         else:
-            continue
+            continue  # non-singleton index: can't prune array element
 
         # Get result domain bounds
         let valName = presolveVarName(con.args[2])
@@ -2351,20 +2349,23 @@ proc varElementArrayBackwardPropagate(tr: FznTranslator,
         else:
             continue
 
-        # Record this element's access to each array position
-        if arrIdent notin arrayAccessors:
-            arrayAccessors[arrIdent] = initTable[int, seq[AccessInfo]]()
+        let arrIdx = idxVal - idxOffset
+        if arrIdx < 0: continue
 
-        for idx in idxDom:
-            let arrIdx = idx - idxOffset
-            if arrIdx < 0: continue
-            if arrIdx notin arrayAccessors[arrIdent]:
-                arrayAccessors[arrIdent][arrIdx] = @[]
-            arrayAccessors[arrIdent][arrIdx].add(AccessInfo(resultLo: valLo, resultHi: valHi))
+        # Record/intersect bounds for this forced access
+        if arrIdent notin arrayAccessors:
+            arrayAccessors[arrIdent] = initTable[int, BoundsInfo]()
+
+        if arrIdx in arrayAccessors[arrIdent]:
+            # Multiple forced accesses: intersect bounds
+            arrayAccessors[arrIdent][arrIdx].reqLo = max(arrayAccessors[arrIdent][arrIdx].reqLo, valLo)
+            arrayAccessors[arrIdent][arrIdx].reqHi = min(arrayAccessors[arrIdent][arrIdx].reqHi, valHi)
+        else:
+            arrayAccessors[arrIdent][arrIdx] = BoundsInfo(reqLo: valLo, reqHi: valHi)
 
     if arrayAccessors.len == 0: return
 
-    # Step 2: Resolve array element names
+    # Step 2: Resolve array element names and apply domain restrictions
     var totalRemoved = 0
     for arrIdent, posAccessors in arrayAccessors:
         # Resolve the array to get element variable names from model declarations
@@ -2377,43 +2378,31 @@ proc varElementArrayBackwardPropagate(tr: FznTranslator,
             else:
                 elemNames.add("")  # constant element, not a variable
 
-        for arrIdx, accessors in posAccessors:
+        for arrIdx, bounds in posAccessors:
             if arrIdx >= elemNames.len: continue
             let elemName = elemNames[arrIdx]
-            if elemName notin domains or elemName in fixedVars: continue
+            if elemName == "" or elemName notin domains or elemName in fixedVars: continue
 
-            # Compute intersection of result bounds: the tightest requirement
-            var reqLo = low(int)
-            var reqHi = high(int)
-            for acc in accessors:
-                reqLo = max(reqLo, acc.resultLo)
-                reqHi = min(reqHi, acc.resultHi)
+            if bounds.reqLo > bounds.reqHi:
+                # Conflicting forced requirements — provably infeasible
+                infeasible = true
+                return
 
-            if reqLo > reqHi: continue  # conflicting requirements, skip
-
-            # Tighten: remove values between domain_min and reqLo
-            # This preserves domain_min (sentinel like 0 for unused) and values >= reqLo
+            # Standard intersection: keep only values in [reqLo, reqHi]
             let elemDom = domains[elemName]
             if elemDom.len == 0: continue
-            let domMin = elemDom[0]
 
-            if reqLo > domMin + 1:
-                # There's a gap between the sentinel (domMin) and the required range
-                var newDom: seq[int]
-                for v in elemDom:
-                    if v == domMin or v >= reqLo:
-                        if reqHi < high(int):
-                            if v == domMin or v <= reqHi:
-                                newDom.add(v)
-                        else:
-                            newDom.add(v)
-                if newDom.len < elemDom.len:
-                    totalRemoved += elemDom.len - newDom.len
-                    domains[elemName] = newDom
-                    result = true
-                    if newDom.len == 0:
-                        infeasible = true
-                        return
+            var newDom: seq[int]
+            for v in elemDom:
+                if v >= bounds.reqLo and v <= bounds.reqHi:
+                    newDom.add(v)
+            if newDom.len < elemDom.len:
+                totalRemoved += elemDom.len - newDom.len
+                domains[elemName] = newDom
+                result = true
+                if newDom.len == 0:
+                    infeasible = true
+                    return
 
     if totalRemoved > 0:
         stderr.writeLine(&"[Presolve] Element array backward: {totalRemoved} domain values removed")
