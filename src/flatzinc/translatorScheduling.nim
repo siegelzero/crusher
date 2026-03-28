@@ -3370,7 +3370,8 @@ proc detectMultiResourceNoOverlapPairs*(tr: var FznTranslator) =
 proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
     ## Detect the multi-machine no-overlap pattern:
     ## Multiple fzn_cumulative constraints with limit=1 sharing start/duration arrays,
-    ## where heights are bool2int(int_eq_reif(machineVar, machineValue)).
+    ## where heights are bool2int(int_eq_reif(machineVar, machineValue)) or equivalently
+    ## linked through int_eq_reif + bool_clause chains (if-then-else encoding).
     ## Replaces N cumulatives + O(N*M) reification channels with a single constraint.
 
     # Step 1: Build defines_var lookup: output_varname → constraint index
@@ -3381,6 +3382,36 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
             let ann = con.getAnnotation("defines_var")
             if ann.args.len > 0 and ann.args[0].kind == FznIdent:
                 definesVarMap[ann.args[0].ident] = ci
+
+    # Step 1b: Build indices for the alternate encoding path:
+    # int_eq_reif(var, val, boolOut) :: defines_var(boolOut)
+    # Map (input_var, compared_value) → (output_bool, constraint_index)
+    var eqReifByInput: Table[(string, int), (string, int)]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIntLit: continue
+        if con.args[2].kind != FznIdent: continue
+        eqReifByInput[(con.args[0].ident, con.args[1].intVal)] = (con.args[2].ident, ci)
+
+    # Build bool_clause implication index for single-literal clauses:
+    # bool_clause([posLit], [negLit]) means negLit → posLit
+    # Map: posLit → (negLit, constraint_index)
+    var boolImpliedBy: Table[string, (string, int)]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1 or negArg.elems.len != 1: continue
+        if posArg.elems[0].kind != FznIdent or negArg.elems[0].kind != FznIdent: continue
+        # bool_clause([pos], [neg]) means neg → pos
+        boolImpliedBy[posArg.elems[0].ident] = (negArg.elems[0].ident, ci)
 
     # Step 2: Find all fzn_cumulative constraints with constant limit=1
     type CumulativeInfo = object
@@ -3401,7 +3432,19 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
         try:
             durations = tr.resolveIntArray(con.args[1])
         except CatchableError:
-            continue
+            # Duration array may be declared as var but contain all constants
+            # (e.g., array of var int = [1,1,...,1]). Try resolving elements individually.
+            let durElems = tr.resolveVarArrayElems(con.args[1])
+            if durElems.len == 0: continue
+            var allConst = true
+            for e in durElems:
+                if e.kind == FznIntLit:
+                    durations.add(e.intVal)
+                elif e.kind == FznIdent and e.ident in tr.paramValues:
+                    durations.add(tr.paramValues[e.ident])
+                else:
+                    allConst = false; break
+            if not allConst: continue
         # Get start and height array elements
         let startElems = tr.resolveVarArrayElems(con.args[0])
         let heightElems = tr.resolveVarArrayElems(con.args[2])
@@ -3471,41 +3514,76 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
 
                 let heightVar = hElem.ident
 
-                # Trace: heightVar → bool2int(boolVar, heightVar)
-                if heightVar notin definesVarMap:
-                    patternValid = false
-                    break
-                let b2iCi = definesVarMap[heightVar]
-                let b2iCon = tr.model.constraints[b2iCi]
-                if stripSolverPrefix(b2iCon.name) != "bool2int":
-                    patternValid = false
-                    break
-                if b2iCon.args[1].kind != FznIdent or b2iCon.args[1].ident != heightVar:
-                    patternValid = false
-                    break
-                let boolVar = if b2iCon.args[0].kind == FznIdent: b2iCon.args[0].ident else: ""
-                if boolVar == "":
-                    patternValid = false
-                    break
+                var machineVar = ""
+                var machineVal = -1
+                var tracedBool2intCI = -1
+                var tracedReifCI = -1
+                var tracedIntermediateVars: seq[string]
+                var tracedExtraCIs: seq[int]  # additional consumed constraints (bool_clause, eq_reif)
 
-                # Trace: boolVar → int_eq_reif(machineVar, machineValue, boolVar)
-                if boolVar notin definesVarMap:
+                # Path A: heightVar → bool2int(boolVar, heightVar) → int_eq_reif(machineVar, val, boolVar)
+                block tracePathA:
+                    if heightVar notin definesVarMap: break tracePathA
+                    let b2iCi = definesVarMap[heightVar]
+                    let b2iCon = tr.model.constraints[b2iCi]
+                    if stripSolverPrefix(b2iCon.name) != "bool2int": break tracePathA
+                    if b2iCon.args[1].kind != FznIdent or b2iCon.args[1].ident != heightVar: break tracePathA
+                    let boolVar = if b2iCon.args[0].kind == FznIdent: b2iCon.args[0].ident else: ""
+                    if boolVar == "": break tracePathA
+                    if boolVar notin definesVarMap: break tracePathA
+                    let reifCi = definesVarMap[boolVar]
+                    let reifCon = tr.model.constraints[reifCi]
+                    if stripSolverPrefix(reifCon.name) != "int_eq_reif": break tracePathA
+                    if reifCon.args[2].kind != FznIdent or reifCon.args[2].ident != boolVar: break tracePathA
+                    if reifCon.args[0].kind != FznIdent or reifCon.args[1].kind != FznIntLit: break tracePathA
+                    machineVar = reifCon.args[0].ident
+                    machineVal = reifCon.args[1].intVal
+                    tracedBool2intCI = b2iCi
+                    tracedReifCI = reifCi
+                    tracedIntermediateVars = @[heightVar, boolVar]
+
+                # Path B: alternate encoding via int_eq_reif + bool_clause chain
+                # heightVar (domain 0..1) linked through:
+                #   int_eq_reif(heightVar, 1, boolH) :: defines_var(boolH)
+                #   bool_clause([boolH], [boolM])  — means boolM → boolH
+                #   int_eq_reif(machineVar, val, boolM) :: defines_var(boolM)
+                # Note: we only consume the height-side constraints. The machine-side
+                # reif and boolM are shared with disjunctive clauses and other patterns.
+                if machineVar == "":
+                    block tracePathB:
+                        let keyH1 = (heightVar, 1)
+                        if keyH1 notin eqReifByInput: break tracePathB
+                        let (boolH, eqReifHCi) = eqReifByInput[keyH1]
+                        # Find bool_clause([boolH], [boolM])
+                        if boolH notin boolImpliedBy: break tracePathB
+                        let (boolM, boolClauseCi) = boolImpliedBy[boolH]
+                        # Trace boolM to int_eq_reif(machineVar, val, boolM)
+                        if boolM notin definesVarMap: break tracePathB
+                        let reifCi = definesVarMap[boolM]
+                        let reifCon = tr.model.constraints[reifCi]
+                        if stripSolverPrefix(reifCon.name) != "int_eq_reif": break tracePathB
+                        if reifCon.args[2].kind != FznIdent or reifCon.args[2].ident != boolM: break tracePathB
+                        if reifCon.args[0].kind != FznIdent or reifCon.args[1].kind != FznIntLit: break tracePathB
+                        machineVar = reifCon.args[0].ident
+                        machineVal = reifCon.args[1].intVal
+                        tracedBool2intCI = -1  # no bool2int in this path
+                        tracedReifCI = -1  # don't consume machine-var reif (shared with other patterns)
+                        # Consume the height-side eq_reifs and bool_clause to prevent
+                        # them from creating channel cascades (which slow move evaluation).
+                        # The height vars become orphan search positions with no constraints,
+                        # which is cheaper than the cascade overhead.
+                        tracedIntermediateVars = @[]
+                        tr.channelVarNames.incl(heightVar)
+                        tracedExtraCIs = @[eqReifHCi, boolClauseCi]
+                        # Also consume the int_eq_reif(heightVar, 0, ...) if it exists
+                        let keyH0 = (heightVar, 0)
+                        if keyH0 in eqReifByInput:
+                            let (_, eqReifH0Ci) = eqReifByInput[keyH0]
+                            tracedExtraCIs.add(eqReifH0Ci)
+
+                if machineVar == "":
                     patternValid = false
                     break
-                let reifCi = definesVarMap[boolVar]
-                let reifCon = tr.model.constraints[reifCi]
-                if stripSolverPrefix(reifCon.name) != "int_eq_reif":
-                    patternValid = false
-                    break
-                if reifCon.args[2].kind != FznIdent or reifCon.args[2].ident != boolVar:
-                    patternValid = false
-                    break
-                # Extract machine variable and machine value
-                if reifCon.args[0].kind != FznIdent or reifCon.args[1].kind != FznIntLit:
-                    patternValid = false
-                    break
-                let machineVar = reifCon.args[0].ident
-                let machineVal = reifCon.args[1].intVal
 
                 # Check consistency: all tasks in all cumulatives should reference the same machineVar set
                 if machineVarInited[t]:
@@ -3525,10 +3603,14 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
                     thisMachineValue = machineVal
                     thisMachineValueSet = true
 
-                allBool2intCIs.add(b2iCi)
-                allReifCIs.add(reifCi)
-                allIntermediateVars.add(heightVar)
-                allIntermediateVars.add(boolVar)
+                if tracedBool2intCI >= 0:
+                    allBool2intCIs.add(tracedBool2intCI)
+                if tracedReifCI >= 0:
+                    allReifCIs.add(tracedReifCI)
+                for v in tracedIntermediateVars:
+                    allIntermediateVars.add(v)
+                for ci in tracedExtraCIs:
+                    allReifCIs.add(ci)
 
             if not patternValid: break
             if not thisMachineValueSet:

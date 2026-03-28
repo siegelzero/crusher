@@ -564,6 +564,50 @@ proc isLinTautological(tr: var FznTranslator, coeffs: seq[int], varArrayArg: Fzn
             maxLHS += coeffs[i] * lo
     return maxLHS <= rhs
 
+proc isLinNeTautological(tr: var FznTranslator, coeffs: seq[int], varArrayArg: FznExpr, rhs: int): bool =
+    ## Check if int_lin_ne(coeffs, vars, rhs) is tautological by computing
+    ## the achievable range [minLHS, maxLHS] of sum(coeffs*vars) from domain bounds.
+    ## Returns true if rhs is outside this range (the constraint is always satisfied).
+    var elems: seq[FznExpr]
+    case varArrayArg.kind
+    of FznArrayLit:
+        elems = varArrayArg.elems
+    of FznIdent:
+        if varArrayArg.ident in tr.arrayElementNames:
+            let names = tr.arrayElementNames[varArrayArg.ident]
+            for n in names:
+                elems.add(FznExpr(kind: FznIdent, ident: n))
+        else:
+            return false
+    else:
+        return false
+
+    if elems.len != coeffs.len:
+        return false
+
+    var minLHS = 0
+    var maxLHS = 0
+    for i in 0..<coeffs.len:
+        let (lo, hi, known) = tr.getExprBounds(elems[i])
+        if not known:
+            return false
+        if coeffs[i] > 0:
+            minLHS += coeffs[i] * lo
+            maxLHS += coeffs[i] * hi
+        else:
+            minLHS += coeffs[i] * hi
+            maxLHS += coeffs[i] * lo
+    return rhs < minLHS or rhs > maxLHS
+
+proc isNeTautological(tr: var FznTranslator, argA: FznExpr, argB: FznExpr): bool =
+    ## Check if int_ne(a, b) is tautological because the domain bounds of a and b
+    ## don't overlap (max(a) < min(b) or max(b) < min(a)).
+    let (loA, hiA, knownA) = tr.getExprBounds(argA)
+    let (loB, hiB, knownB) = tr.getExprBounds(argB)
+    if not knownA or not knownB:
+        return false
+    return hiA < loB or hiB < loA
+
 proc detectNandRedundancy*(tr: var FznTranslator) =
     ## Pre-compute NAND bool pairs and bool2int source mapping for
     ## detecting redundant int_lin_le constraints that duplicate bool_clause NANDs.
@@ -701,8 +745,13 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_lin_ne":
         let coeffs = tr.resolveIntArray(con.args[0])
-        let exprs = tr.resolveExprArray(con.args[1])
         let rhs = tr.resolveIntArg(con.args[2])
+
+        if tr.isLinNeTautological(coeffs, con.args[1], rhs):
+            inc tr.nSkippedTautological
+            return
+
+        let exprs = tr.resolveExprArray(con.args[1])
         let sp = scalarProduct[int](coeffs, exprs)
         tr.sys.addConstraint(sp != rhs)
 
@@ -756,26 +805,54 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         tr.sys.addConstraint(a == b)
 
     of "int_ne":
+        if tr.isNeTautological(con.args[0], con.args[1]):
+            inc tr.nSkippedTautological
+            return
+
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
         tr.sys.addConstraint(a != b)
 
     of "int_lt":
+        block:
+            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            if knownA and knownB and hiA < loB:
+                inc tr.nSkippedTautological
+                return
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
         tr.sys.addConstraint(a < b)
 
     of "int_le":
+        block:
+            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            if knownA and knownB and hiA <= loB:
+                inc tr.nSkippedTautological
+                return
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
         tr.sys.addConstraint(a <= b)
 
     of "int_gt":
+        block:
+            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            if knownA and knownB and loA > hiB:
+                inc tr.nSkippedTautological
+                return
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
         tr.sys.addConstraint(a > b)
 
     of "int_ge":
+        block:
+            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            if knownA and knownB and loA >= hiB:
+                inc tr.nSkippedTautological
+                return
         let a = tr.resolveExprArg(con.args[0])
         let b = tr.resolveExprArg(con.args[1])
         tr.sys.addConstraint(a >= b)
