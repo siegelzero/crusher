@@ -4,6 +4,9 @@ from std/times import epochTime
 import std/packedsets
 import ../constraints/[types, circuitTimeProp]
 
+when compileOption("threads"):
+    import parallelResolution
+
 proc copyPackedSet(src: PackedSet[int]): PackedSet[int] =
     ## Force a deep copy of a PackedSet to avoid shared Trunk refs under ARC.
     ## Nim 2.2.6's PackedSet.=copy is buggy: it doesn't clear dest.head before
@@ -52,21 +55,23 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       upperBound=high(int),
                       deadline: float = 0.0,
                       ) =
-        # Find initial feasible solution: tabu-only first (fast, capped at 1000), scatter fallback
-        try:
-            system.resolve(parallel=parallel, tabuThreshold=min(tabuThreshold, 1000),
-                          scatterThreshold=0,
-                          populationSize=populationSize, numWorkers=numWorkers,
-                          scatterStrategy=scatterStrategy, verbose=verbose,
-                          deadline=deadline)
-        except NoSolutionFoundError:
-            if verbose:
-                echo "[Opt] Tabu probe failed, retrying with scatter search"
-            system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
-                          scatterThreshold=scatterThreshold,
-                          populationSize=populationSize, numWorkers=numWorkers,
-                          scatterStrategy=scatterStrategy, verbose=verbose,
-                          deadline=deadline)
+        # Compute effective population size: 0 means auto-detect (2 * worker threads)
+        let effectivePopSize = when compileOption("threads"):
+            if populationSize > 0: populationSize
+            else:
+                let workers = if numWorkers > 0: numWorkers else: getOptimalWorkerCount()
+                workers * 2
+        else:
+            if populationSize > 0: populationSize else: 8
+
+        # Find initial feasible solution: single unified resolve with tabu + scatter fallback.
+        # Tabu probe runs first; if it fails, scatter search continues from the tabu pool
+        # without re-initialization.
+        system.resolve(parallel=parallel, tabuThreshold=min(tabuThreshold, 1000),
+                      scatterThreshold=max(scatterThreshold, 3),
+                      populationSize=effectivePopSize, numWorkers=numWorkers,
+                      scatterStrategy=scatterStrategy, verbose=verbose,
+                      deadline=deadline)
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
@@ -107,7 +112,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     try:
                         system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
                                       scatterThreshold=max(scatterThreshold, 3),
-                                      populationSize=populationSize, numWorkers=numWorkers,
+                                      populationSize=effectivePopSize, numWorkers=numWorkers,
                                       scatterStrategy=scatterStrategy, verbose=verbose,
                                       deadline=deadline)
                         domainResolved = true
@@ -201,7 +206,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     parallel=parallel,
                     tabuThreshold=tabuThreshold,
                     scatterThreshold=0,
-                    populationSize=populationSize,
+                    populationSize=effectivePopSize,
                     numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy,
                     verbose=verbose,
@@ -338,7 +343,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         parallel=parallel,
                         tabuThreshold=retryThreshold,
                         scatterThreshold=scatterThreshold,
-                        populationSize=populationSize,
+                        populationSize=effectivePopSize,
                         numWorkers=numWorkers,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
@@ -434,7 +439,7 @@ template algebraicWrapper(procName: untyped) =
                       parallel=true,
                       tabuThreshold=1000,
                       scatterThreshold=1,
-                      populationSize=32,
+                      populationSize=0,  # 0 = auto: 2 * worker threads
                       numWorkers=0,
                       scatterStrategy: ScatterStrategy = PathRelinking,
                       verbose=false,
