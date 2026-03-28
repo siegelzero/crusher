@@ -6101,11 +6101,14 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
     ## Must run after detectConditionalImplicationChannels() and detectBoolEquivalenceChannels().
 
     # Step 1: Build eq_reif reverse map: output bool var → (sourceVar, testVal)
+    # Scan ALL int_eq_reif constraints (not just reifChannelDefs) because
+    # some eq_reif outputs end up as definedVars rather than channels, but
+    # the semantic relationship (b ↔ x == val) is still needed for matching.
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
-    for ci in tr.reifChannelDefs:
-        let con = tr.model.constraints[ci]
+    for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
         if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
         eqReifMap[con.args[2].ident] = (sourceVar: con.args[0].ident, testVal: con.args[1])
 
@@ -6151,8 +6154,11 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
 
     var entriesByTarget = initTable[string, seq[GatedEntry]]()
 
+    # Scan ALL bool_clause constraints including consumed ones. Earlier passes
+    # (e.g. N-literal disjunctive clause detection) may consume clauses that are
+    # part of the gated pattern. The semantic checks below prevent false matches,
+    # and if gated detection succeeds, the disjunctive constraint becomes tautological.
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
         let posArg = con.args[0]
@@ -6244,12 +6250,13 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
     # Step 3: Pre-build lookup table for default-value bool_clause constraints.
     # Pattern: bool_clause([litA, litB], []) with 2 positive, 0 negative literals.
     # Index by each positive literal for O(1) lookup per target.
+    # Include consumed constraints: even if another detection pass (e.g. N-literal
+    # disjunctive clause) consumed the clause, the semantic relationship still holds.
     type DefaultClauseEntry = object
         ci: int
         litA, litB: string  # the two positive literals
     var defaultClausesByLit = initTable[string, seq[DefaultClauseEntry]]()
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
         let posArg = con.args[0]
@@ -6294,7 +6301,6 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
         for condVar in condEquivs:
             if condVar notin defaultClausesByLit: continue
             for clause in defaultClausesByLit[condVar]:
-                if clause.ci in tr.definingConstraints: continue
                 if clause.ci == entry.boolClauseCI: continue
                 # The other literal (not condVar) should be an eq_reif for target with constant
                 let otherLit = if clause.litA == condVar: clause.litB else: clause.litA
