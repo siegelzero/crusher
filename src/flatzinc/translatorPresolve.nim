@@ -696,6 +696,107 @@ proc allDiffPropagate(tr: FznTranslator,
                         if presolveRemoveValue(domains, vn, fv, infeasible):
                             result = true
 
+proc tryResolveReifBoolFromDomains(tr: FznTranslator,
+                                   boolVarName: string,
+                                   domains: Table[string, seq[int]],
+                                   fixedVars: Table[string, int],
+                                   eliminated: PackedSet[int],
+                                   reifDefMap: Table[string, int]): int =
+    ## Try to determine a boolean reification output's value from domain bounds.
+    ## Returns 0 (always false), 1 (always true), or -1 (undetermined).
+    ## Does NOT modify domains; caller should apply the result.
+    if boolVarName notin reifDefMap: return -1
+    let ci = reifDefMap[boolVarName]
+    if ci in eliminated: return -1
+    let con = tr.model.constraints[ci]
+    let name = stripSolverPrefix(con.name)
+
+    if name == "int_ne_reif" and con.args.len >= 3:
+        let xName = presolveVarName(con.args[0])
+        if tr.presolveIsFixed(con.args[1], fixedVars):
+            let val = tr.presolveResolve(con.args[1], fixedVars)
+            let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+            if xDom.len > 0:
+                if val notin xDom: return 1   # always not-equal
+                if xDom.len == 1 and xDom[0] == val: return 0  # always equal
+    elif name == "int_eq_reif" and con.args.len >= 3:
+        let xName = presolveVarName(con.args[0])
+        if tr.presolveIsFixed(con.args[1], fixedVars):
+            let val = tr.presolveResolve(con.args[1], fixedVars)
+            let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+            if xDom.len > 0:
+                if val notin xDom: return 0
+                if xDom.len == 1 and xDom[0] == val: return 1
+    elif name == "int_le_reif" and con.args.len >= 3:
+        var xLo, xHi, yLo, yHi: int
+        var xOk, yOk: bool
+        let xName = presolveVarName(con.args[0])
+        let yName = presolveVarName(con.args[1])
+        if tr.presolveIsFixed(con.args[0], fixedVars):
+            let v = tr.presolveResolve(con.args[0], fixedVars); xLo = v; xHi = v; xOk = true
+        elif xName != "" and xName in domains and domains[xName].len > 0:
+            xLo = domains[xName][0]; xHi = domains[xName][^1]; xOk = true
+        if tr.presolveIsFixed(con.args[1], fixedVars):
+            let v = tr.presolveResolve(con.args[1], fixedVars); yLo = v; yHi = v; yOk = true
+        elif yName != "" and yName in domains and domains[yName].len > 0:
+            yLo = domains[yName][0]; yHi = domains[yName][^1]; yOk = true
+        if xOk and yOk:
+            if xHi <= yLo: return 1   # always true
+            if xLo > yHi: return 0    # always false
+    elif name == "int_lt_reif" and con.args.len >= 3:
+        var xLo, xHi, yLo, yHi: int
+        var xOk, yOk: bool
+        let xName = presolveVarName(con.args[0])
+        let yName = presolveVarName(con.args[1])
+        if tr.presolveIsFixed(con.args[0], fixedVars):
+            let v = tr.presolveResolve(con.args[0], fixedVars); xLo = v; xHi = v; xOk = true
+        elif xName != "" and xName in domains and domains[xName].len > 0:
+            xLo = domains[xName][0]; xHi = domains[xName][^1]; xOk = true
+        if tr.presolveIsFixed(con.args[1], fixedVars):
+            let v = tr.presolveResolve(con.args[1], fixedVars); yLo = v; yHi = v; yOk = true
+        elif yName != "" and yName in domains and domains[yName].len > 0:
+            yLo = domains[yName][0]; yHi = domains[yName][^1]; yOk = true
+        if xOk and yOk:
+            if xHi < yLo: return 1
+            if xLo >= yHi: return 0
+    elif name == "int_lin_le_reif" and con.args.len >= 4:
+        var coeffsArg = con.args[0]
+        if coeffsArg.kind == FznIdent:
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == coeffsArg.ident and
+                   decl.value != nil and decl.value.kind == FznArrayLit:
+                    coeffsArg = decl.value; break
+        var varsArg = con.args[1]
+        if varsArg.kind == FznIdent:
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varsArg.ident and
+                   decl.value != nil and decl.value.kind == FznArrayLit:
+                    varsArg = decl.value; break
+        if coeffsArg.kind == FznArrayLit and varsArg.kind == FznArrayLit and
+           coeffsArg.elems.len == varsArg.elems.len and
+           tr.presolveIsFixed(con.args[2], fixedVars):
+            let rhs = tr.presolveResolve(con.args[2], fixedVars)
+            var totalMin, totalMax: int
+            var valid = true
+            for i in 0..<coeffsArg.elems.len:
+                if coeffsArg.elems[i].kind != FznIntLit: valid = false; break
+                let c = coeffsArg.elems[i].intVal
+                let vExpr = varsArg.elems[i]
+                var lo, hi: int
+                if tr.presolveIsFixed(vExpr, fixedVars):
+                    let v = tr.presolveResolve(vExpr, fixedVars); lo = v; hi = v
+                else:
+                    let vn = presolveVarName(vExpr)
+                    if vn != "" and vn in domains and domains[vn].len > 0:
+                        lo = domains[vn][0]; hi = domains[vn][^1]
+                    else: valid = false; break
+                if c > 0: totalMin += c * lo; totalMax += c * hi
+                elif c < 0: totalMin += c * hi; totalMax += c * lo
+            if valid:
+                if totalMax <= rhs: return 1
+                if totalMin > rhs: return 0
+    return -1
+
 proc resolveReifications(tr: FznTranslator,
                          domains: var Table[string, seq[int]],
                          fixedVars: var Table[string, int],
@@ -703,6 +804,20 @@ proc resolveReifications(tr: FznTranslator,
                          infeasible: var bool): bool =
     ## Check reified constraints and fix boolean result when domains determine truth value.
     result = false
+
+    # Build a map from reification output boolean name → defining constraint index.
+    # Used by bool_clause handler for chain propagation through reification.
+    var reifDefMap: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name in ["int_eq_reif", "int_ne_reif", "int_le_reif", "int_lt_reif"] and
+           con.args.len >= 3 and con.args[2].kind == FznIdent:
+            reifDefMap[con.args[2].ident] = ci
+        elif name in ["int_lin_le_reif", "int_lin_eq_reif", "int_lin_ne_reif"] and
+             con.args.len >= 4 and con.args[3].kind == FznIdent:
+            reifDefMap[con.args[3].ident] = ci
+
     for ci, con in tr.model.constraints:
         if infeasible: return
         if ci in eliminated: continue
@@ -1103,6 +1218,211 @@ proc resolveReifications(tr: FznTranslator,
                         eliminated.incl(ci)
                         result = true
 
+        # --- int_lin_le_reif(coeffs, vars, rhs, b): b <=> (sum(c_i * x_i) <= rhs) ---
+        # --- int_lin_eq_reif(coeffs, vars, rhs, b): b <=> (sum(c_i * x_i) == rhs) ---
+        elif (name == "int_lin_le_reif" or name == "int_lin_eq_reif" or
+              name == "int_lin_ne_reif") and con.args.len >= 4:
+            let isLeReif = name == "int_lin_le_reif"
+            let isEqReif = name == "int_lin_eq_reif"
+            # let isNeReif = name == "int_lin_ne_reif"
+            let bName = presolveVarName(con.args[3])
+            let bFixed = tr.presolveIsFixed(con.args[3], fixedVars) or
+                         (bName != "" and bName in domains and domains[bName].len == 1)
+            let bVal = if tr.presolveIsFixed(con.args[3], fixedVars):
+                           tr.presolveResolve(con.args[3], fixedVars)
+                       elif bName != "" and bName in domains and domains[bName].len == 1:
+                           domains[bName][0]
+                       else: -1
+
+            # Resolve coefficient and variable arrays
+            var coeffsArg = con.args[0]
+            if coeffsArg.kind == FznIdent:
+                let arrName = coeffsArg.ident
+                if arrName notin tr.paramValues:
+                    var found = false
+                    for decl in tr.model.parameters:
+                        if decl.isArray and decl.name == arrName:
+                            if decl.value != nil and decl.value.kind == FznArrayLit:
+                                coeffsArg = decl.value; found = true
+                            break
+                    if not found:
+                        for decl in tr.model.variables:
+                            if decl.isArray and decl.name == arrName:
+                                if decl.value != nil and decl.value.kind == FznArrayLit:
+                                    coeffsArg = decl.value; found = true
+                                break
+            if coeffsArg.kind == FznArrayLit:
+                var varsArg = con.args[1]
+                if varsArg.kind == FznIdent:
+                    var found = false
+                    for decl in tr.model.variables:
+                        if decl.isArray and decl.name == varsArg.ident:
+                            if decl.value != nil and decl.value.kind == FznArrayLit:
+                                varsArg = decl.value; found = true
+                            break
+                    if not found:
+                        for decl in tr.model.parameters:
+                            if decl.isArray and decl.name == varsArg.ident:
+                                if decl.value != nil and decl.value.kind == FznArrayLit:
+                                    varsArg = decl.value; found = true
+                                break
+                if varsArg.kind == FznArrayLit and
+                   coeffsArg.elems.len == varsArg.elems.len and
+                   tr.presolveIsFixed(con.args[2], fixedVars):
+                    let rhs = tr.presolveResolve(con.args[2], fixedVars)
+                    let nArgs = coeffsArg.elems.len
+
+                    # Collect per-variable info
+                    type LinReifVarInfo = object
+                        coeff: int
+                        varName: string
+                        fixed: bool
+                        fixedVal: int
+                        lo, hi: int
+                    var lvars = newSeq[LinReifVarInfo](nArgs)
+                    var valid = true
+                    for i in 0..<nArgs:
+                        if coeffsArg.elems[i].kind != FznIntLit:
+                            valid = false; break
+                        lvars[i].coeff = coeffsArg.elems[i].intVal
+                        let vExpr = varsArg.elems[i]
+                        lvars[i].varName = presolveVarName(vExpr)
+                        if tr.presolveIsFixed(vExpr, fixedVars):
+                            lvars[i].fixed = true
+                            lvars[i].fixedVal = tr.presolveResolve(vExpr, fixedVars)
+                            lvars[i].lo = lvars[i].fixedVal
+                            lvars[i].hi = lvars[i].fixedVal
+                        else:
+                            lvars[i].fixed = false
+                            if lvars[i].varName in domains:
+                                let dom = domains[lvars[i].varName]
+                                if dom.len == 0: valid = false; break
+                                lvars[i].lo = dom[0]
+                                lvars[i].hi = dom[^1]
+                            else:
+                                valid = false; break
+                    if valid:
+                        # Compute bounds on sum(c_i * x_i)
+                        var totalMin, totalMax: int
+                        for i in 0..<nArgs:
+                            let c = lvars[i].coeff
+                            if c > 0:
+                                totalMin += c * lvars[i].lo
+                                totalMax += c * lvars[i].hi
+                            elif c < 0:
+                                totalMin += c * lvars[i].hi
+                                totalMax += c * lvars[i].lo
+
+                        # Determine b from bounds
+                        if not bFixed and bName != "":
+                            if isLeReif:
+                                if totalMax <= rhs:
+                                    # sum always <= rhs → b = 1
+                                    if presolveTightenDomain(domains, bName, @[1], infeasible):
+                                        result = true
+                                elif totalMin > rhs:
+                                    # sum always > rhs → b = 0
+                                    if presolveTightenDomain(domains, bName, @[0], infeasible):
+                                        result = true
+                            elif isEqReif:
+                                if totalMin == rhs and totalMax == rhs:
+                                    # sum always == rhs → b = 1
+                                    if presolveTightenDomain(domains, bName, @[1], infeasible):
+                                        result = true
+                                elif totalMin > rhs or totalMax < rhs:
+                                    # sum never == rhs → b = 0
+                                    if presolveTightenDomain(domains, bName, @[0], infeasible):
+                                        result = true
+                            else:  # int_lin_ne_reif
+                                if totalMin == rhs and totalMax == rhs:
+                                    # sum always == rhs → ne is always false → b = 0
+                                    if presolveTightenDomain(domains, bName, @[0], infeasible):
+                                        result = true
+                                elif totalMin > rhs or totalMax < rhs:
+                                    # sum never == rhs → ne is always true → b = 1
+                                    if presolveTightenDomain(domains, bName, @[1], infeasible):
+                                        result = true
+
+                        # If b is fixed, propagate bounds to variables
+                        let bFixedNow = tr.presolveIsFixed(con.args[3], fixedVars) or
+                                        (bName != "" and bName in domains and domains[bName].len == 1)
+                        if bFixedNow:
+                            let bv = if tr.presolveIsFixed(con.args[3], fixedVars):
+                                         tr.presolveResolve(con.args[3], fixedVars)
+                                     else: domains[bName][0]
+                            if (isLeReif and bv == 1) or (isEqReif and bv == 1):
+                                # sum <= rhs (for LE) or sum == rhs (for EQ): tighten each variable
+                                for j in 0..<nArgs:
+                                    if lvars[j].fixed or lvars[j].varName == "": continue
+                                    let c = lvars[j].coeff
+                                    if c == 0: continue
+                                    var jMinC, jMaxC: int
+                                    if c > 0: jMinC = c * lvars[j].lo; jMaxC = c * lvars[j].hi
+                                    else: jMinC = c * lvars[j].hi; jMaxC = c * lvars[j].lo
+                                    let othersMin = totalMin - jMinC
+                                    # sum <= rhs: c*x <= rhs - othersMin
+                                    let slack = rhs - othersMin
+                                    if c > 0:
+                                        let ub = psFloorDiv(slack, c)
+                                        if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                  low(int), ub, infeasible):
+                                            result = true
+                                            lvars[j].hi = min(lvars[j].hi, ub)
+                                    elif c < 0:
+                                        let lb = -psFloorDiv(slack, -c)
+                                        if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                  lb, high(int), infeasible):
+                                            result = true
+                                            lvars[j].lo = max(lvars[j].lo, lb)
+                                    if isEqReif:
+                                        let othersMax = totalMax - jMaxC
+                                        let slack2 = rhs - othersMax
+                                        if c > 0:
+                                            let lb = psCeilDiv(slack2, c)
+                                            if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                      lb, high(int), infeasible):
+                                                result = true
+                                                lvars[j].lo = max(lvars[j].lo, lb)
+                                        elif c < 0:
+                                            let ub = -psCeilDiv(slack2, -c)
+                                            if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                      low(int), ub, infeasible):
+                                                result = true
+                                                lvars[j].hi = min(lvars[j].hi, ub)
+                                    # Update total bounds for subsequent variables
+                                    var newJMinC, newJMaxC: int
+                                    if c > 0: newJMinC = c * lvars[j].lo; newJMaxC = c * lvars[j].hi
+                                    else: newJMinC = c * lvars[j].hi; newJMaxC = c * lvars[j].lo
+                                    totalMin += newJMinC - jMinC
+                                    totalMax += newJMaxC - jMaxC
+                            elif isLeReif and bv == 0:
+                                # NOT(sum <= rhs) → sum > rhs → sum >= rhs + 1
+                                let newRhs = -(rhs + 1)  # -sum <= -(rhs+1)
+                                for j in 0..<nArgs:
+                                    if lvars[j].fixed or lvars[j].varName == "": continue
+                                    let c = -lvars[j].coeff  # negate coeffs for -sum <= newRhs
+                                    if c == 0: continue
+                                    var jMinC, jMaxC: int
+                                    if c > 0: jMinC = c * lvars[j].lo; jMaxC = c * lvars[j].hi
+                                    else: jMinC = c * lvars[j].hi; jMaxC = c * lvars[j].lo
+                                    var negTotalMin = 0
+                                    for i in 0..<nArgs:
+                                        let nc = -lvars[i].coeff
+                                        if nc > 0: negTotalMin += nc * lvars[i].lo
+                                        elif nc < 0: negTotalMin += nc * lvars[i].hi
+                                    let othersMin = negTotalMin - jMinC
+                                    let slack = newRhs - othersMin
+                                    if c > 0:
+                                        let ub = psFloorDiv(slack, c)
+                                        if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                  low(int), ub, infeasible):
+                                            result = true
+                                    elif c < 0:
+                                        let lb = -psFloorDiv(slack, -c)
+                                        if presolveRestrictBounds(domains, lvars[j].varName,
+                                                                  lb, high(int), infeasible):
+                                            result = true
+
         # --- bool_clause(pos, neg): OR(pos) v OR(NOT neg) ---
         elif name == "bool_clause" and con.args.len >= 2:
             if con.args[0].kind == FznArrayLit and con.args[1].kind == FznArrayLit:
@@ -1124,7 +1444,15 @@ proc resolveReifications(tr: FznTranslator,
                             elif domains[vn] == @[0]:
                                 discard  # this literal is false, skip
                             else:
-                                unfixedPos.add(vn)
+                                # Try to resolve through reification definition
+                                let reifVal = tr.tryResolveReifBoolFromDomains(
+                                    vn, domains, fixedVars, eliminated, reifDefMap)
+                                if reifVal == 1:
+                                    satisfied = true; break
+                                elif reifVal == 0:
+                                    discard  # effectively false, skip
+                                else:
+                                    unfixedPos.add(vn)
                 if not satisfied:
                     for e in negElems:
                         if tr.presolveIsFixed(e, fixedVars):
@@ -1138,7 +1466,15 @@ proc resolveReifications(tr: FznTranslator,
                                 elif domains[vn] == @[1]:
                                     discard  # NOT(1) = false, skip
                                 else:
-                                    unfixedNeg.add(vn)
+                                    # Try to resolve through reification
+                                    let reifVal = tr.tryResolveReifBoolFromDomains(
+                                        vn, domains, fixedVars, eliminated, reifDefMap)
+                                    if reifVal == 0:
+                                        satisfied = true; break  # NOT(false) = true
+                                    elif reifVal == 1:
+                                        discard  # NOT(true) = false, skip
+                                    else:
+                                        unfixedNeg.add(vn)
                 if satisfied:
                     if con.canEliminate:
                         eliminated.incl(ci)
