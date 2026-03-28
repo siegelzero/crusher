@@ -8375,3 +8375,304 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
 
         else:  # Minimize — skip for now (less common pattern)
             discard
+
+proc detectForwardBackwardEquivChannels*(tr: var FznTranslator) =
+    ## Detects boolean variables B equivalent to a disjunction of equality conditions,
+    ## established through forward + backward bool_clause implications:
+    ##
+    ##   Forward:  bool_clause([C1, ..., Ck], [B])    -- B -> OR(Ci)
+    ##   Backward: bool_clause([ne_reif(X,v), B], []) -- (X==v) -> B   (for each arm)
+    ##
+    ## Each forward arm Ci may be:
+    ##   - Direct: int_eq_reif(X, v, Ci) with matching backward condition
+    ##   - AND-wrapped: array_bool_and([..., eq_reif(X,v), ...], Ci) with matching backward
+    ##
+    ## When all arms have matching backward conditions: B <-> OR(backward conditions).
+    ## B becomes a channel with a constant {0,1} lookup table indexed by source variables.
+
+    # === Phase 1: Build reverse indexes ===
+
+    # 1a. neReifMap: ne_var_name -> (condVar, condVal)
+    #     from int_ne_reif(X, v, ne_var) in reifChannelDefs
+    var neReifMap: Table[string, tuple[condVar: string, condVal: int]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_ne_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let condVal = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        neReifMap[con.args[2].ident] = (condVar: con.args[0].ident, condVal: condVal)
+
+    # 1b. eqReifMap: eq_var_name -> (sourceVar, testVal)
+    #     from int_eq_reif(X, v, eq_var) in reifChannelDefs
+    var eqReifMap: Table[string, tuple[sourceVar: string, testVal: int]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let testVal = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        eqReifMap[con.args[2].ident] = (sourceVar: con.args[0].ident, testVal: testVal)
+
+    # 1c. andInputs: and_result -> [member names]
+    #     from array_bool_and([...], and_result) in boolAndOrChannelDefs
+    var andInputs: Table[string, seq[string]]
+    for ci in tr.boolAndOrChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_and": continue
+        if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+        let elems = tr.resolveVarArrayElems(con.args[0])
+        var names: seq[string]
+        for e in elems:
+            if e.kind == FznIdent: names.add(e.ident)
+        if names.len > 0:
+            andInputs[con.args[1].ident] = names
+
+    if neReifMap.len == 0: return
+
+    # 1d. backwardByTarget: B -> [(condVar, condVal, clauseIdx)]
+    #     from unconsumed bool_clause([ne_var, B], []) where ne_var in neReifMap
+    type BackwardEntry = object
+        condVar: string
+        condVal: int
+        clauseIdx: int
+
+    var backwardByTarget: Table[string, seq[BackwardEntry]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 2 or negArg.elems.len != 0: continue
+        let a = posArg.elems[0]
+        let b = posArg.elems[1]
+        if a.kind != FznIdent or b.kind != FznIdent: continue
+        # Check both orderings: ne_reif could be either element
+        for (neCandidate, bCandidate) in [(a.ident, b.ident), (b.ident, a.ident)]:
+            if neCandidate in neReifMap:
+                let info = neReifMap[neCandidate]
+                backwardByTarget.mgetOrPut(bCandidate, @[]).add(
+                    BackwardEntry(condVar: info.condVar, condVal: info.condVal, clauseIdx: ci))
+
+    if backwardByTarget.len == 0: return
+
+    # === Phase 2: Scan forward clauses and verify arms ===
+
+    var nDetected, nConsumed = 0
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 1: continue  # exactly 1 negative literal (B)
+        if posArg.elems.len < 1: continue
+        let bElem = negArg.elems[0]
+        if bElem.kind != FznIdent: continue
+        let bName = bElem.ident
+
+        # B must not already be a channel, defined var, or param
+        if bName in tr.channelVarNames: continue
+        if bName in tr.definedVarNames: continue
+        if bName in tr.paramValues: continue
+
+        # B must have backward implications
+        if bName notin backwardByTarget: continue
+        let backwards = backwardByTarget[bName]
+
+        # Build a quick lookup of backward conditions for B
+        var backwardSet: HashSet[string]  # "condVar\tcondVal" for fast matching
+        for bw in backwards:
+            backwardSet.incl(bw.condVar & "\t" & $bw.condVal)
+
+        # Verify each forward arm
+        var allArmsVerified = true
+        var matchedBackwardCIs: seq[int]  # clause indices of matched backward entries
+
+        for armElem in posArg.elems:
+            if armElem.kind != FznIdent:
+                allArmsVerified = false
+                break
+
+            let armName = armElem.ident
+            var armVerified = false
+
+            # Case 1: arm is an AND — check if any member's eq_reif matches a backward condition
+            if armName in andInputs:
+                for member in andInputs[armName]:
+                    if member in eqReifMap:
+                        let info = eqReifMap[member]
+                        let key = info.sourceVar & "\t" & $info.testVal
+                        if key in backwardSet:
+                            armVerified = true
+                            # Find the matching backward clause to consume
+                            for bw in backwards:
+                                if bw.condVar == info.sourceVar and bw.condVal == info.testVal:
+                                    if bw.clauseIdx notin matchedBackwardCIs:
+                                        matchedBackwardCIs.add(bw.clauseIdx)
+                                    break
+                            break
+
+            # Case 2: arm is directly an eq_reif
+            if not armVerified and armName in eqReifMap:
+                let info = eqReifMap[armName]
+                let key = info.sourceVar & "\t" & $info.testVal
+                if key in backwardSet:
+                    armVerified = true
+                    for bw in backwards:
+                        if bw.condVar == info.sourceVar and bw.condVal == info.testVal:
+                            if bw.clauseIdx notin matchedBackwardCIs:
+                                matchedBackwardCIs.add(bw.clauseIdx)
+                            break
+
+            if not armVerified:
+                allArmsVerified = false
+                break
+
+        if not allArmsVerified: continue
+        if matchedBackwardCIs.len == 0: continue
+
+        # === Phase 3: Build lookup table ===
+
+        # Collect all backward conditions (not just the arm-matched ones — all are valid)
+        var sourceConditions: Table[string, seq[int]]  # sourceVar -> [values that make B=1]
+        var allBackwardCIs: seq[int]
+        for bw in backwards:
+            sourceConditions.mgetOrPut(bw.condVar, @[]).add(bw.condVal)
+            if bw.clauseIdx notin allBackwardCIs:
+                allBackwardCIs.add(bw.clauseIdx)
+
+        # Sort source variables for deterministic ordering
+        var sourceVarNames: seq[string]
+        for sv in sourceConditions.keys:
+            sourceVarNames.add(sv)
+        sourceVarNames.sort()
+
+        # Trace source variables to ultimate search variables
+        var ultimateSourceNames: seq[string]
+        type SourceTrace = object
+            isDirect: bool
+            varName: string        # ultimate source var name
+            constArray: seq[int]   # for element channels: lookup array
+            offset: int            # for element channels: index offset
+
+        var sourceTraces: seq[SourceTrace]
+        var valid = true
+
+        for sv in sourceVarNames:
+            if sv in tr.constElementSources:
+                # Element channel: trace through to index variable
+                let src = tr.constElementSources[sv]
+                if src.indexVar in tr.definedVarNames or src.indexVar in tr.channelVarNames:
+                    valid = false
+                    break
+                sourceTraces.add(SourceTrace(isDirect: false, varName: src.indexVar,
+                    constArray: src.constArray, offset: 0))
+                ultimateSourceNames.add(src.indexVar)
+            elif sv notin tr.definedVarNames and sv notin tr.channelVarNames:
+                # Direct search variable
+                sourceTraces.add(SourceTrace(isDirect: true, varName: sv))
+                ultimateSourceNames.add(sv)
+            else:
+                valid = false
+                break
+
+        if not valid: continue
+        if ultimateSourceNames.len == 0: continue
+
+        # Check for duplicate ultimate source names (can't have same var as two dimensions)
+        var srcSet: HashSet[string]
+        var hasDup = false
+        for sn in ultimateSourceNames:
+            if sn in srcSet: hasDup = true; break
+            srcSet.incl(sn)
+        if hasDup: continue
+
+        # Get domains and compute table size
+        var domainOffsets, domainSizes: seq[int]
+        for sn in ultimateSourceNames:
+            let dom = tr.lookupVarDomain(sn)
+            if dom.len == 0: valid = false; break
+            domainOffsets.add(dom[0])
+            domainSizes.add(dom[^1] - dom[0] + 1)
+        if not valid: continue
+
+        var tableSize = 1
+        for ds in domainSizes:
+            if ds <= 0 or tableSize > 100_000 div max(1, ds):
+                valid = false
+                break
+            tableSize *= ds
+        if not valid or tableSize > 100_000 or tableSize <= 0: continue
+
+        # Build the lookup table (default 0)
+        var lookupTable = newSeq[int](tableSize)
+
+        # For each backward condition, set the appropriate entries to 1
+        for svIdx, sv in sourceVarNames:
+            let condVals = sourceConditions[sv]
+            let trace = sourceTraces[svIdx]
+            let dimIdx = ultimateSourceNames.find(trace.varName)
+            if dimIdx < 0: valid = false; break
+
+            for condVal in condVals:
+                # Determine which index values in the ultimate source correspond to this condition
+                var matchingIdxVals: seq[int]
+                if trace.isDirect:
+                    matchingIdxVals.add(condVal)
+                else:
+                    # Element channel: find all index values where constArray maps to condVal
+                    for i, v in trace.constArray:
+                        if v == condVal:
+                            matchingIdxVals.add(i + 1 + trace.offset)  # FZN 1-based indexing
+
+                # Set all table entries where this dimension has each matching value
+                for idxVal in matchingIdxVals:
+                    let relVal = idxVal - domainOffsets[dimIdx]
+                    if relVal < 0 or relVal >= domainSizes[dimIdx]: continue
+
+                    # Compute stride for this dimension
+                    var stride = 1
+                    for d in (dimIdx + 1) ..< domainSizes.len:
+                        stride *= domainSizes[d]
+                    let blockSize = stride  # entries per slice
+
+                    # Iterate over all entries where dimension dimIdx == relVal
+                    var outerStride = stride * domainSizes[dimIdx]
+                    var outerCount = tableSize div outerStride
+                    for outer in 0 ..< outerCount:
+                        let base = outer * outerStride + relVal * stride
+                        for inner in 0 ..< blockSize:
+                            let flatIdx = base + inner
+                            if flatIdx >= 0 and flatIdx < tableSize:
+                                lookupTable[flatIdx] = 1
+
+        if not valid: continue
+
+        # === Phase 4: Register channel and consume constraints ===
+
+        tr.caseAnalysisDefs.add(CaseAnalysisDef(
+            targetVarName: bName,
+            sourceVarNames: ultimateSourceNames,
+            lookupTable: lookupTable,
+            domainOffsets: domainOffsets,
+            domainSizes: domainSizes,
+            varEntries: initTable[int, CaseAnalysisVarEntry]()
+        ))
+        tr.channelVarNames.incl(bName)
+        tr.definingConstraints.incl(ci)  # forward clause
+        for bwCi in allBackwardCIs:
+            tr.definingConstraints.incl(bwCi)
+        inc nDetected
+        nConsumed += 1 + allBackwardCIs.len  # forward + all backward clauses
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Forward-backward equiv channels: {nDetected} detected, " &
+            &"{nConsumed} clauses consumed")

@@ -927,6 +927,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect overlap channels: overlap = NOT sep where sep is a bool_clause_reif channel
     # MUST run after detectReifChannels() (which populates boolNotChannelDefs)
     result.detectOverlapChannels()
+    # Detect forward-backward boolean equivalence channels: B <-> OR(equality conditions)
+    # from bool_clause(arms, [B]) + bool_clause([ne_reif, B], []) patterns.
+    # MUST run after detectReifChannels (needs ne/eq reif maps) and detectBoolAndChannels
+    # (needs AND definitions). Produces CaseAnalysisDef entries for existing binding builder.
+    result.detectForwardBackwardEquivChannels()
     # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
     # MUST run after detectReifChannels() and detectBoolAndChannels()
     result.detectConditionalImplicationChannels()
