@@ -395,6 +395,47 @@ solve satisfy;
       check counts[2] >= 2
       check counts[2] <= 4
 
+  test "GCC count channels: duplicate count variables are not channelized":
+    ## When all_equal(counts) is flattened, MiniZinc merges count variables
+    ## into a single variable appearing multiple times in the counts array.
+    ## A single channel position can only hold one value, so channelization
+    ## would lose the implicit equality constraint between different counts.
+    ## The GCC must fall through to normal decomposition instead.
+    let src = """
+var 1..4: x1 :: output_var;
+var 1..4: x2 :: output_var;
+var 1..4: x3 :: output_var;
+var 1..4: x4 :: output_var;
+var 1..4: x5 :: output_var;
+var 1..4: x6 :: output_var;
+array [1..6] of var int: xs :: var_is_introduced = [x1,x2,x3,x4,x5,x6];
+array [1..3] of int: cover = [2,3,4];
+var 0..2: cnt :: output_var;
+array [1..3] of var int: counts :: var_is_introduced = [cnt,cnt,cnt];
+array [1..16] of int: d = [1,2,3,4,2,2,0,0,3,0,3,0,4,0,0,4];
+constraint fzn_global_cardinality(xs,cover,counts);
+constraint fzn_regular(xs,4,4,d,1,1..4);
+solve maximize cnt;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # The GCC should NOT be channelized due to duplicate count positions
+    check tr.sys.baseArray.countEqChannelBindings.len == 0
+
+    # Solve and verify correctness: each army count must be equal
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+    check tr.sys.hasFeasibleSolution
+
+    let positions = tr.arrayPositions["xs"]
+    var valueCounts = [0, 0, 0, 0, 0]  # index by value 0..4
+    for pos in positions:
+      valueCounts[tr.sys.assignment[pos]] += 1
+
+    # All three army counts must be equal (the implicit constraint from merged variables)
+    check valueCounts[2] == valueCounts[3]
+    check valueCounts[3] == valueCounts[4]
+
 suite "FlatZinc Objective Bound Tightening":
 
   test "objective lower bound tightened for max(max-min) pattern":

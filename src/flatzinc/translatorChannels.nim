@@ -2647,6 +2647,21 @@ proc detectGccCountChannels(tr: var FznTranslator) =
                 allHavePos = false; break
         if not allHavePos: continue
 
+        # Skip if the same variable appears multiple times in the counts array.
+        # A single channel position can only hold one value, so it cannot simultaneously
+        # represent counts for different target values. The implicit equality between
+        # those counts would be lost. (e.g., all_equal(counts) flattened to repeated var)
+        var hasDuplicateCountPos = false
+        block:
+            var seen: PackedSet[int]
+            for cname in countNames:
+                let pos = tr.varPositions[cname]
+                if pos in seen:
+                    hasDuplicateCountPos = true
+                    break
+                seen.incl(pos)
+        if hasDuplicateCountPos: continue
+
         # Count variables may be referenced by downstream constraints (e.g., cnt <= limit).
         # This is fine: they become CountEq channels, and downstream constraints become
         # channel-dep constraints evaluated through the cascade system.
