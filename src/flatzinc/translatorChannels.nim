@@ -1,41 +1,5 @@
 ## Included from translator.nim -- not a standalone module.
 
-proc buildVarDomainIndex(tr: var FznTranslator) =
-    ## Build a hash table index from variable name to declaration index
-    ## for O(1) domain lookups instead of O(n) linear scans.
-    if tr.varDomainIndex.len > 0: return  # already built
-    for i, decl in tr.model.variables:
-        if decl.isArray: continue
-        tr.varDomainIndex[decl.name] = i
-
-proc lookupVarDomain(tr: var FznTranslator, varName: string): seq[int] =
-    ## Look up a variable's domain from the FznModel declarations.
-    tr.buildVarDomainIndex()
-    if varName in tr.varDomainIndex:
-        let decl = tr.model.variables[tr.varDomainIndex[varName]]
-        case decl.varType.kind
-        of FznIntRange:
-            return toSeq(decl.varType.lo..decl.varType.hi)
-        of FznIntSet:
-            return decl.varType.values
-        of FznBool:
-            return @[0, 1]
-        else:
-            return @[]
-    return @[]
-
-proc resolveActualDomain(tr: var FznTranslator, expr: AlgebraicExpression[int],
-                                                  identName: string): seq[int] =
-    ## Resolve the actual domain for an expression. If it maps to a single position,
-    ## use the base array's domain (which reflects aliasing). Otherwise fall back to
-    ## the FZN declaration domain via lookupVarDomain.
-    let positions = toSeq(expr.positions.items)
-    if positions.len == 1:
-        return tr.sys.baseArray.domain[positions[0]].sorted()
-    else:
-        return tr.lookupVarDomain(identName)
-
-
 proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
                                                       defs: var seq[int], label: string) =
     ## Un-channel skipped reif variables — they couldn't have bindings built due to
@@ -165,23 +129,18 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                     continue
 
                 indexExpr = xExpr - lo
-                for v in lo..hi:
-                    arrayElems.add(ArrayElement[int](isConstant: true,
-                            constantValue: if (v == val) == isEq: 1 else: 0))
+                arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                    if (v == val) == isEq: 1 else: 0)
 
         elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
             # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
             let xExpr = tr.resolveExprArg(xArg)
             let yExpr = tr.resolveExprArg(valArg)
-            let domainX = tr.resolveActualDomain(xExpr, xArg.ident)
-            let domainY = tr.resolveActualDomain(yExpr, valArg.ident)
+            let (domainX, loX, hiX) = tr.getActualDomainBounds(xExpr, xArg.ident)
+            let (domainY, loY, hiY) = tr.getActualDomainBounds(yExpr, valArg.ident)
             if domainX.len == 0 or domainY.len == 0:
                 skippedReifCIs.incl(ci)
                 continue
-            let loX = domainX[0]
-            let hiX = domainX[^1]
-            let loY = domainY[0]
-            let hiY = domainY[^1]
             let rangeX = hiX - loX + 1
             let rangeY = hiY - loY + 1
             # Guard against huge 2D tables (use ranges, not domain sizes, since we fill gaps)
@@ -190,14 +149,9 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 skippedReifCIs.incl(ci)
                 continue
 
-            # index = (x - lo_x) * range_y + (y - lo_y)
-            indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
-
-            # Build 2D equality table for full ranges (row-major: x varies in outer loop, y in inner)
-            for vx in loX..hiX:
-                for vy in loY..hiY:
-                    arrayElems.add(ArrayElement[int](isConstant: true,
-                            constantValue: if (vx == vy) == isEq: 1 else: 0))
+            indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
+            arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
+                if (vx == vy) == isEq: 1 else: 0)
         else:
             skippedReifCIs.incl(ci)
             continue
@@ -381,9 +335,9 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                     continue
 
                 indexExpr = xExpr - lo
-                for v in lo..hi:
-                    arrayElems.add(ArrayElement[int](isConstant: true,
-                            constantValue: if v in setAsHashSet: 1 else: 0))
+                let capturedSet = setAsHashSet
+                arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                    if v in capturedSet: 1 else: 0)
         of FznIdent:
             # S is a set variable: b = element(x - lo, S.bools)
             let sName = setArg.ident
@@ -459,10 +413,10 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 skippedLeReifCIs.incl(ci)
                 continue
             indexExpr = xExpr - lo
-            for v in lo..hi:
-                let cmp = if isLe: (c <= v) else: (c < v)
-                arrayElems.add(ArrayElement[int](isConstant: true,
-                        constantValue: if cmp: 1 else: 0))
+            let capturedC = c
+            let capturedIsLe = isLe
+            arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                if (if capturedIsLe: capturedC <= v else: capturedC < v): 1 else: 0)
 
         elif not arg0IsConst and arg1IsConst:
             # int_le_reif(x, const, b): b = (x <= const) for le, b = (x < const) for lt
@@ -479,10 +433,10 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 skippedLeReifCIs.incl(ci)
                 continue
             indexExpr = xExpr - lo
-            for v in lo..hi:
-                let cmp = if isLe: (v <= c) else: (v < c)
-                arrayElems.add(ArrayElement[int](isConstant: true,
-                        constantValue: if cmp: 1 else: 0))
+            let capturedC = c
+            let capturedIsLe = isLe
+            arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                if (if capturedIsLe: v <= capturedC else: v < capturedC): 1 else: 0)
 
         elif not arg0IsConst and not arg1IsConst:
             # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
@@ -505,12 +459,10 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                   rangeX * rangeY > 100_000:
                 skippedLeReifCIs.incl(ci)
                 continue
-            indexExpr = (xExpr - loX) * rangeY + (yExpr - loY)
-            for vx in loX..hiX:
-                for vy in loY..hiY:
-                    let cmp = if isLe: (vx <= vy) else: (vx < vy)
-                    arrayElems.add(ArrayElement[int](isConstant: true,
-                            constantValue: if cmp: 1 else: 0))
+            indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
+            let capturedIsLe = isLe
+            arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
+                if (if capturedIsLe: vx <= vy else: vx < vy): 1 else: 0)
         else:
             # Both constant — skip
             skippedLeReifCIs.incl(ci)
@@ -950,10 +902,9 @@ proc buildOneHotChannelBindings(tr: var FznTranslator) =
         if hi - lo + 1 > 100_000: continue
         let indexExpr = intExpr - lo
 
-        var arrayElems: seq[ArrayElement[int]]
-        for v in lo..hi:
-            arrayElems.add(ArrayElement[int](isConstant: true,
-                    constantValue: if v == value: 1 else: 0))
+        let capturedValue = value
+        let arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+            if v == capturedValue: 1 else: 0)
 
         tr.sys.baseArray.addChannelBinding(indicatorPos, indexExpr, arrayElems)
 
@@ -1131,26 +1082,16 @@ proc buildIntModChannelBindings(tr: var FznTranslator) =
     ## Uses precomputed lookup tables from detectIntModChannels.
     var nBuilt = 0
     for def in tr.intModChannelDefs:
-        if def.varName notin tr.varPositions:
-            continue
+        if def.varName notin tr.varPositions: continue
         let channelPos = tr.varPositions[def.varName]
-
-        # Resolve origin variable: may be a position or a defined-var expression
-        var indexExpr: AlgebraicExpression[int]
-        if def.originVar in tr.varPositions:
-            indexExpr = tr.getExpr(tr.varPositions[def.originVar]) - def.offset
-        elif def.originVar in tr.definedVarExprs:
-            indexExpr = tr.definedVarExprs[def.originVar] - def.offset
-        else:
-            continue
-
+        let originExpr = try: tr.resolveVarOrExpr(def.originVar)
+                         except KeyError: continue
+        let indexExpr = originExpr - def.offset
         var arrayElems: seq[ArrayElement[int]]
         for v in def.lookupTable:
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
-
         tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
         inc nBuilt
-
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} int_mod channel bindings")
 
@@ -1159,26 +1100,16 @@ proc buildIntDivChannelBindings(tr: var FznTranslator) =
     ## Uses precomputed lookup tables from detectIntDivChannels.
     var nBuilt = 0
     for def in tr.intDivChannelDefs:
-        if def.varName notin tr.varPositions:
-            continue
+        if def.varName notin tr.varPositions: continue
         let channelPos = tr.varPositions[def.varName]
-
-        # Resolve origin variable: may be a position or a defined-var expression
-        var indexExpr: AlgebraicExpression[int]
-        if def.originVar in tr.varPositions:
-            indexExpr = tr.getExpr(tr.varPositions[def.originVar]) - def.offset
-        elif def.originVar in tr.definedVarExprs:
-            indexExpr = tr.definedVarExprs[def.originVar] - def.offset
-        else:
-            continue
-
+        let originExpr = try: tr.resolveVarOrExpr(def.originVar)
+                         except KeyError: continue
+        let indexExpr = originExpr - def.offset
         var arrayElems: seq[ArrayElement[int]]
         for v in def.lookupTable:
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: v))
-
         tr.sys.baseArray.addChannelBinding(channelPos, indexExpr, arrayElems)
         inc nBuilt
-
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} int_div channel bindings")
 
@@ -2752,13 +2683,8 @@ proc buildBoolAndChannelBindings*(tr: var FznTranslator) =
         var condExprs: seq[AlgebraicExpression[int]]
         var allValid = true
         for cName in pattern.condVars:
-            if cName in tr.varPositions:
-                condExprs.add(tr.getExpr(tr.varPositions[cName]))
-            elif cName in tr.definedVarExprs:
-                condExprs.add(tr.definedVarExprs[cName])
-            else:
-                allValid = false
-                break
+            try: condExprs.add(tr.resolveVarOrExpr(cName))
+            except KeyError: allValid = false; break
         if not allValid or condExprs.len == 0: continue
 
         # Build linear sum: c1 + c2 + ... + cn as AlgebraicExpression
@@ -2823,13 +2749,8 @@ proc buildConditionalImplicationChannelBindings*(tr: var FznTranslator) =
         var condExprs: seq[AlgebraicExpression[int]]
         var allValid = true
         for cName in def.condChannels:
-            if cName in tr.varPositions:
-                condExprs.add(tr.getExpr(tr.varPositions[cName]))
-            elif cName in tr.definedVarExprs:
-                condExprs.add(tr.definedVarExprs[cName])
-            else:
-                allValid = false
-                break
+            try: condExprs.add(tr.resolveVarOrExpr(cName))
+            except KeyError: allValid = false; break
         if not allValid or condExprs.len == 0: continue
 
         # weighted_sum = 0*cond_0 + 1*cond_1 + 2*cond_2 + ... + (N-1)*cond_{N-1}
@@ -2906,12 +2827,8 @@ proc buildBoolOrChannelBindings*(tr: var FznTranslator) =
         let targetPos = tr.varPositions[def.targetVar]
 
         # Get condition channel expression
-        let condExpr = if def.condChannel in tr.varPositions:
-            tr.getExpr(tr.varPositions[def.condChannel])
-        elif def.condChannel in tr.definedVarExprs:
-            tr.definedVarExprs[def.condChannel]
-        else:
-            continue
+        let condExpr = try: tr.resolveVarOrExpr(def.condChannel)
+                       except KeyError: continue
 
         # Get prev channel position
         if def.prevChannel notin tr.varPositions:

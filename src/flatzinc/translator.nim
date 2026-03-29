@@ -782,11 +782,16 @@ proc extractSetValues(value: FznExpr): seq[int] =
     else:
         return @[]
 
+include translatorHelpers
 include translatorCore
 include translatorPresolve
 include translatorDefinedVars
 include translatorChannels
+include translatorCountPatterns
+include translatorReifChannels
 include translatorPatterns
+include translatorCaseAnalysis
+include translatorBoolChannels
 include translatorScheduling
 include translatorCircuitTime
 

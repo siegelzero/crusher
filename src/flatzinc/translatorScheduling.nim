@@ -6,22 +6,8 @@ proc extractLinLeReifTerm(tr: FznTranslator, reifCi: int):
     let reifCon = tr.model.constraints[reifCi]
     let coeffs = try: tr.resolveIntArray(reifCon.args[0]) except ValueError, KeyError: return
     let rhs = try: tr.resolveIntArg(reifCon.args[2]) except ValueError, KeyError: return
-    let varArr = reifCon.args[1]
-    var varNames: seq[string]
-    case varArr.kind
-    of FznArrayLit:
-        for e in varArr.elems:
-            if e.kind == FznIdent:
-                varNames.add(e.ident)
-            else:
-                return
-    of FznIdent:
-        if varArr.ident in tr.arrayElementNames:
-            varNames = tr.arrayElementNames[varArr.ident]
-        else:
-            return
-    else: return
-    if varNames.len != coeffs.len: return
+    let varNames = tr.extractVarNames(reifCon.args[1])
+    if varNames.len == 0 or varNames.len != coeffs.len: return
     result = (ok: true, term: DisjunctiveClauseTerm(coeffs: coeffs, varNames: varNames, rhs: rhs))
 
 proc extractLeReifTerm(tr: FznTranslator, reifCi: int):
@@ -819,20 +805,8 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
                 let con = tr.model.constraints[lci]
                 let coeffs = tr.resolveIntArray(con.args[0])
                 let rhs = tr.resolveIntArg(con.args[2])
-                var varNames: seq[string]
-                let varArr = con.args[1]
-                var varExtractOk = true
-                if varArr.kind == FznArrayLit:
-                    for elem in varArr.elems:
-                        if elem.kind != FznIdent:
-                            varExtractOk = false
-                            break
-                        varNames.add(elem.ident)
-                elif varArr.kind == FznIdent and varArr.ident in tr.arrayElementNames:
-                    varNames = tr.arrayElementNames[varArr.ident]
-                else:
-                    varExtractOk = false
-                if not varExtractOk: continue
+                let varNames = tr.extractVarNames(con.args[1])
+                if varNames.len == 0: continue
 
                 # Substitute prod = k * largeVar
                 var newCoeffs: seq[int]
@@ -916,18 +890,8 @@ proc substituteChannelVarsInClauses(tr: var FznTranslator) =
         # Parse: int_lin_eq(coeffs, vars, rhs) meaning sum(c_i * v_i) = rhs
         let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
         let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
-        let varArr = con.args[1]
-        var varNames: seq[string]
-        case varArr.kind
-        of FznArrayLit:
-            for e in varArr.elems:
-                if e.kind == FznIdent: varNames.add(e.ident)
-                else: break
-        of FznIdent:
-            if varArr.ident in tr.arrayElementNames:
-                varNames = tr.arrayElementNames[varArr.ident]
-        else: continue
-        if varNames.len != coeffs.len: continue
+        let varNames = tr.extractVarNames(con.args[1])
+        if varNames.len == 0 or varNames.len != coeffs.len: continue
 
         # Find the defines_var in the variable list (should have coeff -1 or similar)
         var chIdx = -1
@@ -1315,20 +1279,8 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
             return (false, LegTrace())
 
         # Resolve variable names
-        var varNames: seq[string]
-        case varsArg.kind
-        of FznArrayLit:
-            for e in varsArg.elems:
-                if e.kind == FznIdent:
-                    varNames.add(e.ident)
-                else:
-                    return (false, LegTrace())
-        of FznIdent:
-            if varsArg.ident in tr.arrayElementNames:
-                varNames = tr.arrayElementNames[varsArg.ident]
-            else:
-                return (false, LegTrace())
-        else:
+        let varNames = tr.extractVarNames(varsArg)
+        if varNames.len == 0:
             return (false, LegTrace())
 
         if varNames.len != coeffs.len or varNames.len != 2:
