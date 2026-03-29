@@ -6,6 +6,8 @@
 
 accap_a4_f30_t15,2022/accap/accap.mzn,2022/accap/accap_a4_f30_t15.json,minimize,10000,103,200
 dcmst_v15_a105_d6,2022/diameterc-mst/dcmst.mzn,2022/diameterc-mst/c_v15_a105_d6.dzn,minimize,10000,314,500
+nfc_12_2_11,2022/nfc/nfc.mzn,2022/nfc/12_2_11.dzn,minimize,10000,784,784
+roster_sickness_small_4,2022/roster-sickness/bool-model-sickness.mzn,2022/roster-sickness/small-4.dzn,maximize,10000,14457,14457
 
 peaceable_queens_n8_q3,2022/generalized-peacable-queens/peaceable_queens.mzn,2022/generalized-peacable-queens/n8_q3.json,maximize,10000,1,4
 
