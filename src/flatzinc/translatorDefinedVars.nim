@@ -359,6 +359,26 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
         tr.definedVarExprs[definedName] = tr.resolveExprArg(a) * tr.resolveExprArg(b)
         return true
 
+    # Handle bool2int(b, x) :: defines_var(x) — x = b (both 0/1 integers)
+    # This occurs when count_eq pattern detection consumes the bool2int constraint
+    # but the indicator variable is still referenced by other constraints.
+    if name == "bool2int" and con.hasAnnotation("defines_var"):
+        if con.args.len < 2 or con.args[1].kind != FznIdent:
+            return true
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent:
+            return true
+        let defName = ann.args[0].ident
+        if defName in tr.definedVarExprs:
+            return true  # already built
+        let bArg = con.args[0]
+        if bArg.kind == FznIdent and bArg.ident in tr.definedVarNames and
+             bArg.ident notin tr.definedVarExprs and bArg.ident notin tr.varPositions and
+             bArg.ident notin tr.paramValues:
+            return false  # dependency not yet built
+        tr.definedVarExprs[defName] = tr.resolveExprArg(bArg)
+        return true
+
     # Only process defining constraints with defines_var
     if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times",
                                     "array_int_minimum", "array_int_maximum"] or

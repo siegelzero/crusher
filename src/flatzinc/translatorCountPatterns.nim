@@ -1,6 +1,36 @@
 ## Included from translator.nim -- not a standalone module.
 ## Count pattern detection: conditional counts, simple counts.
 
+proc buildVarRefConstraints(tr: FznTranslator): Table[string, PackedSet[int]] =
+    ## Builds a map: variable name → set of constraint indices that reference it.
+    ## Used to check if a variable is referenced outside a consumed pattern.
+    proc collectIdents(expr: FznExpr, result: var seq[string]) =
+        case expr.kind
+        of FznIdent:
+            result.add(expr.ident)
+        of FznArrayLit:
+            for e in expr.elems:
+                collectIdents(e, result)
+        else: discard
+    for ci, con in tr.model.constraints:
+        var idents: seq[string]
+        for arg in con.args:
+            collectIdents(arg, idents)
+        for id in idents:
+            if id notin result:
+                result[id] = initPackedSet[int]()
+            result[id].incl(ci)
+
+proc isReferencedOutside(varRefMap: Table[string, PackedSet[int]], varName: string,
+                         consumedCIs: PackedSet[int], patternCI: int): bool =
+    ## Returns true if varName is referenced by any constraint outside consumedCIs and patternCI.
+    if varName notin varRefMap:
+        return false
+    for ci in varRefMap[varName].items:
+        if ci != patternCI and ci notin consumedCIs:
+            return true
+    return false
+
 proc extractVarElems(tr: FznTranslator, vars: FznExpr): seq[FznExpr] =
     ## Extracts variable elements from an inline array literal or named array reference.
     if vars.kind == FznArrayLit:
@@ -65,6 +95,9 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
         elif name == "array_bool_and" and con.hasAnnotation("defines_var"):
             if con.args.len >= 2 and con.args[1].kind == FznIdent:
                 arrayBoolAndDefs[con.args[1].ident] = ci
+
+    # Build variable reference map for checking external references
+    let varRefMap = tr.buildVarRefConstraints()
 
     # Scan for int_lin_eq constraints that match the conditional count pattern.
     # Note: also check definingConstraints — collectDefinedVars may have claimed the
@@ -309,11 +342,17 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
             if targetIdent in tr.definedVarExprs:
                 tr.definedVarExprs.del(targetIdent)
 
-        # Mark consumed constraints and variable names
+        # Mark consumed constraints, but only eliminate variables not referenced elsewhere.
+        # Only the pattern's own consumed constraints are considered "safe" — other
+        # definingConstraints still resolve their inputs and need variables to be available.
+        var patternConsumed = initPackedSet[int]()
         for idx in consumedConstraints:
             tr.definingConstraints.incl(idx)
+            patternConsumed.incl(idx)
+        patternConsumed.incl(ci)  # the int_lin_eq itself
         for vn in consumedVarNames:
-            tr.definedVarNames.incl(vn)
+            if not varRefMap.isReferencedOutside(vn, patternConsumed, ci):
+                tr.definedVarNames.incl(vn)
 
         stderr.writeLine(&"[FZN] Detected conditional count_eq pattern: count_if({primaryVarNames.len} pairs + {directVarNames.len} direct, primary=={targetValue} AND filter=={filterValue}) + {constantOffset} -> {targetIdent}")
 
@@ -343,6 +382,9 @@ proc detectCountPatterns(tr: var FznTranslator) =
             # int_eq_reif(x, val, boolVar) :: defines_var(boolVar)
             if con.args.len >= 3 and con.args[2].kind == FznIdent:
                 intEqReifDefs[con.args[2].ident] = ci
+
+    # Build variable reference map for checking external references
+    let varRefMap = tr.buildVarRefConstraints()
 
     # Now scan for int_lin_eq constraints that match the pattern.
     # Note: we do NOT skip definingConstraints here — collectDefinedVars may have claimed
@@ -447,9 +489,14 @@ proc detectCountPatterns(tr: var FznTranslator) =
         for idx in consumedConstraints:
             tr.definingConstraints.incl(idx)  # the bool2int and int_eq_reif
 
-        # Mark intermediate variable names as defined (skip position creation)
+        # Mark intermediate variable names as defined, but only if not referenced elsewhere
+        var patternConsumed = initPackedSet[int]()
+        for idx in consumedConstraints:
+            patternConsumed.incl(idx)
+        patternConsumed.incl(ci)
         for vn in consumedVarNames:
-            tr.definedVarNames.incl(vn)
+            if not varRefMap.isReferencedOutside(vn, patternConsumed, ci):
+                tr.definedVarNames.incl(vn)
 
         stderr.writeLine(&"[FZN] Detected count_eq pattern: count({arrayVarNames.len} vars, {countValue}) == {targetName}")
 
@@ -552,11 +599,15 @@ proc detectCountPatterns(tr: var FznTranslator) =
             arrayVarNames: uncoveredArrayVarNames
         )
 
-        # Mark consumed constraints (idempotent for already-consumed ones)
+        # Mark consumed constraints, but only eliminate variables not referenced elsewhere
+        var patternConsumed = initPackedSet[int]()
         for idx in consumedConstraints:
             tr.definingConstraints.incl(idx)
+            patternConsumed.incl(idx)
+        patternConsumed.incl(ci)
         for vn in consumedVarNames:
-            tr.definedVarNames.incl(vn)
+            if not varRefMap.isReferencedOutside(vn, patternConsumed, ci):
+                tr.definedVarNames.incl(vn)
 
         stderr.writeLine(&"[FZN] Detected balanced count pattern: count({uncoveredArrayVarNames.len} vars, {uncoveredValue}) == {targetName} (balanced with value {coveredValue})")
 
@@ -665,10 +716,14 @@ proc detectCountPatterns(tr: var FznTranslator) =
                             inc nReduced
             # Mark the int_lin_eq as consumed (it's satisfied by domain reduction)
             tr.definingConstraints.incl(ci)
+            var patternConsumed = initPackedSet[int]()
+            patternConsumed.incl(ci)
             for idx in consumedConstraints:
                 tr.definingConstraints.incl(idx)
+                patternConsumed.incl(idx)
             for vn in consumedVarNames:
-                tr.definedVarNames.incl(vn)
+                if not varRefMap.isReferencedOutside(vn, patternConsumed, ci):
+                    tr.definedVarNames.incl(vn)
             if nReduced > 0:
                 stderr.writeLine(&"[FZN] Zero-count domain reduction: removed value {countValue} from {nReduced}/{arrayVarNames.len} variable domains")
         else:
@@ -681,9 +736,13 @@ proc detectCountPatterns(tr: var FznTranslator) =
             )
             # Mark the int_lin_eq and bool2int as consumed
             # Do NOT consume int_eq_reif — bool vars may be shared by other constraints
+            var patternConsumed2 = initPackedSet[int]()
+            patternConsumed2.incl(ci)
             for idx in consumedConstraints:
                 tr.definingConstraints.incl(idx)
+                patternConsumed2.incl(idx)
             for vn in consumedVarNames:
-                tr.definedVarNames.incl(vn)
+                if not varRefMap.isReferencedOutside(vn, patternConsumed2, ci):
+                    tr.definedVarNames.incl(vn)
             stderr.writeLine(&"[FZN] Detected constant count pattern: exactly({requiredCount}, {arrayVarNames.len} vars, {countValue})")
 
