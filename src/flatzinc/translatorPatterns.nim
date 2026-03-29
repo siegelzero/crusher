@@ -3580,64 +3580,117 @@ proc detectAtMostPairCliques(tr: var FznTranslator) =
             adjacency[pi.varB] = initTable[string, int]()
         adjacency[pi.varB][pi.varA] = idx
 
-    # Step 3: Greedy clique detection
-    # Variables are assigned to at most one clique. Uncovered pairwise constraints
-    # remain as individual 2-var atMost constraints, which provides valuable redundant
-    # penalty signal for the tabu search alongside the clique constraints.
-    var assigned: HashSet[string]
+    # Step 3: Find connected components via BFS, then detect cliques per component.
+    # Processing by component allows us to find ALL cliques in the graph rather than
+    # being limited by a global variable-exclusion set.
+    var visited: HashSet[string]
+    var components: seq[seq[string]]
 
-    # Sort variables by degree (highest first) for better clique detection
-    var varsByDegree: seq[(int, string)]
-    for v, partners in adjacency:
-        varsByDegree.add((partners.len, v))
-    varsByDegree.sort(proc(a, b: (int, string)): int = -cmp(a[0], b[0]))
+    for startVar in adjacency.keys:
+        if startVar in visited:
+            continue
+        var component: seq[string]
+        var queue = @[startVar]
+        visited.incl(startVar)
+        while queue.len > 0:
+            let v = queue[0]
+            queue.delete(0)
+            component.add(v)
+            for neighbor in adjacency[v].keys:
+                if neighbor notin visited:
+                    visited.incl(neighbor)
+                    queue.add(neighbor)
+        components.add(component)
 
+    # Step 4: For each component, detect cliques
     var totalConsumed = 0
     var totalVars = 0
 
-    for (_, startVar) in varsByDegree:
-        if startVar in assigned:
+    for component in components:
+        if component.len < 3:
             continue
 
-        # Build clique starting from startVar
-        var clique = @[startVar]
-        var candidates: seq[string]
-        for partner in adjacency[startVar].keys:
-            if partner notin assigned:
-                candidates.add(partner)
+        # Count edges in this component
+        var edgeCount = 0
+        for v in component:
+            for partner in adjacency[v].keys:
+                if partner in adjacency and partner > v:
+                    # Only count each edge once (canonical direction)
+                    if partner in adjacency[v]:
+                        inc edgeCount
+        let maxEdges = component.len * (component.len - 1) div 2
 
-        # Sort candidates by degree (descending) to prefer high-connectivity nodes
-        candidates.sort(proc(a, b: string): int =
-            -cmp(adjacency[a].len, adjacency[b].len))
+        if edgeCount == maxEdges:
+            # Perfect clique — emit single N-var atMost-1 and consume all pairs
+            tr.atMostPairCliques.add(component)
+            totalVars += component.len
+            for i in 0..<component.len:
+                for j in (i+1)..<component.len:
+                    let a = component[i]
+                    let b = component[j]
+                    let canonA = if a < b: a else: b
+                    let canonB = if a < b: b else: a
+                    if canonB in adjacency.getOrDefault(canonA):
+                        let pairIdx = adjacency[canonA][canonB]
+                        tr.definingConstraints.incl(pairs[pairIdx].ci)
+                        inc totalConsumed
+        else:
+            # Non-perfect component: greedy clique decomposition within the component
+            var assigned: HashSet[string]
 
-        # Greedily add candidates connected to all current clique members
-        for candidate in candidates:
-            var connectedToAll = true
-            for member in clique:
-                if candidate notin adjacency.getOrDefault(member):
-                    connectedToAll = false
-                    break
-            if connectedToAll:
-                clique.add(candidate)
+            # Sort by degree within component (highest first)
+            var compByDegree: seq[(int, string)]
+            for v in component:
+                var degInComp = 0
+                for partner in adjacency[v].keys:
+                    # Adjacency already only has binary-var pairs, all are in some component
+                    inc degInComp
+                compByDegree.add((degInComp, v))
+            compByDegree.sort(proc(a, b: (int, string)): int = -cmp(a[0], b[0]))
 
-        if clique.len < 3:
-            # Only merge cliques of size >= 3 (2-var cliques are just original pairs)
-            continue
+            for (_, startVar) in compByDegree:
+                if startVar in assigned:
+                    continue
 
-        # Collect pair indices and mark consumed
-        for i in 0..<clique.len:
-            for j in (i+1)..<clique.len:
-                let a = clique[i]
-                let b = clique[j]
-                if b in adjacency.getOrDefault(a):
-                    let pairIdx = adjacency[a][b]
-                    tr.definingConstraints.incl(pairs[pairIdx].ci)
-                    inc totalConsumed
+                # Build clique starting from startVar
+                var clique = @[startVar]
+                var candidates: seq[string]
+                for partner in adjacency[startVar].keys:
+                    if partner notin assigned:
+                        candidates.add(partner)
 
-        for member in clique:
-            assigned.incl(member)
-        tr.atMostPairCliques.add(clique)
-        totalVars += clique.len
+                # Sort candidates by degree (descending) to prefer high-connectivity nodes
+                candidates.sort(proc(a, b: string): int =
+                    -cmp(adjacency[a].len, adjacency[b].len))
+
+                # Greedily add candidates connected to all current clique members
+                for candidate in candidates:
+                    var connectedToAll = true
+                    for member in clique:
+                        if candidate notin adjacency.getOrDefault(member):
+                            connectedToAll = false
+                            break
+                    if connectedToAll:
+                        clique.add(candidate)
+
+                if clique.len < 3:
+                    # Only merge cliques of size >= 3
+                    continue
+
+                # Collect pair indices and mark consumed
+                for i in 0..<clique.len:
+                    for j in (i+1)..<clique.len:
+                        let a = clique[i]
+                        let b = clique[j]
+                        if b in adjacency.getOrDefault(a):
+                            let pairIdx = adjacency[a][b]
+                            tr.definingConstraints.incl(pairs[pairIdx].ci)
+                            inc totalConsumed
+
+                for member in clique:
+                    assigned.incl(member)
+                tr.atMostPairCliques.add(clique)
+                totalVars += clique.len
 
     if tr.atMostPairCliques.len > 0:
         stderr.writeLine(&"[FZN] AtMost-1 clique merging: {tr.atMostPairCliques.len} cliques " &
@@ -3646,17 +3699,15 @@ proc detectAtMostPairCliques(tr: var FznTranslator) =
 
 
 proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
-    ## Tightens objective bounds using knapsack LP relaxation.
+    ## Tightens objective bounds using knapsack LP relaxation and at-most-1
+    ## clique covering.
     ##
-    ## When the objective is a linear sum over binary (0/1) variables and a
-    ## knapsack constraint (int_lin_le with positive weights) exists over a
-    ## subset of the same variables, the LP relaxation gives a tight upper
-    ## bound (maximize) or lower bound (minimize).
-    ##
-    ## LP relaxation: sort items by profit/weight ratio, greedily pack
-    ## integer items, then fractionally add the next item. This runs in
-    ## O(n log n) and provides a bound that can be orders of magnitude
-    ## tighter than the declared domain.
+    ## Handles two patterns:
+    ## 1. Pure binary: objective is sum over binary vars with knapsack constraints
+    ##    → LP relaxation (fractional knapsack) gives tight bound.
+    ## 2. Mixed binary/non-binary: objective has binary AND non-binary vars
+    ##    → Separate into binary part (bounded by at-most-1 cliques) and
+    ##      non-binary part (bounded by domain bounds).
 
     if tr.model.solve.kind notin {Minimize, Maximize}: return
     let isMaximize = tr.model.solve.kind == Maximize
@@ -3708,101 +3759,243 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
 
     if not objFound or objCoeffs.len == 0: return
 
-    # Step 2: Check that all objective variables are binary (domain {0,1}).
-    # Use presolveDomains if available (post-presolve), fall back to FZN domain.
-    var allBinary = true
-    for varName in objCoeffs.keys:
+    # Step 2: Classify objective variables as binary or non-binary.
+    var binaryCoeffs: Table[string, int]
+    var nonBinaryCoeffs: Table[string, int]
+    for varName, coeff in objCoeffs:
         var dom: seq[int]
         if varName in tr.presolveDomains:
             dom = tr.presolveDomains[varName]
         else:
             dom = tr.lookupVarDomain(varName)
-        if dom.len == 0 or dom.len > 2 or dom[0] < 0 or dom[^1] > 1:
-            allBinary = false
-            break
-    if not allBinary: return
+        if dom.len >= 1 and dom.len <= 2 and dom[0] >= 0 and dom[^1] <= 1:
+            binaryCoeffs[varName] = coeff
+        else:
+            nonBinaryCoeffs[varName] = coeff
 
-    # Step 3: Find knapsack constraints in the FZN model.
-    # Pattern: int_lin_le(weights, vars, capacity) where all weights > 0 and
-    # vars are a subset of the binary objective variables.
-    type KnapsackInfo = object
-        weights: Table[string, int]  # var name -> weight
-        capacity: int
+    # --- Path A: Pure binary → knapsack LP relaxation (original logic) ---
+    if nonBinaryCoeffs.len == 0 and binaryCoeffs.len > 0:
+        # Find knapsack constraints over the binary objective variables
+        type KnapsackInfo = object
+            weights: Table[string, int]
+            capacity: int
 
-    var knapsacks: seq[KnapsackInfo]
-    for ci, con in tr.model.constraints:
-        let name = stripSolverPrefix(con.name)
-        if name != "int_lin_le": continue
-        if con.args.len < 3: continue
+        var knapsacks: seq[KnapsackInfo]
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name != "int_lin_le": continue
+            if con.args.len < 3: continue
 
-        let coeffsArr = tr.resolveIntArray(con.args[0])
-        let varsArr = tr.resolveVarArrayElems(con.args[1])
-        let rhs = tr.resolveIntArg(con.args[2])
-        if coeffsArr.len != varsArr.len: continue
+            let coeffsArr = tr.resolveIntArray(con.args[0])
+            let varsArr = tr.resolveVarArrayElems(con.args[1])
+            let rhs = tr.resolveIntArg(con.args[2])
+            if coeffsArr.len != varsArr.len: continue
 
-        var valid = true
-        var ks: KnapsackInfo
-        ks.capacity = rhs
+            var valid = true
+            var ks: KnapsackInfo
+            ks.capacity = rhs
 
-        for vi, v in varsArr:
-            if v.kind != FznIdent:
-                valid = false; break
-            if coeffsArr[vi] <= 0:
-                valid = false; break
-            if v.ident notin objCoeffs:
-                valid = false; break
-            ks.weights[v.ident] = coeffsArr[vi]
-        if not valid or ks.weights.len < 3 or ks.capacity <= 0: continue
-        knapsacks.add(ks)
+            for vi, v in varsArr:
+                if v.kind != FznIdent:
+                    valid = false; break
+                if coeffsArr[vi] <= 0:
+                    valid = false; break
+                if v.ident notin binaryCoeffs:
+                    valid = false; break
+                ks.weights[v.ident] = coeffsArr[vi]
+            if not valid or ks.weights.len < 3 or ks.capacity <= 0: continue
+            knapsacks.add(ks)
 
-    if knapsacks.len == 0: return
+        for ks in knapsacks:
+            type Item = tuple[ratio: float, profit, weight: int]
+            var items: seq[Item]
+            for varName, weight in ks.weights:
+                let profit = binaryCoeffs[varName]
+                items.add((ratio: float(profit) / float(weight), profit: profit, weight: weight))
 
-    # Step 4: For each knapsack, compute LP relaxation bound.
-    for ks in knapsacks:
-        type Item = tuple[ratio: float, profit, weight: int]
-        var items: seq[Item]
-        for varName, weight in ks.weights:
-            let profit = objCoeffs[varName]
-            items.add((ratio: float(profit) / float(weight), profit: profit, weight: weight))
+            if items.len == 0: continue
 
-        if items.len == 0: continue
+            if isMaximize:
+                items.sort(proc(a, b: Item): int =
+                    if b.ratio > a.ratio: 1
+                    elif b.ratio < a.ratio: -1
+                    else: 0
+                )
+                var totalWeight = 0
+                var totalProfit = 0
+                var lpBound = 0.0
+                var allFit = true
+                for item in items:
+                    if item.profit <= 0: continue
+                    if totalWeight + item.weight <= ks.capacity:
+                        totalWeight += item.weight
+                        totalProfit += item.profit
+                    else:
+                        let remaining = ks.capacity - totalWeight
+                        lpBound = float(totalProfit) + float(item.profit) * float(remaining) / float(item.weight)
+                        allFit = false
+                        break
+                if allFit:
+                    lpBound = float(totalProfit)
+
+                var nonKsContrib = 0
+                for varName, coeff in binaryCoeffs:
+                    if varName notin ks.weights:
+                        nonKsContrib += max(0, coeff)
+
+                let upperBound = int(lpBound) + nonKsContrib + objConstant
+                if upperBound < tr.objectiveHiBound:
+                    stderr.writeLine(&"[FZN] Knapsack LP relaxation tightened objective upper bound: {tr.objectiveHiBound} → {upperBound}")
+                    tr.objectiveHiBound = upperBound
+            # Minimize: skip for now
+
+    # --- Path B: Mixed binary/non-binary → at-most-1 clique covering bound ---
+    if binaryCoeffs.len > 0:
+        # Collect at-most-1 constraints over binary objective variables from:
+        # 1. Explicit int_lin_le([1,1,...,1], [vars], 1) in the FZN model
+        # 2. Detected pairwise cliques (atMostPairCliques)
+        type AtMost1Group = seq[string]  # variable names in the at-most-1 set
+        var atMost1Groups: seq[AtMost1Group]
+
+        # Source 1: Explicit int_lin_le with all-1 coefficients and rhs=1
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name != "int_lin_le": continue
+            if con.args.len < 3: continue
+
+            let coeffsArr = tr.resolveIntArray(con.args[0])
+            if coeffsArr.len < 2: continue
+            let rhs = tr.resolveIntArg(con.args[2])
+            if rhs != 1: continue
+            var allOnes = true
+            for c in coeffsArr:
+                if c != 1: allOnes = false; break
+            if not allOnes: continue
+
+            let varsArr = tr.resolveVarArrayElems(con.args[1])
+            if varsArr.len != coeffsArr.len: continue
+
+            var group: AtMost1Group
+            var allBinaryObj = true
+            for v in varsArr:
+                if v.kind != FznIdent or v.ident notin binaryCoeffs:
+                    allBinaryObj = false; break
+                group.add(v.ident)
+            if allBinaryObj and group.len >= 2:
+                atMost1Groups.add(group)
+
+        # Source 2: Detected pairwise cliques
+        for clique in tr.atMostPairCliques:
+            var group: AtMost1Group
+            var allBinaryObj = true
+            for varName in clique:
+                if varName notin binaryCoeffs:
+                    allBinaryObj = false; break
+                group.add(varName)
+            if allBinaryObj and group.len >= 2:
+                atMost1Groups.add(group)
+
+        if atMost1Groups.len == 0: return
+
+        # Compute bound using greedy clique covering:
+        # For each at-most-1 group, at most 1 variable can be 1, contributing
+        # at most max(coeff_i) to the objective. Variables covered by any group
+        # are bounded; uncovered variables contribute individually.
+        var coveredVars: HashSet[string]
+        var groupContrib = 0  # contribution from covered groups
 
         if isMaximize:
-            # Sort by profit/weight ratio descending
-            items.sort(proc(a, b: Item): int =
-                if b.ratio > a.ratio: 1
-                elif b.ratio < a.ratio: -1
-                else: 0
+            # Sort groups by size descending (larger groups first to avoid
+            # suboptimal partial covering), then by max positive coeff descending.
+            var groupsWithMax: seq[(int, int, int)]  # (size, maxCoeff, index)
+            for gi, group in atMost1Groups:
+                var maxC = low(int)
+                for varName in group:
+                    maxC = max(maxC, binaryCoeffs[varName])
+                groupsWithMax.add((group.len, maxC, gi))
+            groupsWithMax.sort(proc(a, b: (int, int, int)): int =
+                result = -cmp(a[0], b[0])  # larger groups first
+                if result == 0:
+                    result = -cmp(a[1], b[1])  # then higher max coeff
             )
 
-            var totalWeight = 0
-            var totalProfit = 0
-            var lpBound = 0.0
-            var allFit = true
-            for item in items:
-                if item.profit <= 0: continue  # skip non-profitable items
-                if totalWeight + item.weight <= ks.capacity:
-                    totalWeight += item.weight
-                    totalProfit += item.profit
+            for (_, maxC, gi) in groupsWithMax:
+                let group = atMost1Groups[gi]
+                # Check if this group covers any new variable
+                var hasNew = false
+                for varName in group:
+                    if varName notin coveredVars:
+                        hasNew = true; break
+                if not hasNew: continue
+
+                # Find max coeff among UNCOVERED variables in this group
+                var bestCoeff = low(int)
+                for varName in group:
+                    if varName notin coveredVars:
+                        bestCoeff = max(bestCoeff, binaryCoeffs[varName])
+                if bestCoeff > 0:
+                    groupContrib += bestCoeff
+
+                for varName in group:
+                    coveredVars.incl(varName)
+
+            # Uncovered binary vars: each can contribute max(0, coeff)
+            var uncoveredContrib = 0
+            for varName, coeff in binaryCoeffs:
+                if varName notin coveredVars:
+                    uncoveredContrib += max(0, coeff)
+
+            # Non-binary vars: use domain bounds for best case
+            var nonBinaryContrib = 0
+            for varName, coeff in nonBinaryCoeffs:
+                var dom: seq[int]
+                if varName in tr.presolveDomains:
+                    dom = tr.presolveDomains[varName]
                 else:
-                    let remaining = ks.capacity - totalWeight
-                    lpBound = float(totalProfit) + float(item.profit) * float(remaining) / float(item.weight)
-                    allFit = false
-                    break
-            if allFit:
-                lpBound = float(totalProfit)
+                    dom = tr.lookupVarDomain(varName)
+                if dom.len == 0: continue
+                # For maximize: positive coeff wants max domain value, negative wants min
+                if coeff > 0:
+                    nonBinaryContrib += coeff * dom[^1]
+                elif coeff < 0:
+                    nonBinaryContrib += coeff * dom[0]
 
-            # Non-knapsack objective vars can take their best value
-            var nonKsContrib = 0
-            for varName, coeff in objCoeffs:
-                if varName notin ks.weights:
-                    nonKsContrib += max(0, coeff)
-
-            let upperBound = int(lpBound) + nonKsContrib + objConstant
+            let upperBound = groupContrib + uncoveredContrib + nonBinaryContrib + objConstant
             if upperBound < tr.objectiveHiBound:
-                stderr.writeLine(&"[FZN] Knapsack LP relaxation tightened objective upper bound: {tr.objectiveHiBound} → {upperBound}")
+                stderr.writeLine(&"[FZN] At-most-1 clique covering tightened objective upper bound: {tr.objectiveHiBound} → {upperBound}")
                 tr.objectiveHiBound = upperBound
 
-        else:  # Minimize — skip for now (less common pattern)
-            discard
+        else:  # Minimize
+            # Symmetric: for each at-most-1 group, at least max(1, #positiveCoeffs) contribute
+            # Minimum contribution per group = min(coeff_i) if all must contribute, else 0
+            # For now: just use domain bounds for non-binary part
+            var nonBinaryContrib = 0
+            for varName, coeff in nonBinaryCoeffs:
+                var dom: seq[int]
+                if varName in tr.presolveDomains:
+                    dom = tr.presolveDomains[varName]
+                else:
+                    dom = tr.lookupVarDomain(varName)
+                if dom.len == 0: continue
+                if coeff > 0:
+                    nonBinaryContrib += coeff * dom[0]
+                elif coeff < 0:
+                    nonBinaryContrib += coeff * dom[^1]
+
+            # Binary vars contribute at least 0 (they can all be 0)
+            # but some may be fixed to 1 — their contribution is the coeff
+            var fixedBinaryContrib = 0
+            for varName, coeff in binaryCoeffs:
+                var dom: seq[int]
+                if varName in tr.presolveDomains:
+                    dom = tr.presolveDomains[varName]
+                else:
+                    dom = tr.lookupVarDomain(varName)
+                if dom.len == 1 and dom[0] == 1:
+                    fixedBinaryContrib += coeff
+
+            let lowerBound = fixedBinaryContrib + nonBinaryContrib + objConstant
+            if lowerBound > tr.objectiveLoBound:
+                stderr.writeLine(&"[FZN] At-most-1 clique covering tightened objective lower bound: {tr.objectiveLoBound} → {lowerBound}")
+                tr.objectiveLoBound = lowerBound
 

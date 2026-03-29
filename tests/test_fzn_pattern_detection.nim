@@ -12,6 +12,11 @@ import std/[sequtils, algorithm, sets, tables, strutils, packedsets]
 import crusher
 import flatzinc/[parser, translator, output]
 
+proc getObjectiveExpr(tr: FznTranslator): AlgebraicExpression[int] =
+  if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+  elif tr.objectivePos == ObjPosDefinedExpr: tr.objectiveDefExpr
+  else: raise newException(ValueError, "No objective")
+
 suite "FlatZinc Count Pattern Detection":
 
     test "detectCountPatterns: int_lin_eq → bool2int → int_eq_reif chain":
@@ -2151,6 +2156,294 @@ solve satisfy;
         for name in ["b1", "b2", "b3"]:
             count += tr.sys.assignment[tr.varPositions[name]]
         check count <= 1
+
+
+suite "FlatZinc AtMost-1 Clique Component Detection":
+    ## Tests for the component-based clique detection improvement.
+    ## The detector finds connected components in the pairwise graph and
+    ## handles perfect cliques in O(n) and non-perfect components via greedy.
+
+    test "perfect clique of 5 detected as single component":
+        ## 5 binary vars with all C(5,2)=10 pairwise constraints → 1 clique of 5.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..1: x5 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x1,x4],1);
+constraint int_lin_le([1,1],[x1,x5],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+constraint int_lin_le([1,1],[x2,x4],1);
+constraint int_lin_le([1,1],[x2,x5],1);
+constraint int_lin_le([1,1],[x3,x4],1);
+constraint int_lin_le([1,1],[x3,x5],1);
+constraint int_lin_le([1,1],[x4,x5],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.atMostPairCliques.len == 1
+        check tr.atMostPairCliques[0].len == 5
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        var count = 0
+        for name in ["x1", "x2", "x3", "x4", "x5"]:
+            count += tr.sys.assignment[tr.varPositions[name]]
+        check count <= 1
+
+    test "two disjoint perfect cliques":
+        ## Two separate perfect cliques: {a1..a4} and {b1..b3}.
+        ## Component detection should find both independently.
+        let src = """
+var 0..1: a1 :: output_var;
+var 0..1: a2 :: output_var;
+var 0..1: a3 :: output_var;
+var 0..1: a4 :: output_var;
+var 0..1: b1 :: output_var;
+var 0..1: b2 :: output_var;
+var 0..1: b3 :: output_var;
+constraint int_lin_le([1,1],[a1,a2],1);
+constraint int_lin_le([1,1],[a1,a3],1);
+constraint int_lin_le([1,1],[a1,a4],1);
+constraint int_lin_le([1,1],[a2,a3],1);
+constraint int_lin_le([1,1],[a2,a4],1);
+constraint int_lin_le([1,1],[a3,a4],1);
+constraint int_lin_le([1,1],[b1,b2],1);
+constraint int_lin_le([1,1],[b1,b3],1);
+constraint int_lin_le([1,1],[b2,b3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.atMostPairCliques.len == 2
+        let sizes = @[tr.atMostPairCliques[0].len, tr.atMostPairCliques[1].len].sorted
+        check sizes == @[3, 4]
+
+    test "non-perfect component decomposed into cliques":
+        ## 7 vars forming two overlapping cliques: {x1..x4} complete, {x5..x7} complete,
+        ## connected by a single edge x4-x5 (not a single clique).
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..1: x5 :: output_var;
+var 0..1: x6 :: output_var;
+var 0..1: x7 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x1,x4],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+constraint int_lin_le([1,1],[x2,x4],1);
+constraint int_lin_le([1,1],[x3,x4],1);
+constraint int_lin_le([1,1],[x4,x5],1);
+constraint int_lin_le([1,1],[x5,x6],1);
+constraint int_lin_le([1,1],[x5,x7],1);
+constraint int_lin_le([1,1],[x6,x7],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # One connected component (not a perfect clique), greedy decomposition.
+        # Should find at least 2 cliques covering most of the 10 edges.
+        check tr.atMostPairCliques.len >= 2
+        var totalVars = 0
+        for clique in tr.atMostPairCliques:
+            check clique.len >= 3
+            totalVars += clique.len
+        check totalVars >= 6  # covers most of the 7 variables
+
+
+suite "FlatZinc Objective Bound Tightening":
+    ## Tests for the at-most-1 clique covering objective bound tightening.
+    ## When the objective is a linear combination of binary and non-binary vars,
+    ## at-most-1 constraints bound how many binary vars can be 1 simultaneously.
+
+    test "maximize pure binary with at-most-1 constraints tightens upper bound":
+        ## objective = x1 + x2 + x3 + x4 with at-most-1 on {x1,x2} and {x3,x4}
+        ## => max 2 (one from each group). Upper bound should be <= 2.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..4: objective :: is_defined_var;
+constraint int_lin_eq([1,1,1,1,-1],[x1,x2,x3,x4,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x3,x4],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.objectiveHiBound <= 2
+
+        let objExpr = tr.getObjectiveExpr()
+        tr.sys.maximize(objExpr,
+            parallel = true, tabuThreshold = 5000, verbose = false,
+            upperBound = tr.objectiveHiBound, lowerBound = tr.objectiveLoBound)
+        check tr.sys.hasFeasibleSolution
+        check objExpr.evaluate(tr.sys.assignment) == 2
+
+    test "mixed binary/non-binary objective tightens bound":
+        ## objective = 10*x1 + 10*x2 - abs_val, where abs_val >= 0.
+        ## at-most-1 on {x1,x2}: max binary contribution = 10 (best of one group).
+        ## abs_val has domain [0..100], coeff -1: contributes 0 at best.
+        ## Upper bound = 10 + 0 = 10.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..100: abs_val :: is_defined_var;
+var -100..20: objective :: is_defined_var;
+constraint int_lin_eq([10,10,-1,-1],[x1,x2,abs_val,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1],[x1,x2],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Upper bound: best binary = 10, abs_val coeff=-1 → contributes -1*0=0
+        check tr.objectiveHiBound <= 10
+
+    test "weighted binary with at-most-1 takes max coefficient":
+        ## objective = 5*x1 + 3*x2 + 7*x3 + 2*x4 with at-most-1 on all four.
+        ## Max contribution = max(5,3,7,2) = 7.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..17: objective :: is_defined_var;
+constraint int_lin_eq([5,3,7,2,-1],[x1,x2,x3,x4,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1,1,1],[x1,x2,x3,x4],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.objectiveHiBound <= 7
+
+        let objExpr = tr.getObjectiveExpr()
+        tr.sys.maximize(objExpr,
+            parallel = true, tabuThreshold = 5000, verbose = false,
+            upperBound = tr.objectiveHiBound, lowerBound = tr.objectiveLoBound)
+        check tr.sys.hasFeasibleSolution
+        check objExpr.evaluate(tr.sys.assignment) == 7
+
+    test "multiple at-most-1 groups sum max coefficients":
+        ## objective = 10*a1 + 8*a2 + 5*b1 + 3*b2 with at-most-1 on {a1,a2} and {b1,b2}.
+        ## Upper bound = max(10,8) + max(5,3) = 10 + 5 = 15.
+        let src = """
+var 0..1: a1 :: output_var;
+var 0..1: a2 :: output_var;
+var 0..1: b1 :: output_var;
+var 0..1: b2 :: output_var;
+var 0..26: objective :: is_defined_var;
+constraint int_lin_eq([10,8,5,3,-1],[a1,a2,b1,b2,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1],[a1,a2],1);
+constraint int_lin_le([1,1],[b1,b2],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.objectiveHiBound <= 15
+
+        let objExpr = tr.getObjectiveExpr()
+        tr.sys.maximize(objExpr,
+            parallel = true, tabuThreshold = 5000, verbose = false,
+            upperBound = tr.objectiveHiBound, lowerBound = tr.objectiveLoBound)
+        check tr.sys.hasFeasibleSolution
+        check objExpr.evaluate(tr.sys.assignment) == 15
+
+    test "uncovered binary vars contribute individually":
+        ## objective = 3*x1 + 3*x2 + 3*y with at-most-1 on {x1,x2} only.
+        ## y is uncovered, can be 1 freely.
+        ## Upper bound = max(3,3) + 3 = 6.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: y :: output_var;
+var 0..9: objective :: is_defined_var;
+constraint int_lin_eq([3,3,3,-1],[x1,x2,y,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1],[x1,x2],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.objectiveHiBound <= 6
+
+    test "pairwise cliques used for objective bound":
+        ## 3 binary vars with pairwise at-most-1 (clique of 3).
+        ## objective = 100*x1 + 200*x2 + 150*x3.
+        ## Clique detected → max = max(100,200,150) = 200.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..450: objective :: is_defined_var;
+constraint int_lin_eq([100,200,150,-1],[x1,x2,x3,objective],0) :: defines_var(objective);
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Clique detected
+        check tr.atMostPairCliques.len == 1
+        # Objective bound: max of {100,200,150} = 200
+        check tr.objectiveHiBound <= 200
+
+        let objExpr = tr.getObjectiveExpr()
+        tr.sys.maximize(objExpr,
+            parallel = true, tabuThreshold = 5000, verbose = false,
+            upperBound = tr.objectiveHiBound, lowerBound = tr.objectiveLoBound)
+        check tr.sys.hasFeasibleSolution
+        check objExpr.evaluate(tr.sys.assignment) == 200
+
+    test "no tightening without at-most-1 constraints":
+        ## objective = x1 + x2 + x3 with no at-most-1 constraints.
+        ## All 3 can be 1 → no tightening (original domain bound kept).
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..3: objective :: is_defined_var;
+constraint int_lin_eq([1,1,1,-1],[x1,x2,x3,objective],0) :: defines_var(objective);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # No at-most-1 constraints → bound stays at declared domain
+        check tr.objectiveHiBound >= 3
+
+    test "objective with constant offset":
+        ## objective = 100*x1 + 100*x2 + 500 with at-most-1 on {x1,x2}.
+        ## int_lin_eq([100,100,-1],[x1,x2,objective],-500) :: defines_var(objective)
+        ## means objective = 100*x1 + 100*x2 + 500.
+        ## Upper bound = 100 + 500 = 600.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 500..700: objective :: is_defined_var;
+constraint int_lin_eq([100,100,-1],[x1,x2,objective],-500) :: defines_var(objective);
+constraint int_lin_le([1,1],[x1,x2],1);
+solve maximize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.objectiveHiBound <= 600
 
 
 suite "FlatZinc Multi-Machine No-Overlap Detection":
