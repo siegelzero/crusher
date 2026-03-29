@@ -3267,8 +3267,6 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
 
     # Step 6: For each target, try to build a complete source map
     var nTargets = 0
-    var nConsumed = 0
-    var dbgNoCondMap = 0
     var dbgTooFewMapped = 0
     var dbgNoArray = 0
     var dbgOther = 0
@@ -3288,7 +3286,6 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
 
         # Find condition variable and source array
         var condVar = ""
-        var allValid = true
 
         type SourceEntry = object
             condVal: int

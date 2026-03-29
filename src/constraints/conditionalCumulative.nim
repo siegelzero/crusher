@@ -9,7 +9,7 @@
 #
 # Performance: O(duration) for initialize/updatePosition, O(min(|shift|, duration)) for moveDelta.
 
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, tables]
 
 type
   TaskCondition* = object

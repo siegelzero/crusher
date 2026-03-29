@@ -143,7 +143,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
 
             # Check if x var is itself a const-element channel — compose directly from upstream
             if xArg.kind == FznIdent:
-                let (canCompose, indexVar, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
+                let (canCompose, _, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
                 if canCompose:
                     indexExpr = adjustedIdx
                     for v in upDomain:
@@ -359,7 +359,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
 
             # Check if x var is itself a const-element channel — compose directly from upstream
             if xArg.kind == FznIdent:
-                let (canCompose, indexVar, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
+                let (canCompose, _, constArray, upDomain, adjustedIdx) = canComposeConstElement(tr, xArg.ident)
                 if canCompose:
                     indexExpr = adjustedIdx
                     for v in upDomain:
@@ -1013,7 +1013,7 @@ proc buildChannelBindings(tr: var FznTranslator) =
             let idxArgName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
             var didCompose = false
             if idxArgName.len > 0:
-                let (canCompose, indexVar, upstreamConstArray, upDomain, adjustedIdx) = canComposeConstElement(tr, idxArgName)
+                let (canCompose, _, upstreamConstArray, upDomain, adjustedIdx) = canComposeConstElement(tr, idxArgName)
                 if canCompose:
                     var composedArr: seq[int]
                     var valid = true

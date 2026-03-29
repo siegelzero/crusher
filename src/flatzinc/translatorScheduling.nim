@@ -56,7 +56,6 @@ proc extractEqReifTerms(tr: FznTranslator, reifCi: int):
     let con = tr.model.constraints[reifCi]
     let argX = con.args[0]
     let argV = con.args[1]
-    let xIsConst = argX.kind == FznIntLit or (argX.kind == FznIdent and argX.ident in tr.paramValues)
     let vIsConst = argV.kind == FznIntLit or (argV.kind == FznIdent and argV.ident in tr.paramValues)
     let xIsVar = argX.kind == FznIdent and argX.ident notin tr.paramValues
     let vIsVar = argV.kind == FznIdent and argV.ident notin tr.paramValues

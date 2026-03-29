@@ -161,7 +161,6 @@ proc computePenalties*[T](c: CircuitTimePropConstraint[T],
 
 
 proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
-    let n = c.n
     for i, pos in c.positionArray:
         let value = assignment[pos]
         c.predecessorOf[i] = int(value) - c.valueOffset

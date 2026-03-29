@@ -815,8 +815,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_lt":
         block:
-            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
-            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            let (_, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, _, knownB) = tr.getExprBounds(con.args[1])
             if knownA and knownB and hiA < loB:
                 inc tr.nSkippedTautological
                 return
@@ -826,8 +826,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_le":
         block:
-            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
-            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            let (_, hiA, knownA) = tr.getExprBounds(con.args[0])
+            let (loB, _, knownB) = tr.getExprBounds(con.args[1])
             if knownA and knownB and hiA <= loB:
                 inc tr.nSkippedTautological
                 return
@@ -837,8 +837,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_gt":
         block:
-            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
-            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            let (loA, _, knownA) = tr.getExprBounds(con.args[0])
+            let (_, hiB, knownB) = tr.getExprBounds(con.args[1])
             if knownA and knownB and loA > hiB:
                 inc tr.nSkippedTautological
                 return
@@ -848,8 +848,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
     of "int_ge":
         block:
-            let (loA, hiA, knownA) = tr.getExprBounds(con.args[0])
-            let (loB, hiB, knownB) = tr.getExprBounds(con.args[1])
+            let (loA, _, knownA) = tr.getExprBounds(con.args[0])
+            let (_, hiB, knownB) = tr.getExprBounds(con.args[1])
             if knownA and knownB and loA >= hiB:
                 inc tr.nSkippedTautological
                 return
