@@ -7,9 +7,10 @@
 accap_a4_f30_t15,2022/accap/accap.mzn,2022/accap/accap_a4_f30_t15.json,minimize,10000,103,200
 dcmst_v15_a105_d6,2022/diameterc-mst/dcmst.mzn,2022/diameterc-mst/c_v15_a105_d6.dzn,minimize,10000,314,500
 nfc_12_2_11,2022/nfc/nfc.mzn,2022/nfc/12_2_11.dzn,minimize,10000,784,784
-roster_sickness_small_4,2022/roster-sickness/bool-model-sickness.mzn,2022/roster-sickness/small-4.dzn,maximize,10000,14457,14457
-
 peaceable_queens_n8_q3,2022/generalized-peacable-queens/peaceable_queens.mzn,2022/generalized-peacable-queens/n8_q3.json,maximize,10000,1,4
+roster_sickness_small_4,2022/roster-sickness/bool-model-sickness.mzn,2022/roster-sickness/small-4.dzn,maximize,10000,14457,14457
+rotating_workforce_e30_s9,2022/rotating-workforce-scheduling/rotating-workforce-scheduling.mzn,2022/rotating-workforce-scheduling/rws-instance-e-30-s-9.dzn,satisfy,30000,,
+spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
 
 chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,25,25
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
@@ -25,6 +26,8 @@ ttp_n10_k3,2023/travelling-thief/ttp.mzn,2023/travelling-thief/data/n10_k3_c5000
 unit_commit_L3,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L3-T6G5L5.dzn,minimize,10000,75950,200000
 unit_commit_L7,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L7-T12G5L5.dzn,minimize,10000,130950,300000
 
+accap_a3_f20_t10,2024/accap/accap.mzn,2024/accap/accap_a3_f20_t10.json,minimize,10000,104,110
+
 groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86
 hitori_h5_1,2025/hitori/hitori.mzn,2025/hitori/h5-1.dzn,maximize,10000,17,17
@@ -36,6 +39,3 @@ tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
 work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,3000
 
-spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
-
-rotating_workforce_e30_s9,2022/rotating-workforce-scheduling/rotating-workforce-scheduling.mzn,2022/rotating-workforce-scheduling/rws-instance-e-30-s-9.dzn,satisfy,30000,,

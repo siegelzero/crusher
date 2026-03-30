@@ -2363,6 +2363,142 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
                 tr.sys.baseArray.setDomain(ceilingPos, newDom)
                 stderr.writeLine(&"[FZN] Diffn time profile: tightened '{def.ceilingVarName}' domain from {currentDom.len} to {newDom.len} values (>= {maxLoad})")
 
+        # Separated clustering bound for D upper bound.
+        # If spread patterns (airline groups) are detected, each group's flights can be
+        # packed into its own band of height = group peak load. Since bands don't overlap,
+        # D <= sum(group peaks). Any remaining (ungrouped) rectangles add their own peak.
+        # This is provably tight: S[a] >= peak_a - 1 always holds (from diffn), so
+        # objective >= D + sum(peak_a - 1), and at D = sum(peaks) the separated
+        # solution achieves exactly this bound.
+        block separatedClusteringBound:
+            if tr.spreadPatternDefs.len == 0: break separatedClusteringBound
+
+            # Build yName → rectangle index map for this diffn constraint
+            var yNameToRectIdx: Table[string, int]
+            for i, elem in yElems:
+                if elem.kind == FznIdent:
+                    yNameToRectIdx[elem.ident] = i
+
+            # Compute per-group peak loads
+            var groupedRectIndices: HashSet[int]
+            var sumGroupPeaks = 0
+            var nGroups = 0
+
+            # Compute time horizon for sweep-line
+            var tMax = 0
+            for i in 0..<xVals.len:
+                tMax = max(tMax, xVals[i] + dxVals[i])
+            if tMax <= 0: break separatedClusteringBound
+
+            for def in tr.spreadPatternDefs:
+                # Map spread sources to diffn rectangle indices
+                type GroupRect = tuple[rectIdx, xStart, xEnd, dy: int]
+                var groupRects: seq[GroupRect]
+                for srcIdx, srcName in def.sourceVarNames:
+                    if srcName in yNameToRectIdx:
+                        let ri = yNameToRectIdx[srcName]
+                        groupRects.add((rectIdx: ri,
+                                        xStart: xVals[ri],
+                                        xEnd: xVals[ri] + dxVals[ri],
+                                        dy: dyVals[ri]))
+                        groupedRectIndices.incl(ri)
+
+                if groupRects.len == 0: continue
+
+                # Compute group-only time profile
+                var profile = newSeq[int](tMax + 1)
+                for r in groupRects:
+                    for t in r.xStart ..< r.xEnd:
+                        profile[t] += r.dy
+                var groupPeak = 0
+                for t in 0..tMax:
+                    groupPeak = max(groupPeak, profile[t])
+
+                sumGroupPeaks += groupPeak
+                inc nGroups
+
+            # Add peak from ungrouped rectangles (if any)
+            var ungroupedPeak = 0
+            var hasUngrouped = false
+            if groupedRectIndices.len < xVals.len:
+                var profile = newSeq[int](tMax + 1)
+                for i in 0..<xVals.len:
+                    if i notin groupedRectIndices:
+                        hasUngrouped = true
+                        for t in xVals[i] ..< xVals[i] + dxVals[i]:
+                            profile[t] += dyVals[i]
+                if hasUngrouped:
+                    for t in 0..tMax:
+                        ungroupedPeak = max(ungroupedPeak, profile[t])
+
+            let dUb = sumGroupPeaks + ungroupedPeak
+            if dUb <= 0 or dUb >= maxLoad * xVals.len: break separatedClusteringBound
+            # Only apply if tighter than current domain
+            stderr.writeLine(&"[FZN] Diffn separated clustering: D upper bound = {dUb} ({nGroups} groups, max_load = {maxLoad})")
+
+            # Tighten ceiling domains (upper bound)
+            for def in tr.maxFromLinLeDefs:
+                if def.ceilingVarName notin tr.varPositions: continue
+                var hasOverlap = false
+                for srcName in def.sourceVarNames:
+                    if srcName in diffnYVarNames:
+                        hasOverlap = true; break
+                if not hasOverlap: continue
+                let ceilingPos = tr.varPositions[def.ceilingVarName]
+                let currentDom = tr.sys.baseArray.domain[ceilingPos]
+                if currentDom.len == 0: continue
+                if currentDom[^1] <= dUb: continue
+                var newDom: seq[int]
+                for v in currentDom:
+                    if v <= dUb:
+                        newDom.add(v)
+                if newDom.len > 0 and newDom.len < currentDom.len:
+                    tr.sys.baseArray.setDomain(ceilingPos, newDom)
+                    stderr.writeLine(&"[FZN] Diffn separated clustering: tightened '{def.ceilingVarName}' domain from {currentDom.len} to {newDom.len} values (<= {dUb})")
+
+            # Tighten y-variable upper bounds: y[i] + dy[i] - 1 <= dUb
+            var nTightened = 0
+            for i in 0..<yElems.len:
+                if yElems[i].kind != FznIdent: continue
+                if yElems[i].ident notin tr.varPositions: continue
+                let yPos = tr.varPositions[yElems[i].ident]
+                let yDom = tr.sys.baseArray.domain[yPos]
+                if yDom.len == 0: continue
+                let yMax = dUb - dyVals[i] + 1
+                if yMax >= yDom[^1]: continue
+                var newDom: seq[int]
+                for v in yDom:
+                    if v <= yMax:
+                        newDom.add(v)
+                if newDom.len > 0 and newDom.len < yDom.len:
+                    tr.sys.baseArray.setDomain(yPos, newDom)
+                    inc nTightened
+            if nTightened > 0:
+                let samplePos = (if yElems[0].kind == FznIdent and yElems[0].ident in tr.varPositions:
+                    tr.varPositions[yElems[0].ident] else: -1)
+                if samplePos >= 0:
+                    stderr.writeLine(&"[FZN] Diffn separated clustering: tightened {nTightened} y-domains (e.g. domain size {tr.sys.baseArray.domain[samplePos].len})")
+
+            # Tighten spread variable upper bounds: S[a] <= dUb - 1
+            # Since all y-positions are in [1, dUb-dy+1], the max spread is dUb - 1.
+            var nSpreadTightened = 0
+            for def in tr.spreadPatternDefs:
+                if def.spreadVarName notin tr.varPositions: continue
+                let spreadPos = tr.varPositions[def.spreadVarName]
+                let spreadDom = tr.sys.baseArray.domain[spreadPos]
+                if spreadDom.len == 0: continue
+                let spreadUb = dUb - 1
+                if spreadDom[^1] <= spreadUb: continue
+                var newDom: seq[int]
+                for v in spreadDom:
+                    if v <= spreadUb:
+                        newDom.add(v)
+                if newDom.len > 0 and newDom.len < spreadDom.len:
+                    tr.sys.baseArray.setDomain(spreadPos, newDom)
+                    inc nSpreadTightened
+            if nSpreadTightened > 0:
+                stderr.writeLine(&"[FZN] Diffn separated clustering: tightened {nSpreadTightened} spread domains (<= {dUb - 1})")
+
         # Per-rectangle time-table reasoning: compute compulsory y-interval profile
         # from other x-overlapping rectangles, then tighten each y_i domain.
         # Compulsory part of rect j: if latest_start_j < earliest_end_j, then
