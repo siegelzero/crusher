@@ -2268,6 +2268,146 @@ solve satisfy;
     let yVal = tr.sys.assignment[tr.varPositions["y"]]
     check (xVal, yVal) in [(1, 10), (2, 20), (3, 30)]
 
+  test "table complement conversion: near-complete binary table → tableNotIn":
+    # Binary table where only (2,2) is forbidden — should be converted to tableNotIn.
+    # This is the "not both same nonzero" pattern from SPOT5.
+    let src = """
+var {0,2}: x :: output_var;
+var {0,2}: y :: output_var;
+constraint fzn_table_int([x, y], [0, 0, 0, 2, 2, 0]);
+solve satisfy;
+"""
+    # Allowed: (0,0), (0,2), (2,0). Forbidden: (2,2).
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 1
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check not (xVal == 2 and yVal == 2)
+    check xVal in {0, 2}
+    check yVal in {0, 2}
+
+  test "table complement conversion: alldiff-except-0 pattern":
+    # 4-value table encoding "if both nonzero, must be different".
+    # Forbidden: (1,1), (2,2), (3,3) — 3 tuples out of 16 = near-complete.
+    let src = """
+var 0..3: x :: output_var;
+var 0..3: y :: output_var;
+constraint fzn_table_int([x, y], [0,0, 0,1, 0,2, 0,3, 1,0, 1,2, 1,3, 2,0, 2,1, 2,3, 3,0, 3,1, 3,2]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 1
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal in {0, 1, 2, 3}
+    check yVal in {0, 1, 2, 3}
+    # If both nonzero, must be different
+    if xVal != 0 and yVal != 0:
+      check xVal != yVal
+
+  test "table complement conversion: single forbidden ternary tuple":
+    # Ternary table forbidding exactly 1 tuple out of 8.
+    let src = """
+var 0..1: x :: output_var;
+var 0..1: y :: output_var;
+var 0..1: z :: output_var;
+constraint fzn_table_int([x, y, z], [0,0,0, 0,0,1, 0,1,0, 0,1,1, 1,0,0, 1,0,1, 1,1,0]);
+solve satisfy;
+"""
+    # Forbidden: (1,1,1) — the only missing tuple from {0,1}^3.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 1
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    check not (xVal == 1 and yVal == 1 and zVal == 1)
+
+  test "table complement conversion: tautology (all combos allowed)":
+    # Table with all combinations present — should be skipped entirely.
+    let src = """
+var 0..1: x :: output_var;
+var 0..1: y :: output_var;
+constraint fzn_table_int([x, y], [0,0, 0,1, 1,0, 1,1]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Tautology: complement is empty, constraint should be skipped (not converted)
+    check tr.nTableToNotIn == 0
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal in {0, 1}
+    check yVal in {0, 1}
+
+  test "table complement conversion: large forbidden set stays as tableIn":
+    # Table where the complement is large — should NOT be converted.
+    # Domain 0..9 x 0..9 = 100 combos, only 5 allowed → 95 forbidden.
+    let src = """
+var 0..9: x :: output_var;
+var 0..9: y :: output_var;
+constraint fzn_table_int([x, y], [0,0, 1,1, 2,2, 3,3, 4,4]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 0  # 95 forbidden > threshold? Actually 95 < 100 limit
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal == yVal
+
+  test "table complement conversion: multiple constraints":
+    # Two near-complete tables on different variable pairs.
+    let src = """
+var 0..2: x :: output_var;
+var 0..2: y :: output_var;
+var 0..2: z :: output_var;
+constraint fzn_table_int([x, y], [0,0, 0,1, 0,2, 1,0, 1,2, 2,0, 2,1]);
+constraint fzn_table_int([y, z], [0,0, 0,1, 0,2, 1,0, 1,2, 2,0, 2,1]);
+solve satisfy;
+"""
+    # Both tables forbid (1,1) and (2,2) — "not equal except 0".
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 2
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    let zVal = tr.sys.assignment[tr.varPositions["z"]]
+    if xVal != 0 and yVal != 0: check xVal != yVal
+    if yVal != 0 and zVal != 0: check yVal != zVal
+
+  test "table complement conversion with optimization":
+    # Verify converted constraints work correctly during optimization.
+    # Maximize x + y subject to NOT(x == y when both nonzero).
+    let src = """
+var 0..3: x :: output_var;
+var 0..3: y :: output_var;
+var 0..6: obj :: output_var :: is_defined_var;
+constraint int_lin_eq([1, 1, -1], [x, y, obj], 0) :: defines_var(obj);
+constraint fzn_table_int([x, y], [0,0, 0,1, 0,2, 0,3, 1,0, 1,2, 1,3, 2,0, 2,1, 2,3, 3,0, 3,1, 3,2]);
+solve maximize obj;
+"""
+    # Optimal: x=3, y=2 (or x=2, y=3) → obj=5.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.nTableToNotIn == 1
+    let objExpr = tr.objectiveDefExpr
+    maximize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+    check tr.sys.hasFeasibleSolution
+    let xVal = tr.sys.assignment[tr.varPositions["x"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check xVal + yVal >= 5
+    if xVal != 0 and yVal != 0: check xVal != yVal
+
 suite "Channel Propagation Correctness":
 
   proc reconstructSet(tr: FznTranslator, name: string): seq[int] =

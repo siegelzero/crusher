@@ -448,6 +448,8 @@ type
         conditionalBinaryChannelDefs*: seq[tuple[targetVar, condVar, neqVar: string]]
         # Counter for tautological constraints skipped during translation
         nSkippedTautological*: int
+        # Counter for table constraints converted to tableNotIn (complement conversion)
+        nTableToNotIn*: int
         # Counter for redundant NAND constraints skipped during translation
         nSkippedRedundantNand*: int
         # NAND bool pairs from bool_clause([], [b1, b2]) — for redundancy detection
@@ -1285,6 +1287,8 @@ proc translate*(model: FznModel): FznTranslator =
 
     nTranslated -= result.nSkippedTautological + result.nSkippedRedundantNand
     stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {result.nSkippedRedundantNand} skipped (redundant NAND), {nTranslated} translated")
+    if result.nTableToNotIn > 0:
+        stderr.writeLine(&"[FZN] Table complement conversion: {result.nTableToNotIn} tableIn → tableNotIn")
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0

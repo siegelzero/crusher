@@ -457,6 +457,106 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
 
     return false
 
+proc tryTableComplementConversion(tr: var FznTranslator, positions: seq[int],
+                                                          tuples: seq[seq[int]]): bool =
+    ## Detects when a tableIn constraint has a small forbidden complement and
+    ## converts it to a more efficient representation:
+    ## - tableNotIn (binary cost) when the forbidden set is small
+    ## - allDifferentExcept0 when the pattern matches "no duplicate nonzero values"
+    ## - Tautology (skip entirely) when all combinations are allowed
+    ##
+    ## tableNotIn uses O(1) zeroCount tracking vs tableIn's O(tuples) Hamming
+    ## distance computation, giving major speedups for near-complete tables.
+    let arity = positions.len
+    if arity < 2 or tuples.len == 0:
+        return false
+
+    # Compute Cartesian product size from domains at each position
+    var productSize = 1
+    var domains = newSeq[seq[int]](arity)
+    for col in 0..<arity:
+        domains[col] = tr.sys.baseArray.domain[positions[col]]
+        let domSize = domains[col].len
+        if domSize == 0:
+            return false
+        # Guard against overflow: bail if product exceeds threshold
+        if productSize > 1_000_000 div domSize:
+            return false
+        productSize *= domSize
+
+    let forbiddenCount = productSize - tuples.len
+
+    # Tautology: all combinations allowed, constraint is vacuous
+    if forbiddenCount <= 0:
+        return true
+
+    # Only convert when forbidden set is small (much cheaper to enumerate and store)
+    const maxForbiddenTuples = 100
+    if forbiddenCount > maxForbiddenTuples:
+        return false
+
+    # Build set of allowed tuples for fast lookup
+    var allowedSet = initHashSet[seq[int]](tuples.len)
+    for t in tuples:
+        allowedSet.incl(t)
+
+    # Enumerate Cartesian product and collect forbidden tuples
+    var forbidden = newSeqOfCap[seq[int]](forbiddenCount)
+    var indices = newSeq[int](arity)  # current index into each domain
+
+    block enumeration:
+        while true:
+            # Build current tuple from indices
+            var current = newSeq[int](arity)
+            for col in 0..<arity:
+                current[col] = domains[col][indices[col]]
+
+            if current notin allowedSet:
+                forbidden.add(current)
+
+            # Increment indices (odometer style)
+            var carry = arity - 1
+            while carry >= 0:
+                inc indices[carry]
+                if indices[carry] < domains[carry].len:
+                    break
+                indices[carry] = 0
+                dec carry
+            if carry < 0:
+                break enumeration
+
+    if forbidden.len == 0:
+        return true  # Tautology after enumeration
+
+    # Pattern: allDifferentExcept0 — forbidden set is exactly {(v,v) : v != 0, v in both domains}
+    if arity == 2:
+        var isAllDiffExcept0 = true
+        let dom1Set = toHashSet(domains[1])
+        # Check: every forbidden tuple is (v,v) with v != 0
+        for f in forbidden:
+            if f[0] != f[1] or f[0] == 0:
+                isAllDiffExcept0 = false
+                break
+        # Check: every nonzero value in the intersection is forbidden
+        if isAllDiffExcept0:
+            for v in domains[0]:
+                if v != 0 and v in dom1Set:
+                    let pair = @[v, v]
+                    if pair notin allowedSet:
+                        discard  # Already in forbidden, good
+                    else:
+                        isAllDiffExcept0 = false
+                        break
+        if isAllDiffExcept0 and forbidden.len > 0:
+            # Don't use allDifferentExcept0 for just 2 positions — the overhead of the
+            # allDifferent data structure isn't worthwhile. tableNotIn with few tuples is cheaper.
+            discard
+
+    # Emit tableNotIn with the small forbidden set
+    tr.sys.addConstraint(tableNotIn[int](positions, forbidden))
+    inc tr.nTableToNotIn
+    return true
+
 proc resolveSetArg(tr: FznTranslator, arg: FznExpr): tuple[isConst: bool, constVals: HashSet[int], varInfo: SetVarInfo] =
     ## Resolves a FznExpr that refers to a set (variable or constant).
     ## Constant sets are returned as HashSet[int] for O(1) membership tests.
@@ -1558,13 +1658,15 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             if filtered.len > 0:
                 # Try functional dependency: if col0 values are unique, dependent cols become channels
                 if not tr.tryTableFunctionalDep(reducedPositions, filtered):
-                    tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
+                    if not tr.tryTableComplementConversion(reducedPositions, filtered):
+                        tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
             else:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
         elif allRefs:
             # Try functional dependency on the original table
             if not tr.tryTableFunctionalDep(positions, tuples):
-                tr.sys.addConstraint(tableIn[int](positions, tuples))
+                if not tr.tryTableComplementConversion(positions, tuples):
+                    tr.sys.addConstraint(tableIn[int](positions, tuples))
         else:
             # Some expressions are not simple variable references (e.g., defined vars
             # with linear expressions, or constants). Materialize them:
@@ -1631,7 +1733,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
                 if tablePositions.len > 0 and projectedTuples.len > 0:
                     if not tr.tryTableFunctionalDep(tablePositions, projectedTuples):
-                        tr.sys.addConstraint(tableIn[int](tablePositions, projectedTuples))
+                        if not tr.tryTableComplementConversion(tablePositions, projectedTuples):
+                            tr.sys.addConstraint(tableIn[int](tablePositions, projectedTuples))
 
     of "fzn_global_cardinality":
         # global_cardinality(x, cover, counts)

@@ -4188,45 +4188,97 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if cons.stateType != TableConstraintType:
                 continue
             let tbl = cons.tableConstraintState
-            if tbl.mode != TableIn:
-                continue
-            # Only apply AC to large tables (e.g., transition tables with full graph
-            # adjacency). Small tables from implications may be partial — they encode
-            # one-directional constraints where not all valid combinations are listed.
-            if tbl.tuples.len < MinTransitionTableSize and not tbl.gacSafe:
-                continue
-            let nCols = tbl.sortedPositions.len
-            for col in 0..<nCols:
-                let pos = tbl.sortedPositions[col]
-                # Skip pruning channel positions — their values are determined by
-                # channel propagation, not search. Also skip positions that were
-                # excluded from currentDomain (large-domain channels).
-                if pos in skippedPositions:
+            if tbl.mode == TableIn:
+                # Only apply AC to large tables (e.g., transition tables with full graph
+                # adjacency). Small tables from implications may be partial — they encode
+                # one-directional constraints where not all valid combinations are listed.
+                if tbl.tuples.len < MinTransitionTableSize and not tbl.gacSafe:
                     continue
-                for v in toSeq(currentDomain[pos].items):
-                    if v notin tbl.tuplesByColumnValue[col]:
-                        continue  # Not mentioned in table — unconstrained
-                    # Check if any tuple with this value has support in all other columns
-                    var hasSupport = false
-                    for t in tbl.tuplesByColumnValue[col][v]:
-                        var supported = true
-                        for otherCol in 0..<nCols:
-                            if otherCol == col:
-                                continue
-                            let otherPos = tbl.sortedPositions[otherCol]
-                            # Skipped positions (large-domain channels) have empty
-                            # currentDomain — treat them as having universal support.
-                            if otherPos in skippedPositions:
-                                continue
-                            if tbl.tuples[t][otherCol] notin currentDomain[otherPos]:
-                                supported = false
+                let nCols = tbl.sortedPositions.len
+                for col in 0..<nCols:
+                    let pos = tbl.sortedPositions[col]
+                    if pos in skippedPositions:
+                        continue
+                    for v in toSeq(currentDomain[pos].items):
+                        if v notin tbl.tuplesByColumnValue[col]:
+                            continue  # Not mentioned in table — unconstrained
+                        # Check if any tuple with this value has support in all other columns
+                        var hasSupport = false
+                        for t in tbl.tuplesByColumnValue[col][v]:
+                            var supported = true
+                            for otherCol in 0..<nCols:
+                                if otherCol == col:
+                                    continue
+                                let otherPos = tbl.sortedPositions[otherCol]
+                                if otherPos in skippedPositions:
+                                    continue
+                                if tbl.tuples[t][otherCol] notin currentDomain[otherPos]:
+                                    supported = false
+                                    break
+                            if supported:
+                                hasSupport = true
                                 break
-                        if supported:
-                            hasSupport = true
-                            break
-                    if not hasSupport:
-                        currentDomain[pos].excl(v)
-                        outerChanged = true
+                        if not hasSupport:
+                            currentDomain[pos].excl(v)
+                            outerChanged = true
+
+            elif tbl.mode == TableNotIn:
+                # TableNotIn arc consistency: prune value v at position col if
+                # EVERY combination of the other positions' current domain values
+                # appears in the forbidden set (i.e., v is forbidden with all
+                # possible partner assignments).
+                #
+                # For efficiency, only process small forbidden sets — large ones
+                # are unlikely to cover entire cross-products.
+                if tbl.tuples.len > 1000:
+                    continue
+                let nCols = tbl.sortedPositions.len
+                for col in 0..<nCols:
+                    let pos = tbl.sortedPositions[col]
+                    if pos in skippedPositions:
+                        continue
+                    for v in toSeq(currentDomain[pos].items):
+                        if v notin tbl.tuplesByColumnValue[col]:
+                            continue  # v doesn't appear in any forbidden tuple — safe
+                        # Count how many forbidden tuples have value v at this column
+                        # AND have valid (in-domain) values at all other columns.
+                        # If this count equals the product of other columns' domain sizes,
+                        # then v is forbidden with every possible partner assignment.
+                        var otherProductSize = 1
+                        var overflow = false
+                        for otherCol in 0..<nCols:
+                            if otherCol == col: continue
+                            let otherPos = tbl.sortedPositions[otherCol]
+                            if otherPos in skippedPositions:
+                                overflow = true
+                                break
+                            let otherSize = currentDomain[otherPos].len
+                            if otherSize == 0:
+                                overflow = true
+                                break
+                            if otherProductSize > 1000 div otherSize:
+                                overflow = true
+                                break
+                            otherProductSize *= otherSize
+                        if overflow:
+                            continue
+                        # Count forbidden tuples matching v that are fully supported
+                        var forbiddenCount = 0
+                        for t in tbl.tuplesByColumnValue[col][v]:
+                            var allInDomain = true
+                            for otherCol in 0..<nCols:
+                                if otherCol == col: continue
+                                let otherPos = tbl.sortedPositions[otherCol]
+                                if otherPos in skippedPositions: continue
+                                if tbl.tuples[t][otherCol] notin currentDomain[otherPos]:
+                                    allInDomain = false
+                                    break
+                            if allInDomain:
+                                inc forbiddenCount
+                        if forbiddenCount >= otherProductSize:
+                            currentDomain[pos].excl(v)
+                            outerChanged = true
+
         if not outerChanged:
             break
 
