@@ -36,4 +36,6 @@ tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
 work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,3000
 
+spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
+
 rotating_workforce_e30_s9,2022/rotating-workforce-scheduling/rotating-workforce-scheduling.mzn,2022/rotating-workforce-scheduling/rws-instance-e-30-s-9.dzn,satisfy,30000,,
