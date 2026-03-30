@@ -297,6 +297,71 @@ proc simplifyConstraints(tr: FznTranslator,
                             let val = rhs div unfixedCoeff
                             if presolveTightenDomain(domains, unfixedName, @[val], infeasible):
                                 result = true
+                    elif allFixed and nUnfixed > 1 and rhs == nUnfixed:
+                        # All-ones cardinality forcing: int_lin_eq([1,...,1], vars, k)
+                        # where k == nUnfixed means all unfixed variables must be 1.
+                        # (rhs already has fixed-variable contributions subtracted)
+                        var allCoeffsOne = true
+                        for i in 0..<nArgs:
+                            let c = con.args[0].elems[i].intVal
+                            if c != 1: allCoeffsOne = false; break
+                        if allCoeffsOne:
+                            for i in 0..<nArgs:
+                                let vExpr = con.args[1].elems[i]
+                                if not tr.presolveIsFixed(vExpr, fixedVars):
+                                    let vn = presolveVarName(vExpr)
+                                    if vn != "":
+                                        if presolveTightenDomain(domains, vn, @[1], infeasible):
+                                            result = true
+
+            # Handle parameter-referenced coefficient array for cardinality forcing
+            elif con.args[0].kind == FznIdent and
+                 (con.args[1].kind == FznArrayLit or con.args[1].kind == FznIdent) and
+                 con.args[0].ident in tr.arrayValues:
+                let coeffs = tr.arrayValues[con.args[0].ident]
+                # Resolve variable names
+                var varExprs: seq[FznExpr]
+                if con.args[1].kind == FznArrayLit:
+                    varExprs = con.args[1].elems
+                elif con.args[1].kind == FznIdent:
+                    # Variable array reference - need to look up elements
+                    # Skip for now; inline arrays are the common case
+                    discard
+                if varExprs.len > 0 and varExprs.len == coeffs.len and
+                   tr.presolveIsFixed(con.args[2], fixedVars):
+                    var rhs = tr.presolveResolve(con.args[2], fixedVars)
+                    var nUnfixed = 0
+                    var allCoeffsOne = true
+                    for i in 0..<coeffs.len:
+                        if coeffs[i] != 1: allCoeffsOne = false
+                        if tr.presolveIsFixed(varExprs[i], fixedVars):
+                            rhs -= coeffs[i] * tr.presolveResolve(varExprs[i], fixedVars)
+                        else:
+                            inc nUnfixed
+                    # All-ones cardinality forcing
+                    if allCoeffsOne and nUnfixed > 0 and rhs == nUnfixed:
+                        for i in 0..<varExprs.len:
+                            if not tr.presolveIsFixed(varExprs[i], fixedVars):
+                                let vn = presolveVarName(varExprs[i])
+                                if vn != "":
+                                    if presolveTightenDomain(domains, vn, @[1], infeasible):
+                                        result = true
+                    elif nUnfixed == 1:
+                        # One unfixed variable
+                        for i in 0..<varExprs.len:
+                            if not tr.presolveIsFixed(varExprs[i], fixedVars):
+                                let c = coeffs[i]
+                                if c != 0 and rhs mod c == 0:
+                                    let vn = presolveVarName(varExprs[i])
+                                    if vn != "":
+                                        let val = rhs div c
+                                        if presolveTightenDomain(domains, vn, @[val], infeasible):
+                                            result = true
+                                break
+                    elif nUnfixed == 0:
+                        if con.canEliminate:
+                            eliminated.incl(ci)
+                            result = true
 
         # --- int_lin_le(coeffs, vars, rhs): sum(c_i * x_i) <= rhs ---
         elif name == "int_lin_le" and con.args.len >= 3:

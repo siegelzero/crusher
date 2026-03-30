@@ -85,6 +85,453 @@ proc getReifCI(ident: string,
     if ident in eqReifDefines: return eqReifDefines[ident]
     assert false, "getReifCI: ident not found in any reif table: " & ident
 
+proc detectConditionalSeparationPattern(tr: var FznTranslator) =
+    ## Detect conditional separation patterns for domain reduction:
+    ##   int_le_reif(var, C1, sep_before) :: defines_var(sep_before)  -- var <= C1
+    ##   int_le_reif(C2, var, sep_after) :: defines_var(sep_after)    -- C2 <= var, i.e., var >= C2
+    ##   bool_clause([sep_before, sep_after], [guard])
+    ## Meaning: guard=1 → var ∈ (-inf, C1] ∪ [C2, +inf), i.e., var ∉ (C1, C2)
+    ##
+    ## Also handles the simplified form with only one separation variable:
+    ##   bool_clause([sep_after], [guard])  -- guard=1 → var >= C2
+
+    # Build map of int_le_reif defines_var outputs
+    type LeReifDef = object
+        ci: int
+        isVarLeConst: bool   # var <= const (true) vs const <= var (false)
+        varName: string
+        constVal: int
+
+    var leReifDefs: Table[string, LeReifDef]
+    for ci in tr.leReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3: continue
+        let boolName = if con.args[2].kind == FznIdent: con.args[2].ident else: continue
+        # int_le_reif(a, b, result): result <=> a <= b
+        let aArg = con.args[0]
+        let bArg = con.args[1]
+        if aArg.kind == FznIdent and (bArg.kind == FznIntLit or
+           (bArg.kind == FznIdent and bArg.ident in tr.paramValues)):
+            # var <= const
+            let constVal = if bArg.kind == FznIntLit: bArg.intVal
+                          else: tr.paramValues[bArg.ident]
+            leReifDefs[boolName] = LeReifDef(ci: ci, isVarLeConst: true,
+                varName: aArg.ident, constVal: constVal)
+        elif bArg.kind == FznIdent and (aArg.kind == FznIntLit or
+             (aArg.kind == FznIdent and aArg.ident in tr.paramValues)):
+            # const <= var
+            let constVal = if aArg.kind == FznIntLit: aArg.intVal
+                          else: tr.paramValues[aArg.ident]
+            leReifDefs[boolName] = LeReifDef(ci: ci, isVarLeConst: false,
+                varName: bArg.ident, constVal: constVal)
+
+    if leReifDefs.len == 0: return
+
+    # Scan bool_clause constraints for the separation pattern
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+
+        # Pattern 1: bool_clause([sep_before, sep_after], [guard]) - 2 positive, 1 negative
+        if posArg.elems.len == 2 and negArg.elems.len == 1:
+            if posArg.elems[0].kind != FznIdent or posArg.elems[1].kind != FznIdent: continue
+            if negArg.elems[0].kind != FznIdent: continue
+
+            let s1 = posArg.elems[0].ident
+            let s2 = posArg.elems[1].ident
+            let guard = negArg.elems[0].ident
+
+            if s1 notin leReifDefs or s2 notin leReifDefs: continue
+            let def1 = leReifDefs[s1]
+            let def2 = leReifDefs[s2]
+
+            # Both must reference the same variable
+            if def1.varName != def2.varName: continue
+
+            # One must be var<=const (upper bound), other must be const<=var (lower bound)
+            var lo, hi: int
+            if def1.isVarLeConst and not def2.isVarLeConst:
+                lo = def1.constVal  # var <= lo
+                hi = def2.constVal  # var >= hi
+            elif def2.isVarLeConst and not def1.isVarLeConst:
+                lo = def2.constVal
+                hi = def1.constVal
+            else:
+                continue
+
+            if hi > lo:  # Only useful if there's a gap
+                tr.conditionalSeparationInfos.add((
+                    varName: def1.varName, lo: lo, hi: hi, guardName: guard))
+                nDetected += 1
+
+        # Pattern 2: bool_clause([sep_after], [guard]) - 1 positive, 1 negative (simplified)
+        elif posArg.elems.len == 1 and negArg.elems.len == 1:
+            if posArg.elems[0].kind != FznIdent or negArg.elems[0].kind != FznIdent: continue
+            let s = posArg.elems[0].ident
+            let guard = negArg.elems[0].ident
+            if s notin leReifDefs: continue
+            let def = leReifDefs[s]
+            if def.isVarLeConst:
+                # guard → var <= const: domain reduction to [min, const]
+                # This is a one-sided constraint, not a gap — skip for now
+                discard
+            else:
+                # guard → var >= const: domain reduction to [const, max]
+                # This is a one-sided constraint, not a gap — skip for now
+                discard
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} conditional separation patterns for domain reduction")
+
+proc detectReservoirPattern(tr: var FznTranslator) =
+    ## Detect reservoir constraint pattern:
+    ##   int_lin_le_reif([1,-1], [start_i, start_j], 0, b_ij) :: defines_var(b_ij)
+    ##   bool2int(b_ij, z_ij) :: defines_var(z_ij)
+    ##   int_lin_le(consumption_coeffs, [z_j1_i, ...], maxDiff)
+    ## Replace with a native ReservoirConstraint.
+
+    # Step 1: Build bool2int map: int output name → bool input name + constraint index
+    var bool2intMap: Table[string, tuple[boolVar: string, ci: int]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool2int": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        bool2intMap[con.args[1].ident] = (boolVar: con.args[0].ident, ci: ci)
+
+    if bool2intMap.len == 0: return
+
+    # Build array element name map from model variable declarations
+    # (arrayElementNames is not yet populated at this point in translation)
+    var arrayElemNames: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var names: seq[string]
+            var allIdents = true
+            for e in decl.value.elems:
+                if e.kind == FznIdent:
+                    names.add(e.ident)
+                else:
+                    allIdents = false; break
+            if allIdents and names.len > 0:
+                arrayElemNames[decl.name] = names
+
+    # Helper to resolve variable names from a constraint argument
+    proc resolveVarNamesLocal(arg: FznExpr): seq[string] =
+        case arg.kind
+        of FznArrayLit:
+            result = newSeq[string](arg.elems.len)
+            for i, e in arg.elems:
+                if e.kind != FznIdent: return @[]
+                result[i] = e.ident
+        of FznIdent:
+            if arg.ident in arrayElemNames:
+                return arrayElemNames[arg.ident]
+            return @[]
+        else:
+            return @[]
+
+    # Step 2: Build int_lin_le_reif map for [1,-1] ordering pattern
+    # b_ij <=> start_i - start_j <= 0 <=> start_i <= start_j
+    type LeReifInfo = tuple[ci: int, var1, var2: string]
+    var leReifMap: Table[string, LeReifInfo]  # bool output → (ci, var1, var2)
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 4: continue
+        # Check coefficients are [1, -1]
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        if coeffs.len != 2 or coeffs[0] != 1 or coeffs[1] != -1: continue
+        # Check rhs is 0
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != 0: continue
+        # Extract variable names
+        let varNames = resolveVarNamesLocal(con.args[1])
+        if varNames.len != 2: continue
+        # Extract result bool name
+        if con.args[3].kind != FznIdent: continue
+        let bName = con.args[3].ident
+        leReifMap[bName] = (ci: ci, var1: varNames[0], var2: varNames[1])
+
+    if leReifMap.len == 0: return
+
+    # Step 3: Scan int_lin_le constraints and trace variables backward
+    # Group by "event point" variable (the shared second var in all reifs)
+    type ReservoirCandidate = object
+        intLinLeCi: int
+        coeffs: seq[int]
+        eventPointVar: string       # shared var2 in all reifs
+        taskVars: seq[string]       # var1 from each reif (the "producing" tasks)
+        selfIncluded: bool          # whether event point var appears as a task
+        consumedLeReifCIs: seq[int]
+        consumedBool2intCIs: seq[int]
+
+    var candidates: seq[ReservoirCandidate]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let varNames = resolveVarNamesLocal(con.args[1])
+        if varNames.len < 2 or varNames.len != coeffs.len: continue
+
+        # Trace each variable backward through bool2int → int_lin_le_reif
+        var eventPointVar = ""
+        var taskVars: seq[string]
+        var selfIncluded = false
+        var leReifCIs: seq[int]
+        var b2iCIs: seq[int]
+        var valid = true
+
+        for vi in 0..<varNames.len:
+            let vn = varNames[vi]
+            if vn notin bool2intMap:
+                valid = false; break
+            let (boolVar, b2iCi) = bool2intMap[vn]
+            if boolVar notin leReifMap:
+                valid = false; break
+            let leInfo = leReifMap[boolVar]
+
+            # leInfo.var1 <= leInfo.var2, so this is: task leInfo.var1 starts at or before event point leInfo.var2
+            if eventPointVar == "":
+                eventPointVar = leInfo.var2
+            elif eventPointVar != leInfo.var2:
+                valid = false; break  # Not all pointing to same event point
+
+            if leInfo.var1 == leInfo.var2:
+                selfIncluded = true
+            taskVars.add(leInfo.var1)
+            leReifCIs.add(leInfo.ci)
+            b2iCIs.add(b2iCi)
+
+        if not valid or eventPointVar == "": continue
+        if taskVars.len < 2: continue  # Need at least 2 tasks
+
+        candidates.add(ReservoirCandidate(
+            intLinLeCi: ci,
+            coeffs: coeffs,
+            eventPointVar: eventPointVar,
+            taskVars: taskVars,
+            selfIncluded: selfIncluded,
+            consumedLeReifCIs: leReifCIs,
+            consumedBool2intCIs: b2iCIs))
+
+    if candidates.len == 0: return
+
+    # Step 4: Group candidates into reservoir constraints.
+    # Upper bound: int_lin_le(consumption, vars, maxDiff)
+    # Lower bound: int_lin_le(-consumption, vars, maxDiff) (negated coeffs, same rhs)
+    # Both constraints share the same set of task vars (in the same order) and event point.
+    # Group all candidates that share the same set of task variables (across all event points).
+
+    # First, group by task variable set (sorted) to identify reservoir groups
+    type ReservoirGroup = object
+        taskVarSet: seq[string]  # unique sorted task vars across all event points
+        upperBounds: seq[ReservoirCandidate]  # candidates with positive-ish coeffs
+        lowerBounds: seq[ReservoirCandidate]  # candidates with negated coeffs
+
+    # Match upper/lower bound pairs by checking if coefficients are negated
+    var paired: seq[tuple[upper, lower: ReservoirCandidate]]
+    var unmatched: seq[ReservoirCandidate]
+    var usedCIs: PackedSet[int]
+
+    # Sort candidates by their task vars + event point for pairing
+    for i in 0..<candidates.len:
+        if candidates[i].intLinLeCi in usedCIs: continue
+        # Look for a matching lower bound
+        var found = false
+        for j in (i+1)..<candidates.len:
+            if candidates[j].intLinLeCi in usedCIs: continue
+            if candidates[j].eventPointVar != candidates[i].eventPointVar: continue
+            if candidates[j].taskVars != candidates[i].taskVars: continue
+            # Check if coefficients are negated
+            var isNegated = true
+            if candidates[j].coeffs.len != candidates[i].coeffs.len:
+                isNegated = false
+            else:
+                for k in 0..<candidates[i].coeffs.len:
+                    if candidates[j].coeffs[k] != -candidates[i].coeffs[k]:
+                        isNegated = false; break
+            if isNegated:
+                # MiniZinc may fold the self-consumption constant into the RHS:
+                #   upper: sum(c_j * ord_ji) <= maxDiff - c_i  (rhs = maxDiff - c_i)
+                #   lower: sum(-c_j * ord_ji) <= maxDiff + c_i (rhs = maxDiff + c_i)
+                # So rhs_upper + rhs_lower = 2 * maxDiff
+                let rhs_i = try: tr.resolveIntArg(tr.model.constraints[candidates[i].intLinLeCi].args[2])
+                             except ValueError, KeyError: continue
+                let rhs_j = try: tr.resolveIntArg(tr.model.constraints[candidates[j].intLinLeCi].args[2])
+                             except ValueError, KeyError: continue
+                let sumRhs = rhs_i + rhs_j
+                if sumRhs >= 0 and sumRhs mod 2 == 0:
+                    paired.add((upper: candidates[i], lower: candidates[j]))
+                    usedCIs.incl(candidates[i].intLinLeCi)
+                    usedCIs.incl(candidates[j].intLinLeCi)
+                    found = true
+                    break
+        if not found:
+            unmatched.add(candidates[i])
+
+    if paired.len == 0: return
+
+    # Step 5: Group paired constraints by task variable set to form reservoir constraints
+    # All pairs sharing the same task variable set belong to the same reservoir
+    type TaskSetKey = seq[string]
+    var reservoirGroups: Table[TaskSetKey, seq[tuple[upper, lower: ReservoirCandidate]]]
+
+    for pair in paired:
+        # Collect unique task vars (across all event points for this reservoir)
+        var allTaskVars = pair.upper.taskVars
+        # Add event point var if not already a task
+        if pair.upper.eventPointVar notin allTaskVars:
+            allTaskVars.add(pair.upper.eventPointVar)
+        var sorted = allTaskVars
+        sorted.sort()
+        # Normalize the key
+        reservoirGroups.mgetOrPut(sorted, @[]).add(pair)
+
+    # Step 6: Build reservoir pattern infos
+    var totalConsumed = 0
+    for taskKey, pairs in reservoirGroups:
+        # Extract the canonical task list and consumption values
+        # The consumption values come from ANY upper bound constraint's coefficients
+        # Each pair contributes one event point; we need the full task set
+        let refPair = pairs[0]
+        # maxDiff = (rhs_upper + rhs_lower) / 2 (MiniZinc folds self-consumption into RHS)
+        let rhsUpper = try: tr.resolveIntArg(tr.model.constraints[refPair.upper.intLinLeCi].args[2])
+                        except ValueError, KeyError: continue
+        let rhsLower = try: tr.resolveIntArg(tr.model.constraints[refPair.lower.intLinLeCi].args[2])
+                        except ValueError, KeyError: continue
+        let maxDiff = (rhsUpper + rhsLower) div 2
+        # selfConsumption = (rhsLower - rhsUpper) / 2 for the event point activity
+        let selfConsumption = (rhsLower - rhsUpper) div 2
+
+        # Build the full task list: union of all task vars across all event points
+        var allTaskVarSet: seq[string]
+        var taskVarToIdx: Table[string, int]
+        for pair in pairs:
+            for tv in pair.upper.taskVars:
+                if tv notin taskVarToIdx:
+                    taskVarToIdx[tv] = allTaskVarSet.len
+                    allTaskVarSet.add(tv)
+            if pair.upper.eventPointVar notin taskVarToIdx:
+                taskVarToIdx[pair.upper.eventPointVar] = allTaskVarSet.len
+                allTaskVarSet.add(pair.upper.eventPointVar)
+
+        # Extract consumption values from the constraint coefficients.
+        # Each pair has coefficients for all tasks EXCEPT the event-point task
+        # (whose consumption is folded into the RHS as selfConsumption).
+        # Use each pair to fill in consumption values for the tasks it covers,
+        # and the event point's self-consumption from the RHS difference.
+        var consumptions = newSeq[int](allTaskVarSet.len)
+        var consumptionKnown = newSeq[bool](allTaskVarSet.len)
+        for pair in pairs:
+            # Fill in consumption for non-self tasks from coefficients
+            for k in 0..<pair.upper.taskVars.len:
+                let idx = taskVarToIdx[pair.upper.taskVars[k]]
+                if not consumptionKnown[idx]:
+                    consumptions[idx] = pair.upper.coeffs[k]
+                    consumptionKnown[idx] = true
+            # Fill in self-consumption from RHS difference
+            let evIdx = taskVarToIdx[pair.upper.eventPointVar]
+            if not consumptionKnown[evIdx]:
+                let rhsU = try: tr.resolveIntArg(tr.model.constraints[pair.upper.intLinLeCi].args[2])
+                            except ValueError, KeyError: continue
+                let rhsL = try: tr.resolveIntArg(tr.model.constraints[pair.lower.intLinLeCi].args[2])
+                            except ValueError, KeyError: continue
+                consumptions[evIdx] = (rhsL - rhsU) div 2
+                consumptionKnown[evIdx] = true
+
+        # Collect all consumed constraints
+        var consumedCIs: seq[int]
+        var consumedVarNames: seq[string]
+        for pair in pairs:
+            consumedCIs.add(pair.upper.intLinLeCi)
+            consumedCIs.add(pair.lower.intLinLeCi)
+            for ci in pair.upper.consumedLeReifCIs:
+                consumedCIs.add(ci)
+            for ci in pair.upper.consumedBool2intCIs:
+                consumedCIs.add(ci)
+            # Lower bound reuses same reifs/bool2ints (shared intermediates)
+            for ci in pair.lower.consumedLeReifCIs:
+                consumedCIs.add(ci)
+            for ci in pair.lower.consumedBool2intCIs:
+                consumedCIs.add(ci)
+
+        # Deduplicate consumed CIs
+        var uniqueCIs: PackedSet[int]
+        var dedupCIs: seq[int]
+        for ci in consumedCIs:
+            if ci notin uniqueCIs:
+                uniqueCIs.incl(ci)
+                dedupCIs.add(ci)
+
+        # Collect consumed intermediate variable names (bool and int channel vars)
+        for pair in pairs:
+            for vn in resolveVarNamesLocal(tr.model.constraints[pair.upper.intLinLeCi].args[1]):
+                if vn notin consumedVarNames: consumedVarNames.add(vn)
+            # Bool vars from le_reif
+            for leCi in pair.upper.consumedLeReifCIs:
+                let con = tr.model.constraints[leCi]
+                if con.args.len >= 4 and con.args[3].kind == FznIdent:
+                    let bv = con.args[3].ident
+                    if bv notin consumedVarNames: consumedVarNames.add(bv)
+
+        # Mark consumed
+        for ci in dedupCIs:
+            tr.definingConstraints.incl(ci)
+        for vn in consumedVarNames:
+            tr.definedVarNames.incl(vn)
+        totalConsumed += dedupCIs.len
+
+        tr.reservoirPatternInfos.add((
+            taskVarNames: allTaskVarSet,
+            consumptions: consumptions,
+            maxDiff: maxDiff,
+            consumedCIs: dedupCIs,
+            consumedVarNames: consumedVarNames))
+
+    # Step 7: Also consume the ordering totality constraints
+    # bool_clause([b_ij, b_ji], []) where both b_ij and b_ji are consumed ordering bools
+    if tr.reservoirPatternInfos.len > 0:
+        var consumedBoolVars: HashSet[string]
+        for info in tr.reservoirPatternInfos:
+            for vn in info.consumedVarNames:
+                consumedBoolVars.incl(vn)
+
+        var nTotalityConsumed = 0
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            let name = stripSolverPrefix(con.name)
+            if name != "bool_clause": continue
+            if con.args.len < 2: continue
+            let posArg = con.args[0]
+            let negArg = con.args[1]
+            if posArg.elems.len != 2 or negArg.elems.len != 0: continue
+            if posArg.elems[0].kind != FznIdent or posArg.elems[1].kind != FznIdent: continue
+            let v1 = posArg.elems[0].ident
+            let v2 = posArg.elems[1].ident
+            if v1 in consumedBoolVars and v2 in consumedBoolVars:
+                tr.definingConstraints.incl(ci)
+                nTotalityConsumed += 1
+
+        totalConsumed += nTotalityConsumed
+
+        stderr.writeLine(&"[FZN] Detected {tr.reservoirPatternInfos.len} reservoir constraints " &
+            &"(consumed {totalConsumed} constraints, {consumedBoolVars.len} intermediate variables)")
+
 proc detectDisjunctivePairs(tr: var FznTranslator) =
     ## Detects disjunctive pair patterns:
     ##   int_lin_le_reif(coeffs1, vars1, rhs1, b1) :: defines_var(b1)

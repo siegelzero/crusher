@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -296,6 +296,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ConditionalDayCapacity Constraint"
         of ConditionalLinearType:
             return "ConditionalLinear Constraint"
+        of ReservoirType:
+            return "Reservoir Constraint"
         of DisjunctiveClauseType:
             return "DisjunctiveClause Constraint"
         of ValueSupportType:
@@ -373,6 +375,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.conditionalDayCapacityState.cost
         of ConditionalLinearType:
             return constraint.conditionalLinearState.cost
+        of ReservoirType:
+            return constraint.reservoirState.cost
         of DisjunctiveClauseType:
             return constraint.disjunctiveClauseState.cost
         of ValueSupportType:
@@ -998,6 +1002,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.conditionalDayCapacityState.initialize(assignment)
         of ConditionalLinearType:
             constraint.conditionalLinearState.initialize(assignment)
+        of ReservoirType:
+            constraint.reservoirState.initialize(assignment)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.initialize(assignment)
         of ValueSupportType:
@@ -1072,6 +1078,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
         of ConditionalLinearType:
             constraint.conditionalLinearState.moveDelta(position, oldValue, newValue)
+        of ReservoirType:
+            constraint.reservoirState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
@@ -1146,6 +1154,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.conditionalDayCapacityState.updatePosition(position, newValue)
         of ConditionalLinearType:
             constraint.conditionalLinearState.updatePosition(position, newValue)
+        of ReservoirType:
+            constraint.reservoirState.updatePosition(position, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.updatePosition(position, newValue)
         of ValueSupportType:
@@ -1201,6 +1211,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.conditionalDayCapacityState.getAffectedPositions()
         of ConditionalLinearType:
             return constraint.conditionalLinearState.getAffectedPositions()
+        of ReservoirType:
+            return constraint.reservoirState.getAffectedPositions()
         of MultiResourceNoOverlapType:
             return constraint.multiResourceNoOverlapState.getAffectedPositions()
         of MultiMachineNoOverlapType:
@@ -1239,6 +1251,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.conditionalCumulativeState.getAffectedDomainValues(position)
         of ConditionalLinearType:
             return constraint.conditionalLinearState.getAffectedDomainValues(position)
+        of ReservoirType:
+            return constraint.reservoirState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1810,6 +1824,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: ConditionalLinearType,
                 conditionalLinearState: constraint.conditionalLinearState.deepCopy()
             )
+        of ReservoirType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ReservoirType,
+                reservoirState: constraint.reservoirState.deepCopy()
+            )
         of DisjunctiveClauseType:
             result = StatefulConstraint[T](
                 positions: constraint.positions,
@@ -2092,6 +2112,20 @@ func multiResourceNoOverlap*[T](
     stateType: MultiResourceNoOverlapType,
     multiResourceNoOverlapState: newMultiResourceNoOverlapConstraint[T](
       overlapPos, assignPairs)
+  )
+
+func reservoir*[T](
+    taskPositions: seq[int], consumptions: seq[int], maxDiff: int
+): StatefulConstraint[T] =
+  ## Creates a reservoir constraint: at each task start event, the cumulative
+  ## consumption must be within [-maxDiff, maxDiff].
+  var positions = initPackedSet[int]()
+  for pos in taskPositions:
+    positions.incl(pos)
+  return StatefulConstraint[T](
+    positions: positions,
+    stateType: ReservoirType,
+    reservoirState: newReservoirConstraint[T](taskPositions, consumptions, maxDiff)
   )
 
 ################################################################################

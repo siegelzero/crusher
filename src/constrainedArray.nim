@@ -114,6 +114,8 @@ type
         dormancyBindings*: seq[tuple[dormantPos: int, selectorPos: int, activeValue: T]]
         dormancyAtSelector*: Table[int, seq[int]]  # selector_pos → [binding indices]
         partitionGroups*: seq[PartitionGroup[T]]
+        # Conditional separation infos for domain reduction
+        conditionalSeparations*: seq[tuple[varPos: int, lo: T, hi: T, guardPos: int]]
 
 ################################################################################
 # Value Extraction
@@ -1177,7 +1179,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType, ReservoirType:
                     # Skip these constraint types for domain reduction
                     continue
 
@@ -1397,6 +1399,26 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         of ExpressionBased:
             discard
+
+    # Conditional separation domain reduction:
+    # When guard position has singleton domain {1}, remove values in (lo, hi) from var's domain
+    if carray.conditionalSeparations.len > 0:
+        var condSepRemoved = 0
+        for sep in carray.conditionalSeparations:
+            if sep.guardPos >= currentDomain.len or sep.varPos >= currentDomain.len: continue
+            if sep.guardPos in skippedPositions or sep.varPos in skippedPositions: continue
+            let guardDom = currentDomain[sep.guardPos]
+            if guardDom.len == 1 and T(1) in guardDom:
+                # Guard is forced true: var must be ≤ lo or ≥ hi
+                var toRemove: seq[T]
+                for v in currentDomain[sep.varPos].items:
+                    if v > sep.lo and v < sep.hi:
+                        toRemove.add(v)
+                for v in toRemove:
+                    currentDomain[sep.varPos].excl(v)
+                    condSepRemoved += 1
+        if condSepRemoved > 0:
+            stderr.writeLine(&"[DomRed] Conditional separation: {condSepRemoved} values removed")
 
     # Detect int_div patterns: pairs of constraints encoding z = floor(x / c)
     #   x - c*z >= 0     (i.e., c*z <= x)

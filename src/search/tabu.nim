@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -351,6 +351,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.circuitTimePropState.moveDelta(position, oldValue, newValue)
         of MultiMachineNoOverlapType:
             result = constraint.multiMachineNoOverlapState.moveDelta(position, oldValue, newValue)
+        of ReservoirType:
+            result = constraint.reservoirState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -445,6 +447,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == MultiMachineNoOverlapType:
             let p = constraint.multiMachineNoOverlapState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == ReservoirType:
+            let p = constraint.reservoirState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         else:
@@ -553,6 +559,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == MultiMachineNoOverlapType:
             let penalties = constraint.multiMachineNoOverlapState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == ReservoirType:
+            let penalties = constraint.reservoirState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]

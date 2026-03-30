@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
 
 const
@@ -413,6 +413,20 @@ type
         netFlowDependentPairs*: seq[int]   # dependent pair indices (channels, in topo order)
         netFlowDepTerms*: seq[seq[tuple[pairId: int, coeff: int]]]  # dependency terms per dependent pair
         netFlowDomainBound*: int           # flux domain upper bound (e.g., 50)
+        # Conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
+        # Used for domain reduction when guard is forced to 1
+        conditionalSeparationInfos*: seq[tuple[
+            varName: string,     # the variable whose domain is restricted
+            lo: int,             # values ≤ lo are ok (sep_before satisfied)
+            hi: int,             # values ≥ hi are ok (sep_after satisfied)
+            guardName: string]]  # when guard=1, var ∉ (lo, hi)
+        # Reservoir constraint patterns: producer/consumer balance constraints
+        reservoirPatternInfos*: seq[tuple[
+            taskVarNames: seq[string],   # start-time variable names
+            consumptions: seq[int],      # consumption per task
+            maxDiff: int,                # symmetric bound
+            consumedCIs: seq[int],       # consumed constraint indices
+            consumedVarNames: seq[string]]] # consumed intermediate variable names
         # Multi-resource no-overlap pair infos: groups of bool_clause([], [assign_i_r, assign_j_r, overlap_u])
         multiResourceNoOverlapInfos*: seq[tuple[
             overlapVarName: string,
@@ -877,6 +891,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect atMost-through-reification: int_lin_le([1,...,1], [int_eq_reif outputs]) → direct atMost
     # (MUST run after skill-allocation detection and before detectReifChannels)
     result.detectAtMostThroughReif()
+    # Detect reservoir constraint patterns (int_lin_le → bool2int → int_lin_le_reif([1,-1]))
+    # MUST run before detectReifChannels to prevent channelization of ordering booleans
+    result.detectReservoirPattern()
     # Detect disjunctive pair patterns (bool_clause + int_lin_le_reif)
     # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
     result.detectDisjunctivePairs()
@@ -998,6 +1015,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectConditionalDayCapacityPattern()
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
+    # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
+    # for domain reduction when guard is forced. MUST run after detectReifChannels.
+    result.detectConditionalSeparationPattern()
     result.translateVariables()
     # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
     result.emitCircuitTimePropConstraint()
@@ -1663,6 +1683,38 @@ proc translate*(model: FznModel): FznTranslator =
 
     if nBuiltMultiRes > 0:
         stderr.writeLine(&"[FZN] Built {nBuiltMultiRes} MultiResourceNoOverlap constraints")
+
+    # Build Reservoir constraints from detected patterns
+    var nBuiltReservoir = 0
+    for info in result.reservoirPatternInfos:
+        var positions: seq[int]
+        var allResolved = true
+        for vn in info.taskVarNames:
+            if vn in result.varPositions:
+                positions.add(result.varPositions[vn])
+            else:
+                allResolved = false
+                break
+        if not allResolved: continue
+        result.sys.addConstraint(reservoir[int](positions, info.consumptions, info.maxDiff))
+        nBuiltReservoir += 1
+    if nBuiltReservoir > 0:
+        stderr.writeLine(&"[FZN] Built {nBuiltReservoir} Reservoir constraints")
+
+    # Populate conditional separation infos on the ConstrainedArray
+    if result.conditionalSeparationInfos.len > 0:
+        var nPopulated = 0
+        for info in result.conditionalSeparationInfos:
+            let varPos = if info.varName in result.varPositions:
+                result.varPositions[info.varName] else: -1
+            let guardPos = if info.guardName in result.varPositions:
+                result.varPositions[info.guardName] else: -1
+            if varPos >= 0 and guardPos >= 0:
+                result.sys.baseArray.conditionalSeparations.add(
+                    (varPos: varPos, lo: int(info.lo), hi: int(info.hi), guardPos: guardPos))
+                nPopulated += 1
+        if nPopulated > 0:
+            stderr.writeLine(&"[FZN] Registered {nPopulated} conditional separations for domain reduction")
 
     # Build ConditionalCumulative constraints from detected patterns
     for ccinfo in result.conditionalCumulativeInfos:
