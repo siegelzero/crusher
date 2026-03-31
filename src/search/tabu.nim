@@ -50,6 +50,7 @@ type
         ceCountEq    ## CountEq channel binding
         ceArgmax     ## Argmax channel binding
         ceCrossingCountMax  ## Crossing count max channel binding
+        ceConditionalCountEq  ## ConditionalCountEq channel binding
 
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
@@ -2014,9 +2015,21 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
-                # conditionalCountEq/inverse channels can't be batched — reject topology
+                # ConditionalCountEq channels: include in cascade as dynamic entries
                 if p in carray.conditionalCountEqChannelsAtPosition:
-                    canBuild = false
+                    for bi in carray.conditionalCountEqChannelsAtPosition[p]:
+                        let binding = carray.conditionalCountEqChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false  # conditionalCountEq depends on non-local positions
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)  # index into conditionalCountEqChannelBindings
+                        topoEntryKind.add(ceConditionalCountEq)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
                 if p in carray.inverseChannelsAtPosition:
                     canBuild = false
 
@@ -2144,6 +2157,20 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)  # treat like element deps for dirty tracking
+                of ceConditionalCountEq:
+                    let binding = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.primaryPositions:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
+                    for srcPos in binding.filterPositions:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
+                    for srcPos in binding.primaryOnlyPositions:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
                 of ceArgmax:
                     let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions.items:
@@ -2205,6 +2232,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 of ceCountEq:
                     let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
+                of ceConditionalCountEq:
+                    let binding = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
+                    for srcPos in binding.primaryPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
+                    for srcPos in binding.filterPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
+                    for srcPos in binding.primaryOnlyPositions:
                         if srcPos != pos: inputs.incl(srcPos)
                 of ceArgmax:
                     let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]

@@ -680,6 +680,9 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 of ceCountEq:
                     let binding = state.carray.countEqChannelBindings[bindings[ci]]
                     newVal = evaluateCountEq(binding, state.assignment)
+                of ceConditionalCountEq:
+                    let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
+                    newVal = evaluateConditionalCountEq(binding, state.assignment)
                 of ceArgmax:
                     let binding = state.carray.argmaxChannelBindings[bindings[ci]]
                     newVal = evaluateArgmax(binding, state.assignment)
@@ -763,6 +766,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         # CountEq binding: count matching values over input positions
                         let binding = state.carray.countEqChannelBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
+                    of ceConditionalCountEq:
+                        # ConditionalCountEq binding: count matching with filter condition
+                        let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
                     of ceArgmax:
                         # Argmax binding: evaluate input expressions and find max index
                         let binding = state.carray.argmaxChannelBindings[bindings[ci]]

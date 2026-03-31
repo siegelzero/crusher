@@ -1154,6 +1154,53 @@ proc getAbsOuterScale[T](node: ExpressionNode[T]): T =
             return node.right.value
     return T(1)
 
+proc tryExtractProductLinear[T](node: ExpressionNode[T]):
+    (bool, Table[int, T], T, Table[int, T], T) =
+    ## If node is linear_a * linear_b, extract both linear forms and return
+    ## (success, aCoeffs, aConst, bCoeffs, bConst).
+    if node.kind != BinaryOpNode or node.binaryOp != Multiplication:
+        return (false, initTable[int, T](), T(0), initTable[int, T](), T(0))
+
+    let leftPos = collectPositions(node.left)
+    let rightPos = collectPositions(node.right)
+
+    proc tryLinearize(sub: ExpressionNode[T], positions: PackedSet[int]):
+        (bool, Table[int, T], T) =
+        if positions.len == 0:
+            # Constant node
+            var emptyAssign: Table[int, T]
+            return (true, initTable[int, T](), sub.evaluate(emptyAssign))
+        let alg = AlgebraicExpression[T](
+            positions: positions, node: sub, linear: true)
+        let lin = linearize(alg)
+        if lin.evalMethod != PositionBased:
+            return (false, initTable[int, T](), T(0))
+        # Verify linearity by probing
+        var testAssign: Table[int, T]
+        for pos in positions.items: testAssign[pos] = T(0)
+        for pos in positions.items:
+            testAssign[pos] = T(2)
+            let actual = sub.evaluate(testAssign)
+            let expected = T(2) * lin.coefficient.getOrDefault(pos, T(0)) + lin.constant
+            if actual != expected:
+                return (false, initTable[int, T](), T(0))
+            testAssign[pos] = T(0)
+        return (true, lin.coefficient, lin.constant)
+
+    let (okA, aCoeffs, aConst) = tryLinearize(node.left, leftPos)
+    if not okA:
+        return (false, initTable[int, T](), T(0), initTable[int, T](), T(0))
+    let (okB, bCoeffs, bConst) = tryLinearize(node.right, rightPos)
+    if not okB:
+        return (false, initTable[int, T](), T(0), initTable[int, T](), T(0))
+
+    # At least one factor must have variable positions (otherwise it's constant*linear)
+    if aCoeffs.len == 0 and bCoeffs.len == 0:
+        return (false, initTable[int, T](), T(0), initTable[int, T](), T(0))
+
+    return (true, aCoeffs, aConst, bCoeffs, bConst)
+
+
 ################################################################################
 # ConstrainedArray domain reduction
 ################################################################################
@@ -1268,53 +1315,133 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                 elif es.evalMethod == ExpressionBased and es.isConstantArrayEB:
                     # Expression-based with constant array: common FlatZinc pattern (idx-1 offset)
-                    # Only handle single-position index and value expressions to keep it tractable
                     let idxPositions = toSeq(es.indexExpression.positions.items)
                     let valPositions = toSeq(es.valueExpression.positions.items)
-                    if idxPositions.len != 1 or valPositions.len != 1: continue
-                    let idxPos = idxPositions[0]
-                    let resPos = valPositions[0]
-                    if idxPos in skippedPositions or resPos in skippedPositions: continue
-
                     let arrLen = es.constantArrayEB.len
-                    var tempAssign = initTable[int, T]()
 
-                    # Forward/backward pruning of result domain is only sound when the
-                    # value expression is a simple RefNode (identity mapping between
-                    # resPos domain values and constraint values). For non-trivial
-                    # expressions (e.g. resPos*2+1), raw domain values != expression
-                    # output, so domain intersection would be incorrect.
-                    let simpleValueExpr = es.valueExpression.node.kind == RefNode
+                    if idxPositions.len == 1 and valPositions.len <= 1:
+                        # Single-position index: efficient direct propagation
+                        let idxPos = idxPositions[0]
+                        if idxPos in skippedPositions: continue
 
-                    # Forward: restrict result to values reachable from current idx domain
-                    if simpleValueExpr:
-                        var reachableResults = initPackedSet[T]()
-                        for v in currentDomain[idxPos].items:
+                        # Determine required values from value expression
+                        var requiredVals: PackedSet[T]
+                        var hasResPos = false
+                        var resPos: int
+                        if valPositions.len == 1:
+                            resPos = valPositions[0]
+                            hasResPos = true
+                            if resPos in skippedPositions: continue
+                            requiredVals = currentDomain[resPos]
+                        else:
+                            # Constant value expression
+                            var emptyAssign: Table[int, T]
+                            requiredVals.incl(es.valueExpression.evaluate(emptyAssign))
+
+                        var tempAssign = initTable[int, T]()
+
+                        # Forward/backward pruning of result domain is only sound when the
+                        # value expression is a simple RefNode (identity mapping between
+                        # resPos domain values and constraint values). For non-trivial
+                        # expressions (e.g. resPos*2+1), raw domain values != expression
+                        # output, so domain intersection would be incorrect.
+                        let simpleValueExpr = hasResPos and es.valueExpression.node.kind == RefNode
+
+                        # Forward: restrict result to values reachable from current idx domain
+                        if simpleValueExpr:
+                            var reachableResults = initPackedSet[T]()
+                            for v in currentDomain[idxPos].items:
+                                tempAssign[idxPos] = v
+                                let idx = es.indexExpression.evaluate(tempAssign)
+                                if idx >= 0 and idx < arrLen:
+                                    reachableResults.incl(es.constantArrayEB[idx])
+                            let newResDom = currentDomain[resPos] * reachableResults
+                            if newResDom.len < currentDomain[resPos].len:
+                                elementTotalRemoved += currentDomain[resPos].len - newResDom.len
+                                currentDomain[resPos] = newResDom
+                                elementChanged = true
+
+                        # Backward: restrict idx position to values that map to valid results
+                        for v in toSeq(currentDomain[idxPos].items):
                             tempAssign[idxPos] = v
                             let idx = es.indexExpression.evaluate(tempAssign)
-                            if idx >= 0 and idx < arrLen:
-                                reachableResults.incl(es.constantArrayEB[idx])
-                        let newResDom = currentDomain[resPos] * reachableResults
-                        if newResDom.len < currentDomain[resPos].len:
-                            elementTotalRemoved += currentDomain[resPos].len - newResDom.len
-                            currentDomain[resPos] = newResDom
-                            elementChanged = true
-
-                    # Backward: restrict idx position to values that map to valid results
-                    for v in toSeq(currentDomain[idxPos].items):
-                        tempAssign[idxPos] = v
-                        let idx = es.indexExpression.evaluate(tempAssign)
-                        if idx < 0 or idx >= arrLen:
-                            currentDomain[idxPos].excl(v)
-                            elementTotalRemoved += 1
-                            elementChanged = true
-                        elif simpleValueExpr:
-                            # Only prune when value expression is identity — otherwise
-                            # arrVal may not directly correspond to resPos domain values
-                            let arrVal = es.constantArrayEB[idx]
-                            if arrVal notin currentDomain[resPos]:
+                            if idx < 0 or idx >= arrLen:
                                 currentDomain[idxPos].excl(v)
                                 elementTotalRemoved += 1
+                                elementChanged = true
+                            else:
+                                let arrVal = es.constantArrayEB[idx]
+                                if arrVal notin requiredVals:
+                                    currentDomain[idxPos].excl(v)
+                                    elementTotalRemoved += 1
+                                    elementChanged = true
+
+                    elif idxPositions.len >= 2 and valPositions.len <= 1:
+                        # Multi-position index expression with constant array and
+                        # constant or single-position value: enumerate input combinations
+                        # to prune index position domains via backward propagation.
+                        var anySkipped = false
+                        for sp in idxPositions:
+                            if sp in skippedPositions: anySkipped = true; break
+                        if anySkipped: continue
+
+                        # Check domain product is tractable
+                        var domProduct = 1
+                        var tooLarge = false
+                        for sp in idxPositions:
+                            let sz = currentDomain[sp].len
+                            if sz == 0: tooLarge = true; break
+                            if domProduct > 100000 div max(sz, 1):
+                                tooLarge = true; break
+                            domProduct *= sz
+                        if tooLarge: continue
+
+                        # Determine required result value(s)
+                        var requiredVals: PackedSet[T]
+                        if valPositions.len == 0:
+                            # Constant value expression
+                            var emptyAssign: Table[int, T]
+                            requiredVals.incl(es.valueExpression.evaluate(emptyAssign))
+                        else:
+                            let resPos = valPositions[0]
+                            if resPos in skippedPositions: continue
+                            requiredVals = currentDomain[resPos]
+
+                        # Enumerate all combinations, track which values per position
+                        # participate in at least one valid combination
+                        var domSeqs = newSeq[seq[T]](idxPositions.len)
+                        for i, sp in idxPositions:
+                            domSeqs[i] = toSeq(currentDomain[sp].items)
+                        var validValues = newSeq[PackedSet[T]](idxPositions.len)
+
+                        var indices = newSeq[int](idxPositions.len)
+                        var tempAssign = initTable[int, T]()
+                        block multiEnumLoop:
+                            while true:
+                                for i, sp in idxPositions:
+                                    tempAssign[sp] = domSeqs[i][indices[i]]
+                                let idx = es.indexExpression.evaluate(tempAssign)
+                                if idx >= 0 and idx < arrLen:
+                                    let arrVal = es.constantArrayEB[idx]
+                                    if arrVal in requiredVals:
+                                        # This combination is valid — mark all participating values
+                                        for i in 0..<idxPositions.len:
+                                            validValues[i].incl(domSeqs[i][indices[i]])
+                                # Advance
+                                var carry = idxPositions.len - 1
+                                while carry >= 0:
+                                    inc indices[carry]
+                                    if indices[carry] < domSeqs[carry].len: break
+                                    indices[carry] = 0
+                                    dec carry
+                                if carry < 0: break multiEnumLoop
+
+                        # Prune domains to only valid values
+                        for i, sp in idxPositions:
+                            let newDom = currentDomain[sp] * validValues[i]
+                            if newDom.len < currentDomain[sp].len:
+                                elementTotalRemoved += currentDomain[sp].len - newDom.len
+                                currentDomain[sp] = newDom
                                 elementChanged = true
 
         if elementTotalRemoved > 0:
@@ -1397,6 +1524,62 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
                             currentDomain[chanPos] = newChanDom
                             channelChanged = true
+
+            # Expression channel forward propagation:
+            # For each expression channel c = f(x1, ..., xn), compute reachable values
+            # by enumerating inputs if domain product is small enough.
+            for binding in carray.expressionChannelBindings:
+                let chanPos = binding.channelPosition
+                if chanPos in skippedPositions: continue
+                let srcPositions = toSeq(binding.expression.positions.items)
+                if srcPositions.len == 0: continue
+
+                # Compute domain product size to decide enumeration vs bounds
+                var domProduct = 1
+                var tooLarge = false
+                for sp in srcPositions:
+                    if sp in skippedPositions:
+                        tooLarge = true; break
+                    let sz = currentDomain[sp].len
+                    if sz == 0:
+                        tooLarge = true; break
+                    if domProduct > 50000 div max(sz, 1):
+                        tooLarge = true; break
+                    domProduct *= sz
+                if tooLarge: continue
+
+                # Enumerate all input combinations to compute reachable output values
+                var reachable = initPackedSet[T]()
+                var tempAssign = initTable[int, T]()
+                # Convert domains to seqs for indexed iteration
+                var domSeqs = newSeq[seq[T]](srcPositions.len)
+                for i, sp in srcPositions:
+                    domSeqs[i] = toSeq(currentDomain[sp].items)
+
+                # Multi-dimensional enumeration using index array
+                var indices = newSeq[int](srcPositions.len)
+                block enumLoop:
+                    while true:
+                        # Set assignment from current indices
+                        for i, sp in srcPositions:
+                            tempAssign[sp] = domSeqs[i][indices[i]]
+                        reachable.incl(binding.expression.evaluate(tempAssign))
+                        # Advance to next combination
+                        var carry = srcPositions.len - 1
+                        while carry >= 0:
+                            inc indices[carry]
+                            if indices[carry] < domSeqs[carry].len:
+                                break
+                            indices[carry] = 0
+                            dec carry
+                        if carry < 0:
+                            break enumLoop
+
+                let newChanDom = currentDomain[chanPos] * reachable
+                if newChanDom.len < currentDomain[chanPos].len:
+                    channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
+                    currentDomain[chanPos] = newChanDom
+                    channelChanged = true
 
         if channelTotalRemoved > 0:
             stderr.writeLine(&"[DomRed] Channel binding propagation: {channelTotalRemoved} values removed in {channelIter} iterations")
@@ -1751,6 +1934,88 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             relation: GreaterThanEq
                         ))
                         channelLinearForms += 1
+                else:
+                    # Try product-of-linear pattern: c = a * b for McCormick envelope
+                    let (prodOk, aCoeffs, aConst, bCoeffs, bConst) =
+                        tryExtractProductLinear[T](inputExpr.node)
+                    if prodOk:
+                        # Compute bounds of each factor from current domains
+                        proc factorBounds(coeffs: Table[int, T], constant: T): (T, T) =
+                            var lo = constant
+                            var hi = constant
+                            for pos, c in coeffs.pairs:
+                                if pos < currentDomain.len and currentDomain[pos].len > 0:
+                                    let dmin = T(currentDomain[pos].toSeq[0])
+                                    let dmax = T(currentDomain[pos].toSeq[^1])
+                                    if c > T(0):
+                                        lo += c * dmin
+                                        hi += c * dmax
+                                    else:
+                                        lo += c * dmax
+                                        hi += c * dmin
+                                else:
+                                    return (low(T) div 4, high(T) div 4)
+                            return (lo, hi)
+
+                        let (aLo, aHi) = factorBounds(aCoeffs, aConst)
+                        let (bLo, bHi) = factorBounds(bCoeffs, bConst)
+
+                        # McCormick envelope: 4 linear relaxations of c = a * b
+                        # where a = Σ(aCoeff_i * x_i) + aConst, b = Σ(bCoeff_j * x_j) + bConst
+                        #
+                        # Lower bounds (c >= ...):
+                        #   c >= aLo * b + bLo * a - aLo * bLo
+                        #   c >= aHi * b + bHi * a - aHi * bHi
+                        # Upper bounds (c <= ...):
+                        #   c <= aHi * b + bLo * a - aHi * bLo
+                        #   c <= aLo * b + bHi * a - aLo * bHi
+
+                        proc buildMcCormick(chP: int,
+                                            aC, bC: Table[int, T], aK, bK: T,
+                                            aScale, bScale, crossTerm: T,
+                                            isLower: bool) =
+                            # Form: ch - aScale*b - bScale*a + crossTerm >= 0 (lower)
+                            # or:   -ch + aScale*b + bScale*a - crossTerm >= 0 (upper)
+                            var coeffs: Table[int, T]
+                            let sign = if isLower: T(1) else: T(-1)
+                            coeffs[chP] = sign
+                            # Add -sign * aScale * b terms
+                            for pos, c in bC.pairs:
+                                let contrib = -sign * aScale * c
+                                if pos in coeffs:
+                                    coeffs[pos] = coeffs[pos] + contrib
+                                else:
+                                    coeffs[pos] = contrib
+                            # Add -sign * bScale * a terms
+                            for pos, c in aC.pairs:
+                                let contrib = -sign * bScale * c
+                                if pos in coeffs:
+                                    coeffs[pos] = coeffs[pos] + contrib
+                                else:
+                                    coeffs[pos] = contrib
+                            # Constant: sign * crossTerm - sign*aScale*bConst - sign*bScale*aConst
+                            let constVal = sign * crossTerm -
+                                           sign * aScale * bK -
+                                           sign * bScale * aK
+                            linearForms.add(LinearForm[T](
+                                coefficients: coeffs,
+                                constant: constVal,
+                                relation: GreaterThanEq
+                            ))
+
+                        # Lower bound 1: c >= aLo*b + bLo*a - aLo*bLo
+                        buildMcCormick(chPos, aCoeffs, bCoeffs, aConst, bConst,
+                                       aLo, bLo, -aLo * bLo, true)
+                        # Lower bound 2: c >= aHi*b + bHi*a - aHi*bHi
+                        buildMcCormick(chPos, aCoeffs, bCoeffs, aConst, bConst,
+                                       aHi, bHi, -aHi * bHi, true)
+                        # Upper bound 1: c <= aHi*b + bLo*a - aHi*bLo
+                        buildMcCormick(chPos, aCoeffs, bCoeffs, aConst, bConst,
+                                       aHi, bLo, -aHi * bLo, false)
+                        # Upper bound 2: c <= aLo*b + bHi*a - aLo*bHi
+                        buildMcCormick(chPos, aCoeffs, bCoeffs, aConst, bConst,
+                                       aLo, bHi, -aLo * bHi, false)
+                        channelLinearForms += 4
 
     # Count-equals channel linear forms
     # For each countEq binding: count[v] >= 0 and count[v] <= n

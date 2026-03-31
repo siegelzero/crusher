@@ -2233,6 +2233,95 @@ proc intMaxMinPropagate(tr: FznTranslator,
             if infeasible: return
 
 
+proc intTimesPropagate(tr: FznTranslator,
+                       domains: var Table[string, seq[int]],
+                       fixedVars: Table[string, int],
+                       eliminated: var PackedSet[int],
+                       infeasible: var bool): bool =
+    ## Bounds propagation for int_times(a, b, c): c = a * b.
+    ## Forward:  c ∈ [min(corners), max(corners)] where corners = {a_lo*b_lo, a_lo*b_hi, a_hi*b_lo, a_hi*b_hi}
+    ## Backward: when b bounds are strictly positive or negative, derive a bounds from c/b and vice versa
+    result = false
+
+    type ArgInfo = tuple[lo, hi: int, name: string, isFixed: bool]
+    proc getArgBounds(tr: FznTranslator, arg: FznExpr,
+                      domains: Table[string, seq[int]],
+                      fixedVars: Table[string, int]): ArgInfo =
+        let vn = presolveVarName(arg)
+        if tr.presolveIsFixed(arg, fixedVars):
+            let v = tr.presolveResolve(arg, fixedVars)
+            return (lo: v, hi: v, name: vn, isFixed: true)
+        if vn != "" and vn in domains:
+            let dom = domains[vn]
+            if dom.len > 0:
+                return (lo: dom[0], hi: dom[^1], name: vn, isFixed: false)
+        return (lo: low(int) div 2, hi: high(int) div 2, name: vn, isFixed: true)
+
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_times": continue
+        if con.args.len < 3: continue
+
+        var a = getArgBounds(tr, con.args[0], domains, fixedVars)
+        var b = getArgBounds(tr, con.args[1], domains, fixedVars)
+        var c = getArgBounds(tr, con.args[2], domains, fixedVars)
+
+        # Forward: c = a * b — compute bounds from four corner products
+        let p1 = a.lo * b.lo
+        let p2 = a.lo * b.hi
+        let p3 = a.hi * b.lo
+        let p4 = a.hi * b.hi
+        let fwdLo = min(min(p1, p2), min(p3, p4))
+        let fwdHi = max(max(p1, p2), max(p3, p4))
+        if not c.isFixed and c.name != "":
+            if presolveRestrictBounds(domains, c.name, fwdLo, fwdHi, infeasible):
+                result = true
+                c = getArgBounds(tr, con.args[2], domains, fixedVars)
+        if infeasible: return
+
+        # Backward: restrict a from c and b bounds
+        # c = a * b → a = c / b (when b is strictly positive or strictly negative)
+        if not a.isFixed and a.name != "":
+            if b.lo > 0:
+                # b > 0: a ∈ [ceil(c_lo / b_hi), floor(c_hi / b_lo)]
+                let aLo = psCeilDiv(c.lo, b.hi)
+                let aHi = psFloorDiv(c.hi, b.lo)
+                if presolveRestrictBounds(domains, a.name, aLo, aHi, infeasible):
+                    result = true
+                    a = getArgBounds(tr, con.args[0], domains, fixedVars)
+            elif b.hi < 0:
+                # b < 0: division flips sign
+                let aLo = psCeilDiv(-c.hi, -b.lo)
+                let aHi = psFloorDiv(-c.lo, -b.hi)
+                if presolveRestrictBounds(domains, a.name, aLo, aHi, infeasible):
+                    result = true
+                    a = getArgBounds(tr, con.args[0], domains, fixedVars)
+            # b spans 0: can't tighten a from division alone
+        if infeasible: return
+
+        # Backward: restrict b from c and a bounds (symmetric)
+        if not b.isFixed and b.name != "":
+            if a.lo > 0:
+                let bLo = psCeilDiv(c.lo, a.hi)
+                let bHi = psFloorDiv(c.hi, a.lo)
+                if presolveRestrictBounds(domains, b.name, bLo, bHi, infeasible):
+                    result = true
+            elif a.hi < 0:
+                let bLo = psCeilDiv(-c.hi, -a.lo)
+                let bHi = psFloorDiv(-c.lo, -a.hi)
+                if presolveRestrictBounds(domains, b.name, bLo, bHi, infeasible):
+                    result = true
+        if infeasible: return
+
+        # Elimination: if all three are fixed
+        if a.isFixed and b.isFixed and c.isFixed:
+            if a.lo * b.lo == c.lo and con.canEliminate:
+                eliminated.incl(ci)
+                result = true
+
+
 proc varElementPropagate(tr: FznTranslator,
                          domains: var Table[string, seq[int]],
                          fixedVars: Table[string, int],
@@ -3169,6 +3258,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 6d: int_max/int_min bounds propagation
         if intMaxMinPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6e: int_times bounds propagation
+        if intTimesPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
