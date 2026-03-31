@@ -4135,3 +4135,267 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
                 stderr.writeLine(&"[FZN] At-most-1 clique covering tightened objective lower bound: {tr.objectiveLoBound} → {lowerBound}")
                 tr.objectiveLoBound = lowerBound
 
+proc detectCrossingCountMaxPattern*(tr: var FznTranslator) =
+    ## Detect crossing count max pattern:
+    ##   array_int_maximum(M, [M_1,...,M_k])
+    ## where each M_i = sum of "betweenness" indicators:
+    ##   int_lin_eq([1,...,1,-1], [ind_vars..., M_i], 0)
+    ## each indicator from:
+    ##   bool2int(b, ind)  →  array_bool_and([b1, b2], b)  →  two int_lin_le_reif
+    ## The two int_lin_le_reif encode: x_a < x_i AND x_i < x_b (cable crossing).
+    ##
+    ## Replaces the entire decomposition with a single CrossingCountMaxChannelBinding.
+
+    # Step 1: Index defines_var constraints by defined variable name
+    # Note: int_lin_eq constraints may already be consumed by collectDefinedVars,
+    # so we index ALL constraints (not just unconsumed ones) for chain tracing.
+    var bool2intByDef = initTable[string, int]()        # defined int var → constraint index
+    var boolAndByDef = initTable[string, int]()          # defined bool var → constraint index
+    var linLeReifByDef = initTable[string, int]()        # defined bool var → constraint index
+    var linEqByDef = initTable[string, int]()            # defined int var → constraint index
+
+    for ci in 0..<tr.model.constraints.len:
+        let con = tr.model.constraints[ci]
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        let defVar = con.getAnnotation("defines_var").args[0]
+        if defVar.kind != FznIdent: continue
+        let defName = defVar.ident
+
+        case name
+        of "bool2int":
+            if ci notin tr.definingConstraints:
+                bool2intByDef[defName] = ci
+        of "array_bool_and":
+            if ci notin tr.definingConstraints:
+                boolAndByDef[defName] = ci
+        of "int_lin_le_reif":
+            if ci notin tr.definingConstraints:
+                linLeReifByDef[defName] = ci
+        of "int_lin_eq":
+            # Always index — these are consumed by collectDefinedVars but we need to trace through them
+            linEqByDef[defName] = ci
+        else: discard
+
+    # Step 2: Find array_int_maximum constraints that define channel vars
+    for mmDef in tr.minMaxChannelDefs:
+        if mmDef.isMin: continue  # Only interested in maximum
+        let ci = mmDef.ci
+        # Don't check definingConstraints — collectDefinedVars already consumed these
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_int_maximum": continue
+        if con.args.len < 2: continue
+
+        # Get the array of M_i variables
+        let arrArg = con.args[1]
+        if arrArg.kind != FznArrayLit and arrArg.kind != FznIdent: continue
+
+        var miNames: seq[string]
+        if arrArg.kind == FznArrayLit:
+            for elem in arrArg.elems:
+                if elem.kind != FznIdent: miNames = @[]; break
+                miNames.add(elem.ident)
+        else:
+            # Named array — resolve element names from variable declarations
+            for vd in tr.model.variables:
+                if vd.name == arrArg.ident and vd.value != nil and vd.value.kind == FznArrayLit:
+                    for elem in vd.value.elems:
+                        if elem.kind != FznIdent: miNames = @[]; break
+                        miNames.add(elem.ident)
+                    break
+            if miNames.len == 0 and arrArg.ident in tr.arrayElementNames:
+                miNames = tr.arrayElementNames[arrArg.ident]
+
+        if miNames.len == 0: continue
+
+        # Step 3: For each M_i, trace the chain: int_lin_eq → bool2int → array_bool_and → int_lin_le_reif pairs
+        # Collect cable pairs: (pos_a, pos_b) where a < i < b is the betweenness test
+        var allCablePairs: HashSet[tuple[a, b: string]]  # unordered cable var name pairs
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+        var patternOk = true
+        let k = miNames.len  # Number of positions (domain size)
+
+        for miName in miNames:
+            if miName notin linEqByDef:
+                patternOk = false; break
+
+            let eqCi = linEqByDef[miName]
+            let eqCon = tr.model.constraints[eqCi]
+            # Expect: int_lin_eq(coeffs, vars, 0) with all coeffs = 1 except last = -1
+            if eqCon.args.len < 3: patternOk = false; break
+            var coeffs: seq[int]
+            try: coeffs = tr.resolveIntArray(eqCon.args[0])
+            except: patternOk = false
+            if not patternOk: break
+            var rhs: int
+            try: rhs = tr.resolveIntArg(eqCon.args[2])
+            except: patternOk = false
+            if not patternOk: break
+            if rhs != 0: patternOk = false; break
+
+            # Last coefficient should be -1 (defines M_i), rest should be 1 (indicators)
+            if coeffs.len < 2: patternOk = false; break
+            if coeffs[^1] != -1: patternOk = false; break
+            for j in 0..<coeffs.len - 1:
+                if coeffs[j] != 1: patternOk = false; break
+            if not patternOk: break
+
+            let varsArg = eqCon.args[1]
+            if varsArg.kind != FznArrayLit: patternOk = false; break
+            if varsArg.elems.len != coeffs.len: patternOk = false; break
+
+            var localConsumed: seq[int]
+            var localVarNames: seq[string]
+            localConsumed.add(eqCi)
+            localVarNames.add(miName)
+
+            # Trace each indicator (all elements except the last which is M_i)
+            for j in 0..<varsArg.elems.len - 1:
+                let indElem = varsArg.elems[j]
+                if indElem.kind != FznIdent:
+                    patternOk = false; break
+                let indName = indElem.ident
+
+                # bool2int(b, ind) :: defines_var(ind)
+                if indName notin bool2intByDef:
+                    patternOk = false; break
+                let b2iCi = bool2intByDef[indName]
+                let b2iCon = tr.model.constraints[b2iCi]
+                if b2iCon.args[0].kind != FznIdent: patternOk = false; break
+                let boolName = b2iCon.args[0].ident
+
+                # array_bool_and([b1, b2], b) :: defines_var(b)
+                if boolName notin boolAndByDef:
+                    patternOk = false; break
+                let andCi = boolAndByDef[boolName]
+                let andCon = tr.model.constraints[andCi]
+                if andCon.args[0].kind != FznArrayLit: patternOk = false; break
+                if andCon.args[0].elems.len != 2: patternOk = false; break
+                let b1Elem = andCon.args[0].elems[0]
+                let b2Elem = andCon.args[0].elems[1]
+                if b1Elem.kind != FznIdent or b2Elem.kind != FznIdent: patternOk = false; break
+
+                let b1Name = b1Elem.ident
+                let b2Name = b2Elem.ident
+
+                # int_lin_le_reif([1,-1], [x, y], -1, b1) :: defines_var(b1)
+                # means: x - y <= -1  i.e., x < y
+                if b1Name notin linLeReifByDef or b2Name notin linLeReifByDef:
+                    patternOk = false; break
+                let reif1Ci = linLeReifByDef[b1Name]
+                let reif2Ci = linLeReifByDef[b2Name]
+                let reif1Con = tr.model.constraints[reif1Ci]
+                let reif2Con = tr.model.constraints[reif2Ci]
+
+                # Validate reif coefficients: [1, -1] and rhs = -1
+                var c1, c2: seq[int]
+                try: c1 = tr.resolveIntArray(reif1Con.args[0])
+                except: patternOk = false
+                if not patternOk: break
+                try: c2 = tr.resolveIntArray(reif2Con.args[0])
+                except: patternOk = false
+                if not patternOk: break
+                if c1 != @[1, -1] or c2 != @[1, -1]: patternOk = false; break
+                var r1, r2: int
+                try: r1 = tr.resolveIntArg(reif1Con.args[2])
+                except: patternOk = false
+                if not patternOk: break
+                try: r2 = tr.resolveIntArg(reif2Con.args[2])
+                except: patternOk = false
+                if not patternOk: break
+                if r1 != -1 or r2 != -1: patternOk = false; break
+
+                # Extract variable names from reif: vars = [x, y] → x < y
+                if reif1Con.args[1].kind != FznArrayLit or reif1Con.args[1].elems.len != 2:
+                    patternOk = false; break
+                if reif2Con.args[1].kind != FznArrayLit or reif2Con.args[1].elems.len != 2:
+                    patternOk = false; break
+
+                let r1v0 = reif1Con.args[1].elems[0]
+                let r1v1 = reif1Con.args[1].elems[1]
+                let r2v0 = reif2Con.args[1].elems[0]
+                let r2v1 = reif2Con.args[1].elems[1]
+                if r1v0.kind != FznIdent or r1v1.kind != FznIdent: patternOk = false; break
+                if r2v0.kind != FznIdent or r2v1.kind != FznIdent: patternOk = false; break
+
+                # Betweenness pattern: (a < i) AND (i < b) where i is common.
+                # reif1: r1v0 < r1v1, reif2: r2v0 < r2v1
+                # Check both orderings: r1v1==r2v0 (standard) or r1v0==r2v1 (swapped AND args)
+                var cableA, cableB: string
+                if r1v1.ident == r2v0.ident:
+                    # Standard: (a < i) AND (i < b) → cable (a, b)
+                    cableA = r1v0.ident
+                    cableB = r2v1.ident
+                elif r1v0.ident == r2v1.ident:
+                    # Swapped: (i < b) AND (a < i) → cable (a, b)
+                    cableA = r2v0.ident
+                    cableB = r1v1.ident
+                else:
+                    patternOk = false; break
+
+                # Record cable pair (canonical order)
+                let cablePair = if cableA < cableB: (a: cableA, b: cableB)
+                                else: (a: cableB, b: cableA)
+                allCablePairs.incl(cablePair)
+
+                localConsumed.add(b2iCi)
+                localConsumed.add(andCi)
+                # Don't consume int_lin_le_reif constraints — they might be shared across multiple M_i sums
+                localVarNames.add(indName)
+                localVarNames.add(boolName)
+
+            if not patternOk: break
+            consumedConstraints.add(localConsumed)
+            consumedVarNames.add(localVarNames)
+
+        if not patternOk or allCablePairs.len == 0: continue
+
+        # Step 4: Collect the int_lin_le_reif constraints used in this pattern
+        # These define bool channels that are ONLY used for crossing count indicators.
+        # Collect all reif bool names that feed into consumed array_bool_and constraints.
+        var reifBoolNames: HashSet[string]
+        for consumed_ci in consumedConstraints:
+            let ccon = tr.model.constraints[consumed_ci]
+            if stripSolverPrefix(ccon.name) == "array_bool_and":
+                for elem in ccon.args[0].elems:
+                    if elem.kind == FznIdent:
+                        reifBoolNames.incl(elem.ident)
+
+        # Check if these reif bools are used ONLY in consumed array_bool_and constraints
+        # (they may be shared across multiple M_i sums, so we check ALL uses)
+        var reifConstraintsToConsume: seq[int]
+        for bName in reifBoolNames:
+            if bName in linLeReifByDef:
+                reifConstraintsToConsume.add(linLeReifByDef[bName])
+
+        # Step 5: Pattern detected! Consume everything.
+        stderr.writeLine(&"[FZN] Detected crossing count max pattern: {allCablePairs.len} cables, k={k}, M_max={mmDef.varName}")
+
+        # Consume the array_int_maximum constraint
+        tr.definingConstraints.incl(ci)
+        # Consume all intermediate constraints
+        for cc in consumedConstraints:
+            tr.definingConstraints.incl(cc)
+        # Consume the int_lin_le_reif constraints
+        for rc in reifConstraintsToConsume:
+            tr.definingConstraints.incl(rc)
+
+        # Mark intermediate variables as channels (not search positions)
+        for vn in consumedVarNames:
+            tr.channelVarNames.incl(vn)
+        for bName in reifBoolNames:
+            tr.channelVarNames.incl(bName)
+
+        # Store the pattern for channel binding construction
+        var cables: seq[tuple[a, b: string]]
+        for pair in allCablePairs:
+            cables.add(pair)
+
+        tr.crossingCountMaxDefs.add(CrossingCountMaxDef(
+            maxVarName: mmDef.varName,
+            cables: cables,
+            k: k
+        ))
+

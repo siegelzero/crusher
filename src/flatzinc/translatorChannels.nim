@@ -1113,11 +1113,37 @@ proc buildIntDivChannelBindings(tr: var FznTranslator) =
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} int_div channel bindings")
 
+proc buildCrossingCountMaxChannelBindings(tr: var FznTranslator) =
+    ## Builds CrossingCountMaxChannelBinding from detected crossing count max patterns.
+    for def in tr.crossingCountMaxDefs:
+        if def.maxVarName notin tr.varPositions:
+            stderr.writeLine(&"[FZN] Warning: crossing count max var {def.maxVarName} not found in varPositions")
+            continue
+        let channelPos = tr.varPositions[def.maxVarName]
+        var cables: seq[tuple[startPos, endPos: int]]
+        var ok = true
+        for cable in def.cables:
+            if cable.a notin tr.varPositions or cable.b notin tr.varPositions:
+                stderr.writeLine(&"[FZN] Warning: cable endpoint var {cable.a} or {cable.b} not in varPositions")
+                ok = false; break
+            cables.add((startPos: tr.varPositions[cable.a], endPos: tr.varPositions[cable.b]))
+        if not ok: continue
+        tr.sys.baseArray.addCrossingCountMaxChannelBinding(channelPos, cables, def.k)
+    if tr.crossingCountMaxDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {tr.crossingCountMaxDefs.len} crossing count max channel bindings")
+
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
     ## constraints with defines_var annotations. Must be called after buildDefinedExpressions
     ## so that defined-var inputs can be resolved.
+    # Build set of var names consumed by crossing count max detection
+    var crossingCountMaxVarNames: HashSet[string]
+    for ccDef in tr.crossingCountMaxDefs:
+        crossingCountMaxVarNames.incl(ccDef.maxVarName)
+
     for def in tr.minMaxChannelDefs:
+        if def.varName in crossingCountMaxVarNames:
+            continue  # Already handled by crossing count max channel binding
         let con = tr.model.constraints[def.ci]
         if def.varName notin tr.varPositions:
             continue

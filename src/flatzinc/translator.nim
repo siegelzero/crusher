@@ -152,6 +152,13 @@ type
         targetValue*: int              # the shared constant value being counted
         maxCount*: int                 # maximum allowed count (rhs)
 
+    CrossingCountMaxDef* = object
+        ## A detected crossing count max pattern:
+        ## array_int_maximum(M, sums of betweenness indicators)
+        maxVarName*: string            # M_max channel variable name
+        cables*: seq[tuple[a, b: string]]  # Cable endpoint variable names
+        k*: int                         # Number of positions (domain size)
+
     ArgmaxPattern* = object
         ## A detected argmax decomposition pattern:
         ## N int_ne_reif(tower, t, ne_t) + N int_lin_le_reif(coeffs, [max_var, ...], rhs, ne_t)
@@ -386,6 +393,8 @@ type
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
         # Detected argmax patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
         argmaxPatterns*: Table[int, ArgmaxPattern]
+        # Detected crossing count max patterns (betweenness indicators → sum → array_int_maximum)
+        crossingCountMaxDefs*: seq[CrossingCountMaxDef]
         # Rescued defined vars: originally defined-var-only, but appear in var-indexed arrays
         # so need positions. Converted to channel variables with single-input MinMaxChannelBindings.
         rescuedChannelDefs*: seq[tuple[ci: int, varName: string]]
@@ -909,6 +918,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Detect pairwise atMost-1 cliques (int_lin_le([1,1],[x,y],1) on binary vars → N-var atMost)
     result.detectAtMostPairCliques()
+    # Detect crossing count max patterns (betweenness indicators → sum → array_int_maximum)
+    # MUST run before detectReifChannels which would consume the intermediate bool2int/array_bool_and/int_lin_le_reif
+    result.detectCrossingCountMaxPattern()
     # Detect bool2int identity aliases (MUST run after detectAtMostPairCliques which uses int var names,
     # and before detectReifChannels which would create channels for these)
     result.detectBool2intIdentityAliases()
@@ -2084,6 +2096,8 @@ proc translate*(model: FznModel): FznTranslator =
     # that are only used as outputs (not referenced as inputs elsewhere).
     # Must run before buildMinMaxChannelBindings so new entries are processed.
     result.detectImplicitMaxChannels()
+    # Build channel bindings for crossing count max patterns
+    result.buildCrossingCountMaxChannelBindings()
     # Build channel bindings for array_int_minimum/maximum defines_var
     result.buildMinMaxChannelBindings()
     # Build channel bindings for rescued defined vars (from var-indexed arrays)

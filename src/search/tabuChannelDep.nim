@@ -142,6 +142,27 @@ proc evaluateArgmax[T](binding: ArgmaxChannelBinding[T], assignment: seq[T]): T 
             bestIdx = i
     T(bestIdx + binding.valueOffset)
 
+proc evaluateCrossingCountMax[T](binding: CrossingCountMaxChannelBinding[T],
+                                  assignment: seq[T]): T {.inline.} =
+    ## Evaluate crossing count max channel using sweep-line in O(numCables + k) time.
+    ## crossing(v) = |{j : min(a_j, b_j) < v < max(a_j, b_j)}| for cables (a_j, b_j).
+    ## Returns max_v crossing(v).
+    let k = binding.k
+    var events = newSeq[T](k + 2)
+    for cable in binding.cables:
+        let a = assignment[cable.startPos]
+        let b = assignment[cable.endPos]
+        let lo = min(a, b)
+        let hi = max(a, b)
+        if hi - lo > 1:
+            events[lo + 1] += 1
+            events[hi] -= 1
+    result = T(0)
+    var current = T(0)
+    for v in 1..k:
+        current += events[v]
+        if current > result: result = current
+
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.
     ## Saves original value on first change; cdDirtyPositions stays deduplicated.
@@ -161,7 +182,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
        pos notin state.carray.countEqChannelsAtPosition and
        pos notin state.carray.conditionalCountEqChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition and
-       pos notin state.carray.argmaxChannelsAtPosition:
+       pos notin state.carray.argmaxChannelsAtPosition and
+       pos notin state.carray.crossingCountMaxChannelsAtPosition:
         return 0
 
     # Fast path: use precomputed (static) cascade table for single-value lookup
@@ -641,6 +663,9 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 of ceArgmax:
                     let binding = state.carray.argmaxChannelBindings[bindings[ci]]
                     newVal = evaluateArgmax(binding, state.assignment)
+                of ceCrossingCountMax:
+                    let binding = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
+                    newVal = evaluateCrossingCountMax(binding, state.assignment)
                 of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                     let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
@@ -722,6 +747,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         # Argmax binding: evaluate input expressions and find max index
                         let binding = state.carray.argmaxChannelBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateArgmax(binding, state.assignment)
+                    of ceCrossingCountMax:
+                        # Crossing count max: sweep-line evaluation
+                        let binding = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
                     of ceElement:
                         # Element binding: evaluate index expression and look up array
                         let bindingPtr = addr state.carray.channelBindings[bindings[ci]]

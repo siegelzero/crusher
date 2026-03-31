@@ -54,6 +54,14 @@ type
         channelPosition*: int       # Position of the expression channel variable
         expression*: AlgebraicExpression[T]  # Expression to evaluate
 
+    CrossingCountMaxChannelBinding*[T] = object
+        ## Computes max crossing count: max_v |{j : min(a_j, b_j) < v < max(a_j, b_j)}|
+        ## where (a_j, b_j) are cable endpoint values from the assignment.
+        ## Uses sweep-line evaluation in O(numCables + k) time.
+        channelPosition*: int       # Position of the max crossing count channel variable
+        cables*: seq[tuple[startPos, endPos: int]]  # Cable endpoint positions
+        k*: int                     # Max domain value (values are 1..k)
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -103,6 +111,8 @@ type
         argmaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [argmax binding indices]
         expressionChannelBindings*: seq[ExpressionChannelBinding[T]]
         expressionChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [expr binding indices]
+        crossingCountMaxChannelBindings*: seq[CrossingCountMaxChannelBinding[T]]
+        crossingCountMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -379,6 +389,30 @@ proc addExpressionChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.expressionChannelsAtPosition[pos] = @[bindingIdx]
         elif bindingIdx notin arr.expressionChannelsAtPosition[pos]:
             arr.expressionChannelsAtPosition[pos].add(bindingIdx)
+
+proc addCrossingCountMaxChannelBinding*[T](arr: var ConstrainedArray[T],
+                                            channelPos: int,
+                                            cables: seq[tuple[startPos, endPos: int]],
+                                            k: int) =
+    ## Register a crossing count max channel: channelPos = max_v crossing(v)
+    ## where crossing(v) = |{j : min(a_j, b_j) < v < max(a_j, b_j)}| for cables (a_j, b_j).
+    let bindingIdx = arr.crossingCountMaxChannelBindings.len
+    arr.crossingCountMaxChannelBindings.add(CrossingCountMaxChannelBinding[T](
+        channelPosition: channelPos,
+        cables: cables,
+        k: k
+    ))
+    arr.channelPositions.incl(channelPos)
+    # Register at all cable endpoint positions
+    var registered: PackedSet[int]
+    for cable in cables:
+        for pos in [cable.startPos, cable.endPos]:
+            if pos notin registered:
+                registered.incl(pos)
+                if pos notin arr.crossingCountMaxChannelsAtPosition:
+                    arr.crossingCountMaxChannelsAtPosition[pos] = @[bindingIdx]
+                elif bindingIdx notin arr.crossingCountMaxChannelsAtPosition[pos]:
+                    arr.crossingCountMaxChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -4443,6 +4477,10 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             expression: binding.expression.deepCopy()
         )
     result.expressionChannelsAtPosition = arr.expressionChannelsAtPosition
+
+    # Crossing count max channel bindings are all value types — shallow copy is fine
+    result.crossingCountMaxChannelBindings = arr.crossingCountMaxChannelBindings
+    result.crossingCountMaxChannelsAtPosition = arr.crossingCountMaxChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups
