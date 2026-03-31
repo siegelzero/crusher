@@ -2569,6 +2569,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         groupPositions.add(pos)
                 if groupPositions.len >= 2:
                     state.gccGroupPositions.add(groupPositions)
+        # Detect alldifferent-as-permutation: domain size == num search positions
+        if constraint.stateType == AllDifferentType:
+            var groupPositions: seq[int]
+            var maxDomSize = 0
+            for pos in constraint.positions.items:
+                if pos notin carray.channelPositions:
+                    groupPositions.add(pos)
+                    maxDomSize = max(maxDomSize, state.sharedDomain[][pos].len)
+            if groupPositions.len >= 2 and maxDomSize == groupPositions.len:
+                state.gccGroupPositions.add(groupPositions)
     if state.gccGroupPositions.len > 0 and verbose and id == 0:
         echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
             $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len)
