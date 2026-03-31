@@ -1115,6 +1115,7 @@ proc buildIntDivChannelBindings(tr: var FznTranslator) =
 
 proc buildCrossingCountMaxChannelBindings(tr: var FznTranslator) =
     ## Builds CrossingCountMaxChannelBinding from detected crossing count max patterns.
+    var nBuilt = 0
     for def in tr.crossingCountMaxDefs:
         if def.maxVarName notin tr.varPositions:
             stderr.writeLine(&"[FZN] Warning: crossing count max var {def.maxVarName} not found in varPositions")
@@ -1129,8 +1130,9 @@ proc buildCrossingCountMaxChannelBindings(tr: var FznTranslator) =
             cables.add((startPos: tr.varPositions[cable.a], endPos: tr.varPositions[cable.b]))
         if not ok: continue
         tr.sys.baseArray.addCrossingCountMaxChannelBinding(channelPos, cables, def.k)
-    if tr.crossingCountMaxDefs.len > 0:
-        stderr.writeLine(&"[FZN] Built {tr.crossingCountMaxDefs.len} crossing count max channel bindings")
+        nBuilt += 1
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} crossing count max channel bindings")
 
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max

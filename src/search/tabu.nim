@@ -1606,6 +1606,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             worklist.add(chanPos)
+                # Crossing count max channel bindings
+                if p in carray.crossingCountMaxChannelsAtPosition:
+                    for bi in carray.crossingCountMaxChannelsAtPosition[p]:
+                        let binding = carray.crossingCountMaxChannelBindings[bi]
+                        let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
             # Collect channel-dep constraints reachable from this position
             var seen: PackedSet[int]  # dedup by constraint pointer
             var relevant: seq[StatefulConstraint[T]] = @[]
