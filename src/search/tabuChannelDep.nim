@@ -117,6 +117,15 @@ proc evaluateCountEq[T](binding: CountEqChannelBinding[T], assignment: seq[T]): 
             inc count
     count
 
+proc evaluateWeightedCountEq[T](binding: WeightedCountEqChannelBinding[T], assignment: seq[T]): T {.inline.} =
+    ## Evaluate a weighted count-equals channel:
+    ## constantOffset + sum(weights[i] for i where assignment[inputPositions[i]] == targetValue).
+    var total: T = binding.constantOffset
+    for i in 0..<binding.inputPositions.len:
+        if assignment[binding.inputPositions[i]] == binding.targetValue:
+            total += binding.weights[i]
+    total
+
 proc evaluateConditionalCountEq[T](binding: ConditionalCountEqChannelBinding[T],
                                     assignment: seq[T]): T {.inline.} =
     ## Evaluate a conditional count-equals channel:
@@ -180,6 +189,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     if pos notin state.carray.channelsAtPosition and
        pos notin state.carray.minMaxChannelsAtPosition and
        pos notin state.carray.countEqChannelsAtPosition and
+       pos notin state.carray.weightedCountEqChannelsAtPosition and
        pos notin state.carray.conditionalCountEqChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition and
        pos notin state.carray.argmaxChannelsAtPosition and
@@ -331,6 +341,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            if p in state.carray.weightedCountEqChannelsAtPosition:
+                for bi in state.carray.weightedCountEqChannelsAtPosition[p]:
+                    let binding = state.carray.weightedCountEqChannelBindings[bi]
+                    let newChanVal = evaluateWeightedCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
             if p in state.carray.conditionalCountEqChannelsAtPosition:
                 for bi in state.carray.conditionalCountEqChannelsAtPosition[p]:
                     let binding = state.carray.conditionalCountEqChannelBindings[bi]
@@ -402,6 +422,16 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 for bi in state.carray.countEqChannelsAtPosition[p]:
                     let binding = state.carray.countEqChannelBindings[bi]
                     let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            if p in state.carray.weightedCountEqChannelsAtPosition:
+                for bi in state.carray.weightedCountEqChannelsAtPosition[p]:
+                    let binding = state.carray.weightedCountEqChannelBindings[bi]
+                    let newChanVal = evaluateWeightedCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -683,6 +713,9 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 of ceConditionalCountEq:
                     let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                     newVal = evaluateConditionalCountEq(binding, state.assignment)
+                of ceWeightedCountEq:
+                    let binding = state.carray.weightedCountEqChannelBindings[bindings[ci]]
+                    newVal = evaluateWeightedCountEq(binding, state.assignment)
                 of ceArgmax:
                     let binding = state.carray.argmaxChannelBindings[bindings[ci]]
                     newVal = evaluateArgmax(binding, state.assignment)
@@ -770,6 +803,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         # ConditionalCountEq binding: count matching with filter condition
                         let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                         state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
+                    of ceWeightedCountEq:
+                        # WeightedCountEq binding: sum weights for matching values
+                        let binding = state.carray.weightedCountEqChannelBindings[bindings[ci]]
+                        state.cdBatchValues[ci][di] = evaluateWeightedCountEq(binding, state.assignment)
                     of ceArgmax:
                         # Argmax binding: evaluate input expressions and find max index
                         let binding = state.carray.argmaxChannelBindings[bindings[ci]]

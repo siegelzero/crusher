@@ -35,6 +35,13 @@ type
         inputPositions*: seq[int]            # Positions to scan
         constantOffset*: T                   # Fixed count from constant elements in the array
 
+    WeightedCountEqChannelBinding*[T] = object
+        channelPosition*: int                # Position of the weighted count output variable
+        targetValue*: T                      # Value being matched
+        inputPositions*: seq[int]            # Positions to scan
+        weights*: seq[T]                     # Weight for each input position (parallel to inputPositions)
+        constantOffset*: T                   # Fixed weight sum from constant elements matching targetValue
+
     ConditionalCountEqChannelBinding*[T] = object
         channelPosition*: int       # Output position (e.g., uses[p])
         targetValue*: T             # Value counted on primary positions
@@ -105,6 +112,8 @@ type
         implicitMinMaxPositions*: PackedSet[int]  # channel positions from implicit detection (cascade-exempt)
         countEqChannelBindings*: seq[CountEqChannelBinding[T]]
         countEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [countEq binding indices]
+        weightedCountEqChannelBindings*: seq[WeightedCountEqChannelBinding[T]]
+        weightedCountEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [weightedCountEq binding indices]
         conditionalCountEqChannelBindings*: seq[ConditionalCountEqChannelBinding[T]]
         conditionalCountEqChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [condCountEq binding indices]
         argmaxChannelBindings*: seq[ArgmaxChannelBinding[T]]
@@ -306,6 +315,30 @@ proc addCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
             arr.countEqChannelsAtPosition[pos] = @[bindingIdx]
         else:
             arr.countEqChannelsAtPosition[pos].add(bindingIdx)
+
+proc addWeightedCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
+                                           channelPos: int,
+                                           targetValue: T,
+                                           inputPositions: seq[int],
+                                           weights: seq[T],
+                                           constantOffset: T = T(0)) =
+    ## Register a weighted count-equals channel:
+    ## channelPos = constantOffset + sum(weights[i] for i where assignment[inputPositions[i]] == targetValue).
+    assert inputPositions.len == weights.len
+    let bindingIdx = arr.weightedCountEqChannelBindings.len
+    arr.weightedCountEqChannelBindings.add(WeightedCountEqChannelBinding[T](
+        channelPosition: channelPos,
+        targetValue: targetValue,
+        inputPositions: inputPositions,
+        weights: weights,
+        constantOffset: constantOffset
+    ))
+    arr.channelPositions.incl(channelPos)
+    for pos in inputPositions:
+        if pos notin arr.weightedCountEqChannelsAtPosition:
+            arr.weightedCountEqChannelsAtPosition[pos] = @[bindingIdx]
+        else:
+            arr.weightedCountEqChannelsAtPosition[pos].add(bindingIdx)
 
 proc addConditionalCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
                                                channelPos: int,
@@ -2077,6 +2110,68 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             countEqLinearForms += 1
 
     channelLinearForms += countEqLinearForms
+
+    # Weighted count-equals channel linear forms
+    # For each binding: load[b] >= 0 and load[b] <= sum(weights)
+    # For closed groups: sum(load[b]) == sum(all_weights)
+    var weightedCountEqLinearForms = 0
+    for binding in carray.weightedCountEqChannelBindings:
+        let chPos = binding.channelPosition
+        var maxWeight: T = binding.constantOffset
+        for w in binding.weights: maxWeight += w
+        # load >= 0
+        var geCoeffs: Table[int, T]
+        geCoeffs[chPos] = T(1)
+        linearForms.add(LinearForm[T](
+            coefficients: geCoeffs,
+            constant: T(0),
+            relation: GreaterThanEq
+        ))
+        # load <= maxWeight
+        var leCoeffs: Table[int, T]
+        leCoeffs[chPos] = T(-1)
+        linearForms.add(LinearForm[T](
+            coefficients: leCoeffs,
+            constant: maxWeight,
+            relation: GreaterThanEq
+        ))
+        weightedCountEqLinearForms += 2
+
+    # Detect closed groups for weighted count: sum(load[b]) == totalWeight
+    var wGroupsByInputs: Table[seq[int], seq[int]]
+    for i, binding in carray.weightedCountEqChannelBindings:
+        if binding.inputPositions notin wGroupsByInputs:
+            wGroupsByInputs[binding.inputPositions] = @[i]
+        else:
+            wGroupsByInputs[binding.inputPositions].add(i)
+    for inputPositions, bindingIndices in wGroupsByInputs.pairs:
+        if bindingIndices.len < 2: continue
+        var coverValues: PackedSet[int]
+        for bi in bindingIndices:
+            coverValues.incl(int(carray.weightedCountEqChannelBindings[bi].targetValue))
+        var isClosed = true
+        for p in inputPositions:
+            for v in carray.domain[p]:
+                if v notin coverValues:
+                    isClosed = false; break
+            if not isClosed: break
+        if isClosed:
+            # sum(load[b]) == totalWeight (sum of all weights + constant offsets)
+            var totalWeight: T = T(0)
+            for w in carray.weightedCountEqChannelBindings[bindingIndices[0]].weights: totalWeight += w
+            for bi in bindingIndices:
+                totalWeight += carray.weightedCountEqChannelBindings[bi].constantOffset
+            var sumCoeffs: Table[int, T]
+            for bi in bindingIndices:
+                let chPos = carray.weightedCountEqChannelBindings[bi].channelPosition
+                sumCoeffs[chPos] = T(1)
+            linearForms.add(LinearForm[T](
+                coefficients: sumCoeffs,
+                constant: -totalWeight,
+                relation: EqualTo
+            ))
+            weightedCountEqLinearForms += 1
+    channelLinearForms += weightedCountEqLinearForms
 
     if channelLinearForms > 0:
         stderr.writeLine(&"[DomRed] Channel-to-linear forms: {channelLinearForms}")
@@ -4808,6 +4903,10 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Count-equals channel bindings are all value types — shallow copy is fine
     result.countEqChannelBindings = arr.countEqChannelBindings
     result.countEqChannelsAtPosition = arr.countEqChannelsAtPosition
+
+    # Weighted count-equals channel bindings are all value types — shallow copy is fine
+    result.weightedCountEqChannelBindings = arr.weightedCountEqChannelBindings
+    result.weightedCountEqChannelsAtPosition = arr.weightedCountEqChannelsAtPosition
 
     # Conditional count-equals channel bindings are all value types — shallow copy is fine
     result.conditionalCountEqChannelBindings = arr.conditionalCountEqChannelBindings
