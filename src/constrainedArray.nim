@@ -2482,8 +2482,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     if idxPos >= 0:
                         idxToExprElementConstraints.mgetOrPut(idxPos, @[]).add(ci)
 
-    discard  # ExprElement registration is silent
-
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
     var domainMin = newSeq[T](carray.len)
     var domainMax = newSeq[T](carray.len)
@@ -4115,21 +4113,17 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 2:
                 cbIdxPositions.incl(idxPos)
         for idxPos in idxToExprElementConstraints.keys:
-            if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 2:
-                cbIdxPositions.incl(idxPos)
-            # Also include ExpressionBased-only positions with 1+ constraints
+            # Include ExpressionBased positions with 1+ constraints total
             # (even single ExprBased element with constant result can prune significantly)
             if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 1:
                 cbIdxPositions.incl(idxPos)
 
-        discard  # cbIdxPositions count not logged
         for idxPos in cbIdxPositions.items:
             if currentDomain[idxPos].len <= 1: continue
             if idxPos in skippedPositions: continue
             let cbBindings = if idxPos in idxToVarArrayBindings: idxToVarArrayBindings[idxPos] else: @[]
             let elemCons = if idxPos in idxToElementConstraints: idxToElementConstraints[idxPos] else: @[]
             let exprElemCons = if idxPos in idxToExprElementConstraints: idxToExprElementConstraints[idxPos] else: @[]
-            discard  # Debug logging removed
             var tempAssign = initTable[int, T]()
             for v in toSeq(currentDomain[idxPos].items):
                 tempAssign[idxPos] = v
@@ -4273,17 +4267,18 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                     break
                             else:
                                 # Variable value expression - check if arrVal is in the value positions' domains
-                                var valInDomain = false
-                                for vp in es.valueExpression.positions.items:
-                                    if vp in skippedPositions:
-                                        if arrVal >= domainMin[vp] and arrVal <= domainMax[vp]:
+                                if es.valueExpression.positions.len == 1:
+                                    var valInDomain = false
+                                    for vp in es.valueExpression.positions.items:
+                                        if vp in skippedPositions:
+                                            if arrVal >= domainMin[vp] and arrVal <= domainMax[vp]:
+                                                valInDomain = true
+                                        elif arrVal in currentDomain[vp]:
                                             valInDomain = true
-                                    elif arrVal in currentDomain[vp]:
-                                        valInDomain = true
-                                    break  # value expression typically has one position
-                                if not valInDomain:
-                                    supported = false
-                                    break
+                                    if not valInDomain:
+                                        supported = false
+                                        break
+                                # else: multi-position value expression, skip (can't check soundly)
                         else:
                             # Variable array - evaluate the array expression
                             let arrExpr = es.arrayExpressionsEB[idxVal]
@@ -4297,31 +4292,33 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                         break
                                 else:
                                     # Check arrVal against value domain
-                                    for vp in es.valueExpression.positions.items:
-                                        if vp in skippedPositions:
-                                            if arrVal < domainMin[vp] or arrVal > domainMax[vp]:
+                                    if es.valueExpression.positions.len == 1:
+                                        for vp in es.valueExpression.positions.items:
+                                            if vp in skippedPositions:
+                                                if arrVal < domainMin[vp] or arrVal > domainMax[vp]:
+                                                    supported = false
+                                            elif arrVal notin currentDomain[vp]:
                                                 supported = false
-                                        elif arrVal notin currentDomain[vp]:
-                                            supported = false
-                                        break
-                                    if not supported: break
+                                        if not supported: break
+                                    # else: multi-position value expression, skip
                             else:
                                 # Both array element and value are variable - use bounds overlap
                                 if es.valueExpression.positions.len == 0:
                                     # Constant value target
                                     let targetVal = es.valueExpression.evaluate(tempAssign)
                                     # Check if any array element position's domain contains targetVal
-                                    var canMatch = false
-                                    for ap in arrExpr.positions.items:
-                                        if ap in skippedPositions:
-                                            if targetVal >= domainMin[ap] and targetVal <= domainMax[ap]:
+                                    if arrExpr.positions.len == 1:
+                                        var canMatch = false
+                                        for ap in arrExpr.positions.items:
+                                            if ap in skippedPositions:
+                                                if targetVal >= domainMin[ap] and targetVal <= domainMax[ap]:
+                                                    canMatch = true
+                                            elif targetVal in currentDomain[ap]:
                                                 canMatch = true
-                                        elif targetVal in currentDomain[ap]:
-                                            canMatch = true
-                                        break
-                                    if not canMatch:
-                                        supported = false
-                                        break
+                                        if not canMatch:
+                                            supported = false
+                                            break
+                                    # else: multi-position array expression, skip
                                 # else: both variable - skip (bounds too wide to be useful)
                 if not supported:
                     currentDomain[idxPos].excl(v)

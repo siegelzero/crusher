@@ -269,8 +269,13 @@ proc applyReverseElementImpliedMoves[T](state: TabuState[T]) =
     ## that satisfies the element constraint.
     ## Uses state.changedChannelsBuf which was populated by propagateChannels.
     ## Note: we snapshot the buffer since assignValue may modify it.
+    ## Guard against recursion: assignValue -> applyReverse -> assignValue -> ...
     if not state.reverseElementImpliedEnabled:
         return
+    # Prevent re-entrant calls (assignValue on the index may trigger channel
+    # propagation which would call us again)
+    state.reverseElementImpliedEnabled = false
+    defer: state.reverseElementImpliedEnabled = true
 
     # Collect relevant changed positions (snapshot to avoid iteration-during-mutation)
     var relevantChanges: seq[int]
