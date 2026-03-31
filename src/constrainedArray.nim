@@ -41,6 +41,7 @@ type
         inputPositions*: seq[int]            # Positions to scan
         weights*: seq[T]                     # Weight for each input position (parallel to inputPositions)
         constantOffset*: T                   # Fixed weight sum from constant elements matching targetValue
+        positionWeight*: Table[int, T]       # pos → weight for O(1) delta evaluation
 
     ConditionalCountEqChannelBinding*[T] = object
         channelPosition*: int       # Output position (e.g., uses[p])
@@ -325,13 +326,17 @@ proc addWeightedCountEqChannelBinding*[T](arr: var ConstrainedArray[T],
     ## Register a weighted count-equals channel:
     ## channelPos = constantOffset + sum(weights[i] for i where assignment[inputPositions[i]] == targetValue).
     assert inputPositions.len == weights.len
+    var posWeight: Table[int, T]
+    for i in 0..<inputPositions.len:
+        posWeight[inputPositions[i]] = weights[i]
     let bindingIdx = arr.weightedCountEqChannelBindings.len
     arr.weightedCountEqChannelBindings.add(WeightedCountEqChannelBinding[T](
         channelPosition: channelPos,
         targetValue: targetValue,
         inputPositions: inputPositions,
         weights: weights,
-        constantOffset: constantOffset
+        constantOffset: constantOffset,
+        positionWeight: posWeight
     ))
     arr.channelPositions.incl(channelPos)
     for pos in inputPositions:
