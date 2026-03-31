@@ -555,6 +555,26 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                     if diff != 0:
                         newRight += coeff * diff
                 delta = rc.computeCost(newLeft, newRight) - rc.cost
+            elif state.channelDepConstraints[ci].stateType == DisjunctiveClauseType:
+                # Fast DC path: compute penalty directly from precomputed cascade-to-term mappings
+                let dc = state.channelDepConstraints[ci].disjunctiveClauseState
+                let termCoeffs = state.cdCascadeDCTermCoeffs[cascadeIdx][cli]
+                var newPenalty = high(int)
+                for d in 0..<dc.disjuncts.len:
+                    var conjPenalty = dc.disjunctPenalties[d]
+                    for t in 0..<dc.disjuncts[d].len:
+                        let term = addr dc.disjuncts[d][t]
+                        var sumDelta: T = 0
+                        for entry in termCoeffs[d][t]:
+                            sumDelta += term.coeffs[entry.coeffIdx] * (chanVals[entry.cascIdx][di] - state.assignment[chans[entry.cascIdx]])
+                        if sumDelta != 0:
+                            let oldViolation = max(0, int(term.currentSum) - int(term.rhs))
+                            let newViolation = max(0, int(term.currentSum + sumDelta) - int(term.rhs))
+                            conjPenalty += newViolation - oldViolation
+                    if conjPenalty < newPenalty:
+                        newPenalty = conjPenalty
+                        if newPenalty == 0: break
+                delta = newPenalty - dc.cost
             else:
                 let c = state.channelDepConstraints[ci]
                 let oldPenalty = c.penalty()

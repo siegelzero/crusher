@@ -18,6 +18,7 @@ type
         ## Disjunction of conjunctions of linear inequality terms.
         ## disjuncts[d][t] is term t of disjunct d.
         disjuncts*: seq[seq[DCTermState[T]]]
+        disjunctPenalties*: seq[int]  # cached per-disjunct conjunction penalty
         cost*: int
         # Maps position -> list of (disjunctIdx, termIdx, coefficient) for incremental update
         positionEntries*: Table[int, seq[tuple[di, ti: int, coeff: T]]]
@@ -26,16 +27,20 @@ type
         # Current assignment values for positions in this constraint (for updatePosition old value)
         currentAssignment*: Table[int, T]
 
-func computePenalty*[T](state: DisjunctiveClauseConstraint[T]): int {.inline.} =
-    result = high(int)
+func recomputeDisjunctPenalties*[T](state: DisjunctiveClauseConstraint[T]) {.inline.} =
     for d in 0..<state.disjuncts.len:
         var conjPenalty = 0
         for t in 0..<state.disjuncts[d].len:
             let violation = state.disjuncts[d][t].currentSum - state.disjuncts[d][t].rhs
             if violation > 0:
                 conjPenalty += violation
-        if conjPenalty < result:
-            result = conjPenalty
+        state.disjunctPenalties[d] = conjPenalty
+
+func computePenalty*[T](state: DisjunctiveClauseConstraint[T]): int {.inline.} =
+    result = high(int)
+    for d in 0..<state.disjunctPenalties.len:
+        if state.disjunctPenalties[d] < result:
+            result = state.disjunctPenalties[d]
             if result == 0:
                 return 0
 
@@ -44,6 +49,7 @@ func newDisjunctiveClauseConstraint*[T](
 ): DisjunctiveClauseConstraint[T] =
     new(result)
     result.disjuncts = newSeq[seq[DCTermState[T]]](disjuncts.len)
+    result.disjunctPenalties = newSeq[int](disjuncts.len)
     for d in 0..<disjuncts.len:
         result.disjuncts[d] = newSeq[DCTermState[T]](disjuncts[d].len)
         for t in 0..<disjuncts[d].len:
@@ -74,6 +80,7 @@ func initialize*[T](state: DisjunctiveClauseConstraint[T], assignment: seq[T]) =
                 s += state.disjuncts[d][t].coeffs[i] * assignment[pos]
                 state.currentAssignment[pos] = assignment[pos]
             state.disjuncts[d][t].currentSum = s
+    state.recomputeDisjunctPenalties()
     state.cost = state.computePenalty()
 
 func moveDelta*[T](state: DisjunctiveClauseConstraint[T],
@@ -86,25 +93,30 @@ func moveDelta*[T](state: DisjunctiveClauseConstraint[T],
 
     let byD = state.positionByDisjunct[position]
 
-    # Compute new penalty with affected terms updated
+    # Compute new penalty using cached per-disjunct penalties.
+    # Only adjust disjuncts that are affected by this position change.
     var newPenalty = high(int)
     for d in 0..<state.disjuncts.len:
-        var conjPenalty = 0
-        for t in 0..<state.disjuncts[d].len:
-            let violation = state.disjuncts[d][t].currentSum - state.disjuncts[d][t].rhs
-            if violation > 0:
-                conjPenalty += violation
-        # Adjust for affected terms in this disjunct (O(affected) not O(all entries))
-        for entry in byD[d]:
-            let oldS = state.disjuncts[d][entry.ti].currentSum
-            let newS = oldS + entry.coeff * valueDelta
-            let oldViolation = max(T(0), oldS - state.disjuncts[d][entry.ti].rhs)
-            let newViolation = max(T(0), newS - state.disjuncts[d][entry.ti].rhs)
-            conjPenalty += int(newViolation - oldViolation)
-        if conjPenalty < newPenalty:
-            newPenalty = conjPenalty
-            if newPenalty == 0:
-                return -state.cost
+        let entries = byD[d]
+        if entries.len == 0:
+            # Unaffected disjunct — use cached penalty directly
+            if state.disjunctPenalties[d] < newPenalty:
+                newPenalty = state.disjunctPenalties[d]
+                if newPenalty == 0:
+                    return -state.cost
+        else:
+            # Affected disjunct — adjust cached penalty
+            var conjPenalty = state.disjunctPenalties[d]
+            for entry in entries:
+                let oldS = state.disjuncts[d][entry.ti].currentSum
+                let newS = oldS + entry.coeff * valueDelta
+                let oldViolation = max(T(0), oldS - state.disjuncts[d][entry.ti].rhs)
+                let newViolation = max(T(0), newS - state.disjuncts[d][entry.ti].rhs)
+                conjPenalty += int(newViolation - oldViolation)
+            if conjPenalty < newPenalty:
+                newPenalty = conjPenalty
+                if newPenalty == 0:
+                    return -state.cost
 
     return newPenalty - state.cost
 
@@ -117,6 +129,7 @@ func updatePosition*[T](state: DisjunctiveClauseConstraint[T],
     if position in state.positionEntries:
         for entry in state.positionEntries[position]:
             state.disjuncts[entry.di][entry.ti].currentSum += entry.coeff * valueDelta
+    state.recomputeDisjunctPenalties()
     state.cost = state.computePenalty()
 
 proc batchMovePenalty*[T](state: DisjunctiveClauseConstraint[T],
@@ -175,6 +188,7 @@ proc deepCopy*[T](state: DisjunctiveClauseConstraint[T]): DisjunctiveClauseConst
                 positions: state.disjuncts[d][t].positions,
                 rhs: state.disjuncts[d][t].rhs,
                 currentSum: state.disjuncts[d][t].currentSum)
+    result.disjunctPenalties = state.disjunctPenalties
     result.cost = state.cost
     # Both are immutable after construction; Nim Table assignment deep-copies
     result.positionEntries = state.positionEntries

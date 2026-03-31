@@ -2459,19 +2459,30 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     # Also map: index position -> element constraint indices (for Phase CB-idx)
     var idxToElementConstraints: Table[int, seq[int]]  # idxPos -> constraint indices
+    var idxToExprElementConstraints: Table[int, seq[int]]  # idxPos -> ExpressionBased constraint indices
     for ci, cons in carray.constraints:
         if cons.stateType == ElementType:
             let es = cons.elementState
-            if es.evalMethod != PositionBased: continue
-            if es.isConstantArray: continue  # constant arrays handled by Phase 6 already
-            var hasVariable = false
-            for elem in es.arrayElements:
-                if not elem.isConstant:
-                    hasVariable = true
-                    break
-            if not hasVariable: continue
-            let idxPos = es.indexPosition
-            idxToElementConstraints.mgetOrPut(idxPos, @[]).add(ci)
+            if es.evalMethod == PositionBased:
+                if es.isConstantArray: continue  # constant arrays handled by Phase 6 already
+                var hasVariable = false
+                for elem in es.arrayElements:
+                    if not elem.isConstant:
+                        hasVariable = true
+                        break
+                if not hasVariable: continue
+                let idxPos = es.indexPosition
+                idxToElementConstraints.mgetOrPut(idxPos, @[]).add(ci)
+            elif es.evalMethod == ExpressionBased:
+                # Include ExpressionBased elements where index depends on exactly one position
+                if es.indexExpression.positions.len == 1:
+                    var idxPos = -1
+                    for p in es.indexExpression.positions.items:
+                        idxPos = p
+                    if idxPos >= 0:
+                        idxToExprElementConstraints.mgetOrPut(idxPos, @[]).add(ci)
+
+    discard  # ExprElement registration is silent
 
     # Outer fixed-point loop: bounds propagation <-> allDifferent propagation
     var domainMin = newSeq[T](carray.len)
@@ -4090,24 +4101,35 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # check each candidate index value against ALL constraints. Remove values that fail any.
         var cbIdxPruned = 0
         # Collect all index positions that have at least 2 constraints total
+        # (counting PositionBased element constraints, ExpressionBased element constraints, and channel bindings)
         var cbIdxPositions: PackedSet[int]
+        proc countConstraints(idxPos: int): int =
+            result = 0
+            if idxPos in idxToVarArrayBindings: result += idxToVarArrayBindings[idxPos].len
+            if idxPos in idxToElementConstraints: result += idxToElementConstraints[idxPos].len
+            if idxPos in idxToExprElementConstraints: result += idxToExprElementConstraints[idxPos].len
         for idxPos in idxToVarArrayBindings.keys:
-            let nBindings = idxToVarArrayBindings[idxPos].len
-            let nElems = if idxPos in idxToElementConstraints: idxToElementConstraints[idxPos].len else: 0
-            if nBindings + nElems >= 2:
+            if countConstraints(idxPos) >= 2:
                 cbIdxPositions.incl(idxPos)
         for idxPos in idxToElementConstraints.keys:
-            if idxPos notin cbIdxPositions:
-                let nBindings = if idxPos in idxToVarArrayBindings: idxToVarArrayBindings[idxPos].len else: 0
-                let nElems = idxToElementConstraints[idxPos].len
-                if nBindings + nElems >= 2:
-                    cbIdxPositions.incl(idxPos)
+            if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 2:
+                cbIdxPositions.incl(idxPos)
+        for idxPos in idxToExprElementConstraints.keys:
+            if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 2:
+                cbIdxPositions.incl(idxPos)
+            # Also include ExpressionBased-only positions with 1+ constraints
+            # (even single ExprBased element with constant result can prune significantly)
+            if idxPos notin cbIdxPositions and countConstraints(idxPos) >= 1:
+                cbIdxPositions.incl(idxPos)
 
+        discard  # cbIdxPositions count not logged
         for idxPos in cbIdxPositions.items:
             if currentDomain[idxPos].len <= 1: continue
             if idxPos in skippedPositions: continue
             let cbBindings = if idxPos in idxToVarArrayBindings: idxToVarArrayBindings[idxPos] else: @[]
             let elemCons = if idxPos in idxToElementConstraints: idxToElementConstraints[idxPos] else: @[]
+            let exprElemCons = if idxPos in idxToExprElementConstraints: idxToExprElementConstraints[idxPos] else: @[]
+            discard  # Debug logging removed
             var tempAssign = initTable[int, T]()
             for v in toSeq(currentDomain[idxPos].items):
                 tempAssign[idxPos] = v
@@ -4227,6 +4249,80 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 if (currentDomain[elemPos] * currentDomain[valPos]).len == 0:
                                     supported = false
                                     break
+                # Check ExpressionBased element constraints
+                if supported:
+                    for ci in exprElemCons:
+                        let es = carray.constraints[ci].elementState
+                        # Evaluate the index expression with the candidate value
+                        let idxVal = es.indexExpression.evaluate(tempAssign)
+                        # Check bounds on the array
+                        let arrSize = if es.isConstantArrayEB: es.constantArrayEB.len
+                                      else: es.arrayExpressionsEB.len
+                        if idxVal < 0 or idxVal >= arrSize:
+                            supported = false
+                            break
+                        # Get the array value or domain at this index
+                        if es.isConstantArrayEB:
+                            let arrVal = es.constantArrayEB[idxVal]
+                            # Check against value expression domain
+                            if es.valueExpression.positions.len == 0:
+                                # Constant value expression
+                                let targetVal = es.valueExpression.evaluate(tempAssign)
+                                if arrVal != targetVal:
+                                    supported = false
+                                    break
+                            else:
+                                # Variable value expression - check if arrVal is in the value positions' domains
+                                var valInDomain = false
+                                for vp in es.valueExpression.positions.items:
+                                    if vp in skippedPositions:
+                                        if arrVal >= domainMin[vp] and arrVal <= domainMax[vp]:
+                                            valInDomain = true
+                                    elif arrVal in currentDomain[vp]:
+                                        valInDomain = true
+                                    break  # value expression typically has one position
+                                if not valInDomain:
+                                    supported = false
+                                    break
+                        else:
+                            # Variable array - evaluate the array expression
+                            let arrExpr = es.arrayExpressionsEB[idxVal]
+                            if arrExpr.positions.len == 0:
+                                # Constant array element expression
+                                let arrVal = arrExpr.evaluate(tempAssign)
+                                if es.valueExpression.positions.len == 0:
+                                    let targetVal = es.valueExpression.evaluate(tempAssign)
+                                    if arrVal != targetVal:
+                                        supported = false
+                                        break
+                                else:
+                                    # Check arrVal against value domain
+                                    for vp in es.valueExpression.positions.items:
+                                        if vp in skippedPositions:
+                                            if arrVal < domainMin[vp] or arrVal > domainMax[vp]:
+                                                supported = false
+                                        elif arrVal notin currentDomain[vp]:
+                                            supported = false
+                                        break
+                                    if not supported: break
+                            else:
+                                # Both array element and value are variable - use bounds overlap
+                                if es.valueExpression.positions.len == 0:
+                                    # Constant value target
+                                    let targetVal = es.valueExpression.evaluate(tempAssign)
+                                    # Check if any array element position's domain contains targetVal
+                                    var canMatch = false
+                                    for ap in arrExpr.positions.items:
+                                        if ap in skippedPositions:
+                                            if targetVal >= domainMin[ap] and targetVal <= domainMax[ap]:
+                                                canMatch = true
+                                        elif targetVal in currentDomain[ap]:
+                                            canMatch = true
+                                        break
+                                    if not canMatch:
+                                        supported = false
+                                        break
+                                # else: both variable - skip (bounds too wide to be useful)
                 if not supported:
                     currentDomain[idxPos].excl(v)
                     outerChanged = true

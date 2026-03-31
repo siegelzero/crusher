@@ -208,3 +208,122 @@ proc applyElementImpliedMoves[T](state: TabuState[T], movedPosition: int) =
         let oldIdx = state.domainIndex[targetPos].getOrDefault(oldValue, -1)
         if oldIdx >= 0 and not state.isLazy[targetPos]:
             state.tabu[targetPos][oldIdx] = state.iteration + 1 + state.iteration mod 10
+
+proc initReverseElementImpliedStructures[T](state: TabuState[T]) =
+    ## Build reverse mapping: for each position that appears as an array element
+    ## in an element constraint with a non-channel index, record the constraint
+    ## and index position. This enables adjusting the index when the array element
+    ## changes (e.g., due to channel cascade after a component move).
+    state.reverseElementImpliedEnabled = false
+    state.reverseElementImpliedMap = newSeq[seq[tuple[constraintIdx: int, idxPos: int]]](state.carray.len)
+
+    let channelPos = state.carray.channelPositions
+    var nPositions, nEntries = 0
+
+    for ci, constraint in state.constraints:
+        if constraint.stateType != ElementType:
+            continue
+        let es = constraint.elementState
+
+        var idxPos = -1
+        case es.evalMethod:
+        of PositionBased:
+            idxPos = es.indexPosition
+            if idxPos in channelPos: continue
+            if es.isConstantArray: continue
+            for i, elem in es.arrayElements:
+                if not elem.isConstant and elem.variablePosition in channelPos:
+                    let arrPos = elem.variablePosition
+                    state.reverseElementImpliedMap[arrPos].add(
+                        (constraintIdx: ci, idxPos: idxPos))
+        of ExpressionBased:
+            # Find the single index source position
+            if es.indexExpression.positions.len != 1: continue
+            for p in es.indexExpression.positions.items:
+                idxPos = p
+            if idxPos < 0 or idxPos in channelPos: continue
+            let arrLen = if es.isConstantArrayEB: es.constantArrayEB.len
+                         else: es.arrayExpressionsEB.len
+            if not es.isConstantArrayEB:
+                for i in 0..<arrLen:
+                    let expr = es.arrayExpressionsEB[i]
+                    if expr.node.kind == RefNode and expr.node.position in channelPos:
+                        let arrPos = expr.node.position
+                        state.reverseElementImpliedMap[arrPos].add(
+                            (constraintIdx: ci, idxPos: idxPos))
+
+    for pos in 0..<state.reverseElementImpliedMap.len:
+        if state.reverseElementImpliedMap[pos].len > 0:
+            nPositions += 1
+            nEntries += state.reverseElementImpliedMap[pos].len
+
+    if nEntries > 0:
+        state.reverseElementImpliedEnabled = true
+        if state.verbose and state.id == 0:
+            echo "[Init] Reverse element implied: " & $nPositions &
+                 " array positions, " & $nEntries & " entries"
+
+proc applyReverseElementImpliedMoves[T](state: TabuState[T]) =
+    ## After channel propagation, check if any changed channel positions appear in
+    ## element constraint arrays. If so, try to re-point the index variable to a value
+    ## that satisfies the element constraint.
+    ## Uses state.changedChannelsBuf which was populated by propagateChannels.
+    ## Note: we snapshot the buffer since assignValue may modify it.
+    if not state.reverseElementImpliedEnabled:
+        return
+
+    # Collect relevant changed positions (snapshot to avoid iteration-during-mutation)
+    var relevantChanges: seq[int]
+    for chanPos in state.changedChannelsBuf:
+        if chanPos < state.reverseElementImpliedMap.len and
+           state.reverseElementImpliedMap[chanPos].len > 0:
+            relevantChanges.add(chanPos)
+    if relevantChanges.len == 0: return
+
+    for chanPos in relevantChanges:
+        if state.reverseElementImpliedMap[chanPos].len == 0: continue
+
+        for entry in state.reverseElementImpliedMap[chanPos]:
+            let constraint = state.constraints[entry.constraintIdx]
+            let es = constraint.elementState
+            let idxPos = entry.idxPos
+
+            # Check if this constraint is currently violated
+            if constraint.penalty() == 0:
+                continue  # Already satisfied
+
+            # Try to find a better index value
+            let domain = state.sharedDomain[][idxPos]
+            let currentIdxValue = state.assignment[idxPos]
+            var bestValue = currentIdxValue
+            var bestDelta = 0
+
+            for v in domain:
+                if v == currentIdxValue: continue
+                # Check tabu
+                let domIdx = state.domainIndex[idxPos].getOrDefault(v, -1)
+                if domIdx < 0: continue
+                if not state.isLazy[idxPos] and state.tabu[idxPos][domIdx] > state.iteration:
+                    continue  # Skip tabu values
+
+                # Compute cost delta for changing index to v
+                let delta = if state.isLazy[idxPos]:
+                    state.costDelta(idxPos, v)
+                else:
+                    var d = state.penaltyMap[idxPos][domIdx]
+                    if state.hasChannelDeps and state.channelDepPenalties[idxPos].len > 0:
+                        d += state.channelDepPenalties[idxPos][domIdx]
+                    d
+
+                if delta < bestDelta:
+                    bestDelta = delta
+                    bestValue = v
+
+            # Apply if strictly improving
+            if bestDelta < 0 and bestValue != currentIdxValue:
+                let oldValue = state.assignment[idxPos]
+                state.assignValue(idxPos, bestValue)
+                # Set tabu on old value
+                let oldIdx = state.domainIndex[idxPos].getOrDefault(oldValue, -1)
+                if oldIdx >= 0 and not state.isLazy[idxPos]:
+                    state.tabu[idxPos][oldIdx] = state.iteration + 1 + state.iteration mod 10

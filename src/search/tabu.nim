@@ -150,6 +150,13 @@ type
         elementImpliedDiscount*: Table[int, seq[int]]
             # index position -> per-domainIdx discount from implied fixes
 
+        # Reverse element implied moves: when a channel/array element changes,
+        # try to re-point the index variable to satisfy the element constraint.
+        reverseElementImpliedEnabled*: bool
+        reverseElementImpliedMap*: seq[seq[tuple[constraintIdx: int, idxPos: int]]]
+            # [position] -> [(constraint index, index position)] for reverse implied moves
+            # Indexed by position (sparse, most entries empty)
+
         # Inverse group compound move structures
         inverseEnabled*: bool
         inverseGroups*: seq[InverseGroup[int]]
@@ -200,6 +207,9 @@ type
         cdCascadeConstraintL: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # [cascadeIdx][constraintLocalIdx][j] = (chanIdx in cascade, coeff)
         cdCascadeConstraintR: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # right side
         cdCascadeConstraintIds: seq[seq[int]]     # [cascadeIdx][constraintLocalIdx] -> index into channelDepConstraints
+        # DisjunctiveClause fast cascade path: precomputed term coefficient mappings
+        # [cascadeIdx][constraintLocalIdx] -> per-disjunct, per-term list of (coeffIdx, cascadeIdx) pairs
+        cdCascadeDCTermCoeffs: seq[seq[seq[seq[seq[tuple[coeffIdx: int, cascIdx: int]]]]]]
         # Reusable buffers for dynamic batch evaluation (avoid per-call allocation)
         cdBatchValues: seq[seq[T]]                # [chanIdx][domainIdx] -> channel value (resized as needed)
         cdBatchSaved: seq[T]                      # saved channel values during batch evaluation
@@ -2079,6 +2089,27 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             constraintCoeffL.add(coeffsL)
                             constraintCoeffR.add(coeffsR)
 
+            # Build DisjunctiveClause term coefficient mapping for DC fast cascade path
+            var dcTermCoeffs: seq[seq[seq[seq[tuple[coeffIdx: int, cascIdx: int]]]]] = @[]
+            for cli, ci in constraintLocalIds:
+                let c = state.channelDepConstraints[ci]
+                if c.stateType == DisjunctiveClauseType:
+                    let dc = c.disjunctiveClauseState
+                    var perDisjunct: seq[seq[seq[tuple[coeffIdx: int, cascIdx: int]]]] = @[]
+                    for d in 0..<dc.disjuncts.len:
+                        var perTerm: seq[seq[tuple[coeffIdx: int, cascIdx: int]]] = @[]
+                        for t in 0..<dc.disjuncts[d].len:
+                            var termMapping: seq[tuple[coeffIdx: int, cascIdx: int]] = @[]
+                            for k in 0..<dc.disjuncts[d][t].positions.len:
+                                let tpos = dc.disjuncts[d][t].positions[k]
+                                if tpos in chanToIdx:
+                                    termMapping.add((coeffIdx: k, cascIdx: chanToIdx[tpos]))
+                            perTerm.add(termMapping)
+                        perDisjunct.add(perTerm)
+                    dcTermCoeffs.add(perDisjunct)
+                else:
+                    dcTermCoeffs.add(@[])  # Empty for non-DC constraints
+
             # Compute external dependencies: positions read by cascade entries that
             # are outside the cascade. Separate element vs min/max deps to allow
             # fast-path when only min/max deps changed (skip element re-evaluation).
@@ -2202,6 +2233,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.cdCascadeValues.add(chanValues)
             state.cdCascadeIsStatic.add(canStatic)
             state.cdCascadeConstraintIds.add(constraintLocalIds)
+            state.cdCascadeDCTermCoeffs.add(dcTermCoeffs)
             state.cdCascadeConstraintL.add(constraintCoeffL)
             state.cdCascadeConstraintR.add(constraintCoeffR)
 
@@ -2391,6 +2423,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     # Initialize element implied structures before penalty map so discounts are included
     state.initElementImpliedStructures()
+    state.initReverseElementImpliedStructures()
     state.recomputeElementImpliedDiscounts()
 
     if verbose and id == 0:
@@ -2987,6 +3020,12 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         state.timeChannelDep += tCD1 - tProp1
         let t1 = epochTime()
         state.timeAssignConstraints += t1 - t0
+
+    # Apply reverse element implied moves: when channels changed, try to re-point
+    # index variables (e.g., parent) to restore element constraint satisfaction.
+    if state.reverseElementImpliedEnabled and anyChannelsChanged:
+        {.cast(gcsafe).}:
+            state.applyReverseElementImpliedMoves()
 
     # Recompute element implied discounts before penalty rebuild if this is an index position.
     # The discount depends on current array values (updated above via constraint.updatePosition).

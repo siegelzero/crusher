@@ -45,19 +45,26 @@ proc extractEqReifTerms(tr: FznTranslator, reifCi: int):
     let vIsConst = argV.kind == FznIntLit or (argV.kind == FznIdent and argV.ident in tr.paramValues)
     let xIsVar = argX.kind == FznIdent and argX.ident notin tr.paramValues
     let vIsVar = argV.kind == FznIdent and argV.ident notin tr.paramValues
+    let xIsConst = argX.kind == FznIntLit or (argX.kind == FznIdent and argX.ident in tr.paramValues)
     if xIsVar and vIsConst:
         # var == const → var <= const AND -var <= -const
         let c = try: tr.resolveIntArg(argV) except ValueError, KeyError: return
         result = (ok: true, terms: @[
             DisjunctiveClauseTerm(coeffs: @[1], varNames: @[argX.ident], rhs: c),
             DisjunctiveClauseTerm(coeffs: @[-1], varNames: @[argX.ident], rhs: -c)])
+    elif xIsConst and vIsVar:
+        # const == var → var <= const AND -var <= -const (symmetric)
+        let c = try: tr.resolveIntArg(argX) except ValueError, KeyError: return
+        result = (ok: true, terms: @[
+            DisjunctiveClauseTerm(coeffs: @[1], varNames: @[argV.ident], rhs: c),
+            DisjunctiveClauseTerm(coeffs: @[-1], varNames: @[argV.ident], rhs: -c)])
     elif xIsVar and vIsVar:
         # var == var → var_x - var_v <= 0 AND var_v - var_x <= 0
         result = (ok: true, terms: @[
             DisjunctiveClauseTerm(coeffs: @[1, -1], varNames: @[argX.ident, argV.ident], rhs: 0),
             DisjunctiveClauseTerm(coeffs: @[-1, 1], varNames: @[argX.ident, argV.ident], rhs: 0)])
     else:
-        return  # both const or const==var (swap handled by xIsVar check)
+        return  # both const → can't extract
 
 proc extractReifDisjunct(tr: FznTranslator, boolIdent: string,
     linLeReifDefines, leReifDefines, eqReifDefines: Table[string, int]):
