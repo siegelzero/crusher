@@ -2482,6 +2482,9 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 binHi = max(binHi, dom[^1])
 
         let totalWeight = weights.foldl(a + b, 0)
+        var allUnit = true
+        for w in weights:
+            if w != 1: allUnit = false; break
 
         # For each possible bin value, create auxiliary load variable + channel + capacity constraint
         var nChannels = 0
@@ -2490,14 +2493,20 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             discard tr.sys.newConstrainedVariable()
             tr.sys.baseArray.domain[loadPos] = toSeq(0..min(totalWeight, capacity))
 
-            tr.sys.baseArray.addWeightedCountEqChannelBinding(
-                loadPos, b, binPositions, weights, 0)
+            if allUnit:
+                # Unit weights: use cheaper CountEq channel
+                tr.sys.baseArray.addCountEqChannelBinding(
+                    loadPos, b, binPositions, 0)
+            else:
+                tr.sys.baseArray.addWeightedCountEqChannelBinding(
+                    loadPos, b, binPositions, weights, 0)
 
             let loadExpr = tr.getExpr(loadPos)
             tr.sys.addConstraint(loadExpr <= capacity)
             inc nChannels
 
-        stderr.writeLine(&"[FZN] bin_packing: {nChannels} bins (cap={capacity}), {binExprs.len} items -> {nChannels} weighted count channels")
+        stderr.writeLine(&"[FZN] bin_packing: {nChannels} bins (cap={capacity}), {binExprs.len} items -> {nChannels} " &
+            (if allUnit: "count" else: "weighted count") & " channels")
 
     else:
         # Unknown constraint - warn and skip
