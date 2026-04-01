@@ -166,8 +166,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         let xArg = con.args[0]
         let setArg = con.args[1]
 
-        if xArg.kind == FznIdent and xArg.ident notin tr.definedVarNames:
-            # set_in_reif(var, constSet, b): x is variable, S is constant set
+        if xArg.kind == FznIdent:
+            # set_in_reif(var, constSet, b): x is variable (or defined var), S is constant set
             if setArg.kind == FznSetLit or setArg.kind == FznRange:
                 tr.channelVarNames.incl(bName)
                 tr.definingConstraints.incl(ci)

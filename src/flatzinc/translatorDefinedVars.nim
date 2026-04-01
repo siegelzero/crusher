@@ -256,14 +256,21 @@ proc collectDefinedVars(tr: var FznTranslator) =
                 aliasesOf[originalName] = @[]
             aliasesOf[originalName].add(aliasName)
 
+        # Determine objective variable name — must not be eliminated as dead
+        var objVarName = ""
+        if tr.model.solve.kind in {Minimize, Maximize} and
+             tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+            objVarName = tr.model.solve.objective.ident
+
         # Check each element channel: if neither it nor any alias is referenced, eliminate it
         # A channel is referenced if:
         #   1. It appears in a non-defining constraint, OR
-        #   2. It appears in a defining constraint OTHER than its own
+        #   2. It appears in a defining constraint OTHER than its own, OR
+        #   3. It is the objective variable
         var nDeadChannels = 0
         var deadCIs: seq[int] = @[]
         for ci, chanName in tr.channelConstraints:
-            var isReferenced = chanName in referencedVars
+            var isReferenced = chanName in referencedVars or chanName == objVarName
             if not isReferenced:
                 # Check aliases
                 if chanName in aliasesOf:
@@ -342,6 +349,53 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     ## Returns true if successful, false if a dependency is not yet available.
     let con = tr.model.constraints[ci]
     let name = stripSolverPrefix(con.name)
+
+    # Handle int_lin_eq_reif promoted to defined var (from detectReifEquationDefinedVars)
+    if name == "int_lin_eq_reif" and ci in tr.reifEqDefinedVars:
+        let definedName = tr.reifEqDefinedVars[ci]
+        if definedName in tr.definedVarExprs: return true  # already built
+        # Use args[0..2] (coeffs, vars, rhs), same logic as int_lin_eq
+        let coeffs = tr.resolveIntArray(con.args[0])
+        let rhs = tr.resolveIntArg(con.args[2])
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len == 0: return true
+        var definedIdx = -1
+        for vi, v in varElems:
+            if v.kind == FznIdent and v.ident == definedName:
+                definedIdx = vi; break
+        if definedIdx < 0: return true
+        # Check dependencies
+        for vi, v in varElems:
+            if vi == definedIdx: continue
+            if v.kind == FznIdent and v.ident in tr.definedVarNames and
+                 v.ident notin tr.definedVarExprs and v.ident notin tr.varPositions and
+                 v.ident notin tr.paramValues:
+                return false  # dependency not yet built
+        let defCoeff = coeffs[definedIdx]
+        let sign = if defCoeff == 1: -1 else: 1
+        var expr: AlgebraicExpression[int]
+        var first = true
+        for vi, v in varElems:
+            if vi == definedIdx: continue
+            let otherExpr = tr.resolveExprArg(v)
+            let scaledCoeff = sign * coeffs[vi]
+            let term = scaledCoeff * otherExpr
+            if first: expr = term; first = false
+            else: expr = expr + term
+        let constTerm = if defCoeff == 1: rhs else: -rhs
+        if constTerm != 0:
+            if first:
+                expr = newAlgebraicExpression[int](
+                    positions = initPackedSet[int](),
+                    node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
+                    linear = true)
+                first = false
+            else:
+                expr = expr + constTerm
+        if expr.isNil:
+            raise newException(ValueError, &"Failed to build reif-equation expression for '{definedName}'")
+        tr.definedVarExprs[definedName] = expr
+        return true
 
     # Handle int_times without defines_var (detected by collectDefinedVars)
     if name == "int_times" and not con.hasAnnotation("defines_var"):
@@ -564,6 +618,129 @@ proc detectImplicitMaxChannels(tr: var FznTranslator) =
 
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} implicit min/max channel variables (array_int_max/min without defines_var)")
+
+proc detectReifEquationDefinedVars(tr: var FznTranslator) =
+    ## Detect int_lin_eq_reif(coeffs, vars, rhs, bool) constraints where one variable
+    ## in vars can be promoted to a defined var. This happens when the equation uniquely
+    ## determines a non-search variable given the others.
+    ##
+    ## Pattern: the equation `sum(coeffs[i] * vars[i]) = rhs` has exactly one variable
+    ## that is (a) not already defined/channel/param, (b) not in the solve annotation,
+    ## and (c) has coefficient ±1 (so it can be solved for exactly).
+    ##
+    ## This is critical for models like fox-geeses-corn where conditional predicates
+    ## (the `alone` predicate) produce outputs that MiniZinc reifies instead of defining.
+    # Build set of variables that appear in variable-indexed arrays (element constraints).
+    # These need positions and cannot be promoted to defined vars (no position).
+    # First collect all array names used by array_var_*_element constraints.
+    var varElementArrayNames: HashSet[string]
+    var arrayEmbeddedVars: HashSet[string]
+    for ci, con in tr.model.constraints:
+        let cname = stripSolverPrefix(con.name)
+        if cname in ["array_var_int_element", "array_var_int_element_nonshifted",
+                      "array_var_bool_element", "array_var_bool_element_nonshifted",
+                      "array_var_set_element"]:
+            if con.args.len >= 2:
+                let arrArg = con.args[1]
+                if arrArg.kind == FznArrayLit:
+                    for e in arrArg.elems:
+                        if e.kind == FznIdent:
+                            arrayEmbeddedVars.incl(e.ident)
+                elif arrArg.kind == FznIdent:
+                    varElementArrayNames.incl(arrArg.ident)
+    # Resolve named arrays to their variable elements
+    for decl in tr.model.variables:
+        if decl.isArray and decl.name in varElementArrayNames:
+            if decl.value != nil and decl.value.kind == FznArrayLit:
+                for e in decl.value.elems:
+                    if e.kind == FznIdent:
+                        arrayEmbeddedVars.incl(e.ident)
+
+    var nDetected = 0
+    var changed = true
+    var iterations = 0
+    while changed and iterations < 30:
+        changed = false
+        inc iterations
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name != "int_lin_eq_reif": continue
+            if con.args.len < 4: continue
+            # Allow constraints already in definingConstraints (for the bool channel) —
+            # the same constraint can serve dual purpose: channel the bool AND define the target var.
+            if ci in tr.reifEqDefinedVars: continue  # already processed by us
+
+            # Resolve coefficients and variables
+            var coeffsArg = con.args[0]
+            if coeffsArg.kind == FznIdent:
+                var found = false
+                for decl in tr.model.parameters:
+                    if decl.isArray and decl.name == coeffsArg.ident:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            coeffsArg = decl.value
+                            found = true
+                        break
+                if not found: continue
+            if coeffsArg.kind != FznArrayLit: continue
+
+            var varsArg = con.args[1]
+            if varsArg.kind == FznIdent:
+                var found = false
+                for decl in tr.model.variables:
+                    if decl.isArray and decl.name == varsArg.ident:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            varsArg = decl.value
+                            found = true
+                        break
+                if not found: continue
+            if varsArg.kind != FznArrayLit: continue
+
+            let nArgs = coeffsArg.elems.len
+            if nArgs != varsArg.elems.len: continue
+
+            # Find candidate target: exactly one variable that is:
+            # - Not defined, not channel, not param
+            # - Not in the search annotation
+            # - Has coefficient ±1
+            var candidateIdx = -1
+            var nUnresolved = 0
+            var valid = true
+            for i in 0..<nArgs:
+                if coeffsArg.elems[i].kind != FznIntLit:
+                    valid = false; break
+                let vExpr = varsArg.elems[i]
+                if vExpr.kind != FznIdent:
+                    continue  # literal values are fine
+                let vName = vExpr.ident
+                if vName in tr.definedVarNames or vName in tr.channelVarNames or vName in tr.paramValues:
+                    continue  # already resolved
+                # This is an unresolved variable
+                inc nUnresolved
+                let coeff = coeffsArg.elems[i].intVal
+                if (coeff == 1 or coeff == -1) and vName notin tr.annotatedSearchVarNames:
+                    if candidateIdx == -1:
+                        candidateIdx = i
+                    else:
+                        # Multiple non-annotated candidates — ambiguous, skip
+                        candidateIdx = -2
+            if not valid: continue
+            if candidateIdx < 0: continue  # no candidate or ambiguous
+            if nUnresolved < 1: continue   # all already resolved
+
+            let targetName = varsArg.elems[candidateIdx].ident
+            # Don't promote if already in definedVarNames (from a previous iteration)
+            if targetName in tr.definedVarNames: continue
+            # Don't promote if variable appears in a variable-indexed array (needs position)
+            if targetName in arrayEmbeddedVars: continue
+
+            tr.definedVarNames.incl(targetName)
+            tr.definingConstraints.incl(ci)
+            tr.reifEqDefinedVars[ci] = targetName
+            inc nDetected
+            changed = true
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} reif-equation defined vars (int_lin_eq_reif → defined var, {iterations} iterations)")
 
 proc buildDefinedExpressions(tr: var FznTranslator) =
     ## Second pass: build AlgebraicExpressions for defined variables using the positions

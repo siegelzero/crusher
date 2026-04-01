@@ -3073,3 +3073,31 @@ solve satisfy;
     check nonZero.toHashSet.len == nonZero.len
     # With sum=3 and values in 0..2, we need 1+2=3, so exactly two zeros
     check values.count(0) == 2
+
+  test "element-defined objective variable not eliminated as dead channel":
+    # Regression: when the objective variable is defined solely by an
+    # array_var_int_element constraint and referenced only in the solve line,
+    # dead-channel elimination must NOT remove it.
+    # FlatZinc array_var_int_element is 1-based: idx=1→a0, idx=2→a1, idx=3→a2.
+    let src = """
+var 1..3: idx :: output_var;
+var 10..30: a0;
+var 10..30: a1;
+var 10..30: a2;
+array [1..3] of var int: arr = [a0, a1, a2];
+constraint int_eq(a0, 10);
+constraint int_eq(a1, 20);
+constraint int_eq(a2, 30);
+var 10..30: obj :: is_defined_var :: output_var;
+constraint array_var_int_element(idx, arr, obj) :: defines_var(obj);
+solve maximize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.objectivePos >= 0  # must be a real position, not eliminated
+    let objExpr = tr.getExpr(tr.objectivePos)
+    maximize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+    check tr.sys.hasFeasibleSolution
+    let objVal = tr.sys.assignment[tr.objectivePos]
+    check objVal >= 30  # optimal: idx=3 → obj=a2=30

@@ -2092,13 +2092,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                     # x outside universe — b must be 0
                     if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
                         tr.sys.baseArray.setDomain(tr.varPositions[bArg.ident], @[0])
-            elif xArg.kind == FznIdent and xArg.ident in tr.varPositions:
-                # x is a variable: b = element(x - lo, S.bools)
-                let xPos = tr.varPositions[xArg.ident]
-                let xExpr = tr.getExpr(xPos)
+            elif xArg.kind == FznIdent and (xArg.ident in tr.varPositions or xArg.ident in tr.definedVarExprs):
+                # x is a variable (or defined var): b = element(x - lo, S.bools)
+                let xExpr = if xArg.ident in tr.varPositions:
+                    tr.getExpr(tr.varPositions[xArg.ident])
+                else:
+                    tr.definedVarExprs[xArg.ident]
+                let xDom = if xArg.ident in tr.varPositions:
+                    tr.sys.baseArray.domain[tr.varPositions[xArg.ident]]
+                else:
+                    tr.lookupVarDomain(xArg.ident)
                 var arrayElems: seq[ArrayElement[int]]
                 # Build array covering x's domain range (out-of-universe values map to 0)
-                let xDom = tr.sys.baseArray.domain[xPos]
                 let arrLo = xDom[0]
                 let arrHi = xDom[^1]
                 for v in arrLo..arrHi:
@@ -2119,6 +2124,20 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 let xExpr = tr.getExpr(xPos)
                 let domain = tr.sys.baseArray.domain[xPos]
                 if domain.len > 0:
+                    let lo = domain[0]
+                    let indexExpr = xExpr - lo
+                    var arrayElems: seq[ArrayElement[int]]
+                    for v in domain:
+                        arrayElems.add(ArrayElement[int](isConstant: true,
+                                constantValue: if v in setAsHashSet: 1 else: 0))
+                    if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+                        let bPos = tr.varPositions[bArg.ident]
+                        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
+            elif xArg.kind == FznIdent and xArg.ident in tr.definedVarExprs:
+                # x is a defined var — use its defining expression and declared domain
+                let xExpr = tr.definedVarExprs[xArg.ident]
+                let domain = tr.lookupVarDomain(xArg.ident)
+                if domain.len > 0 and domain.len <= 100_000:
                     let lo = domain[0]
                     let indexExpr = xExpr - lo
                     var arrayElems: seq[ArrayElement[int]]

@@ -258,6 +258,8 @@ type
         leReifChannelDefs*: seq[int]    # int_le_reif/int_lt_reif channel constraint indices
         linLeReifChannelDefs*: seq[int] # int_lin_le_reif channel constraint indices
         linEqReifChannelDefs*: seq[int] # int_lin_eq_reif channel constraint indices
+        # Reif-equation defined vars: int_lin_eq_reif where one var is promoted to defined var
+        reifEqDefinedVars*: Table[int, string] # constraint index -> target var name
         # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
         implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
         # One-hot channel defs: indicator vars to convert to channels of integer vars
@@ -1030,6 +1032,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
     # for domain reduction when guard is forced. MUST run after detectReifChannels.
     result.detectConditionalSeparationPattern()
+    # TODO: detect int_lin_eq_reif constraints that define a variable via channel bindings
+    # (not defined vars — inlining causes expression explosion in deep chains).
+    # result.detectReifEquationDefinedVars()
     result.translateVariables()
     # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
     result.emitCircuitTimePropConstraint()
