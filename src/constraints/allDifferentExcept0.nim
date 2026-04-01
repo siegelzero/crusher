@@ -182,29 +182,29 @@ proc moveDelta*[T](state: AllDifferentExcept0Constraint[T], position: int, oldVa
 
 proc getAffectedPositions*[T](state: AllDifferentExcept0Constraint[T]): PackedSet[int] =
     ## Returns positions needing penalty map updates after the last updatePosition.
-    ## A neighbor's moveDelta only changes when a count crosses a critical boundary:
-    ## - count 1→0 or 0→1: changes whether adding the value incurs a penalty
-    ## - count 2→1 or 1→2: changes whether removing the value reduces penalty
-    let oldV = state.lastOldValue
-    let newV = state.lastNewValue
-    if oldV == newV:
-        return initPackedSet[int]()
-
-    var critical = false
-    # Old value count decreased: check if it crossed 1→0 or 2→1
-    if oldV != 0:
-        # lastOldCountBefore is the count before decrement
-        critical = critical or (state.lastOldCountBefore == 1) or (state.lastOldCountBefore == 2)
-    # New value count increased: check if it crossed 0→1 or 1→2
-    if newV != 0:
-        # lastNewCountAfter is the count after increment
-        critical = critical or (state.lastNewCountAfter == 1) or (state.lastNewCountAfter == 2)
-
-    if not critical:
-        return initPackedSet[int]()
-
+    ## For PositionBased: uses critical boundary detection — a neighbor's moveDelta
+    ## only changes when a count crosses 1→0/0→1 (affects "add" deltas) or
+    ## 2→1/1→2 (affects "remove" deltas).
+    ## For ExpressionBased: always returns all positions, because the count table
+    ## tracks expression-evaluated values (not raw values), so the raw-value-based
+    ## threshold fields cannot reliably detect critical transitions.
     case state.evalMethod:
         of PositionBased:
+            let oldV = state.lastOldValue
+            let newV = state.lastNewValue
+            if oldV == newV:
+                return initPackedSet[int]()
+
+            var critical = false
+            # Old value count decreased: check if it crossed 1→0 or 2→1
+            if oldV != 0:
+                critical = critical or (state.lastOldCountBefore == 1) or (state.lastOldCountBefore == 2)
+            # New value count increased: check if it crossed 0→1 or 1→2
+            if newV != 0:
+                critical = critical or (state.lastNewCountAfter == 1) or (state.lastNewCountAfter == 2)
+
+            if not critical:
+                return initPackedSet[int]()
             return state.positions
         of ExpressionBased:
             var allPos = initPackedSet[int]()
@@ -215,14 +215,20 @@ proc getAffectedPositions*[T](state: AllDifferentExcept0Constraint[T]): PackedSe
 
 proc getAffectedDomainValues*[T](state: AllDifferentExcept0Constraint[T], position: int): seq[T] =
     ## Returns domain values needing recalculation at a neighbor position.
-    ## Only the old/new values need recalc, unless this position's current value
-    ## is one of them (then all values are affected since the baseline changes).
-    let curVal = state.currentAssignment[position]
-    if curVal == state.lastOldValue or curVal == state.lastNewValue:
-        return @[]  # All values affected
-    var result: seq[T]
-    if state.lastOldValue != 0:
-        result.add(state.lastOldValue)
-    if state.lastNewValue != 0 and state.lastNewValue != state.lastOldValue:
-        result.add(state.lastNewValue)
-    return result
+    ## For PositionBased: only the old/new values need recalc, unless the neighbor's
+    ## current value is one of them (baseline shift → all values affected).
+    ## For ExpressionBased: returns @[] (all values), because count table tracks
+    ## expression-evaluated values, not raw domain values.
+    case state.evalMethod:
+        of ExpressionBased:
+            return @[]
+        of PositionBased:
+            let curVal = state.currentAssignment[position]
+            if curVal == state.lastOldValue or curVal == state.lastNewValue:
+                return @[]  # All values affected
+            var result: seq[T]
+            if state.lastOldValue != 0:
+                result.add(state.lastOldValue)
+            if state.lastNewValue != 0 and state.lastNewValue != state.lastOldValue:
+                result.add(state.lastNewValue)
+            return result

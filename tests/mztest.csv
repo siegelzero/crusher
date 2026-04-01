@@ -29,6 +29,7 @@ unit_commit_L7,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L7-
 accap_a3_f20_t10,2024/accap/accap.mzn,2024/accap/accap_a3_f20_t10.json,minimize,10000,104,110
 aircraft_disassembly_01,2024/aircraft-disassembly/aircraft.mzn,2024/aircraft-disassembly/B737NG-600-01-Anon.json.dzn,minimize,10000,3297500,25000000
 community_detection_mexican,2024/community-detection/community-detection.mzn,2024/community-detection/mexican.s26.k4.dzn,maximize,10000,715070,715070
+concert_hall_cap_mznc2018,2024/concert-hall-cap/concert-hall-cap.mzn,2024/concert-hall-cap/concert-cap.mznc2018.04.dzn,minimize,10000,36778,36778
 
 groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86
