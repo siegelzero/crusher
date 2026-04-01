@@ -1930,11 +1930,19 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let exprs = tr.resolveExprArray(con.args[0])
         tr.sys.addConstraint(decreasing[int](exprs))
 
-    of "fzn_all_different_except_0":
+    of "fzn_all_different_except_0", "fzn_alldifferent_except_0":
         let exprs = tr.resolveExprArray(con.args[0])
-        let (allRefs, positions) = isAllRefs(exprs)
+        # Filter out constant 0 expressions — they are exempt from uniqueness
+        var filteredExprs: seq[AlgebraicExpression[int]]
+        for e in exprs:
+            if e.node.kind == LiteralNode and e.node.value == 0:
+                continue
+            filteredExprs.add(e)
+        let (allRefs, positions) = isAllRefs(filteredExprs)
         if allRefs:
             tr.sys.addConstraint(allDifferentExcept0[int](positions))
+        else:
+            tr.sys.addConstraint(allDifferentExcept0[int](filteredExprs))
 
     of "set_in":
         # set_in(x, S) means x must be in set S

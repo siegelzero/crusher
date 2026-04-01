@@ -19,6 +19,10 @@ type
         currentAssignment*: Table[int, T]
         countTable: Table[T, int]
         cost*: int
+        lastOldValue*: T
+        lastNewValue*: T
+        lastOldCountBefore: int  ## count of oldValue before decrement
+        lastNewCountAfter: int   ## count of newValue after increment
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 positions: PackedSet[int]
@@ -110,6 +114,9 @@ proc initialize*[T](state: AllDifferentExcept0Constraint[T], assignment: seq[T])
 
 proc updatePosition*[T](state: AllDifferentExcept0Constraint[T], position: int, newValue: T) =
     let oldValue = state.currentAssignment[position]
+    state.lastOldValue = oldValue
+    state.lastNewValue = newValue
+    state.lastOldCountBefore = if oldValue != 0: getCount(state.countTable, oldValue) else: 0
     if oldValue != newValue:
         case state.evalMethod:
             of PositionBased:
@@ -123,6 +130,7 @@ proc updatePosition*[T](state: AllDifferentExcept0Constraint[T], position: int, 
                     state.currentAssignment[position] = newValue
                     newExpValue = state.expressions[i].evaluate(state.currentAssignment)
                     state.adjustCounts(oldExpValue, newExpValue)
+    state.lastNewCountAfter = if newValue != 0: getCount(state.countTable, newValue) else: 0
 
 
 proc moveDelta*[T](state: AllDifferentExcept0Constraint[T], position: int, oldValue, newValue: T): int =
@@ -170,3 +178,51 @@ proc moveDelta*[T](state: AllDifferentExcept0Constraint[T], position: int, oldVa
                     result -= max(0, newValueCount - 1)
                     newValueCount += 1
                     result += newValueCount - 1
+
+
+proc getAffectedPositions*[T](state: AllDifferentExcept0Constraint[T]): PackedSet[int] =
+    ## Returns positions needing penalty map updates after the last updatePosition.
+    ## A neighbor's moveDelta only changes when a count crosses a critical boundary:
+    ## - count 1→0 or 0→1: changes whether adding the value incurs a penalty
+    ## - count 2→1 or 1→2: changes whether removing the value reduces penalty
+    let oldV = state.lastOldValue
+    let newV = state.lastNewValue
+    if oldV == newV:
+        return initPackedSet[int]()
+
+    var critical = false
+    # Old value count decreased: check if it crossed 1→0 or 2→1
+    if oldV != 0:
+        # lastOldCountBefore is the count before decrement
+        critical = critical or (state.lastOldCountBefore == 1) or (state.lastOldCountBefore == 2)
+    # New value count increased: check if it crossed 0→1 or 1→2
+    if newV != 0:
+        # lastNewCountAfter is the count after increment
+        critical = critical or (state.lastNewCountAfter == 1) or (state.lastNewCountAfter == 2)
+
+    if not critical:
+        return initPackedSet[int]()
+
+    case state.evalMethod:
+        of PositionBased:
+            return state.positions
+        of ExpressionBased:
+            var allPos = initPackedSet[int]()
+            for exp in state.expressions:
+                allPos.incl(exp.positions)
+            return allPos
+
+
+proc getAffectedDomainValues*[T](state: AllDifferentExcept0Constraint[T], position: int): seq[T] =
+    ## Returns domain values needing recalculation at a neighbor position.
+    ## Only the old/new values need recalc, unless this position's current value
+    ## is one of them (then all values are affected since the baseline changes).
+    let curVal = state.currentAssignment[position]
+    if curVal == state.lastOldValue or curVal == state.lastNewValue:
+        return @[]  # All values affected
+    var result: seq[T]
+    if state.lastOldValue != 0:
+        result.add(state.lastOldValue)
+    if state.lastNewValue != 0 and state.lastNewValue != state.lastOldValue:
+        result.add(state.lastNewValue)
+    return result

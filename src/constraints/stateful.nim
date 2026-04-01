@@ -1219,6 +1219,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.multiMachineNoOverlapState.getAffectedPositions()
         of GlobalCardinalityType:
             return constraint.globalCardinalityState.getAffectedPositions()
+        of AllDifferentExcept0Type:
+            return constraint.allDifferentExcept0State.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1253,6 +1255,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.conditionalLinearState.getAffectedDomainValues(position)
         of ReservoirType:
             return constraint.reservoirState.getAffectedDomainValues(position)
+        of AllDifferentExcept0Type:
+            return constraint.allDifferentExcept0State.getAffectedDomainValues(position)
         else:
             return @[]
 

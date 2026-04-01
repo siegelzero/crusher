@@ -2981,3 +2981,95 @@ solve minimize obj;
     let x2Val = tr.sys.assignment[x2Pos]
     check x2Val >= 70
     check x2Val <= 80
+
+  test "fzn_alldifferent_except_0 basic":
+    # 4 variables, domain 0..3, alldifferent_except_0 + sum constraint
+    # Non-zero values must be distinct, zeros are allowed to repeat
+    let src = """
+var 0..3: x1;
+var 0..3: x2;
+var 0..3: x3;
+var 0..3: x4;
+array [1..4] of var int: x :: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_alldifferent_except_0(x);
+constraint int_lin_eq([1,1,1,1],[x1,x2,x3,x4],6);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](positions.len)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    # Verify sum == 6
+    check values.foldl(a + b) == 6
+    # Verify alldifferent_except_0: non-zero values are distinct
+    var nonZero: seq[int]
+    for v in values:
+      if v != 0:
+        nonZero.add(v)
+    check nonZero.toHashSet.len == nonZero.len
+
+  test "fzn_alldifferent_except_0 with constant zeros in array":
+    # Simulates the concert-hall-cap pattern where some array entries are literal 0
+    # (infeasible offers). The translator must filter out constant 0s.
+    let src = """
+var 0..3: x1;
+var 0..3: x2;
+var 0..3: x3;
+array [1..5] of var int: arr :: output_array([1..5]) = [x1, 0, x2, 0, x3];
+constraint fzn_alldifferent_except_0(arr);
+constraint int_lin_eq([1,1,1],[x1,x2,x3],6);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    var values: seq[int]
+    for vname in ["x1", "x2", "x3"]:
+      values.add(tr.sys.assignment[tr.varPositions[vname]])
+
+    # Verify sum == 6 → must be {1,2,3} in some order
+    check values.foldl(a + b) == 6
+    # Verify alldifferent_except_0: non-zero values distinct
+    var nonZero: seq[int]
+    for v in values:
+      if v != 0:
+        nonZero.add(v)
+    check nonZero.toHashSet.len == nonZero.len
+
+  test "fzn_alldifferent_except_0 allows duplicate zeros":
+    # Verify that multiple variables CAN take value 0 simultaneously
+    let src = """
+var 0..2: x1;
+var 0..2: x2;
+var 0..2: x3;
+var 0..2: x4;
+array [1..4] of var int: x :: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_alldifferent_except_0(x);
+constraint int_lin_eq([1,1,1,1],[x1,x2,x3,x4],3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](positions.len)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    check values.foldl(a + b) == 3
+    # Must have at least one zero (sum=3 with distinct non-zeros from {1,2} max = 3,
+    # so {0, 1, 2, 0} or {1, 2, 0, 0} etc.)
+    var nonZero: seq[int]
+    for v in values:
+      if v != 0:
+        nonZero.add(v)
+    check nonZero.toHashSet.len == nonZero.len
+    # With sum=3 and values in 0..2, we need 1+2=3, so exactly two zeros
+    check values.count(0) == 2

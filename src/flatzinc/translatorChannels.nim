@@ -1897,7 +1897,7 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                 if not match: continue
                 if toPackedSet(positions) == arrayPosSet:
                     gccCIs.add(ci2)
-            of "fzn_all_different_int", "all_different_int", "fzn_alldifferent_except_0":
+            of "fzn_all_different_int", "all_different_int", "fzn_alldifferent_except_0", "fzn_all_different_except_0":
                 let varElems = tr.resolveVarArrayElems(con2.args[0])
                 if varElems.len == 0: continue
                 var positions: seq[int]
