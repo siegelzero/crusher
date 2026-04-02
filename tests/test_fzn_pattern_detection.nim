@@ -1168,22 +1168,24 @@ solve satisfy;
         for _, pat in tr.argmaxPatterns:
             check pat.towerVarName == "tower"
             check pat.maxVarName == "max_s"
-            check pat.signalVarNames == @["s1", "s2", "s3"]
+            check pat.signalElems.len == 3
+            check pat.signalElems[0].kind == FznIdent and pat.signalElems[0].ident == "s1"
+            check pat.signalElems[1].kind == FznIdent and pat.signalElems[1].ident == "s2"
+            check pat.signalElems[2].kind == FznIdent and pat.signalElems[2].ident == "s3"
 
         # ne_vars should be removed from channelVarNames (dead channels)
         check "ne1" notin tr.channelVarNames
         check "ne2" notin tr.channelVarNames
         check "ne3" notin tr.channelVarNames
 
-        # max_s should remain a channel (array_int_maximum is NOT consumed)
+        # max_s stays as a channel position but its MinMaxChannelBinding is removed
         check "max_s" in tr.channelVarNames
 
         # Solve and verify: s2=7 is the max, so tower should be 2
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
         let towerVal = tr.sys.assignment[tr.varPositions["tower"]]
         check towerVal == 2
-        let maxVal = tr.sys.assignment[tr.varPositions["max_s"]]
-        check maxVal == 7
+        # max_s position exists but is not computed (no MinMaxChannelBinding)
 
     test "detectArgmaxPattern: non-contiguous tower values are not matched":
         ## If the ne_reif constants are not contiguous (e.g., 1, 3, 5), the pattern
@@ -1237,6 +1239,66 @@ solve satisfy;
 
         # Missing ne2's lin_le_reif → pattern should NOT be detected
         check tr.argmaxPatterns.len == 0
+
+    test "detectArgmaxPattern: mixed int_lin_le_reif + int_le_reif (constant signals)":
+        ## Models like "tower" produce argmax decompositions where some signals
+        ## are variable (int_lin_le_reif) and others are constant (int_le_reif).
+        ## The detector must handle both types.
+        ##
+        ##   tower = argmax([s1, 5, s3, 2])
+        ##     s1 is variable, 5 is constant, s3 is variable, 2 is constant
+        ##   Decomposition:
+        ##     int_ne_reif(tower, 1, ne1), int_lin_le_reif([1,-1], [s1, max_s], 0, ne1)
+        ##     int_ne_reif(tower, 2, ne2), int_le_reif(6, max_s, ne2)    ← constant signal=5
+        ##     int_ne_reif(tower, 3, ne3), int_lin_le_reif([1,-1], [s3, max_s], 0, ne3)
+        ##     int_ne_reif(tower, 4, ne4), int_le_reif(3, max_s, ne4)    ← constant signal=2
+        let src = """
+var 1..4: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+var bool: ne4 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_ne_reif(tower, 4, ne4) :: defines_var(ne4);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_le_reif(6, max_s, ne2);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint int_le_reif(3, max_s, ne4);
+constraint array_int_maximum(max_s, [s1, 5, s3, 2]) :: defines_var(max_s);
+constraint int_eq(s1, 3);
+constraint int_eq(s3, 8);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Verify argmax pattern was detected
+        check tr.argmaxPatterns.len == 1
+        for _, pat in tr.argmaxPatterns:
+            check pat.towerVarName == "tower"
+            check pat.maxVarName == "max_s"
+            check pat.signalElems.len == 4
+            # s1 (variable), 5 (constant), s3 (variable), 2 (constant)
+            check pat.signalElems[0].kind == FznIdent
+            check pat.signalElems[1].kind == FznIntLit
+            check pat.signalElems[2].kind == FznIdent
+            check pat.signalElems[3].kind == FznIntLit
+
+        # ne_vars should be removed from channelVarNames
+        check "ne1" notin tr.channelVarNames
+        check "ne2" notin tr.channelVarNames
+        check "ne3" notin tr.channelVarNames
+        check "ne4" notin tr.channelVarNames
+
+        # Solve: s1=3, const=5, s3=8, const=2 → argmax is index 2 (s3=8) → tower=3
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        let towerVal = tr.sys.assignment[tr.varPositions["tower"]]
+        check towerVal == 3
 
 suite "FlatZinc Max-from-LinLe Detection":
 
