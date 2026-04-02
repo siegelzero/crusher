@@ -1691,11 +1691,11 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
 proc detectArgmaxPattern(tr: var FznTranslator) =
     ## Detects argmax decomposition patterns from MiniZinc's arg_max:
     ##   N × int_ne_reif(tower_var, t, ne_var_t) :: defines_var(ne_var_t)
-    ##   N × int_lin_le_reif(coeffs, [max_var, ...], rhs, ne_var_t)
+    ##   N × int_lin_le_reif/int_le_reif(…, ne_var_t)
     ##   1 × array_int_maximum(max_var, signal_array) :: defines_var(max_var)
     ##
-    ## Replaced by a single element constraint: signal_array[tower-1] == max_var
-    ## This reduces N BooleanType constraints to 1 ElementType per argmax group.
+    ## Replaced by an argmax channel binding: tower = argmax(signals) + offset.
+    ## This reduces N BooleanType constraints + 1 MinMax binding to a single argmax channel.
 
     # Step 1: Index ne_reif channels by source variable.
     # reifChannelDefs contains CIs of int_eq_reif/int_ne_reif with defines_var.
@@ -1824,10 +1824,13 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
                         break
 
             elif compName == "int_le_reif":
-                # int_le_reif(const, max_var, bool) — constant signal
-                let varArg = compCon.args[1]
-                if varArg.kind == FznIdent and varArg.ident in maxChannelVarNames:
-                    foundMaxVar = varArg.ident
+                # int_le_reif(a, b, bool) — constant signal; max_var can be either a or b
+                let arg0 = compCon.args[0]
+                let arg1 = compCon.args[1]
+                if arg1.kind == FznIdent and arg1.ident in maxChannelVarNames:
+                    foundMaxVar = arg1.ident
+                elif arg0.kind == FznIdent and arg0.ident in maxChannelVarNames:
+                    foundMaxVar = arg0.ident
 
             if foundMaxVar == "":
                 valid = false

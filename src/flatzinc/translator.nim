@@ -1301,23 +1301,16 @@ proc translate*(model: FznModel): FznTranslator =
         elif ci in result.argmaxPatterns:
             # Emit argmax channel binding: tower = argmax(signals) + valueOffset
             let p = result.argmaxPatterns[ci]
-            if p.towerVarName in result.varPositions:
-                let towerPos = result.varPositions[p.towerVarName]
-                var signalExprs: seq[AlgebraicExpression[int]]
-                for elem in p.signalElems:
-                    signalExprs.add(result.resolveExprArg(elem))
-                let towerDomain = result.sys.baseArray.domain[towerPos]
-                let valueOffset = towerDomain[0]  # min tower value (e.g., 1 for 1-based)
-                result.sys.baseArray.addArgmaxChannelBinding(towerPos, signalExprs, valueOffset)
-                result.channelVarNames.incl(p.towerVarName)
-            else:
-                # Fallback: emit element constraint as before
-                let indexExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.towerVarName)) - 1
-                var signalExprs: seq[AlgebraicExpression[int]]
-                for elem in p.signalElems:
-                    signalExprs.add(result.resolveExprArg(elem))
-                let maxExpr = result.resolveExprArg(FznExpr(kind: FznIdent, ident: p.maxVarName))
-                result.sys.addConstraint(elementExpr(indexExpr, signalExprs, maxExpr))
+            if p.towerVarName notin result.varPositions:
+                raise newException(KeyError, &"Argmax tower variable '{p.towerVarName}' has no position (array_int_maximum was already consumed)")
+            let towerPos = result.varPositions[p.towerVarName]
+            var signalExprs: seq[AlgebraicExpression[int]]
+            for elem in p.signalElems:
+                signalExprs.add(result.resolveExprArg(elem))
+            let towerDomain = result.sys.baseArray.domain[towerPos]
+            let valueOffset = towerDomain[0]  # min tower value (e.g., 1 for 1-based)
+            result.sys.baseArray.addArgmaxChannelBinding(towerPos, signalExprs, valueOffset)
+            result.channelVarNames.incl(p.towerVarName)
         else:
             inc nTranslated
             result.translateConstraint(con)
