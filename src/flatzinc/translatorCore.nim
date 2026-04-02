@@ -2389,19 +2389,22 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let binArg = con.args[1]
         let weights = tr.resolveIntArray(con.args[2])
 
-        # Resolve bin positions (the search variables)
-        var binPositions: seq[int]
+        # Separate variable and constant bin assignments
         var constBinIndices: seq[int]  # indices into weights for constant bin assignments
         var constBinValues: seq[int]
+        var varPositions: seq[int]
+        var varWeights: seq[int]
         let binExprs = tr.resolveExprArray(binArg)
         for i, e in binExprs:
-            if e.node.kind == RefNode:
-                binPositions.add(e.node.position)
-            elif e.node.kind == LiteralNode:
+            if e.node.kind == LiteralNode:
                 constBinIndices.add(i)
                 constBinValues.add(int(e.node.value))
+            elif e.node.kind == RefNode:
+                varPositions.add(e.node.position)
+                varWeights.add(weights[i])
             else:
-                binPositions.add(e.positions.toSeq[0])
+                varPositions.add(e.positions.toSeq[0])
+                varWeights.add(weights[i])
 
         # Resolve load positions (will become channels)
         var loadPositions: seq[int]
@@ -2412,30 +2415,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             else:
                 loadPositions.add(e.positions.toSeq[0])
 
-        # Determine bin value range from the load array indexing (1-indexed in FZN)
-        let loadBase = 1  # FZN bin_packing_load uses 1-based load indexing
-
-        # Variable-only positions and weights (excluding constants)
-        var varPositions: seq[int]
-        var varWeights: seq[int]
-        for i, e in binExprs:
-            if e.node.kind == RefNode or (e.node.kind != LiteralNode):
-                varPositions.add(binPositions[varPositions.len])
-                varWeights.add(weights[i])
-
-        # Rebuild varPositions/varWeights correctly
-        varPositions = @[]
-        varWeights = @[]
-        var constIdx = 0
-        for i in 0..<binExprs.len:
-            if constIdx < constBinIndices.len and i == constBinIndices[constIdx]:
-                inc constIdx
-            else:
-                if binExprs[i].node.kind == RefNode:
-                    varPositions.add(binExprs[i].node.position)
-                else:
-                    varPositions.add(binExprs[i].positions.toSeq[0])
-                varWeights.add(weights[i])
+        # Derive loadBase from bin variable domains (minimum possible bin value)
+        # FlatZinc normalizes arrays to 1-based, so loadBase is typically 1,
+        # but we derive it to be robust against non-standard indexing.
+        var loadBase = high(int)
+        for pos in varPositions:
+            let dom = tr.sys.baseArray.domain[pos]
+            if dom.len > 0:
+                loadBase = min(loadBase, min(dom))
+        for v in constBinValues:
+            loadBase = min(loadBase, v)
+        if loadBase == high(int):
+            loadBase = 1  # fallback for empty domains
 
         # For each load position: create WeightedCountEq channel
         for b in 0..<loadPositions.len:
@@ -2456,7 +2447,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let loadSp = scalarProduct[int](newSeqWith(loadPositions.len, 1), loadExprs)
         tr.sys.addConstraint(loadSp == totalWeight)
 
-        stderr.writeLine(&"[FZN] bin_packing_load: {loadPositions.len} loads, {binExprs.len} items -> {loadPositions.len} weighted count channels")
+        stderr.writeLine(&"[FZN] bin_packing_load: {loadPositions.len} loads, {binExprs.len} items ({constBinValues.len} const) -> {loadPositions.len} weighted count channels")
 
     of "fzn_bin_packing":
         # bin_packing(c, bin, w): for each bin b, sum(w[i] where bin[i]==b) <= c
@@ -2464,22 +2455,33 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let binExprs = tr.resolveExprArray(con.args[1])
         let weights = tr.resolveIntArray(con.args[2])
 
-        # Extract bin positions
-        var binPositions: seq[int]
-        for e in binExprs:
-            if e.node.kind == RefNode:
-                binPositions.add(e.node.position)
+        # Separate variable and constant bin assignments
+        var varPositions: seq[int]
+        var varWeights: seq[int]
+        var constBinValues: seq[int]   # bin value for each constant assignment
+        var constWeights: seq[int]     # weight for each constant assignment
+        for i, e in binExprs:
+            if e.node.kind == LiteralNode:
+                constBinValues.add(int(e.node.value))
+                constWeights.add(weights[i])
+            elif e.node.kind == RefNode:
+                varPositions.add(e.node.position)
+                varWeights.add(weights[i])
             else:
-                binPositions.add(e.positions.toSeq[0])
+                varPositions.add(e.positions.toSeq[0])
+                varWeights.add(weights[i])
 
-        # Determine range of bin values from domains
+        # Determine range of bin values from variable domains and constant values
         var binLo = high(int)
         var binHi = low(int)
-        for pos in binPositions:
+        for pos in varPositions:
             let dom = tr.sys.baseArray.domain[pos]
             if dom.len > 0:
-                binLo = min(binLo, dom[0])
-                binHi = max(binHi, dom[^1])
+                binLo = min(binLo, min(dom))
+                binHi = max(binHi, max(dom))
+        for v in constBinValues:
+            binLo = min(binLo, v)
+            binHi = max(binHi, v)
 
         let totalWeight = weights.foldl(a + b, 0)
         var allUnit = true
@@ -2493,19 +2495,25 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             discard tr.sys.newConstrainedVariable()
             tr.sys.baseArray.domain[loadPos] = toSeq(0..min(totalWeight, capacity))
 
+            # Compute constant offset from fixed bin assignments
+            var constOffset = 0
+            for ci in 0..<constBinValues.len:
+                if constBinValues[ci] == b:
+                    constOffset += constWeights[ci]
+
             if allUnit:
                 # Unit weights: use cheaper CountEq channel
                 tr.sys.baseArray.addCountEqChannelBinding(
-                    loadPos, b, binPositions, 0)
+                    loadPos, b, varPositions, constOffset)
             else:
                 tr.sys.baseArray.addWeightedCountEqChannelBinding(
-                    loadPos, b, binPositions, weights, 0)
+                    loadPos, b, varPositions, varWeights, constOffset)
 
             let loadExpr = tr.getExpr(loadPos)
             tr.sys.addConstraint(loadExpr <= capacity)
             inc nChannels
 
-        stderr.writeLine(&"[FZN] bin_packing: {nChannels} bins (cap={capacity}), {binExprs.len} items -> {nChannels} " &
+        stderr.writeLine(&"[FZN] bin_packing: {nChannels} bins (cap={capacity}), {binExprs.len} items ({constBinValues.len} const) -> {nChannels} " &
             (if allUnit: "count" else: "weighted count") & " channels")
 
     else:

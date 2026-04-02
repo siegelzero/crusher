@@ -2569,15 +2569,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         groupPositions.add(pos)
                 if groupPositions.len >= 2:
                     state.gccGroupPositions.add(groupPositions)
-        # Detect alldifferent-as-permutation: domain size == num search positions
+        # Detect alldifferent-as-permutation: domain union size == num search positions
         if constraint.stateType == AllDifferentType:
             var groupPositions: seq[int]
-            var maxDomSize = 0
+            var domainUnion = initPackedSet[int]()
             for pos in constraint.positions.items:
                 if pos notin carray.channelPositions:
                     groupPositions.add(pos)
-                    maxDomSize = max(maxDomSize, state.sharedDomain[][pos].len)
-            if groupPositions.len >= 2 and maxDomSize == groupPositions.len:
+                    for v in state.sharedDomain[][pos]:
+                        domainUnion.incl(v)
+            if groupPositions.len >= 2 and domainUnion.len == groupPositions.len:
                 state.gccGroupPositions.add(groupPositions)
     # Build sharedConstraints for all position pairs within GCC/permutation groups
     # so that swapDelta can compute accurate joint deltas.
@@ -3067,6 +3068,13 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
         constraint.updatePosition(position, value)
         let newPenalty = constraint.penalty()
         state.cost += newPenalty - oldPenalty
+        # Maintain violationCount so swap move filters remain accurate
+        if oldPenalty > 0 and newPenalty == 0:
+            for pos in constraint.positions.items:
+                state.violationCount[pos] -= 1
+        elif oldPenalty == 0 and newPenalty > 0:
+            for pos in constraint.positions.items:
+                state.violationCount[pos] += 1
 
     # Circuit-time-prop writeback (lean path)
     for ctc in state.circuitTimePropConstraints:
@@ -3088,6 +3096,12 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
                 constraint.updatePosition(fPos, T(fNew))
                 let newPenalty = constraint.penalty()
                 state.cost += newPenalty - oldPenalty
+                if oldPenalty > 0 and newPenalty == 0:
+                    for pos in constraint.positions.items:
+                        state.violationCount[pos] -= 1
+                elif oldPenalty == 0 and newPenalty > 0:
+                    for pos in constraint.positions.items:
+                        state.violationCount[pos] += 1
             state.propagateChannelsLean(fPos)
 
     state.propagateChannelsLean(position)
@@ -3475,6 +3489,8 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             if oi1 >= 0 and not state.isLazy[pp1]: state.tabu[pp1][oi1] = tabuTenure
             let oi2 = state.domainIndex[pp2].getOrDefault(pov2, -1)
             if oi2 >= 0 and not state.isLazy[pp2]: state.tabu[pp2][oi2] = tabuTenure
+            state.applyElementImpliedMoves(pp1)
+            state.applyElementImpliedMoves(pp2)
             return
 
     if bestPos >= 0:
@@ -3491,7 +3507,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         let tBM = epochTime()
     let moves = state.bestMoves()
     let (swapMoves, swapCost) = state.bestSwapMoves()
-    # Evaluate permutation swaps periodically (swapDelta-based, faster than assignValueLean)
+    # Evaluate permutation swaps periodically (assignValueLean-based simulation)
     var permMoves: seq[(int, int, T, T)] = @[]
     var permCost = high(int)
     if state.gccGroupPositions.len > 0 and state.iteration mod 3 == 0:
@@ -3752,22 +3768,6 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via chain")
-                        state.lastImprovementIter = lastImprovement
-                        return state
-
-        # Try GCC-preserving swap moves periodically during stagnation
-        # (disabled when bestPermutationSwapMoves handles GCC groups in applyBestMove)
-        if false and state.gccGroupPositions.len > 0 and
-           state.iteration - lastImprovement >= 10 and
-           (state.iteration - lastImprovement) mod 10 == 0:
-            if state.tryGCCSwapMoves():
-                if state.cost < state.bestCost:
-                    lastImprovement = state.iteration
-                    state.bestCost = state.cost
-                    state.bestAssignment = state.assignment
-                    if state.cost == 0:
-                        if state.verbose:
-                            state.logExitStats("Solution found via GCC swap")
                         state.lastImprovementIter = lastImprovement
                         return state
 

@@ -134,16 +134,6 @@ proc evaluateWeightedCountEq[T](binding: WeightedCountEqChannelBinding[T], assig
             total += binding.weights[i]
     total
 
-proc evaluateWeightedCountEqDelta[T](binding: WeightedCountEqChannelBinding[T],
-                                      currentVal: T, changedPos: int,
-                                      oldVal: T, newVal: T): T {.inline.} =
-    ## O(1) delta evaluation: adjust current value when a single input position changes.
-    result = currentVal
-    if changedPos in binding.positionWeight:
-        let w = binding.positionWeight[changedPos]
-        if oldVal == binding.targetValue: result -= w
-        if newVal == binding.targetValue: result += w
-
 proc evaluateConditionalCountEq[T](binding: ConditionalCountEqChannelBinding[T],
                                     assignment: seq[T]): T {.inline.} =
     ## Evaluate a conditional count-equals channel:

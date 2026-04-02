@@ -40,6 +40,9 @@ func newCountEqConstraint*[T](arrayPositions: openArray[int], countValue: T, tar
     result.allPositions = toPackedSet[int](arrayPositions)
     result.allPositions.incl(targetPosition)
 
+# overflowChecks off: requiredCount comes from variable assignment and can have
+# wrapped values during intermediate channel propagation states.
+{.push overflowChecks: off.}
 proc initialize*[T](state: CountEqConstraint[T], assignment: seq[T]) =
     state.actualCount = 0
     for pos in state.arrayPositions.items:
@@ -93,6 +96,7 @@ proc moveDelta*[T](state: CountEqConstraint[T], position: int, oldValue, newValu
 
     let newCost = abs(state.actualCount + countDelta - newRequired)
     return newCost - state.cost
+{.pop.}
 
 proc getAffectedPositions*[T](state: CountEqConstraint[T]): PackedSet[int] =
     ## Returns positions needing penalty map updates after the last updatePosition.

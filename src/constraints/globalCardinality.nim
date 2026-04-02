@@ -158,7 +158,10 @@ func newBoundedGlobalCardinality*[T](expressions: seq[AlgebraicExpression[T]], c
 # GlobalCardinalityConstraint utility functions
 ################################################################################
 
-
+# overflowChecks off: during intermediate search states (channel propagation
+# after partial moves), count values derived from wrapped arithmetic can
+# produce subtraction overflow. Consistent with relationalConstraint.nim.
+{.push overflowChecks: off.}
 func contribution[T](state: GlobalCardinalityConstraint[T], value: T): int {.inline.} =
     # Cost contribution for either exact or bounded count constraint
     case state.constraintType:
@@ -301,6 +304,7 @@ proc moveDelta*[T](state: GlobalCardinalityConstraint[T], position: int, oldValu
 
             # Restore original value
             state.currentAssignment[position] = originalValue
+{.pop.}
 
 
 proc getAffectedPositions*[T](state: GlobalCardinalityConstraint[T]): PackedSet[int] =
