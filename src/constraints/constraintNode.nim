@@ -99,9 +99,12 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
                     return left == right
 
 
+{.push overflowChecks: off.}
 func penalty*[T](relation: BinaryRelation, left, right: T): T =
     ## Graduated penalty for inequalities - returns degree of violation
     ## Binary penalty for equality/other relations where gradient doesn't help
+    ## overflowChecks off: intermediate search states can produce wrapped expression
+    ## values where subtraction would overflow.
     case relation:
         of EqualTo, NotEqualTo, CommonFactor, CoPrime:
             # Binary - no natural gradient for these
@@ -118,6 +121,7 @@ func penalty*[T](relation: BinaryRelation, left, right: T): T =
         of GreaterThanEq:
             # left >= right
             return if left >= right: T(0) else: right - left
+{.pop.}
 
 
 proc penalty*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): T =

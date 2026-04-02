@@ -51,12 +51,17 @@ type
         leftTermPLCache*: Table[int, seq[CachedTermPL[T]]]
         rightTermPLCache*: Table[int, seq[CachedTermPL[T]]]
 
+{.push overflowChecks: off.}
 func computeCost*[T](c: RelationalConstraint[T], left, right: T): int {.inline.} =
     ## Compute penalty, using graduated abs(left-right) for EqualTo when enabled.
+    ## overflowChecks off: during intermediate search states (channel propagation
+    ## after partial moves), expression values can overflow int64. The subtraction
+    ## and abs must not crash — a wrapped result is acceptable for transient states.
     if c.graduated and c.relation == EqualTo:
         return int(abs(left - right))
     else:
         return int(c.relation.penalty(left, right))
+{.pop.}
 
 # Create a new RelationalConstraint with Expression wrappers
 func newRelationalConstraint*[T](leftExpr, rightExpr: Expression[T],

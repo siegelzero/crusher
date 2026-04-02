@@ -98,8 +98,10 @@ func `$`*[T](state: SumExpression[T]): string = $(state.value)
 # SumExpression Updates
 ################################################################################
 
+{.push overflowChecks: off.}
 func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.inline.} =
     # Assigns the value newValue to the variable in the given position, updating state.
+    # overflowChecks off: intermediate search states can produce large deltas.
     let oldValue = state.currentAssignment[position]
     state.currentAssignment[position] = newValue
 
@@ -123,6 +125,7 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
 
 func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
     # Returns the change in value obtained by reassigning position from oldValue to newValue.
+    # overflowChecks off: intermediate search states can produce large deltas.
     case state.evalMethod:
         of PositionBased:
             # For position-based: simple coefficient calculation
@@ -141,6 +144,7 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
                 state.currentAssignment[position] = oldValue
 
                 result += (newExpValue - oldExpValue)
+{.pop.}
 
 func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
     # Converts linear expression to a SumExpression

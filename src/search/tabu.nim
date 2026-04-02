@@ -2579,9 +2579,38 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     maxDomSize = max(maxDomSize, state.sharedDomain[][pos].len)
             if groupPositions.len >= 2 and maxDomSize == groupPositions.len:
                 state.gccGroupPositions.add(groupPositions)
-    if state.gccGroupPositions.len > 0 and verbose and id == 0:
-        echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
-            $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len)
+    # Build sharedConstraints for all position pairs within GCC/permutation groups
+    # so that swapDelta can compute accurate joint deltas.
+    if state.gccGroupPositions.len > 0:
+        var groupPosSet = initPackedSet[int]()
+        for group in state.gccGroupPositions:
+            for pos in group:
+                groupPosSet.incl(pos)
+        for constraint in state.constraints:
+            var posInGroups: seq[int]
+            for pos in constraint.positions.items:
+                if pos in groupPosSet:
+                    posInGroups.add(pos)
+            if posInGroups.len >= 2:
+                for i in 0..<posInGroups.len:
+                    for j in (i+1)..<posInGroups.len:
+                        let p1 = posInGroups[i]
+                        let p2 = posInGroups[j]
+                        let key = if p1 < p2: (p1, p2) else: (p2, p1)
+                        if key notin state.sharedConstraints:
+                            state.sharedConstraints[key] = @[constraint]
+                        else:
+                            # Avoid duplicates
+                            var found = false
+                            for existing in state.sharedConstraints[key]:
+                                if cast[pointer](existing) == cast[pointer](constraint):
+                                    found = true; break
+                            if not found:
+                                state.sharedConstraints[key].add(constraint)
+        if verbose and id == 0:
+            echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
+                $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len) &
+                ", shared constraint pairs: " & $state.sharedConstraints.len
 
     # Initialize partition swap structures
     state.partitionGroups = carray.partitionGroups
@@ -3384,11 +3413,89 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
     state.movesExplored = movesEvaluated
 
 
+proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
+    ## Lean first-improvement move: evaluate via costDelta (no penalty map reads),
+    ## apply via assignValueLean (no penalty map rebuild). Much faster for problems
+    ## with large channel-dep cascades where penalty map maintenance dominates.
+    var bestDelta = high(int)
+    var bestPos = -1
+    var bestVal: T
+    shuffle(state.searchPositions)
+    var posChecked = 0
+
+    for position in state.searchPositions:
+        let oldValue = state.assignment[position]
+        # Skip non-violated positions (use constraint state directly, no violationCount)
+        var isViolated = false
+        for c in state.constraintsAtPosition[position]:
+            if c.penalty() > 0:
+                isViolated = true; break
+        if not isViolated and
+           (position >= state.channelDepPenalties.len or state.channelDepPenalties[position].len == 0):
+            continue
+
+        inc posChecked
+        let domain = state.sharedDomain[][position]
+        for di in 0..<domain.len:
+            let value = domain[di]
+            if value == oldValue: continue
+
+            # Tabu check
+            let dIdx = state.domainIndex[position].getOrDefault(value, -1)
+            if dIdx >= 0 and not state.isLazy[position] and
+               state.tabu[position][dIdx] > state.iteration and
+               bestDelta >= state.bestCost - state.cost:
+                continue  # tabu and no aspiration
+
+            let delta = state.costDelta(position, value)
+            if delta < bestDelta:
+                bestDelta = delta
+                bestPos = position
+                bestVal = value
+                if delta < 0:
+                    break  # first improvement found, stop domain scan
+
+        if bestDelta < 0:
+            break  # first improvement found, stop position scan
+        if posChecked >= 50:
+            break  # cap positions checked
+
+    # Also evaluate permutation swaps
+    if state.gccGroupPositions.len > 0 and state.iteration mod 3 == 0:
+        let (permMoves, permCost) = state.bestPermutationSwapMoves()
+        if permMoves.len > 0 and permCost < state.cost + bestDelta:
+            # Apply swap
+            let (pp1, pp2, pnv1, pnv2) = sample(permMoves)
+            let pov1 = state.assignment[pp1]
+            let pov2 = state.assignment[pp2]
+            state.assignValueLean(pp1, pnv1)
+            state.assignValueLean(pp2, pnv2)
+            let tabuTenure = state.iteration + 1 + state.iteration mod 10
+            let oi1 = state.domainIndex[pp1].getOrDefault(pov1, -1)
+            if oi1 >= 0 and not state.isLazy[pp1]: state.tabu[pp1][oi1] = tabuTenure
+            let oi2 = state.domainIndex[pp2].getOrDefault(pov2, -1)
+            if oi2 >= 0 and not state.isLazy[pp2]: state.tabu[pp2][oi2] = tabuTenure
+            return
+
+    if bestPos >= 0:
+        let oldValue = state.assignment[bestPos]
+        state.assignValueLean(bestPos, bestVal)
+        let tabuTenure = state.iteration + 1 + state.iteration mod 10
+        let oldIdx = state.domainIndex[bestPos].getOrDefault(oldValue, -1)
+        if oldIdx >= 0 and not state.isLazy[bestPos]:
+            state.tabu[bestPos][oldIdx] = tabuTenure
+
+
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         let tBM = epochTime()
     let moves = state.bestMoves()
     let (swapMoves, swapCost) = state.bestSwapMoves()
+    # Evaluate permutation swaps periodically (swapDelta-based, faster than assignValueLean)
+    var permMoves: seq[(int, int, T, T)] = @[]
+    var permCost = high(int)
+    if state.gccGroupPositions.len > 0 and state.iteration mod 3 == 0:
+        (permMoves, permCost) = state.bestPermutationSwapMoves()
     # Evaluate partition swaps periodically (every 3 iterations) to limit overhead
     # from assignValueLean-based evaluation, but compare properly with other moves.
     var partMoves: seq[(int, int, int, int)]  # typed as int to match T=int
@@ -3412,8 +3519,26 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
                 if state.inverseEnabled and state.posToInverseGroup[pos] >= 0:
                     singleCost += state.inverseDelta[pos][idx]
 
-    # Find overall best among single, swap, and partition moves
-    if partMoves.len > 0 and partCost <= swapCost and partCost < singleCost:
+    # Find overall best among single, swap, permutation swap, and partition moves
+    if permMoves.len > 0 and permCost <= swapCost and permCost <= partCost and permCost < singleCost:
+        # Apply permutation swap move
+        let (pp1, pp2, pNewVal1, pNewVal2) = sample(permMoves)
+        let pOldVal1 = state.assignment[pp1]
+        let pOldVal2 = state.assignment[pp2]
+        state.assignValue(pp1, pNewVal1)
+        state.assignValue(pp2, pNewVal2)
+        let pTabuTenure = state.iteration + 1 + state.iteration mod 10
+        if not state.isLazy[pp1]:
+            let pOldIdx1 = state.domainIndex[pp1].getOrDefault(pOldVal1, -1)
+            if pOldIdx1 >= 0:
+                state.tabu[pp1][pOldIdx1] = pTabuTenure
+        if not state.isLazy[pp2]:
+            let pOldIdx2 = state.domainIndex[pp2].getOrDefault(pOldVal2, -1)
+            if pOldIdx2 >= 0:
+                state.tabu[pp2][pOldIdx2] = pTabuTenure
+        state.applyElementImpliedMoves(pp1)
+        state.applyElementImpliedMoves(pp2)
+    elif partMoves.len > 0 and partCost <= swapCost and partCost < singleCost:
         # Apply partition swap move
         let (deactPos, actPos, newVal, groupIdx) = sample(partMoves)
         let oldActiveVal = state.assignment[deactPos]
@@ -3574,8 +3699,15 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.neighborByType[ct] = 0
             state.neighborTimeByType[ct] = 0
 
+    # Use lean first-improvement when cascades are large (penalty map rebuild dominates)
+    let useLeanSearch = state.hasChannelDeps and
+        state.searchPositions.len >= 30 and
+        state.channelDepSearchPositions.len > 0 and
+        state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5
+
     if state.verbose:
-        echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}"
+        echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
+            (if useLeanSearch: " (lean first-improvement)" else: "")
 
     while state.iteration - lastImprovement < threshold:
         # Check for early termination signal
@@ -3592,7 +3724,10 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.lastImprovementIter = lastImprovement
             return state
 
-        state.applyBestMove()
+        if useLeanSearch:
+            state.applyFirstImprovingMove()
+        else:
+            state.applyBestMove()
 
         if state.cost < state.bestCost:
             lastImprovement = state.iteration
@@ -3621,7 +3756,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         return state
 
         # Try GCC-preserving swap moves periodically during stagnation
-        if state.gccGroupPositions.len > 0 and
+        # (disabled when bestPermutationSwapMoves handles GCC groups in applyBestMove)
+        if false and state.gccGroupPositions.len > 0 and
            state.iteration - lastImprovement >= 10 and
            (state.iteration - lastImprovement) mod 10 == 0:
             if state.tryGCCSwapMoves():

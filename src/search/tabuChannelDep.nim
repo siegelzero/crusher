@@ -1,6 +1,14 @@
 ## Channel-dependent constraint penalty routines.
 ## Included from tabu.nim — not a standalone module.
 
+# abs() in Nim always checks for low(int) even with -d:release, raising
+# OverflowDefect. During intermediate search states, wrapped arithmetic can
+# produce low(int). This unchecked variant avoids the crash.
+{.push overflowChecks: off.}
+func safeAbs(x: int): int {.inline.} =
+    if x < 0: -x else: x
+{.pop.}
+
 type LinearTerm[T] = tuple[pos: int, coeff: T]
 
 proc tryExtractLinear[T](node: ExpressionNode[T]): tuple[ok: bool, terms: seq[LinearTerm[T]], offset: T] =
@@ -254,7 +262,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         delta = 0
                 result += delta
                 if state.cdTrackPerConstraint and delta != 0:
-                    state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
+                    state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], safeAbs(delta))
             return result
 
     assert not state.cdInUse, "computeChannelDepDelta is not reentrant"
@@ -531,7 +539,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
                     result += delta
                     if state.cdTrackPerConstraint and delta != 0:
-                        state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
+                        state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], safeAbs(delta))
     else:
         # Fallback: iterate all relevant constraints (no reverse index)
         let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
@@ -635,7 +643,7 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                     delta = 0
             totalDelta += delta
             if state.cdTrackPerConstraint and delta != 0:
-                state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], abs(delta))
+                state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], safeAbs(delta))
         penalties[di] = totalDelta
 
 proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExternals: ptr PackedSet[int]) =

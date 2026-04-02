@@ -105,7 +105,11 @@ proc swapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
 
             # Compute joint delta for both changes simultaneously
             var jointDelta: int
-            if constraint.stateType == RelationalType:
+            if constraint.stateType == AllDifferentType:
+                # Fast path: swapping two values within an alldifferent group
+                # preserves the constraint. Joint delta is always 0 for value exchanges.
+                jointDelta = 0
+            elif constraint.stateType == RelationalType:
                 let rc = constraint.relationalState
                 # Fast path for relational constraints with linear expressions
                 var leftOk = true
@@ -470,3 +474,69 @@ proc tryGCCSwapMoves[T](state: TabuState[T]): bool =
     if oldIdx2 >= 0 and not state.isLazy[p2]:
         state.tabu[p2][oldIdx2] = tabuTenure
     return true
+
+
+proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], int) =
+    ## Find the best value-exchange swap within GCC/permutation groups.
+    ## Uses assignValueLean for exact cost evaluation (correct with channel-dep).
+    ## Filters by violated positions and caps evaluations for efficiency.
+    if state.gccGroupPositions.len == 0:
+        return (@[], high(int))
+
+    const MAX_SWAP_EVALS = 500
+    var bestCost = high(int)
+    var moves: seq[(int, int, T, T)] = @[]
+    var evalsCount = 0
+
+    for group in state.gccGroupPositions:
+        for i in 0..<group.len:
+            let p1 = group[i]
+            # Only consider positions involved in violations
+            if state.violationCount[p1] == 0 and
+               (p1 >= state.channelDepPenalties.len or state.channelDepPenalties[p1].len == 0):
+                continue
+            let val1 = state.assignment[p1]
+
+            for j in (i+1)..<group.len:
+                let p2 = group[j]
+                let val2 = state.assignment[p2]
+                if val1 == val2: continue
+
+                # Check domain compatibility
+                let idx1 = state.domainIndex[p1].getOrDefault(val2, -1)
+                let idx2 = state.domainIndex[p2].getOrDefault(val1, -1)
+                if idx1 < 0 or idx2 < 0: continue
+
+                # Simulate swap via assignValueLean for exact cost
+                let origCost = state.cost
+                state.assignValueLean(p1, val2)
+                state.assignValueLean(p2, val1)
+                let delta = state.cost - origCost
+                # Restore
+                state.assignValueLean(p2, val2)
+                state.assignValueLean(p1, val1)
+
+                let newCost = origCost + delta
+                inc evalsCount
+
+                # Tabu: both legs must be tabu to block
+                let tabu1 = not state.isLazy[p1] and state.tabu[p1][idx1] > state.iteration
+                let tabu2 = not state.isLazy[p2] and state.tabu[p2][idx2] > state.iteration
+                if tabu1 and tabu2 and newCost >= state.bestCost:
+                    continue
+
+                if newCost < bestCost:
+                    bestCost = newCost
+                    moves = @[(p1, p2, val2, val1)]
+                elif newCost == bestCost:
+                    moves.add((p1, p2, val2, val1))
+
+                if evalsCount >= MAX_SWAP_EVALS:
+                    return (moves, bestCost)
+
+            if evalsCount >= MAX_SWAP_EVALS:
+                break
+        if evalsCount >= MAX_SWAP_EVALS:
+            break
+
+    return (moves, bestCost)

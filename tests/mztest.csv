@@ -11,6 +11,7 @@ peaceable_queens_n8_q3,2022/generalized-peacable-queens/peaceable_queens.mzn,202
 roster_sickness_small_4,2022/roster-sickness/bool-model-sickness.mzn,2022/roster-sickness/small-4.dzn,maximize,10000,14457,14457
 rotating_workforce_e30_s9,2022/rotating-workforce-scheduling/rotating-workforce-scheduling.mzn,2022/rotating-workforce-scheduling/rws-instance-e-30-s-9.dzn,satisfy,30000,,
 spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
+team_assign_d1_4_6,2022/team-assignment/model.mzn,2022/team-assignment/data1_4_6.dzn,maximize,10000,2900,2948
 
 chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,25,25
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
