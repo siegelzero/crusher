@@ -596,6 +596,7 @@ proc detectReifEquationChannelVars(tr: var FznTranslator) =
             if name != "int_lin_eq_reif": continue
             if con.args.len < 4: continue
             if ci in tr.reifEqDefinedVars: continue  # already processed
+            if ci in tr.definingConstraints: continue  # consumed by another detector
 
             # Resolve coefficients and variables
             var coeffsArg = con.args[0]

@@ -1004,6 +1004,9 @@ proc translate*(model: FznModel): FznTranslator =
             prevCount = result.caseAnalysisDefs.len
             result.detectCaseAnalysisChannels()
             inc iterations
+    # Detect reif-equation channel vars: int_lin_eq_reif where one var can be solved for
+    # MUST run after detectLinEqReifChannels (which consumes defines_var bool channels first)
+    result.detectReifEquationChannelVars()
     # Detect conditional expression channels (optional variable decomposition patterns)
     # target = if occurs then linear_expr else constant
     # MUST run after detectLinEqReifChannels and detectBoolGatedVariableChannels
@@ -2074,6 +2077,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildSingletonSetChannelBindings()
     # Build channel bindings for int_eq_reif/bool2int/bool_eq_reif reification channels
     result.buildReifChannelBindings()
+    # Build channel bindings for reif-equation channels (target = f(sources) lookup table)
+    result.buildReifEquationChannelBindings()
     # Build channel bindings for conditional binary channels (X = cond AND b2)
     result.buildConditionalBinaryChannelBindings()
     # Build channel bindings for bool AND channels (b = AND(c1,...,cn) from bool_clause)

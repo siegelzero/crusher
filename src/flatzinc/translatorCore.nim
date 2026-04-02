@@ -2137,16 +2137,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 # x is a defined var — use its defining expression and declared domain
                 let xExpr = tr.definedVarExprs[xArg.ident]
                 let domain = tr.lookupVarDomain(xArg.ident)
-                if domain.len > 0 and domain.len <= 100_000:
+                if domain.len > 0:
                     let lo = domain[0]
-                    let indexExpr = xExpr - lo
-                    var arrayElems: seq[ArrayElement[int]]
-                    for v in domain:
-                        arrayElems.add(ArrayElement[int](isConstant: true,
-                                constantValue: if v in setAsHashSet: 1 else: 0))
-                    if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
-                        let bPos = tr.varPositions[bArg.ident]
-                        tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
+                    let hi = domain[^1]
+                    if hi - lo + 1 <= 100_000:
+                        let indexExpr = xExpr - lo
+                        var arrayElems: seq[ArrayElement[int]]
+                        for v in lo..hi:
+                            arrayElems.add(ArrayElement[int](isConstant: true,
+                                    constantValue: if v in setAsHashSet: 1 else: 0))
+                        if bArg.kind == FznIdent and bArg.ident in tr.varPositions:
+                            let bPos = tr.varPositions[bArg.ident]
+                            tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arrayElems)
 
     of "array_var_set_element":
         # array_var_set_element(idx, [S1, S2, ...], R) means R = array[idx]
