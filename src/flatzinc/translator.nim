@@ -161,12 +161,12 @@ type
 
     ArgmaxPattern* = object
         ## A detected argmax decomposition pattern:
-        ## N int_ne_reif(tower, t, ne_t) + N int_lin_le_reif/int_le_reif(…, ne_t)
-        ## + array_int_maximum(max_var, signal_array)
-        ## Replaced by an argmax channel binding: tower = argmax(signals) + offset
-        towerVarName*: string         # argmax result (search variable)
-        maxVarName*: string           # max(signals) channel variable
-        signalElems*: seq[FznExpr]    # signal array elements (idents or int literals)
+        ## N int_ne_reif(argmax_var, t, ne_t) + N int_lin_le_reif/int_le_reif(…, ne_t)
+        ## + array_int_maximum(max_var, input_array)
+        ## Replaced by an argmax channel binding: argmax_var = argmax(inputs) + offset
+        argmaxVarName*: string        # argmax result (search variable)
+        maxVarName*: string           # max(inputs) channel variable
+        inputElems*: seq[FznExpr]     # input array elements (idents or int literals)
 
     MaxFromLinLeDef* = object
         ## A detected max-from-lin-le pattern:
@@ -1299,18 +1299,18 @@ proc translate*(model: FznModel): FznTranslator =
             let targetPos = result.varPositions[pattern.targetVarName]
             result.sys.addConstraint(countEq[int](arrayPos, pattern.countValue, targetPos))
         elif ci in result.argmaxPatterns:
-            # Emit argmax channel binding: tower = argmax(signals) + valueOffset
+            # Emit argmax channel binding: argmax_var = argmax(inputs) + valueOffset
             let p = result.argmaxPatterns[ci]
-            if p.towerVarName notin result.varPositions:
-                raise newException(KeyError, &"Argmax tower variable '{p.towerVarName}' has no position (array_int_maximum was already consumed)")
-            let towerPos = result.varPositions[p.towerVarName]
-            var signalExprs: seq[AlgebraicExpression[int]]
-            for elem in p.signalElems:
-                signalExprs.add(result.resolveExprArg(elem))
-            let towerDomain = result.sys.baseArray.domain[towerPos]
-            let valueOffset = towerDomain[0]  # min tower value (e.g., 1 for 1-based)
-            result.sys.baseArray.addArgmaxChannelBinding(towerPos, signalExprs, valueOffset)
-            result.channelVarNames.incl(p.towerVarName)
+            if p.argmaxVarName notin result.varPositions:
+                raise newException(KeyError, &"Argmax variable '{p.argmaxVarName}' has no position (array_int_maximum was already consumed)")
+            let argmaxPos = result.varPositions[p.argmaxVarName]
+            var inputExprs: seq[AlgebraicExpression[int]]
+            for elem in p.inputElems:
+                inputExprs.add(result.resolveExprArg(elem))
+            let argmaxDomain = result.sys.baseArray.domain[argmaxPos]
+            let valueOffset = argmaxDomain[0]  # min value (e.g., 1 for 1-based indexing)
+            result.sys.baseArray.addArgmaxChannelBinding(argmaxPos, inputExprs, valueOffset)
+            result.channelVarNames.incl(p.argmaxVarName)
         else:
             inc nTranslated
             result.translateConstraint(con)

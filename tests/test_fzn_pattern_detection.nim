@@ -1133,12 +1133,12 @@ solve satisfy;
 
 suite "FlatZinc Argmax Pattern Detection":
 
-    test "detectArgmaxPattern: 3-signal argmax → element constraint":
-        ## Encodes tower = argmax([s1, s2, s3]) via MiniZinc's decomposition:
-        ##   int_ne_reif(tower, t, ne_t) :: defines_var(ne_t)  for t = 1..3
+    test "detectArgmaxPattern: 3-input argmax → element constraint":
+        ## Encodes argmax_var = argmax([s1, s2, s3]) via MiniZinc's decomposition:
+        ##   int_ne_reif(argmax_var, t, ne_t) :: defines_var(ne_t)  for t = 1..3
         ##   int_lin_le_reif([1, -1], [s_t, max_s], 0, ne_t)  for t = 1..3
         ##   array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s)
-        ## The detector should replace this with: s[tower-1] == max_s (element constraint).
+        ## The detector should replace this with an argmax channel binding.
         let src = """
 var 1..3: tower :: output_var;
 var 1..10: s1 :: output_var;
@@ -1166,12 +1166,12 @@ solve satisfy;
         # Verify argmax pattern was detected
         check tr.argmaxPatterns.len == 1
         for _, pat in tr.argmaxPatterns:
-            check pat.towerVarName == "tower"
+            check pat.argmaxVarName == "tower"
             check pat.maxVarName == "max_s"
-            check pat.signalElems.len == 3
-            check pat.signalElems[0].kind == FznIdent and pat.signalElems[0].ident == "s1"
-            check pat.signalElems[1].kind == FznIdent and pat.signalElems[1].ident == "s2"
-            check pat.signalElems[2].kind == FznIdent and pat.signalElems[2].ident == "s3"
+            check pat.inputElems.len == 3
+            check pat.inputElems[0].kind == FznIdent and pat.inputElems[0].ident == "s1"
+            check pat.inputElems[1].kind == FznIdent and pat.inputElems[1].ident == "s2"
+            check pat.inputElems[2].kind == FznIdent and pat.inputElems[2].ident == "s3"
 
         # ne_vars should be removed from channelVarNames (dead channels)
         check "ne1" notin tr.channelVarNames
@@ -1181,13 +1181,13 @@ solve satisfy;
         # max_s stays as a channel position but its MinMaxChannelBinding is removed
         check "max_s" in tr.channelVarNames
 
-        # Solve and verify: s2=7 is the max, so tower should be 2
+        # Solve and verify: s2=7 is the max, so argmax should be 2
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
-        let towerVal = tr.sys.assignment[tr.varPositions["tower"]]
-        check towerVal == 2
+        let argmaxVal = tr.sys.assignment[tr.varPositions["tower"]]
+        check argmaxVal == 2
         # max_s position exists but is not computed (no MinMaxChannelBinding)
 
-    test "detectArgmaxPattern: non-contiguous tower values are not matched":
+    test "detectArgmaxPattern: non-contiguous ne_reif values are not matched":
         ## If the ne_reif constants are not contiguous (e.g., 1, 3, 5), the pattern
         ## should NOT be detected.
         let src = """
@@ -1240,18 +1240,17 @@ solve satisfy;
         # Missing ne2's lin_le_reif → pattern should NOT be detected
         check tr.argmaxPatterns.len == 0
 
-    test "detectArgmaxPattern: mixed int_lin_le_reif + int_le_reif (constant signals)":
-        ## Models like "tower" produce argmax decompositions where some signals
-        ## are variable (int_lin_le_reif) and others are constant (int_le_reif).
-        ## The detector must handle both types.
+    test "detectArgmaxPattern: mixed int_lin_le_reif + int_le_reif (constant inputs)":
+        ## Argmax decompositions where some inputs are variable (int_lin_le_reif)
+        ## and others are constant (int_le_reif). The detector must handle both types.
         ##
-        ##   tower = argmax([s1, 5, s3, 2])
+        ##   argmax_var = argmax([s1, 5, s3, 2])
         ##     s1 is variable, 5 is constant, s3 is variable, 2 is constant
-        ##   Decomposition:
+        ##   Decomposition (FZN variable "tower" used as the argmax var):
         ##     int_ne_reif(tower, 1, ne1), int_lin_le_reif([1,-1], [s1, max_s], 0, ne1)
-        ##     int_ne_reif(tower, 2, ne2), int_le_reif(6, max_s, ne2)    ← constant signal=5
+        ##     int_ne_reif(tower, 2, ne2), int_le_reif(6, max_s, ne2)    ← constant input 5
         ##     int_ne_reif(tower, 3, ne3), int_lin_le_reif([1,-1], [s3, max_s], 0, ne3)
-        ##     int_ne_reif(tower, 4, ne4), int_le_reif(3, max_s, ne4)    ← constant signal=2
+        ##     int_ne_reif(tower, 4, ne4), int_le_reif(3, max_s, ne4)    ← constant input 2
         let src = """
 var 1..4: tower :: output_var;
 var 1..10: s1 :: output_var;
@@ -1280,14 +1279,14 @@ solve satisfy;
         # Verify argmax pattern was detected
         check tr.argmaxPatterns.len == 1
         for _, pat in tr.argmaxPatterns:
-            check pat.towerVarName == "tower"
+            check pat.argmaxVarName == "tower"
             check pat.maxVarName == "max_s"
-            check pat.signalElems.len == 4
+            check pat.inputElems.len == 4
             # s1 (variable), 5 (constant), s3 (variable), 2 (constant)
-            check pat.signalElems[0].kind == FznIdent
-            check pat.signalElems[1].kind == FznIntLit
-            check pat.signalElems[2].kind == FznIdent
-            check pat.signalElems[3].kind == FznIntLit
+            check pat.inputElems[0].kind == FznIdent
+            check pat.inputElems[1].kind == FznIntLit
+            check pat.inputElems[2].kind == FznIdent
+            check pat.inputElems[3].kind == FznIntLit
 
         # ne_vars should be removed from channelVarNames
         check "ne1" notin tr.channelVarNames
@@ -1295,10 +1294,10 @@ solve satisfy;
         check "ne3" notin tr.channelVarNames
         check "ne4" notin tr.channelVarNames
 
-        # Solve: s1=3, const=5, s3=8, const=2 → argmax is index 2 (s3=8) → tower=3
+        # Solve: s1=3, const=5, s3=8, const=2 → argmax is index 3 (s3=8)
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
-        let towerVal = tr.sys.assignment[tr.varPositions["tower"]]
-        check towerVal == 3
+        let argmaxVal = tr.sys.assignment[tr.varPositions["tower"]]
+        check argmaxVal == 3
 
 suite "FlatZinc Max-from-LinLe Detection":
 
