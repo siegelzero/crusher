@@ -162,23 +162,47 @@ proc evaluateArgmax[T](binding: ArgmaxChannelBinding[T], assignment: seq[T]): T 
 proc evaluateCrossingCountMax[T](binding: CrossingCountMaxChannelBinding[T],
                                   assignment: seq[T]): T {.inline.} =
     ## Evaluate crossing count max channel using sweep-line in O(numCables + k) time.
-    ## crossing(v) = |{j : min(a_j, b_j) < v < max(a_j, b_j)}| for cables (a_j, b_j).
-    ## Returns max_v crossing(v).
+    ## Unweighted: max_v |{j : min(a_j, b_j) < v < max(a_j, b_j)}|
+    ## Weighted:   max_v (offset_v + Σ_j w_j * [min(a_j, b_j) < v < max(a_j, b_j)])
     let k = binding.k
     var events = newSeq[T](k + 2)
-    for cable in binding.cables:
-        let a = assignment[cable.startPos]
-        let b = assignment[cable.endPos]
-        let lo = min(a, b)
-        let hi = max(a, b)
-        if hi - lo > 1:
-            events[lo + 1] += 1
-            events[hi] -= 1
+    if binding.weights.len > 0:
+        for ci in 0..<binding.cables.len:
+            let cable = binding.cables[ci]
+            let a = assignment[cable.startPos]
+            let b = assignment[cable.endPos]
+            let lo = min(a, b)
+            let hi = max(a, b)
+            if hi - lo > 1:
+                events[lo + 1] += binding.weights[ci]
+                events[hi] -= binding.weights[ci]
+    else:
+        for cable in binding.cables:
+            let a = assignment[cable.startPos]
+            let b = assignment[cable.endPos]
+            let lo = min(a, b)
+            let hi = max(a, b)
+            if hi - lo > 1:
+                events[lo + 1] += 1
+                events[hi] -= 1
     result = T(0)
     var current = T(0)
-    for v in 1..k:
-        current += events[v]
-        if current > result: result = current
+    if binding.permPositions.len > 0:
+        # Weighted version with per-position offsets from inverse permutation
+        var invPerm = newSeq[int](k + 1)  # invPerm[position] = nodeIndex
+        for nodeIdx in 0..<binding.permPositions.len:
+            let posVal = assignment[binding.permPositions[nodeIdx]]
+            if posVal >= 1 and posVal <= k:
+                invPerm[posVal] = nodeIdx
+        for v in 1..k:
+            current += events[v]
+            let nodeIdx = invPerm[v]
+            let total = current + (if nodeIdx < binding.sweepCosts.len: binding.sweepCosts[nodeIdx] else: T(0))
+            if total > result: result = total
+    else:
+        for v in 1..k:
+            current += events[v]
+            if current > result: result = current
 
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.

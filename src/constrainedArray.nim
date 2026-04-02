@@ -65,9 +65,16 @@ type
         ## Computes max crossing count: max_v |{j : min(a_j, b_j) < v < max(a_j, b_j)}|
         ## where (a_j, b_j) are cable endpoint values from the assignment.
         ## Uses sweep-line evaluation in O(numCables + k) time.
+        ##
+        ## Extended for weighted version:
+        ## max_v (offset_v + Σ_j w_j * [min(a_j, b_j) < v < max(a_j, b_j)])
+        ## where offsets come from an inverse permutation lookup (sweep costs).
         channelPosition*: int       # Position of the max crossing count channel variable
         cables*: seq[tuple[startPos, endPos: int]]  # Cable endpoint positions
         k*: int                     # Max domain value (values are 1..k)
+        weights*: seq[T]            # Cable weights (empty → unit weights)
+        permPositions*: seq[int]    # Permutation variable positions (for inverse lookup)
+        sweepCosts*: seq[T]         # sweepCosts[nodeIdx] = per-position offset via inverse permutation
 
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
@@ -426,17 +433,24 @@ proc addExpressionChannelBinding*[T](arr: var ConstrainedArray[T],
 proc addCrossingCountMaxChannelBinding*[T](arr: var ConstrainedArray[T],
                                             channelPos: int,
                                             cables: seq[tuple[startPos, endPos: int]],
-                                            k: int) =
+                                            k: int,
+                                            weights: seq[T] = @[],
+                                            permPositions: seq[int] = @[],
+                                            sweepCosts: seq[T] = @[]) =
     ## Register a crossing count max channel: channelPos = max_v crossing(v)
     ## where crossing(v) = |{j : min(a_j, b_j) < v < max(a_j, b_j)}| for cables (a_j, b_j).
+    ## Weighted version: crossing(v) = offset_v + Σ_j w_j * betweenness(j, v).
     let bindingIdx = arr.crossingCountMaxChannelBindings.len
     arr.crossingCountMaxChannelBindings.add(CrossingCountMaxChannelBinding[T](
         channelPosition: channelPos,
         cables: cables,
-        k: k
+        k: k,
+        weights: weights,
+        permPositions: permPositions,
+        sweepCosts: sweepCosts
     ))
     arr.channelPositions.incl(channelPos)
-    # Register at all cable endpoint positions
+    # Register at all cable endpoint positions and permutation positions
     var registered: PackedSet[int]
     for cable in cables:
         for pos in [cable.startPos, cable.endPos]:
@@ -446,6 +460,13 @@ proc addCrossingCountMaxChannelBinding*[T](arr: var ConstrainedArray[T],
                     arr.crossingCountMaxChannelsAtPosition[pos] = @[bindingIdx]
                 elif bindingIdx notin arr.crossingCountMaxChannelsAtPosition[pos]:
                     arr.crossingCountMaxChannelsAtPosition[pos].add(bindingIdx)
+    for pos in permPositions:
+        if pos notin registered:
+            registered.incl(pos)
+            if pos notin arr.crossingCountMaxChannelsAtPosition:
+                arr.crossingCountMaxChannelsAtPosition[pos] = @[bindingIdx]
+            elif bindingIdx notin arr.crossingCountMaxChannelsAtPosition[pos]:
+                arr.crossingCountMaxChannelsAtPosition[pos].add(bindingIdx)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],

@@ -1129,7 +1129,21 @@ proc buildCrossingCountMaxChannelBindings(tr: var FznTranslator) =
                 ok = false; break
             cables.add((startPos: tr.varPositions[cable.a], endPos: tr.varPositions[cable.b]))
         if not ok: continue
-        tr.sys.baseArray.addCrossingCountMaxChannelBinding(channelPos, cables, def.k)
+        # Resolve permutation positions and sweep costs for weighted version
+        var weights: seq[int]
+        var permPositions: seq[int]
+        var sweepCosts: seq[int]
+        for w in def.weights:
+            weights.add(w)
+        for pName in def.permVarNames:
+            if pName notin tr.varPositions:
+                ok = false; break
+            permPositions.add(tr.varPositions[pName])
+        if not ok: continue
+        for sc in def.sweepCosts:
+            sweepCosts.add(sc)
+        tr.sys.baseArray.addCrossingCountMaxChannelBinding(channelPos, cables, def.k,
+            weights, permPositions, sweepCosts)
         nBuilt += 1
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} crossing count max channel bindings")

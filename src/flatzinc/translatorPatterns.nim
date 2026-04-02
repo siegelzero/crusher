@@ -4425,3 +4425,471 @@ proc detectCrossingCountMaxPattern*(tr: var FznTranslator) =
             k: k
         ))
 
+proc detectWeightedCrossingCountMaxPattern*(tr: var FznTranslator) =
+    ## Detect the weighted crossing count max pattern (graph-clear variant):
+    ##   array_int_maximum(M, [S_1, ..., S_k])
+    ## where each S_v = offset_v + Σ_j w_j * betweenness(j, v):
+    ##   S_v defined by int_lin_eq([1, 1, -1], [offset_v, block_v, S_v], 0)
+    ## block_v = weighted sum of betweenness indicators:
+    ##   int_lin_eq([1, -w_1, ..., -w_m], [block_v, ind_1, ..., ind_m], 0)
+    ## each indicator from:
+    ##   bool2int(b_j, ind_j) → bool_clause([b_j], [c_1, ..., c_n])
+    ##   where c_k are int_le_reif / int_ne_reif (betweenness conditions)
+    ##
+    ## The int_ne_reif conditions identify cable endpoints (permutation variables).
+    ## Cable weights come from the int_lin_eq coefficients.
+    ## Per-position offsets (sweep costs) come from the other signal component.
+    ##
+    ## Replaces the entire chain with a single weighted CrossingCountMaxChannelBinding.
+
+    # Step 1: Index constraints by type and defined variable
+    var bool2intByDef = initTable[string, int]()     # defined int var → CI
+    var linEqByDef = initTable[string, int]()         # defined int var → CI
+    var leReifByDef = initTable[string, int]()        # defined bool var → CI (int_le_reif)
+    var neReifByDef = initTable[string, int]()        # defined bool var → CI (int_ne_reif)
+    var eqReifByDef = initTable[string, int]()        # defined bool var → CI (int_eq_reif)
+    # bool_clause with 1 positive: positive_var → (CI, negated_vars)
+    var boolClauseByPos = initTable[string, tuple[ci: int, negVars: seq[string]]]()
+
+    for ci in 0..<tr.model.constraints.len:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+
+        if con.hasAnnotation("defines_var"):
+            let defVar = con.getAnnotation("defines_var").args[0]
+            if defVar.kind != FznIdent: continue
+            let defName = defVar.ident
+            case name
+            of "bool2int":
+                if ci notin tr.definingConstraints:
+                    bool2intByDef[defName] = ci
+            of "int_lin_eq":
+                linEqByDef[defName] = ci  # Always index (may be consumed by collectDefinedVars)
+            of "int_le_reif":
+                if ci notin tr.definingConstraints:
+                    leReifByDef[defName] = ci
+            of "int_ne_reif":
+                if ci notin tr.definingConstraints:
+                    neReifByDef[defName] = ci
+            of "int_eq_reif":
+                if ci notin tr.definingConstraints:
+                    eqReifByDef[defName] = ci
+            else: discard
+        elif name == "bool_clause":
+            # Index 1-positive bool_clause: bool_clause([pos], [neg1, ...])
+            if con.args.len >= 2:
+                let posArg = con.args[0]
+                let negArg = con.args[1]
+                if posArg.kind == FznArrayLit and posArg.elems.len == 1 and
+                   posArg.elems[0].kind == FznIdent and negArg.kind == FznArrayLit:
+                    let posVar = posArg.elems[0].ident
+                    var negVars: seq[string]
+                    var allIdent = true
+                    for elem in negArg.elems:
+                        if elem.kind != FznIdent: allIdent = false; break
+                        negVars.add(elem.ident)
+                    if allIdent and negVars.len >= 3:
+                        # Store first occurrence (for betweenness indicators)
+                        if posVar notin boolClauseByPos:
+                            boolClauseByPos[posVar] = (ci: ci, negVars: negVars)
+
+
+
+    # Step 2: For each array_int_maximum, attempt to trace the weighted pattern
+    for mmDef in tr.minMaxChannelDefs:
+        if mmDef.isMin: continue
+        let mmCi = mmDef.ci
+        let con = tr.model.constraints[mmCi]
+        let name = stripSolverPrefix(con.name)
+        if name != "array_int_maximum": continue
+        if con.args.len < 2: continue
+
+        # Get the signal array [S_1, ..., S_k]
+        var signalNames: seq[string]
+        let arrArg = con.args[1]
+        if arrArg.kind == FznArrayLit:
+            for elem in arrArg.elems:
+                if elem.kind != FznIdent: signalNames = @[]; break
+                signalNames.add(elem.ident)
+        else:
+            for vd in tr.model.variables:
+                if vd.name == arrArg.ident and vd.value != nil and vd.value.kind == FznArrayLit:
+                    for elem in vd.value.elems:
+                        if elem.kind != FznIdent: signalNames = @[]; break
+                        signalNames.add(elem.ident)
+                    break
+            if signalNames.len == 0 and arrArg.ident in tr.arrayElementNames:
+                signalNames = tr.arrayElementNames[arrArg.ident]
+        if signalNames.len < 2: continue
+
+        let k = signalNames.len
+
+
+
+        # Step 3: For each signal S_v, find int_lin_eq defining it as a sum of two vars
+        var offsetVarNames: seq[string]  # var_s[v] per timestep
+        var blockVarNames: seq[string]   # var_b[v] per timestep
+        var patternOk = true
+
+        for v in 0..<k:
+            let sName = signalNames[v]
+            if sName notin linEqByDef:
+                patternOk = false; break
+            let eqCi = linEqByDef[sName]
+            let eqCon = tr.model.constraints[eqCi]
+            if eqCon.args.len < 3: patternOk = false; break
+            var coeffs: seq[int]
+            try: coeffs = tr.resolveIntArray(eqCon.args[0])
+            except: patternOk = false
+            if not patternOk: break
+            var rhs: int
+            try: rhs = tr.resolveIntArg(eqCon.args[2])
+            except: patternOk = false
+            if not patternOk: break
+            if rhs != 0 or coeffs.len != 3: patternOk = false; break
+            # Expect [1, 1, -1] or permutation: two +1 and one -1
+            let varsArg = eqCon.args[1]
+            if varsArg.kind != FznArrayLit or varsArg.elems.len != 3: patternOk = false; break
+            # Find which var is the defined one (coefficient -1) and which two are inputs
+            var defIdx = -1
+            var inputIndices: seq[int]
+            for i in 0..<3:
+                if coeffs[i] == -1 and varsArg.elems[i].kind == FznIdent and
+                   varsArg.elems[i].ident == sName:
+                    defIdx = i
+                else:
+                    if coeffs[i] != 1: patternOk = false; break
+                    inputIndices.add(i)
+            if not patternOk or defIdx < 0 or inputIndices.len != 2: patternOk = false; break
+            if varsArg.elems[inputIndices[0]].kind != FznIdent or
+               varsArg.elems[inputIndices[1]].kind != FznIdent: patternOk = false; break
+
+            let inpA = varsArg.elems[inputIndices[0]].ident
+            let inpB = varsArg.elems[inputIndices[1]].ident
+
+            # Identify which input is the block sum (has a defining int_lin_eq with many terms)
+            # and which is the offset (no such definition, it's a one-hot channel)
+            proc isWeightedSum(tr: FznTranslator, varName: string,
+                               linEqByDef: Table[string, int]): bool =
+                if varName notin linEqByDef: return false
+                let c = tr.model.constraints[linEqByDef[varName]]
+                if c.args.len < 3: return false
+                try:
+                    let arr = tr.resolveIntArray(c.args[0])
+                    return arr.len >= 3
+                except CatchableError:
+                    return false
+            let aIsBlock = tr.isWeightedSum(inpA, linEqByDef)
+            let bIsBlock = tr.isWeightedSum(inpB, linEqByDef)
+
+            if aIsBlock and not bIsBlock:
+                blockVarNames.add(inpA)
+                offsetVarNames.add(inpB)
+            elif bIsBlock and not aIsBlock:
+                blockVarNames.add(inpB)
+                offsetVarNames.add(inpA)
+            else:
+                discard
+                patternOk = false; break
+
+        if not patternOk: continue
+
+
+
+        # Step 4: Trace block_v to weighted sum of betweenness indicators
+        # Collect cables and weights from the first block sum
+        type CableInfo = object
+            endpointA, endpointB: string
+            weight: int
+
+        var allCables: seq[CableInfo]
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+
+        for v in 0..<k:
+            let blockName = blockVarNames[v]
+            if blockName notin linEqByDef:
+                patternOk = false; break
+            let bEqCi = linEqByDef[blockName]
+            let bEqCon = tr.model.constraints[bEqCi]
+            var bCoeffs: seq[int]
+            try: bCoeffs = tr.resolveIntArray(bEqCon.args[0])
+            except: patternOk = false
+            if not patternOk: break
+            var bRhs: int
+            try: bRhs = tr.resolveIntArg(bEqCon.args[2])
+            except: patternOk = false
+            if not patternOk or bRhs != 0: patternOk = false; break
+            # Resolve variable array (may be inline FznArrayLit or named FznIdent reference)
+            var bVarNames: seq[string]
+            let bVarsArg = bEqCon.args[1]
+            if bVarsArg.kind == FznArrayLit:
+                for elem in bVarsArg.elems:
+                    if elem.kind != FznIdent: bVarNames = @[]; break
+                    bVarNames.add(elem.ident)
+            elif bVarsArg.kind == FznIdent:
+                # Named array reference — resolve from model declarations
+                for decl in tr.model.variables:
+                    if decl.isArray and decl.name == bVarsArg.ident and
+                       decl.value != nil and decl.value.kind == FznArrayLit:
+                        for elem in decl.value.elems:
+                            if elem.kind != FznIdent: bVarNames = @[]; break
+                            bVarNames.add(elem.ident)
+                        break
+            if bVarNames.len != bCoeffs.len:
+                patternOk = false; break
+            # First coefficient should be 1 (for block_v), rest are negated weights
+            if bCoeffs[0] != 1: patternOk = false; break
+            if bVarNames[0] != blockName:
+                patternOk = false; break
+
+            var localConsumed: seq[int] = @[bEqCi]
+            var localVarNames: seq[string] = @[blockName]
+            var timestepCables: seq[CableInfo]
+            let timestep = v + 1  # 1-based
+
+            # Trace each indicator
+            for j in 1..<bCoeffs.len:
+                let weight = -bCoeffs[j]  # Negate since coefficients are negative
+                if weight <= 0: patternOk = false; break
+                let indName = bVarNames[j]
+
+                # bool2int(b, ind) :: defines_var(ind)
+                if indName notin bool2intByDef:
+                    patternOk = false; break
+                let b2iCi = bool2intByDef[indName]
+                let b2iCon = tr.model.constraints[b2iCi]
+                if b2iCon.args[0].kind != FznIdent: patternOk = false; break
+                let boolName = b2iCon.args[0].ident
+
+                # bool_clause([boolName], [c_1, ..., c_n]) — betweenness conjunction
+                if boolName notin boolClauseByPos:
+                    patternOk = false; break
+                let clause = boolClauseByPos[boolName]
+                let negVars = clause.negVars
+
+                # Extract endpoint variables from int_ne_reif conditions
+                var endpointsFound: seq[string]
+                for negVar in negVars:
+                    if negVar in neReifByDef:
+                        let nrCon = tr.model.constraints[neReifByDef[negVar]]
+                        # int_ne_reif(var, const, bool) — extract the variable
+                        if nrCon.args[0].kind == FznIdent:
+                            endpointsFound.add(nrCon.args[0].ident)
+                if endpointsFound.len != 2:
+                    patternOk = false; break
+
+                timestepCables.add(CableInfo(
+                    endpointA: endpointsFound[0],
+                    endpointB: endpointsFound[1],
+                    weight: weight))
+
+                localConsumed.add(b2iCi)
+                localConsumed.add(clause.ci)
+                localVarNames.add(indName)
+                localVarNames.add(boolName)
+                # Consume the le_reif and ne_reif conditions
+                for negVar in negVars:
+                    if negVar in leReifByDef:
+                        localConsumed.add(leReifByDef[negVar])
+                        localVarNames.add(negVar)
+                    elif negVar in neReifByDef:
+                        localConsumed.add(neReifByDef[negVar])
+                        localVarNames.add(negVar)
+
+            if not patternOk: break
+
+            # On first timestep, record the cable set; on subsequent, verify consistency
+            if v == 0:
+                allCables = timestepCables
+            else:
+                # Cables should be in the same order with the same endpoints
+                if timestepCables.len != allCables.len:
+                    patternOk = false; break
+                for j in 0..<allCables.len:
+                    let expected = allCables[j]
+                    let actual = timestepCables[j]
+                    if actual.weight != expected.weight: patternOk = false; break
+                    # Endpoints should match (same variables for same cable across timesteps)
+                    if not ((actual.endpointA == expected.endpointA and actual.endpointB == expected.endpointB) or
+                            (actual.endpointA == expected.endpointB and actual.endpointB == expected.endpointA)):
+                        patternOk = false; break
+                if not patternOk: break
+
+            # Consume the signal sum int_lin_eq
+            localConsumed.add(linEqByDef[signalNames[v]])
+            localVarNames.add(signalNames[v])
+            # Do NOT mark offsetVarNames (var_s) as consumed — they're needed for
+            # one-hot channel detection and output
+
+            consumedConstraints.add(localConsumed)
+            consumedVarNames.add(localVarNames)
+
+        if not patternOk or allCables.len == 0: continue
+
+        # Step 5: Extract the ordered permutation variable names from the solve annotation
+        # Find the int_search array argument to get the ordered var_t list.
+        var permVarNames: seq[string]
+        for ann in tr.model.solve.annotations:
+            if ann.name in ["int_search", "bool_search"] and ann.args.len >= 1:
+                let arrayArg = ann.args[0]
+                if arrayArg.kind == FznIdent:
+                    # Named array reference — resolve to element names
+                    for decl in tr.model.variables:
+                        if decl.isArray and decl.name == arrayArg.ident and
+                           decl.value != nil and decl.value.kind == FznArrayLit:
+                            for elem in decl.value.elems:
+                                if elem.kind == FznIdent:
+                                    permVarNames.add(elem.ident)
+                            break
+                elif arrayArg.kind == FznArrayLit:
+                    for elem in arrayArg.elems:
+                        if elem.kind == FznIdent:
+                            permVarNames.add(elem.ident)
+                if permVarNames.len > 0: break
+
+        if permVarNames.len != k: continue
+
+        # Build reverse map: permutation var name → node index (0-based)
+        var nodeIndexByVar = initTable[string, int]()
+        for ni in 0..<k:
+            nodeIndexByVar[permVarNames[ni]] = ni
+
+        # Step 6: Extract sweep costs from the offset variables (var_s)
+        # For each offset var, find int_eq_reif constraints to get possible values.
+        # Then match to nodes via bool_clause implications.
+        # sweepCosts[nodeIdx] maps each node to its sweep cost.
+        var sweepCosts = newSeq[int](k)
+        var sweepCostsOk = true
+
+        # For offset_v (timestep v+1): find int_eq_reif(offset_v, cost, b_eq)
+        # and bool_clause([b_eq], [b_cond]) where int_eq_reif(t[nodeIdx], v+1, b_cond)
+        # This gives sweepCosts[nodeIdx] = cost.
+        # We only need to trace one timestep fully.
+        let sampleOffset = offsetVarNames[0]
+        let sampleTimestep = 1  # timestep 1
+
+        # Find all int_eq_reif on the sample offset var
+        var eqReifOnOffset: seq[tuple[constVal: int, boolVar: string]]
+        for ci in 0..<tr.model.constraints.len:
+            let c = tr.model.constraints[ci]
+            if stripSolverPrefix(c.name) != "int_eq_reif": continue
+            if c.args.len < 3: continue
+            if c.args[0].kind == FznIdent and c.args[0].ident == sampleOffset and
+               c.args[1].kind == FznIntLit and c.args[2].kind == FznIdent:
+                eqReifOnOffset.add((constVal: c.args[1].intVal, boolVar: c.args[2].ident))
+
+        # For each (cost, b_eq), find bool_clause([b_eq], [b_cond]) and trace b_cond
+        for entry in eqReifOnOffset:
+            var foundNode = -1
+            for ci in 0..<tr.model.constraints.len:
+                let c = tr.model.constraints[ci]
+                if stripSolverPrefix(c.name) != "bool_clause": continue
+                if c.args.len < 2: continue
+                let posArg = c.args[0]
+                let negArg = c.args[1]
+                if posArg.kind != FznArrayLit or posArg.elems.len != 1: continue
+                if posArg.elems[0].kind != FznIdent: continue
+                if posArg.elems[0].ident != entry.boolVar: continue
+                if negArg.kind != FznArrayLit or negArg.elems.len != 1: continue
+                if negArg.elems[0].kind != FznIdent: continue
+                let condVar = negArg.elems[0].ident
+                # condVar should be from int_eq_reif(t[nodeIdx], sampleTimestep, condVar)
+                if condVar in eqReifByDef:
+                    let condCon = tr.model.constraints[eqReifByDef[condVar]]
+                    if condCon.args.len >= 3 and condCon.args[1].kind == FznIntLit and
+                       condCon.args[1].intVal == sampleTimestep and
+                       condCon.args[0].kind == FznIdent:
+                        let nodeVar = condCon.args[0].ident
+                        if nodeVar in nodeIndexByVar:
+                            foundNode = nodeIndexByVar[nodeVar]
+                if foundNode >= 0: break
+            if foundNode >= 0 and foundNode < k:
+                sweepCosts[foundNode] = entry.constVal
+            else:
+                sweepCostsOk = false; break
+
+        if not sweepCostsOk: continue
+
+        # Step 7: Pattern detected! Consume everything.
+        var cableStrs: seq[tuple[a, b: string]]
+        var weights: seq[int]
+        for cable in allCables:
+            cableStrs.add((a: cable.endpointA, b: cable.endpointB))
+            weights.add(cable.weight)
+
+        stderr.writeLine(&"[FZN] Detected weighted crossing count max pattern: {allCables.len} cables, k={k}, M_max={mmDef.varName}")
+
+        # Consume the array_int_maximum
+        tr.definingConstraints.incl(mmCi)
+        # Consume all intermediate constraints
+        for cc in consumedConstraints:
+            tr.definingConstraints.incl(cc)
+        # Mark intermediate variables as channels
+        for vn in consumedVarNames:
+            tr.channelVarNames.incl(vn)
+
+        tr.crossingCountMaxDefs.add(CrossingCountMaxDef(
+            maxVarName: mmDef.varName,
+            cables: cableStrs,
+            k: k,
+            weights: weights,
+            permVarNames: permVarNames,
+            sweepCosts: sweepCosts
+        ))
+
+proc tightenOneHotCondDomains*(tr: var FznTranslator) =
+    ## Tighten domains of one-hot conditional channel targets.
+    ## When var_s[t] is determined by a one-hot permutation lookup with known constant
+    ## values, restrict its domain to only those values.
+    var nTightened = 0
+    for def in tr.oneHotCondChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        let pos = tr.varPositions[def.targetVar]
+        let currentDom = tr.sys.baseArray.domain[pos]
+        if currentDom.len == 0: continue
+        # Build the set of possible values from the lookup table
+        var allowed: HashSet[int]
+        for v in def.targetVals:
+            allowed.incl(v)
+        # Intersect with current domain
+        var newDom: seq[int]
+        for v in currentDom:
+            if v in allowed:
+                newDom.add(v)
+        if newDom.len > 0 and newDom.len < currentDom.len:
+            tr.sys.baseArray.setDomain(pos, newDom)
+            inc nTightened
+    if nTightened > 0:
+        stderr.writeLine(&"[FZN] Tightened {nTightened} one-hot conditional channel domains")
+
+proc tightenBinaryCondDomains*(tr: var FznTranslator) =
+    ## Tighten domains of binary conditional channel targets (min/max patterns).
+    ## target = if cond then val0 else val1, so target ∈ dom(val0) ∪ dom(val1).
+    var nTightened = 0
+    for def in tr.binaryCondChannelDefs:
+        if def.targetVar notin tr.varPositions: continue
+        if def.val0Var notin tr.varPositions: continue
+        if def.val1Var notin tr.varPositions: continue
+        let targetPos = tr.varPositions[def.targetVar]
+        let val0Pos = tr.varPositions[def.val0Var]
+        let val1Pos = tr.varPositions[def.val1Var]
+        let currentDom = tr.sys.baseArray.domain[targetPos]
+        if currentDom.len == 0: continue
+        # Union of source domains
+        var allowed: HashSet[int]
+        for v in tr.sys.baseArray.domain[val0Pos]:
+            allowed.incl(v)
+        for v in tr.sys.baseArray.domain[val1Pos]:
+            allowed.incl(v)
+        # Intersect with current domain
+        var newDom: seq[int]
+        for v in currentDom:
+            if v in allowed:
+                newDom.add(v)
+        if newDom.len > 0 and newDom.len < currentDom.len:
+            tr.sys.baseArray.setDomain(targetPos, newDom)
+            inc nTightened
+    if nTightened > 0:
+        stderr.writeLine(&"[FZN] Tightened {nTightened} binary conditional channel domains")
+

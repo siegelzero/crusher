@@ -158,6 +158,9 @@ type
         maxVarName*: string            # M_max channel variable name
         cables*: seq[tuple[a, b: string]]  # Cable endpoint variable names
         k*: int                         # Number of positions (domain size)
+        weights*: seq[int]             # Cable weights (empty → unit weights)
+        permVarNames*: seq[string]     # Permutation var names for inline offset lookup (empty → no offsets)
+        sweepCosts*: seq[int]          # Sweep cost per node index (empty → no offsets)
 
     ArgmaxPattern* = object
         ## A detected argmax decomposition pattern:
@@ -923,6 +926,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect crossing count max patterns (betweenness indicators → sum → array_int_maximum)
     # MUST run before detectReifChannels which would consume the intermediate bool2int/array_bool_and/int_lin_le_reif
     result.detectCrossingCountMaxPattern()
+    # Detect weighted crossing count max patterns (graph-clear variant: weighted betweenness + offsets)
+    # MUST run before detectReifChannels for the same reason.
+    result.detectWeightedCrossingCountMaxPattern()
     # Detect bool2int identity aliases (MUST run after detectAtMostPairCliques which uses int var names,
     # and before detectReifChannels which would create channels for these)
     result.detectBool2intIdentityAliases()
@@ -1096,6 +1102,10 @@ proc translate*(model: FznModel): FznTranslator =
     result.tightenSpreadFromDiffnProfile()
     # Prune admission domains using zero-capacity day detection
     result.pruneZeroCapacityDays()
+    # Tighten one-hot conditional channel domains (permutation lookups etc.)
+    result.tightenOneHotCondDomains()
+    # Tighten binary conditional channel domains (min/max pair patterns)
+    result.tightenBinaryCondDomains()
     # Build set of variable names that are inputs to min/max channels.
     # Bounds on these intermediate variables are MiniZinc domain analysis artifacts,
     # not problem constraints. The min/max channel propagation maintains correct values

@@ -2306,6 +2306,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             if srcPos != pos and srcPos notin topoSet:
                                 externalDeps.incl(srcPos)
                                 elemExtDeps.incl(srcPos)
+                    for srcPos in binding.permPositions:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
                 of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
@@ -2376,6 +2380,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for cable in binding.cables:
                         for srcPos in [cable.startPos, cable.endPos]:
                             if srcPos != pos: inputs.incl(srcPos)
+                    for srcPos in binding.permPositions:
+                        if srcPos != pos: inputs.incl(srcPos)
                 of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:

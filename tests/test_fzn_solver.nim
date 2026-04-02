@@ -3101,3 +3101,212 @@ solve maximize obj;
     check tr.sys.hasFeasibleSolution
     let objVal = tr.sys.assignment[tr.objectivePos]
     check objVal >= 30  # optimal: idx=3 → obj=a2=30
+
+  test "weighted crossing count max pattern detection (graph-clear 3-node)":
+    # 3 nodes, 2 directed edges (1→2 weight 3, 2→1 weight 3).
+    # Sweep costs: node1=11, node2=16, node3=3.
+    # Optimal: var_z=16 (perm 1,2,3 or 3,2,1 → max sweep=16, no blocking).
+    # Tests: pattern detection, weighted evaluation with sweep costs,
+    #        one-hot domain tightening, intermediate channel consumption.
+    let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+predicate fzn_all_different_int(array [int] of var int: x);
+array [1..2] of int: X_INTRODUCED_250_ = [1,-1];
+array [1..3] of int: X_INTRODUCED_363_ = [1,-3,-3];
+var 1..3: X_INTRODUCED_142_;
+var 1..3: X_INTRODUCED_143_;
+var 1..3: X_INTRODUCED_144_;
+var 1..3: X_INTRODUCED_145_;
+var 1..3: X_INTRODUCED_146_;
+var 1..3: X_INTRODUCED_147_;
+var 1..3: X_INTRODUCED_148_;
+var 1..16: X_INTRODUCED_149_;
+var 1..16: X_INTRODUCED_150_;
+var 1..16: X_INTRODUCED_151_;
+var 0..6: X_INTRODUCED_152_:: is_defined_var;
+var 0..6: X_INTRODUCED_153_:: is_defined_var;
+var 0..6: X_INTRODUCED_154_:: is_defined_var;
+var bool: X_INTRODUCED_156_;
+var bool: X_INTRODUCED_157_;
+var bool: X_INTRODUCED_158_;
+var bool: X_INTRODUCED_159_;
+var bool: X_INTRODUCED_160_;
+var bool: X_INTRODUCED_161_;
+var 1..16: var_z:: is_defined_var:: output_var;
+var 1..22: X_INTRODUCED_164_ ::var_is_introduced :: is_defined_var;
+var 1..22: X_INTRODUCED_165_ ::var_is_introduced :: is_defined_var;
+var 1..22: X_INTRODUCED_166_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_169_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_170_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_178_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_179_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_187_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_188_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_196_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_197_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_205_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_206_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_214_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_215_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_223_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_224_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_232_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_233_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_241_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_242_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_251_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_252_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_253_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_262_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_263_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_264_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_273_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_274_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_275_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_285_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_286_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_287_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_288_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_298_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_299_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_300_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_310_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_311_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_318_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_319_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_326_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_336_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_337_ ::var_is_introduced :: is_defined_var;
+var bool: X_INTRODUCED_347_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_357_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_360_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_364_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_366_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_369_ ::var_is_introduced :: is_defined_var;
+var 0..1: X_INTRODUCED_371_ ::var_is_introduced :: is_defined_var;
+array [1..3] of var int: var_t:: output_array([1..3]) = [X_INTRODUCED_142_,X_INTRODUCED_143_,X_INTRODUCED_144_];
+array [1..2] of var int: var_l:: output_array([1..2]) = [X_INTRODUCED_145_,X_INTRODUCED_146_];
+array [1..2] of var int: var_u:: output_array([1..2]) = [X_INTRODUCED_147_,X_INTRODUCED_148_];
+array [1..3] of var int: var_s:: output_array([1..3]) = [X_INTRODUCED_149_,X_INTRODUCED_150_,X_INTRODUCED_151_];
+array [1..3] of var int: var_b:: output_array([1..3]) = [X_INTRODUCED_152_,X_INTRODUCED_153_,X_INTRODUCED_154_];
+array [1..6] of var bool: X_INTRODUCED_155_:: output_array([1..6]) = [X_INTRODUCED_156_,X_INTRODUCED_157_,X_INTRODUCED_158_,X_INTRODUCED_159_,X_INTRODUCED_160_,X_INTRODUCED_161_];
+array [1..3] of var int: X_INTRODUCED_167_ ::var_is_introduced  = [X_INTRODUCED_164_,X_INTRODUCED_165_,X_INTRODUCED_166_];
+constraint array_int_maximum(var_z,X_INTRODUCED_167_):: defines_var(var_z);
+constraint bool_clause([X_INTRODUCED_170_],[X_INTRODUCED_169_]);
+constraint bool_clause([X_INTRODUCED_179_],[X_INTRODUCED_178_]);
+constraint bool_clause([X_INTRODUCED_188_],[X_INTRODUCED_187_]);
+constraint bool_clause([X_INTRODUCED_197_],[X_INTRODUCED_196_]);
+constraint bool_clause([X_INTRODUCED_206_],[X_INTRODUCED_205_]);
+constraint bool_clause([X_INTRODUCED_215_],[X_INTRODUCED_214_]);
+constraint bool_clause([X_INTRODUCED_224_],[X_INTRODUCED_223_]);
+constraint bool_clause([X_INTRODUCED_233_],[X_INTRODUCED_232_]);
+constraint bool_clause([X_INTRODUCED_242_],[X_INTRODUCED_241_]);
+constraint fzn_all_different_int(var_t);
+constraint bool_clause([X_INTRODUCED_156_],[X_INTRODUCED_273_,X_INTRODUCED_274_,X_INTRODUCED_275_]);
+constraint bool_clause([X_INTRODUCED_157_],[X_INTRODUCED_285_,X_INTRODUCED_286_,X_INTRODUCED_287_,X_INTRODUCED_288_]);
+constraint bool_clause([X_INTRODUCED_158_],[X_INTRODUCED_298_,X_INTRODUCED_299_,X_INTRODUCED_300_]);
+constraint bool_clause([X_INTRODUCED_159_],[X_INTRODUCED_274_,X_INTRODUCED_275_,X_INTRODUCED_326_]);
+constraint bool_clause([X_INTRODUCED_160_],[X_INTRODUCED_287_,X_INTRODUCED_288_,X_INTRODUCED_336_,X_INTRODUCED_337_]);
+constraint bool_clause([X_INTRODUCED_161_],[X_INTRODUCED_299_,X_INTRODUCED_300_,X_INTRODUCED_347_]);
+constraint int_lin_eq(X_INTRODUCED_363_,[X_INTRODUCED_152_,X_INTRODUCED_357_,X_INTRODUCED_360_],0):: defines_var(X_INTRODUCED_152_);
+constraint int_lin_eq(X_INTRODUCED_363_,[X_INTRODUCED_153_,X_INTRODUCED_364_,X_INTRODUCED_366_],0):: defines_var(X_INTRODUCED_153_);
+constraint int_lin_eq(X_INTRODUCED_363_,[X_INTRODUCED_154_,X_INTRODUCED_369_,X_INTRODUCED_371_],0):: defines_var(X_INTRODUCED_154_);
+constraint bool_clause([X_INTRODUCED_252_],[X_INTRODUCED_251_]);
+constraint bool_clause([X_INTRODUCED_253_],[X_INTRODUCED_251_]);
+constraint bool_clause([X_INTRODUCED_318_],[X_INTRODUCED_251_]);
+constraint bool_clause([X_INTRODUCED_319_],[X_INTRODUCED_251_]);
+constraint bool_clause([X_INTRODUCED_263_],[X_INTRODUCED_262_]);
+constraint bool_clause([X_INTRODUCED_264_],[X_INTRODUCED_262_]);
+constraint bool_clause([X_INTRODUCED_310_],[X_INTRODUCED_262_]);
+constraint bool_clause([X_INTRODUCED_311_],[X_INTRODUCED_262_]);
+constraint int_lin_eq([1,1,-1],[X_INTRODUCED_149_,X_INTRODUCED_152_,X_INTRODUCED_164_],0):: defines_var(X_INTRODUCED_164_);
+constraint int_lin_eq([1,1,-1],[X_INTRODUCED_150_,X_INTRODUCED_153_,X_INTRODUCED_165_],0):: defines_var(X_INTRODUCED_165_);
+constraint int_lin_eq([1,1,-1],[X_INTRODUCED_151_,X_INTRODUCED_154_,X_INTRODUCED_166_],0):: defines_var(X_INTRODUCED_166_);
+constraint int_eq_reif(X_INTRODUCED_142_,1,X_INTRODUCED_169_):: defines_var(X_INTRODUCED_169_);
+constraint int_eq_reif(X_INTRODUCED_149_,11,X_INTRODUCED_170_):: defines_var(X_INTRODUCED_170_);
+constraint int_eq_reif(X_INTRODUCED_142_,2,X_INTRODUCED_178_):: defines_var(X_INTRODUCED_178_);
+constraint int_eq_reif(X_INTRODUCED_150_,11,X_INTRODUCED_179_):: defines_var(X_INTRODUCED_179_);
+constraint int_eq_reif(X_INTRODUCED_142_,3,X_INTRODUCED_187_):: defines_var(X_INTRODUCED_187_);
+constraint int_eq_reif(X_INTRODUCED_151_,11,X_INTRODUCED_188_):: defines_var(X_INTRODUCED_188_);
+constraint int_eq_reif(X_INTRODUCED_143_,1,X_INTRODUCED_196_):: defines_var(X_INTRODUCED_196_);
+constraint int_eq_reif(X_INTRODUCED_149_,16,X_INTRODUCED_197_):: defines_var(X_INTRODUCED_197_);
+constraint int_eq_reif(X_INTRODUCED_143_,2,X_INTRODUCED_205_):: defines_var(X_INTRODUCED_205_);
+constraint int_eq_reif(X_INTRODUCED_150_,16,X_INTRODUCED_206_):: defines_var(X_INTRODUCED_206_);
+constraint int_eq_reif(X_INTRODUCED_143_,3,X_INTRODUCED_214_):: defines_var(X_INTRODUCED_214_);
+constraint int_eq_reif(X_INTRODUCED_151_,16,X_INTRODUCED_215_):: defines_var(X_INTRODUCED_215_);
+constraint int_eq_reif(X_INTRODUCED_144_,1,X_INTRODUCED_223_):: defines_var(X_INTRODUCED_223_);
+constraint int_eq_reif(X_INTRODUCED_149_,3,X_INTRODUCED_224_):: defines_var(X_INTRODUCED_224_);
+constraint int_eq_reif(X_INTRODUCED_144_,2,X_INTRODUCED_232_):: defines_var(X_INTRODUCED_232_);
+constraint int_eq_reif(X_INTRODUCED_150_,3,X_INTRODUCED_233_):: defines_var(X_INTRODUCED_233_);
+constraint int_eq_reif(X_INTRODUCED_144_,3,X_INTRODUCED_241_):: defines_var(X_INTRODUCED_241_);
+constraint int_eq_reif(X_INTRODUCED_151_,3,X_INTRODUCED_242_):: defines_var(X_INTRODUCED_242_);
+constraint int_lin_le_reif(X_INTRODUCED_250_,[X_INTRODUCED_142_,X_INTRODUCED_143_],-1,X_INTRODUCED_251_):: defines_var(X_INTRODUCED_251_);
+constraint int_eq_reif(X_INTRODUCED_145_,X_INTRODUCED_142_,X_INTRODUCED_252_):: defines_var(X_INTRODUCED_252_);
+constraint int_eq_reif(X_INTRODUCED_147_,X_INTRODUCED_143_,X_INTRODUCED_253_):: defines_var(X_INTRODUCED_253_);
+constraint int_lin_le_reif(X_INTRODUCED_250_,[X_INTRODUCED_143_,X_INTRODUCED_142_],-1,X_INTRODUCED_262_):: defines_var(X_INTRODUCED_262_);
+constraint int_eq_reif(X_INTRODUCED_145_,X_INTRODUCED_143_,X_INTRODUCED_263_):: defines_var(X_INTRODUCED_263_);
+constraint int_eq_reif(X_INTRODUCED_147_,X_INTRODUCED_142_,X_INTRODUCED_264_):: defines_var(X_INTRODUCED_264_);
+constraint int_le_reif(X_INTRODUCED_145_,1,X_INTRODUCED_273_):: defines_var(X_INTRODUCED_273_);
+constraint int_ne_reif(X_INTRODUCED_142_,1,X_INTRODUCED_274_):: defines_var(X_INTRODUCED_274_);
+constraint int_ne_reif(X_INTRODUCED_143_,1,X_INTRODUCED_275_):: defines_var(X_INTRODUCED_275_);
+constraint int_le_reif(X_INTRODUCED_145_,2,X_INTRODUCED_285_):: defines_var(X_INTRODUCED_285_);
+constraint int_le_reif(2,X_INTRODUCED_147_,X_INTRODUCED_286_):: defines_var(X_INTRODUCED_286_);
+constraint int_ne_reif(X_INTRODUCED_142_,2,X_INTRODUCED_287_):: defines_var(X_INTRODUCED_287_);
+constraint int_ne_reif(X_INTRODUCED_143_,2,X_INTRODUCED_288_):: defines_var(X_INTRODUCED_288_);
+constraint int_le_reif(3,X_INTRODUCED_147_,X_INTRODUCED_298_):: defines_var(X_INTRODUCED_298_);
+constraint int_ne_reif(X_INTRODUCED_142_,3,X_INTRODUCED_299_):: defines_var(X_INTRODUCED_299_);
+constraint int_ne_reif(X_INTRODUCED_143_,3,X_INTRODUCED_300_):: defines_var(X_INTRODUCED_300_);
+constraint int_eq_reif(X_INTRODUCED_146_,X_INTRODUCED_143_,X_INTRODUCED_310_):: defines_var(X_INTRODUCED_310_);
+constraint int_eq_reif(X_INTRODUCED_148_,X_INTRODUCED_142_,X_INTRODUCED_311_):: defines_var(X_INTRODUCED_311_);
+constraint int_eq_reif(X_INTRODUCED_146_,X_INTRODUCED_142_,X_INTRODUCED_318_):: defines_var(X_INTRODUCED_318_);
+constraint int_eq_reif(X_INTRODUCED_148_,X_INTRODUCED_143_,X_INTRODUCED_319_):: defines_var(X_INTRODUCED_319_);
+constraint int_le_reif(X_INTRODUCED_146_,1,X_INTRODUCED_326_):: defines_var(X_INTRODUCED_326_);
+constraint int_le_reif(X_INTRODUCED_146_,2,X_INTRODUCED_336_):: defines_var(X_INTRODUCED_336_);
+constraint int_le_reif(2,X_INTRODUCED_148_,X_INTRODUCED_337_):: defines_var(X_INTRODUCED_337_);
+constraint int_le_reif(3,X_INTRODUCED_148_,X_INTRODUCED_347_):: defines_var(X_INTRODUCED_347_);
+constraint bool2int(X_INTRODUCED_156_,X_INTRODUCED_357_):: defines_var(X_INTRODUCED_357_);
+constraint bool2int(X_INTRODUCED_159_,X_INTRODUCED_360_):: defines_var(X_INTRODUCED_360_);
+constraint bool2int(X_INTRODUCED_157_,X_INTRODUCED_364_):: defines_var(X_INTRODUCED_364_);
+constraint bool2int(X_INTRODUCED_160_,X_INTRODUCED_366_):: defines_var(X_INTRODUCED_366_);
+constraint bool2int(X_INTRODUCED_158_,X_INTRODUCED_369_):: defines_var(X_INTRODUCED_369_);
+constraint bool2int(X_INTRODUCED_161_,X_INTRODUCED_371_):: defines_var(X_INTRODUCED_371_);
+solve :: int_search(var_t,smallest,indomain_min,complete) minimize var_z;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # Pattern should be detected: 2 cables (both edge (1,2) and (2,1)), k=3
+    check tr.crossingCountMaxDefs.len == 1
+    let ccmDef = tr.crossingCountMaxDefs[0]
+    check ccmDef.cables.len == 2
+    check ccmDef.k == 3
+    check ccmDef.weights.len == 2
+    # Both cable weights should be 3
+    for w in ccmDef.weights:
+      check w == 3
+    # Sweep costs: node1=11, node2=16, node3=3
+    check ccmDef.sweepCosts == @[11, 16, 3]
+    check ccmDef.permVarNames.len == 3
+
+    # One-hot domain tightening: var_s domains should be {3, 11, 16} not 1..16
+    for sName in ["X_INTRODUCED_149_", "X_INTRODUCED_150_", "X_INTRODUCED_151_"]:
+      let pos = tr.varPositions[sName]
+      let dom = tr.sys.baseArray.domain[pos]
+      check dom.len == 3
+      check 3 in dom
+      check 11 in dom
+      check 16 in dom
+
+    # Intermediate betweenness channels should be consumed
+    check "X_INTRODUCED_152_" in tr.channelVarNames  # var_b[1]
+    check "X_INTRODUCED_164_" in tr.channelVarNames  # signal[1]
+
+    # Solve and verify: optimal is 16 (max sweep cost with no blocking)
+    # var_z is a channel position (crossing count max binding), not a defined expression
+    check tr.objectivePos >= 0
+    let objExpr = tr.getExpr(tr.objectivePos)
+    minimize(tr.sys, objExpr, parallel = true, tabuThreshold = 10000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+    check tr.sys.hasFeasibleSolution
+    let objVal = tr.sys.assignment[tr.objectivePos]
+    check objVal == 16  # optimal: place nodes so max(sweep+block) = 16
