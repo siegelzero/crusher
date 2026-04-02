@@ -399,7 +399,7 @@ proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], i
     if state.gccGroupPositions.len == 0:
         return (@[], high(int))
 
-    const MAX_SWAP_EVALS = 500
+    let maxEvals = if state.maxPermSwapEvals > 0: state.maxPermSwapEvals else: 500
     var bestCost = high(int)
     var moves: seq[(int, int, T, T)] = @[]
     var evalsCount = 0
@@ -447,12 +447,12 @@ proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], i
                 elif newCost == bestCost:
                     moves.add((p1, p2, val2, val1))
 
-                if evalsCount >= MAX_SWAP_EVALS:
+                if evalsCount >= maxEvals:
                     return (moves, bestCost)
 
-            if evalsCount >= MAX_SWAP_EVALS:
+            if evalsCount >= maxEvals:
                 break
-        if evalsCount >= MAX_SWAP_EVALS:
+        if evalsCount >= maxEvals:
             break
 
     return (moves, bestCost)

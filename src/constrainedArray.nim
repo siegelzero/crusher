@@ -3162,9 +3162,10 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             if domainUnion.len < k:
                 currentDomain[adPositions[0]] = initPackedSet[T]()
 
-            # Singleton propagation to fixed point
+            # Singleton propagation + hidden singles to fixed point
             for iteration in 0..<k:
                 var changed = false
+                # Singleton propagation: remove singleton values from peers
                 for pos in adPositions:
                     if currentDomain[pos].len == 1:
                         var singletonVal: T
@@ -3175,6 +3176,27 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 currentDomain[otherPos].excl(singletonVal)
                                 changed = true
                                 outerChanged = true
+
+                # Hidden singles: if a value appears in exactly one position's
+                # domain within this group, that position must take that value.
+                # Only valid for permutation groups (domain union == position count),
+                # where every value in the union must be used exactly once.
+                if domainUnion.len == k:
+                    for v in domainUnion.items:
+                        var candidatePos = -1
+                        var candidateCount = 0
+                        for pos in adPositions:
+                            if v in currentDomain[pos]:
+                                inc candidateCount
+                                candidatePos = pos
+                                if candidateCount > 1:
+                                    break
+                        if candidateCount == 1 and currentDomain[candidatePos].len > 1:
+                            currentDomain[candidatePos] = initPackedSet[T]()
+                            currentDomain[candidatePos].incl(v)
+                            changed = true
+                            outerChanged = true
+
                 if not changed:
                     break
 

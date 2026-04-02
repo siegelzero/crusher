@@ -128,6 +128,7 @@ type
 
         # GCC-preserving swap structures
         gccGroupPositions*: seq[seq[int]]  # search positions per GCC constraint (for GCC-preserving swaps)
+        maxPermSwapEvals*: int  # adaptive budget for permutation swap evaluations
 
         # Swap move structures for binary variables
         swapEnabled*: bool
@@ -948,6 +949,88 @@ proc balanceBinarySums[T](state: TabuState[T]) =
         for pos in positions:
             fixed.incl(pos)
 
+proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
+    ## For each alldifferent constraint that is a permutation (domain union size ==
+    ## position count), initialize free positions with a valid random permutation of
+    ## the remaining values. When groups overlap, the first group wins (positions
+    ## already assigned by a prior group are treated as fixed).
+    var fixed = initPackedSet[int]()  # positions already assigned by earlier groups
+    var groupCount = 0
+    # Use a local RNG seeded from state id to avoid perturbing the global random state
+    var rng = initRand(42 + state.id * 17)
+
+    for constraint in state.constraints:
+        if constraint.stateType != AllDifferentType:
+            continue
+        let ad = constraint.allDifferentState
+        if ad.evalMethod != PositionBased:
+            continue
+
+        # Collect non-channel positions and build domain union
+        var groupPositions: seq[int]
+        var domainUnion = initPackedSet[int]()
+        for pos in constraint.positions.items:
+            if pos notin state.carray.channelPositions:
+                groupPositions.add(pos)
+                for v in state.sharedDomain[][pos]:
+                    domainUnion.incl(v)
+
+        # Only handle permutation groups (domain union size == position count)
+        if groupPositions.len < 2 or domainUnion.len != groupPositions.len:
+            continue
+
+        inc groupCount
+
+        # Determine which values are already taken by fixed or previously-assigned positions
+        var usedValues = initPackedSet[int]()
+        var freePositions: seq[int]
+        for pos in groupPositions:
+            if pos in fixed or state.sharedDomain[][pos].len == 1:
+                usedValues.incl(int(state.assignment[pos]))
+            else:
+                freePositions.add(pos)
+
+        if freePositions.len == 0:
+            continue
+
+        # Remaining values to assign
+        var remainingValues: seq[T]
+        for v in domainUnion.items:
+            if v notin usedValues:
+                remainingValues.add(T(v))
+
+        # Greedy random assignment: shuffle positions, assign each the first
+        # compatible remaining value (also shuffled for randomness)
+        rng.shuffle(freePositions)
+        rng.shuffle(remainingValues)
+
+        var assigned = newSeq[bool](remainingValues.len)
+        for pos in freePositions:
+            var bestIdx = -1
+            for i in 0..<remainingValues.len:
+                if not assigned[i]:
+                    # Check domain compatibility
+                    let dom = state.sharedDomain[][pos]
+                    var inDomain = false
+                    for dv in dom:
+                        if dv == remainingValues[i]:
+                            inDomain = true
+                            break
+                    if inDomain:
+                        bestIdx = i
+                        break
+            if bestIdx >= 0:
+                state.assignment[pos] = remainingValues[bestIdx]
+                assigned[bestIdx] = true
+
+        # Mark all group positions as fixed for subsequent groups
+        for pos in groupPositions:
+            fixed.incl(pos)
+
+    if verbose and groupCount > 0:
+        stderr.writeLine("[Init] Balanced " & $groupCount & " permutation groups")
+        stderr.flushFile()
+
 proc initStrategyForPopulation*(id, populationSize: int): InitStrategy =
     ## Assigns init strategies to population members.
     ## id 0: domain min, id 1: domain max (if population >= 3), rest: random.
@@ -1135,6 +1218,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Balance binary sums to match equality targets (before channel propagation)
     if initialAssignment.len == 0:
         state.balanceBinarySums()
+
+    # Initialize permutation groups with valid random permutations
+    if initialAssignment.len == 0:
+        state.balancePermutations(verbose and id == 0)
 
     if verbose and id == 0:
         stderr.writeLine("[Init] Assignment init done, starting channel fixed-point (" & $carray.channelBindings.len & " bindings)...")
@@ -2608,10 +2695,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                                     found = true; break
                             if not found:
                                 state.sharedConstraints[key].add(constraint)
+        # Adaptive swap evaluation budget: scale with group count
+        let avgGroupSize = state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div max(1, state.gccGroupPositions.len)
+        state.maxPermSwapEvals = min(2000, max(500, state.gccGroupPositions.len * avgGroupSize div 3))
+
         if verbose and id == 0:
             echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, avg size " &
-                $(state.gccGroupPositions.mapIt(it.len).foldl(a + b, 0) div state.gccGroupPositions.len) &
-                ", shared constraint pairs: " & $state.sharedConstraints.len
+                $avgGroupSize &
+                ", shared constraint pairs: " & $state.sharedConstraints.len &
+                ", swap budget: " & $state.maxPermSwapEvals
 
     # Initialize partition swap structures
     state.partitionGroups = carray.partitionGroups
@@ -3475,7 +3567,8 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             break  # cap positions checked
 
     # Also evaluate permutation swaps
-    if state.gccGroupPositions.len > 0 and state.iteration mod 3 == 0:
+    if state.gccGroupPositions.len > 0 and
+       (state.cost <= state.gccGroupPositions.len div 5 or state.iteration mod 3 == 0):
         let (permMoves, permCost) = state.bestPermutationSwapMoves()
         if permMoves.len > 0 and permCost < state.cost + bestDelta:
             # Apply swap
@@ -3510,7 +3603,8 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     # Evaluate permutation swaps periodically (assignValueLean-based simulation)
     var permMoves: seq[(int, int, T, T)] = @[]
     var permCost = high(int)
-    if state.gccGroupPositions.len > 0 and state.iteration mod 3 == 0:
+    if state.gccGroupPositions.len > 0 and
+       (state.cost <= state.gccGroupPositions.len div 5 or state.iteration mod 3 == 0):
         (permMoves, permCost) = state.bestPermutationSwapMoves()
     # Evaluate partition swaps periodically (every 3 iterations) to limit overhead
     # from assignValueLean-based evaluation, but compare properly with other moves.
