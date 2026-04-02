@@ -1032,9 +1032,6 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
     # for domain reduction when guard is forced. MUST run after detectReifChannels.
     result.detectConditionalSeparationPattern()
-    # TODO: detect int_lin_eq_reif constraints that define a variable via channel bindings
-    # (not defined vars — inlining causes expression explosion in deep chains).
-    # result.detectReifEquationDefinedVars()
     result.translateVariables()
     # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
     result.emitCircuitTimePropConstraint()

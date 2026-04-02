@@ -3317,3 +3317,136 @@ proc buildNetFlowVariables*(tr: var FznTranslator) =
 
     stderr.writeLine(&"[FZN] Built {nChannelBindings} V_in/V_out channel bindings from net_flow")
 
+proc buildReifEquationChannelBindings(tr: var FznTranslator) =
+    ## Build multi-dimensional element channel bindings for variables detected by
+    ## detectReifEquationChannelVars. Each target variable gets a flattened lookup
+    ## table indexed by the source variable positions.
+    ##
+    ## For equation: target = (rhs - sum(other_coeffs * other_vars)) / target_coeff
+    ## The lookup table is indexed by (src1_val, src2_val, ...) → target_value.
+    var nBuilt = 0
+    var nSkipped = 0
+    for ci, targetName in tr.reifEqDefinedVars:
+        if targetName notin tr.varPositions:
+            inc nSkipped; continue
+        let targetPos = tr.varPositions[targetName]
+        let con = tr.model.constraints[ci]
+        let coeffs = tr.resolveIntArray(con.args[0])
+        let rhs = tr.resolveIntArg(con.args[2])
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+
+        # Find target index and collect source info
+        var targetIdx = -1
+        var targetCoeff = 0
+        type SourceInfo = object
+            pos: int
+            coeff: int
+            lo, hi: int  # domain bounds
+            constVal: int  # for constant sources
+            isConst: bool
+        var sources: seq[SourceInfo]
+        var valid = true
+
+        for i in 0..<varElems.len:
+            let v = varElems[i]
+            if v.kind == FznIdent and v.ident == targetName:
+                targetIdx = i
+                targetCoeff = coeffs[i]
+                continue
+            # Source variable
+            var si: SourceInfo
+            si.coeff = coeffs[i]
+            if v.kind == FznIntLit:
+                si.isConst = true
+                si.constVal = v.intVal
+            elif v.kind == FznBoolLit:
+                si.isConst = true
+                si.constVal = if v.boolVal: 1 else: 0
+            elif v.kind == FznIdent:
+                if v.ident in tr.paramValues:
+                    si.isConst = true
+                    si.constVal = tr.paramValues[v.ident]
+                elif v.ident in tr.varPositions:
+                    si.isConst = false
+                    si.pos = tr.varPositions[v.ident]
+                    let dom = tr.sys.baseArray.domain[si.pos]
+                    if dom.len == 0:
+                        valid = false; break
+                    si.lo = dom[0]
+                    si.hi = dom[^1]
+                else:
+                    valid = false; break
+            else:
+                valid = false; break
+            sources.add(si)
+
+        if not valid or targetIdx < 0 or (targetCoeff != 1 and targetCoeff != -1):
+            inc nSkipped; continue
+
+        # Compute constant contribution from fixed sources
+        var constContrib = 0
+        var varSources: seq[SourceInfo]
+        for si in sources:
+            if si.isConst:
+                constContrib += si.coeff * si.constVal
+            else:
+                varSources.add(si)
+
+        # Compute table size and check bounds
+        var tableSize = 1
+        for si in varSources:
+            let range = si.hi - si.lo + 1
+            if range <= 0 or range > 100_000:
+                valid = false; break
+            if tableSize > 100_000 div range:
+                valid = false; break  # overflow guard
+            tableSize *= range
+        if not valid or tableSize > 100_000:
+            inc nSkipped; continue
+
+        # Build flattened lookup table
+        var arrayElems = newSeq[ArrayElement[int]](tableSize)
+        for flatIdx in 0..<tableSize:
+            # Decode flat index to source variable values
+            var remaining = flatIdx
+            var sourceContrib = constContrib
+            for j in countdown(varSources.len - 1, 0):
+                let range = varSources[j].hi - varSources[j].lo + 1
+                let localIdx = remaining mod range
+                remaining = remaining div range
+                let sourceVal = varSources[j].lo + localIdx
+                sourceContrib += varSources[j].coeff * sourceVal
+            # target = (rhs - sourceContrib) / targetCoeff
+            let targetVal = if targetCoeff == 1: rhs - sourceContrib
+                           else: sourceContrib - rhs  # targetCoeff == -1
+            arrayElems[flatIdx] = ArrayElement[int](isConstant: true, constantValue: targetVal)
+
+        # Build index expression: (src0 - lo0) * range1 * range2 * ... + (src1 - lo1) * range2 * ... + ...
+        var indexExpr: AlgebraicExpression[int]
+        if varSources.len == 0:
+            # No variable sources — target is a constant
+            let targetVal = if targetCoeff == 1: rhs - constContrib
+                           else: constContrib - rhs
+            tr.sys.baseArray.setDomain(targetPos, @[targetVal])
+            inc nBuilt; continue
+
+        var first = true
+        for j in 0..<varSources.len:
+            # Stride = product of ranges after this dimension
+            var stride = 1
+            for k in (j+1)..<varSources.len:
+                stride *= (varSources[k].hi - varSources[k].lo + 1)
+            let srcExpr = tr.getExpr(varSources[j].pos) - varSources[j].lo
+            let term = stride * srcExpr
+            if first:
+                indexExpr = term
+                first = false
+            else:
+                indexExpr = indexExpr + term
+
+        tr.sys.baseArray.addChannelBinding(targetPos, indexExpr, arrayElems)
+        inc nBuilt
+
+    if nBuilt > 0 or nSkipped > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} reif-equation channel bindings (skipped {nSkipped})")
+
