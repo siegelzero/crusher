@@ -3455,6 +3455,94 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     currentDomain[pos] = supported
                     outerChanged = true
 
+        # Phase Regular-through-channel: propagate DFA support through element channels
+        # back to the source (search) variable domains. For each Regular constraint
+        # position that is a channel with a constant-array element binding, prune
+        # source values whose element output has no DFA support.
+        var regChannelPruned = 0
+        for cons in carray.constraints:
+            if cons.stateType != RegularType: continue
+            let reg = cons.regularState
+            let n = reg.n
+            if n == 0: continue
+
+            # Check if any position is a channel with an element binding
+            var hasChannelPositions = false
+            for pos in reg.positions.items:
+                if pos in carray.channelPositions:
+                    hasChannelPositions = true
+                    break
+            if not hasChannelPositions: continue
+
+            # Rebuild forward/backward DFA states for this constraint
+            var forwardStates2 = newSeq[PackedSet[int]](n + 1)
+            forwardStates2[0].incl(reg.initialState)
+            for i in 0..<n:
+                let pos = reg.sortedPositions[i]
+                if pos in skippedPositions: break
+                for s in forwardStates2[i].items:
+                    for v in currentDomain[pos].items:
+                        let ns = reg.getNextState(s, v)
+                        if ns != 0:
+                            forwardStates2[i + 1].incl(ns)
+                if forwardStates2[i + 1].len == 0: break
+
+            var backwardStates2 = newSeq[PackedSet[int]](n + 1)
+            backwardStates2[n] = reg.finalStates
+            for i in countdown(n - 1, 0):
+                let pos = reg.sortedPositions[i]
+                if pos in skippedPositions: break
+                for s in forwardStates2[i].items:
+                    for v in currentDomain[pos].items:
+                        let ns = reg.getNextState(s, v)
+                        if ns != 0 and ns in backwardStates2[i + 1]:
+                            backwardStates2[i].incl(s)
+
+            # For each channel position, trace back through element binding
+            for i in 0..<n:
+                let chanPos = reg.sortedPositions[i]
+                if chanPos notin carray.channelPositions: continue
+
+                # Find element channel binding for this position
+                var foundBinding = false
+                for binding in carray.channelBindings:
+                    if binding.channelPosition != chanPos: continue
+                    # Get source position from index expression
+                    let srcPositions = toSeq(binding.indexExpression.positions.items)
+                    if srcPositions.len != 1: break  # Only single-source element channels
+                    let srcPos = srcPositions[0]
+                    if srcPos in skippedPositions: break
+                    if currentDomain[srcPos].len <= 1: break
+
+                    # Check each source value: compute channel value, check DFA support
+                    var supported: PackedSet[T]
+                    var tempAssign = initTable[int, T]()
+                    for sv in currentDomain[srcPos].items:
+                        tempAssign[srcPos] = sv
+                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        if idx < 0 or idx >= binding.arrayElements.len: continue
+                        if not binding.arrayElements[idx].isConstant: continue
+                        let chanVal = binding.arrayElements[idx].constantValue
+                        # Check DFA support for this channel value at position i
+                        var hasSupport = false
+                        for s in forwardStates2[i].items:
+                            let ns = reg.getNextState(s, chanVal)
+                            if ns != 0 and ns in backwardStates2[i + 1]:
+                                hasSupport = true
+                                break
+                        if hasSupport:
+                            supported.incl(sv)
+                    if supported.len > 0 and supported.len < currentDomain[srcPos].len:
+                        regChannelPruned += currentDomain[srcPos].len - supported.len
+                        currentDomain[srcPos] = supported
+                        outerChanged = true
+                    foundBinding = true
+                    break  # Found the binding for this channel position
+                if not foundBinding and i == 0:
+                    stderr.writeLine(&"[DomRed]   No binding found for channel pos {chanPos}")
+        if regChannelPruned > 0:
+            stderr.writeLine(&"[DomRed] Regular-through-channel: {regChannelPruned} source values pruned")
+
         discard (gccPruned, regPruned, regSkipped)
 
         # Phase: Time-table domain reduction for disjunctive cumulative (limit=1)

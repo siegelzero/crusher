@@ -1674,6 +1674,10 @@ proc detectInversePatterns(tr: var FznTranslator) =
     ## encode the involution A[A[i]] = i. These are replaced by an InverseGroup
     ## that maintains the invariant via compound moves.
     ## Also removes matching fzn_all_different_int constraints (implied by involution).
+    ##
+    ## MiniZinc may generate multiple array declarations with the same elements
+    ## (e.g., one for involution constraints and another for alldifferent).
+    ## We merge constraints from arrays sharing the same element set.
 
     # Step 1: Group array_var_int_element constraints by their array argument
     var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
@@ -1695,15 +1699,41 @@ proc detectInversePatterns(tr: var FznTranslator) =
             arrayGroups[arrName] = @[]
         arrayGroups[arrName].add(ci)
 
-    # Step 2: For each group, check if it forms an involution pattern
+    # Step 1b: Merge groups from different arrays that share the same element set.
+    # MiniZinc often generates duplicate array declarations (one for each constraint
+    # type) referencing the same variable elements.
+    type MergedGroup = object
+        elemNames: seq[string]
+        ciList: seq[int]
+        arrayNames: seq[string]
+    var mergedByElemKey: Table[seq[string], int]  # sorted elem names -> index in mergedGroups
+    var mergedGroups: seq[MergedGroup]
+
     for arrName, ciList in arrayGroups:
-        # Get the element names for this array
         if arrName notin tr.arrayElementNames:
             continue
         let elemNames = tr.arrayElementNames[arrName]
+        # Use sorted element names as key (order doesn't matter for grouping)
+        var sortedNames = elemNames
+        sortedNames.sort()
+        if sortedNames in mergedByElemKey:
+            let idx = mergedByElemKey[sortedNames]
+            mergedGroups[idx].ciList.add(ciList)
+            mergedGroups[idx].arrayNames.add(arrName)
+        else:
+            mergedByElemKey[sortedNames] = mergedGroups.len
+            mergedGroups.add(MergedGroup(
+                elemNames: elemNames, ciList: ciList, arrayNames: @[arrName]))
+
+    # Step 2: For each merged group, check if it forms an involution pattern
+    for group in mergedGroups:
+        let elemNames = group.elemNames
+        let ciList = group.ciList
         let n = elemNames.len
-        if ciList.len != n:
-            continue  # must have exactly one constraint per element
+        if ciList.len < n:
+            continue  # need at least one constraint per element
+        if ciList.len > n:
+            continue  # too many (duplicates?) — skip to be safe
 
         # Build map: element name -> 0-based index in the array
         var nameToIdx: Table[string, int]
@@ -1721,8 +1751,6 @@ proc detectInversePatterns(tr: var FznTranslator) =
                 allMatch = false
                 break
             let indexName = con.args[0].ident
-            # The index might be a defined variable — resolve through definedVarNames
-            # But for the involution, the index should be one of the array elements directly
             if indexName notin nameToIdx:
                 allMatch = false
                 break
@@ -1754,10 +1782,12 @@ proc detectInversePatterns(tr: var FznTranslator) =
             continue
 
         # All checks passed — this is an involution group!
-        # Get positions for all elements
-        if arrName notin tr.arrayPositions:
-            continue
-        let positions = tr.arrayPositions[arrName]
+        # Get positions for all elements (from the first array that has positions)
+        var positions: seq[int]
+        for an in group.arrayNames:
+            if an in tr.arrayPositions:
+                positions = tr.arrayPositions[an]
+                break
         if positions.len != n:
             continue
 
@@ -1789,7 +1819,7 @@ proc detectInversePatterns(tr: var FznTranslator) =
         # Register the inverse group (valueOffset = -1 for 1-based FlatZinc indexing)
         tr.sys.baseArray.addInverseGroup(positions, -1)
 
-        stderr.writeLine(&"[FZN] Detected involution on array '{arrName}': {n} positions, " &
+        stderr.writeLine(&"[FZN] Detected involution on arrays {group.arrayNames}: {n} positions, " &
                                           &"{ciList.len} element + {nAllDiffRemoved} all_different constraints consumed")
 
 

@@ -1,10 +1,11 @@
 ## Included from translator.nim -- not a standalone module.
 ## Case analysis channel detection and conditional source/implication/gain patterns.
 
-proc detectCaseAnalysisChannels(tr: var FznTranslator) =
+proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 2000.0) =
     ## Detects case-analysis patterns in bool_clause constraints where a target variable's
     ## value is fully determined by condition variables through exhaustive case analysis.
     ## Converts target variables to channel variables with constant lookup tables.
+    ## Has a time budget (default 5s) to avoid hanging on problems with large reification sets.
     ##
     ## Pattern (2-literal, first/last round):
     ##   int_eq_reif(target, val, B) :: defines_var(B)
@@ -24,6 +25,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     ## When all condition value combinations are covered (or uncovered cases can be
     ## defaulted), the target becomes a channel with a precomputed constant lookup
     ## table indexed by source variable values.
+
+    let caseAnalysisStartTime = epochTime()
+    let caseAnalysisDeadline = caseAnalysisStartTime + timeBudgetMs / 1000.0
 
     # Step 1: Build reverse index from reifChannelDefs
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
@@ -502,6 +506,28 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     for ci, defName in tr.channelConstraints:
         channelByName[defName] = ci
 
+    # Step 3b: Build local constElement map for fast channel resolution.
+    # Maps channel variable names to (indexVar, constArray) for element channels
+    # with constant arrays. Used to resolve variable test values without buildValueMapping.
+    var localConstElements: Table[string, tuple[indexVar: string, constArray: seq[int]]]
+    for ci, chanName in tr.channelConstraints:
+        let con = tr.model.constraints[ci]
+        let cname = stripSolverPrefix(con.name)
+        if cname notin ["array_int_element", "array_int_element_nonshifted", "array_bool_element"]:
+            continue
+        if con.args[0].kind != FznIdent:
+            continue
+        let indexVarName = con.args[0].ident
+        try:
+            let constArray = tr.resolveIntArray(con.args[1])
+            localConstElements[chanName] = (indexVar: indexVarName, constArray: constArray)
+        except ValueError, KeyError:
+            discard
+    # Propagate element channel aliases
+    for aliasName, originalName in tr.elementChannelAliases:
+        if originalName in localConstElements:
+            localConstElements[aliasName] = localConstElements[originalName]
+
     var nTargets = 0
     var nConsumed = 0
     var nRejectedCondVars = 0
@@ -512,6 +538,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
     var nRejectedOther = 0
 
     for targetVar, entries in casesByTarget:
+        # Time budget check — bail out if we've spent too long
+        if epochTime() > caseAnalysisDeadline:
+            break
         # All entries must have same set of condition variables
         var condVarNames: seq[string]
         for (cv, _) in entries[0].condVarVals:
@@ -752,6 +781,17 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                                 channelVarsNeeded.incl(ov)
             if channelVarsNeeded.len == 0:
                 break precompute
+            # Skip expensive buildValueMapping when estimated work is too large.
+            # Each buildValueMapping call iterates over all reifChannelDefs in a fixed-point.
+            # Precompute needs: 1 base + nSources probes + miniTableEntries per channel var.
+            let estimatedCalls = 1 + sourceVarNames.len
+            if tr.reifChannelDefs.len * estimatedCalls > 50_000:
+                valid = false
+                break precompute
+            # Time budget check before expensive buildValueMapping calls
+            if epochTime() > caseAnalysisDeadline:
+                valid = false
+                break precompute
             # Compute base mapping once for all channel vars (all sources at domain minimum)
             var baseValues = initTable[string, int]()
             for i, sv in sourceVarNames:
@@ -808,6 +848,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
 
                 var miniTable = newSeq[int](miniTableSize)
                 for mi in 0..<miniTableSize:
+                    if mi mod 50 == 49 and epochTime() > caseAnalysisDeadline:
+                        valid = false
+                        break
                     var vals = baseValues
                     var rem = mi
                     for k in countdown(depIndices.len - 1, 0):
@@ -973,18 +1016,63 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator) =
                     elif testValExpr.ident in sourceValues:
                         lookupTable[flatIdx] = sourceValues[testValExpr.ident]
                     else:
-                        let mapping = tr.buildValueMapping(sourceValues)
-                        if testValExpr.ident in mapping:
-                            lookupTable[flatIdx] = mapping[testValExpr.ident]
-                        elif testValExpr.ident in tr.channelVarNames:
-                            # Variable-valued entry: the test value is a channel variable
-                            # whose value will be computed at runtime. Create a varEntry.
-                            varEntries[flatIdx] = CaseAnalysisVarEntry(
-                                varName: testValExpr.ident, offset: 0)
-                            lookupTable[flatIdx] = 0
-                        else:
-                            allResolved = false
-                            break
+                        # Try fast element-chain resolution via localConstElements
+                        var resolved = false
+                        var cur = testValExpr.ident
+                        var depth = 0
+                        while depth < 10:
+                            if cur in localConstElements:
+                                let src = localConstElements[cur]
+                                var idxVal: int
+                                var idxOk = false
+                                if src.indexVar in sourceValues:
+                                    idxVal = sourceValues[src.indexVar]
+                                    idxOk = true
+                                elif src.indexVar in tr.paramValues:
+                                    idxVal = tr.paramValues[src.indexVar]
+                                    idxOk = true
+                                elif src.indexVar in localConstElements:
+                                    # Nested chain: resolve index through another element channel
+                                    let innerSrc = localConstElements[src.indexVar]
+                                    var innerIdxVal: int
+                                    if innerSrc.indexVar in sourceValues:
+                                        innerIdxVal = sourceValues[innerSrc.indexVar]
+                                    elif innerSrc.indexVar in tr.paramValues:
+                                        innerIdxVal = tr.paramValues[innerSrc.indexVar]
+                                    else:
+                                        break
+                                    let innerArrIdx = innerIdxVal - 1
+                                    if innerArrIdx >= 0 and innerArrIdx < innerSrc.constArray.len:
+                                        idxVal = innerSrc.constArray[innerArrIdx]
+                                        idxOk = true
+                                    else:
+                                        break
+                                if not idxOk:
+                                    break
+                                let arrIdx = idxVal - 1  # FZN 1-based
+                                if arrIdx >= 0 and arrIdx < src.constArray.len:
+                                    lookupTable[flatIdx] = src.constArray[arrIdx]
+                                    resolved = true
+                                break
+                            elif cur in tr.elementChannelAliases:
+                                cur = tr.elementChannelAliases[cur]
+                                inc depth
+                            else:
+                                break
+                        if not resolved:
+                            if tr.reifChannelDefs.len > 500:
+                                allResolved = false
+                                break
+                            let mapping = tr.buildValueMapping(sourceValues)
+                            if testValExpr.ident in mapping:
+                                lookupTable[flatIdx] = mapping[testValExpr.ident]
+                            elif testValExpr.ident in tr.channelVarNames:
+                                varEntries[flatIdx] = CaseAnalysisVarEntry(
+                                    varName: testValExpr.ident, offset: 0)
+                                lookupTable[flatIdx] = 0
+                            else:
+                                allResolved = false
+                                break
                 else:
                     allResolved = false
                     break

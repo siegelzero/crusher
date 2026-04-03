@@ -1,6 +1,6 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
-import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes]
+import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes, times]
 
 import parser
 import dfaExtract
@@ -1237,6 +1237,45 @@ proc translate*(model: FznModel): FznTranslator =
 
     # Detect NAND redundancy between int_lin_le and bool_clause
     result.detectNandRedundancy()
+
+    # Dead element constraint elimination: mark array_int_element constraints as consumed
+    # when their result variable has no surviving (non-consumed) references besides
+    # the element constraint itself. This happens when case analysis or reification
+    # channels consumed all downstream uses of the result variable.
+    block:
+        # Build variable reference count from non-consumed constraints
+        var varRefCount: Table[string, int]
+        for ci, con in model.constraints:
+            if ci in result.definingConstraints: continue
+            if ci in result.redundantOrderings: continue
+            for arg in con.args:
+                case arg.kind
+                of FznIdent:
+                    varRefCount.mgetOrPut(arg.ident, 0) += 1
+                of FznArrayLit:
+                    for elem in arg.elems:
+                        if elem.kind == FznIdent:
+                            varRefCount.mgetOrPut(elem.ident, 0) += 1
+                else: discard
+
+        var nElementConsumed = 0
+        for ci, con in model.constraints:
+            if ci in result.definingConstraints: continue
+            let name = stripSolverPrefix(con.name)
+            if name notin ["array_int_element", "array_int_element_nonshifted",
+                           "array_bool_element"]: continue
+            if con.hasAnnotation("defines_var"): continue
+            if con.args.len < 3: continue
+            let resultArg = con.args[2]
+            if resultArg.kind != FznIdent: continue
+            # The result variable is referenced by this constraint (counted in varRefCount).
+            # If that's its ONLY reference, the variable is dead and the constraint is redundant.
+            let refCount = varRefCount.getOrDefault(resultArg.ident, 0)
+            if refCount <= 1:
+                result.definingConstraints.incl(ci)
+                inc nElementConsumed
+        if nElementConsumed > 0:
+            stderr.writeLine(&"[FZN] Consumed {nElementConsumed} dead element constraints (result variable unreferenced)")
 
     var nSkippedDefining, nSkippedRedundant, nTranslated = 0
     for ci, con in model.constraints:
