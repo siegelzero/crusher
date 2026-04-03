@@ -2648,15 +2648,18 @@ proc productChainBoundPropagate(tr: FznTranslator,
                         if infeasible: return
             elif lhsCoeff > 0:
                 # factor <= floor(rhsVal / lhsCoeff)
-                let newHi = rhsVal div lhsCoeff
+                # This branch requires factor >= 0: the substitution sum(B) <= sumBound
+                # into X * refPC * sumB is only valid when X is non-negative (refPC > 0 here).
                 if factorName in domains:
                     let oldDom = domains[factorName]
-                    if oldDom.len > 0 and newHi < oldDom[^1]:
-                        if presolveRestrictBounds(domains, factorName, oldDom[0], newHi, infeasible):
-                            stderr.writeLine(&"[FZN] Product chain bound: {factorName} <= {newHi} " &
-                                             &"(chain length {chain.len}, sum bound {sumBound})")
-                            result = true
-                        if infeasible: return
+                    if oldDom.len > 0 and oldDom[0] >= 0:
+                        let newHi = rhsVal div lhsCoeff
+                        if newHi < oldDom[^1]:
+                            if presolveRestrictBounds(domains, factorName, oldDom[0], newHi, infeasible):
+                                stderr.writeLine(&"[FZN] Product chain bound: {factorName} <= {newHi} " &
+                                                 &"(chain length {chain.len}, sum bound {sumBound})")
+                                result = true
+                            if infeasible: return
 
 
 proc varElementPropagate(tr: FznTranslator,

@@ -3490,7 +3490,9 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
             continue
 
         if tuples.len > MaxTuples:
-            # Exceeded limit — emit partial tuples (still valid support, slightly under-constrained)
+            # Exceeded limit — emit partial tuples. Each tuple is valid, but the truncated
+            # tableIn is over-constrained (rejects some feasible assignments not in the subset).
+            # Still better than skipping entirely (no constraint at all).
             stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} truncated at {MaxTuples} tuples")
 
         # Filter out constant columns and project

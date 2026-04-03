@@ -49,6 +49,9 @@ func containsIdent*(expr: FznExpr, name: string): bool =
     of FznArrayLit:
         for e in expr.elems:
             if e.containsIdent(name): return true
+    of FznAnnotationExpr:
+        for e in expr.annArgs:
+            if e.containsIdent(name): return true
     else:
         discard
 
