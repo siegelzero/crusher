@@ -128,6 +128,21 @@ type
         pairs*: seq[SetComprehensionPair]    # contributing pairs with their sum values
         consumedConstraints*: PackedSet[int] # set_in + set_card constraint indices for singletons
 
+    SetEqualityTableDef* = object
+        ## Detected set-equality-to-table pattern:
+        ## union of singletons {f(x_1), ..., f(x_N)} = const_set_array[idx]
+        ## where f(x) = (x - offset) mod C (or identity if modulus=0).
+        ## Replaced by a table constraint on [idx, x_1, ..., x_N].
+        idxVarName*: string              # index variable (from array_set_element)
+        sourceVarNames*: seq[string]     # origin variables (pre-mod search vars)
+        sourceOffsets*: seq[int]         # per-source offset: pitch_class = (x - offset) mod C
+        modulus*: int                    # mod constant (0 if no mod applied)
+        constSetArray*: seq[seq[int]]   # array of target constant sets
+        targetSetName*: string          # target set variable name
+        equalityUnionCI*: int           # the non-defines_var set_union CI
+        consumedCIs*: seq[int]          # all consumed constraint indices
+        consumedSetVarNames*: seq[string] # set vars to skip boolean creation
+
     SkillAllocationDef* = object
         ## A detected skill-allocation disjunctive pattern:
         ## bool_clause([b_set_in, b_and_1, ..., b_and_N], []) where:
@@ -343,6 +358,8 @@ type
         setUnionChains*: seq[SetUnionChainInfo]
         # Detected set comprehension patterns (chains with traced singleton→product mapping)
         setComprehensions*: seq[SetComprehensionInfo]
+        # Detected set-equality-to-table patterns (set comprehension = indexed constant set)
+        setEqualityTableDefs*: seq[SetEqualityTableDef]
         # Set variable names to skip boolean creation for (singletons + intermediates)
         skipSetVarNames*: HashSet[string]
         # Index from variable name -> declaration index for O(1) lookupVarDomain
@@ -885,6 +902,10 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectIntModChannels()
     # Detect int_div channel patterns (Z = X div C → element channel)
     result.detectIntDivChannels()
+    # Detect set-equality-to-table patterns: union of singletons = indexed constant set → table
+    # MUST run after detectIntModChannels (needs intModChannelDefs) and before detectSetUnionChannels
+    # (to consume union chains before they're detected as channels)
+    result.detectSetEqualityTablePattern()
     # Detect conditional count_eq patterns (int_lin_eq → bool2int → array_bool_and → int_eq_reif × 2)
     result.detectConditionalCountPatterns()
     # Detect count_eq patterns before translating variables (marks intermediate vars as defined)
@@ -1042,6 +1063,8 @@ proc translate*(model: FznModel): FznTranslator =
     # for domain reduction when guard is forced. MUST run after detectReifChannels.
     result.detectConditionalSeparationPattern()
     result.translateVariables()
+    # Emit set-equality-to-table constraints (after translateVariables so positions exist)
+    result.emitSetEqualityTableConstraints()
     # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
     result.emitCircuitTimePropConstraint()
     # Create net flow variables and channel bindings (after translateVariables so V positions exist)

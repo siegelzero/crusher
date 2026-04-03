@@ -70,6 +70,7 @@ import test_scalar_product
 import test_scatter_search
 import test_send_more_money
 import test_sequence
+import test_set_equality_table
 import test_simple_element
 import test_table_constraint
 import test_unified_api

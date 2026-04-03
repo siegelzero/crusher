@@ -2890,6 +2890,597 @@ proc detectIntDivChannels(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} int_div channel bindings")
 
+proc detectSetEqualityTablePattern(tr: var FznTranslator) =
+    ## Detects the "set equality to table" pattern:
+    ##   set_union(A, B, C) [without defines_var] — set equality constraint
+    ##   array_set_element(idx, const_sets, C) :: defines_var(C) — indexed set lookup
+    ##   set_union chain :: defines_var leading to A — combining singletons
+    ##   set_card(leaf, 1) + set_in(x, leaf) — singleton sets
+    ##   optionally int_mod(origin, modulus, x) — transformation
+    ##
+    ## Replaces the entire set decomposition with a tableIn constraint on
+    ## [idx, origin_1, ..., origin_N] encoding both membership and coverage.
+
+    const MaxTableVars = 8
+    const MaxTuples = 200_000
+
+    # Phase 1: Build map of array_set_element :: defines_var(C)
+    # arraySetElemTarget[C_name] → (ci, idxArgIdent, constSets)
+    type ArraySetElemInfo = object
+        ci: int
+        idxArgIdent: string
+        constSets: seq[seq[int]]
+    var arraySetElemTarget: Table[string, ArraySetElemInfo]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "array_set_element": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        let idxArg = con.args[0]
+        let arrArg = con.args[1]
+        let rArg = con.args[2]
+        if rArg.kind != FznIdent: continue
+        if idxArg.kind != FznIdent: continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != rArg.ident:
+            continue
+
+        # Resolve constant set array
+        var constSets: seq[seq[int]]
+        case arrArg.kind
+        of FznIdent:
+            if arrArg.ident in tr.setArrayValues:
+                constSets = tr.setArrayValues[arrArg.ident]
+        of FznArrayLit:
+            for e in arrArg.elems:
+                case e.kind
+                of FznSetLit, FznRange:
+                    constSets.add(extractSetValues(e))
+                of FznIdent:
+                    if e.ident in tr.setParamValues:
+                        constSets.add(tr.setParamValues[e.ident])
+                    else:
+                        constSets.add(@[])
+                else:
+                    constSets.add(@[])
+        else:
+            discard
+
+        if constSets.len > 0:
+            arraySetElemTarget[rArg.ident] = ArraySetElemInfo(
+                ci: ci,
+                idxArgIdent: idxArg.ident,
+                constSets: constSets)
+
+    if arraySetElemTarget.len == 0:
+        return
+
+    # Phase 2: Build map of set_union :: defines_var(C)
+    # producedBy[C_name] → (ci, aName, leafName)
+    type UnionDefInfo = object
+        ci: int
+        aName, leafName: string
+    var producedBy: Table[string, UnionDefInfo]
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_union": continue
+        if not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let cName = con.args[2].ident
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != cName:
+            continue
+        let aName = if con.args[0].kind == FznIdent: con.args[0].ident else: ""
+        let leafName = if con.args[1].kind == FznIdent: con.args[1].ident else: ""
+        producedBy[cName] = UnionDefInfo(ci: ci, aName: aName, leafName: leafName)
+
+    # Phase 3: Build singleton maps
+    var cardOneSets: Table[string, int]  # set name -> set_card CI
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_card" or con.args.len < 2: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[1].kind == FznIntLit and con.args[1].intVal == 1:
+            cardOneSets[con.args[0].ident] = ci
+        elif con.args[1].kind == FznIdent and con.args[1].ident in tr.paramValues:
+            if tr.paramValues[con.args[1].ident] == 1:
+                cardOneSets[con.args[0].ident] = ci
+
+    var setInMap: Table[string, tuple[ci: int, xVarName: string]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_in" or con.args.len < 2: continue
+        let xArg = con.args[0]
+        let sArg = con.args[1]
+        if sArg.kind != FznIdent: continue
+        if xArg.kind == FznIdent and xArg.ident notin tr.paramValues:
+            setInMap[sArg.ident] = (ci: ci, xVarName: xArg.ident)
+        elif xArg.kind == FznIntLit:
+            # Constant x: set_in(const, S) with set_card(S,1) means S = {const}
+            # Record with a synthetic name so we can handle it
+            setInMap[sArg.ident] = (ci: ci, xVarName: "$const_" & $xArg.intVal)
+
+    # Build int_mod reverse map: Z var name -> (origin var name, modulus)
+    var intModOrigin: Table[string, tuple[originVar: string, modulus: int]]
+    for def in tr.intModChannelDefs:
+        intModOrigin[def.varName] = (originVar: def.originVar, modulus: def.lookupTable.len)
+        # Actually, modulus is the constant C from int_mod(X, C, Z)
+        # The lookupTable has xHi - xLo + 1 entries; the actual modulus is embedded in the table values
+        # We need to extract it differently. Let's use the table to infer: the modulus is max(table)+1
+        # or we can store it. Actually the lookup table values are (v mod C), so C = the modulus.
+        # Since table[i] = ((xLo + i) mod C + C) mod C, and all values are in [0, C-1],
+        # C = (if table has any value): we need the actual C.
+    # Re-extract modulus properly from int_mod constraints
+    intModOrigin.clear()
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_mod": continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIntLit or con.args[2].kind != FznIdent:
+            continue
+        let modVal = con.args[1].intVal
+        if modVal <= 0: continue
+        intModOrigin[con.args[2].ident] = (originVar: con.args[0].ident, modulus: modVal)
+
+    # Phase 4: Find non-defines_var set_union(A, B, C) where C is an array_set_element target
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_union": continue
+        if con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        let aArg = con.args[0]
+        let bArg = con.args[1]
+        let cArg = con.args[2]
+        if cArg.kind != FznIdent: continue
+        let cName = cArg.ident
+
+        # C must be a target of array_set_element
+        if cName notin arraySetElemTarget: continue
+        let aseInfo = arraySetElemTarget[cName]
+
+        # Trace backward from A through producedBy chain, collecting leaf names
+        if aArg.kind != FznIdent: continue
+        var leafNames: seq[string]
+        var chainCIs: seq[int]
+        var intermediateNames: seq[string]
+        var baseName: string
+        block traceChain:
+            var current = aArg.ident
+            while current in producedBy:
+                let info = producedBy[current]
+                chainCIs.add(info.ci)
+                leafNames.add(info.leafName)
+                intermediateNames.add(current)
+                current = info.aName
+                if current.len == 0:
+                    break
+            baseName = current
+            # Reverse: we traced from result to base, so leaves are in reverse order
+            leafNames.reverse()
+            chainCIs.reverse()
+            intermediateNames.reverse()
+
+        # Add B (the last singleton) as a leaf, and the base as the first leaf
+        # Base is the first argument of the first chain union
+        # If baseName is a set variable with set_card=1, it's also a singleton leaf
+        var allLeafNames: seq[string]
+
+        # Check if base is a singleton set
+        if baseName.len > 0 and baseName in cardOneSets and baseName in setInMap:
+            allLeafNames.add(baseName)
+
+        # Add chain leaves
+        for ln in leafNames:
+            allLeafNames.add(ln)
+
+        # Add B as the last leaf
+        if bArg.kind == FznIdent:
+            allLeafNames.add(bArg.ident)
+        else:
+            continue  # B must be a set variable
+
+        if allLeafNames.len == 0: continue
+        if allLeafNames.len > MaxTableVars: continue
+
+        # Phase 5: For each leaf, verify singleton pattern and trace to origin variable
+        var sourceVarNames: seq[string]
+        var sourceOffsets: seq[int]
+        var modulus = 0
+        var allVerified = true
+        var consumedCIs: seq[int]
+        var consumedSetVarNames: seq[string]
+
+        for leafName in allLeafNames:
+            if leafName notin cardOneSets or leafName notin setInMap:
+                allVerified = false
+                break
+            let cardCI = cardOneSets[leafName]
+            let inInfo = setInMap[leafName]
+            let xVarName = inInfo.xVarName
+
+            consumedCIs.add(cardCI)
+            consumedCIs.add(inInfo.ci)
+            consumedSetVarNames.add(leafName)
+
+            # Handle constant x literal (from set_in(constLit, S))
+            if xVarName.startsWith("$const_"):
+                sourceVarNames.add(xVarName)
+                sourceOffsets.add(0)
+                continue
+
+            # Check if x is a channel from int_mod(variable, const, x)
+            if xVarName in intModOrigin:
+                let modInfo = intModOrigin[xVarName]
+                if modulus == 0:
+                    modulus = modInfo.modulus
+                elif modulus != modInfo.modulus:
+                    allVerified = false  # Inconsistent modulus
+                    break
+                # The int_mod origin may be a defined var (e.g. y = x - offset).
+                # Trace through int_lin_eq defines_var to find the actual search variable
+                # and accumulate the offset: pitch_class = (search_var - totalOffset) mod C.
+                var origin = modInfo.originVar
+                var totalOffset = 0
+                for _ in 0..<10:  # max depth to prevent infinite loops
+                    if origin in tr.definedVarNames:
+                        # Check if defined by int_lin_eq([1,-1],[searchVar, origin], offset)
+                        var found = false
+                        for dci, dcon in tr.model.constraints:
+                            if not dcon.hasAnnotation("defines_var"): continue
+                            let dann = dcon.getAnnotation("defines_var")
+                            if dann.args.len == 0 or dann.args[0].kind != FznIdent: continue
+                            if dann.args[0].ident != origin: continue
+                            let dname = stripSolverPrefix(dcon.name)
+                            if dname == "int_lin_eq" and dcon.args.len >= 3 and
+                                 dcon.args[0].kind == FznArrayLit and dcon.args[1].kind == FznArrayLit and
+                                 dcon.args[2].kind == FznIntLit:
+                                let coeffs = dcon.args[0].elems
+                                let vars = dcon.args[1].elems
+                                let rhs = dcon.args[2].intVal
+                                # Pattern: [1,-1] * [x, y] = c means y = x - c
+                                if coeffs.len == 2 and vars.len == 2 and
+                                     coeffs[0].kind == FznIntLit and coeffs[1].kind == FznIntLit and
+                                     vars[0].kind == FznIdent and vars[1].kind == FznIdent:
+                                    if coeffs[0].intVal == 1 and coeffs[1].intVal == -1 and
+                                         vars[1].ident == origin:
+                                        # x - y = c → y = x - c, offset += c
+                                        totalOffset += rhs
+                                        origin = vars[0].ident
+                                        found = true
+                                        break
+                                    elif coeffs[0].intVal == -1 and coeffs[1].intVal == 1 and
+                                           vars[0].ident == origin:
+                                        # -y + x = c → y = x - c, offset += c
+                                        totalOffset += rhs
+                                        origin = vars[1].ident
+                                        found = true
+                                        break
+                            break  # only one defines_var per variable
+                        if not found:
+                            break  # can't trace further
+                    else:
+                        break  # not a defined var — this is the search variable
+                sourceVarNames.add(origin)
+                sourceOffsets.add(totalOffset)
+            else:
+                # x is not a detected int_mod channel. It might be:
+                # (a) A direct variable (no mod) → use as-is
+                # (b) A variable with a singleton domain (fixed by presolve from
+                #     e.g. int_mod(const, const, x)) → treat as constant
+                let xDom = tr.lookupVarDomain(xVarName)
+                if xDom.len == 1:
+                    # Singleton domain — treat as constant source
+                    sourceVarNames.add("$const_" & $xDom[0])
+                    sourceOffsets.add(0)
+                elif xDom.len > 0:
+                    sourceVarNames.add(xVarName)
+                    sourceOffsets.add(0)
+                else:
+                    allVerified = false
+                    break
+
+        if not allVerified: continue
+
+        # Add the equality union CI and all chain union CIs
+        consumedCIs.add(ci)  # the non-defines_var set_union
+        for chainCI in chainCIs:
+            consumedCIs.add(chainCI)
+        for iname in intermediateNames:
+            consumedSetVarNames.add(iname)
+
+        # Record the pattern
+        var def = SetEqualityTableDef(
+            idxVarName: aseInfo.idxArgIdent,
+            sourceVarNames: sourceVarNames,
+            sourceOffsets: sourceOffsets,
+            modulus: modulus,
+            constSetArray: aseInfo.constSets,
+            targetSetName: cName,
+            equalityUnionCI: ci,
+            consumedCIs: consumedCIs,
+            consumedSetVarNames: consumedSetVarNames)
+
+        tr.setEqualityTableDefs.add(def)
+
+        # Mark consumed constraints
+        for cci in consumedCIs:
+            tr.definingConstraints.incl(cci)
+
+        # Mark set vars to skip boolean creation
+        for svn in consumedSetVarNames:
+            tr.skipSetVarNames.incl(svn)
+
+        inc nDetected
+
+    if nDetected > 0:
+        var totalLeaves = 0
+        for def in tr.setEqualityTableDefs:
+            totalLeaves += def.sourceVarNames.len
+        stderr.writeLine(&"[FZN] Detected {nDetected} set-equality-to-table patterns ({totalLeaves} source vars, modulus={tr.setEqualityTableDefs[0].modulus})")
+
+        # Domain reduction: restrict idx and source domains based on pattern constraints
+        for def in tr.setEqualityTableDefs:
+            let mod_c = def.modulus
+
+            # Helper: compute pitch class = ((value - offset) mod C + C) mod C
+            proc pitchClass(v, offset, mod_c: int): int =
+                if mod_c > 0: (((v - offset) mod mod_c) + mod_c) mod mod_c
+                else: v
+
+            # Restrict idx domain: remove values where a fixed source can't provide any valid value
+            var idxDomain = tr.lookupVarDomain(def.idxVarName)
+            if idxDomain.len > 0:
+                var validIdx: seq[int]
+                for idxVal in idxDomain:
+                    if idxVal < 1 or idxVal > def.constSetArray.len: continue
+                    let targetSet = toHashSet(def.constSetArray[idxVal - 1])
+                    if targetSet.len == 0:
+                        validIdx.add(idxVal)
+                        continue
+                    var feasible = true
+                    for si, srcName in def.sourceVarNames:
+                        let offset = def.sourceOffsets[si]
+                        if srcName.startsWith("$const_"):
+                            let constVal = parseInt(srcName[7..^1])
+                            if pitchClass(constVal, offset, mod_c) notin targetSet:
+                                feasible = false
+                                break
+                        else:
+                            let srcDom = tr.lookupVarDomain(srcName)
+                            var hasValid = false
+                            for v in srcDom:
+                                if pitchClass(v, offset, mod_c) in targetSet:
+                                    hasValid = true
+                                    break
+                            if not hasValid:
+                                feasible = false
+                                break
+                    if feasible:
+                        validIdx.add(idxVal)
+                if validIdx.len < idxDomain.len:
+                    tr.presolveDomains[def.idxVarName] = validIdx
+
+            # Restrict source domains: union of valid values across all valid idx values
+            let finalIdxDomain = if def.idxVarName in tr.presolveDomains:
+                                     tr.presolveDomains[def.idxVarName]
+                                 else:
+                                     idxDomain
+            for si, srcName in def.sourceVarNames:
+                if srcName.startsWith("$const_"): continue
+                let offset = def.sourceOffsets[si]
+                let srcDom = tr.lookupVarDomain(srcName)
+                var validVals: HashSet[int]
+                for idxVal in finalIdxDomain:
+                    if idxVal < 1 or idxVal > def.constSetArray.len: continue
+                    let targetSet = toHashSet(def.constSetArray[idxVal - 1])
+                    for v in srcDom:
+                        if pitchClass(v, offset, mod_c) in targetSet:
+                            validVals.incl(v)
+                var newDom: seq[int]
+                for v in srcDom:
+                    if v in validVals:
+                        newDom.add(v)
+                if newDom.len < srcDom.len:
+                    tr.presolveDomains[srcName] = newDom
+
+proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
+    ## Emits table constraints for detected set-equality-to-table patterns.
+    ## Called after translateVariables() so positions exist.
+    if tr.setEqualityTableDefs.len == 0:
+        return
+
+    const MaxTuples = 200_000
+
+    var nEmitted = 0
+    var totalTuples = 0
+
+    for defIdx, def in tr.setEqualityTableDefs:
+        # Resolve positions
+        if def.idxVarName notin tr.varPositions:
+            continue
+        let idxPos = tr.varPositions[def.idxVarName]
+        var positions: seq[int] = @[idxPos]
+        var constSources: Table[int, int]  # column index -> constant value (for $const_ sources)
+        var allResolved = true
+
+        for i, srcName in def.sourceVarNames:
+            if srcName.startsWith("$const_"):
+                let constVal = parseInt(srcName[7..^1])
+                constSources[i + 1] = constVal  # +1 because idx is column 0
+                positions.add(-1)  # placeholder, will be filtered
+            elif srcName in tr.varPositions:
+                let pos = tr.varPositions[srcName]
+                # Check for singleton domain (effectively a constant)
+                if tr.sys.baseArray.domain[pos].len == 1:
+                    constSources[i + 1] = tr.sys.baseArray.domain[pos][0]
+                    positions.add(-1)  # placeholder
+                else:
+                    positions.add(pos)
+            else:
+                # Source variable might be a defined var with a known constant value
+                # (e.g., int_mod(constant, constant, result) → result is fixed)
+                let srcDom = tr.lookupVarDomain(srcName)
+                if srcDom.len == 1:
+                    constSources[i + 1] = srcDom[0]
+                    positions.add(-1)  # placeholder
+                elif srcDom.len > 1:
+                    # Defined var without a position but with a non-singleton domain —
+                    # can't include in table
+                    allResolved = false
+                    break
+                else:
+                    allResolved = false
+                    break
+
+        if not allResolved:
+            continue
+
+        # Get domains
+        let idxDomain = tr.sys.baseArray.domain[idxPos]
+        var sourceDomains: seq[seq[int]]
+        for i in 1..<positions.len:
+            if (i) in constSources:
+                sourceDomains.add(@[constSources[i]])
+            else:
+                sourceDomains.add(tr.sys.baseArray.domain[positions[i]])
+
+        let mod_c = def.modulus
+
+        # Collect per-source offsets (aligned with sourceDomains, which is 0-based for sources)
+        var srcOffsets: seq[int]
+        for i in 0..<def.sourceVarNames.len:
+            srcOffsets.add(def.sourceOffsets[i])
+
+        # Helper: pitch class for source k, value v
+        proc pc(v, k: int): int =
+            if mod_c > 0: (((v - srcOffsets[k]) mod mod_c) + mod_c) mod mod_c
+            else: v
+
+        # Generate valid tuples
+        var tuples: seq[seq[int]]
+
+        for idxVal in idxDomain:
+            if idxVal < 1 or idxVal > def.constSetArray.len: continue
+            let targetSet = toHashSet(def.constSetArray[idxVal - 1])
+            if targetSet.len == 0: continue
+
+            # For each source: compute valid values (membership only)
+            var validPerSource: seq[seq[int]]
+            var anyEmpty = false
+            for k in 0..<sourceDomains.len:
+                var valid: seq[int]
+                for v in sourceDomains[k]:
+                    if pc(v, k) in targetSet:
+                        valid.add(v)
+                if valid.len == 0:
+                    anyEmpty = true
+                    break
+                validPerSource.add(valid)
+
+            if anyEmpty: continue
+
+            # Enumerate combinations with coverage check (backtracking)
+            let targetElements = toSeq(targetSet)
+            let nSources = validPerSource.len
+
+            proc backtrack(k: int, partial: var seq[int], covered: var seq[int],
+                          validPerSource: seq[seq[int]], targetElements: seq[int],
+                          nSources: int, idxVal: int,
+                          tuples: var seq[seq[int]], maxTuples: int): bool =
+                if tuples.len >= maxTuples:
+                    return false  # safety limit
+
+                if k == nSources:
+                    # Check full coverage
+                    for cnt in covered:
+                        if cnt == 0:
+                            return true  # not covered — skip this tuple
+                    var t = newSeq[int](nSources + 1)
+                    t[0] = idxVal
+                    for i in 0..<nSources:
+                        t[i + 1] = partial[i]
+                    tuples.add(t)
+                    return true
+
+                # Pruning: count uncovered elements; if more than remaining sources, prune
+                let remaining = nSources - k
+                var uncovered = 0
+                for cnt in covered:
+                    if cnt == 0:
+                        inc uncovered
+                if uncovered > remaining:
+                    return true  # impossible to cover
+
+                for v in validPerSource[k]:
+                    let modVal = pc(v, k)
+                    partial[k] = v
+                    # Update coverage
+                    for j in 0..<targetElements.len:
+                        if targetElements[j] == modVal:
+                            covered[j] += 1
+                    let ok = backtrack(k + 1, partial, covered, validPerSource,
+                                      targetElements, nSources, idxVal,
+                                      tuples, maxTuples)
+                    # Undo coverage
+                    for j in 0..<targetElements.len:
+                        if targetElements[j] == modVal:
+                            covered[j] -= 1
+                    if not ok:
+                        return false
+
+                return true
+
+            var partial = newSeq[int](nSources)
+            var covered = newSeq[int](targetElements.len)
+            let ok = backtrack(0, partial, covered, validPerSource, targetElements,
+                              nSources, idxVal, tuples, MaxTuples)
+            if not ok:
+                break  # exceeded tuple limit
+
+        if tuples.len == 0 or tuples.len > MaxTuples:
+            if tuples.len > MaxTuples:
+                stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} exceeded {MaxTuples} tuples, skipping")
+            continue
+
+        # Filter out constant columns and project
+        var varCols: seq[int]   # column indices that are actual variables
+        var varPositions: seq[int]  # constraint system positions
+        for col in 0..<positions.len:
+            if col notin constSources:
+                varCols.add(col)
+                varPositions.add(positions[col])
+
+        if varCols.len < positions.len:
+            # Filter tuples matching constants, then project
+            var projected: seq[seq[int]]
+            for t in tuples:
+                var matches = true
+                for col, constVal in constSources:
+                    if t[col] != constVal:
+                        matches = false
+                        break
+                if matches:
+                    var pt = newSeq[int](varCols.len)
+                    for j, col in varCols:
+                        pt[j] = t[col]
+                    projected.add(pt)
+            tuples = projected
+
+        if varPositions.len > 0 and tuples.len > 0:
+            tr.sys.addConstraint(tableIn[int](varPositions, tuples))
+            inc nEmitted
+            totalTuples += tuples.len
+
+    if nEmitted > 0:
+        stderr.writeLine(&"[FZN] Emitted {nEmitted} set-equality table constraints ({totalTuples} total tuples)")
+
 proc detectSingletonSetChannels(tr: var FznTranslator) =
     ## Detects set_card(S, 1) + set_in(x, S) where x is a variable.
     ## Makes S.bools into indicator channels: S.bools[e] = (x == e) ? 1 : 0.
