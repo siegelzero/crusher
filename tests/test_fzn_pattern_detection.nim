@@ -2676,3 +2676,118 @@ solve satisfy;
                     let tj = tasksOnMachine[j]
                     check(starts[ti] + durations[ti] <= starts[tj] or
                           starts[tj] + durations[tj] <= starts[ti])
+
+suite "Max-from-lin-le Channel Suppression":
+
+    test "detectMaxFromLinLe: skipped when ceiling heavily referenced by other constraints":
+        ## D has 4 max-defining constraints (consumed) but also appears
+        ## in 6 disjunctive-style reified constraints (non-consumed).
+        ## Since non-consumed (6) > consumed (4), D should NOT be channelized.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: y4 :: output_var;
+var 1..50: D :: output_var;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: b3 :: var_is_introduced :: is_defined_var;
+var bool: b4 :: var_is_introduced :: is_defined_var;
+var bool: b5 :: var_is_introduced :: is_defined_var;
+var bool: b6 :: var_is_introduced :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_le([1,-1],[y4,D],-1);
+constraint int_lin_le_reif([1,-1],[y1,D],0,b1) :: defines_var(b1);
+constraint int_lin_le_reif([1,-1],[y2,D],0,b2) :: defines_var(b2);
+constraint int_lin_le_reif([1,-1],[y3,D],0,b3) :: defines_var(b3);
+constraint int_lin_le_reif([1,-1],[y4,D],0,b4) :: defines_var(b4);
+constraint int_lin_le_reif([-1,1],[y1,D],-5,b5) :: defines_var(b5);
+constraint int_lin_le_reif([-1,1],[y2,D],-5,b6) :: defines_var(b6);
+constraint bool_clause([b1,b5],[]);
+constraint bool_clause([b2,b6],[]);
+constraint bool_clause([b3,b4],[]);
+solve minimize D;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D should NOT be a max channel (too many non-consumed references)
+        check tr.maxFromLinLeDefs.len == 0
+        check "D" notin tr.channelVarNames
+
+        # D should remain a search position
+        check "D" in tr.varPositions
+
+    test "detectMaxFromLinLe: still detected when ceiling has few non-consumed references":
+        ## D has 4 max-defining constraints and only 1 non-consumed reference.
+        ## Since non-consumed (1) <= consumed (4), D should be channelized.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: y4 :: output_var;
+var 1..50: D :: output_var;
+var int: objective :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+constraint int_lin_le([1,-1],[y3,D],-4);
+constraint int_lin_le([1,-1],[y4,D],-1);
+constraint int_lin_eq([1,-1],[objective,D],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # D should be detected as a max channel (few non-consumed refs)
+        check tr.maxFromLinLeDefs.len == 1
+        check "D" in tr.channelVarNames
+
+suite "Product Chain Bound Tightening":
+
+    test "productChainBoundPropagate: tightens factor lower bound":
+        ## Cyclic scheduling pattern:
+        ## int_times(X, B_i, P_i) for i=1..4
+        ## Chain: -r_i - P_i + r_{i-1} <= -d_i  (r_i + P_i >= r_{i-1} + d_i)
+        ## Sum: B_1 + B_2 + B_3 + B_4 <= 3
+        ## Closing: r_4 - X <= -10  (r_4 <= X - 10)
+        ## r_0 = 0 (fixed, so first link is boundary)
+        ##
+        ## Chain telescopes to: X * (1 + sum(B)) >= sum(d) + 10
+        ## With sum(B) <= 3: X >= (50+40+60+30 + 10) / 4 = 190 / 4 = 48
+        let src = """
+var 0..200: r1 :: output_var;
+var 0..200: r2 :: output_var;
+var 0..200: r3 :: output_var;
+var 0..200: r4 :: output_var;
+var 10..200: X :: output_var;
+var 0..3: B1 :: output_var;
+var 0..3: B2 :: output_var;
+var 0..3: B3 :: output_var;
+var 0..3: B4 :: output_var;
+var 0..600: P1 :: var_is_introduced :: is_defined_var;
+var 0..600: P2 :: var_is_introduced :: is_defined_var;
+var 0..600: P3 :: var_is_introduced :: is_defined_var;
+var 0..600: P4 :: var_is_introduced :: is_defined_var;
+constraint int_times(X,B1,P1) :: defines_var(P1);
+constraint int_times(X,B2,P2) :: defines_var(P2);
+constraint int_times(X,B3,P3) :: defines_var(P3);
+constraint int_times(X,B4,P4) :: defines_var(P4);
+constraint int_lin_le([-1,-1],[r1,P1],-50);
+constraint int_lin_le([-1,-1,1],[r2,P2,r1],-40);
+constraint int_lin_le([-1,-1,1],[r3,P3,r2],-60);
+constraint int_lin_le([-1,-1,1],[r4,P4,r3],-30);
+constraint int_lin_le([1,-1],[r4,X],-10);
+constraint int_lin_le([1,1,1,1],[B1,B2,B3,B4],3);
+solve minimize X;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # X's domain should be tightened by the product chain bound
+        # Chain sum: d1+d2+d3+d4 = 50+40+60+30 = 180, closing offset = 10
+        # X >= ceil((180 + 10) / (1 + 3)) = ceil(190/4) = 48
+        let xPos = tr.varPositions["X"]
+        let xDom = tr.sys.baseArray.domain[xPos]
+        check xDom[0] >= 48

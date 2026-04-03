@@ -2068,17 +2068,50 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
             groups[ceilingName] = @[]
         groups[ceilingName].add((sourceVar: sourceName, offset: offset, ci: ci))
 
+    # Count non-defining constraint references per candidate ceiling variable.
+    # If the ceiling is heavily referenced outside its max definition, keeping it as
+    # a search variable preserves direct penalty map guidance for those constraints.
+    # Max channels provide sparse signal (only argmax affects value), so constraints
+    # referencing a channelized variable lose effective penalty gradients.
+    var ceilingNonConsumedRefs: Table[string, int]
+    for ceilingName, infos in groups:
+        if infos.len < 3: continue
+        let consumedCIs = block:
+            var s: PackedSet[int]
+            for info in infos: s.incl(info.ci)
+            s
+        var nonConsumed = 0
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            if ci in consumedCIs: continue
+            # Check if ceiling variable appears in this constraint's args
+            block checkArgs:
+                for arg in con.args:
+                    if arg.containsIdent(ceilingName):
+                        inc nonConsumed
+                        break checkArgs
+        ceilingNonConsumedRefs[ceilingName] = nonConsumed
+
     # Build MaxFromLinLeDefs for groups of size >= 3 where ceiling is safe to channel.
     # Non-objective ceilings with many inputs give sparse signal through max channels,
     # since only the argmax source affects the ceiling value. Keep explicit constraints
     # for those — they provide per-source penalty feedback.
     var totalConsumed = 0
+    var skippedHeavyRef = 0
     for ceilingName, infos in groups:
         if infos.len < 3: continue
         if ceilingName in forcedLargeVarNames: continue
         if ceilingName in tr.definedVarNames: continue
         if ceilingName in tr.channelVarNames: continue
         if ceilingName notin minimizedVarNames and infos.len > MaxNonObjectiveCeilingInputs:
+            continue
+
+        # Don't channelize if the variable is heavily referenced by non-consumed constraints.
+        # Those constraints would become channel-dependent and lose direct penalty guidance,
+        # while the max channel provides only sparse signal through the argmax input.
+        let nonConsumed = ceilingNonConsumedRefs.getOrDefault(ceilingName, 0)
+        if nonConsumed > infos.len:
+            inc skippedHeavyRef
             continue
 
         var def = MaxFromLinLeDef(ceilingVarName: ceilingName)
@@ -2100,6 +2133,8 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
 
     if tr.maxFromLinLeDefs.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.maxFromLinLeDefs.len} max-from-lin-le channels, consumed {totalConsumed} int_lin_le constraints")
+    if skippedHeavyRef > 0:
+        stderr.writeLine(&"[FZN] Skipped {skippedHeavyRef} max-from-lin-le channels (heavily referenced by other constraints)")
 
 proc emitMaxFromLinLeChannels*(tr: var FznTranslator) =
     ## Emits max channel bindings for detected max-from-lin-le patterns.
@@ -2902,7 +2937,6 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
     ## [idx, origin_1, ..., origin_N] encoding both membership and coverage.
 
     const MaxTableVars = 8
-    const MaxTuples = 200_000
 
     # Phase 1: Build map of array_set_element :: defines_var(C)
     # arraySetElemTarget[C_name] → (ci, idxArgIdent, constSets)
@@ -3188,12 +3222,14 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
 
         if not allVerified: continue
 
-        # Add the equality union CI and all chain union CIs
+        # Add the equality union CI, array_set_element CI, and all chain union CIs
         consumedCIs.add(ci)  # the non-defines_var set_union
+        consumedCIs.add(aseInfo.ci)  # the array_set_element :: defines_var(C)
         for chainCI in chainCIs:
             consumedCIs.add(chainCI)
         for iname in intermediateNames:
             consumedSetVarNames.add(iname)
+        consumedSetVarNames.add(cName)  # target set variable
 
         # Record the pattern
         var def = SetEqualityTableDef(
@@ -3304,6 +3340,7 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
     for defIdx, def in tr.setEqualityTableDefs:
         # Resolve positions
         if def.idxVarName notin tr.varPositions:
+            stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} idx var not resolved, skipping")
             continue
         let idxPos = tr.varPositions[def.idxVarName]
         var positions: seq[int] = @[idxPos]
@@ -3340,6 +3377,7 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
                     break
 
         if not allResolved:
+            stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} sources not resolved, skipping")
             continue
 
         # Get domains
@@ -3444,10 +3482,16 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
             if not ok:
                 break  # exceeded tuple limit
 
-        if tuples.len == 0 or tuples.len > MaxTuples:
-            if tuples.len > MaxTuples:
-                stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} exceeded {MaxTuples} tuples, skipping")
+        if tuples.len == 0:
+            # No valid tuples — problem is infeasible for this pattern.
+            # Original constraints are already consumed (set vars skipped),
+            # so we can't fall back. Log a warning; Crusher will report UNKNOWN.
+            stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} produced 0 tuples (likely infeasible)")
             continue
+
+        if tuples.len > MaxTuples:
+            # Exceeded limit — emit partial tuples (still valid support, slightly under-constrained)
+            stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} truncated at {MaxTuples} tuples")
 
         # Filter out constant columns and project
         var varCols: seq[int]   # column indices that are actual variables
@@ -3474,9 +3518,13 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
             tuples = projected
 
         if varPositions.len > 0 and tuples.len > 0:
+            for pos in varPositions:
+                assert pos >= 0, "Invalid position in set-equality table constraint"
             tr.sys.addConstraint(tableIn[int](varPositions, tuples))
             inc nEmitted
             totalTuples += tuples.len
+        elif tuples.len == 0:
+            stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} empty after projection (likely infeasible)")
 
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] Emitted {nEmitted} set-equality table constraints ({totalTuples} total tuples)")

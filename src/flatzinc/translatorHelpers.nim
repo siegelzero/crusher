@@ -40,6 +40,18 @@ proc resolveActualDomain(tr: var FznTranslator, expr: AlgebraicExpression[int],
 
 # --- Variable name extraction ---
 
+func containsIdent*(expr: FznExpr, name: string): bool =
+    ## Recursively checks whether a FznExpr tree contains a FznIdent with the given name.
+    if expr.isNil: return false
+    case expr.kind
+    of FznIdent:
+        return expr.ident == name
+    of FznArrayLit:
+        for e in expr.elems:
+            if e.containsIdent(name): return true
+    else:
+        discard
+
 proc extractVarNames*(tr: FznTranslator, arrExpr: FznExpr): seq[string] =
     ## Extracts variable names from an array expression.
     ## If arrExpr is an FznArrayLit, extracts .ident from each element (all must be FznIdent).

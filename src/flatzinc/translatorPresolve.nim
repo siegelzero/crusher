@@ -2322,6 +2322,343 @@ proc intTimesPropagate(tr: FznTranslator,
                 result = true
 
 
+proc productChainBoundPropagate(tr: FznTranslator,
+                                domains: var Table[string, seq[int]],
+                                fixedVars: Table[string, int],
+                                eliminated: PackedSet[int],
+                                infeasible: var bool): bool =
+    ## Tighten bounds on common factors in int_times by detecting telescoping chains.
+    ##
+    ## Pattern: int_times(X, Y_i, P_i) + chain of int_lin_le constraints where
+    ## intermediate variables cancel when summed + sum(Y_i) <= K.
+    ## Derives: X >= (chain_constant + closing_offset) / (1 + K).
+    ##
+    ## Applies to cyclic scheduling, lot sizing, and models with multiplicative delays.
+    result = false
+
+    # Helper: resolve coefficient and variable arrays from an int_lin_le constraint
+    proc resolveLinLeArgs(tr: FznTranslator, con: FznConstraint):
+                          tuple[ok: bool, coeffs: seq[int], varNames: seq[string], rhs: int] =
+        result.ok = false
+        if con.args.len < 3: return
+        var coeffsArg = con.args[0]
+        if coeffsArg.kind == FznIdent:
+            let arrName = coeffsArg.ident
+            if arrName in tr.paramValues: return
+            var found = false
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == arrName:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        coeffsArg = decl.value; found = true
+                    break
+            if not found:
+                for decl in tr.model.variables:
+                    if decl.isArray and decl.name == arrName:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            coeffsArg = decl.value; found = true
+                        break
+            if not found: return
+        if coeffsArg.kind != FznArrayLit: return
+        var varsArg = con.args[1]
+        if varsArg.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varsArg.ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        varsArg = decl.value; found = true
+                    break
+            if not found:
+                for decl in tr.model.parameters:
+                    if decl.isArray and decl.name == varsArg.ident:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            varsArg = decl.value; found = true
+                        break
+            if not found: return
+        if varsArg.kind != FznArrayLit: return
+        if coeffsArg.elems.len != varsArg.elems.len: return
+        for i in 0..<coeffsArg.elems.len:
+            if coeffsArg.elems[i].kind != FznIntLit: return
+            result.coeffs.add(coeffsArg.elems[i].intVal)
+            result.varNames.add(presolveVarName(varsArg.elems[i]))
+            if result.varNames[^1] == "": return
+        if con.args[2].kind == FznIntLit:
+            result.rhs = con.args[2].intVal
+        elif con.args[2].kind == FznIdent and con.args[2].ident in tr.paramValues:
+            result.rhs = tr.paramValues[con.args[2].ident]
+        else:
+            return
+        result.ok = true
+
+    # Step 1: Group int_times by common factor (larger-domain variable)
+    type ProductDef = object
+        factorName, smallName, prodName: string
+    var productsByFactor: Table[string, seq[ProductDef]]
+    var prodToSmall: Table[string, string]
+
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "int_times": continue
+        if con.args.len < 3: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let aName = presolveVarName(con.args[0])
+        let bName = presolveVarName(con.args[1])
+        let pName = presolveVarName(con.args[2])
+        if aName == "" or bName == "" or pName == "": continue
+        let aDom = domains.getOrDefault(aName, @[])
+        let bDom = domains.getOrDefault(bName, @[])
+        let factorName = if aDom.len >= bDom.len: aName else: bName
+        let smallName = if factorName == aName: bName else: aName
+        productsByFactor.mgetOrPut(factorName, @[]).add(
+            ProductDef(factorName: factorName, smallName: smallName, prodName: pName))
+        prodToSmall[pName] = smallName
+
+    if productsByFactor.len == 0: return
+
+    # Step 2: For each factor group, detect chains
+    for factorName, products in productsByFactor:
+        if products.len < 3: continue
+
+        var prodNames: HashSet[string]
+        for p in products: prodNames.incl(p.prodName)
+
+        # Find int_lin_le containing exactly one product variable,
+        # where other chain variables have opposite-sign coefficients (for telescoping).
+        # Handles both interior links (2 chain vars) and boundary links (1 chain var + 1 fixed).
+        type ChainLink = object
+            prodName: string
+            prodCoeff: int
+            upVar: string       # "" for boundary start (fixed value absorbed into rhs)
+            downVar: string     # "" for boundary end
+            chainCoeffAbs: int  # |coefficient| of chain variables
+            rhs: int
+
+        var chainLinks: seq[ChainLink]
+
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            if stripSolverPrefix(con.name) != "int_lin_le": continue
+            let parsed = tr.resolveLinLeArgs(con)
+            if not parsed.ok: continue
+
+            # Find exactly one product variable
+            var prodIdx = -1
+            var prodCount = 0
+            for i, vn in parsed.varNames:
+                if vn in prodNames:
+                    prodIdx = i; inc prodCount
+            if prodCount != 1: continue
+
+            # Collect non-product, non-fixed variables
+            var chainVars: seq[tuple[name: string, coeff: int]]
+            var fixedContrib = 0
+            var valid = true
+            for i, vn in parsed.varNames:
+                if i == prodIdx: continue
+                if vn in fixedVars:
+                    fixedContrib += parsed.coeffs[i] * fixedVars[vn]
+                elif vn in domains:
+                    chainVars.add((name: vn, coeff: parsed.coeffs[i]))
+                else:
+                    valid = false; break
+            if not valid: continue
+            if chainVars.len < 1 or chainVars.len > 2: continue
+
+            let pc = parsed.coeffs[prodIdx]
+            let adjustedRhs = parsed.rhs - fixedContrib
+
+            if chainVars.len == 2:
+                # Interior link: two chain variables with opposite-sign equal-magnitude coefficients
+                if chainVars[0].coeff + chainVars[1].coeff != 0: continue
+                var link = ChainLink(
+                    prodName: parsed.varNames[prodIdx],
+                    prodCoeff: pc,
+                    chainCoeffAbs: abs(chainVars[0].coeff),
+                    rhs: adjustedRhs)
+                if (chainVars[0].coeff > 0) == (pc > 0):
+                    link.downVar = chainVars[0].name
+                    link.upVar = chainVars[1].name
+                else:
+                    link.downVar = chainVars[1].name
+                    link.upVar = chainVars[0].name
+                chainLinks.add(link)
+            else:
+                # Boundary link: one chain variable (the other was fixed)
+                # The chain variable becomes either upVar or downVar
+                let cv = chainVars[0]
+                var link = ChainLink(
+                    prodName: parsed.varNames[prodIdx],
+                    prodCoeff: pc,
+                    chainCoeffAbs: abs(cv.coeff),
+                    rhs: adjustedRhs)
+                # If chain var has same sign as product: it's the "down" end (boundary start)
+                if (cv.coeff > 0) == (pc > 0):
+                    link.downVar = cv.name
+                    link.upVar = ""  # boundary start
+                else:
+                    link.upVar = cv.name
+                    link.downVar = ""  # boundary end
+                chainLinks.add(link)
+
+        if chainLinks.len < 3: continue
+
+        # Group chain links by (prodCoeff, chainCoeffAbs) — lower/upper bound constraints
+        # may have opposite prodCoeff signs and must be processed separately.
+        var linkGroups: Table[tuple[pc, cc: int], seq[int]]
+        for i, link in chainLinks:
+            let key = (pc: link.prodCoeff, cc: link.chainCoeffAbs)
+            linkGroups.mgetOrPut(key, @[]).add(i)
+
+        for groupKey, groupIndices in linkGroups:
+            if groupIndices.len < 3: continue
+            let refPC = groupKey.pc
+            let refCC = groupKey.cc
+
+            # Build chain graph from this group's links.
+            const boundaryKey = "\x00__BOUNDARY__"
+            var edgesFrom: Table[string, seq[int]]
+            var asDown: HashSet[string]
+            for li in groupIndices:
+                let link = chainLinks[li]
+                let up = if link.upVar == "": boundaryKey else: link.upVar
+                let down = if link.downVar == "": boundaryKey else: link.downVar
+                edgesFrom.mgetOrPut(up, @[]).add(li)
+                asDown.incl(down)
+
+            # Chain start: prefer boundary start (sentinel) if available
+            var chainStart = ""
+            var foundStart = false
+            if boundaryKey in edgesFrom and boundaryKey notin asDown:
+                chainStart = boundaryKey
+                foundStart = true
+            else:
+                for v in edgesFrom.keys:
+                    if v != boundaryKey and v notin asDown:
+                        chainStart = v
+                        foundStart = true
+                        break
+            if not foundStart: continue
+
+            # Follow chain greedily
+            var chain: seq[int]
+            var current = chainStart
+            var visited: HashSet[string]
+            visited.incl(current)
+            while current in edgesFrom:
+                var nextLink = -1
+                for li in edgesFrom[current]:
+                    let dv = if chainLinks[li].downVar == "": boundaryKey else: chainLinks[li].downVar
+                    if dv notin visited:
+                        nextLink = li; break
+                if nextLink < 0: break
+                chain.add(nextLink)
+                let dv = if chainLinks[nextLink].downVar == "": boundaryKey else: chainLinks[nextLink].downVar
+                current = dv
+                visited.incl(current)
+
+            if chain.len < 3: continue
+            let chainEnd = current
+
+            # Sum the chain: intermediate chain variables cancel.
+            var totalRhs = 0
+            for li in chain: totalRhs += chainLinks[li].rhs
+
+            let realChainEnd = if chainEnd == boundaryKey: "" else: chainEnd
+            let startIsBoundary = (chainStart == boundaryKey)
+
+            # Step 3: Find closing constraint linking chain endpoint to factor variable.
+            var closingOffset = 0
+            var foundClosing = false
+
+            if realChainEnd != "":
+                for ci, con in tr.model.constraints:
+                    if ci in eliminated: continue
+                    if stripSolverPrefix(con.name) != "int_lin_le": continue
+                    let parsed = tr.resolveLinLeArgs(con)
+                    if not parsed.ok: continue
+                    var endCoeff, factCoeff, fixContrib: int
+                    var endFound, factFound: bool
+                    for i, vn in parsed.varNames:
+                        if vn == realChainEnd: endCoeff = parsed.coeffs[i]; endFound = true
+                        elif vn == factorName: factCoeff = parsed.coeffs[i]; factFound = true
+                        elif vn in fixedVars: fixContrib += parsed.coeffs[i] * fixedVars[vn]
+                        else: endFound = false; break
+                    if not endFound or not factFound: continue
+                    let adjRhs = parsed.rhs - fixContrib
+                    if endCoeff > 0 and factCoeff < 0 and endCoeff == -factCoeff:
+                        closingOffset = -(adjRhs div endCoeff)
+                        foundClosing = true
+                        break
+
+            if not foundClosing: continue
+
+            # Step 4: Find sum constraint on small variables
+            var smallNameSet: HashSet[string]
+            for li in chain:
+                let sn = prodToSmall.getOrDefault(chainLinks[li].prodName, "")
+                if sn != "": smallNameSet.incl(sn)
+
+            var sumBound = int.high
+            for ci, con in tr.model.constraints:
+                if ci in eliminated: continue
+                if stripSolverPrefix(con.name) != "int_lin_le": continue
+                let parsed = tr.resolveLinLeArgs(con)
+                if not parsed.ok: continue
+                var allSmall = true
+                var allSameCoeff = true
+                var fixedSum = 0
+                var varCount = 0
+                let firstCoeff = if parsed.coeffs.len > 0: parsed.coeffs[0] else: 0
+                if firstCoeff <= 0: continue
+                for i, vn in parsed.varNames:
+                    if parsed.coeffs[i] != firstCoeff:
+                        allSameCoeff = false; break
+                    if vn in fixedVars:
+                        fixedSum += fixedVars[vn] * parsed.coeffs[i]
+                    elif vn in smallNameSet:
+                        inc varCount
+                    else:
+                        allSmall = false; break
+                if allSmall and allSameCoeff and varCount >= smallNameSet.len div 2:
+                    let bound = (parsed.rhs - fixedSum) div firstCoeff
+                    if bound < sumBound:
+                        sumBound = bound
+
+            if sumBound >= int.high: continue
+
+            # Step 5: Derive bound on factorName
+            let startContrib = if startIsBoundary: 0
+                               elif chainStart in fixedVars: refCC * fixedVars[chainStart]
+                               elif chainStart in domains and domains[chainStart].len > 0:
+                                   refCC * domains[chainStart][0]
+                               else: continue
+
+            let lhsCoeff = refPC * sumBound - refCC
+            let rhsVal = totalRhs - startContrib - refCC * closingOffset
+
+            if lhsCoeff < 0:
+                # factor >= ceil(rhsVal / lhsCoeff) [division of negative by negative = positive]
+                let newLo = psCeilDiv(-rhsVal, -lhsCoeff)
+                if factorName in domains:
+                    let oldDom = domains[factorName]
+                    if oldDom.len > 0 and newLo > oldDom[0]:
+                        if presolveRestrictBounds(domains, factorName, newLo, oldDom[^1], infeasible):
+                            stderr.writeLine(&"[FZN] Product chain bound: {factorName} >= {newLo} " &
+                                             &"(chain length {chain.len}, sum bound {sumBound})")
+                            result = true
+                        if infeasible: return
+            elif lhsCoeff > 0:
+                # factor <= floor(rhsVal / lhsCoeff)
+                let newHi = rhsVal div lhsCoeff
+                if factorName in domains:
+                    let oldDom = domains[factorName]
+                    if oldDom.len > 0 and newHi < oldDom[^1]:
+                        if presolveRestrictBounds(domains, factorName, oldDom[0], newHi, infeasible):
+                            stderr.writeLine(&"[FZN] Product chain bound: {factorName} <= {newHi} " &
+                                             &"(chain length {chain.len}, sum bound {sumBound})")
+                            result = true
+                        if infeasible: return
+
+
 proc varElementPropagate(tr: FznTranslator,
                          domains: var Table[string, seq[int]],
                          fixedVars: Table[string, int],
@@ -3263,6 +3600,11 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 6e: int_times bounds propagation
         if intTimesPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6f: Product-chain telescoping bound propagation
+        if productChainBoundPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 

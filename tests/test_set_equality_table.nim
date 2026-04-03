@@ -52,9 +52,10 @@ solve satisfy;
     check tr.setEqualityTableDefs[0].sourceVarNames.len == 2
     check tr.setEqualityTableDefs[0].modulus == 3
 
-    # Singleton set variables should be skipped
+    # Singleton and target set variables should be skipped
     check "sing1" in tr.skipSetVarNames
     check "sing2" in tr.skipSetVarNames
+    check "target" in tr.skipSetVarNames
 
     # Solve and verify correctness
     tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
@@ -114,11 +115,12 @@ solve satisfy;
     check tr.setEqualityTableDefs[0].sourceVarNames.len == 3
     check tr.setEqualityTableDefs[0].modulus == 4
 
-    # Chain intermediate should be skipped
+    # Chain intermediate, singletons, and target should be skipped
     check "intermediate" in tr.skipSetVarNames
     check "sing1" in tr.skipSetVarNames
     check "sing2" in tr.skipSetVarNames
     check "sing3" in tr.skipSetVarNames
+    check "target" in tr.skipSetVarNames
 
     # Solve and verify
     tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
@@ -358,11 +360,9 @@ solve satisfy;
 
     check tr.setEqualityTableDefs.len == 1
 
-    # 4 constraints consumed: set_in(pc1), set_card(sing1), set_in(pc2), set_card(sing2)
-    # + 1 equality union
-    # = 5 consumed constraints
+    # 6 constraints consumed: set_in×2 + set_card×2 + equality union + array_set_element
     let def = tr.setEqualityTableDefs[0]
-    check def.consumedCIs.len >= 5  # set_in×2 + set_card×2 + equality union
+    check def.consumedCIs.len >= 6
 
   test "no mod: direct variables in singleton sets":
     ## Source variables are used directly (no int_mod). This tests the
