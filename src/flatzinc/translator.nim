@@ -1243,6 +1243,19 @@ proc translate*(model: FznModel): FznTranslator =
     # the element constraint itself. This happens when case analysis or reification
     # channels consumed all downstream uses of the result variable.
     block:
+        # Build set of protected variable names: objective and output variables must not
+        # have their defining constraints eliminated, even if unreferenced by other constraints.
+        var protectedVars: HashSet[string]
+        if result.model.solve.kind in {Minimize, Maximize}:
+            if result.model.solve.objective != nil and result.model.solve.objective.kind == FznIdent:
+                protectedVars.incl(result.model.solve.objective.ident)
+        for ov in result.outputVars:
+            protectedVars.incl(ov)
+        for oa in result.outputArrays:
+            if oa.name in result.arrayElementNames:
+                for elemName in result.arrayElementNames[oa.name]:
+                    protectedVars.incl(elemName)
+
         # Build variable reference count from non-consumed constraints
         var varRefCount: Table[string, int]
         for ci, con in model.constraints:
@@ -1268,6 +1281,8 @@ proc translate*(model: FznModel): FznTranslator =
             if con.args.len < 3: continue
             let resultArg = con.args[2]
             if resultArg.kind != FznIdent: continue
+            # Never eliminate constraints whose result is the objective or an output variable
+            if resultArg.ident in protectedVars: continue
             # The result variable is referenced by this constraint (counted in varRefCount).
             # If that's its ONLY reference, the variable is dead and the constraint is redundant.
             let refCount = varRefCount.getOrDefault(resultArg.ident, 0)

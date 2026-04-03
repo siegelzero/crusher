@@ -85,9 +85,11 @@ proc getNextState*[T](state: RegularConstraint[T], dfaState: int, inputVal: T): 
     ## Returns 0 (fail state) if input is out of range or state is invalid.
     if dfaState <= 0 or dfaState > state.nStates:
         return 0
-    # Use cast to avoid overflow on out-of-range values during channel simulation
-    let inputIdx = cast[int](cast[uint](int(inputVal)) - cast[uint](int(state.inputMin)))
-    if inputIdx < 0 or inputIdx >= state.transition[dfaState - 1].len:
+    # Early range check avoids overflow in the subtraction below
+    if int(inputVal) < int(state.inputMin):
+        return 0
+    let inputIdx = int(inputVal) - int(state.inputMin)
+    if inputIdx >= state.transition[dfaState - 1].len:
         return 0
     return state.transition[dfaState - 1][inputIdx]
 

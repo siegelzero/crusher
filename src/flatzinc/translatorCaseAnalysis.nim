@@ -5,7 +5,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     ## Detects case-analysis patterns in bool_clause constraints where a target variable's
     ## value is fully determined by condition variables through exhaustive case analysis.
     ## Converts target variables to channel variables with constant lookup tables.
-    ## Has a time budget (default 5s) to avoid hanging on problems with large reification sets.
+    ## Has a time budget (default 2s) to avoid hanging on problems with large reification sets.
     ##
     ## Pattern (2-literal, first/last round):
     ##   int_eq_reif(target, val, B) :: defines_var(B)

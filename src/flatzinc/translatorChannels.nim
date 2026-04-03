@@ -1732,8 +1732,6 @@ proc detectInversePatterns(tr: var FznTranslator) =
         let n = elemNames.len
         if ciList.len < n:
             continue  # need at least one constraint per element
-        if ciList.len > n:
-            continue  # too many (duplicates?) — skip to be safe
 
         # Build map: element name -> 0-based index in the array
         var nameToIdx: Table[string, int]
@@ -1741,7 +1739,10 @@ proc detectInversePatterns(tr: var FznTranslator) =
             nameToIdx[name] = i
 
         # Check each constraint: arg[0] must be one of the array elements,
-        # arg[2] must be the constant (1-based index) of that element
+        # arg[2] must be the constant (1-based index) of that element.
+        # Merged groups may contain duplicate constraints from different arrays
+        # encoding the same involution — duplicates are skipped if consistent.
+        var involution = newSeq[int](n)
         var matched = newSeq[bool](n)
         var allMatch = true
         for ci in ciList:
@@ -1766,9 +1767,13 @@ proc detectInversePatterns(tr: var FznTranslator) =
                 break
 
             if matched[elemIdx]:
-                allMatch = false  # duplicate
-                break
+                # Duplicate from merged array — verify consistency
+                if involution[elemIdx] != constVal - 1:
+                    allMatch = false
+                    break
+                continue
             matched[elemIdx] = true
+            involution[elemIdx] = constVal - 1
 
         if not allMatch:
             continue

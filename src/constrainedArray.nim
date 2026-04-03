@@ -3466,20 +3466,23 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             let n = reg.n
             if n == 0: continue
 
-            # Check if any position is a channel with an element binding
+            # Check if any position is a channel with an element binding,
+            # and skip if any position is in skippedPositions (same as main Regular phase)
             var hasChannelPositions = false
+            var hasSkipped = false
             for pos in reg.positions.items:
                 if pos in carray.channelPositions:
                     hasChannelPositions = true
-                    break
+                if pos in skippedPositions:
+                    hasSkipped = true
             if not hasChannelPositions: continue
+            if hasSkipped: continue
 
             # Rebuild forward/backward DFA states for this constraint
             var forwardStates2 = newSeq[PackedSet[int]](n + 1)
             forwardStates2[0].incl(reg.initialState)
             for i in 0..<n:
                 let pos = reg.sortedPositions[i]
-                if pos in skippedPositions: break
                 for s in forwardStates2[i].items:
                     for v in currentDomain[pos].items:
                         let ns = reg.getNextState(s, v)
@@ -3491,7 +3494,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             backwardStates2[n] = reg.finalStates
             for i in countdown(n - 1, 0):
                 let pos = reg.sortedPositions[i]
-                if pos in skippedPositions: break
                 for s in forwardStates2[i].items:
                     for v in currentDomain[pos].items:
                         let ns = reg.getNextState(s, v)
@@ -3538,8 +3540,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         outerChanged = true
                     foundBinding = true
                     break  # Found the binding for this channel position
-                if not foundBinding and i == 0:
-                    stderr.writeLine(&"[DomRed]   No binding found for channel pos {chanPos}")
+                discard foundBinding
         if regChannelPruned > 0:
             stderr.writeLine(&"[DomRed] Regular-through-channel: {regChannelPruned} source values pruned")
 
