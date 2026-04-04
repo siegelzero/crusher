@@ -13,6 +13,7 @@ rotating_workforce_e30_s9,2022/rotating-workforce-scheduling/rotating-workforce-
 spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
 team_assign_d1_4_6,2022/team-assignment/model.mzn,2022/team-assignment/data1_4_6.dzn,maximize,10000,2900,2948
 tower_070_070_15_070_09,2022/tower/tower.mzn,2022/tower/tower_070_070_15_070-09.dzn,maximize,10000,0,57
+triangular_n10,2022/triangular/triangular.mzn,2022/triangular/n10.dzn,maximize,10000,20,20
 
 chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,25,25
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
