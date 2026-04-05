@@ -11,6 +11,7 @@ import unittest
 import std/[sequtils, algorithm, sets, tables, strutils, packedsets]
 import crusher
 import flatzinc/[parser, translator, output]
+import constraints/types
 
 proc getObjectiveExpr(tr: FznTranslator): AlgebraicExpression[int] =
   if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
@@ -2791,3 +2792,123 @@ solve minimize X;
         let xPos = tr.varPositions["X"]
         let xDom = tr.sys.baseArray.domain[xPos]
         check xDom[0] >= 48
+
+suite "FlatZinc Set Intersect Cardinality Pattern Detection":
+
+    test "detectSetIntersectCardPattern: set_intersect + set_card fused into one constraint":
+        ## set_intersect(A, B, C) :: defines_var(C) with set_card(C, n)
+        ## where n ∈ 0..1 and n is referenced only in set_card.
+        ## Detector should populate setIntersectCardDefs and the emitter should add
+        ## a SetIntersectCardType constraint (not the tautological-skip path, since
+        ## min(|universe A|, |universe B|) = 4 > cardHi = 1).
+        let src = """
+var set of 1..4: A :: output_var;
+var set of 1..4: B :: output_var;
+var set of 1..4: C :: var_is_introduced :: is_defined_var;
+var 0..1: n :: output_var;
+constraint set_intersect(A, B, C) :: defines_var(C);
+constraint set_card(C, n);
+constraint set_in(1, A);
+constraint set_in(2, A);
+constraint set_in(3, B);
+constraint set_in(4, B);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Detector populated the def list.
+        check tr.setIntersectCardDefs.len == 1
+        let def = tr.setIntersectCardDefs[0]
+        check def.aSetName == "A"
+        check def.bSetName == "B"
+        check def.cSetName == "C"
+        check def.cardVarName == "n"
+
+        # Emitter posted an actual SetIntersectCard constraint.
+        var sicCount = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == SetIntersectCardType:
+                inc sicCount
+        check sicCount == 1
+
+        # n and C's booleans should be marked as channel positions (not searched).
+        let nPos = tr.varPositions["n"]
+        check nPos in tr.sys.baseArray.channelPositions
+        let cInfo = tr.setVarBoolPositions["C"]
+        for cPos in cInfo.positions:
+            check cPos in tr.sys.baseArray.channelPositions
+
+        # Solving: assignment must respect |A ∩ B| ≤ hi(n) = 1 (the upper bound
+        # from n's domain, which the SetIntersectCard constraint enforces as maxCard).
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+        # Count actual intersection by inspecting A and B booleans.
+        let aInfo = tr.setVarBoolPositions["A"]
+        let bInfo = tr.setVarBoolPositions["B"]
+        var actualIntersect = 0
+        for elem in 1..4:
+            let aPos = aInfo.positions[elem - aInfo.lo]
+            let bPos = bInfo.positions[elem - bInfo.lo]
+            if tr.sys.assignment[aPos] == 1 and tr.sys.assignment[bPos] == 1:
+                inc actualIntersect
+        check actualIntersect <= 1
+
+    test "detectSetIntersectCardPattern: negative — card var referenced elsewhere (refcount > 1)":
+        ## The detector requires the cardinality variable to be used only in set_card.
+        ## Here n is also used in int_eq, so refcount = 2 and the pattern must NOT fire.
+        let src = """
+var set of 1..4: A :: output_var;
+var set of 1..4: B :: output_var;
+var set of 1..4: C :: var_is_introduced :: is_defined_var;
+var 0..2: n :: output_var;
+constraint set_intersect(A, B, C) :: defines_var(C);
+constraint set_card(C, n);
+constraint int_eq(n, 1);
+constraint set_in(1, A);
+constraint set_in(3, B);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Detector should not record this as a SetIntersectCard pattern.
+        check tr.setIntersectCardDefs.len == 0
+
+        # And no SetIntersectCard constraint should be in the system.
+        var sicCount = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == SetIntersectCardType:
+                inc sicCount
+        check sicCount == 0
+
+    test "detectSetIntersectCardPattern: tautological skip when intersection bound is loose":
+        ## When A and B are themselves capped by set_card(_, 1), |A ∩ B| ≤ 1 trivially.
+        ## If n's upper bound is also ≥ 1 and lower bound is 0, the constraint is
+        ## tautological and emitSetIntersectCardConstraints should skip it —
+        ## pattern still detected, but no constraint is emitted into the system.
+        let src = """
+var set of 1..4: A :: output_var;
+var set of 1..4: B :: output_var;
+var set of 1..4: C :: var_is_introduced :: is_defined_var;
+var 0..3: n :: output_var;
+var 0..1: capA :: output_var;
+var 0..1: capB :: output_var;
+constraint set_card(A, capA);
+constraint set_card(B, capB);
+constraint set_intersect(A, B, C) :: defines_var(C);
+constraint set_card(C, n);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Detection still fires — skipping happens in the emit step.
+        check tr.setIntersectCardDefs.len == 1
+
+        # But no SetIntersectCard constraint was emitted (tautological).
+        var sicCount = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == SetIntersectCardType:
+                inc sicCount
+        check sicCount == 0

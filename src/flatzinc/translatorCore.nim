@@ -1930,6 +1930,16 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let exprs = tr.resolveExprArray(con.args[0])
         tr.sys.addConstraint(decreasing[int](exprs))
 
+    of "fzn_lex_lesseq_int", "fzn_lex_lesseq_bool":
+        let leftExprs = tr.resolveExprArray(con.args[0])
+        let rightExprs = tr.resolveExprArray(con.args[1])
+        tr.sys.addConstraint(lexLe[int](leftExprs, rightExprs))
+
+    of "fzn_lex_less_int", "fzn_lex_less_bool":
+        let leftExprs = tr.resolveExprArray(con.args[0])
+        let rightExprs = tr.resolveExprArray(con.args[1])
+        tr.sys.addConstraint(lexLt[int](leftExprs, rightExprs))
+
     of "fzn_all_different_except_0", "fzn_alldifferent_except_0":
         let exprs = tr.resolveExprArray(con.args[0])
         # Filter out constant 0 expressions — they are exempt from uniqueness

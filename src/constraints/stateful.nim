@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -298,6 +298,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ConditionalLinear Constraint"
         of ReservoirType:
             return "Reservoir Constraint"
+        of SetIntersectCardType:
+            return "SetIntersectCard Constraint"
         of DisjunctiveClauseType:
             return "DisjunctiveClause Constraint"
         of ValueSupportType:
@@ -377,6 +379,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.conditionalLinearState.cost
         of ReservoirType:
             return constraint.reservoirState.cost
+        of SetIntersectCardType:
+            return constraint.setIntersectCardState.cost
         of DisjunctiveClauseType:
             return constraint.disjunctiveClauseState.cost
         of ValueSupportType:
@@ -1004,6 +1008,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.conditionalLinearState.initialize(assignment)
         of ReservoirType:
             constraint.reservoirState.initialize(assignment)
+        of SetIntersectCardType:
+            constraint.setIntersectCardState.initialize(assignment)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.initialize(assignment)
         of ValueSupportType:
@@ -1080,6 +1086,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.conditionalLinearState.moveDelta(position, oldValue, newValue)
         of ReservoirType:
             constraint.reservoirState.moveDelta(position, oldValue, newValue)
+        of SetIntersectCardType:
+            constraint.setIntersectCardState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
@@ -1156,6 +1164,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.conditionalLinearState.updatePosition(position, newValue)
         of ReservoirType:
             constraint.reservoirState.updatePosition(position, newValue)
+        of SetIntersectCardType:
+            constraint.setIntersectCardState.updatePosition(position, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.updatePosition(position, newValue)
         of ValueSupportType:
@@ -1834,6 +1844,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: ReservoirType,
                 reservoirState: constraint.reservoirState.deepCopy()
             )
+        of SetIntersectCardType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: SetIntersectCardType,
+                setIntersectCardState: constraint.setIntersectCardState.deepCopy()
+            )
         of DisjunctiveClauseType:
             result = StatefulConstraint[T](
                 positions: constraint.positions,
@@ -2130,6 +2146,25 @@ func reservoir*[T](
     positions: positions,
     stateType: ReservoirType,
     reservoirState: newReservoirConstraint[T](taskPositions, consumptions, maxDiff)
+  )
+
+################################################################################
+# Set intersection cardinality wrapper functions
+################################################################################
+
+func setIntersectCard*[T](
+    leftPositions, rightPositions: openArray[int],
+    maxCard: int, minCard: int = 0
+): StatefulConstraint[T] =
+  ## Creates a set intersection cardinality constraint:
+  ## minCard <= sum_i min(A[i], B[i]) <= maxCard
+  ## Efficient O(1) moveDelta for binary variables.
+  let constraint = newSetIntersectCardConstraint[T](
+      leftPositions, rightPositions, maxCard, minCard)
+  return StatefulConstraint[T](
+    positions: constraint.positions,
+    stateType: SetIntersectCardType,
+    setIntersectCardState: constraint
   )
 
 ################################################################################

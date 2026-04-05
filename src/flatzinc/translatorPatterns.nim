@@ -3531,6 +3531,181 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] Emitted {nEmitted} set-equality table constraints ({totalTuples} total tuples)")
 
+proc detectSetIntersectCardPattern(tr: var FznTranslator) =
+    ## Detects set_intersect(A, B, C) + set_card(C, n) where C is an intermediate
+    ## set variable (is_defined_var) and n is only used in set_card (domain-bounded).
+    ##
+    ## Fuses these into a single constraint: sum_i min(A.bools[i], B.bools[i]) <= hi(n)
+    ## Eliminates the intermediate set C and its boolean decomposition.
+
+    # Build a set of known set variable names from model declarations
+    # (runs before translateVariables, so setVarBoolPositions isn't populated yet)
+    var setVarNames: HashSet[string]
+    for decl in tr.model.variables:
+        if decl.isArray: continue
+        if not decl.isVar: continue
+        if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+            setVarNames.incl(decl.name)
+
+    # Step 1: Build map of set_intersect results: C name -> (ci, A name, B name)
+    var intersectResults: Table[string, tuple[ci: int, aName, bName: string]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_intersect" or con.args.len < 3: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let aArg = con.args[0]
+        let bArg = con.args[1]
+        let cArg = con.args[2]
+        if aArg.kind != FznIdent or bArg.kind != FznIdent or cArg.kind != FznIdent: continue
+        # C must be a set variable (not a constant set parameter)
+        if cArg.ident notin setVarNames: continue
+        intersectResults[cArg.ident] = (ci: ci, aName: aArg.ident, bName: bArg.ident)
+
+    if intersectResults.len == 0: return
+
+    # Step 2: Build map of set_card constraints: S name -> (ci, card var name)
+    var setCardMap: Table[string, tuple[ci: int, cardVarName: string]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_card" or con.args.len < 2: continue
+        if con.args[0].kind != FznIdent: continue
+        let sName = con.args[0].ident
+        if sName notin intersectResults: continue
+        # Card argument must be an identifier (variable)
+        if con.args[1].kind == FznIdent:
+            setCardMap[sName] = (ci: ci, cardVarName: con.args[1].ident)
+        elif con.args[1].kind == FznIntLit:
+            # Fixed cardinality - still useful to detect, but less common for intersection
+            setCardMap[sName] = (ci: ci, cardVarName: "")
+
+    # Step 3: Check that the cardinality variable is only used in the set_card constraint
+    # Build a reference count for cardinality variable names
+    var cardVarRefCount: Table[string, int]
+    for sName, info in setCardMap:
+        if info.cardVarName != "":
+            cardVarRefCount[info.cardVarName] = 0
+    for ci, con in tr.model.constraints:
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident in cardVarRefCount:
+                cardVarRefCount[arg.ident] += 1
+
+    # Step 4: Match and record fused patterns
+    var nDetected = 0
+    var nBoolsSkipped = 0
+    for sName, cardInfo in setCardMap:
+        let intersectInfo = intersectResults[sName]
+        # Check cardinality variable is only used in the set_card constraint (refcount == 1)
+        if cardInfo.cardVarName != "" and cardVarRefCount.getOrDefault(cardInfo.cardVarName, 0) != 1:
+            continue
+
+        # Mark set_intersect as defining (we'll create channel bindings instead)
+        tr.definingConstraints.incl(intersectInfo.ci)  # set_intersect
+        # Mark set_card as defining (we'll post the sum constraint ourselves)
+        tr.definingConstraints.incl(cardInfo.ci)  # set_card
+
+        # Do NOT skip C booleans — we need them as channel variables.
+        # They'll be marked as channelPositions in the emit function.
+
+        tr.setIntersectCardDefs.add((
+            aSetName: intersectInfo.aName,
+            bSetName: intersectInfo.bName,
+            cSetName: sName,
+            cardVarName: cardInfo.cardVarName,
+            intersectCI: intersectInfo.ci,
+            cardCI: cardInfo.ci))
+
+        # Count skipped bools from model declarations (setVarBoolPositions not yet populated)
+        for decl in tr.model.variables:
+            if decl.name == sName and decl.varType.kind == FznSetOfIntRange:
+                nBoolsSkipped += decl.varType.setHi - decl.varType.setLo + 1
+                break
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} set-intersect-cardinality patterns (skipping {nBoolsSkipped} intermediate bools)")
+
+proc emitSetIntersectCardConstraints(tr: var FznTranslator) =
+    ## Emits dedicated SetIntersectCard constraints for detected patterns.
+    ## Uses O(1) moveDelta instead of sum-of-min expressions.
+    ## C booleans are skipped; constraint operates directly on A and B booleans.
+    ## Must run after translateVariables (so set bool positions are created).
+
+    # Build map of set name -> max cardinality from set_card constraints on primary sets
+    var setMaxCard: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "set_card" or con.args.len < 2: continue
+        if con.args[0].kind != FznIdent: continue
+        let sName = con.args[0].ident
+        # Look up cardinality variable's max domain value
+        if con.args[1].kind == FznIdent:
+            let cardVarName = con.args[1].ident
+            if cardVarName in tr.varPositions:
+                let cardPos = tr.varPositions[cardVarName]
+                let cardDom = tr.sys.baseArray.domain[cardPos]
+                if cardDom.len > 0:
+                    setMaxCard[sName] = cardDom[^1]
+
+    var nEmitted = 0
+    var nSkipped = 0
+    for def in tr.setIntersectCardDefs:
+        let aInfo = tr.setVarBoolPositions.getOrDefault(def.aSetName)
+        let bInfo = tr.setVarBoolPositions.getOrDefault(def.bSetName)
+        if aInfo.positions.len == 0 or bInfo.positions.len == 0: continue
+
+        # Build parallel arrays of matching positions for the shared universe
+        var leftPos, rightPos: seq[int]
+        let lo = max(aInfo.lo, bInfo.lo)
+        let hi = min(aInfo.hi, bInfo.hi)
+        for elem in lo..hi:
+            let aIdx = elem - aInfo.lo
+            let bIdx = elem - bInfo.lo
+            if aIdx < 0 or aIdx >= aInfo.positions.len: continue
+            if bIdx < 0 or bIdx >= bInfo.positions.len: continue
+            leftPos.add(aInfo.positions[aIdx])
+            rightPos.add(bInfo.positions[bIdx])
+
+        if leftPos.len == 0: continue
+
+        # Get the bound from the cardinality variable's domain
+        var cardLo = 0
+        var cardHi = leftPos.len
+        if def.cardVarName != "":
+            if def.cardVarName in tr.varPositions:
+                let cardPos = tr.varPositions[def.cardVarName]
+                let cardDom = tr.sys.baseArray.domain[cardPos]
+                cardHi = cardDom[^1]
+                cardLo = cardDom[0]
+                # Mark cardinality variable as channel (not searched)
+                tr.sys.baseArray.channelPositions.incl(cardPos)
+            elif def.cardVarName in tr.definedVarBounds:
+                let (dLo, dHi) = tr.definedVarBounds[def.cardVarName]
+                cardHi = dHi
+                cardLo = dLo
+
+        # Mark C set booleans as channel positions (not searched)
+        let cInfo = tr.setVarBoolPositions.getOrDefault(def.cSetName)
+        for cPos in cInfo.positions:
+            tr.sys.baseArray.channelPositions.incl(cPos)
+
+        # Tautological check: if max possible intersection <= cardHi, skip.
+        # Max intersection = min(max_card_A, max_card_B) from set_card constraints.
+        let maxCardA = setMaxCard.getOrDefault(def.aSetName, leftPos.len)
+        let maxCardB = setMaxCard.getOrDefault(def.bSetName, rightPos.len)
+        if min(maxCardA, maxCardB) <= cardHi and cardLo <= 0:
+            inc nSkipped
+            continue
+
+        # Emit the dedicated constraint
+        tr.sys.addConstraint(setIntersectCard[int](leftPos, rightPos, cardHi, cardLo))
+        inc nEmitted
+
+    if nEmitted > 0 or nSkipped > 0:
+        stderr.writeLine(&"[FZN] Emitted {nEmitted} SetIntersectCard constraints, skipped {nSkipped} tautological (dedicated O(1) moveDelta)")
+
 proc detectSingletonSetChannels(tr: var FznTranslator) =
     ## Detects set_card(S, 1) + set_in(x, S) where x is a variable.
     ## Makes S.bools into indicator channels: S.bools[e] = (x == e) ? 1 : 0.

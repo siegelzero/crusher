@@ -374,6 +374,8 @@ type
         intDivChannelDefs*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int], offset: int]]
         # Singleton set channel defs: set_card(S,1) + set_in(x, S) → S.bools = indicator(x)
         singletonSetChannelDefs*: seq[tuple[setName: string, xVarName: string, cardCI: int, inCI: int]]
+        # Set intersection cardinality defs: set_intersect(A,B,C) + set_card(C,n) → sum_i min(A[i],B[i]) in domain(n)
+        setIntersectCardDefs*: seq[tuple[aSetName, bSetName, cSetName, cardVarName: string, intersectCI, cardCI: int]]
         # Detected weighted same-value pattern for objective
         weightedSameValuePairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
         weightedSameValueConstant*: int
@@ -882,6 +884,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.boolEquivAliasDefs = @[]
     result.annotatedSearchVarNames = initHashSet[string]()
     result.hasSearchAnnotation = false
+    result.setIntersectCardDefs = @[]
     result.boolGatedVarChannelDefs = @[]
 
     # Load parameters first (needed by collectDefinedVars for resolveIntArray)
@@ -1057,6 +1060,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectConditionalCumulativePattern()
     # Detect conditional day capacity patterns (H3/H4 surgeon/OT capacity)
     result.detectConditionalDayCapacityPattern()
+    # Detect set_intersect(A,B,C) + set_card(C,n) → dedicated SetIntersectCard constraint
+    result.detectSetIntersectCardPattern()
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
     # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
@@ -1077,6 +1082,8 @@ proc translate*(model: FznModel): FznTranslator =
             result.sys.baseArray.channelPositions.incl(result.varPositions[vn])
     # Build copy channel bindings for orphan variables (after translateVariables + channelPositions)
     result.buildOrphanEqualityConstraints()
+    # Emit set-intersect-cardinality constraints (after translateVariables so positions exist)
+    result.emitSetIntersectCardConstraints()
     # Detect singleton set channels: set_card(S,1) + set_in(x,S) → S.bools become channels
     result.detectSingletonSetChannels()
     for def in result.singletonSetChannelDefs:
