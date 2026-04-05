@@ -2970,6 +2970,416 @@ proc elementPropagate(tr: FznTranslator,
                 if infeasible: return
 
 
+# ---------------------------------------------------------------------------
+# Helpers + Pareto dominance pruning of element index domains
+# ---------------------------------------------------------------------------
+
+proc ppResolveConstIntSeq(tr: FznTranslator, arg: FznExpr): tuple[vals: seq[int], ok: bool] =
+    ## Resolve an int_lin_* coefficient argument (or any constant int array arg)
+    ## to a concrete seq[int]. Handles inline FznArrayLit and FznIdent references
+    ## to parameter arrays in tr.arrayValues or decl.value.
+    var a = arg
+    if a.kind == FznIdent:
+        if a.ident in tr.arrayValues:
+            return (tr.arrayValues[a.ident], true)
+        for decl in tr.model.parameters:
+            if decl.isArray and decl.name == a.ident and decl.value != nil and
+                    decl.value.kind == FznArrayLit:
+                a = decl.value
+                break
+    if a.kind == FznArrayLit:
+        var s = newSeq[int](a.elems.len)
+        for i, e in a.elems:
+            if e.kind != FznIntLit: return (@[], false)
+            s[i] = e.intVal
+        return (s, true)
+    return (@[], false)
+
+proc ppResolveVarExprSeq(tr: FznTranslator, arg: FznExpr): tuple[items: seq[FznExpr], ok: bool] =
+    ## Resolve an int_lin_* vars argument to a flat seq[FznExpr]. Handles both
+    ## inline FznArrayLit and FznIdent references to array declarations.
+    var a = arg
+    if a.kind == FznIdent:
+        var found = false
+        for decl in tr.model.variables:
+            if decl.isArray and decl.name == a.ident and decl.value != nil and
+                    decl.value.kind == FznArrayLit:
+                a = decl.value
+                found = true
+                break
+        if not found:
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == a.ident and decl.value != nil and
+                        decl.value.kind == FznArrayLit:
+                    a = decl.value
+                    break
+    if a.kind == FznArrayLit:
+        return (a.elems, true)
+    return (@[], false)
+
+proc computeVarDirections(tr: FznTranslator,
+                          domains: Table[string, seq[int]],
+                          fixedVars: Table[string, int],
+                          eliminated: PackedSet[int]): Table[string, int] =
+    ## Compute a per-variable "preferred direction":
+    ##   +1 — weakly bigger value is better (reduces objective / relaxes constraints)
+    ##   -1 — weakly smaller value is better
+    ##    0 — mixed / unknown (do not rely on it)
+    ##
+    ## Seeds from the solve objective (minimize → −1, maximize → +1) and
+    ## propagates backward through `defines_var` annotations on int_lin_eq /
+    ## int_times constraints. Then, as a second phase, assigns feasibility
+    ## directions from int_lin_le / int_lin_lt for variables that phase 1 didn't
+    ## cover (with conflict downgrade to 0).
+    result = initTable[string, int]()
+    if tr.model.solve.objective == nil: return
+    if tr.model.solve.objective.kind != FznIdent: return
+    case tr.model.solve.kind
+    of Minimize: result[tr.model.solve.objective.ident] = -1
+    of Maximize: result[tr.model.solve.objective.ident] = 1
+    else: return
+
+    proc setDir(t: var Table[string, int], name: string, d: int): bool =
+        ## Returns true if the table entry was updated.
+        if name == "" or d == 0: return false
+        if name in t:
+            if t[name] == 0: return false  # already marked mixed
+            if t[name] != d:
+                t[name] = 0
+                return true
+            return false
+        else:
+            t[name] = d
+            return true
+
+    proc argBounds(tr: FznTranslator, a: FznExpr,
+                   doms: Table[string, seq[int]],
+                   fx: Table[string, int]): tuple[lo, hi: int, ok: bool] =
+        if a.kind == FznIntLit: return (a.intVal, a.intVal, true)
+        if a.kind == FznBoolLit:
+            let v = if a.boolVal: 1 else: 0
+            return (v, v, true)
+        if a.kind == FznIdent:
+            if a.ident in fx: return (fx[a.ident], fx[a.ident], true)
+            if a.ident in tr.paramValues:
+                return (tr.paramValues[a.ident], tr.paramValues[a.ident], true)
+            if a.ident in doms:
+                let d = doms[a.ident]
+                if d.len > 0: return (d[0], d[^1], true)
+        return (0, 0, false)
+
+    # Phase 1: propagate through defines_var chains
+    for iter in 0..<32:
+        var changed = false
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let cname = stripSolverPrefix(con.name)
+
+            # int_lin_eq with defines_var(y): y is linear combo of other vars
+            if cname == "int_lin_eq" and con.args.len >= 3:
+                let defAnn = con.getAnnotation("defines_var")
+                if defAnn.args.len < 1 or defAnn.args[0].kind != FznIdent: continue
+                let defName = defAnn.args[0].ident
+                if defName notin result: continue
+                let dirY = result[defName]
+                if dirY == 0: continue
+
+                let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
+                if not okC: continue
+                let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
+                if not okV: continue
+                if coeffs.len != vars.len: continue
+
+                var cy = 0
+                for i in 0..<vars.len:
+                    if vars[i].kind == FznIdent and vars[i].ident == defName:
+                        cy = coeffs[i]
+                        break
+                if cy == 0: continue
+
+                # From sum(c_i * x_i) = rhs we get y = (rhs − sum_{i≠y} c_i*x_i) / c_y,
+                # so ∂y/∂x_i = −c_i / c_y. direction[x_i] = sign(∂y/∂x_i) * dirY.
+                for i in 0..<vars.len:
+                    if vars[i].kind != FznIdent: continue
+                    if vars[i].ident == defName: continue
+                    let ci = coeffs[i]
+                    if ci == 0: continue
+                    let sameSign = (ci > 0) == (cy > 0)
+                    let newDir = if sameSign: -dirY else: dirY
+                    if setDir(result, vars[i].ident, newDir):
+                        changed = true
+
+            # int_times with defines_var(c): c = a * b
+            elif cname == "int_times" and con.args.len == 3:
+                let defAnn = con.getAnnotation("defines_var")
+                if defAnn.args.len < 1 or defAnn.args[0].kind != FznIdent: continue
+                let defName = defAnn.args[0].ident
+                if defName notin result: continue
+                let dirC = result[defName]
+                if dirC == 0: continue
+
+                let argA = con.args[0]
+                let argB = con.args[1]
+                let argC = con.args[2]
+                if argC.kind != FznIdent or argC.ident != defName: continue
+
+                let bB = argBounds(tr, argB, domains, fixedVars)
+                if argA.kind == FznIdent and bB.ok:
+                    var bSign = 0
+                    if bB.lo >= 0: bSign = 1
+                    elif bB.hi <= 0: bSign = -1
+                    if bSign != 0:
+                        if setDir(result, argA.ident, bSign * dirC):
+                            changed = true
+                let aB = argBounds(tr, argA, domains, fixedVars)
+                if argB.kind == FznIdent and aB.ok:
+                    var aSign = 0
+                    if aB.lo >= 0: aSign = 1
+                    elif aB.hi <= 0: aSign = -1
+                    if aSign != 0:
+                        if setDir(result, argB.ident, aSign * dirC):
+                            changed = true
+
+        if not changed: break
+
+    # Phase 2: feasibility directions from int_lin_le/int_lin_lt for vars
+    # that phase 1 did not cover. A conflicting feasibility vote downgrades
+    # phase-1 entries to 0 (mixed pressure — unsafe to use for dominance).
+    var feasDir = initTable[string, int]()
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname != "int_lin_le" and cname != "int_lin_lt": continue
+        if con.args.len < 3: continue
+        let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
+        if not okC: continue
+        let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
+        if not okV: continue
+        if coeffs.len != vars.len: continue
+        for i in 0..<vars.len:
+            if vars[i].kind != FznIdent: continue
+            let c = coeffs[i]
+            if c == 0: continue
+            let newDir = if c > 0: -1 else: 1
+            let nm = vars[i].ident
+            if nm in feasDir:
+                if feasDir[nm] != 0 and feasDir[nm] != newDir:
+                    feasDir[nm] = 0
+            else:
+                feasDir[nm] = newDir
+
+    for nm, d in feasDir:
+        if nm notin result:
+            if d != 0:
+                result[nm] = d
+        else:
+            if result[nm] != 0 and d != 0 and result[nm] != d:
+                result[nm] = 0
+
+
+proc paretoElementIndexPrune(tr: FznTranslator,
+                             domains: var Table[string, seq[int]],
+                             fixedVars: Table[string, int],
+                             eliminated: PackedSet[int],
+                             infeasible: var bool): bool =
+    ## For each variable x that is used *only* as the first argument (index)
+    ## of array_int_element constraints and where the direction of every
+    ## element result is known, prune Pareto-dominated values from dom(x).
+    ##
+    ## A value v dominates w iff for every element constraint with this index,
+    ##   direction_i * arr_i[v-1]  ≥  direction_i * arr_i[w-1]
+    ## with strict > in at least one i. Safe because all downstream effects of
+    ## changing x are captured by the element results, and every such result
+    ## has a consistent directional preference.
+    ##
+    ## Applications: VM/offer selection (capacity + cost), menu selection, any
+    ## catalog-index variable feeding resource checks and a cost objective.
+    result = false
+
+    var totalRemoved = 0
+    var prunedVars = 0
+
+    type IndexUse = object
+        arr: seq[int]
+        valName: string
+        idxOffset: int  # 1 for _element (1-based), 0 for _nonshifted
+
+    var elementUses = initTable[string, seq[IndexUse]]()
+
+    # Pass 1: collect candidate index variables and their element constraints.
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        let idxName = con.args[0].ident
+        if idxName in fixedVars: continue
+        if idxName notin domains: continue
+        if domains[idxName].len <= 1: continue
+
+        var constArr: seq[int]
+        try:
+            constArr = tr.resolveIntArray(con.args[1])
+        except ValueError, KeyError:
+            continue
+        if constArr.len == 0: continue
+
+        let valName = if con.args[2].kind == FznIdent: con.args[2].ident else: ""
+        if valName == "": continue
+
+        let idxOffset = if cname == "array_int_element": 1 else: 0
+
+        if idxName notin elementUses:
+            elementUses[idxName] = @[]
+        elementUses[idxName].add(IndexUse(arr: constArr, valName: valName, idxOffset: idxOffset))
+
+    if elementUses.len == 0: return
+
+    # Pass 2: invalidate any index variable that has a non-index use
+    # (appears anywhere except as args[0] of an array_int_element constraint).
+    var invalidated = initHashSet[string]()
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname in ["array_int_element", "array_int_element_nonshifted"] and con.args.len >= 3:
+            # Skip the index slot; still check the constant-array and result slots.
+            for i in 1..<con.args.len:
+                let arg = con.args[i]
+                if arg.kind == FznIdent and arg.ident in elementUses:
+                    invalidated.incl(arg.ident)
+                elif arg.kind == FznArrayLit:
+                    for e in arg.elems:
+                        if e.kind == FznIdent and e.ident in elementUses:
+                            invalidated.incl(e.ident)
+            continue
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident in elementUses:
+                invalidated.incl(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent and e.ident in elementUses:
+                        invalidated.incl(e.ident)
+
+    # Directions only need to be computed if at least one candidate survived.
+    var anyCandidate = false
+    for nm in elementUses.keys:
+        if nm notin invalidated:
+            anyCandidate = true
+            break
+    if not anyCandidate: return
+
+    let directions = computeVarDirections(tr, domains, fixedVars, eliminated)
+
+    # Pass 3: for each surviving candidate, attach a direction to every element
+    # result and run pairwise Pareto dominance elimination on the index domain.
+    for idxName, usesRaw in elementUses:
+        if idxName in invalidated: continue
+        if idxName in fixedVars: continue
+        if idxName notin domains: continue
+        let dom = domains[idxName]
+        if dom.len <= 1: continue
+
+        # Resolve direction per element use; bail if any unknown.
+        type Dir = object
+            arr: seq[int]
+            dir: int  # +1 or -1
+            idxOffset: int
+        var uses = newSeq[Dir](usesRaw.len)
+        var allKnown = true
+        for i, u in usesRaw:
+            let d = directions.getOrDefault(u.valName, 0)
+            if d == 0:
+                allKnown = false
+                break
+            uses[i] = Dir(arr: u.arr, dir: d, idxOffset: u.idxOffset)
+        if not allKnown: continue
+
+        # Bounds check: every value in dom(idx) must map to a valid index into
+        # every array, respecting each use's offset. If any use is out of range
+        # for some dom value, skip — elementPropagate will eliminate that value
+        # on a later iteration.
+        var allInRange = true
+        for v in dom:
+            for u in uses:
+                let arrIdx = v - u.idxOffset
+                if arrIdx < 0 or arrIdx >= u.arr.len:
+                    allInRange = false
+                    break
+            if not allInRange: break
+        if not allInRange: continue
+
+        # Guard against excessively large domains (O(n^2 * k) pairwise check).
+        # 5000^2 * 5 ≈ 125M ops per presolve iteration — cap at 5000.
+        if dom.len > 5000: continue
+
+        # Pairwise Pareto elimination. Equal values are broken by keeping the
+        # smaller index, so duplicate offers collapse to a single survivor.
+        let n = dom.len
+        var keep = newSeq[bool](n)
+        for i in 0..<n: keep[i] = true
+
+        for i in 0..<n:
+            if not keep[i]: continue
+            let vi = dom[i]
+            for j in 0..<n:
+                if i == j or not keep[j]: continue
+                let vj = dom[j]
+                # Does vi weakly dominate vj with strict > somewhere, OR are
+                # they equal and vi has the smaller domain index?
+                var allGeq = true
+                var anyStrict = false
+                for u in uses:
+                    let a = u.dir * u.arr[vi - u.idxOffset]
+                    let b = u.dir * u.arr[vj - u.idxOffset]
+                    if a < b:
+                        allGeq = false
+                        break
+                    if a > b:
+                        anyStrict = true
+                if allGeq and (anyStrict or i < j):
+                    keep[j] = false
+
+        var newDom: seq[int]
+        for i in 0..<n:
+            if keep[i]: newDom.add(dom[i])
+
+        if newDom.len < dom.len:
+            totalRemoved += dom.len - newDom.len
+            inc prunedVars
+            domains[idxName] = newDom
+            result = true
+            if newDom.len == 0:
+                infeasible = true
+                return
+
+            # Forward-propagate the pruned idx domain to each element result:
+            # val_i ⊆ {arr_i[v − offset] : v ∈ newDom}. Doing this inline cuts
+            # fixpoint iterations and tightens downstream domains (price
+            # contribution → Price[k] → objective) without waiting for
+            # elementPropagate to re-run.
+            for i in 0..<usesRaw.len:
+                let u = uses[i]
+                let valName = usesRaw[i].valName
+                if valName in fixedVars: continue
+                if valName notin domains: continue
+                var reachable: seq[int]
+                var seen: PackedSet[int]
+                for v in newDom:
+                    let w = u.arr[v - u.idxOffset]
+                    if w notin seen:
+                        seen.incl(w)
+                        reachable.add(w)
+                reachable.sort()
+                if presolveTightenDomain(domains, valName, reachable, infeasible):
+                    result = true
+                if infeasible: return
+
+    if totalRemoved > 0:
+        stderr.writeLine(&"[Presolve] Pareto element index prune: {totalRemoved} values removed across {prunedVars} vars")
+
+
 proc regularPropagate(tr: FznTranslator,
                       domains: var Table[string, seq[int]],
                       fixedVars: Table[string, int],
@@ -3593,6 +4003,14 @@ proc presolve*(tr: var FznTranslator) =
         # Step 6c2: Variable element backward array propagation
         # Tighten array element domains using result domain intersection
         if varElementArrayBackwardPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6c3: Pareto dominance pruning for element index variables
+        # When a var indexes constant arrays whose element results all have a
+        # known directional preference (from the objective or capacity-style
+        # constraints), dominated values in the index domain are removed.
+        if paretoElementIndexPrune(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
