@@ -2912,3 +2912,97 @@ solve satisfy;
             if c.stateType == SetIntersectCardType:
                 inc sicCount
         check sicCount == 0
+
+
+suite "FlatZinc Pareto Element Index Pruning":
+
+    test "pareto prune: minimize with int_lin_eq defines_var direction chain":
+        ## An index variable `idx` selects from two constant arrays whose results
+        ## feed `obj = cost - speed` (minimized). Phase A seeds dir[obj]=-1, then
+        ## int_lin_eq backward propagation infers dir[cost]=-1 and dir[speed]=+1.
+        ## Pareto dominance on the 5-value index domain removes idx=3 (dominated
+        ## by idx=5 on both axes) and idx=4 (dominated by idx=1 and idx=5).
+        let src = """
+array [1..5] of int: Cost = [5, 20, 10, 15, 8];
+array [1..5] of int: Speed = [3, 8, 4, 2, 5];
+var 1..5: idx :: output_var;
+var 0..30: cost :: var_is_introduced;
+var 0..30: speed :: var_is_introduced;
+var -30..30: obj :: var_is_introduced :: is_defined_var;
+constraint array_int_element(idx, Cost, cost);
+constraint array_int_element(idx, Speed, speed);
+constraint int_lin_eq([1,-1,-1],[cost,speed,obj],0) :: defines_var(obj);
+solve minimize obj;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pareto frontier is {1, 2, 5}:
+        #   idx=1: (cost=5, speed=3)  — best cost, not dominated
+        #   idx=2: (cost=20, speed=8) — best speed, not dominated
+        #   idx=3: (cost=10, speed=4) — dominated by idx=5 (-8>-10, 5>4)
+        #   idx=4: (cost=15, speed=2) — dominated by idx=1 and idx=5
+        #   idx=5: (cost=8, speed=5)  — middle point, not dominated
+        check tr.presolveDomains.hasKey("idx")
+        check tr.presolveDomains["idx"] == @[1, 2, 5]
+
+    test "pareto prune: satisfy problem with feasibility-only directions":
+        ## Regression test for the phase-ordering fix: satisfy problems have no
+        ## objective, so the older code bailed out early and never seeded
+        ## direction info. Now phase B (feasibility votes) runs unconditionally
+        ## and drives Pareto pruning from int_lin_le constraints alone.
+        ##
+        ## int_lin_le([1],[a],15) → dir[a]=-1;  int_lin_le([1],[b],10) → dir[b]=-1.
+        ## A value dominates another when it has weakly smaller a AND smaller b.
+        let src = """
+array [1..5] of int: A = [3, 10, 5, 10, 2];
+array [1..5] of int: B = [1, 5, 3, 2, 4];
+var 1..5: idx :: output_var;
+var 0..20: a :: var_is_introduced;
+var 0..20: b :: var_is_introduced;
+constraint array_int_element(idx, A, a);
+constraint array_int_element(idx, B, b);
+constraint int_lin_le([1],[a],15);
+constraint int_lin_le([1],[b],10);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pareto frontier is {1, 5}:
+        #   idx=1: (a=3, b=1)  — best b (smallest), not dominated
+        #   idx=2: (a=10, b=5) — dominated by idx=1 (3<10, 1<5)
+        #   idx=3: (a=5, b=3)  — dominated by idx=1 (3<5, 1<3)
+        #   idx=4: (a=10, b=2) — dominated by idx=1 (3<10, 1<2)
+        #   idx=5: (a=2, b=4)  — best a (smallest), not dominated
+        check tr.presolveDomains.hasKey("idx")
+        check tr.presolveDomains["idx"] == @[1, 5]
+
+    test "pareto prune: minimize via int_plus defines_var":
+        ## Exercises the int_plus direction propagation rule. Phase C sees
+        ## `int_plus(price, weight, total) :: defines_var(total)` with
+        ## dir[total]=-1, and since c = a + b is monotone +1 in each operand,
+        ## propagates dir[price]=dir[weight]=-1. Pareto then removes idx=4,
+        ## which is strictly dominated on both price and weight by idx=1.
+        let src = """
+array [1..4] of int: Price  = [10, 20,  5, 15];
+array [1..4] of int: Weight = [ 4,  3,  6,  5];
+var 1..4: idx :: output_var;
+var 0..50: price :: var_is_introduced;
+var 0..50: weight :: var_is_introduced;
+var 0..100: total :: var_is_introduced :: is_defined_var;
+constraint array_int_element(idx, Price, price);
+constraint array_int_element(idx, Weight, weight);
+constraint int_plus(price, weight, total) :: defines_var(total);
+solve minimize total;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Pareto frontier is {1, 2, 3}:
+        #   idx=1: (price=10, weight=4)
+        #   idx=2: (price=20, weight=3) — best weight
+        #   idx=3: (price=5,  weight=6) — best price
+        #   idx=4: (price=15, weight=5) — dominated by idx=1 (10<15, 4<5)
+        check tr.presolveDomains.hasKey("idx")
+        check tr.presolveDomains["idx"] == @[1, 2, 3]

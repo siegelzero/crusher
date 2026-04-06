@@ -3026,18 +3026,19 @@ proc computeVarDirections(tr: FznTranslator,
     ##   -1 — weakly smaller value is better
     ##    0 — mixed / unknown (do not rely on it)
     ##
-    ## Seeds from the solve objective (minimize → −1, maximize → +1) and
-    ## propagates backward through `defines_var` annotations on int_lin_eq /
-    ## int_times constraints. Then, as a second phase, assigns feasibility
-    ## directions from int_lin_le / int_lin_lt for variables that phase 1 didn't
-    ## cover (with conflict downgrade to 0).
+    ## Three phases, run in order into a single `result` table:
+    ##   A. Seed the objective variable (minimize → −1, maximize → +1). No-op for Satisfy.
+    ##   B. Seed feasibility votes from int_lin_le / int_lin_lt. Each coefficient implies
+    ##      a preferred sign for its variable; conflicting votes downgrade to 0 (sticky).
+    ##   C. Iterated backward propagation through `defines_var` annotations on
+    ##      int_lin_eq, int_times, int_plus, int_max, int_min, int_abs, bool2int,
+    ##      array_int_maximum, array_int_minimum. Each rule propagates only when the
+    ##      partial-derivative sign is knowable (see per-rule comments).
+    ##
+    ## Phase B runs before C so that satisfy-problem feasibility seeds can drive
+    ## defines_var propagation. For min/max problems the semantics match the older
+    ## order: setDir's sticky-zero conflict handling still downgrades contradictions.
     result = initTable[string, int]()
-    if tr.model.solve.objective == nil: return
-    if tr.model.solve.objective.kind != FznIdent: return
-    case tr.model.solve.kind
-    of Minimize: result[tr.model.solve.objective.ident] = -1
-    of Maximize: result[tr.model.solve.objective.ident] = 1
-    else: return
 
     proc setDir(t: var Table[string, int], name: string, d: int): bool =
         ## Returns true if the table entry was updated.
@@ -3068,85 +3069,17 @@ proc computeVarDirections(tr: FznTranslator,
                 if d.len > 0: return (d[0], d[^1], true)
         return (0, 0, false)
 
-    # Phase 1: propagate through defines_var chains
-    for iter in 0..<32:
-        var changed = false
-        for ci, con in tr.model.constraints:
-            if ci in eliminated: continue
-            if not con.hasAnnotation("defines_var"): continue
-            let cname = stripSolverPrefix(con.name)
+    # Phase A: seed objective direction
+    if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        case tr.model.solve.kind
+        of Minimize: result[tr.model.solve.objective.ident] = -1
+        of Maximize: result[tr.model.solve.objective.ident] = 1
+        else: discard
 
-            # int_lin_eq with defines_var(y): y is linear combo of other vars
-            if cname == "int_lin_eq" and con.args.len >= 3:
-                let defAnn = con.getAnnotation("defines_var")
-                if defAnn.args.len < 1 or defAnn.args[0].kind != FznIdent: continue
-                let defName = defAnn.args[0].ident
-                if defName notin result: continue
-                let dirY = result[defName]
-                if dirY == 0: continue
-
-                let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
-                if not okC: continue
-                let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
-                if not okV: continue
-                if coeffs.len != vars.len: continue
-
-                var cy = 0
-                for i in 0..<vars.len:
-                    if vars[i].kind == FznIdent and vars[i].ident == defName:
-                        cy = coeffs[i]
-                        break
-                if cy == 0: continue
-
-                # From sum(c_i * x_i) = rhs we get y = (rhs − sum_{i≠y} c_i*x_i) / c_y,
-                # so ∂y/∂x_i = −c_i / c_y. direction[x_i] = sign(∂y/∂x_i) * dirY.
-                for i in 0..<vars.len:
-                    if vars[i].kind != FznIdent: continue
-                    if vars[i].ident == defName: continue
-                    let ci = coeffs[i]
-                    if ci == 0: continue
-                    let sameSign = (ci > 0) == (cy > 0)
-                    let newDir = if sameSign: -dirY else: dirY
-                    if setDir(result, vars[i].ident, newDir):
-                        changed = true
-
-            # int_times with defines_var(c): c = a * b
-            elif cname == "int_times" and con.args.len == 3:
-                let defAnn = con.getAnnotation("defines_var")
-                if defAnn.args.len < 1 or defAnn.args[0].kind != FznIdent: continue
-                let defName = defAnn.args[0].ident
-                if defName notin result: continue
-                let dirC = result[defName]
-                if dirC == 0: continue
-
-                let argA = con.args[0]
-                let argB = con.args[1]
-                let argC = con.args[2]
-                if argC.kind != FznIdent or argC.ident != defName: continue
-
-                let bB = argBounds(tr, argB, domains, fixedVars)
-                if argA.kind == FznIdent and bB.ok:
-                    var bSign = 0
-                    if bB.lo >= 0: bSign = 1
-                    elif bB.hi <= 0: bSign = -1
-                    if bSign != 0:
-                        if setDir(result, argA.ident, bSign * dirC):
-                            changed = true
-                let aB = argBounds(tr, argA, domains, fixedVars)
-                if argB.kind == FznIdent and aB.ok:
-                    var aSign = 0
-                    if aB.lo >= 0: aSign = 1
-                    elif aB.hi <= 0: aSign = -1
-                    if aSign != 0:
-                        if setDir(result, argB.ident, aSign * dirC):
-                            changed = true
-
-        if not changed: break
-
-    # Phase 2: feasibility directions from int_lin_le/int_lin_lt for vars
-    # that phase 1 did not cover. A conflicting feasibility vote downgrades
-    # phase-1 entries to 0 (mixed pressure — unsafe to use for dominance).
-    var feasDir = initTable[string, int]()
+    # Phase B: seed feasibility votes from int_lin_le/int_lin_lt.
+    # For sum(c_i * x_i) ≤ rhs: bigger c_i * x_i is worse for feasibility, so
+    # positive c → dir[x] = −1, negative c → dir[x] = +1. Multiple votes for the
+    # same variable aggregate via setDir, with conflict collapsing to 0.
     for ci, con in tr.model.constraints:
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
@@ -3162,20 +3095,154 @@ proc computeVarDirections(tr: FznTranslator,
             let c = coeffs[i]
             if c == 0: continue
             let newDir = if c > 0: -1 else: 1
-            let nm = vars[i].ident
-            if nm in feasDir:
-                if feasDir[nm] != 0 and feasDir[nm] != newDir:
-                    feasDir[nm] = 0
-            else:
-                feasDir[nm] = newDir
+            discard setDir(result, vars[i].ident, newDir)
 
-    for nm, d in feasDir:
-        if nm notin result:
-            if d != 0:
-                result[nm] = d
-        else:
-            if result[nm] != 0 and d != 0 and result[nm] != d:
-                result[nm] = 0
+    # Phase C: iterated backward propagation through defines_var chains.
+    for iter in 0..<32:
+        var changed = false
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let defAnn = con.getAnnotation("defines_var")
+            if defAnn.args.len < 1 or defAnn.args[0].kind != FznIdent: continue
+            let defName = defAnn.args[0].ident
+            if defName notin result: continue
+            let dirDef = result[defName]
+            if dirDef == 0: continue
+            let cname = stripSolverPrefix(con.name)
+
+            # int_lin_eq with defines_var(y): y is linear combo of other vars.
+            # From sum(c_i * x_i) = rhs we get y = (rhs − sum_{i≠y} c_i*x_i) / c_y,
+            # so ∂y/∂x_i = −c_i / c_y. direction[x_i] = sign(∂y/∂x_i) * dirY.
+            if cname == "int_lin_eq" and con.args.len >= 3:
+                let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
+                if not okC: continue
+                let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
+                if not okV: continue
+                if coeffs.len != vars.len: continue
+
+                var cy = 0
+                for i in 0..<vars.len:
+                    if vars[i].kind == FznIdent and vars[i].ident == defName:
+                        cy = coeffs[i]
+                        break
+                if cy == 0: continue
+
+                for i in 0..<vars.len:
+                    if vars[i].kind != FznIdent: continue
+                    if vars[i].ident == defName: continue
+                    let ci = coeffs[i]
+                    if ci == 0: continue
+                    let sameSign = (ci > 0) == (cy > 0)
+                    let newDir = if sameSign: -dirDef else: dirDef
+                    if setDir(result, vars[i].ident, newDir):
+                        changed = true
+
+            # int_times(a, b, c) with defines_var(c): c = a * b.
+            # ∂c/∂a = b, ∂c/∂b = a. Propagate only when the partner is sign-stable.
+            elif cname == "int_times" and con.args.len == 3:
+                let argA = con.args[0]
+                let argB = con.args[1]
+                let argC = con.args[2]
+                if argC.kind != FznIdent or argC.ident != defName: continue
+
+                let bB = argBounds(tr, argB, domains, fixedVars)
+                if argA.kind == FznIdent and bB.ok:
+                    var bSign = 0
+                    if bB.lo >= 0: bSign = 1
+                    elif bB.hi <= 0: bSign = -1
+                    if bSign != 0:
+                        if setDir(result, argA.ident, bSign * dirDef):
+                            changed = true
+                let aB = argBounds(tr, argA, domains, fixedVars)
+                if argB.kind == FznIdent and aB.ok:
+                    var aSign = 0
+                    if aB.lo >= 0: aSign = 1
+                    elif aB.hi <= 0: aSign = -1
+                    if aSign != 0:
+                        if setDir(result, argB.ident, aSign * dirDef):
+                            changed = true
+
+            # int_plus(a, b, c) with defines_var on any of a/b/c: a + b = c.
+            # If c defined: ∂c/∂a = ∂c/∂b = +1 → dir[a] = dir[b] = dirC.
+            # If a defined: a = c − b, so dir[c] = dirA, dir[b] = −dirA.
+            # If b defined: b = c − a, so dir[c] = dirB, dir[a] = −dirB.
+            elif cname == "int_plus" and con.args.len == 3:
+                let argA = con.args[0]
+                let argB = con.args[1]
+                let argC = con.args[2]
+                if argC.kind == FznIdent and argC.ident == defName:
+                    if argA.kind == FznIdent and setDir(result, argA.ident, dirDef):
+                        changed = true
+                    if argB.kind == FznIdent and setDir(result, argB.ident, dirDef):
+                        changed = true
+                elif argA.kind == FznIdent and argA.ident == defName:
+                    if argC.kind == FznIdent and setDir(result, argC.ident, dirDef):
+                        changed = true
+                    if argB.kind == FznIdent and setDir(result, argB.ident, -dirDef):
+                        changed = true
+                elif argB.kind == FznIdent and argB.ident == defName:
+                    if argC.kind == FznIdent and setDir(result, argC.ident, dirDef):
+                        changed = true
+                    if argA.kind == FznIdent and setDir(result, argA.ident, -dirDef):
+                        changed = true
+
+            # int_max(a, b, c) / int_min(a, b, c) with defines_var(c): max/min are
+            # weakly monotone in each operand (∂c/∂a ∈ [0,1]), so dir[a] = dir[b] = dirC.
+            # Inverse direction (a or b defined) is skipped — not monotone.
+            elif (cname == "int_max" or cname == "int_min") and con.args.len == 3:
+                let argC = con.args[2]
+                if argC.kind != FznIdent or argC.ident != defName: continue
+                let argA = con.args[0]
+                let argB = con.args[1]
+                if argA.kind == FznIdent and setDir(result, argA.ident, dirDef):
+                    changed = true
+                if argB.kind == FznIdent and setDir(result, argB.ident, dirDef):
+                    changed = true
+
+            # int_abs(a, b) with defines_var(b): b = |a|. ∂b/∂a = sign(a), so we can
+            # only propagate when dom(a) is sign-stable (strictly non-negative or
+            # strictly non-positive). Inverse direction (a defined) is skipped.
+            elif cname == "int_abs" and con.args.len == 2:
+                let argA = con.args[0]
+                let argB = con.args[1]
+                if argB.kind != FznIdent or argB.ident != defName: continue
+                if argA.kind != FznIdent: continue
+                let aB = argBounds(tr, argA, domains, fixedVars)
+                if not aB.ok: continue
+                var aSign = 0
+                if aB.lo >= 0: aSign = 1
+                elif aB.hi <= 0: aSign = -1
+                if aSign != 0:
+                    if setDir(result, argA.ident, aSign * dirDef):
+                        changed = true
+
+            # bool2int(b, i): i = b (order isomorphism 0↔false, 1↔true).
+            # Either defines_var orientation propagates 1:1.
+            elif cname == "bool2int" and con.args.len == 2:
+                let argB = con.args[0]
+                let argI = con.args[1]
+                if argI.kind == FznIdent and argI.ident == defName:
+                    if argB.kind == FznIdent and setDir(result, argB.ident, dirDef):
+                        changed = true
+                elif argB.kind == FznIdent and argB.ident == defName:
+                    if argI.kind == FznIdent and setDir(result, argI.ident, dirDef):
+                        changed = true
+
+            # array_int_maximum(m, arr) / array_int_minimum(m, arr) with
+            # defines_var(m): m = max(arr) / min(arr). Weakly monotone in every
+            # element of arr, so dir[x] = dirM for each x in arr.
+            elif (cname == "array_int_maximum" or cname == "array_int_minimum") and
+                    con.args.len == 2:
+                let argM = con.args[0]
+                if argM.kind != FznIdent or argM.ident != defName: continue
+                let (arrVars, okV) = ppResolveVarExprSeq(tr, con.args[1])
+                if not okV: continue
+                for x in arrVars:
+                    if x.kind == FznIdent and setDir(result, x.ident, dirDef):
+                        changed = true
+
+        if not changed: break
 
 
 proc paretoElementIndexPrune(tr: FznTranslator,
@@ -3239,28 +3306,43 @@ proc paretoElementIndexPrune(tr: FznTranslator,
 
     # Pass 2: invalidate any index variable that has a non-index use
     # (appears anywhere except as args[0] of an array_int_element constraint).
+    # Scans each argument three ways: as a direct scalar ident, as an inline
+    # FznArrayLit, and (crucially) as an FznIdent referring to a variable array
+    # declaration — e.g. `xs = [x1, x2, ...]` passed to `all_different(xs)`.
     var invalidated = initHashSet[string]()
+
+    proc scanArg(tr: FznTranslator, arg: FznExpr,
+                 elementUses: Table[string, seq[IndexUse]],
+                 invalidated: var HashSet[string]) =
+        case arg.kind
+        of FznIdent:
+            if arg.ident in elementUses:
+                invalidated.incl(arg.ident)
+                return
+            # Might be a named variable array; resolve and scan its elements.
+            let (items, ok) = ppResolveVarExprSeq(tr, arg)
+            if ok:
+                for e in items:
+                    if e.kind == FznIdent and e.ident in elementUses:
+                        invalidated.incl(e.ident)
+        of FznArrayLit:
+            for e in arg.elems:
+                if e.kind == FznIdent and e.ident in elementUses:
+                    invalidated.incl(e.ident)
+        else: discard
+
     for ci, con in tr.model.constraints:
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
-        if cname in ["array_int_element", "array_int_element_nonshifted"] and con.args.len >= 3:
-            # Skip the index slot; still check the constant-array and result slots.
-            for i in 1..<con.args.len:
-                let arg = con.args[i]
-                if arg.kind == FznIdent and arg.ident in elementUses:
-                    invalidated.incl(arg.ident)
-                elif arg.kind == FznArrayLit:
-                    for e in arg.elems:
-                        if e.kind == FznIdent and e.ident in elementUses:
-                            invalidated.incl(e.ident)
-            continue
-        for arg in con.args:
-            if arg.kind == FznIdent and arg.ident in elementUses:
-                invalidated.incl(arg.ident)
-            elif arg.kind == FznArrayLit:
-                for e in arg.elems:
-                    if e.kind == FznIdent and e.ident in elementUses:
-                        invalidated.incl(e.ident)
+        let isElement =
+            cname in ["array_int_element", "array_int_element_nonshifted"] and
+            con.args.len >= 3
+        for i in 0..<con.args.len:
+            # For element constraints, args[0] is the (valid) idx use — skip it;
+            # still scan args[1] (constant array) and args[2] (result) to catch
+            # candidates that show up there.
+            if isElement and i == 0: continue
+            scanArg(tr, con.args[i], elementUses, invalidated)
 
     # Directions only need to be computed if at least one candidate survived.
     var anyCandidate = false
@@ -3286,6 +3368,7 @@ proc paretoElementIndexPrune(tr: FznTranslator,
             arr: seq[int]
             dir: int  # +1 or -1
             idxOffset: int
+            valName: string
         var uses = newSeq[Dir](usesRaw.len)
         var allKnown = true
         for i, u in usesRaw:
@@ -3293,7 +3376,7 @@ proc paretoElementIndexPrune(tr: FznTranslator,
             if d == 0:
                 allKnown = false
                 break
-            uses[i] = Dir(arr: u.arr, dir: d, idxOffset: u.idxOffset)
+            uses[i] = Dir(arr: u.arr, dir: d, idxOffset: u.idxOffset, valName: u.valName)
         if not allKnown: continue
 
         # Bounds check: every value in dom(idx) must map to a valid index into
@@ -3359,11 +3442,9 @@ proc paretoElementIndexPrune(tr: FznTranslator,
             # fixpoint iterations and tightens downstream domains (price
             # contribution → Price[k] → objective) without waiting for
             # elementPropagate to re-run.
-            for i in 0..<usesRaw.len:
-                let u = uses[i]
-                let valName = usesRaw[i].valName
-                if valName in fixedVars: continue
-                if valName notin domains: continue
+            for u in uses:
+                if u.valName in fixedVars: continue
+                if u.valName notin domains: continue
                 var reachable: seq[int]
                 var seen: PackedSet[int]
                 for v in newDom:
@@ -3372,7 +3453,7 @@ proc paretoElementIndexPrune(tr: FznTranslator,
                         seen.incl(w)
                         reachable.add(w)
                 reachable.sort()
-                if presolveTightenDomain(domains, valName, reachable, infeasible):
+                if presolveTightenDomain(domains, u.valName, reachable, infeasible):
                     result = true
                 if infeasible: return
 
