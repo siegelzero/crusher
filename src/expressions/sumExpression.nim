@@ -77,8 +77,11 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
         state.currentAssignment[pos] = assignment[pos]
     state.value = state.evaluate(assignment)
 
+{.push overflowChecks: off.}
 func evaluate*[T](state: SumExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     # Computes the value of the SumExpression given the variable assignment.
+    # overflowChecks off: channel bindings with composite keys can produce
+    # intermediate sentinel values (low(int)) during initialization.
     result = state.constant
 
     case state.evalMethod:
@@ -91,6 +94,7 @@ func evaluate*[T](state: SumExpression[T], assignment: seq[T]|Table[int, T]): T 
             # For expression-based: evaluate and sum all expressions
             for exp in state.expressions:
                 result += exp.evaluate(assignment)
+{.pop.}
 
 func `$`*[T](state: SumExpression[T]): string = $(state.value)
 

@@ -347,82 +347,97 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
 
     return true
 
-proc tryCompositeColumnKey(tr: var FznTranslator, positions: seq[int],
-                           tuples: seq[seq[int]], keyCol0, keyCol1: int): bool =
-    ## Try (keyCol0, keyCol1) as a composite functional key.
-    ## If successful, all other columns become channel variables.
+proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
+                       tuples: seq[seq[int]], keyCols: seq[int],
+                       maxTotalRange: int = 500_000,
+                       maxSparsity: int = 0): bool =
+    ## Try keyCols as a composite functional key determining all other columns.
+    ## Generalizes tryCompositeColumnKey to N key columns.
+    ## If maxSparsity > 0, reject when totalRange > tuples.len * maxSparsity.
     let nCols = positions.len
+    let nKeys = keyCols.len
 
-    var key0Min = high(int)
-    var key0Max = low(int)
-    var key1Min = high(int)
-    var key1Max = low(int)
-    for t in tuples:
-        if t[keyCol0] < key0Min: key0Min = t[keyCol0]
-        if t[keyCol0] > key0Max: key0Max = t[keyCol0]
-        if t[keyCol1] < key1Min: key1Min = t[keyCol1]
-        if t[keyCol1] > key1Max: key1Max = t[keyCol1]
-
-    let range0 = key0Max - key0Min + 1
-    let range1 = key1Max - key1Min + 1
-    let totalRange = range0 * range1
-
-    if totalRange > 500_000 or totalRange > tuples.len * 5:
+    if nKeys < 1 or nKeys >= nCols:
         return false
 
-    # Verify all (keyCol0, keyCol1) pairs are unique
+    # Compute ranges for each key column
+    var keyMins = newSeq[int](nKeys)
+    var keyMaxs = newSeq[int](nKeys)
+    for i in 0..<nKeys:
+        keyMins[i] = high(int)
+        keyMaxs[i] = low(int)
+    for t in tuples:
+        for i in 0..<nKeys:
+            let v = t[keyCols[i]]
+            if v < keyMins[i]: keyMins[i] = v
+            if v > keyMaxs[i]: keyMaxs[i] = v
+
+    var keyRanges = newSeq[int](nKeys)
+    var totalRange = 1
+    for i in 0..<nKeys:
+        keyRanges[i] = keyMaxs[i] - keyMins[i] + 1
+        totalRange *= keyRanges[i]
+        if totalRange > maxTotalRange:
+            return false
+
+    if maxSparsity > 0 and totalRange > tuples.len * maxSparsity:
+        return false
+
+    # Compute linearized key for each tuple and check uniqueness
+    proc linearizeKey(t: seq[int], keyCols: seq[int], keyMins: seq[int],
+                      keyRanges: seq[int]): int =
+        result = 0
+        for i in 0..<keyCols.len:
+            result = result * keyRanges[i] + (t[keyCols[i]] - keyMins[i])
+
     var compositeKeys: PackedSet[int]
     for t in tuples:
-        let linearKey = (t[keyCol0] - key0Min) * range1 + (t[keyCol1] - key1Min)
-        if linearKey in compositeKeys:
+        let lk = linearizeKey(t, keyCols, keyMins, keyRanges)
+        if lk in compositeKeys:
             return false
-        compositeKeys.incl(linearKey)
+        compositeKeys.incl(lk)
 
     # Filter key columns' domains to values present in the table
-    var key0Values: PackedSet[int]
-    var key1Values: PackedSet[int]
+    var keyValueSets = newSeq[PackedSet[int]](nKeys)
     for t in tuples:
-        key0Values.incl(t[keyCol0])
-        key1Values.incl(t[keyCol1])
-    let key0Pos = positions[keyCol0]
-    let key0Domain = tr.sys.baseArray.domain[key0Pos]
-    var filtered0: seq[int]
-    for v in key0Domain:
-        if v in key0Values:
-            filtered0.add(v)
-    if filtered0.len < key0Domain.len:
-        tr.sys.baseArray.domain[key0Pos] = filtered0
-    let key1Pos = positions[keyCol1]
-    let key1Domain = tr.sys.baseArray.domain[key1Pos]
-    var filtered1: seq[int]
-    for v in key1Domain:
-        if v in key1Values:
-            filtered1.add(v)
-    if filtered1.len < key1Domain.len:
-        tr.sys.baseArray.domain[key1Pos] = filtered1
+        for i in 0..<nKeys:
+            keyValueSets[i].incl(t[keyCols[i]])
+    for i in 0..<nKeys:
+        let kPos = positions[keyCols[i]]
+        let kDomain = tr.sys.baseArray.domain[kPos]
+        var filtered: seq[int]
+        for v in kDomain:
+            if v in keyValueSets[i]:
+                filtered.add(v)
+        if filtered.len < kDomain.len:
+            tr.sys.baseArray.domain[kPos] = filtered
 
-    # Dependent columns: all columns except keyCol0 and keyCol1
+    # Dependent columns: all columns not in keyCols
+    var keyColSet: PackedSet[int]
+    for c in keyCols: keyColSet.incl(c)
     var depCols: seq[int]
     for c in 0..<nCols:
-        if c != keyCol0 and c != keyCol1:
+        if c notin keyColSet:
             depCols.add(c)
 
     if depCols.len == 0:
         return false
 
-    # Build linearized lookup arrays (gaps get sentinel value)
+    # Build linearized lookup arrays, using first tuple's values as default
+    # for gaps (avoids sentinel low(int) causing overflow in constraint evaluation)
     var lookups = newSeq[seq[int]](depCols.len)
     for i in 0..<depCols.len:
-        lookups[i] = newSeqWith(totalRange, low(int))
+        let defaultVal = tuples[0][depCols[i]]
+        lookups[i] = newSeqWith(totalRange, defaultVal)
     for t in tuples:
-        let idx = (t[keyCol0] - key0Min) * range1 + (t[keyCol1] - key1Min)
+        let idx = linearizeKey(t, keyCols, keyMins, keyRanges)
         for i, depCol in depCols:
             lookups[i][idx] = t[depCol]
 
     # Build composite index expression
-    let expr0 = tr.getExpr(positions[keyCol0])
-    let expr1 = tr.getExpr(positions[keyCol1])
-    let compositeExpr = (expr0 - key0Min) * range1 + (expr1 - key1Min)
+    var compositeExpr = tr.getExpr(positions[keyCols[0]]) - keyMins[0]
+    for i in 1..<nKeys:
+        compositeExpr = compositeExpr * keyRanges[i] + (tr.getExpr(positions[keyCols[i]]) - keyMins[i])
 
     for i, depCol in depCols:
         let depPos = positions[depCol]
@@ -433,15 +448,35 @@ proc tryCompositeColumnKey(tr: var FznTranslator, positions: seq[int],
 
     return true
 
+proc tryCompositeColumnKey(tr: var FznTranslator, positions: seq[int],
+                           tuples: seq[seq[int]], keyCol0, keyCol1: int): bool =
+    ## Try (keyCol0, keyCol1) as a composite functional key.
+    ## Delegates to tryMultiColumnKey with sparsity check.
+    tr.tryMultiColumnKey(positions, tuples, @[keyCol0, keyCol1],
+                         maxSparsity = 5)
+
 proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
-                                                        tuples: seq[seq[int]]): bool =
+                           tuples: seq[seq[int]],
+                           definesVarCol: int = -1): bool =
     ## Detects functional keys in table constraints and converts dependent columns
-    ## to channel variables. Tries all single columns as keys first, then all
-    ## column pairs as composite keys. Returns true if the table was consumed.
+    ## to channel variables. If definesVarCol >= 0, tries the remaining columns as
+    ## a composite key first (guided by defines_var annotation). Otherwise tries
+    ## all single columns, pairs, and triples as keys.
     if positions.len < 2 or tuples.len == 0:
         return false
 
     let nCols = positions.len
+
+    # If defines_var tells us which column is dependent, try remaining cols as key
+    if definesVarCol >= 0 and definesVarCol < nCols:
+        var keyCols: seq[int]
+        for c in 0..<nCols:
+            if c != definesVarCol:
+                keyCols.add(c)
+        # Use relaxed sparsity for annotation-guided detection since we know
+        # the dependency is real
+        if tr.tryMultiColumnKey(positions, tuples, keyCols):
+            return true
 
     # Try each single column as a unique key
     for keyCol in 0..<nCols:
@@ -454,6 +489,15 @@ proc tryTableFunctionalDep(tr: var FznTranslator, positions: seq[int],
             for keyCol1 in (keyCol0 + 1)..<nCols:
                 if tr.tryCompositeColumnKey(positions, tuples, keyCol0, keyCol1):
                     return true
+
+    # Try each column triple as a composite key (for 4+ column tables)
+    if nCols >= 4:
+        for k0 in 0..<nCols:
+            for k1 in (k0 + 1)..<nCols:
+                for k2 in (k1 + 1)..<nCols:
+                    if tr.tryMultiColumnKey(positions, tuples, @[k0, k1, k2],
+                                            maxSparsity = 10):
+                        return true
 
     return false
 
@@ -1617,6 +1661,21 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         for i in 0..<nTuples:
             tuples[i] = flatTable[i * arity ..< (i + 1) * arity]
 
+        # Extract defines_var hint: identify which column is the dependent variable
+        var definesVarCol = -1
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                let defName = ann.args[0].ident
+                if defName in tr.varPositions:
+                    let defPos = tr.varPositions[defName]
+                    let (allRefsCheck, positionsCheck) = isAllRefs(exprs)
+                    if allRefsCheck:
+                        for col in 0..<arity:
+                            if positionsCheck[col] == defPos:
+                                definesVarCol = col
+                                break
+
         # Pre-filter: detect singleton-domain columns (constants) and filter tuples
         # to matching rows, then project out constant columns. This is critical for
         # tables like preferences_data where a user_id column is fixed per constraint.
@@ -1651,20 +1710,26 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
             # Build reduced position array (exclude singleton columns)
             var reducedPositions: seq[int]
+            # Remap definesVarCol to account for projected-out columns
+            var reducedDefinesVarCol = -1
+            var reducedIdx = 0
             for col in 0..<arity:
                 if col notin singletonCols:
                     reducedPositions.add(positions[col])
+                    if col == definesVarCol:
+                        reducedDefinesVarCol = reducedIdx
+                    inc reducedIdx
 
             if filtered.len > 0:
                 # Try functional dependency: if col0 values are unique, dependent cols become channels
-                if not tr.tryTableFunctionalDep(reducedPositions, filtered):
+                if not tr.tryTableFunctionalDep(reducedPositions, filtered, reducedDefinesVarCol):
                     if not tr.tryTableComplementConversion(reducedPositions, filtered):
                         tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
             else:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
         elif allRefs:
             # Try functional dependency on the original table
-            if not tr.tryTableFunctionalDep(positions, tuples):
+            if not tr.tryTableFunctionalDep(positions, tuples, definesVarCol):
                 if not tr.tryTableComplementConversion(positions, tuples):
                     tr.sys.addConstraint(tableIn[int](positions, tuples))
         else:
@@ -1731,8 +1796,16 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         projected[j] = t[col]
                     projectedTuples.add(projected)
 
+                # Remap definesVarCol through constant-column projection
+                var projectedDefinesVarCol = -1
+                if definesVarCol >= 0:
+                    for j, col in projectCols:
+                        if col == definesVarCol:
+                            projectedDefinesVarCol = j
+                            break
+
                 if tablePositions.len > 0 and projectedTuples.len > 0:
-                    if not tr.tryTableFunctionalDep(tablePositions, projectedTuples):
+                    if not tr.tryTableFunctionalDep(tablePositions, projectedTuples, projectedDefinesVarCol):
                         if not tr.tryTableComplementConversion(tablePositions, projectedTuples):
                             tr.sys.addConstraint(tableIn[int](tablePositions, projectedTuples))
 

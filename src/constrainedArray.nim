@@ -2637,6 +2637,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     # Only keep resolvents that have strictly fewer positions than both parents.
     # Single-var resolvents (direct bounds) are always valuable. Multi-var resolvents
     # are added too but limited to avoid bloating bounds propagation.
+    var totalResolvents = 0  # Tracked at function scope for bounds-crossed detection
     block fmResolution:
         var positiveAt: Table[int, seq[int]]
         var negativeAt: Table[int, seq[int]]
@@ -2646,8 +2647,6 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     positiveAt.mgetOrPut(pos, @[]).add(fi)
                 elif coeff < 0:
                     negativeAt.mgetOrPut(pos, @[]).add(fi)
-
-        var totalResolvents = 0
         const MaxResolventsPerPos = 50
         const MaxTotalResolvents = 500
         const MaxPairProduct = 100
@@ -2996,6 +2995,16 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             # Skip skipped positions: their PackedSets are 1-element placeholders, not real domains
             for pos in boundsPositions.items:
                 if pos in skippedPositions: continue
+                if domainMin[pos] > domainMax[pos]:
+                    if totalResolvents > 0:
+                        # FM resolvents can create false infeasibility through relaxation —
+                        # the resolvents are individually valid but their combination with other
+                        # constraints can over-tighten. Reset this position's bounds to avoid
+                        # poisoning subsequent propagation.
+                        domainMin[pos] = carray.domain[pos][0]
+                        domainMax[pos] = carray.domain[pos][^1]
+                        continue
+                    # else: no FM resolvents → truly infeasible, let the empty domain propagate
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
@@ -3776,6 +3785,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
             # Skip skipped positions: their PackedSets are 1-element placeholders, not real domains
             for pos in boundsPositions.items:
                 if pos in skippedPositions: continue
+                if domainMin[pos] > domainMax[pos]:
+                    if totalResolvents > 0:
+                        domainMin[pos] = carray.domain[pos][0]
+                        domainMax[pos] = carray.domain[pos][^1]
+                        continue
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
