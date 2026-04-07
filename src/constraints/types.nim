@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard
+import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard
 
 ################################################################################
 # Shared constraint type definitions
@@ -45,7 +45,8 @@ type
         MultiMachineNoOverlapType,
         ConditionalLinearType,
         ReservoirType,
-        SetIntersectCardType
+        SetIntersectCardType,
+        ConjunctSumAtMostType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -152,3 +153,5 @@ type
                 reservoirState*: ReservoirConstraint[T]
             of SetIntersectCardType:
                 setIntersectCardState*: SetIntersectCardConstraint[T]
+            of ConjunctSumAtMostType:
+                conjunctSumAtMostState*: ConjunctSumAtMostConstraint[T]

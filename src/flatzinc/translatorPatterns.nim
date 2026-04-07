@@ -1688,6 +1688,289 @@ proc emitAtMostThroughReif*(tr: var FznTranslator) =
             parts.add(&"merged {nMergedDefs} atMost into {nMergedGroups} GCC")
         stderr.writeLine(&"[FZN] AtMost-through-reif: {parts.join(\", \")}")
 
+
+proc detectProductSumAtMost*(tr: var FznTranslator) =
+    ## Detects `int_lin_le([1,...,1], [c_1,...,c_n], rhs)` where each c_k is the
+    ## bool2int output of an `array_bool_and([a_k1, a_k2, ...], r_k)` chain.
+    ##
+    ## The standard MiniZinc decomposition of "sum of conjunctions ≤ k" produces
+    ## one (array_bool_and + bool2int) channel pair per term, plus the int_lin_le
+    ## that aggregates them. This creates O(k * n_factors) channel variables and
+    ## O(k) cascade entries per source position. We collapse the entire group to
+    ## a single ExpressionBased AtMost over product expressions, eliminating the
+    ## intermediate channel layers.
+    ##
+    ## Each accepted term must:
+    ##   - resolve via bool2int -> array_bool_and (≥ 2 factors), OR
+    ##   - resolve via bool2int -> plain bool var, OR
+    ##   - be a plain bool var directly (already 0/1)
+    ##
+    ## At least one AND-chain term must be present (otherwise the pattern is
+    ## handled by the normal int_lin_le → AtMost path).
+    ##
+    ## Source bool variables (`a_k1`, ...) must be plain (not channels and not
+    ## already consumed by another pattern), so they will become ordinary search
+    ## positions and the resulting AtMost can evaluate directly off them.
+
+    # Build index: bool var name (output of array_bool_and) -> (ci, factor names)
+    var boolAndByOutput: Table[string, tuple[ci: int, factors: seq[string]]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "array_bool_and": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit: continue
+        if con.args[1].kind != FznIdent: continue
+        let resultName = con.args[1].ident
+        # The defines_var annotation must point at the result
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        if ann.args[0].ident != resultName: continue
+        var factors: seq[string]
+        var allIdent = true
+        for elem in con.args[0].elems:
+            if elem.kind != FznIdent:
+                allIdent = false
+                break
+            factors.add(elem.ident)
+        if not allIdent or factors.len < 2: continue
+        boolAndByOutput[resultName] = (ci: ci, factors: factors)
+
+    # Build index: int var name (output of bool2int) -> (ci, source bool name)
+    var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool2int": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        bool2intByOutput[con.args[1].ident] = (ci: ci, boolVar: con.args[0].ident)
+
+    if boolAndByOutput.len == 0: return
+
+    # Build set of "plain search-bool" candidate names: declared as scalar bool,
+    # not the target of any defines_var annotation, not already a channel, and
+    # not consumed by an earlier pattern. These will become ordinary search
+    # positions during translateVariables, so the AtMost can reference them
+    # directly through algebraic expressions.
+    var plainBoolVars: HashSet[string]
+    for decl in tr.model.variables:
+        if not decl.isVar: continue
+        if decl.isArray: continue
+        if decl.varType.kind != FznBool: continue
+        plainBoolVars.incl(decl.name)
+    for con in tr.model.constraints:
+        if not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+            plainBoolVars.excl(ann.args[0].ident)
+    for n in tr.channelVarNames:
+        plainBoolVars.excl(n)
+    for n in tr.definedVarNames:
+        plainBoolVars.excl(n)
+
+    var nDetected = 0
+    var nAndTerms = 0
+    var nPlainTerms = 0
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+
+        var allPosOne = true
+        for c in coeffs:
+            if c != 1:
+                allPosOne = false
+                break
+        if not allPosOne: continue
+
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != coeffs.len: continue
+        if varElems.len == 0: continue
+
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        if rhs < 0: continue  # infeasible — leave for normal translation
+
+        var terms: seq[ProductSumAtMostTerm]
+        var consumedAndCIs: seq[int]
+        var consumedB2iCIs: seq[int]
+        var consumedAndOutputs: seq[string]
+        var consumedB2iOutputs: seq[string]
+        var hasAndTerm = false
+        var valid = true
+
+        for elem in varElems:
+            if elem.kind != FznIdent:
+                valid = false
+                break
+            let varName = elem.ident
+            var factorNames: seq[string]
+            var resolved = false
+
+            # Try: varName comes from bool2int(boolVar, varName)
+            if varName in bool2intByOutput:
+                let b2i = bool2intByOutput[varName]
+                let bv = b2i.boolVar
+                # Subcase: boolVar is itself an array_bool_and result
+                if bv in boolAndByOutput:
+                    let andInfo = boolAndByOutput[bv]
+                    var factorsOk = true
+                    for fname in andInfo.factors:
+                        if fname notin plainBoolVars:
+                            factorsOk = false
+                            break
+                    if factorsOk:
+                        factorNames = andInfo.factors
+                        consumedAndCIs.add(andInfo.ci)
+                        consumedAndOutputs.add(bv)
+                        consumedB2iCIs.add(b2i.ci)
+                        consumedB2iOutputs.add(varName)
+                        hasAndTerm = true
+                        resolved = true
+                # Subcase: plain bool2int over a search bool var
+                if (not resolved) and (bv in plainBoolVars):
+                    factorNames = @[bv]
+                    consumedB2iCIs.add(b2i.ci)
+                    consumedB2iOutputs.add(varName)
+                    resolved = true
+
+            # Try: varName is itself a search bool var (no bool2int wrapper)
+            if (not resolved) and (varName in plainBoolVars):
+                factorNames = @[varName]
+                resolved = true
+
+            if not resolved:
+                valid = false
+                break
+            terms.add(ProductSumAtMostTerm(factorVarNames: factorNames))
+
+        if not valid: continue
+        if not hasAndTerm: continue  # let the normal int_lin_le path handle this
+        if terms.len < 2: continue   # trivial cases not worth a constraint
+
+        # Pattern accepted — record it and mark consumed.
+        tr.productSumAtMostDefs.add(ProductSumAtMostDef(
+            terms: terms,
+            maxCount: rhs
+        ))
+        tr.definingConstraints.incl(ci)
+        for andCi in consumedAndCIs:
+            tr.definingConstraints.incl(andCi)
+        for b2iCi in consumedB2iCIs:
+            tr.definingConstraints.incl(b2iCi)
+        for vn in consumedAndOutputs:
+            tr.definedVarNames.incl(vn)
+        for vn in consumedB2iOutputs:
+            tr.definedVarNames.incl(vn)
+        inc nDetected
+        for t in terms:
+            if t.factorVarNames.len >= 2:
+                inc nAndTerms
+            else:
+                inc nPlainTerms
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] ProductSumAtMost: {nDetected} patterns ({nAndTerms} AND terms, {nPlainTerms} plain terms)")
+
+
+proc emitProductSumAtMost*(tr: var FznTranslator) =
+    ## Emits a ConjunctSumAtMost constraint for each detected product-sum pattern.
+    ##
+    ## Each term becomes a "group" of positions whose conjunction we count. Terms
+    ## whose product is statically zero (any factor's domain fixed to 0) are dropped;
+    ## terms whose product is statically one (all factors fixed to 1) reduce the
+    ## remaining budget. The resulting constraint operates directly off the source
+    ## boolean positions — no expression-tree traversal, no intermediate channels.
+
+    if tr.productSumAtMostDefs.len == 0: return
+
+    var nMultiGroup = 0
+    var nSingleGroup = 0
+    var nDroppedTerms = 0
+    var nForcedTerms = 0
+    var nUnsat = 0
+
+    for def in tr.productSumAtMostDefs:
+        var groups: seq[seq[int]]
+        var maxCount = def.maxCount
+        var hasMultiFactorGroup = false
+        var allResolved = true
+
+        for term in def.terms:
+            # Resolve all factor positions
+            var positions: seq[int]
+            var ok = true
+            for fname in term.factorVarNames:
+                if fname notin tr.varPositions:
+                    ok = false
+                    break
+                positions.add(tr.varPositions[fname])
+            if not ok:
+                allResolved = false
+                break
+
+            # Static evaluation — drop or fold terms with fixed factors
+            var staticZero = false
+            var unfixedPositions: seq[int]
+            for pos in positions:
+                let dom = tr.sys.baseArray.domain[pos]
+                if dom.len == 1:
+                    if dom[0] == 0:
+                        staticZero = true
+                        break
+                    elif dom[0] == 1:
+                        discard  # forced-true factor: contributes nothing to the group
+                    else:
+                        # Non-binary singleton — bail and let normal translation handle
+                        allResolved = false
+                        break
+                else:
+                    unfixedPositions.add(pos)
+            if not allResolved: break
+            if staticZero:
+                inc nDroppedTerms
+                continue
+            if unfixedPositions.len == 0:
+                # All factors fixed to 1 — this term contributes 1 always.
+                maxCount -= 1
+                inc nForcedTerms
+                continue
+
+            groups.add(unfixedPositions)
+            if unfixedPositions.len >= 2:
+                hasMultiFactorGroup = true
+
+        if not allResolved:
+            # Couldn't resolve cleanly — should not normally happen since detection
+            # validates plain vars; skip silently to be safe.
+            continue
+
+        if groups.len == 0:
+            # All terms folded away. If maxCount < 0 the constraint is unsat;
+            # otherwise it's trivially satisfied.
+            if maxCount < 0:
+                inc nUnsat
+            continue
+
+        let effectiveMax = max(0, maxCount)
+        tr.sys.addConstraint(conjunctSumAtMost[int](groups, 1, effectiveMax))
+        if hasMultiFactorGroup:
+            inc nMultiGroup
+        else:
+            inc nSingleGroup
+
+    if nMultiGroup + nSingleGroup + nDroppedTerms + nForcedTerms + nUnsat > 0:
+        stderr.writeLine(&"[FZN] ProductSumAtMost emit: {nMultiGroup} conjunct atMost, {nSingleGroup} ref-only atMost, {nDroppedTerms} terms dropped (zero), {nForcedTerms} terms forced (one), {nUnsat} unsat collapsed")
+
+
 proc detectArgmaxPattern(tr: var FznTranslator) =
     ## Detects argmax decomposition patterns from MiniZinc's arg_max:
     ##   N × int_ne_reif(argmax_var, t, ne_var_t) :: defines_var(ne_var_t)

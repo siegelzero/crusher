@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -9,8 +9,13 @@ randomize()
 
 # Logging configuration
 const LogInterval* = 50000  # Log every N iterations
-const ProfileMoveDelta* = false  # Enable moveDelta profiling (disable for performance)
-const ProfileIteration* = false  # Enable per-iteration phase profiling
+# Profiling switches — disabled by default. Enable at compile time with
+#   -d:profileMoveDelta   → per-constraint-type moveDelta call counts and time
+#   -d:profileIteration   → full per-phase iteration timing + neighborByType
+# `profileIteration` implies `profileMoveDelta` since the per-type breakdown
+# in updateNeighborPenalties is more useful with both available.
+const ProfileMoveDelta* = defined(profileMoveDelta) or defined(profileIteration)
+const ProfileIteration* = defined(profileIteration)
 const LazyThreshold* = 1000  # Positions with domain > this use on-demand costDelta instead of penalty maps
 const BatchLazyMax* = 10000  # Lazy positions with domain <= this use batch evaluation in bestMoves
 
@@ -369,6 +374,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.reservoirState.moveDelta(position, oldValue, newValue)
         of SetIntersectCardType:
             result = constraint.setIntersectCardState.moveDelta(position, oldValue, newValue)
+        of ConjunctSumAtMostType:
+            result = constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -467,6 +474,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ReservoirType:
             let p = constraint.reservoirState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == ConjunctSumAtMostType:
+            let p = constraint.conjunctSumAtMostState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         else:
@@ -585,6 +596,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
                 state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == ConjunctSumAtMostType:
+            let penalties = constraint.conjunctSumAtMostState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
         else:
             # Individual computation for other constraints
             for i in 0..<dLen:
@@ -697,6 +714,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             state.constraintPenalties[position][localIdx][i] = newP
     elif constraint.stateType == MultiMachineNoOverlapType:
         let penalties = constraint.multiMachineNoOverlapState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == ConjunctSumAtMostType:
+        let penalties = constraint.conjunctSumAtMostState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]

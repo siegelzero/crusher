@@ -1,7 +1,7 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test fzcrusher mztest
+.PHONY: help test fzcrusher fzcrusher-profile mztest
 
 # Default target
 help:
@@ -9,10 +9,12 @@ help:
 	@echo "==============================="
 	@echo ""
 	@echo "Available targets:"
-	@echo "  help         - Show this help message"
-	@echo "  test         - Auto-discover and run all test_*.nim files in tests/"
-	@echo "  fzcrusher    - Build the FlatZinc solver binary"
-	@echo "  mztest       - Run MiniZinc integration tests"
+	@echo "  help              - Show this help message"
+	@echo "  test              - Auto-discover and run all test_*.nim files in tests/"
+	@echo "  fzcrusher         - Build the FlatZinc solver binary"
+	@echo "  fzcrusher-profile - Build fzcrusher with iteration/moveDelta profiling enabled"
+	@echo "                       (run with -v to see [Profile] lines)"
+	@echo "  mztest            - Run MiniZinc integration tests"
 	@echo ""
 
 test:
@@ -24,6 +26,12 @@ test:
 # Build the FlatZinc solver binary
 fzcrusher:
 	nim c --threads:on --mm:arc --deepcopy:on -d:release -o:fzcrusher src/fzcrusher.nim
+
+# Build with neighborhood-exploration profiling enabled. Adds per-phase timing,
+# per-constraint-type neighbor update counts/time, and moveDelta call profiling.
+# Profiling output is printed by logExitStats at the end of each Tabu run.
+fzcrusher-profile:
+	nim c --threads:on --mm:arc --deepcopy:on -d:release -d:profileIteration -o:fzcrusher-profile src/fzcrusher.nim
 
 mztest: fzcrusher
 	@bash tests/mztest.sh

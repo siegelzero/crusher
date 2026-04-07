@@ -1314,7 +1314,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType, ReservoirType, SetIntersectCardType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType, ReservoirType, SetIntersectCardType, ConjunctSumAtMostType:
                     # Skip these constraint types for domain reduction
                     continue
 
@@ -3287,6 +3287,66 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if currentDomain[pos].len > 1:
                             currentDomain[pos] = toPackedSet[T]([T(target)])
                             outerChanged = true
+
+        # Phase 5e: ConjunctSumAtMost domain reduction
+        # Each constraint counts how many "groups" of positions have ALL members
+        # equal to targetValue, and bounds that count by maxOccurrences. We can
+        # tighten domains via two observations:
+        #
+        #   1. A group with any position whose domain excludes target is "dead"
+        #      — it will never satisfy the conjunction and contributes 0 forever.
+        #   2. A group with all positions fixed to target is "forced" — it always
+        #      contributes 1 and consumes one slot of the budget.
+        #   3. For each position p still containing target in its domain, count
+        #      how many *active* groups would become forced if p were set to
+        #      target (i.e., groups where p is the sole position not yet pinned
+        #      to target). If forcedCount + triggerCount > maxOccurrences, then
+        #      setting p to target would overflow the budget, so target can be
+        #      excluded from p's domain.
+        #
+        # Symmetric in target value (works for both target=1 and target=0). Each
+        # reduction may unfix things in other constraints, so the outer fixed-point
+        # loop will re-run all phases.
+        for cons in carray.constraints:
+            if cons.stateType != ConjunctSumAtMostType: continue
+            let csam = cons.conjunctSumAtMostState
+            let maxOcc = csam.maxOccurrences
+            let target = csam.targetValue
+            let nGroups = csam.groupTruth.len
+
+            var forcedCount = 0
+            var perPosTrigger: Table[int, int]
+            for gi in 0 ..< nGroups:
+                let gStart = csam.groupOffsets[gi]
+                let gEnd = csam.groupOffsets[gi + 1]
+                var dead = false
+                var unfixed: seq[int]
+                for k in gStart ..< gEnd:
+                    let li = csam.groupLocalPositions[k]
+                    let p = csam.localToPosition[li]
+                    let dom = currentDomain[p]
+                    if T(target) notin dom:
+                        dead = true
+                        break
+                    if dom.len > 1:
+                        unfixed.add(p)
+                if dead:
+                    continue
+                if unfixed.len == 0:
+                    inc forcedCount
+                elif unfixed.len == 1:
+                    perPosTrigger.mgetOrPut(unfixed[0], 0) += 1
+
+            if forcedCount > maxOcc:
+                # Already infeasible from a domain point of view — let local search
+                # report the violation rather than zeroing out domains here.
+                continue
+
+            for p, triggerCount in perPosTrigger.pairs:
+                if forcedCount + triggerCount > maxOcc:
+                    if currentDomain[p].len > 1 and T(target) in currentDomain[p]:
+                        currentDomain[p].excl(T(target))
+                        outerChanged = true
 
         # Phase 5d: GCC (Global Cardinality) domain reduction
         var gccPruned = 0

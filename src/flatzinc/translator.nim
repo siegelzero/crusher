@@ -167,6 +167,23 @@ type
         targetValue*: int              # the shared constant value being counted
         maxCount*: int                 # maximum allowed count (rhs)
 
+    ProductSumAtMostTerm* = object
+        ## A single term in a product-sum atMost constraint. Each term contributes
+        ## the product of its source boolean variables (which equals 1 iff all are
+        ## true). A single-element factor list is just a plain bool reference.
+        factorVarNames*: seq[string]   # source bool var names whose AND we count
+
+    ProductSumAtMostDef* = object
+        ## A detected `int_lin_le([1,...,1], [c_1,...,c_n], rhs)` where each c_k
+        ## ultimately comes from a chain like
+        ##   array_bool_and([a_k1, a_k2, ...], r_k) :: defines_var(r_k)
+        ##   bool2int(r_k, c_k) :: defines_var(c_k)
+        ## Collapsed to: `atMost(product_expressions, 1, rhs)`, where each
+        ## expression is the product of its factor positions. This eliminates
+        ## the intermediate array_bool_and / bool2int channel layers.
+        terms*: seq[ProductSumAtMostTerm]
+        maxCount*: int                 # maximum allowed count (rhs)
+
     CrossingCountMaxDef* = object
         ## A detected crossing count max pattern:
         ## array_int_maximum(M, sums of betweenness indicators)
@@ -415,6 +432,8 @@ type
         skillAllocationDefs*: seq[SkillAllocationDef]
         # Detected atMost-through-reification patterns (int_lin_le on int_eq_reif outputs)
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
+        # Detected product-sum atMost patterns (int_lin_le on bool2int(array_bool_and(..)) chains)
+        productSumAtMostDefs*: seq[ProductSumAtMostDef]
         # Detected argmax patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
         argmaxPatterns*: Table[int, ArgmaxPattern]
         # Detected crossing count max patterns (betweenness indicators → sum → array_int_maximum)
@@ -879,6 +898,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.skipSetVarNames = initHashSet[string]()
     result.rescuedChannelDefs = @[]
     result.boolAndChannelDefs = @[]
+    result.productSumAtMostDefs = @[]
     result.binaryCondChannelDefs = @[]
     result.oneHotCondChannelDefs = @[]
     result.boolEquivAliasDefs = @[]
@@ -929,6 +949,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect atMost-through-reification: int_lin_le([1,...,1], [int_eq_reif outputs]) → direct atMost
     # (MUST run after skill-allocation detection and before detectReifChannels)
     result.detectAtMostThroughReif()
+    # Detect product-sum atMost: int_lin_le([1,...,1], [bool2int(array_bool_and(..)) outputs]) →
+    # ExpressionBased atMost over product expressions. MUST run before detectReifChannels and
+    # detectBoolAndChannels so the consumed array_bool_and / bool2int constraints are not
+    # turned into channel bindings.
+    result.detectProductSumAtMost()
     # Detect reservoir constraint patterns (int_lin_le → bool2int → int_lin_le_reif([1,-1]))
     # MUST run before detectReifChannels to prevent channelization of ordering booleans
     result.detectReservoirPattern()
@@ -1099,6 +1124,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit direct atMost constraints for detected atMost-through-reification patterns
     if result.atMostThroughReifDefs.len > 0:
         result.emitAtMostThroughReif()
+    # Emit ExpressionBased atMost constraints for detected product-sum patterns
+    if result.productSumAtMostDefs.len > 0:
+        result.emitProductSumAtMost()
     # Build expressions for bool2int identity aliases (int output → bool input's position)
     # MUST run before buildDefinedExpressions which may reference aliased vars
     for intName, boolName in result.bool2intIdentityAliases:

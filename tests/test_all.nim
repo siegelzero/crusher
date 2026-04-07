@@ -4,6 +4,7 @@ import test_all_different_except0
 import test_argmax_channels
 import test_atleast
 import test_atmost
+import test_conjunct_sum_at_most
 import test_bool_equiv_gated_channels
 import test_bool_iff_or_channels
 import test_boolean_constraints

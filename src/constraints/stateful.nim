@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
 
@@ -310,6 +310,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "CircuitTimeProp Constraint"
         of MultiMachineNoOverlapType:
             return "MultiMachineNoOverlap Constraint"
+        of ConjunctSumAtMostType:
+            return "ConjunctSumAtMost Constraint"
 
 ################################################################################
 # Evaluation
@@ -391,6 +393,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.circuitTimePropState.cost
         of MultiMachineNoOverlapType:
             return constraint.multiMachineNoOverlapState.cost
+        of ConjunctSumAtMostType:
+            return constraint.conjunctSumAtMostState.cost
 
 ################################################################################
 # Computed Constraints
@@ -718,6 +722,36 @@ func atMost*[T](expressions: seq[AlgebraicExpression[T]], targetValue: T, maxOcc
         )
 
 
+func conjunctSumAtMost*[T](groups: seq[seq[int]], targetValue: T, maxOccurrences: int): StatefulConstraint[T] =
+    ## Creates a ConjunctSumAtMost constraint that bounds how many groups have ALL
+    ## member positions equal to `targetValue`.
+    ##
+    ## **Mathematical Form**: `|{g ∈ groups : ∀ p ∈ g . x[p] = targetValue}| ≤ maxOccurrences`
+    ##
+    ## When every group has exactly one position this is equivalent to a position-based
+    ## AtMost; the wrapper redirects to that more compact form. Otherwise it produces a
+    ## dedicated position-based constraint that is faster than ExpressionBased AtMost
+    ## over product expressions.
+    var allBinary = true
+    var refPositions: seq[int]
+    for g in groups:
+        if g.len != 1:
+            allBinary = false
+            break
+        refPositions.add(g[0])
+    if allBinary and refPositions.len > 0:
+        return atMost[T](refPositions, targetValue, maxOccurrences)
+    var allPositions = toPackedSet[int]([])
+    for g in groups:
+        for p in g:
+            allPositions.incl(p)
+    return StatefulConstraint[T](
+        positions: allPositions,
+        stateType: ConjunctSumAtMostType,
+        conjunctSumAtMostState: newConjunctSumAtMostConstraint[T](groups, targetValue, maxOccurrences)
+    )
+
+
 func increasing*[T](positions: openArray[int]): StatefulConstraint[T] =
     ## Creates an Increasing constraint ensuring non-decreasing order.
     ##
@@ -1020,6 +1054,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.circuitTimePropState.initialize(assignment)
         of MultiMachineNoOverlapType:
             constraint.multiMachineNoOverlapState.initialize(assignment)
+        of ConjunctSumAtMostType:
+            constraint.conjunctSumAtMostState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1098,6 +1134,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.circuitTimePropState.moveDelta(position, oldValue, newValue)
         of MultiMachineNoOverlapType:
             constraint.multiMachineNoOverlapState.moveDelta(position, oldValue, newValue)
+        of ConjunctSumAtMostType:
+            constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1176,6 +1214,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.circuitTimePropState.updatePosition(position, newValue)
         of MultiMachineNoOverlapType:
             constraint.multiMachineNoOverlapState.updatePosition(position, newValue)
+        of ConjunctSumAtMostType:
+            constraint.conjunctSumAtMostState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1231,6 +1271,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.globalCardinalityState.getAffectedPositions()
         of AllDifferentExcept0Type:
             return constraint.allDifferentExcept0State.getAffectedPositions()
+        of ConjunctSumAtMostType:
+            return constraint.conjunctSumAtMostState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1267,6 +1309,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.reservoirState.getAffectedDomainValues(position)
         of AllDifferentExcept0Type:
             return constraint.allDifferentExcept0State.getAffectedDomainValues(position)
+        of ConjunctSumAtMostType:
+            return constraint.conjunctSumAtMostState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -1879,6 +1923,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: MultiMachineNoOverlapType,
                 multiMachineNoOverlapState: constraint.multiMachineNoOverlapState.deepCopy()
+            )
+        of ConjunctSumAtMostType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: ConjunctSumAtMostType,
+                conjunctSumAtMostState: constraint.conjunctSumAtMostState.deepCopy()
             )
 
 
