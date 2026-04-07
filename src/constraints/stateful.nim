@@ -732,14 +732,16 @@ func conjunctSumAtMost*[T](groups: seq[seq[int]], targetValue: T, maxOccurrences
     ## AtMost; the wrapper redirects to that more compact form. Otherwise it produces a
     ## dedicated position-based constraint that is faster than ExpressionBased AtMost
     ## over product expressions.
-    var allBinary = true
+    # If every group is a single position the conjunction collapses to a plain
+    # value test, so the constraint is equivalent to a position-based AtMost.
+    var allSinglePosition = true
     var refPositions: seq[int]
     for g in groups:
         if g.len != 1:
-            allBinary = false
+            allSinglePosition = false
             break
         refPositions.add(g[0])
-    if allBinary and refPositions.len > 0:
+    if allSinglePosition and refPositions.len > 0:
         return atMost[T](refPositions, targetValue, maxOccurrences)
     var allPositions = toPackedSet[int]([])
     for g in groups:

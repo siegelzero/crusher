@@ -1842,10 +1842,10 @@ proc detectProductSumAtMost*(tr: var FznTranslator) =
                     consumedB2iOutputs.add(varName)
                     resolved = true
 
-            # Try: varName is itself a search bool var (no bool2int wrapper)
-            if (not resolved) and (varName in plainBoolVars):
-                factorNames = @[varName]
-                resolved = true
+            # NOTE: a "varName is itself a search bool" branch would be dead
+            # code — int_lin_le's second argument is `array of var int`, so a
+            # bool var declaration cannot legally appear there. Both subcases
+            # above route through the bool2int wrapper.
 
             if not resolved:
                 valid = false

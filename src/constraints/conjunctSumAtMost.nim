@@ -59,11 +59,20 @@ type
         positionToLocal*: Table[int, int]  # absolute → local (entry point only)
         localAssignment*: seq[T]        # local index → current value
         groupsAtLocal*: seq[seq[int]]   # local index → group indices containing it
+                                        # (deduplicated; each gi appears at most once
+                                        # per local index even if a group lists the
+                                        # position multiple times)
 
         # Group storage (CSR), keyed by local indices
         groupOffsets*: seq[int]         # length numGroups + 1
         groupLocalPositions*: seq[int]  # concatenated local-index lists
         groupTruth*: seq[uint8]         # 1 if group's conjunction holds
+
+        # Maximum |actualOccurrences delta| achievable from a single position
+        # change. Equals max length of `groupsAtLocal[li]` over all li (after
+        # dedup). Used by `getAffectedPositions` to widen the boundary check
+        # so penalty maps are recomputed when stale values would result.
+        maxDegree*: int
 
         # Union of all referenced *absolute* positions, used by the system to
         # track which positions this constraint touches.
@@ -77,7 +86,9 @@ func newConjunctSumAtMostConstraint*[T](groups: seq[seq[int]],
                                         targetValue: T,
                                         maxOccurrences: int): ConjunctSumAtMostConstraint[T] =
     ## `groups[i]` is the list of *absolute* positions whose conjunction we count.
-    new(result)
+    ## Duplicate positions within a group are tolerated: they collapse to a single
+    ## factor (a position pinned to target alongside itself trivially holds), and
+    ## `groupsAtLocal` is deduplicated so `moveDelta` cannot double-count.
     result = ConjunctSumAtMostConstraint[T](
         targetValue: targetValue,
         maxOccurrences: maxOccurrences,
@@ -98,22 +109,40 @@ func newConjunctSumAtMostConstraint*[T](groups: seq[seq[int]],
     result.localAssignment = newSeq[T](result.nLocal)
     result.groupsAtLocal = newSeq[seq[int]](result.nLocal)
 
-    # Pass 2: Materialise the CSR group store with local indices.
+    # Pass 2: Materialise the CSR group store with local indices. Within each
+    # group we drop duplicate local indices so `groupLocalPositions` reflects
+    # the unique factor set, and we record each gi at most once per local index
+    # (otherwise `moveDelta`/`batchMovePenalty` would over-count `changeCount`).
     result.groupOffsets = newSeq[int](groups.len + 1)
     var totalLen = 0
     for g in groups:
-        totalLen += g.len
+        totalLen += g.len  # upper bound; actual may be smaller after dedup
     result.groupLocalPositions = newSeq[int](totalLen)
     result.groupTruth = newSeq[uint8](groups.len)
     var cursor = 0
+    var seenInGroup = newSeq[int](result.nLocal)  # marker buffer, value = gi+1 if seen
     for gi, g in groups:
         result.groupOffsets[gi] = cursor
+        let mark = gi + 1
         for p in g:
             let li = result.positionToLocal[p]
+            if seenInGroup[li] == mark: continue  # dedupe within this group
+            seenInGroup[li] = mark
             result.groupLocalPositions[cursor] = li
             inc cursor
             result.groupsAtLocal[li].add(gi)
     result.groupOffsets[groups.len] = cursor
+    # Trim to the actual (post-dedup) length so iteration over groupOffsets is
+    # correct even though the underlying buffer was over-allocated.
+    result.groupLocalPositions.setLen(cursor)
+
+    # Compute maxDegree from the deduplicated groupsAtLocal lists. This is the
+    # maximum |delta| in actualOccurrences that any single move can produce.
+    var maxDeg = 0
+    for li in 0 ..< result.nLocal:
+        if result.groupsAtLocal[li].len > maxDeg:
+            maxDeg = result.groupsAtLocal[li].len
+    result.maxDegree = maxDeg
 
 ################################################################################
 # Initialization & updates
@@ -297,15 +326,34 @@ proc batchMovePenalty*[T](state: ConjunctSumAtMostConstraint[T], position: int,
                 result[i] = 0
 
 proc getAffectedPositions*[T](state: ConjunctSumAtMostConstraint[T]): PackedSet[int] =
-    ## Mirrors AtMost: only return positions when the at-most boundary was crossed.
+    ## Returns positions whose cached penalty maps could now be stale.
+    ##
+    ## Unlike vanilla `AtMost`, a single position move can shift
+    ## `actualOccurrences` by up to `maxDegree` (when the moved position is
+    ## shared across many groups). The simple `(actual < maxOcc)` boundary
+    ## check used by `AtMost` is therefore unsafe here: a neighbor whose
+    ## hypothetical move has `changeCount = c > 1` may see its delta change
+    ## even when neither marginal flips.
+    ##
+    ## Sufficient condition for *every* neighbor's penalty delta to be
+    ## unaffected by this state change:
+    ##
+    ##   - both old and new actualOccurrences are ≤ `maxOcc - maxDegree`
+    ##     (constraint is slack; all deltas are 0), OR
+    ##   - both old and new actualOccurrences are >  `maxOcc + maxDegree`
+    ##     (constraint is saturated; all deltas equal ±changeCount).
+    ##
+    ## Anywhere else (including the boundary band itself) requires recomputing.
     let old = state.lastOldOccurrences
     let new2 = state.lastNewOccurrences
     if old == new2:
         return initPackedSet[int]()
     let maxOcc = state.maxOccurrences
-    let addMarginalChanged = (old < maxOcc) != (new2 < maxOcc)
-    let removeMarginalChanged = (old <= maxOcc) != (new2 <= maxOcc)
-    if not addMarginalChanged and not removeMarginalChanged:
+    let maxDeg = state.maxDegree
+    let lowSafe = maxOcc - maxDeg
+    let highSafe = maxOcc + maxDeg
+    if (old <= lowSafe and new2 <= lowSafe) or
+       (old > highSafe and new2 > highSafe):
         return initPackedSet[int]()
     return state.positions
 
@@ -318,17 +366,23 @@ proc getAffectedDomainValues*[T](state: ConjunctSumAtMostConstraint[T], position
     return @[]
 
 proc deepCopy*[T](state: ConjunctSumAtMostConstraint[T]): ConjunctSumAtMostConstraint[T] =
-    ## Independent copy for parallel worker isolation. The local-index layout is
-    ## immutable post-construction, so we share its conceptual content via fresh
-    ## copies. Live state (`actualOccurrences`, `cost`, `groupTruth`,
-    ## `localAssignment`) is reset; the copy is ready for a fresh `initialize`.
-    new(result)
+    ## Independent copy for parallel worker isolation. The structural layout
+    ## (`localToPosition`, `groupsAtLocal`, `groupOffsets`, `groupLocalPositions`)
+    ## is immutable post-construction, so seq assignment yields independent
+    ## per-worker buffers without further work. Live state (`groupTruth`,
+    ## `localAssignment`) is reset to default; the copy is ready for a fresh
+    ## `initialize`.
+    ##
+    ## `positions` is rebuilt via `incl` rather than direct field assignment to
+    ## sidestep the Nim 2.2.6 PackedSet `=copy` bug under ARC (see CLAUDE.md /
+    ## src/search/optimization.nim:copyPackedSet).
     result = ConjunctSumAtMostConstraint[T](
         targetValue: state.targetValue,
         maxOccurrences: state.maxOccurrences,
         actualOccurrences: 0,
         cost: 0,
         nLocal: state.nLocal,
+        maxDegree: state.maxDegree,
         positionToLocal: initTable[int, int]()
     )
     result.localToPosition = state.localToPosition
@@ -337,6 +391,8 @@ proc deepCopy*[T](state: ConjunctSumAtMostConstraint[T]): ConjunctSumAtMostConst
     result.groupOffsets = state.groupOffsets
     result.groupLocalPositions = state.groupLocalPositions
     result.groupTruth = newSeq[uint8](state.groupTruth.len)
-    result.positions = state.positions
+    result.positions = initPackedSet[int]()
+    for p in state.positions.items:
+        result.positions.incl(p)
     for k, v in state.positionToLocal.pairs:
         result.positionToLocal[k] = v
