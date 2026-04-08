@@ -4958,6 +4958,231 @@ proc detectAtMostPairCliques(tr: var FznTranslator) =
                           &"({totalVars} vars), {totalConsumed} pairwise constraints consumed")
 
 
+proc detectBinaryNandAggregate*(tr: var FznTranslator) =
+    ## Detects `int_lin_le([1,...,1], [x_1,...,x_k], k-1)` constraints where
+    ## every x_i is a binary {0,1} variable, with k >= 3. Each such constraint
+    ## is logically a k-ary boolean NAND clause: NOT(x_1 AND ... AND x_k),
+    ## i.e. "no all-true k-tuple". A wide class of problems (hypergraph
+    ## independent set, packing, no-bad-triple) emit thousands of these from
+    ## a parametric `forall ... where ...` quantifier.
+    ##
+    ## Crusher already routes such constraints individually to position-based
+    ## `AtMost(positions, 1, k-1)`. Each one becomes its own constraint with
+    ## its own state, dispatch entry, and per-move evaluation. For models with
+    ## thousands of clauses on the same dense set of binary positions, the
+    ## per-constraint *fixed* overhead (one dispatch + one hash-map probe per
+    ## affected clause per move) dominates.
+    ##
+    ## We aggregate them: collect all such clauses (k >= 3), record the
+    ## variable names, and mark the source `int_lin_le` constraints as
+    ## consumed. The emit pass builds one `ConjunctSumAtMost(groups, 1, 0)`
+    ## with one group per clause. ConjunctSumAtMost's CSR / dense-seq hot
+    ## path is designed exactly for "many tiny groups, dense affected-position
+    ## walk", so move evaluation drops to a single dispatch that walks just
+    ## the groups touching the moved position.
+    ##
+    ## Pairwise (k=2) NAND clauses are intentionally left to
+    ## `detectAtMostPairCliques`, which has its own (more compact) clique
+    ## merging.
+    ##
+    ## **Generality**: this is not isosceles-specific. Any model whose
+    ## decomposition produces many `int_lin_le([1,...,1], binary_vars, k-1)`
+    ## constraints benefits identically — n-queens-style packing, hypergraph
+    ## IS, set-system avoidance, etc.
+
+    var nClauses = 0
+    var nMixedSizes = newSeq[int](16)  # histogram of clause sizes (clamped)
+
+    # Build the var-name → declaration index once so we can check the
+    # `is_defined_var` annotation directly. `definedVarNames` and
+    # `channelVarNames` aren't yet populated for bool2int outputs at this
+    # point in the pipeline (those passes run later), so we need the source
+    # annotation as the authoritative test.
+    tr.buildVarDomainIndex()
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if ci in tr.redundantOrderings: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        # Coefficients must all be +1
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        if coeffs.len < 3: continue  # leave k=1,2 to other paths
+        var allOne = true
+        for c in coeffs:
+            if c != 1:
+                allOne = false
+                break
+        if not allOne: continue
+
+        # rhs must be k - 1 exactly (the NAND threshold)
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        if rhs != coeffs.len - 1: continue
+
+        # Variables must all be binary {0,1}, distinct, plain (not channels,
+        # not defined vars, not eliminated). We require distinct names because
+        # repeated positions inside one clause are degenerate (and would change
+        # the rhs interpretation).
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != coeffs.len: continue
+        var names: seq[string]
+        var ok = true
+        var seen: HashSet[string]
+        for elem in varElems:
+            if elem.kind != FznIdent:
+                ok = false
+                break
+            let nm = elem.ident
+            if nm in tr.paramValues:
+                ok = false
+                break
+            if nm in tr.definedVarNames:
+                ok = false
+                break
+            if nm in tr.channelVarNames:
+                ok = false
+                break
+            # The runtime channel/defined sets above are populated by passes
+            # that run *later* in the pipeline (e.g. bool2int identity
+            # aliasing, reif channel detection). Catch those cases at the
+            # source by checking the variable's `is_defined_var` annotation
+            # on the model declaration directly. This keeps bool2int outputs,
+            # int_eq_reif outputs, etc. out of the aggregation so they remain
+            # available for downstream NAND-redundancy detection or for
+            # channel-based pruning.
+            if nm in tr.varDomainIndex:
+                let decl = tr.model.variables[tr.varDomainIndex[nm]]
+                if decl.hasAnnotation("is_defined_var"):
+                    ok = false
+                    break
+            if nm in seen:
+                ok = false
+                break
+            seen.incl(nm)
+            var dom = tr.lookupVarDomain(nm)
+            if nm in tr.presolveDomains:
+                dom = tr.presolveDomains[nm]
+            if dom != @[0, 1]:
+                ok = false
+                break
+            names.add(nm)
+        if not ok: continue
+
+        tr.binaryNandClauses.add(BinaryNandClause(varNames: names))
+        tr.definingConstraints.incl(ci)
+        inc nClauses
+        let bucket = if names.len >= nMixedSizes.len: nMixedSizes.len - 1 else: names.len
+        nMixedSizes[bucket] += 1
+
+    if nClauses > 0:
+        # Compact size histogram for the log line
+        var hist: seq[string]
+        for k in 3..<nMixedSizes.len:
+            if nMixedSizes[k] > 0:
+                if k == nMixedSizes.len - 1:
+                    hist.add(&"k>={k}:{nMixedSizes[k]}")
+                else:
+                    hist.add(&"k={k}:{nMixedSizes[k]}")
+        stderr.writeLine(&"[FZN] BinaryNandAggregate: {nClauses} k-NAND clauses collected ({hist.join(\" \")})")
+
+
+proc emitBinaryNandAggregate*(tr: var FznTranslator) =
+    ## Emits a single ConjunctSumAtMost constraint covering every collected
+    ## binary k-NAND clause. Runs after `translateVariables()` so that
+    ## `varPositions` is populated.
+    ##
+    ## Per-clause static evaluation (mirrors `emitProductSumAtMost`):
+    ##   - any var fixed to 0 → clause already satisfied → drop
+    ##   - all vars fixed to 1 → unsat (no remaining var to set to 0)
+    ##   - exactly one unfixed var, all others fixed to 1 → unit propagation:
+    ##       force that var's domain to {0}. Skip the clause; it's now sat.
+    ##   - otherwise: keep the (possibly shrunken to unfixed positions) group.
+    ##
+    ## We iterate the clause list once. The unit-propagation step *can* in
+    ## principle cascade (forcing a var to 0 may newly satisfy other clauses
+    ## containing that var, or expose a new unit clause). For now we run a
+    ## single pass; the presolve loop already does generalised unit-prop on
+    ## raw `int_lin_le` constraints, so cascading here would mostly catch
+    ## propagations that the original presolve missed because vars hadn't
+    ## yet been fixed at that time.
+
+    if tr.binaryNandClauses.len == 0: return
+
+    var groups: seq[seq[int]]
+    var nDropped = 0       # clauses already satisfied (some var fixed to 0)
+    var nUnitForced = 0    # clauses that propagated a single var to 0
+    var nMissing = 0       # clauses with at least one var lacking a position
+    var nUnsat = 0         # clauses with all vars fixed to 1 (translation bug or infeasible)
+
+    for clause in tr.binaryNandClauses:
+        var positions: seq[int]
+        var ok = true
+        for nm in clause.varNames:
+            if nm notin tr.varPositions:
+                # Variable was eliminated by another pass between detection and
+                # emit (e.g. aliased away). Bail on this clause — it can't be
+                # safely encoded without all positions.
+                ok = false
+                break
+            positions.add(tr.varPositions[nm])
+        if not ok:
+            inc nMissing
+            continue
+
+        # Static evaluation against current (post-translateVariables) domains.
+        var unfixedPositions: seq[int]
+        var staticZero = false
+        var nFixedOne = 0
+        for pos in positions:
+            let dom = tr.sys.baseArray.domain[pos]
+            if dom.len == 1:
+                if dom[0] == 0:
+                    staticZero = true
+                    break
+                elif dom[0] == 1:
+                    inc nFixedOne
+                else:
+                    # Non-binary singleton — should not happen given the
+                    # detection-time domain check, but bail safely.
+                    ok = false
+                    break
+            else:
+                unfixedPositions.add(pos)
+        if staticZero:
+            inc nDropped
+            continue
+        if not ok:
+            inc nMissing
+            continue
+
+        if unfixedPositions.len == 0:
+            # Every var is fixed to 1 → NAND clause is violated unconditionally.
+            # The model is infeasible; we still emit a length-0 group so the
+            # downstream system reports a permanent cost rather than silently
+            # accepting the violation.
+            inc nUnsat
+            groups.add(@[])  # ConjunctSumAtMost treats this as always-true → unit cost
+            continue
+
+        if unfixedPositions.len == 1:
+            # All other vars forced to 1 → the remaining var must be 0.
+            # Tighten its domain in place; don't emit a group for this clause.
+            let p = unfixedPositions[0]
+            tr.sys.baseArray.setDomain(p, @[0])
+            inc nUnitForced
+            continue
+
+        groups.add(unfixedPositions)
+
+    if groups.len > 0:
+        tr.sys.addConstraint(conjunctSumAtMost[int](groups, 1, 0))
+
+    stderr.writeLine(&"[FZN] BinaryNandAggregate emit: {groups.len} groups in 1 ConjunctSumAtMost, {nDropped} sat-dropped, {nUnitForced} unit-forced, {nMissing} missing-var, {nUnsat} unsat")
+
 
 proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
     ## Tightens objective bounds using knapsack LP relaxation and at-most-1

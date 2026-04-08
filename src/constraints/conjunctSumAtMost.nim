@@ -52,6 +52,13 @@ type
         cost*: int
         lastOldOccurrences*: int
         lastNewOccurrences*: int
+        # Local index of the most recent `updatePosition` call. Used by
+        # `getAffectedPositions` to return only the positions that share a
+        # group with the just-moved cell, instead of broadcasting to every
+        # position in the constraint. -1 means "no move yet" or "moved cell
+        # was outside this constraint" — both cases fall back to the full
+        # `positions` set for safety.
+        lastMovedLocal*: int
 
         # Local-index storage (the hot path uses these exclusively)
         nLocal*: int
@@ -94,6 +101,7 @@ func newConjunctSumAtMostConstraint*[T](groups: seq[seq[int]],
         maxOccurrences: maxOccurrences,
         actualOccurrences: 0,
         cost: 0,
+        lastMovedLocal: -1,
         positionToLocal: initTable[int, int]()
     )
 
@@ -174,6 +182,7 @@ proc updatePosition*[T](state: ConjunctSumAtMostConstraint[T], position: int, ne
     ## Apply an assignment change in place.
     state.lastOldOccurrences = state.actualOccurrences
     let localOfPos = state.positionToLocal.getOrDefault(position, -1)
+    state.lastMovedLocal = localOfPos
     if localOfPos < 0:
         state.lastNewOccurrences = state.actualOccurrences
         return
@@ -344,6 +353,14 @@ proc getAffectedPositions*[T](state: ConjunctSumAtMostConstraint[T]): PackedSet[
     ##     (constraint is saturated; all deltas equal ±changeCount).
     ##
     ## Anywhere else (including the boundary band itself) requires recomputing.
+    ## Even then, only the **co-group neighbours** of the cell that just moved
+    ## need recomputing — a cell whose groups don't intersect the moved cell's
+    ## groups can't have its `changeCount` (and thus its penalty delta) change.
+    ## This narrowing is essential for huge constraints (e.g. one big
+    ## `ConjunctSumAtMost` produced by the binary k-NAND aggregator or by the
+    ## `crusher_isosceles_free` global): without it, every move would
+    ## broadcast a recompute to every position in the constraint, giving an
+    ## O(positions × group_degree) per-move cost that strangles search.
     let old = state.lastOldOccurrences
     let new2 = state.lastNewOccurrences
     if old == new2:
@@ -355,7 +372,21 @@ proc getAffectedPositions*[T](state: ConjunctSumAtMostConstraint[T]): PackedSet[
     if (old <= lowSafe and new2 <= lowSafe) or
        (old > highSafe and new2 > highSafe):
         return initPackedSet[int]()
-    return state.positions
+    # Tight set: walk every group containing the just-moved cell, and emit the
+    # absolute position of every other member of those groups. The PackedSet
+    # handles deduplication. If we don't know which cell moved (initial setup,
+    # or moved cell wasn't in this constraint), fall back to all positions for
+    # safety.
+    let movedLi = state.lastMovedLocal
+    if movedLi < 0 or movedLi >= state.groupsAtLocal.len:
+        return state.positions
+    var affected = initPackedSet[int]()
+    for gi in state.groupsAtLocal[movedLi]:
+        let gStart = state.groupOffsets[gi]
+        let gEnd = state.groupOffsets[gi + 1]
+        for k in gStart ..< gEnd:
+            affected.incl(state.localToPosition[state.groupLocalPositions[k]])
+    return affected
 
 proc getAffectedDomainValues*[T](state: ConjunctSumAtMostConstraint[T], position: int): seq[T] =
     ## Returns @[] (all values), routing the consumer through the
@@ -381,6 +412,7 @@ proc deepCopy*[T](state: ConjunctSumAtMostConstraint[T]): ConjunctSumAtMostConst
         maxOccurrences: state.maxOccurrences,
         actualOccurrences: 0,
         cost: 0,
+        lastMovedLocal: -1,
         nLocal: state.nLocal,
         maxDegree: state.maxDegree,
         positionToLocal: initTable[int, int]()

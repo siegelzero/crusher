@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, sequtils, sets, tables]
 
 import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
 import constraintNode, types
@@ -752,6 +752,115 @@ func conjunctSumAtMost*[T](groups: seq[seq[int]], targetValue: T, maxOccurrences
         stateType: ConjunctSumAtMostType,
         conjunctSumAtMostState: newConjunctSumAtMostConstraint[T](groups, targetValue, maxOccurrences)
     )
+
+
+proc isoscelesFreeGrid*[T](positions: openArray[int], n: int): StatefulConstraint[T] =
+    ## Creates a constraint that forbids any three selected cells on an n×n
+    ## grid from forming an isosceles triangle (including the degenerate
+    ## "midpoint of two collinear cells" case, since two of the three
+    ## pairwise squared distances are equal in that case as well).
+    ##
+    ## `positions` is the row-major flattening of the n×n grid: position
+    ## `i*n + j` corresponds to row i (0-based), column j. Each position
+    ## must be a binary {0,1} variable; value 1 means "selected".
+    ##
+    ## The bad triples are enumerated *here*, in Nim, at constraint
+    ## construction time — not in the FlatZinc model. This avoids the
+    ## O(n^6) flattening blow-up of the parametric `forall(a,b,c) where ...`
+    ## formulation, which makes MiniZinc unable to compile the model for
+    ## n much above ~20. The Nim-side enumeration is O(n^4) and finishes
+    ## in milliseconds even for n = 64.
+    ##
+    ## **Implementation strategy**: enumerate triples by (apex, c1, c2)
+    ## where apex is the vertex between the two equal-length sides. For
+    ## every cell `apex` and every pair `(c1, c2)` with c1 < c2 of cells
+    ## equidistant from `apex`, the triple {apex, c1, c2} is isosceles.
+    ## Each triple is recorded once per valid apex (1 for a "normal"
+    ## isosceles triangle, 2 for an isosceles with extra symmetry, 3 for
+    ## an equilateral triangle); the underlying ConjunctSumAtMost handles
+    ## duplicate groups gracefully.
+    ##
+    ## The constraint is then expressed as a single `ConjunctSumAtMost`
+    ## with `targetValue = 1`, `maxOccurrences = 0`, and one group per
+    ## bad triple — meaning "no group may have all three positions equal
+    ## to 1". This is exactly the encoding produced by the binary k-NAND
+    ## aggregator, but without paying the per-clause MiniZinc emission
+    ## cost.
+    doAssert n >= 1, "isoscelesFreeGrid: n must be >= 1"
+    doAssert positions.len == n * n,
+        "isoscelesFreeGrid: positions.len (" & $positions.len &
+        ") must equal n*n (" & $(n * n) & ")"
+
+    if n < 3:
+        # No isosceles triple can exist on a 1×1 or 2×2 grid (only 4 cells,
+        # min triple needs at least 3 — and 3 cells on a 2×2 always have a
+        # right angle but only the degenerate "collinear" case which can't
+        # exist in 2×2 either). Return a trivially-satisfied constraint.
+        let emptyGroups: seq[seq[int]] = @[]
+        let one: T = 1
+        return conjunctSumAtMost(emptyGroups, one, 0)
+
+    # Cache row/col for each linear cell index.
+    var rowOf = newSeq[int](n * n)
+    var colOf = newSeq[int](n * n)
+    for k in 0 ..< n * n:
+        rowOf[k] = k div n
+        colOf[k] = k mod n
+
+    # For each apex, bucket the other cells by squared distance from apex.
+    # Then every pair within the same bucket forms a bad triple with apex.
+    #
+    # Each unordered triple {a, b, c} may be discovered up to 3 times (once
+    # per valid apex: 1 for a generic isosceles, 2 if two pairs of sides
+    # are equal, 3 for an equilateral). ConjunctSumAtMost counts groups
+    # independently, so duplicate groups would inflate the violation cost
+    # by the number of duplicates. We canonicalise each triple as a sorted
+    # 3-tuple of cell indices and dedupe with a HashSet before emitting.
+    let total = n * n
+    # Dedupe via HashSet[int] keyed on the packed sorted triple. We use
+    # HashSet (not PackedSet) because for large grids the key range
+    # `(a*total + b)*total + c` reaches ~10^9 and PackedSet's trunk-based
+    # storage allocates one slot per consecutive run of values, which
+    # explodes both in memory and access time. HashSet[int] is O(1) per
+    # insert with bounded memory.
+    var seenTripleKeys = initHashSet[int]()
+    var bucket: Table[int, seq[int]]
+    for apex in 0 ..< total:
+        bucket.clear()
+        let ar = rowOf[apex]
+        let ac = colOf[apex]
+        for c in 0 ..< total:
+            if c == apex: continue
+            let dr = ar - rowOf[c]
+            let dc = ac - colOf[c]
+            let d = dr*dr + dc*dc
+            bucket.mgetOrPut(d, @[]).add(c)
+        for d, members in bucket.pairs:
+            if members.len < 2: continue
+            for i in 0 ..< members.len:
+                for j in (i + 1) ..< members.len:
+                    # Canonicalise the unordered triple {apex, c1, c2} so
+                    # duplicate discoveries (different apex picks for the
+                    # same triple) collapse to a single key. Pack the sorted
+                    # tuple into a single int via base-`total` digits.
+                    var a = apex
+                    var b = members[i]
+                    var c2 = members[j]
+                    if a > b: swap(a, b)
+                    if b > c2: swap(b, c2)
+                    if a > b: swap(a, b)
+                    let key = (a * total + b) * total + c2
+                    seenTripleKeys.incl(key)
+
+    var groups = newSeqOfCap[seq[int]](seenTripleKeys.len)
+    for key in seenTripleKeys.items:
+        let c = key mod total
+        let mid = (key div total) mod total
+        let lo = key div (total * total)
+        groups.add(@[positions[lo], positions[mid], positions[c]])
+
+    let one: T = 1
+    return conjunctSumAtMost(groups, one, 0)
 
 
 func increasing*[T](positions: openArray[int]): StatefulConstraint[T] =

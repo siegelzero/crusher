@@ -67,11 +67,14 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Find initial feasible solution: single unified resolve with tabu + scatter fallback.
         # Tabu probe runs first; if it fails, scatter search continues from the tabu pool
         # without re-initialization.
+        let initSolveStart = epochTime()
         system.resolve(parallel=parallel, tabuThreshold=min(tabuThreshold, 1000),
                       scatterThreshold=max(scatterThreshold, 3),
                       populationSize=effectivePopSize, numWorkers=numWorkers,
                       scatterStrategy=scatterStrategy, verbose=verbose,
                       deadline=deadline)
+        let initSolveElapsed = max(0.001, epochTime() - initSolveStart)
+        let initIters = system.lastIterations
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
@@ -80,8 +83,27 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         system.bestFeasibleAssignment = system.assignment
         system.bestAssignmentValid = true
 
+        # Detect "low iteration rate" workloads. When the per-move cost is so
+        # high that tabu only manages a few iterations per second (typically
+        # huge global constraints with O(n²)+ per-move work), a binary-search
+        # bisection wastes most of the budget chasing a target so far above
+        # the true optimum that no resolve attempt can reach it. For such
+        # workloads we skip the bisection phase entirely and go straight to
+        # the retry-improvement loop, which only ever ratchets the bound by
+        # one step at a time. The threshold is empirical: anything below
+        # ~100 iters/sec means even a single bisection probe consumes a
+        # significant chunk of the deadline.
+        const LowIterRateThreshold = 100.0  # iters/sec
+        let initIterRate =
+            if initIters > 0: initIters.float / initSolveElapsed
+            else: 0.0
+        let lowIterRate = initIters > 0 and initIterRate < LowIterRateThreshold
+
         echo "[Opt] Initial solution: ", currentCost
         flushFile(stdout)
+        if lowIterRate and verbose:
+            echo "[Opt] Low iter rate detected (", initIterRate.int, "/s) — skipping binary search bisection, going straight to retry-improvement"
+            flushFile(stdout)
 
         # Add domain bounds as permanent constraints only when the initial solution
         # violates them. Adding trivially-satisfied bounds wastes per-iteration work
@@ -160,7 +182,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             echo "[Opt] Binary search [", lo, "..", hi, "]"
             flushFile(stdout)
 
-        while lo <= hi:
+        while lo <= hi and not lowIterRate:
             if deadline > 0 and epochTime() > deadline:
                 system.searchCompleted = false
                 break

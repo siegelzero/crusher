@@ -184,6 +184,14 @@ type
         terms*: seq[ProductSumAtMostTerm]
         maxCount*: int                 # maximum allowed count (rhs)
 
+    BinaryNandClause* = object
+        ## A k-ary boolean NAND clause: NOT(x_1 AND ... AND x_k), encoded
+        ## originally as `int_lin_le([1,...,1], [x_1,...,x_k], k-1)` on binary
+        ## {0,1} variables. Many such clauses are aggregated into a single
+        ## `ConjunctSumAtMost(groups, 1, 0)` constraint to amortise per-move
+        ## dispatch overhead across thousands of independent clauses.
+        varNames*: seq[string]         # k binary var names; "all 1s forbidden"
+
     CrossingCountMaxDef* = object
         ## A detected crossing count max pattern:
         ## array_int_maximum(M, sums of betweenness indicators)
@@ -434,6 +442,9 @@ type
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
         # Detected product-sum atMost patterns (int_lin_le on bool2int(array_bool_and(..)) chains)
         productSumAtMostDefs*: seq[ProductSumAtMostDef]
+        # Detected binary k-ary NAND clauses (int_lin_le([1,...,1], vars, k-1) on
+        # binary {0,1} vars, k >= 3) — aggregated into one ConjunctSumAtMost on emit.
+        binaryNandClauses*: seq[BinaryNandClause]
         # Detected argmax patterns (int_ne_reif + int_lin_le_reif + array_int_maximum → element)
         argmaxPatterns*: Table[int, ArgmaxPattern]
         # Detected crossing count max patterns (betweenness indicators → sum → array_int_maximum)
@@ -518,8 +529,10 @@ type
         nTableToNotIn*: int
         # Counter for redundant NAND constraints skipped during translation
         nSkippedRedundantNand*: int
-        # NAND bool pairs from bool_clause([], [b1, b2]) — for redundancy detection
-        nandBoolPairs*: HashSet[tuple[a, b: string]]
+        # NAND bool clauses from bool_clause([], [b_1, ..., b_k]) — for redundancy
+        # detection. Each entry is the *sorted* tuple of source bool var names.
+        # Supports any arity k >= 2 (originally k = 2 only).
+        nandBoolClauses*: HashSet[seq[string]]
         # Maps bool2int output var name → input bool var name
         bool2intSourceMap*: Table[string, string]
         # Detected circuit-time-propagation pattern (TSPTW/VRP)
@@ -899,6 +912,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.rescuedChannelDefs = @[]
     result.boolAndChannelDefs = @[]
     result.productSumAtMostDefs = @[]
+    result.binaryNandClauses = @[]
     result.binaryCondChannelDefs = @[]
     result.oneHotCondChannelDefs = @[]
     result.boolEquivAliasDefs = @[]
@@ -972,6 +986,11 @@ proc translate*(model: FznModel): FznTranslator =
     result.detectDisjunctiveResources()
     # Detect pairwise atMost-1 cliques (int_lin_le([1,1],[x,y],1) on binary vars → N-var atMost)
     result.detectAtMostPairCliques()
+    # Detect binary k-ary NAND clauses (int_lin_le([1,...,1], binary_vars, k-1), k>=3)
+    # MUST run after detectAtMostPairCliques (which handles k=2) and after the other
+    # passes that consume int_lin_le. Aggregates all such clauses into a single
+    # ConjunctSumAtMost constraint emitted later by emitBinaryNandAggregate.
+    result.detectBinaryNandAggregate()
     # Detect crossing count max patterns (betweenness indicators → sum → array_int_maximum)
     # MUST run before detectReifChannels which would consume the intermediate bool2int/array_bool_and/int_lin_le_reif
     result.detectCrossingCountMaxPattern()
@@ -1127,6 +1146,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit ExpressionBased atMost constraints for detected product-sum patterns
     if result.productSumAtMostDefs.len > 0:
         result.emitProductSumAtMost()
+    # Emit a single ConjunctSumAtMost for all collected binary k-NAND clauses
+    if result.binaryNandClauses.len > 0:
+        result.emitBinaryNandAggregate()
     # Build expressions for bool2int identity aliases (int output → bool input's position)
     # MUST run before buildDefinedExpressions which may reference aliased vars
     for intName, boolName in result.bool2intIdentityAliases:

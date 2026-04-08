@@ -753,8 +753,16 @@ proc isNeTautological(tr: var FznTranslator, argA: FznExpr, argB: FznExpr): bool
     return hiA < loB or hiB < loA
 
 proc detectNandRedundancy*(tr: var FznTranslator) =
-    ## Pre-compute NAND bool pairs and bool2int source mapping for
-    ## detecting redundant int_lin_le constraints that duplicate bool_clause NANDs.
+    ## Pre-compute NAND bool clauses and bool2int source mapping for detecting
+    ## redundant int_lin_le constraints that duplicate bool_clause NANDs.
+    ##
+    ## Generalised from k=2 to any arity k >= 2: a `bool_clause([], [b_1, ..., b_k])`
+    ## is logically `NOT(b_1 AND ... AND b_k)`, i.e. a k-NAND. The matching
+    ## `int_lin_le([c,...,c], [bool2int(b_1),...,bool2int(b_k)], (k-1)*c)`
+    ## encodes the same constraint over the bool2int outputs and can be skipped.
+    ##
+    ## Each clause is stored as the *sorted* sequence of source bool var names
+    ## so lookup is order-independent without storing every permutation.
 
     # Build bool2int source map from bool2intChannelDefs
     for ci in tr.bool2intChannelDefs:
@@ -762,7 +770,7 @@ proc detectNandRedundancy*(tr: var FznTranslator) =
         if con.args.len >= 2 and con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
             tr.bool2intSourceMap[con.args[1].ident] = con.args[0].ident
 
-    # Collect NAND pairs from bool_clause([], [b1, b2])
+    # Collect NAND clauses from bool_clause([], [b_1, ..., b_k]) for k >= 2
     for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -770,43 +778,56 @@ proc detectNandRedundancy*(tr: var FznTranslator) =
         let posArg = con.args[0]
         let negArg = con.args[1]
         if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
-        if posArg.elems.len != 0 or negArg.elems.len != 2: continue
-        let b1 = negArg.elems[0]
-        let b2 = negArg.elems[1]
-        if b1.kind != FznIdent or b2.kind != FznIdent: continue
-        # Store both orderings so lookup is symmetric
-        tr.nandBoolPairs.incl((b1.ident, b2.ident))
-        tr.nandBoolPairs.incl((b2.ident, b1.ident))
+        if posArg.elems.len != 0: continue
+        if negArg.elems.len < 2: continue
+        var names: seq[string]
+        var ok = true
+        for elem in negArg.elems:
+            if elem.kind != FznIdent:
+                ok = false
+                break
+            names.add(elem.ident)
+        if not ok: continue
+        names.sort()
+        tr.nandBoolClauses.incl(names)
 
-    if tr.nandBoolPairs.len > 0:
-        stderr.writeLine(&"[FZN] Detected {tr.nandBoolPairs.len div 2} NAND bool pairs, {tr.bool2intSourceMap.len} bool2int sources")
+    if tr.nandBoolClauses.len > 0:
+        stderr.writeLine(&"[FZN] Detected {tr.nandBoolClauses.len} NAND bool clauses, {tr.bool2intSourceMap.len} bool2int sources")
 
 proc isRedundantNandLinLe(tr: FznTranslator, coeffs: seq[int], varArrayArg: FznExpr, rhs: int): bool =
-    ## Check if int_lin_le(coeffs, vars, rhs) is a NAND constraint on bool2int outputs
-    ## that duplicates an existing bool_clause([], [b1, b2]) NAND.
-    if tr.nandBoolPairs.len == 0:
+    ## Check if int_lin_le(coeffs, vars, rhs) is a k-NAND constraint on
+    ## bool2int outputs that duplicates an existing bool_clause([], [...]) NAND.
+    ##
+    ## Accepts any arity k >= 2 with equal positive coefficients c and
+    ## rhs = (k - 1) * c, which is the canonical encoding of "no all-true
+    ## tuple" via int_lin_le. The bool2int sources of the k variables are
+    ## sorted and looked up in `nandBoolClauses`.
+    if tr.nandBoolClauses.len == 0:
         return false
 
-    # Only handle 2-variable case with equal positive coefficients and rhs = coefficient
-    if coeffs.len != 2: return false
-    if coeffs[0] != coeffs[1] or coeffs[0] <= 0: return false
-    if rhs != coeffs[0]: return false  # rhs = c means c*x1 + c*x2 <= c → x1+x2 <= 1
+    if coeffs.len < 2: return false
+    let c = coeffs[0]
+    if c <= 0: return false
+    for i in 1..<coeffs.len:
+        if coeffs[i] != c: return false
+    # rhs == (k - 1) * c is the NAND threshold for k vars at uniform coeff c
+    if rhs != (coeffs.len - 1) * c: return false
 
     var elems: seq[FznExpr]
     if varArrayArg.kind == FznArrayLit:
         elems = varArrayArg.elems
     else:
         return false
-    if elems.len != 2: return false
+    if elems.len != coeffs.len: return false
 
-    # Both variables must be bool2int outputs
+    # All variables must be bool2int outputs
+    var boolNames: seq[string]
     for e in elems:
         if e.kind != FznIdent: return false
         if e.ident notin tr.bool2intSourceMap: return false
-
-    let boolA = tr.bool2intSourceMap[elems[0].ident]
-    let boolB = tr.bool2intSourceMap[elems[1].ident]
-    return (boolA, boolB) in tr.nandBoolPairs
+        boolNames.add(tr.bool2intSourceMap[e.ident])
+    boolNames.sort()
+    return boolNames in tr.nandBoolClauses
 
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     ## Translates a single FlatZinc constraint to a Crusher constraint.
@@ -1117,6 +1138,31 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     of "fzn_all_different_int", "all_different_int":
         let exprs = tr.resolveExprArray(con.args[0])
         tr.sys.addConstraint(allDifferent[int](exprs))
+
+    of "crusher_isosceles_free":
+        # crusher_isosceles_free(array_of_var_int, n)
+        # Custom global constraint that forbids any three selected cells on
+        # an n×n grid from forming an isosceles triangle. The bad triples
+        # are enumerated in Nim at constraint construction time, avoiding
+        # the O(n^6) MiniZinc flattening blow-up of a parametric forall.
+        let n = tr.resolveIntArg(con.args[1])
+        let exprs = tr.resolveExprArray(con.args[0])
+        if exprs.len != n * n:
+            raise newException(ValueError,
+                "crusher_isosceles_free: array length " & $exprs.len &
+                " does not match n*n = " & $(n * n))
+        var positions: seq[int]
+        for e in exprs:
+            if e.node.kind == RefNode:
+                positions.add(e.node.position)
+            else:
+                # Should not normally happen — the array must be plain
+                # variable references for the geometric encoding to make
+                # sense. Bail loudly so the user knows.
+                raise newException(ValueError,
+                    "crusher_isosceles_free: array element is not a plain variable")
+        tr.sys.addConstraint(isoscelesFreeGrid[int](positions, n))
+        stderr.writeLine(&"[FZN] crusher_isosceles_free: emitted single dedicated constraint for n={n}")
 
     # ===== Element constraints =====
     of "array_int_element", "array_int_element_nonshifted":

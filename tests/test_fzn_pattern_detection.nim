@@ -1913,8 +1913,8 @@ solve satisfy;
         let model = parseFzn(src)
         var tr = translate(model)
         check tr.nSkippedRedundantNand >= 1
-        # The bool_clause NAND should still exist as a constraint
-        check tr.nandBoolPairs.len > 0
+        # The bool_clause NAND should still exist in the collected clause set
+        check tr.nandBoolClauses.len > 0
 
     test "int_lin_le with scaled coefficients duplicating NAND is skipped":
         ## bool_clause([], [b1, b2]) → NAND
@@ -3006,3 +3006,284 @@ solve minimize total;
         #   idx=4: (price=15, weight=5) — dominated by idx=1 (10<15, 4<5)
         check tr.presolveDomains.hasKey("idx")
         check tr.presolveDomains["idx"] == @[1, 2, 3]
+
+
+suite "FlatZinc Binary k-NAND Aggregation":
+
+    test "k=3 NAND clauses aggregated into one ConjunctSumAtMost":
+        ## Three int_lin_le([1,1,1], [a,b,c], 2) constraints over disjoint
+        ## triples on binary vars are recognised as 3-NAND clauses and
+        ## collapsed into a single ConjunctSumAtMost constraint.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..1: x5 :: output_var;
+var 0..1: x6 :: output_var;
+constraint int_lin_le([1,1,1],[x1,x2,x3],2);
+constraint int_lin_le([1,1,1],[x4,x5,x6],2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.binaryNandClauses.len == 2
+        check tr.binaryNandClauses[0].varNames.len == 3
+        check tr.binaryNandClauses[1].varNames.len == 3
+
+        # Exactly one constraint of type ConjunctSumAtMostType should be in
+        # the system; the original int_lin_le constraints are consumed.
+        var nConjunct = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == ConjunctSumAtMostType:
+                inc nConjunct
+        check nConjunct == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        # Each triple may have at most 2 ones (i.e. NOT all-3 true).
+        for triple in [["x1","x2","x3"], ["x4","x5","x6"]]:
+            var s = 0
+            for nm in triple:
+                s += tr.sys.assignment[tr.varPositions[nm]]
+            check s <= 2
+
+    test "mixed arities k=3 and k=4 are aggregated together":
+        ## Different-sized NAND clauses (k=3 and k=4) all collapse into
+        ## the same ConjunctSumAtMost — its groups can be heterogeneous.
+        let src = """
+var 0..1: a :: output_var;
+var 0..1: b :: output_var;
+var 0..1: c :: output_var;
+var 0..1: d :: output_var;
+var 0..1: e :: output_var;
+constraint int_lin_le([1,1,1],[a,b,c],2);
+constraint int_lin_le([1,1,1,1],[a,b,c,d],3);
+constraint int_lin_le([1,1,1,1],[b,c,d,e],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.binaryNandClauses.len == 3
+        var nConjunct = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == ConjunctSumAtMostType:
+                inc nConjunct
+        check nConjunct == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+        # All three NAND clauses must hold.
+        var sa = tr.sys.assignment[tr.varPositions["a"]]
+        var sb = tr.sys.assignment[tr.varPositions["b"]]
+        var sc = tr.sys.assignment[tr.varPositions["c"]]
+        var sd = tr.sys.assignment[tr.varPositions["d"]]
+        var se = tr.sys.assignment[tr.varPositions["e"]]
+        check sa + sb + sc <= 2
+        check sa + sb + sc + sd <= 3
+        check sb + sc + sd + se <= 3
+
+    test "pairwise (k=2) NAND is left to clique merging, not aggregated":
+        ## k=2 binary NAND constraints are int_lin_le([1,1], [x,y], 1).
+        ## detectAtMostPairCliques handles those; the new aggregator must
+        ## NOT consume them, so binaryNandClauses stays empty here.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+constraint int_lin_le([1,1],[x1,x2],1);
+constraint int_lin_le([1,1],[x1,x3],1);
+constraint int_lin_le([1,1],[x2,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.binaryNandClauses.len == 0
+        # The clique merger should still pick this up.
+        check tr.atMostPairCliques.len == 1
+
+    test "non-NAND int_lin_le (rhs != k-1) is not consumed":
+        ## int_lin_le([1,1,1], [x,y,z], 1) is "at most one true", NOT a NAND.
+        ## The aggregator must leave it alone.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+constraint int_lin_le([1,1,1],[x1,x2,x3],1);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.binaryNandClauses.len == 0
+
+    test "non-binary variables are not consumed":
+        ## A coefficient-1 int_lin_le with rhs=k-1 over int (non-binary) vars
+        ## is not a NAND clause and must not be aggregated.
+        let src = """
+var 0..3: x1 :: output_var;
+var 0..3: x2 :: output_var;
+var 0..3: x3 :: output_var;
+constraint int_lin_le([1,1,1],[x1,x2,x3],2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.binaryNandClauses.len == 0
+
+
+suite "FlatZinc k-ary NAND Redundancy Detection":
+
+    test "k=3 NAND duplicating bool_clause is suppressed":
+        ## A bool_clause([], [b1,b2,b3]) NAND on bools paired with the
+        ## equivalent int_lin_le([1,1,1], [bool2int(b1..b3)], 2) on the
+        ## bool2int outputs: the int_lin_le is redundant and should be skipped.
+        ## The bool2int outputs are channels (defines_var), so the NAND
+        ## aggregator does NOT consume them — the redundancy path does.
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var bool: b3 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+var 0..1: i3 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool2int(b3, i3) :: defines_var(i3);
+constraint bool_clause([], [b1, b2, b3]);
+constraint int_lin_le([1,1,1],[i1,i2,i3],2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand >= 1
+
+    test "permuted variable order still recognised as redundant":
+        ## bool_clause stores [b1,b2,b3]; int_lin_le references the bool2int
+        ## outputs in a *different* order. Canonicalisation by sort means the
+        ## redundancy detector still recognises them as the same NAND.
+        let src = """
+var bool: b1 :: output_var;
+var bool: b2 :: output_var;
+var bool: b3 :: output_var;
+var bool: b4 :: output_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+var 0..1: i3 :: var_is_introduced :: is_defined_var;
+var 0..1: i4 :: var_is_introduced :: is_defined_var;
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool2int(b3, i3) :: defines_var(i3);
+constraint bool2int(b4, i4) :: defines_var(i4);
+constraint bool_clause([], [b1, b2, b3, b4]);
+constraint int_lin_le([1,1,1,1],[i4,i2,i1,i3],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.nSkippedRedundantNand >= 1
+
+
+suite "FlatZinc crusher_isosceles_free Translator Hook":
+
+    test "n=3: emits a single ConjunctSumAtMost from one global constraint":
+        ## The FZN translator should recognize crusher_isosceles_free(x, n)
+        ## and emit exactly one ConjunctSumAtMost constraint that covers all
+        ## isosceles triples on the n×n grid. No int_lin_le constraints
+        ## should appear in the system from this single source.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+var 0..1: x5 :: output_var;
+var 0..1: x6 :: output_var;
+var 0..1: x7 :: output_var;
+var 0..1: x8 :: output_var;
+var 0..1: x9 :: output_var;
+array [1..9] of var int: x :: output_array([1..9]) = [x1,x2,x3,x4,x5,x6,x7,x8,x9];
+constraint crusher_isosceles_free(x, 3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        var nConjunct = 0
+        var nLinear = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == ConjunctSumAtMostType:
+                inc nConjunct
+            if c.stateType == RelationalType:
+                inc nLinear
+        check nConjunct == 1
+        check nLinear == 0
+
+        # The constraint should be solvable; the all-zero assignment is
+        # trivially feasible.
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    test "n=4: array translation and constraint emission":
+        # Build the 16-element array inline. Cells are 0-indexed in the
+        # underlying constraint, so the row-major ordering of x1..x16
+        # matches the constraint's interpretation.
+        var declLines: seq[string]
+        var arrElems: seq[string]
+        for i in 1 .. 16:
+            declLines.add("var 0..1: x" & $i & " :: output_var;")
+            arrElems.add("x" & $i)
+        let src = declLines.join("\n") & "\n" &
+            "array [1..16] of var int: x :: output_array([1..16]) = [" &
+            arrElems.join(",") & "];\n" &
+            "constraint crusher_isosceles_free(x, 4);\nsolve satisfy;\n"
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        var nConjunct = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == ConjunctSumAtMostType:
+                inc nConjunct
+        check nConjunct == 1
+
+        tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+
+suite "FlatZinc int_lin_le Presolve Unit Propagation":
+
+    test "saturated NAND forces remaining var to 0":
+        ## sum(x_i) <= 2 over four binary vars where three are pre-fixed to 1
+        ## must force the fourth to 0 in presolve.
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+constraint int_eq(x1, 1);
+constraint int_eq(x2, 1);
+constraint int_eq(x3, 1);
+constraint int_lin_le([1,1,1,1],[x1,x2,x3,x4],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.presolveDomains.hasKey("x4")
+        check tr.presolveDomains["x4"] == @[0]
+
+    test "non-saturated NAND leaves remaining var free":
+        ## Same shape but only two are forced to 1 — the remaining two
+        ## must still be allowed to be either 0 or 1 (slack > 0).
+        let src = """
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 0..1: x4 :: output_var;
+constraint int_eq(x1, 1);
+constraint int_eq(x2, 1);
+constraint int_lin_le([1,1,1,1],[x1,x2,x3,x4],3);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        # Neither x3 nor x4 should be tightened to a singleton by this rule.
+        if "x3" in tr.presolveDomains:
+            check tr.presolveDomains["x3"] == @[0, 1]
+        if "x4" in tr.presolveDomains:
+            check tr.presolveDomains["x4"] == @[0, 1]

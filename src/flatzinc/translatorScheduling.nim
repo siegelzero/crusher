@@ -3175,7 +3175,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
 
         nDetected += indices.len
 
-    stderr.writeLine(&"[FZN] Detected {nDetected} int_lin_le → {tr.conditionalDayCapacityInfos.len} ConditionalDayCapacity constraints")
+    if nDetected > 0 or tr.conditionalDayCapacityInfos.len > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} int_lin_le → {tr.conditionalDayCapacityInfos.len} ConditionalDayCapacity constraints")
 
 
 proc detectRedundantOrderings(tr: var FznTranslator) =

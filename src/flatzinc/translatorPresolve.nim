@@ -369,18 +369,66 @@ proc simplifyConstraints(tr: FznTranslator,
                 let nArgs = con.args[0].elems.len
                 if nArgs == con.args[1].elems.len and
                         tr.presolveIsFixed(con.args[2], fixedVars):
-                    var allFixed = true
+                    var rhs = tr.presolveResolve(con.args[2], fixedVars)
+                    var allCoeffsLit = true
                     var nUnfixed = 0
-                    # First check all coeffs are literals
+                    var allCoeffsOne = true
+                    var allUnfixedBinary = true
+                    var nFixedContribution = 0
+                    # First check all coeffs are literals; track unit-coefficient case
+                    # and accumulate fixed-variable contribution to LHS.
                     for i in 0..<nArgs:
                         if con.args[0].elems[i].kind != FznIntLit:
-                            allFixed = false; break
-                        if not tr.presolveIsFixed(con.args[1].elems[i], fixedVars):
+                            allCoeffsLit = false; break
+                        let c = con.args[0].elems[i].intVal
+                        if c != 1: allCoeffsOne = false
+                        let vExpr = con.args[1].elems[i]
+                        if tr.presolveIsFixed(vExpr, fixedVars):
+                            nFixedContribution += c * tr.presolveResolve(vExpr, fixedVars)
+                        else:
                             inc nUnfixed
-                    if allFixed and nUnfixed == 0:
-                        if con.canEliminate:
+                            # For NAND-style propagation we also need every
+                            # unfixed var to be binary {0,1}.
+                            let vn = presolveVarName(vExpr)
+                            if vn == "" or vn notin domains:
+                                allUnfixedBinary = false
+                            else:
+                                let dom = domains[vn]
+                                if dom != @[0, 1]:
+                                    allUnfixedBinary = false
+                    if allCoeffsLit and nUnfixed == 0:
+                        # Verify the now-fully-evaluated constraint and eliminate.
+                        if nFixedContribution > rhs:
+                            infeasible = true
+                        elif con.canEliminate:
                             eliminated.incl(ci)
                             result = true
+                    elif allCoeffsLit and allCoeffsOne and allUnfixedBinary:
+                        # Unit-coefficient atMost on (still-)binary unfixed vars.
+                        # Generalised NAND unit propagation:
+                        #   sum_unfixed x_i  <=  rhs - nFixedContribution
+                        # i.e. atMost(unfixed, 1, slack).
+                        let slack = rhs - nFixedContribution
+                        if slack < 0:
+                            infeasible = true
+                        elif slack == 0:
+                            # Every remaining unfixed variable must be 0.
+                            for i in 0..<nArgs:
+                                let vExpr = con.args[1].elems[i]
+                                if tr.presolveIsFixed(vExpr, fixedVars): continue
+                                let vn = presolveVarName(vExpr)
+                                if vn != "":
+                                    if presolveTightenDomain(domains, vn, @[0], infeasible):
+                                        result = true
+                            if con.canEliminate:
+                                eliminated.incl(ci)
+                                result = true
+                        elif slack >= nUnfixed:
+                            # Even setting every unfixed variable to 1 satisfies it
+                            # → constraint is tautological in the current state.
+                            if con.canEliminate:
+                                eliminated.incl(ci)
+                                result = true
 
 proc boundsPropagate(tr: FznTranslator,
                      domains: var Table[string, seq[int]],
