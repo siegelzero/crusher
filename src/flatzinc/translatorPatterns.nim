@@ -4991,7 +4991,16 @@ proc detectBinaryNandAggregate*(tr: var FznTranslator) =
     ## IS, set-system avoidance, etc.
 
     var nClauses = 0
+    var nDupes = 0
     var nMixedSizes = newSeq[int](16)  # histogram of clause sizes (clamped)
+
+    # Track unique clauses by *sorted* var-name tuple. ConjunctSumAtMost counts
+    # groups independently, so emitting the same clause twice would inflate the
+    # violation cost by a factor of 2 — which silently distorts the cost
+    # landscape and the optimum. Models that legitimately produce the same
+    # NAND from two different decompositions (e.g. presolve canonicalisation
+    # plus a redundant user constraint) hit this in practice.
+    var seenClauseKeys = initHashSet[seq[string]]()
 
     # Build the var-name → declaration index once so we can check the
     # `is_defined_var` annotation directly. `definedVarNames` and
@@ -5072,6 +5081,18 @@ proc detectBinaryNandAggregate*(tr: var FznTranslator) =
             names.add(nm)
         if not ok: continue
 
+        # Canonicalise (sort) and dedupe before recording the clause. The
+        # source `int_lin_le` is still marked consumed even when it's a
+        # duplicate — the first occurrence already covers the same logical
+        # constraint, so the second is redundant and safe to eliminate.
+        var sortedNames = names
+        sortedNames.sort()
+        if sortedNames in seenClauseKeys:
+            tr.definingConstraints.incl(ci)
+            inc nDupes
+            continue
+        seenClauseKeys.incl(sortedNames)
+
         tr.binaryNandClauses.add(BinaryNandClause(varNames: names))
         tr.definingConstraints.incl(ci)
         inc nClauses
@@ -5087,7 +5108,8 @@ proc detectBinaryNandAggregate*(tr: var FznTranslator) =
                     hist.add(&"k>={k}:{nMixedSizes[k]}")
                 else:
                     hist.add(&"k={k}:{nMixedSizes[k]}")
-        stderr.writeLine(&"[FZN] BinaryNandAggregate: {nClauses} k-NAND clauses collected ({hist.join(\" \")})")
+        let dupeNote = if nDupes > 0: &", {nDupes} duplicates skipped" else: ""
+        stderr.writeLine(&"[FZN] BinaryNandAggregate: {nClauses} k-NAND clauses collected ({hist.join(\" \")}){dupeNote}")
 
 
 proc emitBinaryNandAggregate*(tr: var FznTranslator) =

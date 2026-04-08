@@ -289,6 +289,79 @@ suite "ConjunctSumAtMost Constraint":
         let reduced = sys.baseArray.reduceDomain()
         check reduced[3].sorted == @[0]
 
+    test "maxOcc>0: getAffectedPositions broadcasts across boundary":
+        # Regression test for the co-group narrowing in getAffectedPositions.
+        # When maxOcc > 0, the cost function `max(0, actualOcc - maxOcc)` has
+        # a kink at `actualOcc = maxOcc`, and a non-co-group cell's penalty
+        # delta can change purely from the global actualOccurrences shift —
+        # even though its own changeCount is unaffected by a move at another
+        # cell. The narrowing must therefore *not* be applied in that regime;
+        # it must broadcast to every position the constraint touches.
+        let cons = conjunctSumAtMost[int](@[@[0, 1], @[2, 3], @[4, 5]], 1, 1)
+        let st = cons.conjunctSumAtMostState
+        st.initialize(@[1, 1, 1, 1, 1, 1])
+        check st.actualOccurrences == 3
+
+        # Drop pos 2 first to get into the band (actualOcc 3→2). Inside the
+        # band but no delta change for pos 0 yet.
+        cons.updatePosition(2, 0)
+        check st.actualOccurrences == 2
+        # Snapshot pos 0's leave-target delta before the boundary-crossing move.
+        # f_-(2) = max(0, 2-1-1) - max(0, 2-1) = 0 - 1 = -1.
+        let delta0Before = st.moveDelta(0, 1, 0)
+        check delta0Before == -1
+
+        # Now drop pos 4: actualOcc 2→1 crosses the kink at maxOcc=1. Pos 0
+        # is in group [0,1] and shares no member with pos 4's group [4,5],
+        # so the co-group narrowing would exclude pos 0 — but its delta DID
+        # change.
+        cons.updatePosition(4, 0)
+        check st.actualOccurrences == 1
+
+        # Pos 0's leave-target delta after the move:
+        # f_-(1) = max(0, 1-1-1) - max(0, 1-1) = 0 - 0 = 0.
+        let delta0After = st.moveDelta(0, 1, 0)
+        check delta0After == 0
+        check delta0After != delta0Before  # Confirms the bug surface.
+
+        # The fix: getAffectedPositions must return the full positions set so
+        # the tabu-search penalty map recomputes pos 0's entry. Without the
+        # fix, the affected set would only contain pos 4's co-group neighbour
+        # (pos 5), leaving stale deltas at positions 0, 1, 2, 3.
+        let affected = cons.getAffectedPositions()
+        for p in 0 .. 5:
+            check p in affected
+
+    test "maxOcc=0: getAffectedPositions narrows to co-group neighbours":
+        # Companion to the regression above: with maxOcc=0 the cost function
+        # is linear in actualOcc≥0 and non-co-group cells truly do have
+        # unchanged deltas, so the narrowing IS applied and the affected set
+        # only contains the moved cell's co-group neighbours.
+        #
+        # Setup so the move lands inside the band (otherwise the safe-zone
+        # early return short-circuits to an empty set, which is also correct
+        # but doesn't exercise the narrowing path). With maxDeg=1 and
+        # maxOcc=0, the safe zone is `actualOcc > 1`; we need the move to
+        # cross from 2 to 1 so that `new=1` is no longer above highSafe.
+        let cons = conjunctSumAtMost[int](@[@[0, 1], @[2, 3], @[4, 5]], 1, 0)
+        let st = cons.conjunctSumAtMostState
+        st.initialize(@[1, 1, 1, 1, 0, 0])
+        check st.actualOccurrences == 2
+        # Move pos 2 from 1 to 0: group [2,3] truth → 0, actualOcc 2→1.
+        # old=2 > highSafe=1, but new=1 == highSafe — not both > highSafe,
+        # so we fall through to the narrowing branch.
+        cons.updatePosition(2, 0)
+        check st.actualOccurrences == 1
+        let affected = cons.getAffectedPositions()
+        # Only positions 2 and 3 (the moved cell's group) should appear; the
+        # narrowing must exclude positions 0, 1, 4, 5.
+        check 2 in affected
+        check 3 in affected
+        check 0 notin affected
+        check 1 notin affected
+        check 4 notin affected
+        check 5 notin affected
+
 
 # Brute-force isosceles-free check for cross-validation: returns the number of
 # isosceles triples in the chosen set on an n×n grid (cells are 0-indexed).
@@ -358,15 +431,29 @@ suite "isoscelesFreeGrid Constraint":
         check st.actualOccurrences == 0
         check cons.penalty() == 0
 
-    test "n < 3 trivially has no constraints":
-        # 2×2 grid: no isosceles triple is possible (only 4 cells, and any
-        # 3 of them on a 2×2 grid form a right triangle whose two legs are
-        # equal — actually that IS isosceles. But the factory short-circuits
-        # n < 3, so verify it returns a trivially-satisfied constraint).
+    test "n=1 is trivially constraint-free":
+        # 1×1 grid: only one cell, so no triple of three cells is possible
+        # and the constraint is vacuously satisfied for any assignment.
+        var positions = @[0]
+        let cons = isoscelesFreeGrid[int](positions, 1)
+        let st = cons.conjunctSumAtMostState
+        st.initialize(@[1])
+        check st.actualOccurrences == 0
+        check cons.penalty() == 0
+
+    test "n=2 enumerates all four right-isosceles triples":
+        # 2×2 grid: any 3 of the 4 cells form a right isosceles triangle
+        # (legs of length 1). All four such triples must be forbidden, so
+        # the all-ones assignment violates the constraint with cost 4 and
+        # the brute-force count agrees.
         var positions = @[0, 1, 2, 3]
         let cons = isoscelesFreeGrid[int](positions, 2)
         let st = cons.conjunctSumAtMostState
         st.initialize(@[1, 1, 1, 1])
+        check st.actualOccurrences == 4
+        check st.actualOccurrences == bruteIsoscelesViolations(2, @[1, 1, 1, 1])
+        # Selecting only two cells leaves no triple to violate.
+        st.initialize(@[1, 1, 0, 0])
         check st.actualOccurrences == 0
         check cons.penalty() == 0
 

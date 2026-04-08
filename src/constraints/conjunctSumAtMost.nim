@@ -353,14 +353,30 @@ proc getAffectedPositions*[T](state: ConjunctSumAtMostConstraint[T]): PackedSet[
     ##     (constraint is saturated; all deltas equal ±changeCount).
     ##
     ## Anywhere else (including the boundary band itself) requires recomputing.
-    ## Even then, only the **co-group neighbours** of the cell that just moved
-    ## need recomputing — a cell whose groups don't intersect the moved cell's
-    ## groups can't have its `changeCount` (and thus its penalty delta) change.
-    ## This narrowing is essential for huge constraints (e.g. one big
-    ## `ConjunctSumAtMost` produced by the binary k-NAND aggregator or by the
-    ## `crusher_isosceles_free` global): without it, every move would
-    ## broadcast a recompute to every position in the constraint, giving an
-    ## O(positions × group_degree) per-move cost that strangles search.
+    ##
+    ## **Co-group narrowing (maxOccurrences == 0 only).** When `maxOccurrences`
+    ## is zero — the dominant case for both the binary k-NAND aggregator and
+    ## `crusher_isosceles_free` — the per-position penalty delta simplifies to
+    ## `±changeCount_r`, a value that depends *only* on r's own groups. A
+    ## non-co-group cell's `changeCount` cannot change in response to a move at
+    ## another cell, so its delta is unchanged and we may safely return only
+    ## the co-group neighbours of the moved cell. Without this narrowing, every
+    ## move would broadcast a recompute to every position in the constraint,
+    ## giving an O(positions × group_degree) per-move cost that strangles search
+    ## for huge constraints.
+    ##
+    ## **Why we cannot narrow when `maxOccurrences > 0`.** With `maxOcc > 0`
+    ## the cost function `max(0, actualOccurrences - maxOcc)` has a kink at
+    ## `actualOcc = maxOcc`, and the per-position delta
+    ##   f(x) = max(0, x ± changeCount_r - maxOcc) - max(0, x - maxOcc)
+    ## is *not* constant in `x` across the boundary band: e.g. with
+    ## `maxOcc=2`, `changeCount_r=1`, `x` going 2→1` flips f from 1 to 0 even
+    ## though r shares no group with the moved cell. Returning only co-group
+    ## neighbours in that regime would leave stale entries in the cached
+    ## penalty map. The early-return safe-zones above already cover the deep-
+    ## slack and deep-saturated regions where the delta is constant; in the
+    ## boundary band we must therefore broadcast to every position the
+    ## constraint touches.
     let old = state.lastOldOccurrences
     let new2 = state.lastNewOccurrences
     if old == new2:
@@ -372,6 +388,10 @@ proc getAffectedPositions*[T](state: ConjunctSumAtMostConstraint[T]): PackedSet[
     if (old <= lowSafe and new2 <= lowSafe) or
        (old > highSafe and new2 > highSafe):
         return initPackedSet[int]()
+    # Past the safe zones we are inside the boundary band. Co-group narrowing
+    # is only sound when `maxOccurrences == 0` (see the long comment above).
+    if maxOcc != 0:
+        return state.positions
     # Tight set: walk every group containing the just-moved cell, and emit the
     # absolute position of every other member of those groups. The PackedSet
     # handles deduplication. If we don't know which cell moved (initial setup,

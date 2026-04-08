@@ -791,14 +791,12 @@ proc isoscelesFreeGrid*[T](positions: openArray[int], n: int): StatefulConstrain
         "isoscelesFreeGrid: positions.len (" & $positions.len &
         ") must equal n*n (" & $(n * n) & ")"
 
-    if n < 3:
-        # No isosceles triple can exist on a 1×1 or 2×2 grid (only 4 cells,
-        # min triple needs at least 3 — and 3 cells on a 2×2 always have a
-        # right angle but only the degenerate "collinear" case which can't
-        # exist in 2×2 either). Return a trivially-satisfied constraint.
-        let emptyGroups: seq[seq[int]] = @[]
-        let one: T = 1
-        return conjunctSumAtMost(emptyGroups, one, 0)
+    # n == 1 has only one cell — no triple is possible, so the enumeration
+    # below produces zero groups and we get a vacuously-satisfied constraint.
+    # n == 2 (the 2×2 grid) is *not* trivial: any 3 of its 4 cells form a
+    # right isosceles triangle (legs of length 1), so all 4 such triples are
+    # forbidden. The enumeration below handles both cases without a special
+    # path.
 
     # Cache row/col for each linear cell index.
     var rowOf = newSeq[int](n * n)
