@@ -376,9 +376,9 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
     var totalRange = 1
     for i in 0..<nKeys:
         keyRanges[i] = keyMaxs[i] - keyMins[i] + 1
-        totalRange *= keyRanges[i]
-        if totalRange > maxTotalRange:
+        if keyRanges[i] > maxTotalRange div totalRange:
             return false
+        totalRange *= keyRanges[i]
 
     if maxSparsity > 0 and totalRange > tuples.len * maxSparsity:
         return false

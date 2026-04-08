@@ -3001,8 +3001,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         # the resolvents are individually valid but their combination with other
                         # constraints can over-tighten. Reset this position's bounds to avoid
                         # poisoning subsequent propagation.
-                        domainMin[pos] = carray.domain[pos][0]
-                        domainMax[pos] = carray.domain[pos][^1]
+                        domainMin[pos] = min(carray.domain[pos])
+                        domainMax[pos] = max(carray.domain[pos])
                         continue
                     # else: no FM resolvents → truly infeasible, let the empty domain propagate
                 for v in toSeq(currentDomain[pos].items):
@@ -3787,8 +3787,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 if pos in skippedPositions: continue
                 if domainMin[pos] > domainMax[pos]:
                     if totalResolvents > 0:
-                        domainMin[pos] = carray.domain[pos][0]
-                        domainMax[pos] = carray.domain[pos][^1]
+                        domainMin[pos] = min(carray.domain[pos])
+                        domainMax[pos] = max(carray.domain[pos])
                         continue
                 for v in toSeq(currentDomain[pos].items):
                     if v < domainMin[pos] or v > domainMax[pos]:

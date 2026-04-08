@@ -80,8 +80,8 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
 {.push overflowChecks: off.}
 func evaluate*[T](state: SumExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     # Computes the value of the SumExpression given the variable assignment.
-    # overflowChecks off: channel bindings with composite keys can produce
-    # intermediate sentinel values (low(int)) during initialization.
+    # overflowChecks off: intermediate search states can produce large values
+    # during channel propagation before convergence.
     result = state.constant
 
     case state.evalMethod:
