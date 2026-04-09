@@ -2647,9 +2647,14 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     positiveAt.mgetOrPut(pos, @[]).add(fi)
                 elif coeff < 0:
                     negativeAt.mgetOrPut(pos, @[]).add(fi)
-        const MaxResolventsPerPos = 50
-        const MaxTotalResolvents = 500
-        const MaxPairProduct = 100
+
+        # Adaptive limits: scale with the number of normalized forms.
+        # Equality-heavy systems (e.g., Sv=0 stoichiometry) produce many paired
+        # forms and benefit from more aggressive resolution.
+        let nForms = normalizedForms.len
+        let MaxResolventsPerPos = 50
+        let MaxTotalResolvents = max(500, nForms)
+        let MaxPairProduct = max(100, nForms div 4)
 
         for pos in positiveAt.keys:
             if pos notin negativeAt:
@@ -2906,6 +2911,55 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         cbDomSnapshot[pos] = if pos in skippedPositions: -1
                              else: currentDomain[pos].len
 
+    # Pre-compute GCD info for equality constraints.
+    # For sum(c_i * x_i) + const = 0 (EqualTo), for each position j we can prune
+    # domain values v where (const + c_j * v) is incompatible mod gcd(other coefficients).
+    type GcdEqInfo = object
+        positions: seq[int]
+        coefficients: seq[T]
+        constant: T
+        # Per-position GCD of all OTHER coefficients in this constraint.
+        # If g_rest[j] > 1, then (constant + c_j * v) must be divisible by g_rest[j].
+        gcdRest: seq[T]
+
+    var gcdEqForms: seq[GcdEqInfo]
+    for form in linearForms:
+        if form.relation != EqualTo: continue
+        if form.coefficients.len < 2: continue
+        var posSeq: seq[int]
+        var coeffSeq: seq[T]
+        for pos, c in form.coefficients.pairs:
+            posSeq.add(pos)
+            coeffSeq.add(c)
+        # Compute gcd of all coefficients first
+        var gAll = T(0)
+        for c in coeffSeq:
+            gAll = gcd(gAll, abs(c))
+        if gAll > 1:
+            # Divide through by overall GCD (all values become smaller)
+            for i in 0..<coeffSeq.len:
+                coeffSeq[i] = coeffSeq[i] div gAll
+            # constant / gAll must be integer for feasibility
+            # (if not, will be caught by bounds propagation as infeasible)
+        # Compute per-position gcd of OTHER coefficients
+        var gcdRestSeq = newSeq[T](posSeq.len)
+        var hasNonTrivial = false
+        for j in 0..<posSeq.len:
+            var g = T(0)
+            for i in 0..<coeffSeq.len:
+                if i == j: continue
+                g = gcd(g, abs(coeffSeq[i]))
+            gcdRestSeq[j] = g
+            if g > 1: hasNonTrivial = true
+        if hasNonTrivial:
+            let adjConst = if gAll > 1: form.constant div gAll else: form.constant
+            gcdEqForms.add(GcdEqInfo(
+                positions: posSeq, coefficients: coeffSeq,
+                constant: adjConst, gcdRest: gcdRestSeq))
+
+    if gcdEqForms.len > 0:
+        stderr.writeLine(&"[DomRed] GCD equality forms: {gcdEqForms.len} with non-trivial per-position GCD")
+
     let domRedStartTime = epochTime()
     const DomRedTimeBudget = 5.0  # seconds
 
@@ -3009,6 +3063,29 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     if v < domainMin[pos] or v > domainMax[pos]:
                         currentDomain[pos].excl(v)
                         outerChanged = true
+
+        # Phase GCD: For equality constraints, prune domain values incompatible
+        # with the GCD structure. For sum(c_i * x_i) + constant = 0, each position
+        # j requires (constant + c_j * v) ≡ 0 (mod g_rest_j) where g_rest_j is the
+        # GCD of all OTHER coefficients.
+        if gcdEqForms.len > 0:
+            for eq in gcdEqForms:
+                for j in 0..<eq.positions.len:
+                    let g = eq.gcdRest[j]
+                    if g <= 1: continue
+                    let pos = eq.positions[j]
+                    if pos in skippedPositions: continue
+                    if currentDomain[pos].len == 0: continue
+                    let cj = eq.coefficients[j]
+                    # Need: (eq.constant + cj * v) mod g == 0
+                    # i.e. cj * v ≡ -eq.constant (mod g)
+                    # Precompute the target residue
+                    let target = ((-eq.constant) mod g + g) mod g  # normalize to [0, g)
+                    for v in toSeq(currentDomain[pos].items):
+                        let residue = ((cj * v) mod g + g) mod g
+                        if residue != target:
+                            currentDomain[pos].excl(v)
+                            outerChanged = true
 
         # Phase IntDiv: Restrict x to ∪{[c*z, c*z+c-1] : z ∈ domain(z)}
         if divPatterns.len > 0:

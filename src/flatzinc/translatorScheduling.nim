@@ -144,6 +144,7 @@ proc detectConditionalSeparationPattern(tr: var FznTranslator) =
 
         let posArg = con.args[0]
         let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
 
         # Pattern 1: bool_clause([sep_before, sep_after], [guard]) - 2 positive, 1 negative
         if posArg.elems.len == 2 and negArg.elems.len == 1:

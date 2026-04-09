@@ -3310,3 +3310,105 @@ solve :: int_search(var_t,smallest,indomain_min,complete) minimize var_z;
     check tr.sys.hasFeasibleSolution
     let objVal = tr.sys.assignment[tr.objectivePos]
     check objVal == 16  # optimal: place nodes so max(sweep+block) = 16
+
+  test "GCD-based domain pruning for linear equalities":
+    # Constraint: 3*x + 7*y = 0  with x in 0..20, y in 0..20
+    # GCD analysis: for x, gcd of other coeffs = 7, so 3*x ≡ 0 (mod 7)
+    #   => x must be a multiple of 7: {0, 7, 14}
+    # For y, gcd of other coeffs = 3, so 7*y ≡ 0 (mod 3) => y*1 ≡ 0 (mod 3)
+    #   => y must be a multiple of 3: {0, 3, 6, 9, 12, 15, 18}
+    # After bounds propagation: 3*x <= 7*20 = 140 (no bound tightening for x),
+    #   but 7*y <= 3*20 = 60 => y <= 8, so y in {0, 3, 6}
+    # Combined with 3*x + 7*y = 0 and both non-negative: x=0, y=0
+    # Presolve should fix both to 0.
+    let src = """
+var 0..20: x;
+var 0..20: y;
+constraint int_lin_eq([3,7],[x,y],0);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let xPos = tr.varPositions["x"]
+    let yPos = tr.varPositions["y"]
+    # Both should be fixed to 0 by presolve (bounds propagation + GCD)
+    check tr.sys.baseArray.domain[xPos] == @[0]
+    check tr.sys.baseArray.domain[yPos] == @[0]
+
+  test "GCD-based domain pruning with non-trivial feasible set":
+    # Constraint: 3*x + 5*y = 30  with x in 0..10, y in 0..6
+    # GCD pruning for x: gcd of other coeffs = 5, so 3*x ≡ 30 (mod 5)
+    #   => 3*x ≡ 0 (mod 5) => x ≡ 0 (mod 5): {0, 5, 10}
+    # GCD pruning for y: gcd of other coeffs = 3, so 5*y ≡ 30 (mod 3)
+    #   => 2*y ≡ 0 (mod 3) => y ≡ 0 (mod 3): {0, 3, 6}
+    # Bounds propagation: y <= (30 - 0) / 5 = 6, x <= (30 - 0) / 3 = 10
+    # Solutions: (0,6), (5,3), (10,0) - all valid
+    let src = """
+var 0..10: x;
+var 0..6: y;
+constraint int_lin_eq([3,5],[x,y],30);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let xPos = tr.varPositions["x"]
+    let yPos = tr.varPositions["y"]
+    # x should be pruned to multiples of 5
+    check tr.sys.baseArray.domain[xPos] == @[0, 5, 10]
+    # y should be pruned to multiples of 3
+    check tr.sys.baseArray.domain[yPos] == @[0, 3, 6]
+
+    # Should find a feasible solution
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+    let xVal = tr.sys.assignment[xPos]
+    let yVal = tr.sys.assignment[yPos]
+    check 3 * xVal + 5 * yVal == 30
+
+  test "GCD pruning with negative coefficients":
+    # Constraint: 4*x - 6*y = 2  with x in 0..10, y in 0..10
+    # Overall gcd(4,6) = 2, but rhs=2 is divisible by 2, so constraint is feasible.
+    # GCD pruning for x: gcd of other coeffs = |(-6)| = 6, so 4*x ≡ 2 (mod 6)
+    #   => 4*x mod 6 = 2: x=2 gives 8%6=2 ✓, x=5 gives 20%6=2 ✓, x=8 gives 32%6=2 ✓
+    #   so x in {2, 5, 8}
+    # GCD pruning for y: gcd of other coeffs = |4| = 4, so -6*y ≡ 2 (mod 4)
+    #   => (-6*y) mod 4 = 2 mod 4 = 2: y=1 gives -6%4 = (-6+8)%4 = 2 ✓, y=3 gives -18%4 = (-18+20)%4 = 2 ✓
+    #   etc. so y in {1, 3, 5, 7, 9}
+    # Bounds: 4*x = 2 + 6*y >= 2 => x >= 1; 4*x = 2 + 6*y <= 2+60=62 => x <= 10 (no further)
+    #   -6*y = 2 - 4*x => 6*y = 4*x - 2 >= -2 => y >= 0; 6*y = 4*x - 2 <= 38 => y <= 6
+    # After bounds + GCD: x in {2, 5, 8}, y in {1, 3, 5}
+    let src = """
+var 0..10: x;
+var 0..10: y;
+constraint int_lin_eq([4,-6],[x,y],2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let xPos = tr.varPositions["x"]
+    let yPos = tr.varPositions["y"]
+    # x should be pruned: bounds give [1,10], GCD gives multiples of... let's check
+    let xDom = tr.sys.baseArray.domain[xPos]
+    let yDom = tr.sys.baseArray.domain[yPos]
+    # x must satisfy 4*x ≡ 2 (mod 6): x in {2, 5, 8}
+    check 0 notin xDom
+    check 1 notin xDom
+    check 2 in xDom
+    check 3 notin xDom
+    check 5 in xDom
+    check 8 in xDom
+    # y bounds: [0,6], GCD: -6*y ≡ 2 (mod 4) => y odd: {1, 3, 5}
+    check 0 notin yDom
+    check 1 in yDom
+    check 2 notin yDom
+    check 3 in yDom
+    check 5 in yDom
+
+    # Should find a valid solution
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+    let xVal = tr.sys.assignment[xPos]
+    let yVal = tr.sys.assignment[yPos]
+    check 4 * xVal - 6 * yVal == 2
+

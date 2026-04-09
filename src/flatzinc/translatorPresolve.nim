@@ -597,6 +597,39 @@ proc boundsPropagate(tr: FznTranslator,
                         result = true
                         vars[j].hi = min(vars[j].hi, upperBound)
 
+        # GCD-based feasibility pruning for equalities.
+        # For sum(c_i * x_i) = rhs, for each unfixed variable x_j, the sum of
+        # other terms must equal (rhs - c_j * x_j). That sum is a multiple of
+        # gcd(other coefficients), so (rhs - c_j * x_j) must also be.
+        if isEq and nArgs >= 2:
+            for j in 0..<nArgs:
+                if vars[j].fixed: continue
+                if vars[j].varName == "": continue
+                let c = vars[j].coeff
+                if c == 0: continue
+                # Compute gcd of OTHER unfixed coefficients
+                var gRest = 0
+                for i in 0..<nArgs:
+                    if i == j or vars[i].fixed: continue
+                    gRest = gcd(gRest, abs(vars[i].coeff))
+                if gRest <= 1: continue
+                # Need: (rhs - c * v) mod gRest == 0
+                # i.e. c * v ≡ rhs (mod gRest)
+                let target = ((rhs mod gRest) + gRest) mod gRest
+                if vars[j].varName in domains:
+                    let dom = domains[vars[j].varName]
+                    var allowed: seq[int]
+                    for v in dom:
+                        let residue = ((c * v) mod gRest + gRest) mod gRest
+                        if residue == target:
+                            allowed.add(v)
+                    if allowed.len < dom.len:
+                        if presolveTightenDomain(domains, vars[j].varName, allowed, infeasible):
+                            result = true
+                            if allowed.len > 0:
+                                vars[j].lo = allowed[0]
+                                vars[j].hi = allowed[^1]
+
 proc bigMDomainPruning(tr: FznTranslator,
                        domains: var Table[string, seq[int]],
                        fixedVars: Table[string, int],
