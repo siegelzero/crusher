@@ -37,6 +37,7 @@ concert_hall_cap_mznc2018,2024/concert-hall-cap/concert-hall-cap.mzn,2024/concer
 graph_clear_n20_14,2024/graph-clear/graph_clear_cp.mzn,2024/graph-clear/planar_n20_seed2022_14.json,minimize,10000,54,120
 harmony_brother,2024/harmony/harmony.mzn,2024/harmony/brother.dzn,minimize,10000,36,100
 hoist_benchmark_PU_2_4_3,2024/hoist-benchmark/hoist-benchmark.mzn,2024/hoist-benchmark/PU_2_4_3.dzn,minimize,10000,295,600
+neighbours_new_2,2024/neighbours/neighbours-rect.mzn,2024/neighbours/neightbours-new-2.dzn,maximize,10000,17,17
 
 groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86
