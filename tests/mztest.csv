@@ -16,7 +16,7 @@ tower_070_070_15_070_09,2022/tower/tower.mzn,2022/tower/tower_070_070_15_070-09.
 triangular_n10,2022/triangular/triangular.mzn,2022/triangular/n10.dzn,maximize,10000,20,20
 wordpress_12_500,2022/wordpress/wordpress.mzn,2022/wordpress/Wordpress12_Offers500.dzn,minimize,10000,3580,30000
 
-chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,25,25
+chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,24,25
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
 mrcpsp_j30_25_5,2023/mrcpsp/mrcpsp.mzn,2023/mrcpsp/j30_25_5.dzn,minimize,10000,27,50
 pennies_n5,2023/pennies-opt/pennies.mzn,2023/pennies-opt/n5.dzn,maximize,10000,1,5
@@ -48,5 +48,5 @@ products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,
 proteindesign12_1HZ5,2025/proteindesign12/wcsp.mzn,2025/proteindesign12/1HZ5.12p.9aa.usingEref_self.dzn,minimize,10000,1473,1480
 tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.dzn,maximize,10000,25,45
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
-work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,3000
+work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,4000
 
