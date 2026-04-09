@@ -2936,11 +2936,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         for c in coeffSeq:
             gAll = gcd(gAll, abs(c))
         if gAll > 1:
+            if form.constant mod gAll != 0:
+                # Equation is infeasible: constant not divisible by gcd of all coefficients.
+                # Skip — bounds propagation will detect infeasibility via empty domains.
+                continue
             # Divide through by overall GCD (all values become smaller)
             for i in 0..<coeffSeq.len:
                 coeffSeq[i] = coeffSeq[i] div gAll
-            # constant / gAll must be integer for feasibility
-            # (if not, will be caught by bounds propagation as infeasible)
         # Compute per-position gcd of OTHER coefficients
         var gcdRestSeq = newSeq[T](posSeq.len)
         var hasNonTrivial = false

@@ -613,9 +613,14 @@ proc boundsPropagate(tr: FznTranslator,
                     if i == j or vars[i].fixed: continue
                     gRest = gcd(gRest, abs(vars[i].coeff))
                 if gRest <= 1: continue
-                # Need: (rhs - c * v) mod gRest == 0
-                # i.e. c * v ≡ rhs (mod gRest)
-                let target = ((rhs mod gRest) + gRest) mod gRest
+                # Need: (adjRhs - c * v) mod gRest == 0
+                # where adjRhs = rhs - sum(c_i * fixedVal_i) for fixed i
+                # i.e. c * v ≡ adjRhs (mod gRest)
+                var adjRhs = rhs
+                for i in 0..<nArgs:
+                    if i != j and vars[i].fixed:
+                        adjRhs -= vars[i].coeff * vars[i].fixedVal
+                let target = ((adjRhs mod gRest) + gRest) mod gRest
                 if vars[j].varName in domains:
                     let dom = domains[vars[j].varName]
                     var allowed: seq[int]

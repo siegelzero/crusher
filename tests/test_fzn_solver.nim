@@ -3412,3 +3412,46 @@ solve satisfy;
     let yVal = tr.sys.assignment[yPos]
     check 4 * xVal - 6 * yVal == 2
 
+  test "GCD pruning with fixed variables in presolve":
+    # Constraint: 2*x + 3*y + 5*z = 20  with z fixed to 2
+    # Effective: 2*x + 3*y = 10
+    # GCD pruning for x: gRest = gcd(3) = 3, adjRhs = 10
+    #   2*x ≡ 10 (mod 3) → 2*x ≡ 1 (mod 3) → x ≡ 2 (mod 3): {2, 5, 8, ...}
+    # GCD pruning for y: gRest = gcd(2) = 2, adjRhs = 10
+    #   3*y ≡ 10 (mod 2) → y ≡ 0 (mod 2): {0, 2, 4, ...}
+    # Bounds: x in [0, (10-0)/2] = [0, 5], y in [0, (10-0)/3] = [0, 3]
+    # After GCD + bounds: x in {2, 5}, y in {0, 2}
+    # Solutions: (2, 2) → 4+6=10 ✓, (5, 0) → 10+0=10 ✓
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var 2..2: z;
+constraint int_lin_eq([2,3,5],[x,y,z],20);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let xPos = tr.varPositions["x"]
+    let yPos = tr.varPositions["y"]
+    let xDom = tr.sys.baseArray.domain[xPos]
+    let yDom = tr.sys.baseArray.domain[yPos]
+    # x must satisfy x ≡ 2 (mod 3) within [0, 5]: {2, 5}
+    check 0 notin xDom
+    check 1 notin xDom
+    check 2 in xDom
+    check 3 notin xDom
+    check 4 notin xDom
+    check 5 in xDom
+    # y must satisfy y ≡ 0 (mod 2) within [0, 3]: {0, 2}
+    check 0 in yDom
+    check 1 notin yDom
+    check 2 in yDom
+    check 3 notin yDom
+
+    # Should find a valid solution
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+    let xVal = tr.sys.assignment[xPos]
+    let yVal = tr.sys.assignment[yPos]
+    check 2 * xVal + 3 * yVal == 10
+
