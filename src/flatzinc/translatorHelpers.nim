@@ -132,6 +132,27 @@ proc make2DIndex*(exprA, exprB: AlgebraicExpression[int],
     ## Builds a 2D index expression: (exprA - loA) * rangeB + (exprB - loB).
     (exprA - loA) * rangeB + (exprB - loB)
 
+# --- Sparse clamp index for reified comparison channels ---
+
+proc constLitExpr*(value: int): AlgebraicExpression[int] {.inline.} =
+    ## Builds a constant literal AlgebraicExpression with no positions.
+    newAlgebraicExpression[int](
+        positions = initPackedSet[int](),
+        node = ExpressionNode[int](kind: LiteralNode, value: value),
+        linear = true)
+
+proc buildSignClampIndex*(diffExpr: AlgebraicExpression[int]): AlgebraicExpression[int] =
+    ## Builds a 3-valued sign-clamp index from a difference expression:
+    ##   index = clamp(diffExpr, -1, 1) + 1   ∈  {0, 1, 2}
+    ##     0 when diffExpr < 0   (LT)
+    ##     1 when diffExpr == 0  (EQ)
+    ##     2 when diffExpr > 0   (GT)
+    ## Used for sparse 3-entry channels for reified comparisons (int_eq_reif,
+    ## int_ne_reif, int_le_reif, int_lt_reif, int_lin_eq_reif) when the source
+    ## domain is too large for a dense lookup table. The index is non-linear
+    ## (uses Maximum/Minimum) but the underlying eval is cheap.
+    binaryMin(binaryMax(diffExpr, constLitExpr(-1)), constLitExpr(1)) + 1
+
 # --- Bool clause helpers ---
 
 proc extractBoolClauseLiterals*(con: FznConstraint):

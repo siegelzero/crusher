@@ -125,12 +125,25 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 let lo = domain[0]
                 let hi = domain[^1]
                 if hi - lo + 1 > 100_000:
-                    skippedReifCIs.incl(ci)
-                    continue
-
-                indexExpr = xExpr - lo
-                arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
-                    if (v == val) == isEq: 1 else: 0)
+                    # Sparse 3-entry clamp channel: avoid building a giant table
+                    # when the domain range is huge (e.g. scheduling time horizons).
+                    if val < lo or val > hi:
+                        # val is outside the domain — b is constant.
+                        let constB = if isEq: 0 else: 1
+                        tr.sys.baseArray.setDomain(bPos, @[constB])
+                        continue
+                    indexExpr = buildSignClampIndex(xExpr - val)
+                    let eqVal = if isEq: 1 else: 0
+                    let neVal = if isEq: 0 else: 1
+                    arrayElems = @[
+                        ArrayElement[int](isConstant: true, constantValue: neVal),
+                        ArrayElement[int](isConstant: true, constantValue: eqVal),
+                        ArrayElement[int](isConstant: true, constantValue: neVal),
+                    ]
+                else:
+                    indexExpr = xExpr - lo
+                    arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                        if (v == val) == isEq: 1 else: 0)
 
         elif valArg.kind == FznIdent and valArg.ident notin tr.definedVarNames:
             # Variable val: b = element((x-lo_x)*range_y + (y-lo_y), equality_table)
@@ -146,12 +159,20 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             # Guard against huge 2D tables (use ranges, not domain sizes, since we fill gaps)
             if rangeX > 10_000 or rangeY > 10_000 or
                   rangeX * rangeY > 100_000:
-                skippedReifCIs.incl(ci)
-                continue
-
-            indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
-            arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
-                if (vx == vy) == isEq: 1 else: 0)
+                # Sparse 3-entry clamp channel on the difference (x - y).
+                # Index = clamp(x - y, -1, 1) + 1 ∈ {0, 1, 2}.
+                indexExpr = buildSignClampIndex(xExpr - yExpr)
+                let eqVal = if isEq: 1 else: 0
+                let neVal = if isEq: 0 else: 1
+                arrayElems = @[
+                    ArrayElement[int](isConstant: true, constantValue: neVal),
+                    ArrayElement[int](isConstant: true, constantValue: eqVal),
+                    ArrayElement[int](isConstant: true, constantValue: neVal),
+                ]
+            else:
+                indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
+                arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
+                    if (vx == vy) == isEq: 1 else: 0)
         else:
             skippedReifCIs.incl(ci)
             continue
@@ -410,13 +431,33 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             let lo = domain[0]
             let hi = domain[^1]
             if hi - lo + 1 > 100_000:
-                skippedLeReifCIs.incl(ci)
-                continue
-            indexExpr = xExpr - lo
-            let capturedC = c
-            let capturedIsLe = isLe
-            arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
-                if (if capturedIsLe: capturedC <= v else: capturedC < v): 1 else: 0)
+                # Sparse 3-entry clamp channel: index = clamp(x - c, -1, 1) + 1.
+                # b = (c REL x), so for index 0 = x<c, 1 = x==c, 2 = x>c:
+                #   le: c <= x → [0, 1, 1]
+                #   lt: c <  x → [0, 0, 1]
+                # b always 0: le when hi < c (all x < c), lt when hi <= c
+                # b always 1: le when lo >= c, lt when lo > c
+                let alwaysZero = if isLe: hi < c else: hi <= c
+                let alwaysOne = if isLe: lo >= c else: lo > c
+                if alwaysZero:
+                    tr.sys.baseArray.setDomain(bPos, @[0])
+                    continue
+                if alwaysOne:
+                    tr.sys.baseArray.setDomain(bPos, @[1])
+                    continue
+                indexExpr = buildSignClampIndex(xExpr - c)
+                let mid = if isLe: 1 else: 0
+                arrayElems = @[
+                    ArrayElement[int](isConstant: true, constantValue: 0),
+                    ArrayElement[int](isConstant: true, constantValue: mid),
+                    ArrayElement[int](isConstant: true, constantValue: 1),
+                ]
+            else:
+                indexExpr = xExpr - lo
+                let capturedC = c
+                let capturedIsLe = isLe
+                arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                    if (if capturedIsLe: capturedC <= v else: capturedC < v): 1 else: 0)
 
         elif not arg0IsConst and arg1IsConst:
             # int_le_reif(x, const, b): b = (x <= const) for le, b = (x < const) for lt
@@ -430,13 +471,33 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             let lo = domain[0]
             let hi = domain[^1]
             if hi - lo + 1 > 100_000:
-                skippedLeReifCIs.incl(ci)
-                continue
-            indexExpr = xExpr - lo
-            let capturedC = c
-            let capturedIsLe = isLe
-            arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
-                if (if capturedIsLe: v <= capturedC else: v < capturedC): 1 else: 0)
+                # Sparse 3-entry clamp channel: index = clamp(x - c, -1, 1) + 1.
+                # b = (x REL c), so for index 0 = x<c, 1 = x==c, 2 = x>c:
+                #   le: x <= c → [1, 1, 0]
+                #   lt: x <  c → [1, 0, 0]
+                # b always 1: le when hi <= c, lt when hi < c
+                # b always 0: le when lo > c, lt when lo >= c
+                let alwaysOne = if isLe: hi <= c else: hi < c
+                let alwaysZero = if isLe: lo > c else: lo >= c
+                if alwaysOne:
+                    tr.sys.baseArray.setDomain(bPos, @[1])
+                    continue
+                if alwaysZero:
+                    tr.sys.baseArray.setDomain(bPos, @[0])
+                    continue
+                indexExpr = buildSignClampIndex(xExpr - c)
+                let mid = if isLe: 1 else: 0
+                arrayElems = @[
+                    ArrayElement[int](isConstant: true, constantValue: 1),
+                    ArrayElement[int](isConstant: true, constantValue: mid),
+                    ArrayElement[int](isConstant: true, constantValue: 0),
+                ]
+            else:
+                indexExpr = xExpr - lo
+                let capturedC = c
+                let capturedIsLe = isLe
+                arrayElems = buildConstLookupTable(lo, hi, proc(v: int): int =
+                    if (if capturedIsLe: v <= capturedC else: v < capturedC): 1 else: 0)
 
         elif not arg0IsConst and not arg1IsConst:
             # int_le_reif(x, y, b): b = (x <= y) for le, b = (x < y) for lt
@@ -457,12 +518,20 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             let rangeY = hiY - loY + 1
             if rangeX > 10_000 or rangeY > 10_000 or
                   rangeX * rangeY > 100_000:
-                skippedLeReifCIs.incl(ci)
-                continue
-            indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
-            let capturedIsLe = isLe
-            arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
-                if (if capturedIsLe: vx <= vy else: vx < vy): 1 else: 0)
+                # Sparse 3-entry clamp channel on (x - y).
+                # b = (x REL y): same table layouts as the (x, const) case.
+                indexExpr = buildSignClampIndex(xExpr - yExpr)
+                let mid = if isLe: 1 else: 0
+                arrayElems = @[
+                    ArrayElement[int](isConstant: true, constantValue: 1),
+                    ArrayElement[int](isConstant: true, constantValue: mid),
+                    ArrayElement[int](isConstant: true, constantValue: 0),
+                ]
+            else:
+                indexExpr = make2DIndex(xExpr, yExpr, loX, loY, rangeY)
+                let capturedIsLe = isLe
+                arrayElems = buildConstLookupTable2D(loX, hiX, loY, hiY, proc(vx, vy: int): int =
+                    if (if capturedIsLe: vx <= vy else: vx < vy): 1 else: 0)
         else:
             # Both constant — skip
             skippedLeReifCIs.incl(ci)
@@ -558,7 +627,24 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 exprMin += coeffs[i] * hi
                 exprMax += coeffs[i] * lo
 
-        if not boundsOk or exprMax - exprMin + 1 > 100_000:
+        if not boundsOk:
+            skippedLinLeReifCIs.incl(ci)
+            continue
+
+        # Static fold: if the entire range is on one side of rhs, fix b directly.
+        # This is always safe and avoids both a giant table and a runtime constraint.
+        if exprMax <= rhs:
+            tr.sys.baseArray.setDomain(bPos, @[1])
+            continue
+        if exprMin > rhs:
+            tr.sys.baseArray.setDomain(bPos, @[0])
+            continue
+
+        if exprMax - exprMin + 1 > 100_000:
+            # Skip sparse channel here: lin_le_reif tends to be quadratic in pairwise
+            # disjunctive scheduling encodings (3000+ at once), and channeling all of
+            # them inflates the per-move cascade cost. Let the runtime reified
+            # constraint handle them instead.
             skippedLinLeReifCIs.incl(ci)
             continue
 
@@ -584,6 +670,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             if ci notin skippedLinLeReifCIs:
                 filtered.add(ci)
         tr.linLeReifChannelDefs = filtered
+        stderr.writeLine(&"[FZN] Un-channeled {skippedLinLeReifCIs.len} lin_le_reif bindings (bounds unknown)")
 
     # Process int_lin_eq_reif channels
     # b <-> sum(coeffs[i] * vars[i]) == rhs
@@ -671,12 +758,31 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 exprMin += coeffs[i] * hi
                 exprMax += coeffs[i] * lo
 
-        if not boundsOk or exprMax - exprMin + 1 > 100_000:
+        if not boundsOk:
+            skippedLinEqReifCIs.incl(ci)
+            continue
+
+        let isLinEq = stripSolverPrefix(con.name) == "int_lin_eq_reif"
+
+        # Static fold: if rhs is outside the expression range, fix b directly.
+        # Always safe; no runtime constraint or channel binding required.
+        if rhs < exprMin or rhs > exprMax:
+            tr.sys.baseArray.setDomain(bPos, @[if isLinEq: 0 else: 1])
+            continue
+        # If expression is constant, the truth value is fully determined.
+        if exprMin == exprMax:
+            tr.sys.baseArray.setDomain(bPos,
+                @[if (exprMin == rhs) == isLinEq: 1 else: 0])
+            continue
+
+        if exprMax - exprMin + 1 > 100_000:
+            # Skip sparse channel: like lin_le_reif, lin_eq_reif tends to come in
+            # bulk and the per-move cascade fanout from many channels is worse
+            # than runtime reified constraint evaluation.
             skippedLinEqReifCIs.incl(ci)
             continue
 
         # Build lookup table: for each value v of the expression, b = (v == rhs) or (v != rhs)
-        let isLinEq = stripSolverPrefix(con.name) == "int_lin_eq_reif"
         var arrayElems: seq[ArrayElement[int]]
         for v in exprMin..exprMax:
             arrayElems.add(ArrayElement[int](isConstant: true,
@@ -698,6 +804,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
             if ci notin skippedLinEqReifCIs:
                 filtered.add(ci)
         tr.linEqReifChannelDefs = filtered
+        stderr.writeLine(&"[FZN] Un-channeled {skippedLinEqReifCIs.len} lin_eq_reif bindings (bounds unknown)")
 
     # Process bool_eq_reif / bool_ne_reif channels
     # bool_eq_reif(a, b, r): r = (a == b) = element(a*2 + b, [1, 0, 0, 1])
