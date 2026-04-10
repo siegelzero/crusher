@@ -3287,3 +3287,145 @@ solve satisfy;
             check tr.presolveDomains["x3"] == @[0, 1]
         if "x4" in tr.presolveDomains:
             check tr.presolveDomains["x4"] == @[0, 1]
+
+
+suite "FlatZinc int_times Expression Channel":
+
+    test "low fan-out int_times: routed to expression channel":
+        ## When each source variable feeds at most a few products, int_times defines_var
+        ## should be channeled (not inlined as defined var). Channel position exists,
+        ## constraint is consumed by definingConstraints, expressionChannelDef is added.
+        let src = """
+var 0..10: a :: output_var;
+var 0..10: b :: output_var;
+var 0..100: p :: var_is_introduced :: is_defined_var;
+constraint int_times(a, b, p) :: defines_var(p);
+constraint int_lin_le([1], [p], 50);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        # Product is a channel var (gets a position)
+        check "p" in tr.channelVarNames
+        check "p" notin tr.definedVarNames
+        check tr.varPositions.hasKey("p")
+        # Expression channel def was registered
+        var found = false
+        for def in tr.expressionChannelDefs:
+            if def.varName == "p":
+                found = true
+                break
+        check found
+        # An expression channel binding was actually built for it
+        let pPos = tr.varPositions["p"]
+        var bindingFound = false
+        for binding in tr.sys.baseArray.expressionChannelBindings:
+            if binding.channelPosition == pPos:
+                bindingFound = true
+                break
+        check bindingFound
+
+    test "low fan-out int_times: solver computes correct product":
+        ## End-to-end check that the channel correctly evaluates a*b at runtime.
+        let src = """
+var 3..3: a :: output_var;
+var 7..7: b :: output_var;
+var 0..100: p :: var_is_introduced :: is_defined_var;
+constraint int_times(a, b, p) :: defines_var(p);
+constraint int_lin_le([-1], [p], -21);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check "p" in tr.channelVarNames
+        tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+        check tr.sys.hasFeasibleSolution
+        let pPos = tr.varPositions["p"]
+        check tr.sys.assignment[pPos] == 21
+
+    test "high fan-out int_times: falls back to defined var inlining":
+        ## When one source variable would feed >16 products (MaxTimesChannelFanOut),
+        ## ALL int_times candidates sharing that source should be inlined as defined
+        ## vars instead of channeled. This prevents cascade blowup from a single
+        ## source change triggering re-evaluation of dozens of channels.
+        ## Pattern: 17 products all sharing source `s`, plus distinct b_i factors.
+        var srcLines = "var 0..10: s :: output_var;\n"
+        for i in 1..17:
+            srcLines &= "var 0..10: b" & $i & " :: output_var;\n"
+        for i in 1..17:
+            srcLines &= "var 0..100: p" & $i & " :: var_is_introduced :: is_defined_var;\n"
+        for i in 1..17:
+            srcLines &= "constraint int_times(s, b" & $i & ", p" & $i & ") :: defines_var(p" & $i & ");\n"
+        for i in 1..17:
+            srcLines &= "constraint int_lin_le([1], [p" & $i & "], 50);\n"
+        srcLines &= "solve satisfy;\n"
+
+        let model = parseFzn(srcLines)
+        var tr = translate(model)
+        # All products should be inlined as defined vars (not channeled)
+        for i in 1..17:
+            let name = "p" & $i
+            check name in tr.definedVarNames
+            check name notin tr.channelVarNames
+            check not tr.varPositions.hasKey(name)
+        # No expression channel defs for the products
+        for def in tr.expressionChannelDefs:
+            check not def.varName.startsWith("p")
+
+    test "boundary: exactly 16 products with shared source still channels":
+        ## 16 products is at the threshold (MaxTimesChannelFanOut = 16).
+        ## All 16 should still be channeled (the guard rejects > 16, not >= 16).
+        var srcLines = "var 0..10: s :: output_var;\n"
+        for i in 1..16:
+            srcLines &= "var 0..10: b" & $i & " :: output_var;\n"
+        for i in 1..16:
+            srcLines &= "var 0..100: p" & $i & " :: var_is_introduced :: is_defined_var;\n"
+        for i in 1..16:
+            srcLines &= "constraint int_times(s, b" & $i & ", p" & $i & ") :: defines_var(p" & $i & ");\n"
+        for i in 1..16:
+            srcLines &= "constraint int_lin_le([1], [p" & $i & "], 50);\n"
+        srcLines &= "solve satisfy;\n"
+
+        let model = parseFzn(srcLines)
+        var tr = translate(model)
+        for i in 1..16:
+            let name = "p" & $i
+            check name in tr.channelVarNames
+            check name notin tr.definedVarNames
+
+    test "mixed fan-out: only high-fan-out source rejects its products":
+        ## Two sources: `hi` feeds 17 products (over threshold), `lo` feeds 2.
+        ## The 17 products that touch `hi` are inlined; the 2 that don't are channeled.
+        ## This verifies the per-product check correctly distinguishes by source.
+        var srcLines = "var 0..10: hi :: output_var;\n"
+        srcLines &= "var 0..10: lo :: output_var;\n"
+        for i in 1..17:
+            srcLines &= "var 0..10: bh" & $i & " :: output_var;\n"
+        srcLines &= "var 0..10: bl1 :: output_var;\n"
+        srcLines &= "var 0..10: bl2 :: output_var;\n"
+        for i in 1..17:
+            srcLines &= "var 0..100: ph" & $i & " :: var_is_introduced :: is_defined_var;\n"
+        srcLines &= "var 0..100: pl1 :: var_is_introduced :: is_defined_var;\n"
+        srcLines &= "var 0..100: pl2 :: var_is_introduced :: is_defined_var;\n"
+        for i in 1..17:
+            srcLines &= "constraint int_times(hi, bh" & $i & ", ph" & $i & ") :: defines_var(ph" & $i & ");\n"
+        srcLines &= "constraint int_times(lo, bl1, pl1) :: defines_var(pl1);\n"
+        srcLines &= "constraint int_times(lo, bl2, pl2) :: defines_var(pl2);\n"
+        for i in 1..17:
+            srcLines &= "constraint int_lin_le([1], [ph" & $i & "], 50);\n"
+        srcLines &= "constraint int_lin_le([1], [pl1], 50);\n"
+        srcLines &= "constraint int_lin_le([1], [pl2], 50);\n"
+        srcLines &= "solve satisfy;\n"
+
+        let model = parseFzn(srcLines)
+        var tr = translate(model)
+        # The 17 high-fan-out products are inlined (their `hi` source has fan-out 17 > 16)
+        for i in 1..17:
+            let name = "ph" & $i
+            check name in tr.definedVarNames
+            check name notin tr.channelVarNames
+        # The 2 low-fan-out products are channeled (their `lo` source has fan-out 2)
+        check "pl1" in tr.channelVarNames
+        check "pl2" in tr.channelVarNames
+        check "pl1" notin tr.definedVarNames
+        check "pl2" notin tr.definedVarNames

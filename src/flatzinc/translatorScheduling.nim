@@ -1212,8 +1212,7 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
         if con.args.len < 3: continue
         if con.args[2].kind != FznIdent: continue
         let prodName = con.args[2].ident
-        if prodName notin tr.definedVarNames: continue
-        if prodName in tr.channelVarNames: continue  # defensive
+        if prodName notin tr.definedVarNames and prodName notin tr.channelVarNames: continue
         for (si, li) in [(0, 1), (1, 0)]:
             let sArg = con.args[si]
             let lArg = con.args[li]
@@ -1303,6 +1302,12 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
             tr.definingConstraints.incl(lci)
             consumedLinLe.incl(lci)
         tr.disjunctiveClauses.add(DisjunctiveClause(disjuncts: disjuncts))
+        # Product is fully inlined into disjunctive clauses; move from channel to defined
+        # so it doesn't get an unnecessary position allocated.
+        if product.prodVar in tr.channelVarNames:
+            tr.channelVarNames.excl(product.prodVar)
+            tr.definedVarNames.incl(product.prodVar)
+            tr.expressionChannelDefs = tr.expressionChannelDefs.filterIt(it.varName != product.prodVar)
         nDecomposed += 1
         nLinLeConsumed += linLeCIs.len
 

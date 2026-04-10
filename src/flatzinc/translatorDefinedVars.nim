@@ -37,6 +37,9 @@ proc collectDefinedVars(tr: var FznTranslator) =
     # Third loop: identify int_abs, int_max, int_min, int_times with defines_var annotations
     # int_min/int_max become channel variables (like array_int_minimum/maximum) to avoid
     # deep expression tree inlining that creates exponentially large DAGs.
+    # int_times candidates are collected first, then filtered by fan-out guard below.
+    type IntTimesCand = tuple[ci: int, definedName: string]
+    var intTimesCands: seq[IntTimesCand]
     for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
         if name in ["int_abs", "int_max", "int_min", "int_times"] and con.hasAnnotation("defines_var"):
@@ -56,6 +59,9 @@ proc collectDefinedVars(tr: var FznTranslator) =
                         tr.channelVarNames.incl(definedName)
                         tr.definingConstraints.incl(ci)
                         tr.minMaxChannelDefs.add((ci: ci, varName: definedName, isMin: isMin))
+                    elif name == "int_times":
+                        # Collect candidate; routing decision deferred to fan-out guard
+                        intTimesCands.add((ci: ci, definedName: definedName))
                     else:
                         definedVarNames[definedName] = true
                         tr.definingConstraints.incl(ci)
@@ -136,8 +142,47 @@ proc collectDefinedVars(tr: var FznTranslator) =
             elif arg.kind != FznIntLit:
                 resolvable = false
         if resolvable:
-            definedVarNames[cName] = true
-            tr.definingConstraints.incl(ci)
+            intTimesCands.add((ci: ci, definedName: cName))
+
+    # Fan-out guard for int_times channeling: count how many product channels each
+    # source variable would feed into. If any source exceeds the threshold, the cascade
+    # from changing that variable becomes too wide (re-evaluating 100+ channels + their
+    # downstream constraints). Fall back to defined-var inlining for high-fan-out products.
+    const MaxTimesChannelFanOut = 16
+    block:
+        var sourceFanOut: Table[string, int]
+        for cand in intTimesCands:
+            let con = tr.model.constraints[cand.ci]
+            for idx in 0..1:
+                let arg = con.args[idx]
+                if arg.kind == FznIdent and arg.ident notin tr.paramValues:
+                    sourceFanOut.mgetOrPut(arg.ident, 0) += 1
+        var nChanneled, nInlined = 0
+        var maxFanOut = 0
+        for (_, cnt) in sourceFanOut.pairs:
+            maxFanOut = max(maxFanOut, cnt)
+        for cand in intTimesCands:
+            let con = tr.model.constraints[cand.ci]
+            var fanOutOk = true
+            for idx in 0..1:
+                let arg = con.args[idx]
+                if arg.kind == FznIdent and arg.ident in sourceFanOut:
+                    if sourceFanOut[arg.ident] > MaxTimesChannelFanOut:
+                        fanOutOk = false
+                        break
+            if fanOutOk:
+                # Low fan-out: channel the product to avoid DAG duplication in constraints
+                tr.channelVarNames.incl(cand.definedName)
+                tr.definingConstraints.incl(cand.ci)
+                tr.expressionChannelDefs.add((ci: cand.ci, varName: cand.definedName))
+                inc nChanneled
+            else:
+                # High fan-out: inline as defined var to avoid cascade blowup
+                definedVarNames[cand.definedName] = true
+                tr.definingConstraints.incl(cand.ci)
+                inc nInlined
+        if intTimesCands.len > 0:
+            stderr.writeLine(&"[FZN] int_times products: {nChanneled} channeled, {nInlined} inlined (max source fan-out: {maxFanOut}, threshold: {MaxTimesChannelFanOut})")
 
     # Store the set of defined variable names for use in translateVariables
     for name in definedVarNames.keys:

@@ -994,7 +994,7 @@ proc buildChannelBindings(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
 proc buildExpressionChannelBindings(tr: var FznTranslator) =
-    ## Builds expression channel bindings for int_div/int_mod/int_plus with defines_var.
+    ## Builds expression channel bindings for int_times/int_div/int_mod/int_plus with defines_var.
     var nBuilt = 0
     for def in tr.expressionChannelDefs:
         if def.varName notin tr.varPositions:
@@ -1005,7 +1005,9 @@ proc buildExpressionChannelBindings(tr: var FznTranslator) =
         let arg0 = tr.resolveExprArg(con.args[0])
         let arg1 = tr.resolveExprArg(con.args[1])
         var expr: AlgebraicExpression[int]
-        if name == "int_div":
+        if name == "int_times":
+            expr = arg0 * arg1
+        elif name == "int_div":
             expr = intDiv(arg0, arg1)
         elif name == "int_mod":
             expr = intMod(arg0, arg1)
