@@ -648,6 +648,18 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                                 varTotalRefCount.mgetOrPut(elem.ident, 0) += 1
                 if con.args[2].kind == FznIdent:
                     varTotalRefCount.mgetOrPut(con.args[2].ident, 0) += 1
+        of "int_eq_reif", "int_ne_reif", "int_le_reif", "int_lt_reif", "set_in_reif",
+           "bool_eq_reif", "bool_ne_reif":
+            # Count reification bool (args[2]) references WITHOUT defines_var —
+            # these are unconsumed constraints that use the bool variable
+            if not con.hasAnnotation("defines_var"):
+                if con.args.len >= 3 and con.args[2].kind == FznIdent:
+                    varTotalRefCount.mgetOrPut(con.args[2].ident, 0) += 1
+        of "int_lin_le_reif", "int_lin_eq_reif", "int_lin_ne_reif":
+            # Reification bool is args[3] for linear constraints
+            if not con.hasAnnotation("defines_var"):
+                if con.args.len >= 4 and con.args[3].kind == FznIdent:
+                    varTotalRefCount.mgetOrPut(con.args[3].ident, 0) += 1
         else: discard
         if ci in tr.definingConstraints: continue
         case name

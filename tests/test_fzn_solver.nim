@@ -3630,3 +3630,83 @@ solve satisfy;
     check reduced[xPos].len > 0
     check reduced[yPos].len > 0
 
+  test "fzn_nvalue constraint — exactly 2 distinct values":
+    let src = """
+var 1..5: x1;
+var 1..5: x2;
+var 1..5: x3;
+var 1..5: x4;
+var 1..5: n;
+array [1..4] of var int: x:: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_nvalue(n, x);
+constraint int_eq(n, 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](positions.len)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    let distinctCount = values.toHashSet.len
+    check distinctCount == 2
+    echo "fzn_nvalue satisfy: ", values, " distinct=", distinctCount
+
+  test "fzn_nvalue constraint — maximize distinct values":
+    let src = """
+var 1..4: x1;
+var 1..4: x2;
+var 1..4: x3;
+var 1..4: x4;
+var 1..4: n:: is_defined_var;
+array [1..4] of var int: x:: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_nvalue(n, x);
+solve maximize n;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](positions.len)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    let distinctCount = values.toHashSet.len
+    let nPos = tr.varPositions["n"]
+    let nVal = tr.sys.assignment[nPos]
+    # nvalue constraint must be satisfied: n == distinct count
+    check distinctCount == nVal
+    # Maximizing nvalue with 4 vars in domain 1..4 → should get at least 3
+    check distinctCount >= 3
+    echo "fzn_nvalue maximize: ", values, " n=", nVal, " distinct=", distinctCount
+
+  test "fzn_nvalue with all_different — nvalue must equal array length":
+    let src = """
+var 1..5: x1;
+var 1..5: x2;
+var 1..5: x3;
+var 1..5: n;
+array [1..3] of var int: x:: output_array([1..3]) = [x1,x2,x3];
+constraint fzn_nvalue(n, x);
+constraint fzn_all_different_int(x);
+constraint int_eq(n, 3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](positions.len)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    check values.toHashSet.len == 3
+    let nPos = tr.varPositions["n"]
+    check tr.sys.assignment[nPos] == 3
+    echo "fzn_nvalue + all_different: ", values
+

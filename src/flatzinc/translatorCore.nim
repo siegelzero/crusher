@@ -2041,6 +2041,21 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # Reified form - not yet implemented
         stderr.writeLine("[FZN] Warning: fzn_count_eq_reif not implemented, constraint ignored")
 
+    of "fzn_nvalue":
+        # nvalue(n, x) means the number of distinct values in x equals n
+        let nExpr = tr.resolveExprArg(con.args[0])
+        let arrayExprs = tr.resolveExprArray(con.args[1])
+        var arrayPos: seq[int]
+        for e in arrayExprs:
+            if e.node.kind == RefNode:
+                arrayPos.add(e.node.position)
+            else:
+                raise newException(ValueError, "fzn_nvalue requires simple variable references in array")
+        if nExpr.node.kind == RefNode:
+            tr.sys.addConstraint(nvalue[int](arrayPos, nExpr.node.position))
+        else:
+            raise newException(ValueError, "fzn_nvalue requires a variable for the count argument")
+
     of "fzn_at_least_int":
         # at_least(n, x, v) means at least n occurrences of v in x
         let n = tr.resolveIntArg(con.args[0])

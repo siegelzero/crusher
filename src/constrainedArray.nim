@@ -1317,7 +1317,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let lv = rc.leftExpr.getValue()
                     let rv = rc.rightExpr.getValue()
                     tempPenalty = rc.computeCost(lv, rv)
-                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType, ReservoirType, SetIntersectCardType, ConjunctSumAtMostType:
+                of AllDifferentType, AtLeastType, AtMostType, ElementType, OrderingType, GlobalCardinalityType, MultiknapsackType, SequenceType, BooleanType, CumulativeType, GeostType, IrdcsType, CircuitType, SubcircuitType, ConnectedType, AllDifferentExcept0Type, LexOrderType, TableConstraintType, RegularType, CountEqType, NValueType, DiffnType, DiffnKType, MatrixElementType, NoOverlapFixedBoxType, ConditionalCumulativeType, ConditionalNoOverlapPairType, ConditionalDayCapacityType, DisjunctiveClauseType, ValueSupportType, MultiResourceNoOverlapType, CircuitTimePropType, MultiMachineNoOverlapType, ConditionalLinearType, ReservoirType, SetIntersectCardType, ConjunctSumAtMostType:
                     # Skip these constraint types for domain reduction
                     continue
 
@@ -1543,13 +1543,14 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if idx >= 0 and idx < binding.arrayElements.len:
                             reachable.incl(binding.arrayElements[idx].constantValue)
                     let newChanDom = currentDomain[chanPos] * reachable
-                    if newChanDom.len < currentDomain[chanPos].len:
+                    if newChanDom.len > 0 and newChanDom.len < currentDomain[chanPos].len:
                         channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
                         currentDomain[chanPos] = newChanDom
                         channelChanged = true
 
                     # Backward: index domain restricted to values mapping to valid channel values
                     for v in toSeq(currentDomain[idxPos].items):
+                        if currentDomain[idxPos].len <= 1: break  # never empty a domain
                         tempAssign[idxPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= binding.arrayElements.len:
@@ -1577,7 +1578,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                     reachable.incl(sv)
                     if reachable.len > 0:
                         let newChanDom = currentDomain[chanPos] * reachable
-                        if newChanDom.len < currentDomain[chanPos].len:
+                        if newChanDom.len > 0 and newChanDom.len < currentDomain[chanPos].len:
                             channelTotalRemoved += currentDomain[chanPos].len - newChanDom.len
                             currentDomain[chanPos] = newChanDom
                             channelChanged = true
@@ -4468,12 +4469,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if idx >= 0 and idx < arrLen:
                             reachableValues.incl(arrElems[idx].constantValue)
                     let newChDom = currentDomain[chPos] * reachableValues
-                    if newChDom.len < currentDomain[chPos].len:
+                    if newChDom.len > 0 and newChDom.len < currentDomain[chPos].len:
                         currentDomain[chPos] = newChDom
                         outerChanged = true
 
                     # Backward: domain(keyPos) ∩= {v : eval(v) ∈ bounds AND lookup[eval(v)] ∈ domain(ch)}
                     for v in toSeq(currentDomain[keyPos].items):
+                        if currentDomain[keyPos].len <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= arrLen:
@@ -4488,6 +4490,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     if currentDomain[keyPos].len == 0:
                         continue
                     for v in toSeq(currentDomain[keyPos].items):
+                        if currentDomain[keyPos].len <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= arrLen:
@@ -4555,12 +4558,13 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             if idx >= 0 and idx < arrLen:
                                 reachableValues.incl(arrElems[idx].constantValue)
                     let newChDom = currentDomain[chPos] * reachableValues
-                    if newChDom.len < currentDomain[chPos].len:
+                    if newChDom.len > 0 and newChDom.len < currentDomain[chPos].len:
                         currentDomain[chPos] = newChDom
                         outerChanged = true
 
                     # Backward for p0: keep v0 if ∃ v1 s.t. lookup[eval(v0,v1)] ∈ domain(ch)
                     for v0 in toSeq(currentDomain[p0].items):
+                        if currentDomain[p0].len <= 1: break  # never empty a domain
                         tempAssign[p0] = v0
                         var hasSupport = false
                         for v1 in currentDomain[p1].items:
@@ -4576,6 +4580,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
                     # Backward for p1: symmetric
                     for v1 in toSeq(currentDomain[p1].items):
+                        if currentDomain[p1].len <= 1: break  # never empty a domain
                         tempAssign[p1] = v1
                         var hasSupport = false
                         for v0 in currentDomain[p0].items:
@@ -4603,6 +4608,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var tempAssign = initTable[int, T]()
 
                     for v0 in toSeq(currentDomain[p0].items):
+                        if currentDomain[p0].len <= 1: break  # never empty a domain
                         tempAssign[p0] = v0
                         var hasSupport = false
                         for v1 in currentDomain[p1].items:
@@ -4618,6 +4624,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             outerChanged = true
 
                     for v1 in toSeq(currentDomain[p1].items):
+                        if currentDomain[p1].len <= 1: break  # never empty a domain
                         tempAssign[p1] = v1
                         var hasSupport = false
                         for v0 in currentDomain[p0].items:
@@ -4681,7 +4688,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                 break
 
                     let newChDom = currentDomain[chPos] * reachableValues
-                    if newChDom.len < currentDomain[chPos].len:
+                    if newChDom.len > 0 and newChDom.len < currentDomain[chPos].len:
                         cbPruned += currentDomain[chPos].len - newChDom.len
                         currentDomain[chPos] = newChDom
                         outerChanged = true
@@ -4721,6 +4728,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                     else:
                                         break
                             if not hasSupport:
+                                if currentDomain[kPos].len <= 1: break  # never empty a domain
                                 currentDomain[kPos].excl(v)
                                 cbPruned += 1
                                 outerChanged = true

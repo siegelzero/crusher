@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, sets, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
@@ -278,6 +278,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Regular Constraint"
         of CountEqType:
             return "CountEq Constraint"
+        of NValueType:
+            return "NValue Constraint"
         of DiffnType:
             return "Diffn Constraint"
         of DiffnKType:
@@ -361,6 +363,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.regularState.cost
         of CountEqType:
             return constraint.countEqState.cost
+        of NValueType:
+            return constraint.nvalueState.cost
         of DiffnType:
             return constraint.diffnState.cost
         of DiffnKType:
@@ -1140,6 +1144,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.regularState.initialize(assignment)
         of CountEqType:
             constraint.countEqState.initialize(assignment)
+        of NValueType:
+            constraint.nvalueState.initialize(assignment)
         of DiffnType:
             constraint.diffnState.initialize(assignment)
         of DiffnKType:
@@ -1220,6 +1226,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
             constraint.countEqState.moveDelta(position, oldValue, newValue)
+        of NValueType:
+            constraint.nvalueState.moveDelta(position, oldValue, newValue)
         of DiffnType:
             constraint.diffnState.moveDelta(position, oldValue, newValue)
         of DiffnKType:
@@ -1300,6 +1308,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.regularState.updatePosition(position, newValue)
         of CountEqType:
             constraint.countEqState.updatePosition(position, newValue)
+        of NValueType:
+            constraint.nvalueState.updatePosition(position, newValue)
         of DiffnType:
             constraint.diffnState.updatePosition(position, newValue)
         of DiffnKType:
@@ -1355,6 +1365,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.sequenceState.getAffectedPositions()
         of CountEqType:
             return constraint.countEqState.getAffectedPositions()
+        of NValueType:
+            return constraint.nvalueState.getAffectedPositions()
         of RegularType:
             return constraint.regularState.getAffectedPositions()
         of MatrixElementType:
@@ -1415,6 +1427,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.sequenceState.getAffectedDomainValues(position)
         of CountEqType:
             return constraint.countEqState.getAffectedDomainValues(position)
+        of NValueType:
+            return constraint.nvalueState.getAffectedDomainValues(position)
         of GeostType:
             return constraint.geostState.getAffectedDomainValues(position)
         of RelationalType:
@@ -1945,6 +1959,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: CountEqType,
                 countEqState: constraint.countEqState.deepCopy()
+            )
+        of NValueType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: NValueType,
+                nvalueState: constraint.nvalueState.deepCopy()
             )
         of DiffnType:
             result = StatefulConstraint[T](
@@ -2674,6 +2694,24 @@ func countEq*[T](arrayPositions: openArray[int], countValue: T, targetPosition: 
         positions: constraint.allPositions,
         stateType: CountEqType,
         countEqState: constraint
+    )
+
+################################################################################
+# NValue wrapper functions
+################################################################################
+
+func nvalue*[T](arrayPositions: openArray[int], targetPosition: int): StatefulConstraint[T] =
+    ## Creates an NValue constraint: the number of distinct values in array positions
+    ## must equal the value at `targetPosition`.
+    ##
+    ## **Mathematical Form**: `|{x[i] : i ∈ arrayPositions}| = x[targetPosition]`
+    ##
+    ## **Violation Cost**: `|distinctCount - requiredCount|`
+    let constraint = newNValueConstraint[T](arrayPositions, targetPosition)
+    return StatefulConstraint[T](
+        positions: constraint.allPositions,
+        stateType: NValueType,
+        nvalueState: constraint
     )
 
 ################################################################################

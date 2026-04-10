@@ -58,6 +58,7 @@ import test_movie_scheduling
 import test_multiknapsack
 import test_n_queens
 import test_negative_domains
+import test_nvalue
 import test_newspaper
 import test_objective_bounds
 import test_ordering_constraint

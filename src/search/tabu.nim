@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -342,6 +342,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.regularState.moveDelta(position, oldValue, newValue)
         of CountEqType:
             result = constraint.countEqState.moveDelta(position, oldValue, newValue)
+        of NValueType:
+            result = constraint.nvalueState.moveDelta(position, oldValue, newValue)
         of DiffnType:
             result = constraint.diffnState.moveDelta(position, oldValue, newValue)
         of DiffnKType:
