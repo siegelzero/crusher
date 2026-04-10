@@ -4,6 +4,8 @@
 # Leave min_obj or max_obj empty to skip that bound check
 # For satisfy problems, both bounds are ignored
 
+carpet_cutting_rnd_01,2021/carpet-cutting/cc_base.mzn,2021/carpet-cutting/mzn_rnd_test.01.dzn,minimize,10000,621,700
+
 accap_a4_f30_t15,2022/accap/accap.mzn,2022/accap/accap_a4_f30_t15.json,minimize,10000,103,200
 dcmst_v15_a105_d6,2022/diameterc-mst/dcmst.mzn,2022/diameterc-mst/c_v15_a105_d6.dzn,minimize,10000,314,500
 nfc_12_2_11,2022/nfc/nfc.mzn,2022/nfc/12_2_11.dzn,minimize,10000,784,784
