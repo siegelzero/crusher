@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, sets, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
@@ -314,6 +314,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "MultiMachineNoOverlap Constraint"
         of ConjunctSumAtMostType:
             return "ConjunctSumAtMost Constraint"
+        of PseudoBoolLinLeType:
+            return "PseudoBoolLinLe Constraint"
 
 ################################################################################
 # Evaluation
@@ -399,6 +401,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.multiMachineNoOverlapState.cost
         of ConjunctSumAtMostType:
             return constraint.conjunctSumAtMostState.cost
+        of PseudoBoolLinLeType:
+            return constraint.pseudoBoolLinLeState.cost
 
 ################################################################################
 # Computed Constraints
@@ -764,6 +768,16 @@ func conjunctSumAtMost*[T](groups: seq[seq[int]], targetValue: T, maxOccurrences
         positions: allPositions,
         stateType: ConjunctSumAtMostType,
         conjunctSumAtMostState: newConjunctSumAtMostConstraint[T](groups, targetValue, maxOccurrences)
+    )
+
+
+func pseudoBoolLinLe*[T](positions: openArray[int], coefficients: openArray[T], rhs: T): StatefulConstraint[T] =
+    ## Creates a PseudoBoolLinLe constraint: sum(coefficients[i] * x[positions[i]]) <= rhs
+    ## All variables must be binary {0, 1}.
+    return StatefulConstraint[T](
+        positions: toPackedSet[int](positions),
+        stateType: PseudoBoolLinLeType,
+        pseudoBoolLinLeState: newPseudoBoolLinLeConstraint[T](positions, coefficients, rhs)
     )
 
 
@@ -1180,6 +1194,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.multiMachineNoOverlapState.initialize(assignment)
         of ConjunctSumAtMostType:
             constraint.conjunctSumAtMostState.initialize(assignment)
+        of PseudoBoolLinLeType:
+            constraint.pseudoBoolLinLeState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1262,6 +1278,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.multiMachineNoOverlapState.moveDelta(position, oldValue, newValue)
         of ConjunctSumAtMostType:
             constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
+        of PseudoBoolLinLeType:
+            constraint.pseudoBoolLinLeState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1344,6 +1362,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.multiMachineNoOverlapState.updatePosition(position, newValue)
         of ConjunctSumAtMostType:
             constraint.conjunctSumAtMostState.updatePosition(position, newValue)
+        of PseudoBoolLinLeType:
+            constraint.pseudoBoolLinLeState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1403,6 +1423,8 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.allDifferentExcept0State.getAffectedPositions()
         of ConjunctSumAtMostType:
             return constraint.conjunctSumAtMostState.getAffectedPositions()
+        of PseudoBoolLinLeType:
+            return constraint.pseudoBoolLinLeState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1443,6 +1465,8 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.allDifferentExcept0State.getAffectedDomainValues(position)
         of ConjunctSumAtMostType:
             return constraint.conjunctSumAtMostState.getAffectedDomainValues(position)
+        of PseudoBoolLinLeType:
+            return constraint.pseudoBoolLinLeState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -2067,6 +2091,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: ConjunctSumAtMostType,
                 conjunctSumAtMostState: constraint.conjunctSumAtMostState.deepCopy()
+            )
+        of PseudoBoolLinLeType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: PseudoBoolLinLeType,
+                pseudoBoolLinLeState: constraint.pseudoBoolLinLeState.deepCopy()
             )
 
 

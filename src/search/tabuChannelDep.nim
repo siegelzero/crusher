@@ -244,18 +244,28 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 let ci = constraintIds[cli]
                 var delta: int
                 if state.cdConstraintCanFast[ci]:
-                    let rc = state.channelDepConstraints[ci].relationalState
-                    var newLeft = rc.leftValue
-                    var newRight = rc.rightValue
-                    for (cascIdx, coeff) in coeffsL[cli]:
-                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
-                        if diff != 0:
-                            newLeft += coeff * diff
-                    for (cascIdx, coeff) in coeffsR[cli]:
-                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
-                        if diff != 0:
-                            newRight += coeff * diff
-                    delta = rc.computeCost(newLeft, newRight) - rc.cost
+                    let cfast = state.channelDepConstraints[ci]
+                    if cfast.stateType == PseudoBoolLinLeType:
+                        let pb = cfast.pseudoBoolLinLeState
+                        var newSum = pb.currentSum
+                        for (cascIdx, coeff) in coeffsL[cli]:
+                            let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                            if diff != 0:
+                                newSum += coeff * diff
+                        delta = max(0, newSum - pb.rhs) - pb.cost
+                    else:
+                        let rc = cfast.relationalState
+                        var newLeft = rc.leftValue
+                        var newRight = rc.rightValue
+                        for (cascIdx, coeff) in coeffsL[cli]:
+                            let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                            if diff != 0:
+                                newLeft += coeff * diff
+                        for (cascIdx, coeff) in coeffsR[cli]:
+                            let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                            if diff != 0:
+                                newRight += coeff * diff
+                        delta = rc.computeCost(newLeft, newRight) - rc.cost
                 else:
                     let c = state.channelDepConstraints[ci]
                     let oldPenalty = c.penalty()
@@ -528,16 +538,25 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                     var delta: int
                     if state.cdConstraintCanFast[ci]:
                         # Fast path: iterate precomputed coefficient arrays, check position-indexed flags
-                        let rc = state.channelDepConstraints[ci].relationalState
-                        var newLeft = rc.leftValue
-                        var newRight = rc.rightValue
-                        for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
-                            if state.cdIsChanged[cpos]:
-                                newLeft += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
-                        for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
-                            if state.cdIsChanged[cpos]:
-                                newRight += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
-                        delta = rc.computeCost(newLeft, newRight) - rc.cost
+                        let cfast = state.channelDepConstraints[ci]
+                        if cfast.stateType == PseudoBoolLinLeType:
+                            let pb = cfast.pseudoBoolLinLeState
+                            var newSum = pb.currentSum
+                            for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
+                                if state.cdIsChanged[cpos]:
+                                    newSum += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                            delta = max(0, newSum - pb.rhs) - pb.cost
+                        else:
+                            let rc = cfast.relationalState
+                            var newLeft = rc.leftValue
+                            var newRight = rc.rightValue
+                            for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
+                                if state.cdIsChanged[cpos]:
+                                    newLeft += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                            for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
+                                if state.cdIsChanged[cpos]:
+                                    newRight += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                            delta = rc.computeCost(newLeft, newRight) - rc.cost
                     else:
                         # Fallback: simulate-restore on the constraint
                         let c = state.channelDepConstraints[ci]
@@ -605,18 +624,28 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
             let ci = constraintIds[cli]
             var delta: int
             if state.cdConstraintCanFast[ci]:
-                let rc = state.channelDepConstraints[ci].relationalState
-                var newLeft = rc.leftValue
-                var newRight = rc.rightValue
-                for (cascIdx, coeff) in coeffsL[cli]:
-                    let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
-                    if diff != 0:
-                        newLeft += coeff * diff
-                for (cascIdx, coeff) in coeffsR[cli]:
-                    let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
-                    if diff != 0:
-                        newRight += coeff * diff
-                delta = rc.computeCost(newLeft, newRight) - rc.cost
+                let cfast = state.channelDepConstraints[ci]
+                if cfast.stateType == PseudoBoolLinLeType:
+                    let pb = cfast.pseudoBoolLinLeState
+                    var newSum = pb.currentSum
+                    for (cascIdx, coeff) in coeffsL[cli]:
+                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                        if diff != 0:
+                            newSum += coeff * diff
+                    delta = max(0, newSum - pb.rhs) - pb.cost
+                else:
+                    let rc = cfast.relationalState
+                    var newLeft = rc.leftValue
+                    var newRight = rc.rightValue
+                    for (cascIdx, coeff) in coeffsL[cli]:
+                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                        if diff != 0:
+                            newLeft += coeff * diff
+                    for (cascIdx, coeff) in coeffsR[cli]:
+                        let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
+                        if diff != 0:
+                            newRight += coeff * diff
+                    delta = rc.computeCost(newLeft, newRight) - rc.cost
             elif state.channelDepConstraints[ci].stateType == DisjunctiveClauseType:
                 # Fast DC path: compute penalty directly from precomputed cascade-to-term mappings
                 let dc = state.channelDepConstraints[ci].disjunctiveClauseState

@@ -547,6 +547,8 @@ type
         # Stats for `reachableValuesPropagate`: domains tightened + total values removed
         reachableValuesTightened*: int
         reachableValuesRemoved*: int
+        # Counter for variables fixed by binary linear domain reduction
+        nBinaryLinFixings*: int
         # NAND bool clauses from bool_clause([], [b_1, ..., b_k]) — for redundancy
         # detection. Each entry is the *sorted* tuple of source bool var names.
         # Supports any arity k >= 2 (originally k = 2 only).
@@ -1530,6 +1532,8 @@ proc translate*(model: FznModel): FznTranslator =
     stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {result.nSkippedRedundantNand} skipped (redundant NAND), {nTranslated} translated")
     if result.nTableToNotIn > 0:
         stderr.writeLine(&"[FZN] Table complement conversion: {result.nTableToNotIn} tableIn → tableNotIn")
+    if result.nBinaryLinFixings > 0:
+        stderr.writeLine(&"[FZN] Binary linear domain reduction: {result.nBinaryLinFixings} variables fixed")
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0

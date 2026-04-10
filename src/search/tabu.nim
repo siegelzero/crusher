@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -381,6 +381,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.setIntersectCardState.moveDelta(position, oldValue, newValue)
         of ConjunctSumAtMostType:
             result = constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
+        of PseudoBoolLinLeType:
+            result = constraint.pseudoBoolLinLeState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -484,6 +486,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ConjunctSumAtMostType:
             let p = constraint.conjunctSumAtMostState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == PseudoBoolLinLeType:
+            let p = constraint.pseudoBoolLinLeState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         else:
@@ -604,6 +610,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == ConjunctSumAtMostType:
             let penalties = constraint.conjunctSumAtMostState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == PseudoBoolLinLeType:
+            let penalties = constraint.pseudoBoolLinLeState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -734,6 +746,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             let oldP = state.constraintPenalties[position][localIdx][i]
             state.penaltyMap[position][i] += newP - oldP
             state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == PseudoBoolLinLeType:
+        let penalties = constraint.pseudoBoolLinLeState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
     else:
         for i in 0..<domain.len:
             let value = domain[i]
@@ -856,6 +876,51 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                     state.neighborByType[constraint.stateType] += 1
                     state.neighborTimeByType[constraint.stateType] += epochTime() - tNeighC
                 continue  # Done with this constraint via broadcast
+
+        # PseudoBoolLinLe binary broadcast fast path
+        if constraint.stateType == PseudoBoolLinLeType and affectedPositions.len > 0:
+            let pb = constraint.pseudoBoolLinLeState
+            let currentCost = pb.cost
+            let currentSum = pb.currentSum
+            let rhs = pb.rhs
+
+            for pos in searchPos.items:
+                if pos == position: continue
+                if state.isLazy[pos]: continue
+                if pos notin affectedPositions: continue
+
+                let domain = state.sharedDomain[][pos]
+                if domain.len != 2 or domain[0] != T(0) or domain[1] != T(1):
+                    # Non-binary: fall back to standard update
+                    when ProfileIteration:
+                        state.neighborUpdates += 1
+                        state.neighborBatchCalls += 1
+                    let localIdx = state.findLocalConstraintIdx(pos, constraint)
+                    state.updateConstraintAtPosition(pos, localIdx)
+                    continue
+
+                when ProfileIteration:
+                    state.neighborUpdates += 1
+                let localIdx = state.findLocalConstraintIdx(pos, constraint)
+                let x = int(state.assignment[pos])
+                let coeff = pb.coeffAtPosition.getOrDefault(pos, T(0))
+
+                # For binary domain: flip penalty = max(0, currentSum + flipDelta - rhs) - currentCost
+                let flipDelta = if x == 0: coeff else: -coeff
+                let newFlip = max(0, currentSum + flipDelta - rhs) - currentCost
+
+                # Binary domain sorted [0,1]: keepIdx = x, flipIdx = 1-x
+                let oldKeep = state.constraintPenalties[pos][localIdx][x]
+                let oldFlip = state.constraintPenalties[pos][localIdx][1-x]
+                state.penaltyMap[pos][x] -= oldKeep  # newKeep = 0
+                state.penaltyMap[pos][1-x] += newFlip - oldFlip
+                state.constraintPenalties[pos][localIdx][x] = 0
+                state.constraintPenalties[pos][localIdx][1-x] = newFlip
+
+            when ProfileIteration:
+                state.neighborByType[constraint.stateType] += 1
+                state.neighborTimeByType[constraint.stateType] += epochTime() - tNeighC
+            continue  # Done with this constraint via broadcast
 
         # Standard path
         for pos in searchPos.items:
@@ -2027,6 +2092,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdSavedConstraintCosts = newSeq[int](nCd)
         for ci in 0..<nCd:
             let c = state.channelDepConstraints[ci]
+            if c.stateType == PseudoBoolLinLeType:
+                # PseudoBoolLinLe: sum(c_i * x_i) <= rhs maps to left=sum, right=constant
+                let pb = c.pseudoBoolLinLeState
+                for pos, coeff in pb.coeffAtPosition.pairs:
+                    state.cdConstraintCoeffs[ci].add((pos: pos, coeff: coeff))
+                # Right side is constant (rhs) — no coefficients needed
+                state.cdConstraintCanFast[ci] = true
+                continue
             if c.stateType != RelationalType:
                 state.cdConstraintCanFast[ci] = false
                 continue

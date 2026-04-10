@@ -64,6 +64,7 @@ import test_newspaper
 import test_objective_bounds
 import test_ordering_constraint
 import test_parallel_search
+import test_pseudo_bool_lin_le
 import test_pentominoes_geost
 import test_quasigroup7
 import test_regular

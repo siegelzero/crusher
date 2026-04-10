@@ -941,6 +941,73 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         emittedUnitCoeff = true
 
         if not emittedUnitCoeff:
+            # Check for mixed-coefficient binary variables → PseudoBoolLinLe
+            if allRefsLe:
+                var allBinaryMixed = true
+                var unfixedPosMixed: seq[int]
+                var unfixedCoeffMixed: seq[int]
+                var fixedContrib = 0
+                for i in 0..<positionsLe.len:
+                    let pos = positionsLe[i]
+                    let dom = tr.sys.baseArray.domain[pos]
+                    if dom.len == 2 and dom[0] == 0 and dom[1] == 1:
+                        unfixedPosMixed.add(pos)
+                        unfixedCoeffMixed.add(coeffs[i])
+                    elif dom.len == 1 and (dom[0] == 0 or dom[0] == 1):
+                        fixedContrib += coeffs[i] * dom[0]
+                    else:
+                        allBinaryMixed = false
+                        break
+                if allBinaryMixed and unfixedPosMixed.len > 0:
+                    # Domain reduction: if setting x_j to its worst value must violate
+                    # regardless of other variables, fix x_j to its safe value.
+                    var sumNeg = 0  # sum of min(0, c_i) over all unfixed positions
+                    for c in unfixedCoeffMixed:
+                        sumNeg += min(0, c)
+                    var nFixed = 0
+                    var idx = 0
+                    while idx < unfixedPosMixed.len:
+                        let c = unfixedCoeffMixed[idx]
+                        let pos = unfixedPosMixed[idx]
+                        # minSum when x_j=1: c_j + sumNeg_excluding_j
+                        # sumNeg_excluding_j = sumNeg - min(0, c_j)
+                        let minSum1 = c + sumNeg - min(0, c)
+                        if minSum1 > rhs - fixedContrib:
+                            # x_j=1 always violates → fix to 0
+                            tr.sys.baseArray.domain[pos] = @[0]
+                            fixedContrib += 0  # c * 0 = 0
+                            sumNeg -= min(0, c)
+                            unfixedPosMixed.delete(idx)
+                            unfixedCoeffMixed.delete(idx)
+                            inc nFixed
+                            continue
+                        # minSum when x_j=0: sumNeg_excluding_j = sumNeg - min(0, c_j)
+                        let minSum0 = sumNeg - min(0, c)
+                        if minSum0 > rhs - fixedContrib:
+                            # x_j=0 always violates → fix to 1
+                            tr.sys.baseArray.domain[pos] = @[1]
+                            fixedContrib += c  # c * 1
+                            sumNeg -= min(0, c)
+                            unfixedPosMixed.delete(idx)
+                            unfixedCoeffMixed.delete(idx)
+                            inc nFixed
+                            continue
+                        inc idx
+                    if nFixed > 0:
+                        inc tr.nBinaryLinFixings, nFixed
+                    if unfixedPosMixed.len == 0:
+                        # All positions fixed — check if satisfied
+                        if fixedContrib <= rhs:
+                            inc tr.nSkippedTautological
+                        # else: infeasible, but we can't do much here
+                        emittedUnitCoeff = true
+                    else:
+                        let adjustedRhs = rhs - fixedContrib
+                        tr.sys.addConstraint(pseudoBoolLinLe[int](
+                            unfixedPosMixed, unfixedCoeffMixed, adjustedRhs))
+                        emittedUnitCoeff = true
+
+        if not emittedUnitCoeff:
             let sp = scalarProduct[int](coeffs, exprs)
             tr.sys.addConstraint(sp <= rhs)
 
