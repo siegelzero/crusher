@@ -15,7 +15,7 @@ import std/[os, strutils, strformat, times, posix]
 
 import crusher
 import flatzinc/[parser, translator, output]
-import expressions/weightedSameValue
+import expressions/[weightedSameValue, binaryPairwiseSum]
 
 proc immediateExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noReturn.}
 
@@ -174,6 +174,16 @@ proc main() =
           lowerBound = tr.objectiveLoBound,
           upperBound = tr.objectiveHiBound
         )
+      elif tr.objectivePos == ObjPosBinaryPairwiseSum:
+        minimize(tr.sys, tr.binaryPairwiseSumExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
       else:
         let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
                       elif tr.objectivePos == ObjPosDefinedExpr: tr.objectiveDefExpr
@@ -205,6 +215,16 @@ proc main() =
     try:
       if tr.objectivePos == ObjPosWeightedSV:
         maximize(tr.sys, tr.weightedSameValueExpr,
+          parallel = parallel,
+          tabuThreshold = tabuThreshold,
+          numWorkers = numWorkers,
+          verbose = verbose,
+          deadline = deadline,
+          lowerBound = tr.objectiveLoBound,
+          upperBound = tr.objectiveHiBound
+        )
+      elif tr.objectivePos == ObjPosBinaryPairwiseSum:
+        maximize(tr.sys, tr.binaryPairwiseSumExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
           numWorkers = numWorkers,

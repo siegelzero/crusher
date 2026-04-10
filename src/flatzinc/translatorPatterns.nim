@@ -2,6 +2,369 @@
 ## Miscellaneous pattern detection: weighted same-value, set union, equality copy,
 ## skill allocation, atMost, argmax, spread, diffn, int_mod/div, net flow, etc.
 
+proc detectBinaryPairwiseSumPattern(tr: var FznTranslator) =
+    ## Detects binary pairwise sum objective pattern where the objective is a sum of
+    ## conditional constants gated by conjunctions of binary variable indicators:
+    ##   objective = Σ constant_k * product(binary_vars_k) + remaining_terms
+    ##
+    ## FlatZinc pattern (per composable term):
+    ##   int_eq_reif(cost_var, C, b_eq_C)      :: defines_var(b_eq_C)
+    ##   int_eq_reif(cost_var, 0, b_eq_0)       :: defines_var(b_eq_0)
+    ##   bool_clause([b_eq_C], [cond_1, ..., cond_n])  -- conjunction of conds → cost = C
+    ##   int_eq_reif(search_var_i, 1, cond_i)   :: defines_var(cond_i)  -- each cond_i
+    ##
+    ## Produces quadratic terms (n=2): C * x_i * x_j
+    ## Produces linear terms (n=1): C * x_i
+    ## Non-composable terms kept as channel position references.
+
+    if tr.model.solve.kind notin {Minimize, Maximize}:
+        return
+    if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent:
+        return
+    let objectiveName = tr.model.solve.objective.ident
+
+    # Build reverse maps
+    # eq_reif output bool → (sourceVar, testVal, constraintIndex)
+    # Note: don't skip definingConstraints — eq_reifs with defines_var may be already claimed
+    type EqReifInfo = tuple[sourceVar: string, testVal: FznExpr, ci: int]
+    var eqReifByBool: Table[string, EqReifInfo]
+    # cost var → seq of (testVal as int, boolVar, constraintIndex) for constant testVals
+    type CostEqReifEntry = tuple[testVal: int, boolVar: string, ci: int]
+    var costEqReifs: Table[string, seq[CostEqReifEntry]]
+
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif" or not con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let boolVar = con.args[2].ident
+        if con.args[0].kind == FznIdent:
+            let sourceVar = con.args[0].ident
+            eqReifByBool[boolVar] = (sourceVar: sourceVar, testVal: con.args[1], ci: ci)
+            # Also track by cost variable for constant test values
+            if con.args[1].kind == FznIntLit:
+                costEqReifs.mgetOrPut(sourceVar, @[]).add(
+                    (testVal: con.args[1].intVal, boolVar: boolVar, ci: ci))
+
+    # Build bool_clause index: positive literal → (ci, negative literals)
+    # Don't skip definingConstraints — clauses may be already claimed by other passes
+    type ClauseInfo = tuple[ci: int, negLits: seq[string]]
+    var clauseByPosLit: Table[string, seq[ClauseInfo]]
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if posArg.elems.len != 1: continue  # exactly 1 positive literal
+        let posLit = posArg.elems[0]
+        if posLit.kind != FznIdent: continue
+        var negLits: seq[string]
+        var allIdent = true
+        for elem in negArg.elems:
+            if elem.kind != FznIdent:
+                allIdent = false
+                break
+            negLits.add(elem.ident)
+        if not allIdent: continue
+        clauseByPosLit.mgetOrPut(posLit.ident, @[]).add((ci: ci, negLits: negLits))
+
+    # Find the int_lin_eq defining the objective
+    # Note: don't skip definingConstraints — collectDefinedVars may have already claimed this
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        if ann.args[0].ident != objectiveName: continue
+
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let vars = con.args[1]
+        var varElems: seq[FznExpr]
+        if vars.kind == FznArrayLit:
+            varElems = vars.elems
+        elif vars.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+                    varElems = decl.value.elems
+                    found = true
+                    break
+            if not found: continue
+        else: continue
+
+        if coeffs.len != varElems.len or varElems.len < 2: continue
+
+        # Find the objective variable in the sum and its coefficient
+        var objIdx = -1
+        for i in 0..<varElems.len:
+            if varElems[i].kind == FznIdent and varElems[i].ident == objectiveName:
+                objIdx = i
+                break
+        if objIdx < 0: continue
+        let objCoeff = coeffs[objIdx]
+        if objCoeff == 0: continue
+
+        # Try to trace each non-objective variable through the conditional chain
+        var pairs: seq[tuple[varNameA, varNameB: string, coeff: int]]
+        var linearTerms: seq[tuple[varName: string, coeff: int]]
+        var remainingTerms: seq[tuple[varName: string, coeff: int]]
+        var consumedConstraints: seq[int]
+        var consumedVarNames: seq[string]
+        var nComposed = 0
+        var nRemaining = 0
+
+        for i in 0..<varElems.len:
+            if i == objIdx: continue
+            if varElems[i].kind != FznIdent:
+                # Can't compose non-ident terms
+                continue
+
+            let costVarName = varElems[i].ident
+            let termCoeff = coeffs[i]
+
+            # Check if this is a parameter (constant) — fold into constant
+            if costVarName in tr.paramValues:
+                # Will be folded into the expression constant
+                continue
+
+            # Try to trace: costVar has eq_reif with constant C > 0 and constant 0
+            if costVarName notin costEqReifs:
+                remainingTerms.add((varName: costVarName, coeff: termCoeff))
+                inc nRemaining
+                continue
+
+            let entries = costEqReifs[costVarName]
+
+            # Find the non-zero constant value and its bool, and the zero bool
+            var nonZeroVal = 0
+            var nonZeroBool = ""
+            var nonZeroCI = -1
+            var zeroBool = ""
+            var zeroCI = -1
+            for entry in entries:
+                if entry.testVal != 0:
+                    if nonZeroBool != "":
+                        # Multiple non-zero values — not a simple binary gate
+                        nonZeroBool = ""
+                        break
+                    nonZeroVal = entry.testVal
+                    nonZeroBool = entry.boolVar
+                    nonZeroCI = entry.ci
+                elif entry.testVal == 0:
+                    zeroBool = entry.boolVar
+                    zeroCI = entry.ci
+
+            if nonZeroBool == "" or zeroBool == "":
+                remainingTerms.add((varName: costVarName, coeff: termCoeff))
+                inc nRemaining
+                continue
+
+            # Check that the cost variable's domain contains both 0 and the non-zero value
+            # (domain may be a range like 0..20 rather than a sparse set {0, 20})
+            let costDomain = tr.lookupVarDomain(costVarName)
+            if 0 notin costDomain or nonZeroVal notin costDomain:
+                remainingTerms.add((varName: costVarName, coeff: termCoeff))
+                inc nRemaining
+                continue
+
+            # Find the bool_clause that links nonZeroBool to conditions:
+            # bool_clause([nonZeroBool], [cond1, ...]) → conjunction of conds → cost = C
+            if nonZeroBool notin clauseByPosLit:
+                remainingTerms.add((varName: costVarName, coeff: termCoeff))
+                inc nRemaining
+                continue
+
+            var foundClause = false
+            for clause in clauseByPosLit[nonZeroBool]:
+                if clause.negLits.len < 1 or clause.negLits.len > 2:
+                    continue  # only handle 1-2 conditions
+
+                # Each negative literal must trace to int_eq_reif(binaryVar, 1, negLit)
+                # where binaryVar has domain {0,1}
+                var searchVars: seq[string]
+                var condCIs: seq[int]
+                var validChain = true
+
+                for negLit in clause.negLits:
+                    if negLit notin eqReifByBool:
+                        validChain = false
+                        break
+                    let info = eqReifByBool[negLit]
+                    # testVal must be constant 1
+                    if info.testVal.kind != FznIntLit or info.testVal.intVal != 1:
+                        validChain = false
+                        break
+                    # sourceVar must have binary domain {0,1}
+                    let srcDomain = tr.lookupVarDomain(info.sourceVar)
+                    if srcDomain != @[0, 1]:
+                        validChain = false
+                        break
+                    # sourceVar must not be already defined/consumed
+                    if info.sourceVar in tr.definedVarNames:
+                        validChain = false
+                        break
+                    searchVars.add(info.sourceVar)
+                    condCIs.add(info.ci)
+
+                if not validChain or searchVars.len == 0:
+                    continue
+
+                # Compute the effective coefficient:
+                # int_lin_eq: objCoeff * objective + termCoeff * costVar = rhs
+                # objective = (rhs - termCoeff * costVar) / objCoeff
+                # When costVar = nonZeroVal: contribution = -termCoeff * nonZeroVal / objCoeff
+                if (-termCoeff * nonZeroVal) mod objCoeff != 0:
+                    continue
+                let effectiveCoeff = (-termCoeff * nonZeroVal) div objCoeff
+
+                if searchVars.len == 1:
+                    linearTerms.add((varName: searchVars[0], coeff: effectiveCoeff))
+                elif searchVars.len == 2:
+                    pairs.add((varNameA: searchVars[0], varNameB: searchVars[1], coeff: effectiveCoeff))
+
+                # Mark consumed: cost variable + its dedicated eq_reif booleans
+                consumedConstraints.add(nonZeroCI)
+                consumedConstraints.add(zeroCI)
+                consumedConstraints.add(clause.ci)
+                consumedVarNames.add(costVarName)
+                consumedVarNames.add(nonZeroBool)
+                consumedVarNames.add(zeroBool)
+                # Don't consume the eq_reif condition channels (cond_i) — they're shared
+                inc nComposed
+                foundClause = true
+                break
+
+            if not foundClause:
+                remainingTerms.add((varName: costVarName, coeff: termCoeff))
+                inc nRemaining
+
+        # Need at least some composed terms to be worthwhile
+        if nComposed < 2:
+            continue
+
+        # Compute constant: rhs / objCoeff (from the int_lin_eq)
+        if rhs mod objCoeff != 0:
+            continue
+        var bpsConstant = rhs div objCoeff
+
+        # Fold parameter values into constant
+        for i in 0..<varElems.len:
+            if i == objIdx: continue
+            if varElems[i].kind != FznIdent: continue
+            let vn = varElems[i].ident
+            if vn in tr.paramValues:
+                if (-coeffs[i] * tr.paramValues[vn]) mod objCoeff != 0:
+                    continue
+                bpsConstant += (-coeffs[i] * tr.paramValues[vn]) div objCoeff
+
+        # Pattern detected!
+        tr.binaryPairwiseSumPairs = pairs
+        tr.binaryPairwiseSumLinearTerms = linearTerms
+        tr.binaryPairwiseSumRemainingTerms = remainingTerms
+        tr.binaryPairwiseSumConstant = bpsConstant
+        tr.binaryPairwiseSumObjName = objectiveName
+
+        # Mark consumed constraints and variables
+        for idx in consumedConstraints:
+            tr.definingConstraints.incl(idx)
+        tr.definingConstraints.incl(ci)  # the int_lin_eq itself
+
+        let consumedVarSet = consumedVarNames.toHashSet()
+        for vn in consumedVarNames:
+            tr.definedVarNames.incl(vn)
+        tr.definedVarNames.incl(objectiveName)
+
+        # Also consume any bool_clause constraints that reference consumed bool variables.
+        # These are the default-value implications for the cost variables, e.g.,
+        # bool_clause([cond, zeroBool], []) where zeroBool was consumed.
+        var nExtraClauses = 0
+        for xci, xcon in tr.model.constraints:
+            if xci in tr.definingConstraints: continue
+            if stripSolverPrefix(xcon.name) != "bool_clause": continue
+            if xcon.args.len < 2: continue
+            let posArg = xcon.args[0]
+            let negArg = xcon.args[1]
+            if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+            var hasConsumed = false
+            for elem in posArg.elems:
+                if elem.kind == FznIdent and elem.ident in consumedVarSet:
+                    hasConsumed = true
+                    break
+            if not hasConsumed:
+                for elem in negArg.elems:
+                    if elem.kind == FznIdent and elem.ident in consumedVarSet:
+                        hasConsumed = true
+                        break
+            if hasConsumed:
+                tr.definingConstraints.incl(xci)
+                inc nExtraClauses
+
+        stderr.writeLine(&"[FZN] Detected binary pairwise sum pattern: {pairs.len} quadratic + {linearTerms.len} linear + {nRemaining} remaining, constant={bpsConstant}, objective={objectiveName} ({nExtraClauses} extra clauses consumed)")
+        break
+
+
+proc detectBinaryPartitionConstraints(tr: var FznTranslator) =
+    ## Detects int_lin_eq([1,...,1], [x1,...,xn], 1) where all xi have binary domain {0,1}.
+    ## These represent "exactly one" partition constraints: exactly one of the binary
+    ## variables is 1. Used for domain reduction during channel binding propagation.
+    var detected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.hasAnnotation("defines_var"): continue  # skip defining constraints
+
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != 1: continue
+
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+
+        # All coefficients must be 1
+        var allOnes = true
+        for c in coeffs:
+            if c != 1:
+                allOnes = false
+                break
+        if not allOnes or coeffs.len < 2: continue
+
+        # Extract variable names — all must have binary domain {0, 1}
+        let vars = con.args[1]
+        var varElems: seq[FznExpr]
+        if vars.kind == FznArrayLit:
+            varElems = vars.elems
+        elif vars.kind == FznIdent:
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == vars.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+                    varElems = decl.value.elems
+                    break
+        if varElems.len != coeffs.len: continue
+
+        var varNames: seq[string]
+        var allBinary = true
+        for elem in varElems:
+            if elem.kind != FznIdent:
+                allBinary = false
+                break
+            let vn = elem.ident
+            if vn in tr.definedVarNames or vn in tr.channelVarNames:
+                allBinary = false
+                break
+            let domain = tr.lookupVarDomain(vn)
+            if domain != @[0, 1]:
+                allBinary = false
+                break
+            varNames.add(vn)
+        if not allBinary: continue
+
+        tr.binaryPartitions.add((varNames: varNames, ci: ci))
+        inc detected
+
+    if detected > 0:
+        stderr.writeLine(&"[FZN] Detected {detected} binary partition (exactly-one) constraints")
+
+
 proc detectWeightedSameValuePattern(tr: var FznTranslator) =
     ## Detects weighted same-value objective pattern:
     ##   int_eq_reif(x_i, x_j, b_ij) :: defines_var(b_ij)  -- variable-variable equality

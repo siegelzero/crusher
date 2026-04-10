@@ -4,6 +4,7 @@ import sumExpression
 import minExpression
 import maxExpression
 import weightedSameValue
+import binaryPairwiseSum
 
 ################################################################################
 # StatefulAlgebraicExpression - mirrors Sum/Min/MaxExpression pattern
@@ -74,6 +75,7 @@ type
         MaxExpr
         ConstantExpr
         WeightedSameValueExpr
+        BinaryPairwiseSumExpr
 
     Expression*[T] = object
         positions*: PackedSet[int]
@@ -90,6 +92,8 @@ type
             constantValue*: T
         of WeightedSameValueExpr:
             weightedSameValueExpr*: WeightedSameValueExpression[T]
+        of BinaryPairwiseSumExpr:
+            binaryPairwiseSumExpr*: BinaryPairwiseSumExpression[T]
 
 # Overloaded procs to create Expression wrapper from various expression types
 proc newExpression*[T](expression: StatefulAlgebraicExpression[T]): Expression[T] =
@@ -144,6 +148,9 @@ proc newExpression*[T](value: T): Expression[T] =
 proc newExpression*[T](expression: WeightedSameValueExpression[T]): Expression[T] =
     Expression[T](kind: WeightedSameValueExpr, weightedSameValueExpr: expression, positions: expression.positions)
 
+proc newExpression*[T](expression: BinaryPairwiseSumExpression[T]): Expression[T] =
+    Expression[T](kind: BinaryPairwiseSumExpr, binaryPairwiseSumExpr: expression, positions: expression.positions)
+
 # Helper functions for Expression operations
 func initialize*[T](expression: Expression[T], assignment: seq[T]) =
     case expression.kind
@@ -159,6 +166,8 @@ func initialize*[T](expression: Expression[T], assignment: seq[T]) =
         discard  # Constants don't need initialization
     of WeightedSameValueExpr:
         expression.weightedSameValueExpr.initialize(assignment)
+    of BinaryPairwiseSumExpr:
+        expression.binaryPairwiseSumExpr.initialize(assignment)
 
 func getValue*[T](expression: Expression[T]): T =
     case expression.kind
@@ -174,6 +183,8 @@ func getValue*[T](expression: Expression[T]): T =
         return expression.constantValue
     of WeightedSameValueExpr:
         return expression.weightedSameValueExpr.value
+    of BinaryPairwiseSumExpr:
+        return expression.binaryPairwiseSumExpr.value
 
 func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
     case expression.kind
@@ -189,6 +200,8 @@ func updatePosition*[T](expression: Expression[T], position: int, newValue: T) =
         discard  # Constants don't change
     of WeightedSameValueExpr:
         expression.weightedSameValueExpr.updatePosition(position, newValue)
+    of BinaryPairwiseSumExpr:
+        expression.binaryPairwiseSumExpr.updatePosition(position, newValue)
 
 
 func moveDelta*[T](expression: Expression[T], position: int,
@@ -206,6 +219,8 @@ func moveDelta*[T](expression: Expression[T], position: int,
         return 0  # Constants don't change
     of WeightedSameValueExpr:
         return expression.weightedSameValueExpr.moveDelta(position, oldValue, newValue)
+    of BinaryPairwiseSumExpr:
+        return expression.binaryPairwiseSumExpr.moveDelta(position, oldValue, newValue)
 
 ################################################################################
 # Deep copy implementations for thread-safe parallel processing
@@ -258,4 +273,10 @@ proc deepCopy*[T](expression: Expression[T]): Expression[T] =
                 kind: WeightedSameValueExpr,
                 positions: expression.positions,
                 weightedSameValueExpr: expression.weightedSameValueExpr.deepCopy()
+            )
+        of BinaryPairwiseSumExpr:
+            result = Expression[T](
+                kind: BinaryPairwiseSumExpr,
+                positions: expression.positions,
+                binaryPairwiseSumExpr: expression.binaryPairwiseSumExpr.deepCopy()
             )

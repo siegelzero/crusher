@@ -2,7 +2,7 @@ import std/[packedsets, sequtils, sets, tables]
 
 import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard
 import constraintNode, types
-import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue]
+import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
 export StatefulConstraint, StatefulConstraintType, StatefulAlgebraicConstraint, BooleanConstraint
 
@@ -588,6 +588,15 @@ template ExprConstRel(rel, relEnum: untyped) =
 
     # WeightedSameValueExpression-to-constant relations
     func `rel`*[T](left: WeightedSameValueExpression[T], right: T): StatefulConstraint[T] {.inline.} =
+        let constraint = newRelationalConstraint[T](left, right, relEnum)
+        return StatefulConstraint[T](
+            positions: constraint.positions,
+            stateType: RelationalType,
+            relationalState: constraint
+        )
+
+    # BinaryPairwiseSumExpression-to-constant relations
+    func `rel`*[T](left: BinaryPairwiseSumExpression[T], right: T): StatefulConstraint[T] {.inline.} =
         let constraint = newRelationalConstraint[T](left, right, relEnum)
         return StatefulConstraint[T](
             positions: constraint.positions,

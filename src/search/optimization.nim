@@ -454,6 +454,9 @@ optimizeImpl(StatefulAlgebraicExpression, Maximize, maximize)
 optimizeImpl(WeightedSameValueExpression, Minimize, minimize)
 optimizeImpl(WeightedSameValueExpression, Maximize, maximize)
 
+optimizeImpl(BinaryPairwiseSumExpression, Minimize, minimize)
+optimizeImpl(BinaryPairwiseSumExpression, Maximize, maximize)
+
 # Template for AlgebraicExpression wrappers - convert to StatefulAlgebraicExpression
 template algebraicWrapper(procName: untyped) =
     proc procName*[T](system: ConstraintSystem[T],

@@ -7,12 +7,13 @@ import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
 import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir]
-import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue]
+import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue, binaryPairwiseSum]
 
 const
     ObjPosNone* = -2          ## No objective (satisfy problem)
     ObjPosDefinedExpr* = -1   ## Objective is a defined-variable expression
     ObjPosWeightedSV* = -3    ## Objective is a WeightedSameValueExpression
+    ObjPosBinaryPairwiseSum* = -4  ## Objective is a BinaryPairwiseSumExpression
 
 type
     CountEqPattern* = object
@@ -406,6 +407,15 @@ type
         weightedSameValueConstant*: int
         weightedSameValueObjName*: string
         weightedSameValueExpr*: WeightedSameValueExpression[int]
+        # Detected binary pairwise sum pattern for objective
+        binaryPairwiseSumPairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
+        binaryPairwiseSumLinearTerms*: seq[tuple[varName: string, coeff: int]]
+        binaryPairwiseSumRemainingTerms*: seq[tuple[varName: string, coeff: int]]
+        binaryPairwiseSumConstant*: int
+        binaryPairwiseSumObjName*: string
+        binaryPairwiseSumExpr*: BinaryPairwiseSumExpression[int]
+        # Detected binary partition (exactly-one) constraints: sum(binary_vars) = 1
+        binaryPartitions*: seq[tuple[varNames: seq[string], ci: int]]
         # Detected conditional no-overlap pair patterns
         conditionalNoOverlapInfos*: seq[tuple[
             startAName, startBName: string,
@@ -952,6 +962,10 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect spread patterns (pairwise constraints retained for gradient;
     # pattern info used for domain tightening only, no runtime channels)
     result.detectSpreadPattern()
+    # Detect binary partition (exactly-one) constraints: sum(binary_vars) = 1
+    result.detectBinaryPartitionConstraints()
+    # Detect binary pairwise sum objective pattern (Σ c_ij * x_i * x_j + Σ c_k * x_k + constant)
+    result.detectBinaryPairwiseSumPattern()
     # Detect weighted same-value objective pattern (Σ coeff_k * δ(x_i == x_j) + constant)
     result.detectWeightedSameValuePattern()
     # Detect value-support patterns (bool_clause + int_eq_reif + int_le_reif → native constraint)
@@ -1275,6 +1289,11 @@ proc translate*(model: FznModel): FznTranslator =
     # Handle objective bounds for weighted same-value objective (not in definedVarExprs)
     if result.weightedSameValueObjName != "" and result.weightedSameValueObjName in result.definedVarBounds:
         let (lo, hi) = result.definedVarBounds[result.weightedSameValueObjName]
+        result.objectiveLoBound = lo
+        result.objectiveHiBound = hi
+    # Handle objective bounds for binary pairwise sum objective
+    if result.binaryPairwiseSumObjName != "" and result.binaryPairwiseSumObjName in result.definedVarBounds:
+        let (lo, hi) = result.definedVarBounds[result.binaryPairwiseSumObjName]
         result.objectiveLoBound = lo
         result.objectiveHiBound = hi
         nObjBoundsSkipped += 2
@@ -2525,6 +2544,42 @@ proc translate*(model: FznModel): FznTranslator =
             wsvPairs.add((posA: posA, posB: posB, coeff: pair.coeff))
         result.weightedSameValueExpr = newWeightedSameValueExpression[int](
             wsvPairs, result.weightedSameValueConstant)
+
+    # Build BinaryPairwiseSumExpression if pattern was detected
+    if result.binaryPairwiseSumObjName != "":
+        var bpsPairs: seq[BinaryPairwiseSumPair[int]]
+        var bpsLinear: seq[BinaryPairwiseSumLinear[int]]
+        for pair in result.binaryPairwiseSumPairs:
+            let posA = result.varPositions[pair.varNameA]
+            let posB = result.varPositions[pair.varNameB]
+            bpsPairs.add((posA: posA, posB: posB, coeff: pair.coeff))
+        for lt in result.binaryPairwiseSumLinearTerms:
+            let pos = result.varPositions[lt.varName]
+            bpsLinear.add((pos: pos, coeff: lt.coeff))
+        # Add remaining (non-composable) terms as linear references to their channel positions
+        for rt in result.binaryPairwiseSumRemainingTerms:
+            let pos = result.varPositions[rt.varName]
+            bpsLinear.add((pos: pos, coeff: rt.coeff))
+        result.binaryPairwiseSumExpr = newBinaryPairwiseSumExpression[int](
+            bpsPairs, bpsLinear, result.binaryPairwiseSumConstant)
+        result.objectivePos = ObjPosBinaryPairwiseSum
+
+    # Build binary partition groups for domain reduction
+    if result.binaryPartitions.len > 0:
+        var nBuilt = 0
+        for bp in result.binaryPartitions:
+            var positions: seq[int]
+            var valid = true
+            for vn in bp.varNames:
+                if vn notin result.varPositions:
+                    valid = false
+                    break
+                positions.add(result.varPositions[vn])
+            if valid and positions.len >= 2:
+                result.sys.baseArray.binaryPartitions.add(positions)
+                inc nBuilt
+        if nBuilt > 0:
+            stderr.writeLine(&"[FZN] Built {nBuilt} binary partition groups for domain reduction")
 
     # Tighten objective bounds via knapsack LP relaxation.
     # When the objective is a linear sum over binary variables and there's a

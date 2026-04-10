@@ -2660,6 +2660,9 @@ proc translateSolve(tr: var FznTranslator) =
                 if objName == tr.weightedSameValueObjName:
                     # Weighted same-value objective — handled separately via WeightedSameValueExpression
                     tr.objectivePos = ObjPosWeightedSV
+                elif objName == tr.binaryPairwiseSumObjName:
+                    # Binary pairwise sum objective — handled separately via BinaryPairwiseSumExpression
+                    tr.objectivePos = ObjPosBinaryPairwiseSum
                 elif objName in tr.varPositions:
                     tr.objectivePos = tr.varPositions[objName]
                     # Extract domain bounds from the variable declaration for the optimizer

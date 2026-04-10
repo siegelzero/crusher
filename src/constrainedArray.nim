@@ -140,6 +140,7 @@ type
         dormancyBindings*: seq[tuple[dormantPos: int, selectorPos: int, activeValue: T]]
         dormancyAtSelector*: Table[int, seq[int]]  # selector_pos → [binding indices]
         partitionGroups*: seq[PartitionGroup[T]]
+        binaryPartitions*: seq[seq[int]]  # groups of binary positions where exactly one is 1
         # Conditional separation infos for domain reduction
         conditionalSeparations*: seq[tuple[varPos: int, lo: T, hi: T, guardPos: int]]
 
@@ -1079,6 +1080,8 @@ proc evaluateExpression[T](expr: Expression[T], assignment: seq[T]): T =
         return expr.maxExpr.evaluate(assignment)
     of WeightedSameValueExpr:
         return expr.weightedSameValueExpr.evaluate(assignment)
+    of BinaryPairwiseSumExpr:
+        return expr.binaryPairwiseSumExpr.evaluate(assignment)
 
 proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
     ## Statelessly evaluate a constraint's penalty with a raw assignment.
@@ -1637,6 +1640,49 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         if channelTotalRemoved > 0:
             stderr.writeLine(&"[DomRed] Channel binding propagation: {channelTotalRemoved} values removed in {channelIter} iterations")
+
+    # Binary partition (exactly-one) domain reduction:
+    # For each group where sum(binary_vars) = 1:
+    #   - If any member has domain {1} (singleton 1), fix all others to {0}
+    #   - If only one member can still take value 1, fix it to {1}
+    if carray.binaryPartitions.len > 0:
+        var partTotalRemoved = 0
+        var changed = true
+        var iter = 0
+        while changed and iter < 20:
+            changed = false
+            inc iter
+            for group in carray.binaryPartitions:
+                # Count how many can be 1, find the one that IS 1
+                var fixedToOne = -1
+                var canBeOne: seq[int]
+                for pos in group:
+                    if pos >= currentDomain.len: continue
+                    let dom = currentDomain[pos]
+                    if dom.len == 1 and 1 in dom:
+                        fixedToOne = pos
+                    elif 1 in dom:
+                        canBeOne.add(pos)
+
+                if fixedToOne >= 0:
+                    # One member is fixed to 1 — fix all others to 0
+                    for pos in group:
+                        if pos == fixedToOne: continue
+                        if pos >= currentDomain.len: continue
+                        if 1 in currentDomain[pos]:
+                            currentDomain[pos].excl(1)
+                            inc partTotalRemoved
+                            changed = true
+                elif canBeOne.len == 1:
+                    # Only one member can be 1 — fix it to 1
+                    let pos = canBeOne[0]
+                    if 0 in currentDomain[pos]:
+                        currentDomain[pos].excl(0)
+                        inc partTotalRemoved
+                        changed = true
+
+        if partTotalRemoved > 0:
+            stderr.writeLine(&"[DomRed] Binary partition propagation: {partTotalRemoved} values removed in {iter} iterations")
 
     # Cumulative constraint domain reduction
     for cons in carray.constraints:
@@ -5239,4 +5285,5 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
 
     # Partition groups are all value types — shallow copy is fine
     result.partitionGroups = arr.partitionGroups
+    result.binaryPartitions = arr.binaryPartitions
 
