@@ -389,6 +389,50 @@ proc collectDefinedVars(tr: var FznTranslator) =
                 tr.channelVarNames.incl(name)
             stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from var-indexed arrays)")
 
+    # Rescue defined vars that appear as duration/height elements in cumulative/disjunctive.
+    # These need positions so the constraint can track variable durations via durationPositions.
+    block:
+        var rescueNames = initHashSet[string]()
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name notin ["fzn_cumulative", "fzn_cumulatives", "fzn_disjunctive", "fzn_disjunctive_strict"]:
+                continue
+            # args[1] = durations array
+            let durElems = tr.resolveVarArrayElems(con.args[1])
+            for elem in durElems:
+                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                    rescueNames.incl(elem.ident)
+            # args[2] = heights array (only for cumulative)
+            if name in ["fzn_cumulative", "fzn_cumulatives"] and con.args.len > 2:
+                let hElems = tr.resolveVarArrayElems(con.args[2])
+                for elem in hElems:
+                    if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                        rescueNames.incl(elem.ident)
+
+        if rescueNames.len > 0:
+            # Find defining constraints for each rescued var
+            for ci, con in tr.model.constraints:
+                if ci notin tr.definingConstraints: continue
+                if con.hasAnnotation("defines_var"):
+                    let ann = con.getAnnotation("defines_var")
+                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                        let definedName = ann.args[0].ident
+                        if definedName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
+                else:
+                    let cname = stripSolverPrefix(con.name)
+                    if cname == "int_times" and con.args.len >= 3 and
+                         con.args[2].kind == FznIdent:
+                        let cName = con.args[2].ident
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+
+            # Move from definedVarNames to channelVarNames
+            for name in rescueNames:
+                tr.definedVarNames.excl(name)
+                tr.channelVarNames.incl(name)
+            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from cumulative/disjunctive durations)")
+
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     ## Tries to build the AlgebraicExpression for one defining constraint.
     ## Returns true if successful, false if a dependency is not yet available.

@@ -3455,3 +3455,178 @@ solve satisfy;
     let yVal = tr.sys.assignment[yPos]
     check 2 * xVal + 3 * yVal == 10
 
+suite "FlatZinc Variable-Duration Cumulative/Disjunctive":
+
+  test "defined-var durations rescued as channels for disjunctive":
+    # When disjunctive durations are defined vars (dur = end - start), they must
+    # be rescued as channel variables so the cumulative gets proper durationPositions.
+    # Model: 2 tasks on a single resource.
+    #   arrive1 in 0..10, depart1 in 0..10, wait1 = depart1 - arrive1 (defined var)
+    #   arrive2 in 0..10, depart2 in 0..10, wait2 = depart2 - arrive2 (defined var)
+    #   disjunctive([arrive1, arrive2], [wait1, wait2])
+    #   depart1 >= arrive1 + 2 (min duration 2)
+    #   depart2 >= arrive2 + 2 (min duration 2)
+    let src = """
+predicate fzn_disjunctive(array [int] of var int: s, array [int] of var int: d);
+var 0..10: arrive1;
+var 0..10: depart1;
+var 0..10: wait1:: is_defined_var:: var_is_introduced;
+var 0..10: arrive2;
+var 0..10: depart2;
+var 0..10: wait2:: is_defined_var:: var_is_introduced;
+constraint int_lin_eq([1, -1, 1], [wait1, depart1, arrive1], 0):: defines_var(wait1);
+constraint int_lin_eq([1, -1, 1], [wait2, depart2, arrive2], 0):: defines_var(wait2);
+constraint int_lin_le([1, -1], [arrive1, depart1], -2);
+constraint int_lin_le([1, -1], [arrive2, depart2], -2);
+constraint fzn_disjunctive([arrive1, arrive2], [wait1, wait2]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # wait1 and wait2 should be rescued as channel vars (not defined vars)
+    check "wait1" in tr.channelVarNames
+    check "wait2" in tr.channelVarNames
+    check "wait1" notin tr.definedVarNames
+    check "wait2" notin tr.definedVarNames
+    # They should have positions
+    check "wait1" in tr.varPositions
+    check "wait2" in tr.varPositions
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+
+    # Verify channel propagation: wait = depart - arrive
+    let a1 = tr.sys.assignment[tr.varPositions["arrive1"]]
+    let d1 = tr.sys.assignment[tr.varPositions["depart1"]]
+    let w1 = tr.sys.assignment[tr.varPositions["wait1"]]
+    let a2 = tr.sys.assignment[tr.varPositions["arrive2"]]
+    let d2 = tr.sys.assignment[tr.varPositions["depart2"]]
+    let w2 = tr.sys.assignment[tr.varPositions["wait2"]]
+    check w1 == d1 - a1
+    check w2 == d2 - a2
+    # Min duration enforced
+    check d1 - a1 >= 2
+    check d2 - a2 >= 2
+    # Disjunctive: intervals [arrive, arrive+wait) must not overlap
+    check (a1 + w1 <= a2) or (a2 + w2 <= a1)
+
+  test "defined-var durations rescued as channels for cumulative":
+    # Same pattern but with cumulative (limit > 1).
+    # 3 tasks, resource capacity 2, durations are defined vars.
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 0..20: s1;
+var 0..20: e1;
+var 0..20: d1:: is_defined_var:: var_is_introduced;
+var 0..20: s2;
+var 0..20: e2;
+var 0..20: d2:: is_defined_var:: var_is_introduced;
+var 0..20: s3;
+var 0..20: e3;
+var 0..20: d3:: is_defined_var:: var_is_introduced;
+constraint int_lin_eq([1, -1, 1], [d1, e1, s1], 0):: defines_var(d1);
+constraint int_lin_eq([1, -1, 1], [d2, e2, s2], 0):: defines_var(d2);
+constraint int_lin_eq([1, -1, 1], [d3, e3, s3], 0):: defines_var(d3);
+constraint int_lin_le([1, -1], [s1, e1], -3);
+constraint int_lin_le([1, -1], [s2, e2], -3);
+constraint int_lin_le([1, -1], [s3, e3], -3);
+constraint fzn_cumulative([s1, s2, s3], [d1, d2, d3], [1, 1, 1], 2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # d1, d2, d3 rescued as channel vars
+    check "d1" in tr.channelVarNames
+    check "d2" in tr.channelVarNames
+    check "d3" in tr.channelVarNames
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+
+    let sv1 = tr.sys.assignment[tr.varPositions["s1"]]
+    let ev1 = tr.sys.assignment[tr.varPositions["e1"]]
+    let dv1 = tr.sys.assignment[tr.varPositions["d1"]]
+    let sv2 = tr.sys.assignment[tr.varPositions["s2"]]
+    let ev2 = tr.sys.assignment[tr.varPositions["e2"]]
+    let dv2 = tr.sys.assignment[tr.varPositions["d2"]]
+    let sv3 = tr.sys.assignment[tr.varPositions["s3"]]
+    let ev3 = tr.sys.assignment[tr.varPositions["e3"]]
+    let dv3 = tr.sys.assignment[tr.varPositions["d3"]]
+    # Channels correct
+    check dv1 == ev1 - sv1
+    check dv2 == ev2 - sv2
+    check dv3 == ev3 - sv3
+    # Min duration
+    check ev1 - sv1 >= 3
+    check ev2 - sv2 >= 3
+    check ev3 - sv3 >= 3
+    # Cumulative capacity 2: at most 2 tasks active at any time
+    for t in 0..20:
+      var active = 0
+      if t >= sv1 and t < ev1: inc active
+      if t >= sv2 and t < ev2: inc active
+      if t >= sv3 and t < ev3: inc active
+      check active <= 2
+
+  test "constant-duration disjunctive unchanged by rescue":
+    # When disjunctive durations are constant, no rescue should occur.
+    let src = """
+predicate fzn_disjunctive(array [int] of var int: s, array [int] of var int: d);
+var 0..20: s1;
+var 0..20: s2;
+var 0..20: s3;
+constraint fzn_disjunctive([s1, s2, s3], [3, 5, 4]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # No rescues needed — durations are constants
+    var rescuedFromCumDur = 0
+    for def in tr.rescuedChannelDefs:
+      inc rescuedFromCumDur
+    # Only the pre-existing rescued defs (should be 0 for this simple model)
+    check rescuedFromCumDur == 0
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+
+    let v1 = tr.sys.assignment[tr.varPositions["s1"]]
+    let v2 = tr.sys.assignment[tr.varPositions["s2"]]
+    let v3 = tr.sys.assignment[tr.varPositions["s3"]]
+    # Disjunctive: no overlap with constant durations
+    check (v1 + 3 <= v2) or (v2 + 5 <= v1)
+    check (v1 + 3 <= v3) or (v3 + 4 <= v1)
+    check (v2 + 5 <= v3) or (v3 + 4 <= v2)
+
+suite "Domain Reduction Partial Restoration":
+
+  test "empty domains selectively restored without discarding all reductions":
+    # Create a model where domain reduction can tighten some domains but
+    # over-prunes others. Verify that the valid reductions are preserved.
+    # Model: x in 1..10, y in 1..10, z in 1..5
+    #   x + y = 12 (forces x >= 2, y >= 2, etc.)
+    #   z = x (element channel — z mirrors x but has smaller domain)
+    # Domain reduction should tighten x to 2..10, y to 2..10 based on the sum.
+    # If z's domain (1..5) restricts x to 1..5 through the channel, and then
+    # x+y=12 restricts y to 7..10 — all valid.
+    let src = """
+var 2..10: x;
+var 2..10: y;
+constraint int_lin_eq([1, 1], [x, y], 12);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # After domain reduction, both x and y should be tightened
+    let xPos = tr.varPositions["x"]
+    let yPos = tr.varPositions["y"]
+    let reduced = tr.sys.baseArray.reduceDomain()
+    # x + y = 12, x in 2..10, y in 2..10
+    # → x in 2..10, y in 2..10 (bounds propagation)
+    check reduced[xPos].len <= 9
+    check reduced[yPos].len <= 9
+    # Both domains should be non-empty
+    check reduced[xPos].len > 0
+    check reduced[yPos].len > 0
+

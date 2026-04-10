@@ -1516,23 +1516,36 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # disjunctive(starts, durations) = cumulative(starts, durations, heights=[1,...], limit=1)
         let startExprs = tr.resolveExprArray(con.args[0])
         var durations: seq[int]
+        var durPositions: seq[int]
+        var hasVarDur = false
         try:
             durations = tr.resolveIntArray(con.args[1])
+            durPositions = newSeq[int](durations.len)
+            for i in 0..<durPositions.len: durPositions[i] = -1
         except CatchableError:
             let dExprs = tr.resolveExprArray(con.args[1])
             durations = newSeq[int](dExprs.len)
+            durPositions = newSeq[int](dExprs.len)
             for i, e in dExprs:
                 if e.node.kind == LiteralNode:
                     durations[i] = e.node.value
+                    durPositions[i] = -1
                 elif e.node.kind == RefNode:
+                    durPositions[i] = e.node.position
+                    hasVarDur = true
                     let dom = tr.sys.baseArray.domain[e.node.position]
                     if dom.len == 1:
                         durations[i] = dom[0]
                     else:
-                        durations[i] = dom[dom.len div 2]
-                        stderr.writeLine(&"[FZN] Warning: disjunctive duration variable has non-singleton domain (size {dom.len}), using median value {durations[i]}")
+                        durations[i] = dom[dom.len div 2]  # fallback for initial value
+                else:
+                    durations[i] = 1  # fallback
+                    durPositions[i] = -1
+        if hasVarDur:
+            stderr.writeLine(&"[FZN] disjunctive: variable durations ({startExprs.len} tasks)")
         let heights = newSeqWith(durations.len, 1)
-        tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, 1))
+        let heightPositions = newSeqWith(durations.len, -1)  # all -1 (constant height=1)
+        tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, 1, -1, durPositions, heightPositions))
 
     of "fzn_diffn":
         # diffn(x, y, dx, dy) - non-overlapping rectangles
