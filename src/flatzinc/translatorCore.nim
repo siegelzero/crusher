@@ -78,7 +78,17 @@ proc translateVariables(tr: var FznTranslator) =
         # own output_var annotation. Don't allocate a new position; we'll point this
         # name at the canonical's position in a second pass after all non-aliases are
         # processed.
+        #
+        # NOTE: scalar int/bool aliases only. Set-variable aliases are not handled
+        # (canonicalizeFznVarAliases skips set-of-int decls for simplicity). If MZN
+        # ever emits `var set of int: Y = X;`, this branch would skip the
+        # set-decomposition path below and leave `Y` without a setVarBoolPositions
+        # entry. Abort loudly if that case ever arises so the gap is visible.
         if decl.name in tr.fznVarAliases:
+            if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
+                raise newException(ValueError,
+                    "set-of-int alias '" & decl.name & "' not supported " &
+                    "(canonicalizeFznVarAliases only handles scalar int/bool)")
             if decl.hasAnnotation("output_var"):
                 tr.outputVars.add(decl.name)
                 if decl.varType.kind == FznBool:

@@ -111,23 +111,35 @@ solve satisfy;
         ## unconstrained and the model breaks (objective collapses to a bogus
         ## minimum because nothing forces the inputs to match).
         ##
-        ## Here `chosen + 5 = listget` (one direction, defining via element)
-        ## and `listget = lookup[idxFromOrder]` (the other direction, also
-        ## defining via element on a different array but the SAME aliased
-        ## result var). One must win as the channel; the other becomes a
-        ## regular constraint that enforces the equation.
+        ## Here two element constraints define the same aliased result via
+        ## DIFFERENT constant arrays. `forwardArr` is [6,7,8] (picks listget[i])
+        ## and `reverseArr` is [8,7,6] (picks the reverse). One constraint wins
+        ## as the channel; the other becomes a regular constraint enforcing
+        ## its own equation.
+        ##
+        ## With listget pinned to 7, the channel constraint forces its index
+        ## var to 2 (since forwardArr[2]=7). For the demoted constraint to
+        ## also enforce its equation, the reverseArr-index var must also be 2
+        ## (since reverseArr[2]=7). Since the two index vars are separately
+        ## tied to chooseOrder via int_eq, chooseOrder must equal 2.
+        ##
+        ## If the demoted constraint were silently dropped, its input
+        ## (reverseIdx) would be free and the test wouldn't constrain
+        ## chooseOrder. The asymmetric arrays are essential — if both arrays
+        ## were identical, the demoted constraint would be redundant even if
+        ## dropped, and the test couldn't distinguish "enforced" from "dropped".
         let src = """
-array [1..3] of int: shiftBy5 = [6, 7, 8];
-array [1..3] of int: pickFromArr = [6, 7, 8];
+array [1..3] of int: forwardArr = [6, 7, 8];
+array [1..3] of int: reverseArr = [8, 7, 6];
 var 1..3: chooseOrder :: output_var;
-var 1..3: chosen :: var_is_introduced;
-var 1..3: idxFromOrder :: var_is_introduced;
+var 1..3: forwardIdx :: var_is_introduced;
+var 1..3: reverseIdx :: var_is_introduced;
 var 6..8: listget :: var_is_introduced :: is_defined_var;
 var 6..8: listgetAlias :: var_is_introduced :: is_defined_var = listget;
-constraint int_eq(chosen, chooseOrder);
-constraint int_eq(idxFromOrder, chooseOrder);
-constraint array_int_element(chosen, shiftBy5, listget) :: defines_var(listget);
-constraint array_int_element(idxFromOrder, pickFromArr, listgetAlias) :: defines_var(listgetAlias);
+constraint int_eq(forwardIdx, chooseOrder);
+constraint int_eq(reverseIdx, chooseOrder);
+constraint array_int_element(forwardIdx, forwardArr, listget) :: defines_var(listget);
+constraint array_int_element(reverseIdx, reverseArr, listgetAlias) :: defines_var(listgetAlias);
 constraint int_eq(listget, 7);
 solve satisfy;
 """
@@ -139,7 +151,10 @@ solve satisfy;
         check tr.fznVarAliases["listgetAlias"] == "listget"
         check tr.varPositions["listget"] == tr.varPositions["listgetAlias"]
         tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
-        # listget == 7 forces both element constraints to point at index 2
+        # listget == 7 forces forwardArr[chooseOrder]=7 ⇒ chooseOrder=2, and
+        # (via the demoted constraint) reverseArr[chooseOrder]=7 ⇒ chooseOrder=2.
+        # Both agree only at chooseOrder=2.
+        check tr.sys.hasFeasibleSolution
         check tr.sys.assignment[tr.varPositions["listget"]] == 7
         check tr.sys.assignment[tr.varPositions["chooseOrder"]] == 2
 
@@ -228,18 +243,18 @@ solve satisfy;
 
 suite "FlatZinc Matrix-Element Diagonal Exclusion":
 
-    test "diagonal-only zero is excluded from result domain":
-        ## A 3x3 distance matrix with 0 only on the diagonal, plus a
-        ## sentinel-inverse permutation pattern in the same model. The
-        ## diagonal-exclusion pass should remove value 0 from the result var's
-        ## domain since `row != col` is structurally enforced by the inverse
-        ## permutation.
-        ##
-        ## We add a `doubled` int_lin_eq referencing `distance` so the
-        ## dead-element-channel elim (which runs before our diagonal pass)
-        ## doesn't drop it as unreferenced.
+    test "diagonal-only zero is excluded when row/col trace to forward positions":
+        ## Positive case: rowSrc and colSrc are structurally linked (via
+        ## int_lin_eq offsets) to p1 and p2, which are forward positions of a
+        ## sentinel-inverse channel group. The strict guard traces rowSrc's
+        ## equivalence class to {rowSrc: 0, p1: -1} and colSrc's to
+        ## {colSrc: 0, p2: -1}. With rowBase=1, colBase=1, diagOffset=0:
+        ##     diagOffset + rowOffset(p1) - colOffset(p2) = 0 + (-1) - (-1) = 0
+        ## so diagonal ⇔ p1 == p2, which is false since p1 and p2 are at
+        ## distinct forward-position indices in the inverse channel group.
+        ## Tightening must proceed.
         let src = """
-% Sentinel-prefixed inverse permutation pattern (the routing-style guard)
+% Sentinel-prefixed inverse permutation pattern (gives us the inverse channel group)
 var 0..2: p1 :: output_var;
 var 0..2: p2 :: output_var;
 var 0..2: p3 :: output_var;
@@ -254,12 +269,19 @@ constraint array_var_int_element(idx1, arr1, 1);
 constraint array_var_int_element(idx2, arr2, 2);
 constraint fzn_all_different_int([p1, p2, p3]);
 
-% Three-element matrix lookup pattern: row labels, col labels, distance matrix
+% Link rowSrc/colSrc to p1/p2 via int_lin_eq offsets:
+%   p1 - rowSrc = -1  →  rowSrc = p1 + 1
+%   p2 - colSrc = -1  →  colSrc = p2 + 1
+var 1..3: rowSrc :: var_is_introduced;
+var 1..3: colSrc :: var_is_introduced;
+constraint int_lin_eq([1,-1],[p1,rowSrc],-1);
+constraint int_lin_eq([1,-1],[p2,colSrc],-1);
+
+% Three-element matrix lookup pattern sharing flatIdx. Row labels start at 1
+% and step with the row; col labels start at 1 and step with the col.
 array [1..9] of int: rowLabels = [1,1,1, 2,2,2, 3,3,3];
 array [1..9] of int: colLabels = [1,2,3, 1,2,3, 1,2,3];
 array [1..9] of int: dataMatrix = [0,5,7, 5,0,3, 7,3,0];
-var 1..3: rowSrc :: var_is_introduced;
-var 1..3: colSrc :: var_is_introduced;
 var 1..9: flatIdx :: var_is_introduced;
 var 0..7: distance :: output_var;
 constraint array_int_element(flatIdx, rowLabels, rowSrc);
@@ -272,21 +294,65 @@ solve satisfy;
 """
         let model = parseFzn(src)
         var tr = translate(model)
-        # Sentinel inverse channel must have been built (the routing-style guard)
+        # Sentinel inverse channel must have been built
         check tr.sys.baseArray.inverseChannelGroups.len >= 1
-        # The diagonal-exclusion pass should have removed value 0 from `distance`
+        # Strict guard should have proved row != col and removed 0 from distance
         check tr.varPositions.hasKey("distance")
         let distPos = tr.varPositions["distance"]
         check 0 notin tr.sys.baseArray.domain[distPos]
-        # The remaining off-diagonal values should still be present
+        # Off-diagonal values must remain
         check 3 in tr.sys.baseArray.domain[distPos]
         check 5 in tr.sys.baseArray.domain[distPos]
         check 7 in tr.sys.baseArray.domain[distPos]
 
+    test "no diagonal exclusion when row/col don't trace to forward positions":
+        ## The strict guard REJECTS this case: rowSrc and colSrc have no
+        ## constant-offset chain connecting them to any inverse channel forward
+        ## position, so we can't prove row != col. This is the case the original
+        ## weak `inverseChannelGroups.len > 0` guard would have wrongly tightened.
+        let src = """
+% Sentinel-inverse pattern, but over vars unrelated to the matrix inputs
+var 0..2: p1 :: output_var;
+var 0..2: p2 :: output_var;
+var 0..2: p3 :: output_var;
+var 1..4: idx0 :: var_is_introduced;
+var 1..4: idx1 :: var_is_introduced;
+var 1..4: idx2 :: var_is_introduced;
+array [1..4] of var int: arr0 = [0, p1, p2, p3];
+array [1..4] of var int: arr1 = [1, p1, p2, p3];
+array [1..4] of var int: arr2 = [2, p1, p2, p3];
+constraint array_var_int_element(idx0, arr0, 0);
+constraint array_var_int_element(idx1, arr1, 1);
+constraint array_var_int_element(idx2, arr2, 2);
+constraint fzn_all_different_int([p1, p2, p3]);
+
+% rowSrc/colSrc are NOT linked to p1/p2/p3 by any int_lin_eq or shifted-identity.
+% Their equivalence classes contain only themselves.
+array [1..9] of int: rowLabels = [1,1,1, 2,2,2, 3,3,3];
+array [1..9] of int: colLabels = [1,2,3, 1,2,3, 1,2,3];
+array [1..9] of int: dataMatrix = [0,5,7, 5,0,3, 7,3,0];
+var 1..3: rowSrc :: var_is_introduced;
+var 1..3: colSrc :: var_is_introduced;
+var 1..9: flatIdx :: var_is_introduced;
+var 0..7: distance :: output_var;
+constraint array_int_element(flatIdx, rowLabels, rowSrc);
+constraint array_int_element(flatIdx, colLabels, colSrc);
+constraint array_int_element(flatIdx, dataMatrix, distance) :: defines_var(distance);
+var 0..14: doubled :: output_var;
+constraint int_lin_eq([2,-1],[distance,doubled],0);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        # Inverse channel exists but is structurally unrelated to rowSrc/colSrc
+        check tr.sys.baseArray.inverseChannelGroups.len >= 1
+        # Strict guard must reject — 0 stays in the domain
+        check tr.varPositions.hasKey("distance")
+        let distPos = tr.varPositions["distance"]
+        check 0 in tr.sys.baseArray.domain[distPos]
+
     test "no diagonal exclusion when there's no inverse channel pattern":
-        ## Without the routing-style guard (no sentinel-inverse pattern), the
-        ## diagonal-exclusion pass must NOT fire — we can't safely assume row
-        ## != col without that signal.
+        ## Without any inverse channel, the pass must not fire at all.
         let src = """
 array [1..9] of int: rowLabels = [1,1,1, 2,2,2, 3,3,3];
 array [1..9] of int: colLabels = [1,2,3, 1,2,3, 1,2,3];
@@ -306,8 +372,7 @@ solve satisfy;
         let model = parseFzn(src)
         var tr = translate(model)
         check tr.sys.baseArray.inverseChannelGroups.len == 0
-        # Without the guard, value 0 must remain in the domain — search may
-        # legitimately pick row == col.
+        # Without the guard, value 0 must remain in the domain
         check tr.varPositions.hasKey("distance")
         let distPos = tr.varPositions["distance"]
         check 0 in tr.sys.baseArray.domain[distPos]
