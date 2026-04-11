@@ -635,6 +635,166 @@ proc boundsPropagate(tr: FznTranslator,
                                 vars[j].lo = allowed[0]
                                 vars[j].hi = allowed[^1]
 
+proc reachableValuesPropagate(tr: var FznTranslator,
+                              domains: var Table[string, seq[int]],
+                              fixedVars: Table[string, int],
+                              eliminated: PackedSet[int],
+                              infeasible: var bool): bool =
+    ## Discrete-domain (reachable-values) propagation for int_lin_eq.
+    ##
+    ## For a constraint Σᵢ cᵢ·xᵢ = rhs with each xᵢ having a small enumerable
+    ## domain, tighten each xⱼ to those values v for which some assignment of
+    ## the other xᵢ over their discrete domains can complete the sum. This is
+    ## strictly stronger than the interval-only reasoning in `boundsPropagate`:
+    ## it removes values in *gaps* of the achievable value set (e.g. y ∈ {0,70,140}
+    ## when y = 70·b₁ + 70·b₂ and the bᵢ are binary, where interval arithmetic
+    ## would only give y ∈ [0, 140]).
+    ##
+    ## Budgeted: aborts the constraint if the Cartesian product of domain sizes
+    ## exceeds `enumerationLimit` so we don't blow up on long sums.
+    const enumerationLimit = 4096
+    result = false
+    var nTightened = 0
+    var nValuesRemoved = 0
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.args.len < 3: continue
+
+        # Resolve coefficients array (same logic as boundsPropagate)
+        var coeffsArg = con.args[0]
+        if coeffsArg.kind == FznIdent:
+            let arrName = coeffsArg.ident
+            if arrName in tr.paramValues: continue
+            var found = false
+            for decl in tr.model.parameters:
+                if decl.isArray and decl.name == arrName:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        coeffsArg = decl.value
+                        found = true
+                    break
+            if not found:
+                for decl in tr.model.variables:
+                    if decl.isArray and decl.name == arrName:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            coeffsArg = decl.value
+                            found = true
+                        break
+            if not found: continue
+        if coeffsArg.kind != FznArrayLit: continue
+
+        var varsArg = con.args[1]
+        if varsArg.kind == FznIdent:
+            var found = false
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varsArg.ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        varsArg = decl.value
+                        found = true
+                    break
+            if not found:
+                for decl in tr.model.parameters:
+                    if decl.isArray and decl.name == varsArg.ident:
+                        if decl.value != nil and decl.value.kind == FznArrayLit:
+                            varsArg = decl.value
+                            found = true
+                        break
+            if not found: continue
+        if varsArg.kind != FznArrayLit: continue
+
+        let nArgs = coeffsArg.elems.len
+        if nArgs != varsArg.elems.len: continue
+        if nArgs < 2: continue
+        if not tr.presolveIsFixed(con.args[2], fixedVars): continue
+        let rhs = tr.presolveResolve(con.args[2], fixedVars)
+
+        # Collect per-term info and check budget.
+        type Term = object
+            coeff: int
+            varName: string
+            fixed: bool
+            fixedVal: int
+            dom: seq[int]
+        var terms = newSeq[Term](nArgs)
+        var fixedSum = 0
+        var cartProduct = 1
+        var nUnfixed = 0
+        var valid = true
+        var overBudget = false
+        for i in 0..<nArgs:
+            if coeffsArg.elems[i].kind != FznIntLit:
+                valid = false; break
+            terms[i].coeff = coeffsArg.elems[i].intVal
+            let vExpr = varsArg.elems[i]
+            terms[i].varName = presolveVarName(vExpr)
+            if tr.presolveIsFixed(vExpr, fixedVars):
+                terms[i].fixed = true
+                terms[i].fixedVal = tr.presolveResolve(vExpr, fixedVars)
+                fixedSum += terms[i].coeff * terms[i].fixedVal
+            elif terms[i].varName in domains:
+                terms[i].dom = domains[terms[i].varName]
+                if terms[i].dom.len == 0:
+                    valid = false; break
+                if terms[i].coeff != 0:
+                    inc nUnfixed
+                    # Guard against overflow and keep the budget check cheap.
+                    if cartProduct > enumerationLimit or
+                       terms[i].dom.len > enumerationLimit:
+                        overBudget = true
+                    else:
+                        cartProduct *= terms[i].dom.len
+                        if cartProduct > enumerationLimit:
+                            overBudget = true
+            else:
+                valid = false; break
+        if not valid or overBudget or nUnfixed < 2: continue
+
+        let adjRhs = rhs - fixedSum
+
+        # For each unfixed term j: enumerate the achievable values of the sum
+        # of the remaining unfixed terms and tighten dom(xⱼ) accordingly.
+        for j in 0..<nArgs:
+            if terms[j].fixed: continue
+            if terms[j].varName == "": continue
+            let cj = terms[j].coeff
+            if cj == 0: continue
+            if terms[j].dom.len <= 1: continue
+
+            # Build coeff-scaled domains of the other unfixed terms.
+            var otherDomains: seq[seq[int]]
+            for i in 0..<nArgs:
+                if i == j or terms[i].fixed or terms[i].coeff == 0: continue
+                if terms[i].dom.len == 0: continue
+                var scaled = newSeq[int](terms[i].dom.len)
+                for k, v in terms[i].dom:
+                    scaled[k] = terms[i].coeff * v
+                otherDomains.add(scaled)
+
+            let reachable = computeReachableSums(otherDomains, enumerationLimit)
+            if reachable.len == 0: continue  # budget exceeded, skip
+
+            var newDom: seq[int]
+            for v in terms[j].dom:
+                let needed = adjRhs - cj * v
+                if needed in reachable:
+                    newDom.add(v)
+            if newDom.len == 0:
+                infeasible = true
+                return
+            if newDom.len < terms[j].dom.len:
+                let removed = terms[j].dom.len - newDom.len
+                if presolveTightenDomain(domains, terms[j].varName, newDom, infeasible):
+                    result = true
+                    inc nTightened
+                    nValuesRemoved += removed
+                    terms[j].dom = newDom  # tighter for remaining j iterations
+
+    if nTightened > 0:
+        tr.reachableValuesTightened += nTightened
+        tr.reachableValuesRemoved += nValuesRemoved
+
 proc bigMDomainPruning(tr: FznTranslator,
                        domains: var Table[string, seq[int]],
                        fixedVars: Table[string, int],
@@ -2212,6 +2372,145 @@ proc presolveResolveVarElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
         return @[]
     else: return @[]
 
+
+proc arrayMinMaxPropagate(tr: FznTranslator,
+                          domains: var Table[string, seq[int]],
+                          fixedVars: Table[string, int],
+                          eliminated: PackedSet[int],
+                          infeasible: var bool): bool =
+    ## Bounds propagation for `array_int_maximum(m, [x_1,...,x_n])` and
+    ## `array_int_minimum(m, [x_1,...,x_n])`.
+    ##
+    ## For max:
+    ##   Forward:  m ∈ [max_i lo(x_i), max_i hi(x_i)]
+    ##   Backward: each x_i ≤ hi(m)
+    ##   Strong:   if exactly one x_i has hi(x_i) ≥ lo(m), then that x_i ≥ lo(m)
+    ## For min: symmetric (swap bounds and directions).
+    ##
+    ## Critical for objective tightening in max-of-sums models: the FZN
+    ## flattener often emits `array_int_maximum(obj, [f_1,...,f_k])` with
+    ## `obj ∈ [0..big]`, even though the tightest coarse bound is
+    ## `max_i hi(f_i)`. Running to fixed-point couples tightening in both
+    ## directions as the component f_i bounds shrink.
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        let isMax = name == "array_int_maximum"
+        let isMin = name == "array_int_minimum"
+        if not isMax and not isMin: continue
+        if con.args.len < 2: continue
+
+        let mArg = con.args[0]
+        if mArg.kind != FznIdent: continue
+        let mName = mArg.ident
+        let arrVars = presolveResolveVarElems(tr, con.args[1])
+        if arrVars.len == 0: continue
+
+        # Collect element (lo, hi, varName, fixed) quadruples.
+        type ElemInfo = tuple[lo, hi: int, varName: string, fixed: bool]
+        var elems = newSeq[ElemInfo](arrVars.len)
+        var valid = true
+        for i, e in arrVars:
+            if tr.presolveIsFixed(e, fixedVars):
+                let v = tr.presolveResolve(e, fixedVars)
+                elems[i] = (lo: v, hi: v, varName: presolveVarName(e), fixed: true)
+            else:
+                let vn = presolveVarName(e)
+                if vn == "" or vn notin domains:
+                    valid = false; break
+                let d = domains[vn]
+                if d.len == 0:
+                    valid = false; break
+                elems[i] = (lo: d[0], hi: d[^1], varName: vn, fixed: false)
+        if not valid: continue
+
+        # m's current bounds
+        var mLo, mHi: int
+        var mFixed = false
+        if mName in fixedVars:
+            mLo = fixedVars[mName]; mHi = mLo; mFixed = true
+        elif mName in domains:
+            let d = domains[mName]
+            if d.len == 0: continue
+            mLo = d[0]; mHi = d[^1]
+        else:
+            continue
+
+        var aggLo = elems[0].lo
+        var aggHi = elems[0].hi
+        for i in 1..<elems.len:
+            if isMax:
+                aggLo = max(aggLo, elems[i].lo)
+                aggHi = max(aggHi, elems[i].hi)
+            else:
+                aggLo = min(aggLo, elems[i].lo)
+                aggHi = min(aggHi, elems[i].hi)
+
+        # Forward: tighten m to the aggregated bounds.
+        if not mFixed:
+            if presolveRestrictBounds(domains, mName, aggLo, aggHi, infeasible):
+                result = true
+                let d = domains[mName]
+                if d.len == 0: return
+                mLo = d[0]; mHi = d[^1]
+        if infeasible: return
+
+        # Backward: each element is bounded by m.
+        if isMax:
+            for i in 0..<elems.len:
+                if elems[i].fixed or elems[i].varName == "": continue
+                if presolveRestrictBounds(domains, elems[i].varName,
+                                          low(int), mHi, infeasible):
+                    result = true
+                    let d = domains[elems[i].varName]
+                    if d.len == 0: return
+                    elems[i].lo = d[0]; elems[i].hi = d[^1]
+                if infeasible: return
+        else:
+            for i in 0..<elems.len:
+                if elems[i].fixed or elems[i].varName == "": continue
+                if presolveRestrictBounds(domains, elems[i].varName,
+                                          mLo, high(int), infeasible):
+                    result = true
+                    let d = domains[elems[i].varName]
+                    if d.len == 0: return
+                    elems[i].lo = d[0]; elems[i].hi = d[^1]
+                if infeasible: return
+
+        # Strong backward: if the max requires lo(m), at most one element can
+        # still reach it — if that element is unique, it must be ≥ lo(m).
+        if isMax and mLo > low(int):
+            var candidate = -1
+            var unique = true
+            for i in 0..<elems.len:
+                if elems[i].hi >= mLo:
+                    if candidate < 0:
+                        candidate = i
+                    else:
+                        unique = false; break
+            if unique and candidate >= 0 and not elems[candidate].fixed and
+                    elems[candidate].varName != "":
+                if presolveRestrictBounds(domains, elems[candidate].varName,
+                                          mLo, high(int), infeasible):
+                    result = true
+            if infeasible: return
+        elif isMin and mHi < high(int):
+            var candidate = -1
+            var unique = true
+            for i in 0..<elems.len:
+                if elems[i].lo <= mHi:
+                    if candidate < 0:
+                        candidate = i
+                    else:
+                        unique = false; break
+            if unique and candidate >= 0 and not elems[candidate].fixed and
+                    elems[candidate].varName != "":
+                if presolveRestrictBounds(domains, elems[candidate].varName,
+                                          low(int), mHi, infeasible):
+                    result = true
+            if infeasible: return
 
 proc intMaxMinPropagate(tr: FznTranslator,
                         domains: var Table[string, seq[int]],
@@ -3885,6 +4184,111 @@ proc partitionPropagate(tr: FznTranslator,
                 if presolveRemoveValue(domains, m.placeVar, nullVal, infeasible):
                     result = true
 
+proc binPackingLoadPropagate(tr: FznTranslator,
+                             domains: var Table[string, seq[int]],
+                             fixedVars: Table[string, int],
+                             eliminated: PackedSet[int],
+                             infeasible: var bool): bool =
+    ## Subset-sum domain tightening for `fzn_bin_packing_load(load, bin, w)`.
+    ##
+    ## Each `load[b]` equals the sum of `w[i]` over items whose bin var takes
+    ## value `b`. The achievable values of `load[b]` are therefore
+    ##
+    ##     { constOffset[b] + s : s ∈ subset-sums of { w[i] : domain(bin[i]) ∋ b } }
+    ##
+    ## where `constOffset[b]` is the contribution of items whose bin is a fixed
+    ## literal equal to `b`. We intersect each load var's current domain with
+    ## this reachable set. Running inside the presolve fixpoint lets the tight
+    ## loads feed downstream bound propagation (e.g. objective ≥ max load).
+    const subsetSumLimit = 8192
+    result = false
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname != "fzn_bin_packing_load": continue
+        if con.args.len < 3: continue
+
+        let loadElems = presolveResolveVarElems(tr, con.args[0])
+        let binElems = presolveResolveVarElems(tr, con.args[1])
+        if loadElems.len == 0 or binElems.len == 0: continue
+
+        let weights = try: tr.resolveIntArray(con.args[2])
+                      except CatchableError: continue
+        if weights.len != binElems.len: continue
+
+        # Partition items into variable-bin and fixed-bin, and resolve each
+        # variable bin's current domain.
+        type BinItem = tuple[weight: int, binDomain: seq[int]]
+        var varItems: seq[BinItem]
+        var constPerBin = initTable[int, int]()
+        for i, e in binElems:
+            if tr.presolveIsFixed(e, fixedVars):
+                let b = tr.presolveResolve(e, fixedVars)
+                constPerBin[b] = constPerBin.getOrDefault(b, 0) + weights[i]
+            else:
+                let vn = presolveVarName(e)
+                if vn == "" or vn notin domains:
+                    # Unknown bin domain — can't prune, skip the whole constraint.
+                    varItems.setLen(0); break
+                let dom = domains[vn]
+                if dom.len == 0:
+                    infeasible = true; return
+                varItems.add((weight: weights[i], binDomain: dom))
+
+        if varItems.len == 0 and constPerBin.len == 0: continue
+
+        # Resolve load variable names and their current domains.
+        var loadVarNames: seq[string]
+        var loadBase = high(int)
+        for _, item in varItems:
+            for v in item.binDomain:
+                loadBase = min(loadBase, v)
+        for b, _ in constPerBin:
+            loadBase = min(loadBase, b)
+        if loadBase == high(int):
+            loadBase = 1
+
+        for e in loadElems:
+            let vn = presolveVarName(e)
+            loadVarNames.add(vn)
+
+        # Cache subset-sum sets: key is the sorted active-weight string so bins
+        # with the same support share the enumeration.
+        var cache = initTable[string, HashSet[int]]()
+
+        for bIdx, loadVarName in loadVarNames:
+            if loadVarName == "": continue
+            if loadVarName notin domains: continue
+            let binValue = bIdx + loadBase
+            let constOffset = constPerBin.getOrDefault(binValue, 0)
+
+            var activeWeights = newSeqOfCap[int](varItems.len)
+            for item in varItems:
+                if binValue in item.binDomain:
+                    activeWeights.add(item.weight)
+            let key = activeWeights.sorted.join(",")
+
+            var reachable: HashSet[int]
+            if key in cache:
+                reachable = cache[key]
+            else:
+                reachable = reachableWeightedSums(activeWeights, subsetSumLimit)
+                cache[key] = reachable
+            if reachable.len == 0: continue  # budget exceeded
+
+            let currentDom = domains[loadVarName]
+            var newDom = newSeqOfCap[int](currentDom.len)
+            for v in currentDom:
+                if (v - constOffset) in reachable:
+                    newDom.add(v)
+            if newDom.len == 0:
+                infeasible = true
+                return
+            if newDom.len < currentDom.len:
+                if presolveTightenDomain(domains, loadVarName, newDom, infeasible):
+                    result = true
+
 proc inferUnboundedDomains(tr: FznTranslator,
                            domains: var Table[string, seq[int]],
                            fixedVars: var Table[string, int],
@@ -4147,6 +4551,13 @@ proc presolve*(tr: var FznTranslator) =
             changed = true
         if infeasible: break
 
+        # Step 4c: Discrete-domain reachable-values propagation for int_lin_eq.
+        # Stronger than interval bounds: removes values in gaps of the achievable
+        # value set when all terms have small enumerable domains. Budget-capped.
+        if reachableValuesPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
         # Step 5: AllDifferent propagation
         if allDiffPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
@@ -4183,6 +4594,22 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 6d: int_max/int_min bounds propagation
         if intMaxMinPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6d2: array_int_maximum/minimum bounds propagation. Essential for
+        # max-of-sums objectives (e.g. `obj = max(f_1,...,f_k)`) where the
+        # default domain of the objective far exceeds the tightest aggregate
+        # bound over the component fᵢ.
+        if arrayMinMaxPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 6d3: bin_packing_load subset-sum propagation. Tightens each
+        # load variable's domain to the set of achievable subset sums of the
+        # item weights. Runs inside the fixpoint so tightened loads feed into
+        # boundsPropagate / arrayMinMaxPropagate (e.g. objective upper bound).
+        if binPackingLoadPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
@@ -4245,3 +4672,5 @@ proc presolve*(tr: var FznTranslator) =
 
     if nFixed > 0 or eliminated.len > 0 or tr.presolveDomains.len > 0:
         stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated, {tr.presolveDomains.len} domains tightened")
+    if tr.reachableValuesTightened > 0:
+        stderr.writeLine(&"[FZN] Presolve: reachable-values propagation tightened {tr.reachableValuesTightened} domains ({tr.reachableValuesRemoved} values removed)")

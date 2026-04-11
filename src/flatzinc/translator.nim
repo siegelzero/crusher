@@ -544,6 +544,9 @@ type
         nTableToNotIn*: int
         # Counter for redundant NAND constraints skipped during translation
         nSkippedRedundantNand*: int
+        # Stats for `reachableValuesPropagate`: domains tightened + total values removed
+        reachableValuesTightened*: int
+        reachableValuesRemoved*: int
         # NAND bool clauses from bool_clause([], [b_1, ..., b_k]) — for redundancy
         # detection. Each entry is the *sorted* tuple of source bool var names.
         # Supports any arity k >= 2 (originally k = 2 only).
@@ -2255,6 +2258,15 @@ proc translate*(model: FznModel): FznTranslator =
     # Consolidate shared-index element channels into table constraints
     # MUST run after translateVariables (positions exist) and before buildChannelBindings
     result.detectSharedIndexConsolidation()
+
+    # Merge int_eq_reif/int_ne_reif pairs that define two bool vars over the same
+    # (x, v) predicate, rewriting the ne-side as a bool_not of the eq-side. Halves
+    # the number of reification channels for problems where MiniZinc's flattener
+    # emits both polarities (common in flow/indicator-heavy models).
+    # MUST run after every detect* pass that reads reifChannelDefs for int_ne_reif
+    # entries (notably detectForwardBackwardEquivChannels), and before
+    # buildReifChannelBindings which consumes the final list.
+    result.detectReifPolarityPairs()
 
     # Record binding count from constraint loop (table_int functional deps, array_set_element, etc.)
     let constraintLoopBindingCount = result.sys.baseArray.channelBindings.len

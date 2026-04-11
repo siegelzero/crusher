@@ -283,6 +283,46 @@ proc extractBoolClauseLiterals*(con: FznConstraint):
     if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: return
     result = (ok: true, posElems: con.args[0].elems, negElems: con.args[1].elems)
 
+# --- Subset-sum reachability (used by bin_packing_load presolve, linear-sum
+#     reachable-values presolve, and anywhere we need the set of achievable
+#     values of Σ cᵢ·xᵢ where each xᵢ has a small discrete domain). ---
+
+proc computeReachableSums*(termDomains: seq[seq[int]], limit: int): HashSet[int] =
+    ## Return the set of all achievable values of the sum `Σᵢ t[i]` where each
+    ## `t[i]` independently ranges over the values in `termDomains[i]`.
+    ## Aborts (returning an empty set) if the set of reachable sums exceeds `limit`
+    ## at any point — callers should treat an empty return as "skip tightening".
+    ## Empty `termDomains[i]` (no choices) contributes 0 for convenience so the
+    ## helper can't be poisoned by degenerate inputs.
+    result = initHashSet[int]()
+    result.incl(0)
+    for vals in termDomains:
+        if vals.len == 0: continue
+        # Dedup the offsets so we don't blow up when the same value appears twice.
+        var distinctVals: seq[int]
+        var seen = initHashSet[int]()
+        for v in vals:
+            if v notin seen:
+                seen.incl(v)
+                distinctVals.add(v)
+        if distinctVals.len == 1 and distinctVals[0] == 0:
+            continue  # term is forced to zero, no branching
+        var nextSums = initHashSet[int](result.len * distinctVals.len)
+        for s in result:
+            for v in distinctVals:
+                nextSums.incl(s + v)
+                if nextSums.len > limit:
+                    return initHashSet[int]()
+        result = nextSums
+
+proc reachableWeightedSums*(weights: seq[int], limit: int): HashSet[int] =
+    ## Convenience wrapper for Σ wᵢ·bᵢ where each bᵢ ∈ {0,1} (i.e. the classic
+    ## subset-sum set), used by bin_packing_load.
+    var termDoms = newSeq[seq[int]](weights.len)
+    for i, w in weights:
+        termDoms[i] = @[0, w]
+    return computeReachableSums(termDoms, limit)
+
 # --- Logging ---
 
 template logBuilt*(label: string, count: int, tr: FznTranslator) =

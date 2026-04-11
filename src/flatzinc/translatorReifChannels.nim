@@ -1,6 +1,101 @@
 ## Included from translator.nim -- not a standalone module.
 ## Reification channel detection: int_eq_reif, bool2int, bool_not, le_reif, lin_le_reif, lin_eq_reif.
 
+proc detectReifPolarityPairs*(tr: var FznTranslator) =
+    ## Rewrites int_eq_reif / int_ne_reif polarity pairs that both end up in
+    ## `reifChannelDefs` to avoid building two independent element-lookup
+    ## channels for what is logically one predicate.
+    ##
+    ##     int_eq_reif(x, v, b_eq) :: defines_var(b_eq)
+    ##     int_ne_reif(x, v, b_ne) :: defines_var(b_ne)
+    ##
+    ## Runs LATE — after `detectReifChannels` and every downstream detect* pass
+    ## that reads reifChannelDefs for ne_reif entries (e.g.
+    ## `detectForwardBackwardEquivChannels`, which relies on them intact) but
+    ## BEFORE `buildReifChannelBindings`. For each matched pair this pass:
+    ##
+    ##   1. Drops the ne_reif ci from reifChannelDefs (so no duplicate element
+    ##      channel is built for it).
+    ##   2. Synthesizes a `bool_not(b_eq, b_ne) :: defines_var(b_ne)` constraint,
+    ##      appends it to `tr.model.constraints`, and registers it in
+    ##      `boolNotChannelDefs` + `definingConstraints` so the standard
+    ##      bool_not channel builder picks it up.
+    ##
+    ## b_ne stays in `channelVarNames` (already added by detectReifChannels), so
+    ## downstream code referencing it resolves to the new bool_not channel.
+    ##
+    ## Handles both literal-value (`int_eq_reif(x, k, b)`) and variable-value
+    ## (`int_eq_reif(x, y, b)`) forms. The key tags its type so we don't merge
+    ## across the two forms.
+    type Entry = tuple[ci: int, bName: string]
+    var eqByKey = initTable[string, Entry]()
+    var neCandidates: seq[tuple[key: string, ci: int, bName: string, defIdx: int]]
+
+    for defIdx, ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif" and name != "int_ne_reif": continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let bName = con.args[2].ident
+        let xArg = con.args[0]
+        if xArg.kind != FznIdent: continue
+        let valArg = con.args[1]
+        var valKey: string
+        case valArg.kind
+        of FznIntLit:  valKey = "#" & $valArg.intVal
+        of FznBoolLit: valKey = "#" & (if valArg.boolVal: "1" else: "0")
+        of FznIdent:   valKey = "@" & valArg.ident
+        else: continue
+        let key = xArg.ident & "|" & valKey
+
+        if name == "int_eq_reif":
+            # Keep the first eq_reif per key. Multiple distinct eq bools on the
+            # same predicate are a rare quirk we don't rewrite here.
+            if key notin eqByKey:
+                eqByKey[key] = (ci: ci, bName: bName)
+        else:
+            neCandidates.add((key: key, ci: ci, bName: bName, defIdx: defIdx))
+
+    if neCandidates.len == 0 or eqByKey.len == 0: return
+
+    var dropDefIdxs: PackedSet[int]
+    var nMerged = 0
+    for nc in neCandidates:
+        if nc.key notin eqByKey: continue
+        let eqEntry = eqByKey[nc.key]
+        if eqEntry.bName == nc.bName: continue  # self-pair, shouldn't happen
+
+        # Synthesize bool_not(b_eq, b_ne) :: defines_var(b_ne) :: var_is_introduced
+        # and wire it through the normal bool_not channel build path.
+        let newCi = tr.model.constraints.len
+        let boolNot = FznConstraint(
+            name: "bool_not",
+            args: @[
+                FznExpr(kind: FznIdent, ident: eqEntry.bName),
+                FznExpr(kind: FznIdent, ident: nc.bName)
+            ],
+            annotations: @[
+                FznAnnotation(
+                    name: "defines_var",
+                    args: @[FznExpr(kind: FznIdent, ident: nc.bName)]
+                ),
+                FznAnnotation(name: "var_is_introduced", args: @[])
+            ]
+        )
+        tr.model.constraints.add(boolNot)
+        tr.boolNotChannelDefs.add(newCi)
+        tr.definingConstraints.incl(newCi)
+        dropDefIdxs.incl(nc.defIdx)
+        inc nMerged
+
+    if nMerged > 0:
+        var kept: seq[int]
+        for i, ci in tr.reifChannelDefs:
+            if i notin dropDefIdxs:
+                kept.add(ci)
+        tr.reifChannelDefs = kept
+        stderr.writeLine(&"[FZN] Merged {nMerged} int_eq_reif/int_ne_reif pair(s) → bool_not channels")
+
 proc detectReifChannels(tr: var FznTranslator) =
     ## Detects int_eq_reif(x, val, b) :: defines_var(b) and bool2int(b, i) :: defines_var(i)
     ## patterns and marks the defined variables as channel variables.

@@ -2621,16 +2621,71 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         if loadBase == high(int):
             loadBase = 1  # fallback for empty domains
 
+        # --- Subset-sum domain tightening -------------------------------------
+        # load[b] is a sum of a constant offset (from items whose bin is a fixed
+        # literal) plus a subset sum of the item weights whose bin var can still
+        # take value b. Enumerate the achievable values to tighten each load
+        # variable's domain — this is critical for problems like bin_packing +
+        # small discrete weights where the declared domain (e.g. 0..capacity)
+        # drastically overstates the real value set (e.g. {0, w, 2w, ...}).
+        const subsetSumLimit = 8192
+        var perBinOffset = initTable[int, int]()
+        for ci in 0..<constBinIndices.len:
+            let b = constBinValues[ci]
+            let w = weights[constBinIndices[ci]]
+            perBinOffset[b] = perBinOffset.getOrDefault(b, 0) + w
+
+        # Compute once assuming every variable item can go to every bin;
+        # re-compute per-bin only if some varPositions have restricted domains.
+        let fullReachable = reachableWeightedSums(varWeights, subsetSumLimit)
+        var perBinCache = initTable[string, HashSet[int]]()
+
+        var nTightened = 0
+        var nValuesRemoved = 0
+
         # For each load position: create WeightedCountEq channel
         for b in 0..<loadPositions.len:
             let binValue = b + loadBase
             let loadPos = loadPositions[b]
 
             # Compute constant offset from fixed bin assignments
-            var constOffset = 0
-            for ci in 0..<constBinIndices.len:
-                if constBinValues[ci] == binValue:
-                    constOffset += weights[constBinIndices[ci]]
+            let constOffset = perBinOffset.getOrDefault(binValue, 0)
+
+            # Build the list of weights that can still contribute to load[binValue].
+            # If every varPosition supports binValue, fall back to the full set.
+            var activeWeights = newSeqOfCap[int](varWeights.len)
+            var anyExcluded = false
+            for i, pos in varPositions:
+                if binValue in tr.sys.baseArray.domain[pos]:
+                    activeWeights.add(varWeights[i])
+                else:
+                    anyExcluded = true
+
+            var reachable: HashSet[int]
+            if not anyExcluded:
+                reachable = fullReachable
+            else:
+                # Cache by the sorted active-weight tuple so multiple bins that
+                # share the same support don't re-enumerate.
+                let key = activeWeights.sorted.join(",")
+                if key in perBinCache:
+                    reachable = perBinCache[key]
+                else:
+                    reachable = reachableWeightedSums(activeWeights, subsetSumLimit)
+                    perBinCache[key] = reachable
+
+            if reachable.len > 0:
+                let currentDom = tr.sys.baseArray.domain[loadPos]
+                var newDom = newSeqOfCap[int](currentDom.len)
+                for v in currentDom:
+                    if (v - constOffset) in reachable:
+                        newDom.add(v)
+                if newDom.len == 0:
+                    stderr.writeLine(&"[FZN] bin_packing_load: load[{binValue}] has empty subset-sum intersection — instance infeasible")
+                elif newDom.len < currentDom.len:
+                    nValuesRemoved += currentDom.len - newDom.len
+                    tr.sys.baseArray.domain[loadPos] = newDom
+                    inc nTightened
 
             tr.sys.baseArray.addWeightedCountEqChannelBinding(
                 loadPos, binValue, varPositions, varWeights, constOffset)
@@ -2641,6 +2696,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         tr.sys.addConstraint(loadSp == totalWeight)
 
         stderr.writeLine(&"[FZN] bin_packing_load: {loadPositions.len} loads, {binExprs.len} items ({constBinValues.len} const) -> {loadPositions.len} weighted count channels")
+        if nTightened > 0:
+            stderr.writeLine(&"[FZN] bin_packing_load: subset-sum tightened {nTightened} load domains ({nValuesRemoved} values removed)")
 
     of "fzn_bin_packing":
         # bin_packing(c, bin, w): for each bin b, sum(w[i] where bin[i]==b) <= c
