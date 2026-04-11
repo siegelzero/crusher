@@ -2690,6 +2690,20 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             tr.sys.baseArray.addWeightedCountEqChannelBinding(
                 loadPos, binValue, varPositions, varWeights, constOffset)
 
+            # The load var's declared domain bound is implicit in the FZN
+            # (e.g. `var 0..200`) but isn't enforced as a constraint by tabu
+            # for channel positions. Emit explicit min/max constraints so the
+            # search respects the per-bin capacity even when the channel
+            # output (a free sum of weights) would otherwise overshoot.
+            let loadExpr = loadExprs[b]
+            let loadDom = tr.sys.baseArray.domain[loadPos]
+            if loadDom.len > 0:
+                let dHi = loadDom[^1]
+                let dLo = loadDom[0]
+                tr.sys.addConstraint(loadExpr <= dHi)
+                if dLo > 0:
+                    tr.sys.addConstraint(loadExpr >= dLo)
+
         # Add sum(load) = sum(w) as constraint for domain reduction
         let totalWeight = weights.foldl(a + b, 0)
         let loadSp = scalarProduct[int](newSeqWith(loadPositions.len, 1), loadExprs)

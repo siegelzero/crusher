@@ -1,5 +1,135 @@
 ## Included from translator.nim -- not a standalone module.
 
+proc detectBivalentIndicatorChannels*(tr: var FznTranslator) =
+    ## Detects integer variables X with bivalent domain {0, c} that are
+    ## structurally determined by another variable Y through a chain of two
+    ## reifications sharing the same bool var b, and adds element-lookup
+    ## channel bindings so X stops being a search position.
+    ##
+    ## Pattern:
+    ##   var X: dom = {xVal, c}                       (currently a search var)
+    ##   constraint int_eq_reif(X, xVal, b)           (defining b = (X == xVal))
+    ##                  -- or int_ne_reif(X, xVal, b) defining b = (X != xVal)
+    ##   constraint int_eq_reif(Y, yVal, b)           (non-defining: b == (Y == yVal))
+    ##                  -- or int_ne_reif(Y, yVal, b)
+    ##
+    ## Together these imply X is a deterministic function of Y:
+    ##   x_test_passes = (b == 1 and xIsEq) or (b == 0 and not xIsEq)
+    ##                 ≡ (Y rel yVal)  [where rel is determined by yIsEq]
+    ## so for each y in dom(Y) we know X is xVal or c.
+    ##
+    ## This subsumes search positions whose value is uniquely pinned by a
+    ## single decision elsewhere — common in flow / one-hot / indicator
+    ## problems where MiniZinc's flattener forgets to mark the bivalent var
+    ## as `is_defined_var`.
+    if tr.reifChannelDefs.len == 0: return
+
+    type DefInfo = object
+        srcVar: string
+        srcVal: int
+        isEq: bool
+        ci: int
+
+    # Phase 1: build map from bool var name → its (defining) reif source.
+    var defByBool = initTable[string, DefInfo]()
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        let cname = stripSolverPrefix(con.name)
+        if cname != "int_eq_reif" and cname != "int_ne_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[1].kind != FznIntLit: continue  # only literal-value reifs
+        if con.args[2].kind != FznIdent: continue
+        let bName = con.args[2].ident
+        defByBool[bName] = DefInfo(
+            srcVar: con.args[0].ident,
+            srcVal: con.args[1].intVal,
+            isEq: cname == "int_eq_reif",
+            ci: ci
+        )
+
+    if defByBool.len == 0: return
+
+    var nChanneled = 0
+    var alreadyChanneled = initHashSet[string]()
+
+    # Phase 2: scan for non-defining int_eq/ne_reif on the same b that link
+    # to a different variable, and channel the bivalent source X to it.
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let cname = stripSolverPrefix(con.name)
+        if cname != "int_eq_reif" and cname != "int_ne_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[1].kind != FznIntLit: continue
+        if con.args[2].kind != FznIdent: continue
+
+        let bName = con.args[2].ident
+        if bName notin defByBool: continue
+        let info = defByBool[bName]
+
+        let xName = info.srcVar
+        let xVal = info.srcVal
+        let xIsEq = info.isEq
+
+        let yName = con.args[0].ident
+        let yVal = con.args[1].intVal
+        let yIsEq = cname == "int_eq_reif"
+
+        if xName == yName: continue
+        if xName in alreadyChanneled: continue
+        if xName notin tr.varPositions: continue
+        if xName in tr.channelVarNames: continue
+        if yName notin tr.varPositions: continue
+        # Avoid cycles: don't channel X to Y if Y itself is a channel that
+        # might transitively depend on X. Checking exact reachability is
+        # expensive; conservatively require Y to not be a channel.
+        if yName in tr.channelVarNames: continue
+
+        let xPos = tr.varPositions[xName]
+        let xDom = tr.sys.baseArray.domain[xPos].sorted()
+        if xDom.len != 2: continue
+        if xVal notin xDom: continue
+        let cVal = if xDom[0] == xVal: xDom[1] else: xDom[0]
+
+        let yPos = tr.varPositions[yName]
+        let yDom = tr.sys.baseArray.domain[yPos].sorted()
+        if yDom.len < 2: continue
+
+        let yLo = yDom[0]
+        let yHi = yDom[^1]
+        let arrSize = yHi - yLo + 1
+        if arrSize > 100_000: continue
+
+        # Mark which y values are present in dom(Y) for selecting outputs.
+        var yInDom = initHashSet[int]()
+        for v in yDom: yInDom.incl(v)
+
+        var arrayElems = newSeq[ArrayElement[int]](arrSize)
+        for v in yLo..yHi:
+            let idx = v - yLo
+            # For values outside dom(Y) we still need a placeholder; pick
+            # the value that the relation would predict so the lookup is
+            # consistent if the domain ever expands.
+            let y_test = (yIsEq and v == yVal) or ((not yIsEq) and v != yVal)
+            # b = y_test (from the non-defining reif)
+            # x_test = b if xIsEq, else not b   (from the defining reif)
+            let x_test = (xIsEq and y_test) or ((not xIsEq) and (not y_test))
+            let xResult = if x_test: xVal else: cVal
+            arrayElems[idx] = ArrayElement[int](isConstant: true, constantValue: xResult)
+
+        let yExpr = tr.getExpr(yPos)
+        let indexExpr = yExpr - yLo
+
+        tr.sys.baseArray.addChannelBinding(xPos, indexExpr, arrayElems)
+        tr.channelVarNames.incl(xName)
+        alreadyChanneled.incl(xName)
+        inc nChanneled
+
+    if nChanneled > 0:
+        stderr.writeLine(&"[FZN] Built {nChanneled} bivalent indicator channel bindings " &
+                         &"(X = element(Y) where dom(X)=2, X chained via shared reif bool)")
+
 proc unchannelSkippedReifs(tr: var FznTranslator, skipped: HashSet[int],
                                                       defs: var seq[int], label: string) =
     ## Un-channel skipped reif variables — they couldn't have bindings built due to

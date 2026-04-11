@@ -1142,6 +1142,11 @@ proc translate*(model: FznModel): FznTranslator =
     # for domain reduction when guard is forced. MUST run after detectReifChannels.
     result.detectConditionalSeparationPattern()
     result.translateVariables()
+    # Detect bivalent integer vars structurally pinned by another var via a
+    # shared reif bool, and channel them so they stop being search positions.
+    # MUST run after translateVariables (positions exist) and before any
+    # build-* phase that consumes the new channel bindings.
+    result.detectBivalentIndicatorChannels()
     # Emit set-equality-to-table constraints (after translateVariables so positions exist)
     result.emitSetEqualityTableConstraints()
     # Emit circuit-time-propagation constraint (after translateVariables so positions exist)
