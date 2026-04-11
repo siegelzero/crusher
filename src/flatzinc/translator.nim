@@ -356,6 +356,11 @@ type
         # Tracks which output variables/arrays are boolean (for true/false formatting)
         outputBoolVars*: HashSet[string]
         outputBoolArrays*: HashSet[string]
+        # FZN-level variable aliases from `var X = Y;` declarations emitted by MZN's
+        # flattener when CSE merges parallel definitions of the same value.
+        # Maps alias name → canonical (already chain-resolved). Built upfront by
+        # canonicalizeFznVarAliases so downstream passes never see the alias name.
+        fznVarAliases*: Table[string, string]
         # Element channel aliases: maps duplicate channel var name → original channel var name
         # (when multiple element constraints share same index var and constant array)
         elementChannelAliases*: Table[string, string]
@@ -908,6 +913,7 @@ proc translate*(model: FznModel): FznTranslator =
     result.objectivePos = ObjPosNone
     result.objectiveLoBound = low(int)
     result.objectiveHiBound = high(int)
+    result.fznVarAliases = initTable[string, string]()
     result.elementChannelAliases = initTable[string, string]()
     result.constElementSources = initTable[string, tuple[indexVar: string, constArray: seq[int]]]()
     result.equalityCopyAliases = initTable[string, string]()
@@ -937,6 +943,13 @@ proc translate*(model: FznModel): FznTranslator =
     result.extractSearchAnnotationVars()
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
+    # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection
+    # or constraint collection. Substitutes alias names with canonical names everywhere
+    # in the model and demotes redundant parallel defining constraints (which become
+    # regular enforced constraints). Without this, parallel `defines_var` constraints
+    # flattened by MZN's CSE create independent positions for the same logical variable,
+    # breaking the model's implicit equalities.
+    result.canonicalizeFznVarAliases()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
     # Detect circuit-time-propagation pattern (TSPTW/VRP: circuit + element chains + time windows)
@@ -1310,6 +1323,14 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect inverse channel patterns (element(person[p], seat, p) groups)
     result.detectInverseChannelPatterns()
 
+    # Detect sentinel-prefixed inverse permutation patterns. The MZN flattener of
+    # imperative-style "find first position of v in permutation" code emits one
+    # array_var_int_element with a sentinel-prefixed array per value v, plus
+    # `(v == perm[k]) -> idx_v > k+1` implications. When 12 such constraints share
+    # the same suffix permutation, the idx vars are the inverse permutation
+    # (offset by +1 for the sentinel).
+    result.detectSentinelInverseChannelPatterns()
+
     # Detect if-then-else channels (int_lin_ne_reif + int_eq_reif + bool_clause → 2D table channel)
     result.detectIfThenElseChannels()
 
@@ -1355,20 +1376,36 @@ proc translate*(model: FznModel): FznTranslator =
                 for elemName in result.arrayElementNames[oa.name]:
                     protectedVars.incl(elemName)
 
-        # Build variable reference count from non-consumed constraints
+        # Build variable reference count from non-consumed constraints. Reachability
+        # walks two indirections that the original loop missed:
+        #
+        #   1. NAMED ARRAY DECLARATIONS — when a constraint references a named array
+        #      via FznIdent (e.g., `array_var_int_element(idx, X_INTRODUCED_59_, 6)`),
+        #      every element of `X_INTRODUCED_59_` is transitively referenced.
+        #   2. DEFINING CONSTRAINTS — channel-binding constraints (e.g. int_eq_reif
+        #      with defines_var) consume their input vars even though they're
+        #      formally in `definingConstraints`. Counting refs from these keeps
+        #      element results that feed into reification/min/max channels alive.
         var varRefCount: Table[string, int]
         for ci, con in model.constraints:
-            if ci in result.definingConstraints: continue
             if ci in result.redundantOrderings: continue
             for arg in con.args:
                 case arg.kind
                 of FznIdent:
                     varRefCount.mgetOrPut(arg.ident, 0) += 1
+                    # Expand named arrays to count element references too
+                    if arg.ident in result.arrayElementNames:
+                        for elemName in result.arrayElementNames[arg.ident]:
+                            varRefCount.mgetOrPut(elemName, 0) += 1
                 of FznArrayLit:
                     for elem in arg.elems:
                         if elem.kind == FznIdent:
                             varRefCount.mgetOrPut(elem.ident, 0) += 1
                 else: discard
+            for ann in con.annotations:
+                for annArg in ann.args:
+                    if annArg.kind == FznIdent:
+                        varRefCount.mgetOrPut(annArg.ident, 0) += 1
 
         var nElementConsumed = 0
         for ci, con in model.constraints:
@@ -1382,8 +1419,11 @@ proc translate*(model: FznModel): FznTranslator =
             if resultArg.kind != FznIdent: continue
             # Never eliminate constraints whose result is the objective or an output variable
             if resultArg.ident in protectedVars: continue
-            # The result variable is referenced by this constraint (counted in varRefCount).
-            # If that's its ONLY reference, the variable is dead and the constraint is redundant.
+            # The result variable is referenced by this constraint AND by every other
+            # constraint that uses it. If the only reference is this one, it's dead.
+            # We count refs from BOTH defining and non-defining constraints (above), so
+            # any external use — channel, reification input, named array element, etc.
+            # — keeps the constraint alive.
             let refCount = varRefCount.getOrDefault(resultArg.ident, 0)
             if refCount <= 1:
                 result.definingConstraints.incl(ci)
@@ -2273,6 +2313,11 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildConditionalSourceChannelBindings()
     # Build inverse channel groups (inverse relationship: seat[person[p]] = p)
     result.buildInverseChannelBindings()
+    # Tighten constant 2D matrix-element result domains via diagonal exclusion when
+    # the row/col inputs are guaranteed pairwise distinct (e.g., outputs of an
+    # inverse permutation channel). Raises per-step distance lower bounds for
+    # TSP-like routing models from 0 to the matrix's minimum off-diagonal value.
+    result.tightenMatrixDiagonalDomains()
     # Detect dormant positions in diffnK constraints (don't-care placements)
     result.detectDormantPositions()
 

@@ -33,6 +33,7 @@ import test_employee_scheduling
 import test_evm_channels
 import test_furniture_moving
 import test_forward_backward_equiv_channels
+import test_fzn_alias_and_diagonal
 import test_fzn_channel_detection
 import test_fzn_pattern_detection
 import test_fzn_parser

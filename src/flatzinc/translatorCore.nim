@@ -58,6 +58,7 @@ proc translateVariables(tr: var FznTranslator) =
     # First pass: create all variables (non-array), skipping defined variables
     var nSetVars = 0
     var nSetBools = 0
+    var nAliasSkipped = 0
     for decl in tr.model.variables:
         if decl.isArray:
             continue
@@ -70,6 +71,19 @@ proc translateVariables(tr: var FznTranslator) =
             # Record domain bounds for later constraint generation
             if decl.varType.kind == FznIntRange:
                 tr.definedVarBounds[decl.name] = (decl.varType.lo, decl.varType.hi)
+            continue
+        # Skip FZN-level alias declarations (`var X = Y;`). canonicalizeFznVarAliases
+        # has already substituted the alias name with the canonical name everywhere in
+        # the model, so this declaration has no remaining downstream uses except its
+        # own output_var annotation. Don't allocate a new position; we'll point this
+        # name at the canonical's position in a second pass after all non-aliases are
+        # processed.
+        if decl.name in tr.fznVarAliases:
+            if decl.hasAnnotation("output_var"):
+                tr.outputVars.add(decl.name)
+                if decl.varType.kind == FznBool:
+                    tr.outputBoolVars.incl(decl.name)
+            inc nAliasSkipped
             continue
 
         # Handle set variables: decompose into boolean arrays
@@ -176,6 +190,18 @@ proc translateVariables(tr: var FznTranslator) =
 
     if nSetVars > 0:
         stderr.writeLine(&"[FZN] Set decomposition: {nSetVars} set variables -> {nSetBools} boolean variables")
+    if nAliasSkipped > 0:
+        stderr.writeLine(&"[FZN] Skipped {nAliasSkipped} alias var declarations (positions reused from canonicals)")
+
+    # FZN alias resolution pass: for every alias name `var X = Y;`, point X at Y's
+    # position so that downstream lookups (output formatter, channel binding, etc.)
+    # of either name resolve to the same Crusher position. canonicalizeFznVarAliases
+    # already chain-resolved fznVarAliases to canonical names.
+    for aliasName, canonName in tr.fznVarAliases:
+        if canonName in tr.varPositions:
+            tr.varPositions[aliasName] = tr.varPositions[canonName]
+        if canonName in tr.channelVarNames:
+            tr.channelVarNames.incl(aliasName)
 
     # Second pass: process variable arrays (they reference already-created variables)
     for decl in tr.model.variables:

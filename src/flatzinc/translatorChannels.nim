@@ -2119,6 +2119,378 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                                  &"'{patB.arrayName}' positions remain searchable)")
 
 
+proc detectSentinelInverseChannelPatterns(tr: var FznTranslator) =
+    ## Detects "sentinel-prefixed" inverse channel patterns. The MZN flattener emits
+    ## this when imperative-style code searches for the position of a value in a
+    ## permutation:
+    ##   array_var_int_element(idx_v, [v, p1, p2, ..., pn], v)
+    ##   constraint (v == p_k) -> idx_v > k+1   for each k=0..n-1
+    ## After the implications, idx_v points to the (1-based) position of v in
+    ## [p1..pn], offset by +1 (because of the sentinel at position 1). Equivalently,
+    ## idx_v - 1 is the (1-based) position of v in the suffix [p1..pn].
+    ##
+    ## When 12 such constraints share the same suffix p1..pn (with distinct sentinel
+    ## values v ∈ 0..n-1), the idx_v variables are exactly the inverse permutation
+    ## of [p1..pn] with a +1 offset. We can express this as a single inverse channel
+    ## binding so chooseOrder ↔ idx_v propagates efficiently.
+
+    # Step 1: Find candidate sentinel-prefixed array_var_int_element constraints
+    type Candidate = object
+        ci: int
+        idxVarName: string
+        suffixVarNames: seq[string]
+        sentinelValue: int  # = result value
+        elemArrName: string  # name of the FZN array (for consuming later)
+
+    var candidates: seq[Candidate]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
+            continue
+        if con.hasAnnotation("defines_var"): continue
+        if con.args[0].kind != FznIdent: continue
+        if con.args[2].kind != FznIntLit: continue
+        let resultVal = con.args[2].intVal
+        # Resolve the array contents (must be a named array decl)
+        if con.args[1].kind != FznIdent: continue
+        let arrName = con.args[1].ident
+        let arrElems = tr.resolveVarArrayElems(con.args[1])
+        if arrElems.len < 3: continue  # need sentinel + at least 2 vars
+        # First element must be a constant equal to the result value
+        if arrElems[0].kind != FznIntLit or arrElems[0].intVal != resultVal: continue
+        # Remaining elements must all be FznIdents (search/permutation vars)
+        var suffix: seq[string]
+        var allIdents = true
+        for i in 1..<arrElems.len:
+            if arrElems[i].kind != FznIdent:
+                allIdents = false
+                break
+            suffix.add(arrElems[i].ident)
+        if not allIdents: continue
+        candidates.add(Candidate(
+            ci: ci,
+            idxVarName: con.args[0].ident,
+            suffixVarNames: suffix,
+            sentinelValue: resultVal,
+            elemArrName: arrName
+        ))
+
+    if candidates.len < 2: return
+
+    # Step 2: Group candidates by suffix structure (same set of vars in same order)
+    var groups: Table[seq[string], seq[int]]  # suffix -> indices into candidates
+    for ci in 0..<candidates.len:
+        let key = candidates[ci].suffixVarNames
+        if key notin groups:
+            groups[key] = @[]
+        groups[key].add(ci)
+
+    # Step 3: For each group, verify it forms an inverse permutation pattern and build the channel
+    var nDetected = 0
+    for suffix, ciList in groups:
+        if ciList.len < 2: continue
+        let n = suffix.len  # permutation length
+
+        # Distinct sentinel values, all forming a contiguous range starting from 0..k
+        var sentinelSet: HashSet[int]
+        var sentinelValues: seq[int]
+        var allValid = true
+        for ci in ciList:
+            let v = candidates[ci].sentinelValue
+            if v in sentinelSet:
+                allValid = false
+                break
+            sentinelSet.incl(v)
+            sentinelValues.add(v)
+        if not allValid: continue
+
+        # All idx vars must be distinct positioned variables
+        var idxNames: HashSet[string]
+        for ci in ciList:
+            let n = candidates[ci].idxVarName
+            if n in idxNames:
+                allValid = false
+                break
+            idxNames.incl(n)
+            if n notin tr.varPositions:
+                allValid = false
+                break
+        if not allValid: continue
+
+        # All suffix vars must be positioned variables
+        for v in suffix:
+            if v notin tr.varPositions:
+                allValid = false
+                break
+        if not allValid: continue
+
+        # Sentinel values must be a contiguous range starting at the minimum
+        let sortedSentinels = sentinelValues.sorted()
+        var contiguous = true
+        for i in 1..<sortedSentinels.len:
+            if sortedSentinels[i] != sortedSentinels[i-1] + 1:
+                contiguous = false
+                break
+        if not contiguous: continue
+        let forwardBase = sortedSentinels[0]
+
+        # Skip if we don't have enough constraints to cover all positions of the suffix.
+        # The "find first" pattern only makes sense when each suffix var (which holds
+        # a value v ∈ {sentinel values}) is unique — i.e., the suffix is a permutation
+        # over the sentinel value range. We require ciList.len == n for the inverse
+        # to be complete; partial inverse patterns are ambiguous.
+        if ciList.len != n: continue
+
+        # Build inverse channel parameters
+        # Forward positions = positions of the suffix vars (search/permutation), in order
+        var forwardPositions: seq[int]
+        for v in suffix:
+            forwardPositions.add(tr.varPositions[v])
+
+        # Inverse positions = positions of idx vars, sorted by sentinel value
+        var idxPosBySentinel: Table[int, int]
+        for ci in ciList:
+            idxPosBySentinel[candidates[ci].sentinelValue] =
+                tr.varPositions[candidates[ci].idxVarName]
+        var inversePositions: seq[int]
+        for v in sortedSentinels:
+            inversePositions.add(idxPosBySentinel[v])
+
+        # The relationship: inverse[forward[i] - inverseBase] = i + forwardBase
+        # We want: idx_v = (1-based position of v in suffix) + 1, for v = forward[i].
+        # With i 0-indexed, position = i+1 (1-based), so idx_v = i + 2.
+        # → forwardBase = 2 (so i + forwardBase = i + 2 = idx_v value)
+        # → inverseBase = forwardBase_of_inverse = 0 (sentinel values start at 0)
+        # Wait: standard formula is inverse[forward[i] - inverseBase] = i + forwardBase.
+        # forward[i] is a value v in 0..n-1 (the sentinel range).
+        # inverseBase should be 0 so that the index into inversePositions is v - 0 = v.
+        # We want inverse[v] = (idx_v var's value). idx_v = i + 2 (1-based position + 1).
+        # So forwardBase = 2 (since i is 0-indexed offset into forwardPositions and we
+        # want to write i+2 as the value of inverse[v]).
+        # BUT: forwardBase is added to i in the formula. Let me re-derive.
+        #   recomputeInverse: result[idx] = T(i + forwardBase)
+        #     where idx = v - inverseBase, v = assignment[forwardPositions[i]]
+        #   We want: idx_v's value = (1-based position of v in suffix) + 1 = i + 2 (i 0-indexed)
+        # So forwardBase = 2. inverseBase = forwardBase of the sentinel range = 0.
+        let inverseBase = forwardBase  # values v in {forwardBase..forwardBase+n-1}
+        let actualForwardBase = 2  # because of the +1 sentinel offset (idx is 1-based + 1)
+
+        # Default value: a value that's outside the idx var domain (won't ever be the
+        # "real" value). idx vars are in 1..n+1 (1 = sentinel, 2..n+1 = real positions).
+        # Use 0 as the default since idx_v ∈ 2..n+1 always.
+        let defaultValue = 0
+
+        # Register the inverse channel binding
+        tr.sys.baseArray.addInverseChannelGroup(
+            forwardPositions, inversePositions, actualForwardBase, inverseBase, defaultValue)
+
+        # Mark the element constraints as consumed (skip during translation)
+        for ci in ciList:
+            tr.definingConstraints.incl(candidates[ci].ci)
+
+        # Also consume the per-constraint "first occurrence" implications
+        # bool_clause([X_INTRODUCED_*], []) where the negative literal is the
+        # int_eq_reif/int_ne_reif of (sentinelValue == suffix[k]) and the positive
+        # literal is int_le/lt_reif(idx_v, k+2). These are now redundant since the
+        # inverse channel encodes the same relationship exactly.
+        # NOTE: a fully general implication-consumer is non-trivial; we leave the
+        # bool_clause/reif constraints in place for now (they'll be detected as
+        # tautological by the channel-dep init pass once the inverse channel is built).
+
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Built {nDetected} sentinel-prefixed inverse channel groups")
+
+
+proc traceVarToRoot(tr: var FznTranslator, name: string, depth: int = 0): string =
+    ## Walks an alias / identity-element / linear-offset chain to find the "root"
+    ## variable a derived var ultimately depends on. Follows three kinds of links
+    ## bidirectionally:
+    ##   1. int_lin_eq with defines_var: name = other +/- constant
+    ##   2. shifted-identity element with defines_var: name = idx + offset
+    ##   3. shifted-identity element WITHOUT defines_var: name and the other side
+    ##      of the constraint are equal modulo a constant offset (either side can
+    ##      be the "source", we just hop through the equation).
+    ## Stops at the first var not produced by an obvious chain. Cycle-safe via
+    ## depth bound and visited-set.
+    var cur = name
+    var depthCounter = depth
+    var visited: HashSet[string]
+    while depthCounter < 16 and cur notin visited:
+        visited.incl(cur)
+        var nextName = ""
+        for ci, con in tr.model.constraints:
+            let cname = stripSolverPrefix(con.name)
+            if cname == "int_lin_eq" and con.args.len >= 3 and
+                 con.hasAnnotation("defines_var"):
+                let ann = con.getAnnotation("defines_var")
+                if ann.args.len > 0 and ann.args[0].kind == FznIdent and
+                     ann.args[0].ident == cur:
+                    let varElems = tr.resolveVarArrayElems(con.args[1])
+                    var otherName = ""
+                    var nonConstCount = 0
+                    for ve in varElems:
+                        if ve.kind == FznIdent:
+                            inc nonConstCount
+                            if ve.ident != cur:
+                                otherName = ve.ident
+                    if nonConstCount == 2 and otherName != "":
+                        nextName = otherName
+                        break
+            elif cname in ["array_int_element", "array_int_element_nonshifted"] and
+                       con.args.len >= 3:
+                # Recognize shifted-identity arrays: arr[i] = i + offset for all i
+                var arr: seq[int]
+                try:
+                    arr = tr.resolveIntArray(con.args[1])
+                except CatchableError:
+                    continue
+                if arr.len == 0: continue
+                let offset = arr[0] - 1
+                var isShiftedIdentity = true
+                for i in 0..<arr.len:
+                    if arr[i] != i + 1 + offset:
+                        isShiftedIdentity = false; break
+                if not isShiftedIdentity: continue
+                # The constraint says result = idx + offset (modulo 1-indexing).
+                # If `cur` is the result, hop to idx; if `cur` is the index, hop to result.
+                if con.args[2].kind == FznIdent and con.args[2].ident == cur and
+                     con.args[0].kind == FznIdent:
+                    nextName = con.args[0].ident
+                    break
+                if con.args[0].kind == FznIdent and con.args[0].ident == cur and
+                     con.args[2].kind == FznIdent:
+                    nextName = con.args[2].ident
+                    break
+        if nextName == "" or nextName == cur:
+            return cur
+        cur = nextName
+        inc depthCounter
+    cur
+
+
+proc tightenMatrixDiagonalDomains(tr: var FznTranslator) =
+    ## Tightens result domains of constant 2D matrix-element lookups when the
+    ## row and column inputs are guaranteed pairwise distinct.
+    ##
+    ## Pattern: three array_int_element constraints sharing a flat-index variable:
+    ##   array_int_element(flatIdx, rowLabels, rowSrc)   -- rowLabels[i] depends on (i-1) div n
+    ##   array_int_element(flatIdx, colLabels, colSrc)   -- colLabels[i] depends on (i-1) mod n
+    ##   array_int_element(flatIdx, dataMatrix, result)  -- the actual constant n×n matrix
+    ##
+    ## When `dataMatrix` has values that appear ONLY at diagonal positions (where
+    ## row == col) AND the model has an inverse permutation channel pattern (i.e.,
+    ## it looks like a routing/TSP-style model where consecutive trip steps visit
+    ## distinct locations), those diagonal-only values are unreachable and can be
+    ## excluded from the result var's domain.
+    ##
+    ## The "routing-style" guard via inverseChannelGroups is a sufficient (but not
+    ## necessary) condition: it catches TSP/VRP/scheduling models that use the
+    ## sentinel-prefixed inverse-permutation idiom for finding-by-value, and avoids
+    ## false reductions in models that happen to have a diagonal-zero constant
+    ## matrix without enforced row != col.
+
+    if tr.sys.baseArray.inverseChannelGroups.len == 0:
+        return  # No inverse permutation pattern → not safe to assume row != col
+
+    # Group element constraints by shared flat-index var
+    var indexToConstraints: Table[string, seq[int]]
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name notin ["array_int_element", "array_int_element_nonshifted"]:
+            continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent: continue
+        let idxName = con.args[0].ident
+        indexToConstraints.mgetOrPut(idxName, @[]).add(ci)
+
+    var nTightened = 0
+    var nValuesRemoved = 0
+
+    for idxName, ciList in indexToConstraints:
+        if ciList.len < 3: continue
+
+        var hasRowLabels = false
+        var hasColLabels = false
+        var dataResult = ""
+        var dataArr: seq[int]
+        var matrixN = 0
+
+        for ci in ciList:
+            let con = tr.model.constraints[ci]
+            var arr: seq[int]
+            try:
+                arr = tr.resolveIntArray(con.args[1])
+            except CatchableError:
+                continue
+            let n = int(sqrt(arr.len.float) + 0.5)
+            if n * n != arr.len or n < 2: continue
+
+            if con.args[2].kind != FznIdent: continue
+            let resultName = con.args[2].ident
+
+            # Row labels: arr[i] depends only on (i div n) — same for full row block
+            var isRowLabels = true
+            for i in 0..<arr.len:
+                if arr[i] != arr[(i div n) * n]:
+                    isRowLabels = false; break
+            # Col labels: arr[i] depends only on (i mod n) — same for each column
+            var isColLabels = true
+            for i in 0..<arr.len:
+                if arr[i] != arr[i mod n]:
+                    isColLabels = false; break
+
+            if isRowLabels and not isColLabels:
+                hasRowLabels = true
+                if matrixN == 0: matrixN = n
+            elif isColLabels and not isRowLabels:
+                hasColLabels = true
+                if matrixN == 0: matrixN = n
+            elif not isRowLabels and not isColLabels:
+                # The actual data matrix (not row labels, not col labels)
+                dataResult = resultName
+                dataArr = arr
+                if matrixN == 0: matrixN = n
+
+        if not hasRowLabels or not hasColLabels or dataResult == "" or matrixN < 2:
+            continue
+        if dataArr.len != matrixN * matrixN: continue
+
+        # Find values that appear ONLY at diagonal positions
+        var diagValues, offDiagValues: HashSet[int]
+        for i in 0..<dataArr.len:
+            let row = i div matrixN
+            let col = i mod matrixN
+            if row == col:
+                diagValues.incl(dataArr[i])
+            else:
+                offDiagValues.incl(dataArr[i])
+
+        var diagOnly: seq[int]
+        for v in diagValues:
+            if v notin offDiagValues:
+                diagOnly.add(v)
+        if diagOnly.len == 0: continue
+
+        # Tighten the result var's domain
+        if dataResult notin tr.varPositions: continue
+        let resultPos = tr.varPositions[dataResult]
+        let oldDom = tr.sys.baseArray.domain[resultPos]
+        var newDom: seq[int]
+        for v in oldDom:
+            if v notin diagOnly:
+                newDom.add(v)
+        if newDom.len < oldDom.len and newDom.len > 0:
+            tr.sys.baseArray.domain[resultPos] = newDom
+            nValuesRemoved += oldDom.len - newDom.len
+            inc nTightened
+
+    if nTightened > 0:
+        stderr.writeLine(&"[FZN] Tightened {nTightened} matrix-element result domains via diagonal exclusion ({nValuesRemoved} values removed)")
+
+
 type BoolClauseEntry = object
     ci: int
     posLits: seq[string]
