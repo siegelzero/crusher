@@ -1502,20 +1502,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     if initialAssignment.len == 0:
         state.repairLinearEqualities(verbose, id)
 
-        # Re-propagate channels that depend on the repaired positions. Expression
-        # channels (int_times products etc.) read from the assignment array, so
-        # updating search positions changes their output values.
+        # Re-propagate all channel types that depend on the repaired positions.
+        # This mirrors the full channel initialization sequence (argmax, element/
+        # expression fixed-point, crossing, count, inverse, min/max).
+        for binding in carray.argmaxChannelBindings:
+            state.assignment[binding.channelPosition] = evaluateArgmax(binding, state.assignment)
+
         var repairChannelChanged = true
         var repairFpIter = 0
         while repairChannelChanged:
             repairChannelChanged = false
             repairFpIter += 1
             if repairFpIter > 50: break
-            for binding in carray.expressionChannelBindings:
-                let newVal = binding.expression.evaluate(state.assignment)
-                if newVal != state.assignment[binding.channelPosition]:
-                    state.assignment[binding.channelPosition] = newVal
-                    repairChannelChanged = true
             for binding in carray.channelBindings:
                 let idxVal = binding.indexExpression.evaluate(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
@@ -1525,8 +1523,27 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     if newVal != state.assignment[binding.channelPosition]:
                         state.assignment[binding.channelPosition] = newVal
                         repairChannelChanged = true
+            for binding in carray.expressionChannelBindings:
+                let newVal = binding.expression.evaluate(state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    repairChannelChanged = true
 
-        # Re-evaluate min/max channels with updated expression channel values
+        for binding in carray.crossingCountMaxChannelBindings:
+            state.assignment[binding.channelPosition] = evaluateCrossingCountMax(binding, state.assignment)
+        for binding in carray.countEqChannelBindings:
+            state.assignment[binding.channelPosition] = evaluateCountEq(binding, state.assignment)
+        for binding in carray.weightedCountEqChannelBindings:
+            state.assignment[binding.channelPosition] = evaluateWeightedCountEq(binding, state.assignment)
+        for binding in carray.conditionalCountEqChannelBindings:
+            state.assignment[binding.channelPosition] = evaluateConditionalCountEq(binding, state.assignment)
+
+        for group in carray.inverseChannelGroups:
+            let newInverse = group.recomputeInverse(state.assignment)
+            for j, ipos in group.inversePositions:
+                state.assignment[ipos] = newInverse[j]
+
+        # Re-evaluate min/max channels with updated values
         if state.flatMinMaxBindings.len > 0:
             for i, fb in state.flatMinMaxBindings:
                 let newVal = evaluateFlatMinMax(fb, state.assignment)

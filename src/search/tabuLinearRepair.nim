@@ -3,8 +3,21 @@
 ##
 ## Provides two entry points:
 ## 1. repairLinearEqualities: for initialization, fixes flow conservation violations
-## 2. tryLinearRepairMove: for use during search stagnation, coordinates multi-variable
+## 2. tryLinearRepairMoves: for use during search stagnation, coordinates multi-variable
 ##    adjustments on violated EqualTo constraints
+
+proc nearestDomainValue[T](dom: seq[T], target: T): T =
+    ## Snap target to the nearest value in a sorted domain.
+    if target <= dom[0]: return dom[0]
+    if target >= dom[^1]: return dom[^1]
+    let idx = algorithm.lowerBound(dom, target)
+    # idx is the first position where dom[idx] >= target
+    if dom[idx] == target: return target
+    # Choose the closer of dom[idx-1] and dom[idx]
+    if target - dom[idx - 1] <= dom[idx] - target:
+        return dom[idx - 1]
+    else:
+        return dom[idx]
 
 proc repairLinearEqualities*[T](state: TabuState[T], verbose: bool, id: int) =
     ## Initialization repair: iteratively fix violated EqualTo constraints.
@@ -93,7 +106,7 @@ proc repairLinearEqualities*[T](state: TabuState[T], verbose: bool, id: int) =
                 let oldVal = state.assignment[pos]
                 let idealDelta = -(residual div coeff)
                 let idealNewVal = oldVal + idealDelta
-                let clampedVal = max(dom[0], min(dom[^1], idealNewVal))
+                let clampedVal = nearestDomainValue(dom, idealNewVal)
                 let actualDelta = clampedVal - oldVal
                 if actualDelta == T(0): continue
 
@@ -174,7 +187,7 @@ proc tryLinearRepairMoves*[T](state: TabuState[T]): bool =
             let oldVal = state.assignment[pos]
             let idealDelta = -(T(residual) div coeff)
             let idealNewVal = oldVal + idealDelta
-            let clampedVal = max(dom[0], min(dom[^1], idealNewVal))
+            let clampedVal = nearestDomainValue(dom, idealNewVal)
             if clampedVal == oldVal: continue
 
             # Evaluate full cost delta for this move
