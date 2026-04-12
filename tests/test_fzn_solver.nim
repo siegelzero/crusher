@@ -3661,14 +3661,17 @@ var 1..4: x1;
 var 1..4: x2;
 var 1..4: x3;
 var 1..4: x4;
-var 1..4: n:: is_defined_var;
+var 1..4: n;
 array [1..4] of var int: x:: output_array([1..4]) = [x1,x2,x3,x4];
 constraint fzn_nvalue(n, x);
 solve maximize n;
 """
     let model = parseFzn(src)
     var tr = translate(model)
-    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let objExpr = tr.getExpr(tr.objectivePos)
+    maximize(tr.sys, objExpr, parallel = true, tabuThreshold = 5000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound,
+             verbose = false)
 
     let positions = tr.arrayPositions["x"]
     var values = newSeq[int](positions.len)
@@ -3680,8 +3683,8 @@ solve maximize n;
     let nVal = tr.sys.assignment[nPos]
     # nvalue constraint must be satisfied: n == distinct count
     check distinctCount == nVal
-    # Maximizing nvalue with 4 vars in domain 1..4 → should get at least 3
-    check distinctCount >= 3
+    # Maximizing nvalue with 4 vars in domain 1..4 → optimum is 4
+    check distinctCount == 4
     echo "fzn_nvalue maximize: ", values, " n=", nVal, " distinct=", distinctCount
 
   test "fzn_nvalue with all_different — nvalue must equal array length":

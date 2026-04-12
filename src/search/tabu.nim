@@ -392,6 +392,7 @@ include tabuChannelDep
 include tabuElementImplied
 include tabuSwapMoves
 include tabuFlowMoves
+include tabuLinearRepair
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -1493,6 +1494,43 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             echo "[Init] Min/max channel fixed-point: " & $fpEvals & " evals, " &
                  $carray.minMaxChannelBindings.len & " bindings, took " & $(epochTime() - initStart) & "s"
             initStart = epochTime()
+
+    # Repair search positions involved in graduated EqualTo constraints (e.g., flow
+    # conservation) by solving the linear system via Gaussian elimination. Without
+    # this, randomly-initialized flow variables cause large initial violations that
+    # single-variable tabu moves struggle to resolve.
+    if initialAssignment.len == 0:
+        state.repairLinearEqualities(verbose, id)
+
+        # Re-propagate channels that depend on the repaired positions. Expression
+        # channels (int_times products etc.) read from the assignment array, so
+        # updating search positions changes their output values.
+        var repairChannelChanged = true
+        var repairFpIter = 0
+        while repairChannelChanged:
+            repairChannelChanged = false
+            repairFpIter += 1
+            if repairFpIter > 50: break
+            for binding in carray.expressionChannelBindings:
+                let newVal = binding.expression.evaluate(state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    repairChannelChanged = true
+            for binding in carray.channelBindings:
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    let newVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition] + elem.offset
+                    if newVal != state.assignment[binding.channelPosition]:
+                        state.assignment[binding.channelPosition] = newVal
+                        repairChannelChanged = true
+
+        # Re-evaluate min/max channels with updated expression channel values
+        if state.flatMinMaxBindings.len > 0:
+            for i, fb in state.flatMinMaxBindings:
+                let newVal = evaluateFlatMinMax(fb, state.assignment)
+                state.assignment[fb.channelPosition] = newVal
 
     for constraint in state.constraints:
         constraint.initialize(state.assignment)
@@ -3912,6 +3950,21 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via swap")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Try linear repair moves during stagnation: coordinate multi-variable
+        # adjustments on violated EqualTo constraints (e.g., flow conservation)
+        if state.iteration - lastImprovement >= 100 and
+           (state.iteration - lastImprovement) mod 100 == 0:
+            if state.tryLinearRepairMoves():
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via linear repair")
                         state.lastImprovementIter = lastImprovement
                         return state
 
