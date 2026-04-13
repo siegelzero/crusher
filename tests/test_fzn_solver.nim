@@ -3713,3 +3713,250 @@ solve satisfy;
     check tr.sys.assignment[nPos] == 3
     echo "fzn_nvalue + all_different: ", values
 
+  test "disconnected all_different with redundant cfp":
+    # cfp is a second permutation that is not linked to pfc or the objective.
+    # detectDisconnectedAllDifferent (currently disabled) would eliminate these.
+    # With it disabled, the solver still finds a solution — cfp is satisfied independently.
+    let src = """
+var 1..4: x1 :: output_var;
+var 1..4: x2 :: output_var;
+var 1..4: x3 :: output_var;
+var 1..4: x4 :: output_var;
+array [1..4] of var int: pfc = [x1,x2,x3,x4];
+var 1..4: y1;
+var 1..4: y2;
+var 1..4: y3;
+var 1..4: y4;
+array [1..4] of var int: cfp = [y1,y2,y3,y4];
+array [1..2] of int: c = [1,-1];
+constraint fzn_all_different_int(pfc);
+constraint fzn_all_different_int(cfp);
+constraint int_lin_le(c,[x1,x2],-1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # pfc variables should be present
+    check "x1" in tr.varPositions
+    check "x2" in tr.varPositions
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+
+    let vals = [tr.sys.assignment[tr.varPositions["x1"]],
+                tr.sys.assignment[tr.varPositions["x2"]],
+                tr.sys.assignment[tr.varPositions["x3"]],
+                tr.sys.assignment[tr.varPositions["x4"]]]
+    check vals.toHashSet.len == 4  # all different
+    check vals[0] < vals[1]        # x1 < x2
+
+  test "redundant disjunction elimination via max condition":
+    # Disjunction x1 < x2 ∨ x1 < x3 is implied by max(x2,x3) > x1.
+    # The disjunction should be eliminated as redundant.
+    let src = """
+var 1..5: x1 :: output_var;
+var 1..5: x2 :: output_var;
+var 1..5: x3 :: output_var;
+var 1..5: x4 :: output_var;
+var 1..5: x5 :: output_var;
+array [1..5] of var int: xs:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+var 1..5: m :: is_defined_var;
+array [1..2] of int: c1 = [1,-1];
+array [1..2] of int: c2 = [-1,1];
+var bool: b1 :: is_defined_var;
+var bool: b2 :: is_defined_var;
+constraint fzn_all_different_int(xs);
+constraint int_max(x2,x3,m) :: defines_var(m);
+constraint int_lin_le(c2,[m,x1],-1);
+constraint int_lin_le_reif(c1,[x1,x2],-1,b1) :: defines_var(b1);
+constraint int_lin_le_reif(c1,[x1,x3],-1,b2) :: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # The disjunctive pair (b1 ∨ b2) should be consumed as redundant
+    check tr.consumedDisjunctivePairs.len == 1
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+
+    let v = [tr.sys.assignment[tr.varPositions["x1"]],
+             tr.sys.assignment[tr.varPositions["x2"]],
+             tr.sys.assignment[tr.varPositions["x3"]],
+             tr.sys.assignment[tr.varPositions["x4"]],
+             tr.sys.assignment[tr.varPositions["x5"]]]
+    check v.toHashSet.len == 5  # all different
+    # max(x2,x3) > x1 should hold
+    check max(v[1], v[2]) > v[0]
+
+  test "redundant disjunction elimination via min condition":
+    # Dual of the max case: disjunction x2 < x1 ∨ x3 < x1 is implied by min(x2,x3) < x1.
+    let src = """
+var 1..5: x1 :: output_var;
+var 1..5: x2 :: output_var;
+var 1..5: x3 :: output_var;
+var 1..5: x4 :: output_var;
+var 1..5: x5 :: output_var;
+array [1..5] of var int: xs:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+var 1..5: m :: is_defined_var;
+array [1..2] of int: c1 = [1,-1];
+var bool: b1 :: is_defined_var;
+var bool: b2 :: is_defined_var;
+constraint fzn_all_different_int(xs);
+constraint int_min(x2,x3,m) :: defines_var(m);
+constraint int_lin_le(c1,[m,x1],-1);
+constraint int_lin_le_reif(c1,[x2,x1],-1,b1) :: defines_var(b1);
+constraint int_lin_le_reif(c1,[x3,x1],-1,b2) :: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.consumedDisjunctivePairs.len == 1
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+    let v = [tr.sys.assignment[tr.varPositions["x1"]],
+             tr.sys.assignment[tr.varPositions["x2"]],
+             tr.sys.assignment[tr.varPositions["x3"]],
+             tr.sys.assignment[tr.varPositions["x4"]],
+             tr.sys.assignment[tr.varPositions["x5"]]]
+    check v.toHashSet.len == 5
+    check min(v[1], v[2]) < v[0]
+
+  test "redundant disjunction not eliminated without implying max":
+    # Same disjunction pattern but no max condition: should NOT be eliminated.
+    let src = """
+var 1..5: x1 :: output_var;
+var 1..5: x2 :: output_var;
+var 1..5: x3 :: output_var;
+var 1..5: x4 :: output_var;
+var 1..5: x5 :: output_var;
+array [1..5] of var int: xs:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+array [1..2] of int: c1 = [1,-1];
+var bool: b1 :: is_defined_var;
+var bool: b2 :: is_defined_var;
+constraint fzn_all_different_int(xs);
+constraint int_lin_le_reif(c1,[x1,x2],-1,b1) :: defines_var(b1);
+constraint int_lin_le_reif(c1,[x1,x3],-1,b2) :: defines_var(b2);
+constraint bool_clause([b1,b2],[]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # No max condition — disjunction must remain
+    check tr.consumedDisjunctivePairs.len == 0
+
+  test "CPM implied edges through int_max":
+    # Chain: z < a (weight 5), so a >= 6. Then m = max(a, b) >= 6, and d >= m + 3 >= 9.
+    # With implied edges: a→d with weight 3 directly gives d >= a + 3 = 9 at CPM time.
+    # Without implied edges, CPM only sees m→d (weight 3) and uses m's initial lb=1,
+    # giving d >= 4 until the fixpoint propagates int_max bounds. Either way the final
+    # bound should be correct (>= 9).
+    let src = """
+var 1..30: z;
+var 1..30: a;
+var 1..30: b;
+var 1..30: d;
+var 1..30: m :: is_defined_var;
+array [1..2] of int: c = [1,-1];
+constraint int_lin_le(c,[z,a],-5);
+constraint int_max(a,b,m) :: defines_var(m);
+constraint int_lin_le(c,[m,d],-3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # d >= z + 5 + 3 = 9 (transitive: z→a→m→d with weights 5, 0, 3)
+    check "d" in tr.varPositions
+    let dPos = tr.varPositions["d"]
+    let dDom = tr.sys.baseArray.domain[dPos]
+    check dDom.len > 0
+    check dDom[0] >= 9
+
+  test "permutation counting tightens independent predecessors":
+    # 4 independent predecessors of x5 in a 5-element permutation.
+    # CPM would only give x5 >= 2 (longest chain = 1).
+    # Counting should give x5 >= 5 (needs 4 distinct values below it).
+    let src = """
+var 1..5: x1 :: output_var;
+var 1..5: x2 :: output_var;
+var 1..5: x3 :: output_var;
+var 1..5: x4 :: output_var;
+var 1..5: x5 :: output_var;
+array [1..5] of var int: xs:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+array [1..2] of int: c = [1,-1];
+constraint fzn_all_different_int(xs);
+constraint int_lin_le(c,[x1,x5],-1);
+constraint int_lin_le(c,[x2,x5],-1);
+constraint int_lin_le(c,[x3,x5],-1);
+constraint int_lin_le(c,[x4,x5],-1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # x5 must be 5 (only value >= 5 in domain 1..5)
+    let x5Pos = tr.varPositions["x5"]
+    let x5Dom = tr.sys.baseArray.domain[x5Pos]
+    check x5Dom == @[5]  # fully determined by counting
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+    let v = [tr.sys.assignment[tr.varPositions["x1"]],
+             tr.sys.assignment[tr.varPositions["x2"]],
+             tr.sys.assignment[tr.varPositions["x3"]],
+             tr.sys.assignment[tr.varPositions["x4"]],
+             tr.sys.assignment[tr.varPositions["x5"]]]
+    check v.toHashSet.len == 5
+    check v[4] == 5  # x5 = 5
+
+  test "permutation counting tightens with independent successors":
+    # 4 independent successors of x1 in a 5-element permutation.
+    # Counting should give x1 <= 1.
+    let src = """
+var 1..5: x1 :: output_var;
+var 1..5: x2 :: output_var;
+var 1..5: x3 :: output_var;
+var 1..5: x4 :: output_var;
+var 1..5: x5 :: output_var;
+array [1..5] of var int: xs:: output_array([1..5]) = [x1,x2,x3,x4,x5];
+array [1..2] of int: c = [1,-1];
+constraint fzn_all_different_int(xs);
+constraint int_lin_le(c,[x1,x2],-1);
+constraint int_lin_le(c,[x1,x3],-1);
+constraint int_lin_le(c,[x1,x4],-1);
+constraint int_lin_le(c,[x1,x5],-1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    let x1Pos = tr.varPositions["x1"]
+    let x1Dom = tr.sys.baseArray.domain[x1Pos]
+    check x1Dom == @[1]  # fully determined: must be smallest
+
+  test "permutation counting respects transitive closure":
+    # Diamond pattern: x1 < x2, x1 < x3, x2 < x4, x3 < x4
+    # x4 has 3 ancestors (x1, x2, x3), so x4 >= 4
+    # x1 has 3 descendants (x2, x3, x4), so x1 <= 1 (k - 3 = 4 - 3 = 1 with k=4)
+    let src = """
+var 1..4: x1 :: output_var;
+var 1..4: x2 :: output_var;
+var 1..4: x3 :: output_var;
+var 1..4: x4 :: output_var;
+array [1..4] of var int: xs:: output_array([1..4]) = [x1,x2,x3,x4];
+array [1..2] of int: c = [1,-1];
+constraint fzn_all_different_int(xs);
+constraint int_lin_le(c,[x1,x2],-1);
+constraint int_lin_le(c,[x1,x3],-1);
+constraint int_lin_le(c,[x2,x4],-1);
+constraint int_lin_le(c,[x3,x4],-1);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # x1 is 1 (3 descendants) and x4 is 4 (3 ancestors)
+    check tr.sys.baseArray.domain[tr.varPositions["x1"]] == @[1]
+    check tr.sys.baseArray.domain[tr.varPositions["x4"]] == @[4]

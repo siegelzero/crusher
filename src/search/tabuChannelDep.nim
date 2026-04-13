@@ -174,8 +174,11 @@ proc evaluateCrossingCountMax[T](binding: CrossingCountMaxChannelBinding[T],
             let lo = min(a, b)
             let hi = max(a, b)
             if hi - lo > 1:
-                events[lo + 1] += binding.weights[ci]
-                events[hi] -= binding.weights[ci]
+                let evStart = max(1, lo + 1)
+                let evEnd = min(k + 1, hi)
+                if evStart <= k:
+                    events[evStart] += binding.weights[ci]
+                    events[evEnd] -= binding.weights[ci]
     else:
         for cable in binding.cables:
             let a = assignment[cable.startPos]
@@ -183,8 +186,11 @@ proc evaluateCrossingCountMax[T](binding: CrossingCountMaxChannelBinding[T],
             let lo = min(a, b)
             let hi = max(a, b)
             if hi - lo > 1:
-                events[lo + 1] += 1
-                events[hi] -= 1
+                let evStart = max(1, lo + 1)
+                let evEnd = min(k + 1, hi)
+                if evStart <= k:
+                    events[evStart] += 1
+                    events[evEnd] -= 1
     result = T(0)
     var current = T(0)
     if binding.permPositions.len > 0:

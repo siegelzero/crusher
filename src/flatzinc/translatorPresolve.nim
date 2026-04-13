@@ -2034,6 +2034,70 @@ proc cpmBoundsPropagate(tr: FznTranslator,
                     fromVar: varNames[1], toVar: varNames[0],
                     durVar: "", constWeight: -(rhs div c)))
 
+    if candidates.len == 0 and tr.model.constraints.len == 0: return false
+
+    # Phase 1b: Generate implied precedence edges through int_max/int_min.
+    # If M = max(A, B) (from int_max :: defines_var) and there's a candidate edge
+    # M → D with weight w (meaning D >= M + w), then D >= A + w AND D >= B + w.
+    # Similarly for int_min: if M = min(A, B) and there's a candidate edge D → M
+    # with weight w (meaning M >= D + w), then A >= D + w AND B >= D + w.
+    block:
+        # Build mapping: max/min output var → (input1, input2, isMax)
+        var maxMinDefs: Table[string, tuple[input1, input2: string, isMax: bool]]
+        for ci, con in tr.model.constraints:
+            if ci in eliminated: continue
+            let name = stripSolverPrefix(con.name)
+            let isMax = name == "int_max"
+            let isMin = name == "int_min"
+            if not isMax and not isMin: continue
+            if con.args.len < 3: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let a0 = con.args[0]
+            let a1 = con.args[1]
+            let a2 = con.args[2]
+            if a0.kind != FznIdent or a1.kind != FznIdent or a2.kind != FznIdent: continue
+            maxMinDefs[a2.ident] = (input1: a0.ident, input2: a1.ident, isMax: isMax)
+
+        if maxMinDefs.len > 0:
+            var nImplied = 0
+            # For int_max(A, B, M): edge M→D becomes edges A→D and B→D (same weight)
+            # For int_min(A, B, M): edge D→M becomes edges D→A and D→B (same weight)
+            var extraCandidates: seq[CpmCandidate]
+            for cand in candidates:
+                if cand.durVar != "":
+                    # 3-var candidate: check if fromVar or toVar is a max/min output
+                    # fromVar is one of the two +1 vars, toVar is the -1 var
+                    # These are more complex — skip for now
+                    discard
+                else:
+                    # Constant-weight edge fromVar → toVar
+                    if cand.fromVar in maxMinDefs:
+                        let def = maxMinDefs[cand.fromVar]
+                        if def.isMax:
+                            # M = max(A,B), edge M→toVar: since A <= M, edge A→toVar is also valid
+                            extraCandidates.add(CpmCandidate(
+                                fromVar: def.input1, toVar: cand.toVar,
+                                durVar: "", constWeight: cand.constWeight))
+                            extraCandidates.add(CpmCandidate(
+                                fromVar: def.input2, toVar: cand.toVar,
+                                durVar: "", constWeight: cand.constWeight))
+                            nImplied += 2
+                    if cand.toVar in maxMinDefs:
+                        let def = maxMinDefs[cand.toVar]
+                        if not def.isMax:
+                            # M = min(A,B), edge fromVar→M: since M <= A, edge fromVar→A is also valid
+                            extraCandidates.add(CpmCandidate(
+                                fromVar: cand.fromVar, toVar: def.input1,
+                                durVar: "", constWeight: cand.constWeight))
+                            extraCandidates.add(CpmCandidate(
+                                fromVar: cand.fromVar, toVar: def.input2,
+                                durVar: "", constWeight: cand.constWeight))
+                            nImplied += 2
+            if nImplied > 0:
+                candidates.add(extraCandidates)
+                for c in extraCandidates:
+                    destVars.incl(c.toVar)
+
     if candidates.len == 0: return false
 
     # Phase 2: Resolve 3-var candidates into edges.
@@ -2195,6 +2259,166 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
     if nTightened > 0:
         stderr.writeLine(&"[FZN] CPM: tightened {nTightened} start variable domains across {nEdges} precedence edges")
+
+proc permutationCountingPropagate(tr: FznTranslator,
+                                   domains: var Table[string, seq[int]],
+                                   fixedVars: Table[string, int],
+                                   eliminated: PackedSet[int],
+                                   infeasible: var bool): bool =
+    ## For all_different (permutation) constraints with precedence edges,
+    ## tighten domains by counting predecessors/successors in the transitive closure.
+    ##
+    ## CPM only uses the longest chain length, but for permutations, every
+    ## predecessor needs a distinct value below the variable, so:
+    ##   lb(x) = |ancestors(x)| + domain_min
+    ##   ub(x) = domain_max - |descendants(x)|
+    ##
+    ## This can be MUCH tighter than CPM when many predecessors are independent
+    ## (not in a single chain). Example: 12 independent predecessors give lb=13,
+    ## but CPM only gives lb=2.
+    result = false
+
+    # Step 1: Collect all_different groups as sets of variable names.
+    # Handle both array literal and array name arguments.
+    var allDiffGroups: seq[HashSet[string]]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_all_different_int": continue
+        if con.args.len < 1: continue
+        var varNames: seq[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent:
+                    varNames.add(e.ident)
+        elif con.args[0].kind == FznIdent:
+            # Array name — resolve from model declarations
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == con.args[0].ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        for e in decl.value.elems:
+                            if e.kind == FznIdent:
+                                varNames.add(e.ident)
+                    break
+        if varNames.len >= 3:
+            allDiffGroups.add(toHashSet(varNames))
+
+    if allDiffGroups.len == 0: return
+
+    # Step 2: Collect precedence edges from int_lin_le constraints.
+    # Pattern: coeffs=[1,-1], vars=[from, to], rhs=-w → from + w <= to (edge from→to weight w)
+    # Pattern: coeffs=[-1,1], vars=[to, from], rhs=-w → same
+    type Edge = tuple[fromVar, toVar: string, weight: int]
+    var edges: seq[Edge]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError:
+            continue
+        if coeffs.len != 2: continue
+        if not tr.presolveIsFixed(con.args[2], fixedVars): continue
+        let rhs = tr.presolveResolve(con.args[2], fixedVars)
+        if con.args[1].kind != FznArrayLit: continue
+        let elems = con.args[1].elems
+        if elems.len != 2 or elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
+        let v0 = elems[0].ident
+        let v1 = elems[1].ident
+        # [1,-1],[v0,v1],rhs → v0 - v1 <= rhs → v1 >= v0 + (-rhs) → edge v0→v1 weight -rhs
+        if coeffs[0] == 1 and coeffs[1] == -1 and rhs < 0:
+            edges.add((fromVar: v0, toVar: v1, weight: -rhs))
+        elif coeffs[0] == -1 and coeffs[1] == 1 and rhs < 0:
+            edges.add((fromVar: v1, toVar: v0, weight: -rhs))
+
+    if edges.len == 0: return
+
+    # Step 3: For each all_different group, compute transitive closure and tighten.
+    var totalTightened = 0
+    var totalEdges = 0
+    for group in allDiffGroups:
+        # Filter edges to those with both endpoints in the group
+        var adj: Table[string, seq[string]]
+        var rev: Table[string, seq[string]]
+        var groupEdgeCount = 0
+        for e in edges:
+            if e.fromVar in group and e.toVar in group:
+                adj.mgetOrPut(e.fromVar, @[]).add(e.toVar)
+                rev.mgetOrPut(e.toVar, @[]).add(e.fromVar)
+                inc groupEdgeCount
+        if groupEdgeCount == 0: continue
+        totalEdges += groupEdgeCount
+
+        # Compute domain min/max for the group
+        var globalMin = high(int)
+        var globalMax = low(int)
+        for vn in group:
+            if vn in fixedVars:
+                globalMin = min(globalMin, fixedVars[vn])
+                globalMax = max(globalMax, fixedVars[vn])
+            elif vn in domains and domains[vn].len > 0:
+                globalMin = min(globalMin, domains[vn][0])
+                globalMax = max(globalMax, domains[vn][^1])
+
+        # BFS from each node to compute ancestor/descendant counts
+        # Only count group members (not external variables in precedence chains)
+        for vn in group:
+            if vn in fixedVars: continue
+            if vn notin domains or domains[vn].len <= 1: continue
+
+            # Count ancestors (predecessors): BFS backward
+            var ancestors = 0
+            var visited: HashSet[string]
+            var queue: seq[string]
+            if vn in rev:
+                for pred in rev[vn]:
+                    if pred notin visited:
+                        visited.incl(pred)
+                        queue.add(pred)
+            var qi = 0
+            while qi < queue.len:
+                let cur = queue[qi]
+                inc qi
+                inc ancestors
+                if cur in rev:
+                    for pred in rev[cur]:
+                        if pred notin visited:
+                            visited.incl(pred)
+                            queue.add(pred)
+
+            # Count descendants (successors): BFS forward
+            var descendants = 0
+            visited.clear()
+            queue.setLen(0)
+            qi = 0
+            if vn in adj:
+                for succ in adj[vn]:
+                    if succ notin visited:
+                        visited.incl(succ)
+                        queue.add(succ)
+            while qi < queue.len:
+                let cur = queue[qi]
+                inc qi
+                inc descendants
+                if cur in adj:
+                    for succ in adj[cur]:
+                        if succ notin visited:
+                            visited.incl(succ)
+                            queue.add(succ)
+
+            # Tighten bounds: need `ancestors` distinct values below, `descendants` above
+            let newLo = globalMin + ancestors
+            let newHi = globalMax - descendants
+            if presolveRestrictBounds(domains, vn, newLo, newHi, infeasible):
+                result = true
+                inc totalTightened
+
+    if totalTightened > 0:
+        stderr.writeLine(&"[FZN] Permutation counting: tightened {totalTightened} domains " &
+                         &"across {totalEdges} precedence edges in {allDiffGroups.len} groups")
 
 proc nonRenewableResourcePruning(tr: FznTranslator,
                                   domains: var Table[string, seq[int]],
@@ -4530,6 +4754,12 @@ proc presolve*(tr: var FznTranslator) =
     # CPM: single-pass forward/backward propagation for precedence chains.
     # Run once before the fixpoint loop — O(V+E) vs O(D) iterations needed by boundsPropagate.
     if cpmBoundsPropagate(tr, domains, fixedVars, eliminated, infeasible):
+        discard fixSingletons(domains, fixedVars)
+
+    # Permutation counting: for all_different groups with precedences, count ancestors/descendants
+    # in the transitive closure and tighten bounds. Strictly stronger than CPM for permutations
+    # when predecessors are independent (not in a single chain).
+    if permutationCountingPropagate(tr, domains, fixedVars, eliminated, infeasible):
         discard fixSingletons(domains, fixedVars)
 
     var totalIterations = 0

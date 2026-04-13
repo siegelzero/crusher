@@ -1143,6 +1143,14 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
     # for domain reduction when guard is forced. MUST run after detectReifChannels.
     result.detectConditionalSeparationPattern()
+    # Detect redundant disjunctive pairs implied by max/min conditions.
+    # MUST run after detectDisjunctivePairs (which populates disjunctivePairs).
+    result.detectRedundantDisjunctions()
+    # Eliminate disconnected all_different constraints whose variables appear nowhere else.
+    # MUST run just before translateVariables so definedVarNames additions take effect.
+    # DISABLED: removing disconnected variables can hurt search quality in some cases
+    # (e.g., GCC swap groups lose diversity when the permutation pool shrinks).
+    # result.detectDisconnectedAllDifferent()
     result.translateVariables()
     # Detect bivalent integer vars structurally pinned by another var via a
     # shared reif bool, and channel them so they stop being search positions.

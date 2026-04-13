@@ -6602,3 +6602,239 @@ proc tightenBinaryCondDomains*(tr: var FznTranslator) =
     if nTightened > 0:
         stderr.writeLine(&"[FZN] Tightened {nTightened} binary conditional channel domains")
 
+proc detectDisconnectedAllDifferent*(tr: var FznTranslator) =
+    ## Detects all_different constraints where EVERY variable is "disconnected" —
+    ## it appears only in that one all_different constraint and nowhere else
+    ## (no other constraints, not in the objective, not an output variable).
+    ## Such variables and their constraint are eliminated entirely.
+    ##
+    ## Common source: MiniZinc models with `redundant_constraint(all_different(cfp))`
+    ## where the inverse linking constraint is absent, leaving cfp as dead weight.
+
+    # Build mapping from array name → element variable names by scanning model declarations.
+    # This runs before translateVariables, so arrayElementNames isn't populated yet.
+    var arrayElements: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if not decl.isArray: continue
+        if decl.value == nil or decl.value.kind != FznArrayLit: continue
+        var names: seq[string]
+        var allIdents = true
+        for e in decl.value.elems:
+            if e.kind == FznIdent:
+                names.add(e.ident)
+            else:
+                allIdents = false
+                break
+        if allIdents and names.len > 0:
+            arrayElements[decl.name] = names
+
+    # Build set of protected variable names: objective, output variables, and output arrays.
+    # We scan model declarations directly since translateVariables hasn't run yet.
+    var protectedVars: HashSet[string]
+    if tr.model.solve.kind in {Minimize, Maximize}:
+        if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+            protectedVars.incl(tr.model.solve.objective.ident)
+    for decl in tr.model.variables:
+        if decl.hasAnnotation("output_var"):
+            protectedVars.incl(decl.name)
+        if decl.isArray and decl.hasAnnotation("output_array"):
+            if decl.name in arrayElements:
+                for elemName in arrayElements[decl.name]:
+                    protectedVars.incl(elemName)
+
+    # Helper: resolve an FZN argument to variable names, handling both array literals
+    # and array name identifiers (e.g., fzn_all_different_int(cfp) where cfp is an array name).
+    proc resolveArgVarNames(arg: FznExpr, arrayElements: Table[string, seq[string]]): seq[string] =
+        case arg.kind
+        of FznArrayLit:
+            for elem in arg.elems:
+                if elem.kind == FznIdent:
+                    result.add(elem.ident)
+        of FznIdent:
+            if arg.ident in arrayElements:
+                result = arrayElements[arg.ident]
+        else: discard
+
+    # Build variable reference count from non-consumed constraints.
+    # For array name arguments, resolve to element names so individual variables are counted.
+    var varRefCount: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if ci in tr.redundantOrderings: continue
+        for arg in con.args:
+            case arg.kind
+            of FznIdent:
+                # Could be a scalar variable or an array name
+                if arg.ident in arrayElements:
+                    for elemName in arrayElements[arg.ident]:
+                        varRefCount.mgetOrPut(elemName, 0) += 1
+                else:
+                    varRefCount.mgetOrPut(arg.ident, 0) += 1
+            of FznArrayLit:
+                for elem in arg.elems:
+                    if elem.kind == FznIdent:
+                        varRefCount.mgetOrPut(elem.ident, 0) += 1
+            else: discard
+
+    # Scan all_different constraints for disconnected variable groups
+    var nElimVars = 0
+    var nElimConstraints = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_all_different_int": continue
+        if con.args.len < 1: continue
+        let varNames = resolveArgVarNames(con.args[0], arrayElements)
+        if varNames.len == 0: continue
+
+        # Check every variable in this all_different
+        var allDisconnected = true
+        for vn in varNames:
+            # Protected vars (output/objective) can't be eliminated
+            if vn in protectedVars:
+                allDisconnected = false
+                break
+            # Already defined/channeled vars aren't free to eliminate
+            if vn in tr.definedVarNames or vn in tr.channelVarNames:
+                allDisconnected = false
+                break
+            # Variable must appear in exactly 1 non-consumed constraint (this all_different)
+            let refCount = varRefCount.getOrDefault(vn, 0)
+            if refCount != 1:
+                allDisconnected = false
+                break
+
+        if allDisconnected:
+            # Eliminate: mark constraint as consumed and all variables as defined (no position)
+            tr.definingConstraints.incl(ci)
+            for vn in varNames:
+                tr.definedVarNames.incl(vn)
+            nElimVars += varNames.len
+            inc nElimConstraints
+
+    if nElimConstraints > 0:
+        stderr.writeLine(&"[FZN] Eliminated {nElimConstraints} disconnected all_different constraints ({nElimVars} variables)")
+
+proc detectRedundantDisjunctions*(tr: var FznTranslator) =
+    ## Detects disjunctive pairs that are implied by an existing max/min condition.
+    ##
+    ## Pattern: If we have a disjunctive pair "A < B ∨ A < D" (both disjuncts share a
+    ## common variable A), AND there exists int_max(B, D, M) :: defines_var(M) with a
+    ## constraint A < M (or equivalently M > A), then the disjunction is redundant because
+    ## max(B, D) > A implies at least one of B, D is > A.
+    ##
+    ## Also handles the dual: "B < A ∨ D < A" with int_min(B, D, M) and M < A.
+    if tr.disjunctivePairs.len == 0: return
+
+    # Build lookup: sorted (input1, input2) → max/min output variable name.
+    # Don't skip definingConstraints — int_max/int_min with defines_var are consumed
+    # as channel defs but we still need to read their structure.
+    type MaxMinInfo = object
+        outputVar: string
+        isMax: bool  # true for int_max, false for int_min
+    var maxMinLookup: Table[tuple[a, b: string], MaxMinInfo]
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        let isMax = name == "int_max"
+        let isMin = name == "int_min"
+        if not isMax and not isMin: continue
+        if con.args.len < 3: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let arg0 = con.args[0]
+        let arg1 = con.args[1]
+        let arg2 = con.args[2]
+        if arg0.kind != FznIdent or arg1.kind != FznIdent or arg2.kind != FznIdent: continue
+        # Store with sorted key so lookup is order-independent
+        let key = if arg0.ident <= arg1.ident: (a: arg0.ident, b: arg1.ident)
+                  else: (a: arg1.ident, b: arg0.ident)
+        maxMinLookup[key] = MaxMinInfo(outputVar: arg2.ident, isMax: isMax)
+
+    if maxMinLookup.len == 0: return
+
+    # Build set of precedence constraints: (fromVar, toVar) meaning fromVar < toVar
+    # from int_lin_le([1,-1], [from, to], -1) or int_lin_le([-1,1], [to, from], -1)
+    var precedences: HashSet[tuple[fromVar, toVar: string]]
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+        var coeffs: seq[int]
+        try:
+            coeffs = tr.resolveIntArray(con.args[0])
+        except CatchableError:
+            continue
+        if coeffs.len != 2: continue
+        if con.args[1].kind != FznArrayLit: continue
+        let elems = con.args[1].elems
+        if elems.len != 2 or elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        if rhs != -1: continue
+        let v0 = elems[0].ident
+        let v1 = elems[1].ident
+        # [1,-1],[v0,v1],-1 → v0 - v1 <= -1 → v0 < v1
+        if coeffs[0] == 1 and coeffs[1] == -1:
+            precedences.incl((fromVar: v0, toVar: v1))
+        # [-1,1],[v0,v1],-1 → -v0 + v1 <= -1 → v1 < v0
+        elif coeffs[0] == -1 and coeffs[1] == 1:
+            precedences.incl((fromVar: v1, toVar: v0))
+
+    if precedences.len == 0: return
+
+    # Check each disjunctive pair for redundancy
+    var nRedundant = 0
+    for pairIdx, pair in tr.disjunctivePairs:
+        if pairIdx in tr.consumedDisjunctivePairs: continue
+        # Only handle 2-variable disjuncts
+        if pair.coeffs1.len != 2 or pair.coeffs2.len != 2: continue
+        if pair.rhs1 != -1 or pair.rhs2 != -1: continue
+
+        # Extract: disjunct i means coeffs_i[0]*v0 + coeffs_i[1]*v1 <= -1
+        # For the pattern "A < B": coeffs=[1,-1], vars=[A,B]
+        # For the pattern "B < A": coeffs=[-1,1], vars=[B,A] ≡ coeffs=[1,-1], vars=[A,B] reversed
+
+        # Normalize each disjunct to (fromVar, toVar) meaning from < to
+        proc extractPrecedence(coeffs: seq[int], varNames: seq[string]): tuple[fromVar, toVar: string, ok: bool] =
+            if coeffs == @[1, -1]:
+                return (fromVar: varNames[0], toVar: varNames[1], ok: true)
+            elif coeffs == @[-1, 1]:
+                return (fromVar: varNames[1], toVar: varNames[0], ok: true)
+            else:
+                return (fromVar: "", toVar: "", ok: false)
+
+        let d1 = extractPrecedence(pair.coeffs1, pair.varNames1)
+        let d2 = extractPrecedence(pair.coeffs2, pair.varNames2)
+        if not d1.ok or not d2.ok: continue
+
+        # Check for shared common variable: "A < B ∨ A < D" (shared fromVar)
+        # or "B < A ∨ D < A" (shared toVar)
+        if d1.fromVar == d2.fromVar:
+            # Pattern: commonVar < B ∨ commonVar < D
+            # Implied by: max(B, D) > commonVar, i.e., commonVar < max(B, D)
+            let commonVar = d1.fromVar
+            let key = if d1.toVar <= d2.toVar: (a: d1.toVar, b: d2.toVar)
+                      else: (a: d2.toVar, b: d1.toVar)
+            if key in maxMinLookup:
+                let info = maxMinLookup[key]
+                if info.isMax:
+                    # Check: commonVar < M where M = max(B, D)
+                    if (fromVar: commonVar, toVar: info.outputVar) in precedences:
+                        tr.consumedDisjunctivePairs.incl(pairIdx)
+                        inc nRedundant
+        elif d1.toVar == d2.toVar:
+            # Pattern: B < commonVar ∨ D < commonVar
+            # Implied by: min(B, D) < commonVar, i.e., commonVar > min(B, D)
+            let commonVar = d1.toVar
+            let key = if d1.fromVar <= d2.fromVar: (a: d1.fromVar, b: d2.fromVar)
+                      else: (a: d2.fromVar, b: d1.fromVar)
+            if key in maxMinLookup:
+                let info = maxMinLookup[key]
+                if not info.isMax:  # int_min
+                    # Check: M < commonVar where M = min(B, D)
+                    if (fromVar: info.outputVar, toVar: commonVar) in precedences:
+                        tr.consumedDisjunctivePairs.incl(pairIdx)
+                        inc nRedundant
+
+    if nRedundant > 0:
+        stderr.writeLine(&"[FZN] Eliminated {nRedundant} redundant disjunctive pairs (implied by max/min conditions)")
+
