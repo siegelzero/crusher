@@ -178,6 +178,9 @@ type
         # Circuit-time-prop writeback: after updatePosition, write computed times to assignment
         circuitTimePropConstraints*: seq[CircuitTimePropConstraint[T]]
 
+        # Cached list of tableIn constraint indices for fast stagnation-time table moves
+        tableInConstraintIndices*: seq[int]
+
         # Channel-dep optimized simulation state (position-indexed arrays instead of hash tables)
         cdIsChanged: seq[bool]           # position-indexed, true if changed during simulation
         cdSavedVal: seq[T]               # position-indexed, original value before simulation
@@ -1111,12 +1114,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if c.stateType == RelationalType and c.relationalState.relation == EqualTo:
                     c.relationalState.graduated = true
 
-    for constraint in state.constraints:
+    for ci, constraint in state.constraints:
         for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
         # Collect CircuitTimeProp constraints for writeback
         if constraint.stateType == CircuitTimePropType:
             state.circuitTimePropConstraints.add(constraint.circuitTimePropState)
+        # Cache tableIn constraint indices for fast stagnation-time table moves
+        if constraint.stateType == TableConstraintType and
+           constraint.tableConstraintState.mode == TableIn and
+           constraint.tableConstraintState.tuples.len > 1:
+            state.tableInConstraintIndices.add(ci)
 
     # Build O(1) constraint index lookup
     state.constraintIdxAt = newSeq[Table[pointer, int]](carray.len)
@@ -1252,6 +1260,44 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Initialize permutation groups with valid random permutations
     if initialAssignment.len == 0:
         state.balancePermutations(verbose and id == 0)
+
+    # Table-aware initialization: for each table constraint, try to satisfy it
+    # by picking a valid tuple closest to the current assignment. This dramatically
+    # reduces initial cost for table-heavy problems. Process constraints in random
+    # order to avoid bias; skip channel positions (they're computed later).
+    if initialAssignment.len == 0 and initStrategy == isRandom:
+        var tableIndices: seq[int]
+        for i, c in state.constraints:
+            if c.stateType == TableConstraintType and
+               c.tableConstraintState.mode == TableIn:
+                tableIndices.add(i)
+        shuffle(tableIndices)
+        for ci in tableIndices:
+            let tc = state.constraints[ci].tableConstraintState
+            if tc.tuples.len == 0: continue
+            # Find the tuple with minimum Hamming distance to current assignment
+            var bestIdx = -1
+            var bestDist = tc.sortedPositions.len + 1
+            for idx in 0..<tc.tuples.len:
+                let tup = tc.tuples[idx]
+                var domainOk = true
+                var dist = 0
+                for col, pos in tc.sortedPositions:
+                    let dom = state.sharedDomain[][pos]
+                    if tup[col] notin dom:
+                        domainOk = false
+                        break
+                    if state.assignment[pos] != tup[col]:
+                        dist += 1
+                if domainOk and dist < bestDist:
+                    bestDist = dist
+                    bestIdx = idx
+            if bestIdx >= 0:
+                let tup = tc.tuples[bestIdx]
+                for col, pos in tc.sortedPositions:
+                    if pos in carray.channelPositions: continue
+                    if pos in inverseGroupPositions: continue
+                    state.assignment[pos] = tup[col]
 
     if verbose and id == 0:
         stderr.writeLine("[Init] Assignment init done, starting channel fixed-point (" & $carray.channelBindings.len & " bindings)...")
@@ -3855,6 +3901,102 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     state.logProfileStats()
 
 
+proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
+    ## Stagnation-triggered table move: pick a random table constraint and
+    ## try switching to a different valid tuple. Uses cheap simulation via
+    ## assignValueLean to find a strictly improving move, then applies it.
+    ## When allowPerturb is true, also applies neutral/slightly-worse moves
+    ## as a perturbation to escape deep local optima.
+    if state.tableInConstraintIndices.len == 0: return false
+
+    # Try a few random table constraints
+    const MAX_TABLES = 3
+    const MAX_TUPLES_PER_TABLE = 8
+
+    var bestDelta = 0  # only accept strictly improving moves
+    var bestCI = -1
+    var bestTupleIdx = -1
+    # Track best perturbation candidate (smallest non-improving delta)
+    var perturbDelta = high(int)
+    var perturbCI = -1
+    var perturbTupleIdx = -1
+
+    var tableCandidates = state.tableInConstraintIndices
+    shuffle(tableCandidates)
+    let nTables = min(tableCandidates.len, MAX_TABLES)
+
+    for ti in 0..<nTables:
+        let ci = tableCandidates[ti]
+        let tc = state.constraints[ci].tableConstraintState
+        let nPos = tc.sortedPositions.len
+
+        var tried: PackedSet[int]
+        let nTries = min(tc.tuples.len, MAX_TUPLES_PER_TABLE)
+
+        for attempt in 0..<nTries:
+            var idx = rand(tc.tuples.len - 1)
+            while idx in tried and tried.len < tc.tuples.len:
+                idx = rand(tc.tuples.len - 1)
+            tried.incl(idx)
+
+            let tup = tc.tuples[idx]
+
+            # Quick check: different from current and domain-compatible?
+            var same = true
+            var domainOk = true
+            for col in 0..<nPos:
+                let pos = tc.sortedPositions[col]
+                let curVal = state.assignment[pos]
+                if tup[col] != curVal:
+                    same = false
+                    let dom = state.sharedDomain[][pos]
+                    if tup[col] notin dom:
+                        domainOk = false
+                        break
+            if same or not domainOk: continue
+
+            # Simulate: apply via assignValueLean, measure delta, restore
+            let origCost = state.cost
+            var changes: seq[(int, T)] = @[]
+            for col in 0..<nPos:
+                let pos = tc.sortedPositions[col]
+                if tup[col] != state.assignment[pos]:
+                    changes.add((pos, state.assignment[pos]))
+                    state.assignValueLean(pos, tup[col])
+            let delta = state.cost - origCost
+            # Restore
+            for i in countdown(changes.len - 1, 0):
+                let (pos, oldVal) = changes[i]
+                state.assignValueLean(pos, oldVal)
+
+            if delta < bestDelta:
+                bestDelta = delta
+                bestCI = ci
+                bestTupleIdx = idx
+            elif allowPerturb and delta >= bestDelta and delta < perturbDelta:
+                perturbDelta = delta
+                perturbCI = ci
+                perturbTupleIdx = idx
+
+    # Prefer improving move; fall back to perturbation if allowed
+    let applyCI = if bestCI >= 0: bestCI else: perturbCI
+    let applyIdx = if bestCI >= 0: bestTupleIdx else: perturbTupleIdx
+    if applyCI < 0: return false
+
+    let tc = state.constraints[applyCI].tableConstraintState
+    let tup = tc.tuples[applyIdx]
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    for col in 0..<tc.sortedPositions.len:
+        let pos = tc.sortedPositions[col]
+        let oldVal = state.assignment[pos]
+        if tup[col] != oldVal:
+            let oldIdx = state.domainIndex[pos].getOrDefault(oldVal, -1)
+            if oldIdx >= 0 and not state.isLazy[pos]:
+                state.tabu[pos][oldIdx] = tabuTenure
+            state.assignValue(pos, tup[col])
+    return true
+
+
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     var lastImprovement = 0
 
@@ -3967,6 +4109,26 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via swap")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Try table moves during stagnation: switch a table constraint to a
+        # different valid tuple, changing multiple variables simultaneously.
+        # Short stagnation: only improving moves (safe). Deep stagnation (table-
+        # heavy problems): allow perturbation to escape local optima.
+        if state.tableInConstraintIndices.len > 0 and
+           state.iteration - lastImprovement >= 100 and
+           (state.iteration - lastImprovement) mod 100 == 0:
+            let deepStag = state.tableInConstraintIndices.len >= 10 and
+                           state.iteration - lastImprovement >= 500
+            if state.tryTableMoves(allowPerturb = deepStag):
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via table move")
                         state.lastImprovementIter = lastImprovement
                         return state
 

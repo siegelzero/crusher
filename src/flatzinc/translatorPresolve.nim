@@ -2284,9 +2284,9 @@ proc tablePropagate(tr: FznTranslator,
                     fixedVars: Table[string, int],
                     eliminated: PackedSet[int],
                     infeasible: var bool): bool =
-    ## Arc consistency propagation on 2-variable table_int constraints.
-    ## If one variable is fixed, restrict the other to supported values.
-    ## Also remove unsupported values even when neither is fixed.
+    ## Generalized arc consistency propagation on table_int constraints.
+    ## For each variable in each table constraint, remove domain values
+    ## that have no support in any tuple (given current domains of all other variables).
     result = false
     for ci, con in tr.model.constraints:
         if infeasible: return
@@ -2297,66 +2297,81 @@ proc tablePropagate(tr: FznTranslator,
         let varsArg = con.args[0]
         let tableArg = con.args[1]
         if varsArg.kind != FznArrayLit or tableArg.kind != FznArrayLit: continue
-        if varsArg.elems.len != 2: continue  # Only 2-variable tables
+        let arity = varsArg.elems.len
+        if arity < 2: continue
 
-        let vn0 = presolveVarName(varsArg.elems[0])
-        let vn1 = presolveVarName(varsArg.elems[1])
-        if vn0 == "" or vn1 == "": continue
+        # Resolve variable names for all columns
+        var varNames = newSeq[string](arity)
+        var allValid = true
+        for col in 0..<arity:
+            varNames[col] = presolveVarName(varsArg.elems[col])
+            if varNames[col] == "":
+                allValid = false
+                break
+        if not allValid: continue
 
         # Parse flat table into tuples
         let flatElems = tableArg.elems
-        if flatElems.len mod 2 != 0: continue
-        var tuples: seq[(int, int)]
-        for i in countup(0, flatElems.len - 2, 2):
-            if flatElems[i].kind != FznIntLit or flatElems[i+1].kind != FznIntLit: continue
-            tuples.add((flatElems[i].intVal, flatElems[i+1].intVal))
+        if flatElems.len mod arity != 0: continue
+        let nTuples = flatElems.len div arity
+        var tuples = newSeq[seq[int]](nTuples)
+        var parseOk = true
+        for i in 0..<nTuples:
+            tuples[i] = newSeq[int](arity)
+            for col in 0..<arity:
+                let elem = flatElems[i * arity + col]
+                if elem.kind != FznIntLit:
+                    parseOk = false
+                    break
+                tuples[i][col] = elem.intVal
+            if not parseOk: break
+        if not parseOk: continue
 
-        let fixed0 = tr.presolveIsFixed(varsArg.elems[0], fixedVars)
-        let fixed1 = tr.presolveIsFixed(varsArg.elems[1], fixedVars)
+        # Resolve fixed values and build domain sets for each column
+        var fixedCol = newSeq[bool](arity)
+        var fixedVal = newSeq[int](arity)
+        var domSets = newSeq[PackedSet[int]](arity)
+        for col in 0..<arity:
+            if tr.presolveIsFixed(varsArg.elems[col], fixedVars):
+                fixedCol[col] = true
+                fixedVal[col] = tr.presolveResolve(varsArg.elems[col], fixedVars)
+            elif varNames[col] in domains:
+                domSets[col] = domains[varNames[col]].toPackedSet()
 
-        if fixed0:
-            let val0 = tr.presolveResolve(varsArg.elems[0], fixedVars)
+        # Filter tuples to those compatible with all current domains/fixed values
+        var supported = newSeq[PackedSet[int]](arity)
+        for col in 0..<arity:
+            supported[col] = initPackedSet[int]()
+
+        for t in tuples:
+            var valid = true
+            for col in 0..<arity:
+                if fixedCol[col]:
+                    if t[col] != fixedVal[col]:
+                        valid = false
+                        break
+                elif varNames[col] in domains:
+                    if t[col] notin domSets[col]:
+                        valid = false
+                        break
+            if valid:
+                for col in 0..<arity:
+                    supported[col].incl(t[col])
+
+        # Tighten domains for non-fixed variables
+        for col in 0..<arity:
+            if fixedCol[col]: continue
+            if varNames[col] notin domains: continue
             var allowed: seq[int]
-            for t in tuples:
-                if t[0] == val0:
-                    allowed.add(t[1])
-            if allowed.len > 0:
-                if presolveTightenDomain(domains, vn1, allowed, infeasible):
+            for v in domains[varNames[col]]:
+                if v in supported[col]:
+                    allowed.add(v)
+            if allowed.len < domains[varNames[col]].len and allowed.len > 0:
+                if presolveTightenDomain(domains, varNames[col], allowed, infeasible):
                     result = true
-        elif fixed1:
-            let val1 = tr.presolveResolve(varsArg.elems[1], fixedVars)
-            var allowed: seq[int]
-            for t in tuples:
-                if t[1] == val1:
-                    allowed.add(t[0])
-            if allowed.len > 0:
-                if presolveTightenDomain(domains, vn0, allowed, infeasible):
-                    result = true
-        else:
-            # Neither fixed: domain consistency — remove unsupported values
-            if vn0 in domains and vn1 in domains:
-                let dom0 = domains[vn0].toPackedSet()
-                let dom1 = domains[vn1].toPackedSet()
-                var supported0 = initPackedSet[int]()
-                var supported1 = initPackedSet[int]()
-                for t in tuples:
-                    if t[0] in dom0 and t[1] in dom1:
-                        supported0.incl(t[0])
-                        supported1.incl(t[1])
-                var allowed0: seq[int]
-                for v in domains[vn0]:
-                    if v in supported0:
-                        allowed0.add(v)
-                if allowed0.len < domains[vn0].len and allowed0.len > 0:
-                    if presolveTightenDomain(domains, vn0, allowed0, infeasible):
-                        result = true
-                var allowed1: seq[int]
-                for v in domains[vn1]:
-                    if v in supported1:
-                        allowed1.add(v)
-                if allowed1.len < domains[vn1].len and allowed1.len > 0:
-                    if presolveTightenDomain(domains, vn1, allowed1, infeasible):
-                        result = true
+            elif allowed.len == 0:
+                infeasible = true
+                return
 
 proc presolveResolveVarElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
     ## Resolve a constraint arg (FznArrayLit or named var array FznIdent) to its elements.

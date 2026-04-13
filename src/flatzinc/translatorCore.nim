@@ -1815,6 +1815,21 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         reducedDefinesVarCol = reducedIdx
                     inc reducedIdx
 
+            # Filter tuples by variable domains (remove rows with unsupported values)
+            var domainFiltered: seq[seq[int]]
+            var domainSets = newSeq[HashSet[int]](reducedPositions.len)
+            for col in 0..<reducedPositions.len:
+                domainSets[col] = toHashSet(tr.sys.baseArray.domain[reducedPositions[col]])
+            for t in filtered:
+                var valid = true
+                for col in 0..<t.len:
+                    if t[col] notin domainSets[col]:
+                        valid = false
+                        break
+                if valid:
+                    domainFiltered.add(t)
+            filtered = domainFiltered
+
             if filtered.len > 0:
                 # Try functional dependency: if col0 values are unique, dependent cols become channels
                 if not tr.tryTableFunctionalDep(reducedPositions, filtered, reducedDefinesVarCol):
@@ -1823,10 +1838,27 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             else:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
         elif allRefs:
-            # Try functional dependency on the original table
-            if not tr.tryTableFunctionalDep(positions, tuples, definesVarCol):
-                if not tr.tryTableComplementConversion(positions, tuples):
-                    tr.sys.addConstraint(tableIn[int](positions, tuples))
+            # Filter tuples by variable domains (remove rows with unsupported values)
+            var domainFiltered: seq[seq[int]]
+            var domainSets = newSeq[HashSet[int]](positions.len)
+            for col in 0..<positions.len:
+                domainSets[col] = toHashSet(tr.sys.baseArray.domain[positions[col]])
+            for t in tuples:
+                var valid = true
+                for col in 0..<t.len:
+                    if t[col] notin domainSets[col]:
+                        valid = false
+                        break
+                if valid:
+                    domainFiltered.add(t)
+
+            if domainFiltered.len > 0:
+                # Try functional dependency on the domain-filtered table
+                if not tr.tryTableFunctionalDep(positions, domainFiltered, definesVarCol):
+                    if not tr.tryTableComplementConversion(positions, domainFiltered):
+                        tr.sys.addConstraint(tableIn[int](positions, domainFiltered))
+            else:
+                stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
         else:
             # Some expressions are not simple variable references (e.g., defined vars
             # with linear expressions, or constants). Materialize them:
