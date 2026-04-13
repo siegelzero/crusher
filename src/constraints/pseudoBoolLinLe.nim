@@ -22,12 +22,13 @@ type
     PseudoBoolLinLeConstraint*[T] = ref object
         positions*: PackedSet[int]
         coeffAtPosition*: Table[int, T]   # position -> coefficient
+        valueAtPosition*: Table[int, T]   # position -> current assigned value
         rhs*: T
         currentSum*: T
         cost*: int
         lastOldSum*: T        # sum before last updatePosition
         lastNewSum*: T        # sum after last updatePosition
-        maxAbsCoeff*: T       # max |coefficient| — max sum change from a single binary flip
+        maxAbsCoeff*: T       # max |merged coefficient| — max sum change from a single flip
 
 ################################################################################
 # Constructor
@@ -43,6 +44,7 @@ proc newPseudoBoolLinLeConstraint*[T](posSeq: openArray[int], coefficients: open
     result.lastOldSum = 0
     result.lastNewSum = 0
     result.maxAbsCoeff = 0
+    result.valueAtPosition = initTable[int, T]()
     for i in 0..<posSeq.len:
         let c = coefficients[i]
         if posSeq[i] in result.coeffAtPosition:
@@ -50,7 +52,9 @@ proc newPseudoBoolLinLeConstraint*[T](posSeq: openArray[int], coefficients: open
             result.coeffAtPosition[posSeq[i]] += c
         else:
             result.coeffAtPosition[posSeq[i]] = c
-        let absC = abs(c)
+    # Compute maxAbsCoeff from merged coefficients, not raw inputs
+    for pos, coeff in result.coeffAtPosition.pairs:
+        let absC = abs(coeff)
         if absC > result.maxAbsCoeff:
             result.maxAbsCoeff = absC
 
@@ -61,6 +65,7 @@ proc newPseudoBoolLinLeConstraint*[T](posSeq: openArray[int], coefficients: open
 proc initialize*[T](state: PseudoBoolLinLeConstraint[T], assignment: seq[T]) =
     state.currentSum = 0
     for pos, coeff in state.coeffAtPosition.pairs:
+        state.valueAtPosition[pos] = assignment[pos]
         state.currentSum += coeff * assignment[pos]
     state.cost = max(0, state.currentSum - state.rhs)
 
@@ -70,10 +75,9 @@ proc updatePosition*[T](state: PseudoBoolLinLeConstraint[T], position: int, newV
         state.lastNewSum = state.currentSum
         return
     let coeff = state.coeffAtPosition[position]
-    # For binary variables: newValue - oldValue is either +1 or -1
-    # oldValue = 1 - newValue (binary flip)
-    # delta = coeff * (newValue - oldValue) = coeff * (2*newValue - 1)
-    let delta = coeff * (2 * newValue - 1)
+    let oldValue = state.valueAtPosition[position]
+    let delta = coeff * (newValue - oldValue)
+    state.valueAtPosition[position] = newValue
     state.currentSum += delta
     state.cost = max(0, state.currentSum - state.rhs)
     state.lastNewSum = state.currentSum
@@ -146,10 +150,14 @@ proc getAffectedDomainValues*[T](state: PseudoBoolLinLeConstraint[T], position: 
 
 proc deepCopy*[T](state: PseudoBoolLinLeConstraint[T]): PseudoBoolLinLeConstraint[T] =
     new(result)
-    result.positions = state.positions  # PackedSet is value type
+    # Rebuild PackedSet via incl to sidestep Nim 2.2.6 =copy bug under ARC
+    result.positions = initPackedSet[int]()
+    for p in state.positions.items:
+        result.positions.incl(p)
     result.coeffAtPosition = initTable[int, T]()
     for k, v in state.coeffAtPosition.pairs:
         result.coeffAtPosition[k] = v
+    result.valueAtPosition = initTable[int, T]()
     result.rhs = state.rhs
     result.currentSum = 0
     result.cost = 0
