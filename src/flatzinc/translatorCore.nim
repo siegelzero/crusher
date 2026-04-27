@@ -355,9 +355,12 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
         if c != keyCol:
             depCols.add(c)
 
+    # Use first tuple's value as default for gap indices — keyRange may exceed
+    # tuples.len when keys are sparse, and a low(int) sentinel propagates through
+    # constraint evaluation as overflow during initial channel computation.
     var lookups = newSeq[seq[int]](depCols.len)
-    for i in 0..<depCols.len:
-        lookups[i] = newSeqWith(keyRange, low(int))
+    for i, depCol in depCols:
+        lookups[i] = newSeqWith(keyRange, tuples[0][depCol])
     for t in tuples:
         let idx = t[keyCol] - keyMin
         for i, depCol in depCols:

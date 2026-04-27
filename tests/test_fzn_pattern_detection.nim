@@ -1099,6 +1099,41 @@ solve satisfy;
         let costVal = tr.sys.assignment[tr.varPositions["cost"]]
         check costVal == 30  # px=2, py=1 → cost=30
 
+    test "sparse single-column key: gap entries use safe default, not low(int)":
+        ## Regression: trySingleColumnKey filled gap indices with low(int) as a
+        ## sentinel. When a worker's random init landed on a gap, the dependent
+        ## channel got low(int), and any constraint summing that position
+        ## overflowed during initial cost computation, crashing the worker.
+        ## With the fix, gap indices use the first tuple's value as default.
+        let src = """
+var 0..6: x :: output_var;
+var 0..100: y :: output_var;
+array [1..8] of int: t = [0,10, 2,20, 4,30, 6,40];
+constraint fzn_table_int([x, y], t);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Verify the key was detected and a channel binding was emitted
+        check tr.sys.baseArray.channelBindings.len >= 1
+
+        # No channel binding should contain a low(int) sentinel for a gap entry.
+        for binding in tr.sys.baseArray.channelBindings:
+            for elem in binding.arrayElements:
+                if elem.isConstant:
+                    check elem.constantValue != low(int)
+                    check elem.constantValue != high(int)
+
+        # Solver must not crash on parallel init even when workers land on gaps.
+        tr.sys.resolve(parallel = true, tabuThreshold = 1000, verbose = false)
+        let xVal = tr.sys.assignment[tr.varPositions["x"]]
+        let yVal = tr.sys.assignment[tr.varPositions["y"]]
+        # Any feasible solution must match a tuple
+        let ok = (xVal == 0 and yVal == 10) or (xVal == 2 and yVal == 20) or
+                 (xVal == 4 and yVal == 30) or (xVal == 6 and yVal == 40)
+        check ok
+
     test "WCSP pattern: multiple cost channels from tables":
         ## Mini WCSP: 2 decision vars, 2 unary costs + 1 binary cost.
         ## All cost vars should become channels via generalized key detection.
