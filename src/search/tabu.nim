@@ -492,6 +492,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             let p = constraint.pseudoBoolLinLeState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == AtMostType:
+            let p = constraint.atMostState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
         else:
             for i in 0..<dLen:
                 if domain[i] != oldValue:
@@ -616,6 +620,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == PseudoBoolLinLeType:
             let penalties = constraint.pseudoBoolLinLeState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == AtMostType:
+            let penalties = constraint.atMostState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -748,6 +758,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             state.constraintPenalties[position][localIdx][i] = newP
     elif constraint.stateType == PseudoBoolLinLeType:
         let penalties = constraint.pseudoBoolLinLeState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == AtMostType:
+        let penalties = constraint.atMostState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
@@ -2199,6 +2217,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var dynamicCount = 0
         var cascadeFail = 0
         var cascadeDepthFail = 0
+        var noConstraintSkip = 0  # cascades skipped: zero channel-dep constraints read them
 
         for pos in state.channelDepSearchPositions:
             if state.isLazy[pos]: continue
@@ -2361,6 +2380,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if topoOrder.len >= MaxCascadeChans and state.sharedDomain[][pos].len > LazyThreshold:
                     state.isLazy[pos] = true
                     inc cascadeDepthFail
+                continue
+
+            # Early-skip: if no active channel-dep constraint reads any of the
+            # channels in this cascade, the cascade contributes nothing to the
+            # penalty map — skip both the value precomputation and the per-cascade
+            # bookkeeping. This is purely a perf optimization: the channels still
+            # propagate via the global worklist; we just stop using this cascade
+            # for penalty deltas.
+            block earlySkipCheck:
+                for chanPos in topoOrder:
+                    if chanPos notin state.chanPosToDepConstraintIdx: continue
+                    for ci in state.chanPosToDepConstraintIdx[chanPos]:
+                        if state.channelDepConstraintActive[ci]:
+                            break earlySkipCheck
+                # No active constraint reads any channel in this cascade — skip.
+                inc noConstraintSkip
                 continue
 
             # Build channel values
@@ -2645,8 +2680,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 elif state.cdCascadeExternalDeps[ci].len > 0: inc mmExtCount
                 else: inc noExtCount
             echo "[Init] Cascade tables: " & $staticCount & " static + " & $dynamicCount &
-                 " dynamic / " & $(staticCount + dynamicCount + cascadeFail) &
+                 " dynamic / " & $(staticCount + dynamicCount + cascadeFail + noConstraintSkip) &
                  " positions (fail=" & $cascadeFail & " depthFail=" & $cascadeDepthFail &
+                 " noCons=" & $noConstraintSkip &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
                  " mem=" & $(totalMem div 1024) & "KB" &
                  " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &

@@ -181,6 +181,41 @@ proc moveDelta*[T](state: AtMostConstraint[T], position: int, oldValue, newValue
 
     return newCost - state.cost
 
+proc batchMovePenalty*[T](state: AtMostConstraint[T], position: int,
+                          oldValue: T, domain: seq[T]): seq[int] =
+    ## Compute the penalty delta for assigning each value in `domain` to
+    ## `position`. Avoids per-value function-call overhead and (for the
+    ## PositionBased path) the hash lookup into `currentAssignment` that
+    ## moveDelta does. Generalizes to all bound values, including the very
+    ## common AtMostOne case (maxOccurrences = 1).
+    result = newSeq[int](domain.len)
+    case state.evalMethod:
+        of PositionBased:
+            let target = state.targetValue
+            let maxOcc = state.maxOccurrences
+            let currentCost = state.cost
+            # Occurrences that don't depend on this position's new value:
+            # subtract this position's old contribution (if any).
+            let baseOcc = state.actualOccurrences -
+                (if oldValue == target: 1 else: 0)
+            # Precompute the two possible new costs (target vs non-target);
+            # the per-domain-value loop becomes a single compare + lookup.
+            let costIfTarget = max(0, baseOcc + 1 - maxOcc)
+            let costIfNotTarget = max(0, baseOcc - maxOcc)
+            let deltaTarget = costIfTarget - currentCost
+            let deltaNotTarget = costIfNotTarget - currentCost
+            for i in 0..<domain.len:
+                if domain[i] == oldValue:
+                    result[i] = 0
+                elif domain[i] == target:
+                    result[i] = deltaTarget
+                else:
+                    result[i] = deltaNotTarget
+        of ExpressionBased:
+            # Expressions need per-value evaluation; preserve moveDelta semantics.
+            for i in 0..<domain.len:
+                result[i] = state.moveDelta(position, oldValue, domain[i])
+
 proc getAffectedPositions*[T](state: AtMostConstraint[T]): PackedSet[int] =
     ## Returns positions needing penalty map updates after the last updatePosition.
     ## If occurrence count didn't cross a critical boundary, no neighbor's moveDelta

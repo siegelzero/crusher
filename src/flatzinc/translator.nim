@@ -887,6 +887,7 @@ include translatorHelpers
 include translatorCore
 include translatorPresolve
 include translatorDefinedVars
+include translatorCanonicalize
 include translatorChannels
 include translatorCountPatterns
 include translatorReifChannels
@@ -946,6 +947,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.translateParameters()
     # Extract annotated search variables from solve :: int_search / seq_search
     result.extractSearchAnnotationVars()
+    # Canonicalize single-term linear reifs into primitive eq/ne/le_reif so
+    # presolve and all downstream pattern-detection passes see a uniform shape.
+    result.canonicalizeLinearReifs()
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
     # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection

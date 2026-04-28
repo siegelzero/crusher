@@ -3392,6 +3392,56 @@ proc varElementPropagate(tr: FznTranslator,
                     result = true
                 if infeasible: return
 
+        # Forward (sparse): compute the set-union of element domains over the
+        # valid index values. When elements have sparse domains (gaps), this is
+        # strictly tighter than the [lo, hi] interval and can drop many values
+        # from `val`'s domain. Budgeted by ValueUnionLimit so this stays cheap
+        # on long arrays. Generalises the set-based propagation that the
+        # constant-array variant `elementPropagate` already does.
+        const ValueUnionLimit = 256
+        if valName != "" and valName notin fixedVars and valName in domains:
+            let curValDom = domains[valName]
+            if curValDom.len > 1:
+                var unionVals: PackedSet[int]
+                var unionOk = true
+                for i in validIdxValues:
+                    let arrIdx = i - idxOffset
+                    if arrIdx < 0 or arrIdx >= arrElems.len: continue
+                    let elem = arrElems[arrIdx]
+                    case elem.kind
+                    of FznIntLit:
+                        unionVals.incl(elem.intVal)
+                    of FznBoolLit:
+                        unionVals.incl(if elem.boolVal: 1 else: 0)
+                    of FznIdent:
+                        if tr.presolveIsFixed(elem, fixedVars):
+                            unionVals.incl(tr.presolveResolve(elem, fixedVars))
+                        else:
+                            let vn = elem.ident
+                            if vn != "" and vn in domains:
+                                let dom = domains[vn]
+                                if dom.len == 0:
+                                    unionOk = false
+                                    break
+                                for v in dom: unionVals.incl(v)
+                            else:
+                                unionOk = false
+                                break
+                    else:
+                        unionOk = false
+                        break
+                    if unionVals.len > ValueUnionLimit:
+                        unionOk = false
+                        break
+                if unionOk and unionVals.len > 0 and unionVals.len < curValDom.len:
+                    var newDom = newSeq[int](0)
+                    for v in curValDom:
+                        if v in unionVals: newDom.add(v)
+                    if newDom.len < curValDom.len:
+                        if presolveTightenDomain(domains, valName, newDom, infeasible):
+                            result = true
+                        if infeasible: return
+
 
 proc varElementArrayBackwardPropagate(tr: FznTranslator,
                                       domains: var Table[string, seq[int]],
