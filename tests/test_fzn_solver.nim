@@ -2982,6 +2982,217 @@ solve minimize obj;
     check x2Val >= 70
     check x2Val <= 80
 
+  test "big-M int_lin_le → ConditionalLinear (b=0 active)":
+    # x in 0..100, y in 0..100, b in {0,1}
+    # int_lin_le([1,-1,1000], [x, y, b], 50)
+    #   = x - y + 1000*b <= 50
+    # With Lmax(x-y) = 100, rhs=50:
+    #   b=0: x-y <= 50  (active, Lmax=100 > 50)
+    #   b=1: x-y <= 50-1000 = -950  (vacuous when b=1 — actually this case is
+    #     INFEASIBLE: needs Lmin <= -950, but Lmin(x-y) = -100. So b=1 forbidden.)
+    # The other direction is the vacuous case:
+    #   b=0: x-y <= 50 — active.
+    # Wait that's not vacuous on the b=1 side; it's infeasible. Let's pick a
+    # cleaner pair: rhs large enough that b=0 vacuous, b=1 active.
+    let src = """
+var 0..100: x;
+var 0..100: y;
+var bool: b;
+array [1..3] of int: c = [1, -1, -1000];
+constraint int_lin_le(c, [x, y, b], 100);
+constraint int_lin_le([1], [x], 80);
+constraint int_lin_le([1], [y], 30);
+solve satisfy;
+"""
+    # With x in 0..80, y in 0..30, b in {0,1}:
+    #   x - y - 1000*b <= 100
+    #   Lmax(x - y) = 80 - 0 = 80
+    #   b=0 case: x - y <= 100 — vacuous (Lmax 80 <= 100)
+    #   b=1 case: x - y <= 100 + 1000 = 1100 — also vacuous
+    # Whole constraint redundant! Let me use rhs=50:
+    let src2 = """
+var 0..100: x;
+var 0..100: y;
+var bool: b;
+array [1..3] of int: c = [1, -1, -1000];
+constraint int_lin_le(c, [x, y, b], 50);
+constraint int_lin_le([1], [x], 80);
+constraint int_lin_le([1], [y], 30);
+solve satisfy;
+"""
+    # With x in 0..80, y in 0..30, b in {0,1}:
+    #   x - y - 1000*b <= 50
+    #   Lmax = 80, Lmin = -30
+    #   b=0: x - y <= 50 — active (Lmax=80 > 50)
+    #   b=1: x - y <= 50 + 1000 = 1050 — vacuous (Lmax=80 <= 1050)
+    # Detection should rewrite as: b=0 → x - y <= 50
+    let model = parseFzn(src2)
+    var tr = translate(model)
+    # Should detect at least one big-M pattern
+    var nCondLinear = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == ConditionalLinearType:
+        inc nCondLinear
+    check nCondLinear >= 1
+
+  test "big-M int_lin_le → ConditionalLinear (b=1 active, hoist pattern)":
+    # The hoist-benchmark cycle-return pattern, isolated:
+    #   r[i] - r[i-1] + M*B[i] <= f + M*Cap     (M = p_ub, Cap = 1)
+    # Concretely: 1*r2 + (-1)*r1 + 100*b <= 130 with r1, r2 in 0..100, b in {0,1}.
+    #   Lmax(r2 - r1) = 100 - 0 = 100.
+    #   b=0: r2 - r1 <= 130 — vacuous (Lmax=100 ≤ 130).
+    #   b=1: r2 - r1 + 100 <= 130 → r2 - r1 <= 30 — active.
+    # Detection should rewrite with activeGuardValue=1, activeRhs=30, and the
+    # search must respect the conditional: when b=1, r2-r1 ≤ 30; when b=0, no
+    # constraint between r2 and r1.
+    let src = """
+var 0..100: r1;
+var 0..100: r2;
+var bool: b;
+array [1..3] of int: c = [1, -1, 100];
+constraint int_lin_le(c, [r2, r1, b], 130);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # The constraint must have been emitted as ConditionalLinear (not Relational).
+    var nCondLinear = 0
+    var nRelational = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == ConditionalLinearType:
+        inc nCondLinear
+      if c.stateType == RelationalType:
+        inc nRelational
+    check nCondLinear == 1
+    check nRelational == 0
+    # Solve; the constraint should be satisfied either way (b=0 trivially, b=1
+    # with r2 ≤ r1 + 30). Verify the constraint is enforced.
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let r1 = tr.sys.assignment[tr.varPositions["r1"]]
+    let r2 = tr.sys.assignment[tr.varPositions["r2"]]
+    let b = tr.sys.assignment[tr.varPositions["b"]]
+    if b == 1:
+      check r2 - r1 <= 30
+    # b=0 has no constraint to check.
+
+  test "big-M int_lin_le redundant constraint dropped":
+    # When BOTH b=0 and b=1 cases are vacuous, the whole constraint is dropped.
+    let src = """
+var 0..10: x;
+var bool: b;
+array [1..2] of int: c = [1, 100];
+constraint int_lin_le(c, [x, b], 200);
+solve satisfy;
+"""
+    # x + 100*b <= 200, x in 0..10, b in {0,1}
+    # Lmax(x) = 10. b=0: 10 <= 200 vacuous. b=1: 10 <= 100 vacuous.
+    # Whole constraint should be dropped.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # No ConditionalLinear, no Relational
+    var nCondLinear = 0
+    var nRelevant = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == ConditionalLinearType:
+        inc nCondLinear
+      if c.stateType == RelationalType:
+        inc nRelevant
+    check nCondLinear == 0
+    check nRelevant == 0
+
+  test "guard fix cascades to dependent linear":
+    # End-to-end check that the big-M / repropagate pipeline produces a fully
+    # tightened model even when the cascade has multiple steps. Two int_lin_le
+    # constraints share a binary variable b:
+    #   (1) x - 100*b <= -1     with x in 5..10  → forces b=1
+    #   (2) y + 50*b <= 100     with y in 0..200 → after b=1: y <= 50
+    # Whether b is fixed by presolve's existing linear bounds propagation or
+    # by detectBigMImplicationLinLe, the *cascade* (b=1 → y<=50 via the second
+    # constraint) must complete before constraint translation. This test
+    # guards the full pipeline.
+    let src = """
+var 5..10: x;
+var 0..200: y;
+var bool: b;
+array [1..2] of int: c1 = [1, -100];
+array [1..2] of int: c2 = [1, 50];
+constraint int_lin_le(c1, [x, b], -1);
+constraint int_lin_le(c2, [y, b], 100);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # b should be fixed to 1.
+    let bPos = tr.varPositions["b"]
+    check tr.sys.baseArray.domain[bPos] == @[1]
+    # y should be tightened to 0..50 via the second constraint after b=1.
+    let yPos = tr.varPositions["y"]
+    let yDom = tr.sys.baseArray.domain[yPos]
+    check yDom.len > 0
+    check yDom[^1] == 50
+
+  test "big-M int_lin_le with infeasible case fixes guard":
+    # int_lin_le([10, 5], [x, b], 4) with x in 5..10, b in {0,1}:
+    #   10*x + 5*b <= 4
+    #   Lmin(10*x) = 50, Lmax(10*x) = 100.
+    #   b=0: 10*x <= 4 — INFEASIBLE (Lmin=50 > 4).
+    #   b=1: 10*x <= -1 — INFEASIBLE (Lmin=50 > -1).
+    # Both cases infeasible — model infeasible, no fixing.
+    # Use a different example where one case is feasible.
+    let src = """
+var 5..10: x;
+var bool: b;
+array [1..2] of int: c = [1, -100];
+constraint int_lin_le(c, [x, b], -1);
+solve satisfy;
+"""
+    # x - 100*b <= -1 with x in 5..10, b in {0,1}:
+    #   Lmin(x) = 5, Lmax(x) = 10.
+    #   b=0: x <= -1 — INFEASIBLE (Lmin=5 > -1).
+    #   b=1: x <= 99 — vacuous (Lmax=10 <= 99).
+    # → Force b=1, drop constraint.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # b should be fixed in the system: domain {1}.
+    let bPos = tr.varPositions["b"]
+    let bDom = tr.sys.baseArray.domain[bPos]
+    check bDom == @[1]
+
+  test "big-M int_lin_le rewriting solves correctly":
+    # Hoist-style pattern: x <= y + 30 + 1000*(1-b)
+    # rewritten as: x - y - 1000*b <= -970  (after moving 1000 to LHS, rhs = 30 - 1000)
+    # FZN: int_lin_le([1, -1, -1000], [x, y, b], -970)
+    # With x, y in 0..50, b in {0,1}:
+    #   Lmax(x - y) = 50
+    #   b=0: x - y <= -970, infeasible (Lmin=-50 > -970? -50 > -970, so feasible only when x - y is very small)
+    # Actually -970 is too tight. Use simpler example: b=0 forces x <= y, b=1 anything.
+    # int_lin_le([1, -1, -100], [x, y, b], 0)
+    #   = x - y - 100*b <= 0
+    # x, y in 0..10, b in {0,1}:
+    #   Lmax(x - y) = 10
+    #   b=0: x - y <= 0 — active (Lmax=10 > 0). Constraint: x <= y.
+    #   b=1: x - y <= 100 — vacuous (Lmax=10 <= 100).
+    let src = """
+var 0..10: x;
+var 0..10: y;
+var bool: b;
+array [1..3] of int: c = [1, -1, -100];
+constraint int_lin_le(c, [x, y, b], 0);
+constraint int_eq(b, 0);
+constraint int_lin_le([-1], [y], -3);
+constraint int_lin_le([-1], [x], -5);
+solve satisfy;
+"""
+    # b=0 forced, x>=5, y>=3. ConditionalLinear active: x <= y. So x<=y, x>=5, y>=3 → y>=5.
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+    let x = tr.sys.assignment[tr.varPositions["x"]]
+    let y = tr.sys.assignment[tr.varPositions["y"]]
+    check x >= 5
+    check y >= 3
+    check x <= y  # The conditional constraint must be satisfied
+
   test "fzn_alldifferent_except_0 basic":
     # 4 variables, domain 0..3, alldifferent_except_0 + sum constraint
     # Non-zero values must be distinct, zeros are allowed to repeat

@@ -1195,6 +1195,159 @@ proc detectConditionalLinearPatterns(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} conditional linear constraints (guard → linear_le)")
 
+proc detectBigMImplicationLinLe(tr: var FznTranslator) =
+    ## Detect int_lin_le constraints of the form  Σ cᵢ·xᵢ + M·b ≤ rhs
+    ## where exactly one variable b is binary {0,1}, and analyse each case
+    ## (b=0, b=1) for vacuity and infeasibility against the *post-presolve*
+    ## bounds of the other variables.
+    ##
+    ##   "Vacuous"     — Lmax ≤ rhs_case   (case is always satisfied).
+    ##   "Infeasible"  — Lmin > rhs_case   (case is never satisfied).
+    ##
+    ## Combined per-case state lets us either:
+    ##   - drop the constraint (both vacuous, or one vacuous + the other case
+    ##     is the one already forbidden by infeasibility),
+    ##   - **fix the guard** to the feasible value (one infeasible),
+    ##   - or rewrite as ConditionalLinear (one vacuous, the other feasible) so
+    ##     the search sees a magnitude-aware penalty in the active case instead
+    ##     of a flat reified inequality.
+    ##
+    ## Big-M pattern shows up whenever a model writes `b=v → linear` as
+    ## `linear ≤ rhs + M·(c-b)` — extremely common in MIP-style encodings.
+    var nDetected = 0
+    var nRedundant = 0
+    var nGuardFixed = 0
+    for ci in 0..<tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        let con = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        let varNames = tr.extractVarNames(con.args[1])
+        if varNames.len < 2 or varNames.len != coeffs.len: continue
+
+        # Find the (unique) binary variable
+        var binaryIdx = -1
+        var skip = false
+        for vi, vn in varNames:
+            let dom = tr.lookupTightenedDomain(vn)
+            if dom.len == 0: skip = true; break
+            if dom.len == 2 and dom[0] == 0 and dom[1] == 1:
+                if binaryIdx == -1:
+                    binaryIdx = vi
+                else:
+                    # Multiple binaries — not a single-guard big-M pattern
+                    skip = true; break
+        if skip or binaryIdx < 0: continue
+
+        # Compute Lmin/Lmax of the linear part excluding the binary
+        var Lmin = 0
+        var Lmax = 0
+        for vi, vn in varNames:
+            if vi == binaryIdx: continue
+            let dom = tr.lookupTightenedDomain(vn)
+            if dom.len == 0: skip = true; break
+            let lo = dom[0]
+            let hi = dom[^1]
+            let c = coeffs[vi]
+            if c >= 0:
+                Lmin += c * lo
+                Lmax += c * hi
+            else:
+                Lmin += c * hi
+                Lmax += c * lo
+        if skip: continue
+
+        let M = coeffs[binaryIdx]
+        let guardVar = varNames[binaryIdx]
+        # Skip if guard is a defined channel variable — its domain isn't ours
+        # to tighten and ConditionalLinear can't use it as a guard.
+        if guardVar in tr.definedVarNames: continue
+
+        # b=0: linear ≤ rhs      → vacuous iff Lmax ≤ rhs;   infeasible iff Lmin > rhs
+        # b=1: linear ≤ rhs - M  → vacuous iff Lmax ≤ rhs-M; infeasible iff Lmin > rhs-M
+        let case0Vacuous = Lmax <= rhs
+        let case1Vacuous = Lmax <= rhs - M
+        let case0Infeasible = Lmin > rhs
+        let case1Infeasible = Lmin > rhs - M
+
+        # Both vacuous → constraint redundant, drop it.
+        if case0Vacuous and case1Vacuous:
+            tr.definingConstraints.incl(ci)
+            inc nRedundant
+            continue
+
+        # If one case is infeasible, fix the guard. Caller benefit: removes a
+        # binary search variable, downstream constraints on the guard collapse.
+        if case0Infeasible and not case1Infeasible:
+            # b=0 forbidden → fix guard to 1.
+            tr.presolveDomains[guardVar] = @[1]
+            if case1Vacuous:
+                # Guard fixed AND active case vacuous → constraint is fully
+                # discharged; drop it.
+                tr.definingConstraints.incl(ci)
+            # else: leave the constraint to be emitted; with the guard fixed,
+            # downstream emission/translation evaluates it with a constant for
+            # the binary term.
+            inc nGuardFixed
+            continue
+        if case1Infeasible and not case0Infeasible:
+            tr.presolveDomains[guardVar] = @[0]
+            if case0Vacuous:
+                tr.definingConstraints.incl(ci)
+            inc nGuardFixed
+            continue
+        if case0Infeasible and case1Infeasible:
+            # Both cases infeasible — model is infeasible. Leave the constraint
+            # in place so the search can flag it; don't try to fix anything.
+            continue
+
+        # No infeasibility — check vacuity-driven big-M rewrite.
+        var activeGuardValue = -1
+        var activeRhs = 0
+        if case0Vacuous and not case1Vacuous:
+            # b=1 active: linear ≤ rhs - M
+            activeGuardValue = 1
+            activeRhs = rhs - M
+        elif case1Vacuous and not case0Vacuous:
+            # b=0 active: linear ≤ rhs
+            activeGuardValue = 0
+            activeRhs = rhs
+        else:
+            continue  # neither case vacuous — not a big-M pattern
+
+        # Build the active-case linear term (excluding the binary)
+        var activeCoeffs: seq[int]
+        var activeVars: seq[string]
+        for vi, vn in varNames:
+            if vi == binaryIdx: continue
+            activeCoeffs.add(coeffs[vi])
+            activeVars.add(vn)
+
+        tr.conditionalLinearPatterns.add((
+            coeffs: activeCoeffs,
+            varNames: activeVars,
+            rhs: activeRhs,
+            guardVarName: guardVar,
+            guardActiveValue: activeGuardValue,
+            boolClauseCi: -1,
+            reifCi: -1,
+            reifBoolName: ""
+        ))
+
+        tr.definingConstraints.incl(ci)
+        inc nDetected
+
+    if nDetected > 0 or nRedundant > 0 or nGuardFixed > 0:
+        stderr.writeLine(&"[FZN] Big-M int_lin_le: {nDetected} rewritten as ConditionalLinear, " &
+                          &"{nGuardFixed} guards fixed by infeasibility, " &
+                          &"{nRedundant} redundant constraints dropped")
+
 proc referencesIdent(expr: FznExpr, name: string): bool =
     ## Check if a FznExpr tree references a given identifier name.
     case expr.kind

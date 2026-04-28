@@ -159,7 +159,12 @@ solve satisfy;
     let vz = tr.sys.assignment[tr.varPositions["z"]]
     check vy - vz <= 0  # y <= z
 
-  test "non-binary vars fall through to RelationalType":
+  test "non-binary vars do not become PseudoBoolLinLe":
+    # int_lin_le([1,-1],[x,y],2) with x in 0..5, y in 0..1 is x - y <= 2.
+    # After presolve tightens x to 0..3 (since x <= 2+y, max y=1), the constraint
+    # becomes a big-M implication: y=0 → x <= 2 (the y=1 case is vacuous on x's
+    # tightened domain). The detector emits a ConditionalLinear instead. Either
+    # way, this is NOT a PseudoBoolLinLe and the constraint is enforced.
     let src = """
 var 0..5: x;
 var 0..1: y;
@@ -170,12 +175,12 @@ solve satisfy;
     var tr = translate(model)
 
     var nPB = 0
-    var nRel = 0
+    var nEnforced = 0
     for c in tr.sys.baseArray.constraints:
       if c.stateType == PseudoBoolLinLeType: inc nPB
-      if c.stateType == RelationalType: inc nRel
+      if c.stateType in {RelationalType, ConditionalLinearType}: inc nEnforced
     check nPB == 0
-    check nRel >= 1
+    check nEnforced >= 1
 
 suite "Early tautological detection for int_lin_le_reif":
 

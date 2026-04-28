@@ -4969,3 +4969,61 @@ proc presolve*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated, {tr.presolveDomains.len} domains tightened")
     if tr.reachableValuesTightened > 0:
         stderr.writeLine(&"[FZN] Presolve: reachable-values propagation tightened {tr.reachableValuesTightened} domains ({tr.reachableValuesRemoved} values removed)")
+
+proc repropagateBounds*(tr: var FznTranslator) =
+    ## Run linear bounds propagation + big-M indicator pruning AFTER detection
+    ## passes have potentially tightened `tr.presolveDomains`. The initial
+    ## `presolve()` runs before detection, so any domain tightenings produced
+    ## by detection passes (e.g., guard fixings from `detectBigMImplicationLinLe`)
+    ## don't get a chance to cascade through the rest of the model.
+    ##
+    ## This pass picks up the current state and runs a small fix-point loop on
+    ## the cheap, broadly-applicable propagators only (no AC, no element/table,
+    ## no reif resolution — those are best-effort, and the search will find
+    ## what's left).
+    var domains = tr.initPresolveDomains()
+    # Overlay detection-time tightenings.
+    for name, dom in tr.presolveDomains:
+        domains[name] = dom
+
+    var fixedVars = initTable[string, int]()
+    for name, val in tr.paramValues:
+        fixedVars[name] = val
+    for name, dom in domains:
+        if dom.len == 1:
+            fixedVars[name] = dom[0]
+
+    var eliminated = initPackedSet[int]()
+    # Seed eliminated from detection consumption so we don't redo work on
+    # already-discharged constraints.
+    for ci in tr.definingConstraints:
+        eliminated.incl(ci)
+
+    var infeasible = false
+    var nIterations = 0
+    let nFixedBefore = fixedVars.len
+    let nTightenedBefore = tr.presolveDomains.len
+
+    for iteration in 0..<5:
+        var changed = false
+        if fixSingletons(domains, fixedVars):
+            changed = true
+        if boundsPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+        if bigMDomainPruning(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+        inc nIterations
+        if not changed: break
+
+    # Write back the tightened state.
+    tr.applyPresolveResults(domains, fixedVars, eliminated)
+
+    let nFixedAfter = fixedVars.len
+    let nTightenedAfter = tr.presolveDomains.len
+    let nNewFixed = nFixedAfter - nFixedBefore
+    let nNewTightened = nTightenedAfter - nTightenedBefore
+    if nNewFixed > 0 or nNewTightened > 0:
+        stderr.writeLine(&"[FZN] Repropagate: {nIterations} iterations, " &
+                          &"+{nNewFixed} vars fixed, +{nNewTightened} domains tightened")

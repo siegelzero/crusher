@@ -57,6 +57,7 @@ import test_min_max_constraints
 import test_mip
 import test_mols
 import test_movie_scheduling
+import test_multi_machine_setup
 import test_multiknapsack
 import test_n_queens
 import test_negative_domains

@@ -208,11 +208,26 @@ proc resolveVarOrExpr*(tr: FznTranslator, name: string): AlgebraicExpression[int
 
 # --- Domain bounds helpers ---
 
+proc lookupTightenedDomain*(tr: var FznTranslator, varName: string): seq[int] =
+    ## Look up a variable's domain, preferring the presolve-tightened domain
+    ## (`tr.presolveDomains`) over the raw FZN declaration.
+    if varName in tr.presolveDomains:
+        return tr.presolveDomains[varName]
+    return tr.lookupVarDomain(varName)
+
 proc getDomainBounds*(tr: var FznTranslator, varName: string):
     tuple[domain: seq[int], lo: int, hi: int] =
     ## Looks up a variable's domain and returns (domain, lo, hi).
     ## Returns empty domain if not found. Domain must be sorted.
     let domain = tr.lookupVarDomain(varName)
+    if domain.len == 0:
+        return (@[], 0, 0)
+    return (domain, domain[0], domain[^1])
+
+proc getTightenedBounds*(tr: var FznTranslator, varName: string):
+    tuple[domain: seq[int], lo: int, hi: int] =
+    ## Same as getDomainBounds but consults presolve-tightened domains first.
+    let domain = tr.lookupTightenedDomain(varName)
     if domain.len == 0:
         return (@[], 0, 0)
     return (domain, domain[0], domain[^1])

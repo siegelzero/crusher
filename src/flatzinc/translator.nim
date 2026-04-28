@@ -1014,6 +1014,12 @@ proc translate*(model: FznModel): FznTranslator =
     # MUST run after detectDisjunctivePairs (which consumes 2-literal patterns where BOTH are reif)
     # MUST run before detectReifChannels so int_lin_le_reif channelization doesn't consume these
     result.detectConditionalLinearPatterns()
+    # Detect big-M implication patterns in plain int_lin_le: a single binary guard
+    # variable with a coefficient large enough that one of its values renders the
+    # inequality vacuous given the other variables' bounds. Rewrite as
+    # ConditionalLinear so the search sees a magnitude-aware penalty in the
+    # active case instead of a flat reified inequality.
+    result.detectBigMImplicationLinLe()
     # Substitute linear channel variables in disjunctive clause terms (reduces positions)
     result.substituteChannelVarsInClauses()
     # Detect small-domain product patterns (int_times with small operand → case-split)
@@ -1379,6 +1385,13 @@ proc translate*(model: FznModel): FznTranslator =
 
     # Detect NAND redundancy between int_lin_le and bool_clause
     result.detectNandRedundancy()
+
+    # Re-run cheap bound propagators on the post-detection state. Detection
+    # passes (e.g. detectBigMImplicationLinLe) can fix guard variables and
+    # tighten domains *after* the initial presolve runs, but no propagator
+    # gets to cascade those tightenings through the rest of the model unless
+    # we re-fire here.
+    result.repropagateBounds()
 
     # Dead element constraint elimination: mark array_int_element constraints as consumed
     # when their result variable has no surviving (non-consumed) references besides
