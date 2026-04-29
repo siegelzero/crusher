@@ -1225,15 +1225,18 @@ proc translate*(model: FznModel): FznTranslator =
     for intName, boolName in result.bool2intIdentityAliases:
         if boolName in result.varPositions:
             result.definedVarExprs[intName] = result.getExpr(result.varPositions[boolName])
-    # Build expressions for defined variables using the now-created positions
-    # (must run before emitMaxFromLinLeChannels which resolves source vars as expressions)
-    result.buildDefinedExpressions()
     # Build expressions for element channel aliases (duplicate → original channel's position)
+    # MUST run before buildDefinedExpressions: int_lin_eq defined-vars may reference
+    # an aliased element channel as a dependency, and the dependency-availability
+    # check requires the alias to already have a position OR an expression.
     for aliasName, originalName in result.elementChannelAliases:
         if originalName in result.varPositions:
             result.definedVarExprs[aliasName] = result.getExpr(result.varPositions[originalName])
         elif originalName in result.definedVarExprs:
             result.definedVarExprs[aliasName] = result.definedVarExprs[originalName]
+    # Build expressions for defined variables using the now-created positions
+    # (must run before emitMaxFromLinLeChannels which resolves source vars as expressions)
+    result.buildDefinedExpressions()
     # Build expressions for equality copy aliases (copy → original's expression)
     for copyName, originalName in result.equalityCopyAliases:
         if originalName in result.varPositions:

@@ -483,6 +483,59 @@ solve minimize objective;
     let objVal = objExpr.evaluate(tr.sys.assignment)
     check objVal == 3
 
+  test "deduplicated element channel alias resolves int_lin_eq dependency":
+    # Regression test for translator ordering bug: when two array_int_element
+    # constraints share the same (index, const-array) key, the second is
+    # deduplicated into elementChannelAliases and added to definedVarNames
+    # WITHOUT a position. If an int_lin_eq defined-var depends on the alias,
+    # the alias's expression must be registered in definedVarExprs BEFORE
+    # buildDefinedExpressions runs — otherwise the dependency-availability
+    # check fails (alias is in definedVarNames but not in varPositions /
+    # definedVarExprs / paramValues), the dependent expression never gets
+    # built, and downstream resolveExprArg throws KeyError.
+    #
+    # Model: idx in 1..3 indexes two identical const arrays tab=[3,5,7],
+    # producing e1 and e2 (e2 deduplicated as alias of e1). y = e2 + 10
+    # is defined by int_lin_eq; y is then used as the result of another
+    # element constraint (b[idx2] = y) so it must resolve.
+    let src = """
+var 1..3: idx;
+var 3..7: e1:: is_defined_var:: var_is_introduced;
+var 3..7: e2:: is_defined_var:: var_is_introduced;
+var 13..17: y:: is_defined_var:: var_is_introduced;
+var 1..3: idx2;
+array [1..3] of int: tab = [3,5,7];
+array [1..3] of int: tab2 = [3,5,7];
+array [1..3] of int: ytab = [13,15,17];
+constraint array_int_element(idx, tab, e1):: defines_var(e1);
+constraint array_int_element(idx, tab2, e2):: defines_var(e2);
+constraint int_lin_eq([1, -1], [y, e2], 10):: defines_var(y);
+constraint array_int_element(idx2, ytab, y);
+constraint int_eq(idx, idx2);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # e2 was deduplicated into an alias of e1
+    check "e2" in tr.elementChannelAliases
+    # The alias's expression was registered (the fix's required pre-condition)
+    check "e2" in tr.definedVarExprs
+    # The dependent int_lin_eq defined-var got its expression built
+    # (this is what the bug broke — y was missing from definedVarExprs)
+    check "y" in tr.definedVarExprs
+    # y has no position (defined var, eliminated)
+    check "y" notin tr.varPositions
+
+    # End-to-end: solve and verify y = e2 + 10 holds for any consistent idx
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let idxVal = tr.sys.assignment[tr.varPositions["idx"]]
+    let idx2Val = tr.sys.assignment[tr.varPositions["idx2"]]
+    check idxVal == idx2Val
+    let tabVals = [3, 5, 7]
+    let yTabVals = [13, 15, 17]
+    check yTabVals[idx2Val - 1] == tabVals[idxVal - 1] + 10
+
   test "defined vars in var-indexed arrays rescued as channels":
     # Regression test: defined vars (is_defined_var, no position) appearing in
     # arrays indexed by variable expressions (array_var_int_element) must be

@@ -1259,11 +1259,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     state.assignment = newSeq[T](carray.len)
 
-    # Collect positions belonging to inverse groups so we skip them in normal random init
+    # Collect positions belonging to inverse groups so we skip them in normal random init.
+    # Build a position→group-indices map so seed clamping can mark whole groups for
+    # involution regeneration (clamping a single position would leave the involution
+    # invariant broken).
     var inverseGroupPositions: PackedSet[int]
-    for group in carray.inverseGroups:
+    var positionToInverseGroups = initTable[int, seq[int]]()
+    for gi, group in carray.inverseGroups:
         for pos in group.positions:
             inverseGroupPositions.incl(pos)
+            positionToInverseGroups.mgetOrPut(pos, @[]).add(gi)
+    var clampedInverseGroups: PackedSet[int]
 
     for pos in carray.allPositions():
         if initialAssignment.len > 0:
@@ -1271,13 +1277,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # comes from a previous optimization iteration: tightenReducedDomain
             # may have shrunk the domain after the seed was recorded. Channel
             # positions are recomputed below by the channel fixed-point, so we
-            # only need to validate non-channel positions.
+            # only need to validate non-channel positions. For inverse-group
+            # positions we record the affected group so the involution generator
+            # below can rebuild a valid permutation rather than leaving a single
+            # randomly-clamped value that breaks the involution invariant.
             if pos in carray.channelPositions:
                 state.assignment[pos] = initialAssignment[pos]
             else:
                 let dom = state.sharedDomain[][pos]
                 if dom.len > 0 and initialAssignment[pos] notin dom:
-                    state.assignment[pos] = sample(dom)
+                    if pos in inverseGroupPositions:
+                        for gi in positionToInverseGroups[pos]:
+                            clampedInverseGroups.incl(gi)
+                        # Placeholder; overwritten by involution generator below
+                        state.assignment[pos] = dom[0]
+                    else:
+                        case initStrategy
+                        of isRandom:    state.assignment[pos] = sample(dom)
+                        of isDomainMin: state.assignment[pos] = dom[0]
+                        of isDomainMax: state.assignment[pos] = dom[^1]
                 else:
                     state.assignment[pos] = initialAssignment[pos]
         elif pos in carray.channelPositions:
@@ -1293,9 +1311,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             of isDomainMin: state.assignment[pos] = dom[0]
             of isDomainMax: state.assignment[pos] = dom[^1]
 
-    # Generate random involutions for inverse group positions
-    if initialAssignment.len == 0 and carray.inverseGroups.len > 0:
-        for group in carray.inverseGroups:
+    # Generate random involutions for inverse group positions.
+    # When seeded, only regenerate groups whose seed values were clamped
+    # (un-clamped groups already have a valid involution from the previous
+    # iteration's solution).
+    let regenAllGroups = initialAssignment.len == 0
+    if (regenAllGroups or clampedInverseGroups.len > 0) and carray.inverseGroups.len > 0:
+        for gi, group in carray.inverseGroups:
+            if not regenAllGroups and gi notin clampedInverseGroups:
+                continue
             let n = group.positions.len
             let offset = group.valueOffset
             # Generate a random involution (self-inverse permutation) via shuffle+pair

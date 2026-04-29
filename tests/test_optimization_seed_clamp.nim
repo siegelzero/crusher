@@ -44,6 +44,92 @@ suite "Optimization seed clamping":
         check state.assignment[2] == 0
         check state.assignment[3] == 1
 
+    test "newTabuState honors initStrategy (isDomainMin) when clamping":
+        # Verify that out-of-domain seed values are replaced according to the
+        # caller's initStrategy, rather than always sampled randomly.
+        var system = initConstraintSystem[int]()
+        let xs = system.newConstrainedSequence(2)
+        xs.setDomain(toSeq(0..5))
+        system.addConstraint(sum(xs) <= 10)
+
+        system.baseArray.reducedDomain = newSeq[seq[int]](2)
+        system.baseArray.reducedDomain[0] = @[2, 3, 4]
+        system.baseArray.reducedDomain[1] = @[0, 1]
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
+
+        # Both seed values are out-of-domain.
+        let staleSeed = @[5, 3]
+
+        var state: TabuState[int]
+        new(state)
+        state.init(system.baseArray, initialAssignment = staleSeed,
+                   initStrategy = isDomainMin)
+
+        check state.assignment[0] == 2  # dom[0], not random
+        check state.assignment[1] == 0  # dom[0], not random
+
+    test "newTabuState honors initStrategy (isDomainMax) when clamping":
+        var system = initConstraintSystem[int]()
+        let xs = system.newConstrainedSequence(2)
+        xs.setDomain(toSeq(0..5))
+        system.addConstraint(sum(xs) <= 10)
+
+        system.baseArray.reducedDomain = newSeq[seq[int]](2)
+        system.baseArray.reducedDomain[0] = @[2, 3, 4]
+        system.baseArray.reducedDomain[1] = @[0, 1]
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
+
+        let staleSeed = @[0, 5]
+
+        var state: TabuState[int]
+        new(state)
+        state.init(system.baseArray, initialAssignment = staleSeed,
+                   initStrategy = isDomainMax)
+
+        check state.assignment[0] == 4  # dom[^1]
+        check state.assignment[1] == 1  # dom[^1]
+
+    test "newTabuState regenerates involution when seed clamping is needed":
+        # When a seeded position belongs to an inverse group and its seed value
+        # is out-of-domain, single-position clamping would leave the involution
+        # invariant broken. The fix re-runs the involution generator for the
+        # affected group so the result is a valid self-inverse permutation in
+        # the tightened domain.
+        proc isValidInvolution(assignment: seq[int],
+                               positions: seq[int],
+                               offset: int): bool =
+            for i in 0..<positions.len:
+                let v = assignment[positions[i]]
+                let j = v + offset
+                if j < 0 or j >= positions.len:
+                    return false
+                if assignment[positions[j]] != i - offset:
+                    return false
+            return true
+
+        var system = initConstraintSystem[int]()
+        let xs = system.newConstrainedSequence(4)
+        xs.setDomain(toSeq(0..3))
+        system.addConstraint(allDifferent(xs))
+        system.baseArray.addInverseGroup(toSeq(0..<4), 0)
+
+        system.baseArray.reducedDomain = newSeq[seq[int]](4)
+        for i in 0..<4:
+            system.baseArray.reducedDomain[i] = toSeq(0..3)
+        # Tighten position 2 to {0, 1}: the seed's value 3 there is now out-of-domain.
+        system.baseArray.reducedDomain[2] = @[0, 1]
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
+
+        # Stale double-swap involution that was valid before tightening.
+        let staleSeed = @[1, 0, 3, 2]
+
+        let state = newTabuState[int](system.baseArray, staleSeed)
+
+        let positions = toSeq(0..<4)
+        check isValidInvolution(state.assignment, positions, 0)
+        for pos in positions:
+            check state.assignment[pos] in system.baseArray.reducedDomain[pos]
+
     test "minimize binary search survives domain tightening between iterations":
         # End-to-end check that the optimizer's binary search no longer crashes
         # when tightenReducedDomain shrinks a position's domain after the seed
