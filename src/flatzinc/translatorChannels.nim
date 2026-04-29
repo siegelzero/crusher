@@ -1739,15 +1739,34 @@ proc buildCaseAnalysisChannelBindings(tr: var FznTranslator) =
 
 proc buildConditionalSourceChannelBindings(tr: var FznTranslator) =
     ## Builds channel bindings for conditional variable-source patterns.
-    ## Creates two bindings per target:
-    ##   1. src_idx = element(condVar, sourceMap)  (constant-array element)
-    ##   2. target = var_element(src_idx, sourceArray)  (variable-element)
+    ## Two shapes:
+    ##   • Legacy (sourceArrayName + sourceMap): two bindings —
+    ##       1. src_idx = element(condVar, sourceMap)  (constant-array element)
+    ##       2. target  = var_element(src_idx, sourceArray)  (variable-element)
+    ##   • Synthetic (sourceVars per condDom position): one direct binding —
+    ##       target = var_element(condVar - condDomMin, sourceVars)
+    ##     Used when the source vars come from different declared arrays.
     var nBuilt = 0
     for def in tr.conditionalSourceDefs:
         if def.targetVarName notin tr.varPositions: continue
         if def.condVarName notin tr.varPositions: continue
         let targetPos = tr.varPositions[def.targetVarName]
         let condPos = tr.varPositions[def.condVarName]
+
+        if def.sourceVars.len > 0:
+            # Synthetic shape: build the var_element directly from sourceVars.
+            var elems: seq[ArrayElement[int]]
+            var allOk = true
+            for vn in def.sourceVars:
+                if vn notin tr.varPositions:
+                    allOk = false; break
+                elems.add(ArrayElement[int](isConstant: false,
+                    variablePosition: tr.varPositions[vn]))
+            if not allOk: continue
+            let idxExpr = tr.sys.baseArray[condPos] - def.condDomMin
+            tr.sys.baseArray.addChannelBinding(targetPos, idxExpr, elems)
+            inc nBuilt
+            continue
 
         # Create synthetic source-index variable
         let srcIdxVarName = "CRUSHER_SRC_IDX_" & def.targetVarName

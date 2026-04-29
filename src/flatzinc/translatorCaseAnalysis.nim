@@ -1128,29 +1128,31 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
     ##   Creates: src_idx = element(C, source_map)  (constant-array channel)
     ##            T = var_element(src_idx, A)         (variable-element channel)
 
-    # Step 1: Build eqReifMap
+    # Step 1: Build eqReifMap. Scan the entire constraint list (not just
+    # reifChannelDefs) — earlier passes such as detectDisjunctivePairs may have
+    # marked some int_eq_reif constraints as defining (consumed for refcount=1
+    # bool vars), but the bool var → (sourceVar, testVal) mapping is still
+    # valid here and is needed to identify cond reifs in disjunctive clauses.
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
-    for ci in tr.reifChannelDefs:
-        let con = tr.model.constraints[ci]
+    for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
+        if name != "int_eq_reif": continue
         if con.args.len < 3 or con.args[2].kind != FznIdent: continue
         let resultVar = con.args[2].ident
-        if name == "int_eq_reif":
-            if con.args[0].kind != FznIdent: continue
-            eqReifMap[resultVar] = (sourceVar: con.args[0].ident, testVal: con.args[1])
+        if con.args[0].kind != FznIdent: continue
+        eqReifMap[resultVar] = (sourceVar: con.args[0].ident, testVal: con.args[1])
 
     if eqReifMap.len == 0: return
 
-    # Step 2: Collect all int_eq_reif(T, V_k, B_k) where both T and V_k are variables
-    # Group by target variable T.
+    # Step 2: Collect all int_eq_reif(T, V_k, B_k) where both T and V_k are
+    # variables. Group by target variable T.
     type EqReifEntry = object
         targetVar: string    # T (arg[0])
         sourceVar: string    # V_k (arg[1])
         boolVar: string      # B_k (arg[2])
     var eqReifByTarget: Table[string, seq[EqReifEntry]]
 
-    for ci in tr.reifChannelDefs:
-        let con = tr.model.constraints[ci]
+    for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if con.args.len < 3: continue
@@ -1263,6 +1265,61 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
     # Note: do NOT skip definingConstraints — AND constraints may be consumed as channels
     # but we still need their structure for propagation.
     # Run as fixpoint since AND results may chain through bool_clause.
+
+    # Helper: from a 2-literal no-neg clause [a, b], if one literal is a cond
+    # reif (cond == v0), the other must hold whenever cond ≠ v0. So its
+    # condVals are condDom \ {v0}. Generalises to multi-pos clauses where all
+    # but one literal pin a single cond variable to specific values.
+    proc derive2LitClauseCondVals(tr: var FznTranslator, posElems: seq[FznExpr],
+                                  eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]],
+                                  setInReifCondMap: Table[string, tuple[sourceVar: string, condVals: seq[int]]],
+                                  boolToCondVals: var Table[string, tuple[condVar: string, condVals: seq[int]]]) =
+        if posElems.len < 2: return
+        # Try each literal as the "unmapped target": all others must resolve to
+        # condition vals on a common cond variable.
+        for unmappedIdx in 0..<posElems.len:
+            let target = posElems[unmappedIdx]
+            if target.kind != FznIdent: continue
+            if target.ident in boolToCondVals: continue
+            var condVar = ""
+            var pinned: HashSet[int]
+            var ok = true
+            for j in 0..<posElems.len:
+                if j == unmappedIdx: continue
+                let lit = posElems[j]
+                if lit.kind != FznIdent: ok = false; break
+                # The other literal must be a known cond reif.
+                if lit.ident in eqReifMap:
+                    let info = eqReifMap[lit.ident]
+                    let v = try: tr.resolveIntArg(info.testVal)
+                            except ValueError, KeyError:
+                                ok = false; break
+                    if condVar == "": condVar = info.sourceVar
+                    elif condVar != info.sourceVar: ok = false; break
+                    pinned.incl(v)
+                elif lit.ident in setInReifCondMap:
+                    let info = setInReifCondMap[lit.ident]
+                    if condVar == "": condVar = info.sourceVar
+                    elif condVar != info.sourceVar: ok = false; break
+                    for v in info.condVals: pinned.incl(v)
+                else:
+                    ok = false; break
+            if not ok or condVar == "": continue
+            # The target must be true whenever cond ∉ pinned.
+            let condDom = tr.lookupVarDomain(condVar)
+            if condDom.len == 0: continue
+            var negCondVals: seq[int]
+            for v in condDom:
+                if v notin pinned: negCondVals.add(v)
+            if negCondVals.len == 0: continue
+            # Self-cond filter: if the target is itself a cond reif on the same
+            # variable, don't override (leave it for direct cond mapping).
+            if target.ident in eqReifMap and
+               eqReifMap[target.ident].sourceVar == condVar: continue
+            if target.ident in setInReifCondMap and
+               setInReifCondMap[target.ident].sourceVar == condVar: continue
+            boolToCondVals[target.ident] = (condVar: condVar, condVals: negCondVals)
+
     var prevCondCount = -1
     while boolToCondVals.len != prevCondCount:
         prevCondCount = boolToCondVals.len
@@ -1286,7 +1343,13 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             let posArg = con.args[0]
             let negArg = con.args[1]
             if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
-            if negArg.elems.len == 0: continue
+            if negArg.elems.len == 0:
+                # No-neg clause: derive complementary condVals from cond reifs in
+                # the positive literals. Captures the "else" branch of patterns
+                # like (cond==v0) ∨ (T==V_else).
+                derive2LitClauseCondVals(tr, posArg.elems, eqReifMap,
+                                         setInReifCondMap, boolToCondVals)
+                continue
             let (ok, condVar, condVals) = resolveNegLiterals(negArg, eqReifMap, setInReifCondMap, tr)
             if not ok: continue
             mapPosLiterals(posArg, condVar, condVals, eqReifMap, setInReifCondMap, boolToCondVals)
@@ -1389,7 +1452,37 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             commonArrayCandidates = nextArrayNames
 
         if commonArrayCandidates.len == 0:
-            inc dbgNoArray
+            # No declared array contains all source vars. Build a synthetic
+            # source-var list keyed by condDom index instead. This handles
+            # patterns where the "then" branch reads from one array and the
+            # "else" branch reads from another (or from a free variable).
+            let condDom = tr.lookupVarDomain(condVar)
+            if condDom.len == 0: inc dbgNoArray; continue
+            var condValToIdx: Table[int, int]
+            for i, v in condDom: condValToIdx[v] = i
+            var synthSources = newSeq[string](condDom.len)
+            var coveredCount = 0
+            for c in candidates:
+                if c.condVal notin condValToIdx: continue
+                let di = condValToIdx[c.condVal]
+                if synthSources[di] == "":
+                    synthSources[di] = c.sourceVar
+                    inc coveredCount
+            if coveredCount == 0: inc dbgNoArray; continue
+            # Fill uncovered slots with the target itself (tautological "T = T").
+            # Without this the channel would over-constrain: search would assume
+            # T equals some specific source for cond values we have no info on.
+            for i in 0..<synthSources.len:
+                if synthSources[i] == "": synthSources[i] = targetVar
+            tr.channelVarNames.incl(targetVar)
+            tr.conditionalSourceDefs.add(ConditionalSourceDef(
+                targetVarName: targetVar,
+                condVarName: condVar,
+                sourceArrayName: "",
+                sourceMap: @[],
+                condDomMin: min(condDom),
+                sourceVars: synthSources))
+            inc nTargets
             continue
 
         # For single candidates: require the target to also be in a common array
@@ -1497,6 +1590,258 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
         &" (skipped: alreadyChannel={dbgSkippedChannel} fewEqReifs={dbgSkippedFew}" &
         &" fewMapped={dbgTooFewMapped}[noCond={dbgTotalNoCond} noArr={dbgTotalNoArr} diffCond={dbgTotalDiffCond}]" &
         &" noArray={dbgNoArray} other={dbgOther})")
+
+
+proc pruneClausesImpliedByConditionalSource*(tr: var FznTranslator) =
+    ## Removes bool_clauses and generalized disjunctive clauses that are
+    ## tautologically satisfied once a ConditionalSourceDef has been built.
+    ##
+    ## A ConditionalSourceDef T = sourceArr[sourceMap[idx(C)]-1] makes any
+    ## clause whose literals are all of the form
+    ##   • int_eq_reif(C, val, b)        (a "cond reif")
+    ##   • int_eq_reif(T, V, b) where V = sourceArr[i]  (a "target-eq-member reif")
+    ## redundant when the clause covers every value v ∈ dom(C).
+    ##
+    ## The pos/neg structure is honoured:
+    ##   pos lit b is satisfied at v iff the underlying equality holds at v;
+    ##   neg lit b is satisfied at v iff the equality is *provably* false there.
+    ## We can prove a cond reif false (cond domain is concrete), but we can't
+    ## prove target-equality false in general — so neg lits over targetEqMember
+    ## reifs are treated as "doesn't help" and the clause must be covered by
+    ## another literal.
+    if tr.conditionalSourceDefs.len == 0: return
+
+    # Build int_eq_reif lookup over the whole model (constraints may already be
+    # marked defining by detectReifChannels — that's fine, we still read them).
+    type ReifKind = enum rkConst, rkVarVar
+    type ReifInfo = object
+        kind: ReifKind
+        varA: string         # for rkConst: the variable side; for rkVarVar: arg0
+        constVal: int        # for rkConst
+        varB: string         # for rkVarVar: arg1
+    var reifInfo: Table[string, ReifInfo]
+    for ci, con in tr.model.constraints:
+        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        let boolVar = con.args[2].ident
+        let argA = con.args[0]
+        let argB = con.args[1]
+        let aIsVar = argA.kind == FznIdent and argA.ident notin tr.paramValues
+        let bIsVar = argB.kind == FznIdent and argB.ident notin tr.paramValues
+        let aIsConst = argA.kind == FznIntLit or
+            (argA.kind == FznIdent and argA.ident in tr.paramValues)
+        let bIsConst = argB.kind == FznIntLit or
+            (argB.kind == FznIdent and argB.ident in tr.paramValues)
+        if aIsVar and bIsConst:
+            let v = try: tr.resolveIntArg(argB) except ValueError, KeyError: continue
+            reifInfo[boolVar] = ReifInfo(kind: rkConst, varA: argA.ident, constVal: v)
+        elif bIsVar and aIsConst:
+            let v = try: tr.resolveIntArg(argA) except ValueError, KeyError: continue
+            reifInfo[boolVar] = ReifInfo(kind: rkConst, varA: argB.ident, constVal: v)
+        elif aIsVar and bIsVar:
+            reifInfo[boolVar] = ReifInfo(kind: rkVarVar, varA: argA.ident, varB: argB.ident)
+
+    if reifInfo.len == 0: return
+
+    # Build varArrayMembers — same shape used in detectConditionalSourceChannels.
+    var varArrayMembers: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var members: seq[string]
+            for e in decl.value.elems:
+                if e.kind == FznIdent: members.add(e.ident)
+                else: members.add("")
+            varArrayMembers[decl.name] = members
+
+    # For fast clause-vs-def matching, group ConditionalSourceDefs by target var.
+    var defsByTarget: Table[string, seq[int]]
+    for di, def in tr.conditionalSourceDefs:
+        defsByTarget.mgetOrPut(def.targetVarName, @[]).add(di)
+
+    type LitKind = enum lkUnknown, lkCondEq, lkTargetEqVar
+    type LitInfo = object
+        kind: LitKind
+        condVal: int    # for lkCondEq
+        eqVar: string   # for lkTargetEqVar — the V in (T == V), known to belong
+                        # to the def's source list
+
+    proc classifyLit(boolVar: string, def: ConditionalSourceDef,
+                     reifInfo: Table[string, ReifInfo],
+                     arrayMembers: seq[string]): LitInfo =
+        ## Classifies a clause literal against a ConditionalSourceDef. The
+        ## literal must reference either the cond var (a "cond reif") or the
+        ## target var paired with a known source var (a "target-eq reif"). For
+        ## the latter the source must appear in the def's source list — either
+        ## the legacy declared array (arrayMembers) or the synthetic sourceVars.
+        if boolVar notin reifInfo: return LitInfo(kind: lkUnknown)
+        let info = reifInfo[boolVar]
+        case info.kind:
+        of rkConst:
+            if info.varA == def.condVarName:
+                return LitInfo(kind: lkCondEq, condVal: info.constVal)
+            return LitInfo(kind: lkUnknown)
+        of rkVarVar:
+            var V = ""
+            if info.varA == def.targetVarName: V = info.varB
+            elif info.varB == def.targetVarName: V = info.varA
+            if V == "": return LitInfo(kind: lkUnknown)
+            if def.sourceVars.len > 0:
+                for sv in def.sourceVars:
+                    if sv == V: return LitInfo(kind: lkTargetEqVar, eqVar: V)
+                return LitInfo(kind: lkUnknown)
+            for m in arrayMembers:
+                if m == V: return LitInfo(kind: lkTargetEqVar, eqVar: V)
+            return LitInfo(kind: lkUnknown)
+
+    proc clauseImpliedByDef(posBools, negBools: seq[string],
+                            def: ConditionalSourceDef,
+                            condDom: seq[int],
+                            reifInfo: Table[string, ReifInfo],
+                            arrayMembers: seq[string]): bool =
+        ## A clause is implied by the def iff for every cond value v ∈ condDom,
+        ## at least one literal evaluates to TRUE under T = source-at-v.
+        ## - lkCondEq pos: true iff condVal == v
+        ## - lkTargetEqVar pos: true iff source-at-v *is the same variable* as
+        ##   the lit's eqVar (proves T == V definitively; differing variables
+        ##   are treated as unknown ⇒ doesn't help, even if values might be
+        ##   equal at runtime).
+        ## - lkCondEq neg: true iff v ≠ condVal
+        ## - lkTargetEqVar neg: can't prove non-equality without extra
+        ##   reasoning ⇒ never helps.
+        var posLits, negLits: seq[LitInfo]
+        for b in posBools:
+            let li = classifyLit(b, def, reifInfo, arrayMembers)
+            if li.kind == lkUnknown: return false
+            posLits.add(li)
+        for b in negBools:
+            let li = classifyLit(b, def, reifInfo, arrayMembers)
+            negLits.add(li)
+
+        for vIdx, v in condDom:
+            var sourceAtV = ""
+            if def.sourceVars.len > 0:
+                if vIdx >= def.sourceVars.len: return false
+                sourceAtV = def.sourceVars[vIdx]
+            else:
+                if vIdx >= def.sourceMap.len: return false
+                let tSlot = def.sourceMap[vIdx] - 1
+                if tSlot < 0 or tSlot >= arrayMembers.len: return false
+                sourceAtV = arrayMembers[tSlot]
+            var covered = false
+            for lit in posLits:
+                case lit.kind
+                of lkCondEq:
+                    if lit.condVal == v: covered = true; break
+                of lkTargetEqVar:
+                    if lit.eqVar == sourceAtV: covered = true; break
+                else: discard
+            if covered: continue
+            for lit in negLits:
+                case lit.kind
+                of lkCondEq:
+                    if lit.condVal != v: covered = true; break
+                else: discard
+            if not covered: return false
+        return true
+
+    # Look-up for each ConditionalSourceDef: condDom + arrayMembers.
+    var defCondDoms: seq[seq[int]] = newSeq[seq[int]](tr.conditionalSourceDefs.len)
+    var defArrayMembers: seq[seq[string]] = newSeq[seq[string]](tr.conditionalSourceDefs.len)
+    for di, def in tr.conditionalSourceDefs:
+        defCondDoms[di] = tr.lookupVarDomain(def.condVarName)
+        defArrayMembers[di] = varArrayMembers.getOrDefault(def.sourceArrayName, @[])
+
+    # 1. Prune raw bool_clauses still in tr.model.constraints.
+    var nClauseConsumed = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        var posBools, negBools: seq[string]
+        var allIdent = true
+        for e in posArg.elems:
+            if e.kind != FznIdent: allIdent = false; break
+            posBools.add(e.ident)
+        if not allIdent: continue
+        for e in negArg.elems:
+            if e.kind != FznIdent: allIdent = false; break
+            negBools.add(e.ident)
+        if not allIdent: continue
+
+        # Try every ConditionalSourceDef whose target appears in any literal.
+        var matched = false
+        var seenDefs: HashSet[int]
+        for b in posBools & negBools:
+            if b notin reifInfo: continue
+            let info = reifInfo[b]
+            var candidates: seq[string]
+            case info.kind
+            of rkConst: candidates = @[info.varA]
+            of rkVarVar: candidates = @[info.varA, info.varB]
+            for cand in candidates:
+                if cand notin defsByTarget: continue
+                for di in defsByTarget[cand]:
+                    if di in seenDefs: continue
+                    seenDefs.incl(di)
+                    let def = tr.conditionalSourceDefs[di]
+                    let condDom = defCondDoms[di]
+                    if condDom.len == 0: continue
+                    let arrayMembers = defArrayMembers[di]
+                    if def.sourceVars.len == 0 and arrayMembers.len == 0: continue
+                    if clauseImpliedByDef(posBools, negBools, def, condDom,
+                                          reifInfo, arrayMembers):
+                        matched = true; break
+                if matched: break
+            if matched: break
+        if matched:
+            tr.definingConstraints.incl(ci)
+            inc nClauseConsumed
+
+    # 2. Prune disjunctive clauses with sourceBools tracking.
+    var keep: seq[DisjunctiveClause]
+    var nDisjConsumed = 0
+    for clause in tr.disjunctiveClauses:
+        if clause.sourceBools.len == 0 or
+           clause.sourceBools.len != clause.disjuncts.len:
+            keep.add(clause); continue
+        var matched = false
+        var seenDefs: HashSet[int]
+        for b in clause.sourceBools:
+            if b notin reifInfo: continue
+            let info = reifInfo[b]
+            var candidates: seq[string]
+            case info.kind
+            of rkConst: candidates = @[info.varA]
+            of rkVarVar: candidates = @[info.varA, info.varB]
+            for cand in candidates:
+                if cand notin defsByTarget: continue
+                for di in defsByTarget[cand]:
+                    if di in seenDefs: continue
+                    seenDefs.incl(di)
+                    let def = tr.conditionalSourceDefs[di]
+                    let condDom = defCondDoms[di]
+                    if condDom.len == 0: continue
+                    let arrayMembers = defArrayMembers[di]
+                    if def.sourceVars.len == 0 and arrayMembers.len == 0: continue
+                    if clauseImpliedByDef(clause.sourceBools, @[], def, condDom,
+                                          reifInfo, arrayMembers):
+                        matched = true; break
+                if matched: break
+            if matched: break
+        if matched:
+            inc nDisjConsumed
+        else:
+            keep.add(clause)
+    if nDisjConsumed > 0:
+        tr.disjunctiveClauses = keep
+
+    if nClauseConsumed > 0 or nDisjConsumed > 0:
+        stderr.writeLine(&"[FZN] Pruned tautological clauses implied by " &
+            &"conditional-source channels: {nClauseConsumed} bool_clauses, " &
+            &"{nDisjConsumed} disjunctive clauses")
 
 
 proc detectImplicationPatterns(tr: var FznTranslator) =

@@ -1203,11 +1203,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # Collect CircuitTimeProp constraints for writeback
         if constraint.stateType == CircuitTimePropType:
             state.circuitTimePropConstraints.add(constraint.circuitTimePropState)
-        # Cache tableIn constraint indices for fast stagnation-time table moves
+        # Cache tableIn constraint indices for fast stagnation-time table moves.
+        # Skip constraints whose positions include any channel position: channel
+        # values are derived from source vars, so directly assigning a tuple to
+        # them is semantically wrong, and their tabu rows are never allocated
+        # (tabu.nim:2734-2740 skips channel positions), which would crash at the
+        # tabu-tenure write below.
         if constraint.stateType == TableConstraintType and
            constraint.tableConstraintState.mode == TableIn and
            constraint.tableConstraintState.tuples.len > 1:
-            state.tableInConstraintIndices.add(ci)
+            var hasChannelPos = false
+            for pos in constraint.tableConstraintState.sortedPositions:
+                if pos in carray.channelPositions:
+                    hasChannelPos = true
+                    break
+            if not hasChannelPos:
+                state.tableInConstraintIndices.add(ci)
 
     # Build O(1) constraint index lookup
     state.constraintIdxAt = newSeq[Table[pointer, int]](carray.len)

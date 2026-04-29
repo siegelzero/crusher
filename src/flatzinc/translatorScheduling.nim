@@ -932,7 +932,10 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
                 nNLiteralConsumed += 1
                 nNLiteralBoolElim += 1
 
-        tr.disjunctiveClauses.add(DisjunctiveClause(disjuncts: disjuncts))
+        var srcBools: seq[string]
+        for elem in posArg.elems: srcBools.add(elem.ident)
+        tr.disjunctiveClauses.add(DisjunctiveClause(
+            disjuncts: disjuncts, sourceBools: srcBools))
         nNLiteralClauses += 1
 
     if nTautological > 0:

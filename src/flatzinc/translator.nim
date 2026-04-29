@@ -78,12 +78,18 @@ type
 
     ConditionalSourceDef* = object
         ## A detected conditional variable-source channel: target variable equals
-        ## an element of a source array, selected by a condition variable.
+        ## an element of a source list, selected by a condition variable.
+        ## Two source-list variants:
+        ##   • sourceVars non-empty: use this synthetic list directly, indexed by
+        ##     condDom position (sourceMap is unused). Lets us combine sources
+        ##     drawn from different declared arrays.
+        ##   • sourceVars empty: index sourceMap into the named declared array.
         targetVarName*: string           # T: the target variable
         condVarName*: string             # C: the condition variable (e.g., op[i])
-        sourceArrayName*: string         # A: the source variable array name
-        sourceMap*: seq[int]             # sourceMap[i] = 1-based array index for condDom[i]
+        sourceArrayName*: string         # A: the source variable array name (legacy)
+        sourceMap*: seq[int]             # sourceMap[i] = 1-based array index for condDom[i] (legacy)
         condDomMin*: int                 # min value of condition variable domain
+        sourceVars*: seq[string]         # synthetic per-condDom-position source var names
 
     NoOverlapEndpoint* = object
         ## An endpoint in a NoOverlap pattern — either a constant or a variable name
@@ -239,6 +245,11 @@ type
         ## Each disjunct is a seq of terms (conjunction of linear inequalities).
         ## Satisfied when at least one disjunct has all its terms satisfied.
         disjuncts*: seq[seq[DisjunctiveClauseTerm]]
+        ## Optional: original positive bool var per disjunct, recorded by the
+        ## N-literal handler so later passes (e.g. conditional-source pruning)
+        ## can recognise tautologies without re-parsing the lowered terms. Empty
+        ## means the source bool vars are not tracked for this clause.
+        sourceBools*: seq[string]
 
     ValueSupportDef* = object
         ## A detected value-support pattern: if cell has value N>1, neighbours must include 1..N-1.
@@ -1130,6 +1141,10 @@ proc translate*(model: FznModel): FznTranslator =
     # Detect conditional variable-source channels (EVM step predicate patterns)
     # MUST run after case-analysis fixpoint (uses same eqReifMap) and before implication patterns
     result.detectConditionalSourceChannels()
+    # Prune bool_clauses and disjunctive clauses already implied by the
+    # ConditionalSourceDefs we just built. Otherwise the same conditional
+    # logic ships to search twice — once as channels, once as constraints.
+    result.pruneClausesImpliedByConditionalSource()
     # Detect implication-to-table and one-hot channel patterns
     result.detectImplicationPatterns()
     # Detect conditional gain patterns (reified value assignment → element channel)

@@ -17,6 +17,7 @@ import test_circuit_time_prop
 import test_conditional_count_eq_channels
 import test_conditional_counter_element_channels
 import test_conditional_expr_channels
+import test_conditional_source_pruning
 import test_connected
 import test_constrained_variable
 import test_constant_element_composition
