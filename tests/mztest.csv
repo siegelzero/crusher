@@ -60,4 +60,5 @@ tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
 work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,4000
 lot_sizing_pigment15b,2020/lot-sizing/lot_sizing_cp.mzn,2020/lot-sizing/pigment15b.psp.dzn,minimize,10000,1123,10000
+sparse_mds_breast_cancer4,2020/minimal-decision-sets/sparse_mds.mzn,2020/minimal-decision-sets/breast-cancer_train4.dzn,minimize,10000,102,200
 

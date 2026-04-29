@@ -65,6 +65,7 @@ import test_negative_domains
 import test_nvalue
 import test_newspaper
 import test_objective_bounds
+import test_objective_slack_bools
 import test_ordering_constraint
 import test_parallel_search
 import test_pseudo_bool_lin_le

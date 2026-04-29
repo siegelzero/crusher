@@ -905,6 +905,7 @@ include translatorReifChannels
 include translatorPatterns
 include translatorCaseAnalysis
 include translatorBoolChannels
+include translatorObjectiveSlack
 include translatorScheduling
 include translatorCircuitTime
 
@@ -1407,6 +1408,15 @@ proc translate*(model: FznModel): FznTranslator =
     # gets to cascade those tightenings through the rest of the model unless
     # we re-fire here.
     result.repropagateBounds()
+
+    # Detect objective slack-bool variables. Bool vars that contribute +1 to a
+    # minimisation objective and only ever appear as positive literals in
+    # bool_clauses are derivable from the rest of the model — channel them
+    # directly so they stop being search positions. Generally applicable to
+    # misclassification / tardiness / demand-unmet style indicators.
+    # MUST run after detectNandRedundancy (uses bool2intSourceMap) and before
+    # the constraint translation loop (so consumed clauses are skipped).
+    result.detectObjectiveSlackBools()
 
     # Dead element constraint elimination: mark array_int_element constraints as consumed
     # when their result variable has no surviving (non-consumed) references besides
