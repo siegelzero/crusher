@@ -10,6 +10,91 @@ proc resolveVarArrayElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
                 return decl.value.elems
     return @[]
 
+proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
+    ## Promote defined vars (expression-only) to channel vars (with positions) when they
+    ## appear as elements of a var-indexed array OR as durations/heights of a cumulative/
+    ## disjunctive constraint. Element constraint bindings and cumulative resource tracking
+    ## both need a position for these variables.
+    ##
+    ## Idempotent: only acts on vars currently in `definedVarNames`. Safe to call multiple
+    ## times — late-added defined vars (e.g., from twin-defining-equations rescue) will
+    ## still be picked up.
+
+    # Phase 1: var-indexed array element rescue
+    block:
+        var rescueNames = initHashSet[string]()
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
+                                        "array_var_bool_element", "array_var_bool_element_nonshifted"]:
+                continue
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            for elem in elems:
+                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                    rescueNames.incl(elem.ident)
+
+        if rescueNames.len > 0:
+            for ci, con in tr.model.constraints:
+                if ci notin tr.definingConstraints: continue
+                if con.hasAnnotation("defines_var"):
+                    let ann = con.getAnnotation("defines_var")
+                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                        let definedName = ann.args[0].ident
+                        if definedName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
+                else:
+                    let name = stripSolverPrefix(con.name)
+                    if name == "int_times" and con.args.len >= 3 and
+                         con.args[2].kind == FznIdent:
+                        let cName = con.args[2].ident
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+
+            for name in rescueNames:
+                tr.definedVarNames.excl(name)
+                tr.channelVarNames.incl(name)
+            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from var-indexed arrays)")
+
+    # Phase 2: cumulative/disjunctive duration & height rescue
+    block:
+        var rescueNames = initHashSet[string]()
+        for ci, con in tr.model.constraints:
+            let name = stripSolverPrefix(con.name)
+            if name notin ["fzn_cumulative", "fzn_cumulatives", "fzn_disjunctive", "fzn_disjunctive_strict"]:
+                continue
+            let durElems = tr.resolveVarArrayElems(con.args[1])
+            for elem in durElems:
+                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                    rescueNames.incl(elem.ident)
+            if name in ["fzn_cumulative", "fzn_cumulatives"] and con.args.len > 2:
+                let hElems = tr.resolveVarArrayElems(con.args[2])
+                for elem in hElems:
+                    if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
+                        rescueNames.incl(elem.ident)
+
+        if rescueNames.len > 0:
+            for ci, con in tr.model.constraints:
+                if ci notin tr.definingConstraints: continue
+                if con.hasAnnotation("defines_var"):
+                    let ann = con.getAnnotation("defines_var")
+                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                        let definedName = ann.args[0].ident
+                        if definedName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
+                else:
+                    let cname = stripSolverPrefix(con.name)
+                    if cname == "int_times" and con.args.len >= 3 and
+                         con.args[2].kind == FznIdent:
+                        let cName = con.args[2].ident
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+
+            for name in rescueNames:
+                tr.definedVarNames.excl(name)
+                tr.channelVarNames.incl(name)
+            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from cumulative/disjunctive durations)")
+
+
 proc collectDefinedVars(tr: var FznTranslator) =
     ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
     ## These variables will be replaced by their defining expressions instead of being created as positions.
@@ -349,89 +434,10 @@ proc collectDefinedVars(tr: var FznTranslator) =
         if nDeadChannels > 0:
             stderr.writeLine(&"[FZN] Eliminated {nDeadChannels} dead element channels (unreferenced)")
 
-    # Rescue defined vars that appear in var-indexed arrays.
-    # These need positions for element constraint channel bindings, so convert
-    # them from defined vars (expression-only) to channel vars with positions.
-    block:
-        var rescueNames = initHashSet[string]()
-        for ci, con in tr.model.constraints:
-            let name = stripSolverPrefix(con.name)
-            if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
-                                        "array_var_bool_element", "array_var_bool_element_nonshifted"]:
-                continue
-            let elems = tr.resolveVarArrayElems(con.args[1])
-            for elem in elems:
-                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
-                    rescueNames.incl(elem.ident)
-
-        if rescueNames.len > 0:
-            # Find defining constraints for each rescued var
-            for ci, con in tr.model.constraints:
-                if ci notin tr.definingConstraints: continue
-                if con.hasAnnotation("defines_var"):
-                    let ann = con.getAnnotation("defines_var")
-                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
-                        let definedName = ann.args[0].ident
-                        if definedName in rescueNames:
-                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
-                else:
-                    # Handle int_times without defines_var (detected by collectDefinedVars)
-                    let name = stripSolverPrefix(con.name)
-                    if name == "int_times" and con.args.len >= 3 and
-                         con.args[2].kind == FznIdent:
-                        let cName = con.args[2].ident
-                        if cName in rescueNames:
-                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
-
-            # Move from definedVarNames to channelVarNames
-            for name in rescueNames:
-                tr.definedVarNames.excl(name)
-                tr.channelVarNames.incl(name)
-            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from var-indexed arrays)")
-
-    # Rescue defined vars that appear as duration/height elements in cumulative/disjunctive.
-    # These need positions so the constraint can track variable durations via durationPositions.
-    block:
-        var rescueNames = initHashSet[string]()
-        for ci, con in tr.model.constraints:
-            let name = stripSolverPrefix(con.name)
-            if name notin ["fzn_cumulative", "fzn_cumulatives", "fzn_disjunctive", "fzn_disjunctive_strict"]:
-                continue
-            # args[1] = durations array
-            let durElems = tr.resolveVarArrayElems(con.args[1])
-            for elem in durElems:
-                if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
-                    rescueNames.incl(elem.ident)
-            # args[2] = heights array (only for cumulative)
-            if name in ["fzn_cumulative", "fzn_cumulatives"] and con.args.len > 2:
-                let hElems = tr.resolveVarArrayElems(con.args[2])
-                for elem in hElems:
-                    if elem.kind == FznIdent and elem.ident in tr.definedVarNames:
-                        rescueNames.incl(elem.ident)
-
-        if rescueNames.len > 0:
-            # Find defining constraints for each rescued var
-            for ci, con in tr.model.constraints:
-                if ci notin tr.definingConstraints: continue
-                if con.hasAnnotation("defines_var"):
-                    let ann = con.getAnnotation("defines_var")
-                    if ann.args.len > 0 and ann.args[0].kind == FznIdent:
-                        let definedName = ann.args[0].ident
-                        if definedName in rescueNames:
-                            tr.rescuedChannelDefs.add((ci: ci, varName: definedName))
-                else:
-                    let cname = stripSolverPrefix(con.name)
-                    if cname == "int_times" and con.args.len >= 3 and
-                         con.args[2].kind == FznIdent:
-                        let cName = con.args[2].ident
-                        if cName in rescueNames:
-                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
-
-            # Move from definedVarNames to channelVarNames
-            for name in rescueNames:
-                tr.definedVarNames.excl(name)
-                tr.channelVarNames.incl(name)
-            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from cumulative/disjunctive durations)")
+    # Rescue defined vars that appear in var-indexed arrays / cumulative / disjunctive.
+    # These need positions, so convert them from defined vars (expression-only) to
+    # channel vars with positions.
+    tr.rescueDefinedVarsToChannels()
 
 proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
     ## Tries to build the AlgebraicExpression for one defining constraint.
