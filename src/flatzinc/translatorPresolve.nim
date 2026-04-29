@@ -1967,6 +1967,326 @@ proc implicationPropagate(tr: FznTranslator,
                         visited.incl(tgt)
                         queue.add(tgt)
 
+proc disjunctionEqualitiesPropagate(tr: FznTranslator,
+                                    domains: var Table[string, seq[int]],
+                                    fixedVars: Table[string, int],
+                                    eliminated: PackedSet[int],
+                                    infeasible: var bool): bool =
+    ## Recover the membership relation `b ↔ x ∈ S` from MiniZinc's flattened
+    ## "exists(j where C(j))(x = j)" patterns: one int_eq_reif per candidate
+    ## with the booleans ORed together. By the time the disjunction reaches
+    ## FZN it's lost the "x must be one of these values" semantics — we
+    ## recover it here as bidirectional domain ↔ result-flag propagation.
+    ##
+    ## Three carrier forms are handled:
+    ##   bool_clause([b_1,...], [])         → implicit OR-result = 1
+    ##   array_bool_or([b_1,...], b)        → reified OR
+    ##   bool_clause_reif([b_1,...], [], b) → reified OR (rare in FZN)
+    ##
+    ## Where every b_i is `int_eq_reif(x, c_i, b_i)` on a shared x:
+    ##   - OR-result fixed to 1 (or implicit)        ⇒ dom(x) ⊆ {c_i}
+    ##   - OR-result fixed to 0                      ⇒ dom(x) ∩ {c_i} = ∅
+    ##   - dom(x) ⊆ {c_i for known i}                ⇒ OR-result = 1
+    ##   - dom(x) disjoint from {c_i for known i}    ⇒ OR-result = 0
+    ##
+    ## We don't eliminate the carrier constraints: case-analysis and other
+    ## downstream detectors may still want them, and once domains are
+    ## tightened they're trivially satisfied so leaving them costs nothing.
+    result = false
+
+    # Phase 1: build map b_name -> (x_name, c) for int_eq_reif with constant
+    # RHS. A boolean produced by multiple defining int_eq_reifs (shouldn't
+    # happen in well-formed FZN, but we don't audit that) is dropped.
+    var eqMap: Table[string, (string, int)]
+    var conflict: HashSet[string]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[1].kind != FznIntLit: continue
+        let xName = presolveVarName(con.args[0])
+        let bName = presolveVarName(con.args[2])
+        if xName == "" or bName == "": continue
+        if bName in conflict: continue
+        if bName in eqMap:
+            # Different defining constraint for the same b — drop both.
+            eqMap.del(bName)
+            conflict.incl(bName)
+        else:
+            eqMap[bName] = (xName, con.args[1].intVal)
+
+    if eqMap.len == 0: return
+
+    # Helper: for a literal-array, check that all elements are eq-reif outputs
+    # over the same source variable and collect their constants.
+    proc collectMembership(elems: seq[FznExpr],
+                           eqMap: Table[string, (string, int)]):
+                          tuple[ok: bool, x: string, vals: HashSet[int]] =
+        var x = ""
+        var vals = initHashSet[int]()
+        for e in elems:
+            let bName = presolveVarName(e)
+            if bName == "" or bName notin eqMap:
+                return (false, "", initHashSet[int]())
+            let (xName, c) = eqMap[bName]
+            if x == "":
+                x = xName
+            elif x != xName:
+                return (false, "", initHashSet[int]())
+            vals.incl(c)
+        return (true, x, vals)
+
+    # Apply bidirectional propagation between x and the OR-result `bArg` given
+    # membership set S = {c_i}. `bArg` may be missing (= implicit-true case).
+    proc applyMembership(tr: FznTranslator,
+                         domains: var Table[string, seq[int]],
+                         fixedVars: Table[string, int],
+                         x: string, vals: HashSet[int],
+                         bArg: FznExpr, bImplicitTrue: bool,
+                         infeasible: var bool): bool =
+        var changed = false
+        if x notin domains: return false
+        # Snapshot result-flag value if known.
+        var bVal = -1
+        if bImplicitTrue:
+            bVal = 1
+        elif bArg.kind == FznIntLit or bArg.kind == FznBoolLit:
+            bVal = tr.presolveResolve(bArg, fixedVars)
+        elif bArg.kind == FznIdent:
+            if bArg.ident in fixedVars:
+                bVal = fixedVars[bArg.ident]
+            elif bArg.ident in tr.paramValues:
+                bVal = tr.paramValues[bArg.ident]
+            elif bArg.ident in domains and domains[bArg.ident].len == 1:
+                bVal = domains[bArg.ident][0]
+
+        # Forward direction: result-flag drives domain.
+        if bVal == 1:
+            var allowed: seq[int]
+            for v in vals: allowed.add(v)
+            if presolveTightenDomain(domains, x, allowed, infeasible):
+                changed = true
+        elif bVal == 0:
+            for v in vals:
+                if presolveRemoveValue(domains, x, v, infeasible):
+                    changed = true
+                if infeasible: return changed
+
+        # Reverse direction: domain drives result-flag (only if there's a flag).
+        if not bImplicitTrue and bArg.kind == FznIdent and
+           bArg.ident in domains and domains[bArg.ident].len > 1:
+            let bName = bArg.ident
+            let xDom = domains[x]
+            if xDom.len > 0:
+                var allInS = true
+                var anyInS = false
+                for v in xDom:
+                    if v in vals:
+                        anyInS = true
+                    else:
+                        allInS = false
+                if allInS:
+                    if presolveTightenDomain(domains, bName, @[1], infeasible):
+                        changed = true
+                elif not anyInS:
+                    if presolveTightenDomain(domains, bName, @[0], infeasible):
+                        changed = true
+        return changed
+
+    # Phase 2a: bool_clause([pos], []) — the implicit-true OR.
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit: continue
+        if con.args[1].kind != FznArrayLit: continue
+        if con.args[1].elems.len > 0: continue
+        let posElems = con.args[0].elems
+        if posElems.len < 2: continue
+        let m = collectMembership(posElems, eqMap)
+        if not m.ok or m.x == "": continue
+        if applyMembership(tr, domains, fixedVars, m.x, m.vals,
+                           FznExpr(kind: FznIdent, ident: ""), true, infeasible):
+            result = true
+
+    # Phase 2b: array_bool_or([pos], b) — reified OR, both directions.
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "array_bool_or": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit: continue
+        let posElems = con.args[0].elems
+        if posElems.len < 2: continue
+        let m = collectMembership(posElems, eqMap)
+        if not m.ok or m.x == "": continue
+        if applyMembership(tr, domains, fixedVars, m.x, m.vals,
+                           con.args[1], false, infeasible):
+            result = true
+
+    # Phase 2c: bool_clause_reif([pos], [], b) — reified OR with empty negs.
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "bool_clause_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznArrayLit: continue
+        if con.args[1].kind != FznArrayLit: continue
+        if con.args[1].elems.len > 0: continue
+        let posElems = con.args[0].elems
+        if posElems.len < 2: continue
+        let m = collectMembership(posElems, eqMap)
+        if not m.ok or m.x == "": continue
+        if applyMembership(tr, domains, fixedVars, m.x, m.vals,
+                           con.args[2], false, infeasible):
+            result = true
+
+proc nonMembershipPropagate(tr: FznTranslator,
+                            domains: var Table[string, seq[int]],
+                            fixedVars: Table[string, int],
+                            eliminated: PackedSet[int],
+                            infeasible: var bool): bool =
+    ## Dual of disjunctionEqualitiesPropagate: recover `r ↔ x ∉ S` from
+    ## MiniZinc's flattened "forall(j where C(j))(x != j)" pattern, where each
+    ## inequality is an int_ne_reif and they're conjoined by an array_bool_and.
+    ##
+    ## Also catches the inconsistent shape `r ↔ AND of (x = c_i)` with
+    ## distinct c_i — that AND can never hold, so r is forced to 0.
+    ##
+    ## Forms handled (the carrier is array_bool_and([b_1,...], r)):
+    ##   each b_i = int_ne_reif(x, c_i, b_i)  ⇒
+    ##     r=1            ⇒ dom(x) ∩ {c_i} = ∅
+    ##     r=0            ⇒ dom(x) ⊆ {c_i}
+    ##     dom(x) ⊆ Sᶜ    ⇒ r=1
+    ##     dom(x) ⊆ S     ⇒ r=0     (where S = {c_i})
+    ##
+    ##   each b_i = int_eq_reif(x, c_i, b_i) with ≥2 distinct c_i ⇒
+    ##     r is forced to 0 (mutually exclusive equalities).
+    ##
+    ## Like the OR-side propagator, we don't eliminate the carrier — downstream
+    ## detectors may still want it and it's trivially satisfied once the
+    ## domains are tightened.
+    result = false
+
+    # Build maps from b_name → (x_name, c_value) for both reif kinds.
+    var eqMap: Table[string, (string, int)]
+    var neMap: Table[string, (string, int)]
+    var eqConflict, neConflict: HashSet[string]
+    for ci, con in tr.model.constraints:
+        if ci in eliminated: continue
+        let name = stripSolverPrefix(con.name)
+        if con.args.len < 3: continue
+        if con.args[1].kind != FznIntLit: continue
+        let xName = presolveVarName(con.args[0])
+        let bName = presolveVarName(con.args[2])
+        if xName == "" or bName == "": continue
+        if name == "int_eq_reif":
+            if bName in eqConflict: continue
+            if bName in eqMap:
+                eqMap.del(bName); eqConflict.incl(bName)
+            else:
+                eqMap[bName] = (xName, con.args[1].intVal)
+        elif name == "int_ne_reif":
+            if bName in neConflict: continue
+            if bName in neMap:
+                neMap.del(bName); neConflict.incl(bName)
+            else:
+                neMap[bName] = (xName, con.args[1].intVal)
+
+    if eqMap.len == 0 and neMap.len == 0: return
+
+    for ci, con in tr.model.constraints:
+        if infeasible: return
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "array_bool_and": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit: continue
+        let elems = con.args[0].elems
+        if elems.len < 2: continue
+
+        # Classify: are all elements ne_reif on a shared x, or eq_reif on
+        # a shared x? Mixed shapes → skip.
+        var commonX = ""
+        var values = initHashSet[int]()
+        var allNe = true
+        var allEq = true
+        for e in elems:
+            let bName = presolveVarName(e)
+            if bName == "":
+                allNe = false; allEq = false; break
+            if bName notin neMap: allNe = false
+            if bName notin eqMap: allEq = false
+            if not allNe and not allEq: break
+
+        if allNe:
+            for e in elems:
+                let (xName, c) = neMap[presolveVarName(e)]
+                if commonX == "":
+                    commonX = xName
+                elif commonX != xName:
+                    commonX = ""; break
+                values.incl(c)
+            if commonX == "" or commonX notin domains: continue
+
+            # rArg known?
+            let rArg = con.args[1]
+            var rVal = -1
+            if rArg.kind == FznBoolLit or rArg.kind == FznIntLit:
+                rVal = tr.presolveResolve(rArg, fixedVars)
+            elif rArg.kind == FznIdent:
+                if rArg.ident in fixedVars: rVal = fixedVars[rArg.ident]
+                elif rArg.ident in tr.paramValues: rVal = tr.paramValues[rArg.ident]
+                elif rArg.ident in domains and domains[rArg.ident].len == 1:
+                    rVal = domains[rArg.ident][0]
+
+            if rVal == 1:
+                # x ∉ S
+                for v in values:
+                    if presolveRemoveValue(domains, commonX, v, infeasible):
+                        result = true
+                    if infeasible: return
+            elif rVal == 0:
+                # x ∈ S
+                var allowed: seq[int]
+                for v in values: allowed.add(v)
+                if presolveTightenDomain(domains, commonX, allowed, infeasible):
+                    result = true
+
+            # Reverse: domain → r.
+            if rArg.kind == FznIdent and rArg.ident in domains and
+               domains[rArg.ident].len > 1:
+                let xDom = domains[commonX]
+                if xDom.len > 0:
+                    var anyInS = false
+                    var allInS = true
+                    for v in xDom:
+                        if v in values: anyInS = true
+                        else: allInS = false
+                    if not anyInS:
+                        if presolveTightenDomain(domains, rArg.ident, @[1], infeasible):
+                            result = true
+                    elif allInS:
+                        if presolveTightenDomain(domains, rArg.ident, @[0], infeasible):
+                            result = true
+
+        elif allEq:
+            # AND of int_eq_reif on the same var with ≥2 distinct constants is
+            # unsatisfiable — force r=0.
+            for e in elems:
+                let (xName, c) = eqMap[presolveVarName(e)]
+                if commonX == "":
+                    commonX = xName
+                elif commonX != xName:
+                    commonX = ""; break
+                values.incl(c)
+            if commonX == "": continue
+            if values.len < 2: continue
+            let rArg = con.args[1]
+            if rArg.kind == FznIdent:
+                if presolveTightenDomain(domains, rArg.ident, @[0], infeasible):
+                    result = true
+
 proc cpmBoundsPropagate(tr: FznTranslator,
                         domains: var Table[string, seq[int]],
                         fixedVars: Table[string, int],
@@ -4833,6 +5153,20 @@ proc presolve*(tr: var FznTranslator) =
 
         # Step 3b: Implication transitive propagation (BFS through bool_clause chains)
         if implicationPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 3c: Disjunction-of-equalities domain reduction.
+        # bool_clause([b_1,...,b_n],[]) where every b_i is int_eq_reif(x, c_i, b_i)
+        # on a shared x ⇒ dom(x) ⊆ {c_i}. Recovers MZN's flattened "exists" pattern.
+        if disjunctionEqualitiesPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 3d: Conjunction-of-inequalities (dual of step 3c).
+        # array_bool_and([b_1,...,b_n], r) where every b_i is int_ne_reif(x, c_i, b_i)
+        # on a shared x ⇒ r ↔ x ∉ {c_i}. Also catches AND-of-eq_reif inconsistency.
+        if nonMembershipPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
