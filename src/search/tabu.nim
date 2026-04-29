@@ -1267,7 +1267,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     for pos in carray.allPositions():
         if initialAssignment.len > 0:
-            state.assignment[pos] = initialAssignment[pos]
+            # Seed values can fall outside the current sharedDomain when the seed
+            # comes from a previous optimization iteration: tightenReducedDomain
+            # may have shrunk the domain after the seed was recorded. Channel
+            # positions are recomputed below by the channel fixed-point, so we
+            # only need to validate non-channel positions.
+            if pos in carray.channelPositions:
+                state.assignment[pos] = initialAssignment[pos]
+            else:
+                let dom = state.sharedDomain[][pos]
+                if dom.len > 0 and initialAssignment[pos] notin dom:
+                    state.assignment[pos] = sample(dom)
+                else:
+                    state.assignment[pos] = initialAssignment[pos]
         elif pos in carray.channelPositions:
             # Channel variables get a placeholder; computed below
             state.assignment[pos] = state.sharedDomain[][pos][0]

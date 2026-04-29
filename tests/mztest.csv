@@ -6,6 +6,7 @@
 
 cable_tree_wiring_A031,2020/cable_tree_wiring/ctw.mzn,2020/cable_tree_wiring/A031.dzn,minimize,10000,24104,48208
 racp_j30_26_2,2020/racp/racp.mzn,2020/racp/j30_26_2_1.0.dzn,minimize,10000,704,1408
+radiation_i6_9,2020/radiation/radiation.mzn,2020/radiation/i6-9.dzn,minimize,10000,338,676
 
 carpet_cutting_rnd_01,2021/carpet-cutting/cc_base.mzn,2021/carpet-cutting/mzn_rnd_test.01.dzn,minimize,10000,621,700
 crypto_aes_r1,2021/opt-cryptoanalysis/mznc2017_aes_opt.mzn,2021/opt-cryptoanalysis/r1.dzn,minimize,10000,2,2

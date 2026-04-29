@@ -66,6 +66,7 @@ import test_nvalue
 import test_newspaper
 import test_objective_bounds
 import test_objective_slack_bools
+import test_optimization_seed_clamp
 import test_ordering_constraint
 import test_parallel_search
 import test_pseudo_bool_lin_le
