@@ -1607,10 +1607,15 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let nFiltered = heights.len - filteredHeights.len
         if nFiltered > 0:
             stderr.writeLine(&"[FZN] cumulative: filtered {nFiltered} zero-height tasks")
-        # Skip if trivially satisfied (only when all heights are constant)
+        # Skip if trivially satisfied (only when all heights are constant).
+        # For a variable limit, the search may shrink it down to its lower bound,
+        # so the elimination check must use lb(limit), not ub(limit).
         var totalHeight = 0
         for h in filteredHeights: totalHeight += h
-        if filteredStarts.len <= 1 or (totalHeight <= limit and not hasVarHeight):
+        let limitForTrivCheck =
+            if limitPos >= 0: tr.sys.baseArray.domain[limitPos][0]
+            else: limit
+        if filteredStarts.len <= 1 or (totalHeight <= limitForTrivCheck and not hasVarHeight):
             if nFiltered > 0:
                 stderr.writeLine(&"[FZN] cumulative: constraint eliminated (trivially satisfied)")
         else:

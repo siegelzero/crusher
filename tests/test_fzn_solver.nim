@@ -3666,6 +3666,120 @@ solve satisfy;
     let yVal = tr.sys.assignment[yPos]
     check 2 * xVal + 3 * yVal == 10
 
+suite "FlatZinc Variable-Limit Cumulative":
+
+  test "variable-limit cumulative not eliminated when ub(limit) == sum(heights)":
+    # RACP/resource-investment pattern: limit is a variable whose upper bound is
+    # the sum of all heights (the trivial "give every task its own capacity"
+    # bound). The trivial-elimination check must use lb(limit), not ub(limit) —
+    # otherwise the cumulative is silently dropped and the search drives limit
+    # below feasibility.
+    #
+    # Three tasks, all forced to start at 0 (start var domain = {0}), each with
+    # duration 4 and height 5. Sum of heights = 15, so limit's ub = 15 and the
+    # buggy elimination would always fire. With the fix the cumulative remains
+    # and the search must set limit to at least 15 (3 tasks × height 5, all
+    # active over the full horizon).
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 0..0: s1;
+var 0..0: s2;
+var 0..0: s3;
+var 5..15: lim;
+constraint fzn_cumulative([s1, s2, s3], [4, 4, 4], [5, 5, 5], lim);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    # The cumulative must be retained — count CumulativeType constraints in
+    # the system after translation.
+    var nCumulative = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == CumulativeType:
+        inc nCumulative
+    check nCumulative == 1
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+
+    # All three tasks active simultaneously over [0, 4) — limit must be ≥ 15.
+    let limVal = tr.sys.assignment[tr.varPositions["lim"]]
+    check limVal >= 15
+
+  test "constant-limit cumulative still trivially eliminated when sum(heights) ≤ limit":
+    # Sanity check that the fix didn't break the constant-limit elimination path:
+    # when limit is a constant ≥ Σ heights, the cumulative is genuinely vacuous
+    # and should still be dropped.
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 0..10: s1;
+var 0..10: s2;
+var 0..10: s3;
+constraint fzn_cumulative([s1, s2, s3], [3, 3, 3], [2, 2, 2], 100);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    var nCumulative = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == CumulativeType:
+        inc nCumulative
+    check nCumulative == 0
+
+  test "variable-limit cumulative trivially eliminated when lb(limit) ≥ sum(heights)":
+    # When the variable limit's *lower* bound already dominates the sum of
+    # heights, the cumulative truly is vacuous regardless of how the search
+    # moves limit, and should still be dropped.
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 0..10: s1;
+var 0..10: s2;
+var 0..10: s3;
+var 100..200: lim;
+constraint fzn_cumulative([s1, s2, s3], [3, 3, 3], [2, 2, 2], lim);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    var nCumulative = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == CumulativeType:
+        inc nCumulative
+    check nCumulative == 0
+
+  test "variable-limit cumulative enforces capacity during search":
+    # Two tasks of height 3 fit in a 10-unit horizon with limit lb=3 ub=6=sum.
+    # Pre-fix the cumulative would be eliminated (totalHeight=6 ≤ ub=6) and the
+    # search could leave them overlapping. Post-fix the search must either
+    # serialize them (start1+dur ≤ start2 or vice versa) or push lim ≥ 6.
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 0..10: s1;
+var 0..10: s2;
+var 3..6: lim;
+constraint int_lin_le([1, 1], [s1, lim], 7);
+constraint int_lin_le([1, 1], [s2, lim], 7);
+constraint fzn_cumulative([s1, s2], [4, 4], [3, 3], lim);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    var nCumulative = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == CumulativeType:
+        inc nCumulative
+    check nCumulative == 1
+
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+
+    let s1 = tr.sys.assignment[tr.varPositions["s1"]]
+    let s2 = tr.sys.assignment[tr.varPositions["s2"]]
+    let lim = tr.sys.assignment[tr.varPositions["lim"]]
+    # Either no overlap, or lim is large enough to stack them.
+    let nonOverlapping = (s1 + 4 <= s2) or (s2 + 4 <= s1)
+    check nonOverlapping or lim >= 6
+
 suite "FlatZinc Variable-Duration Cumulative/Disjunctive":
 
   test "defined-var durations rescued as channels for disjunctive":
