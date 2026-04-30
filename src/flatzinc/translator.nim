@@ -473,6 +473,37 @@ type
         skillAllocationDefs*: seq[SkillAllocationDef]
         # Detected atMost-through-reification patterns (int_lin_le on int_eq_reif outputs)
         atMostThroughReifDefs*: seq[AtMostThroughReifDef]
+        # Detected pair-int_lin_le patterns: two complementary linear inequalities over
+        # the same small-domain variables whose feasible-tuple set is small. Replaced
+        # by a single tableIn after translateVariables.
+        pairLinLeTableDefs*: seq[tuple[varNames: seq[string], tuples: seq[seq[int]]]]
+        # Detected ranking-from-counters patterns: an array X[1..N] of variables, plus
+        # N "worst-position" counters c[i] = sum_{j != i} (X[j] >= X[i]) whose lower
+        # bounds K_i form a permutation of 1..N. Emit a redundant decreasing chain
+        # X[r[1]] >= X[r[2]] >= ... >= X[r[N]] where r is the inverse of K, giving
+        # tabu a magnitude-based gradient that the deep reif/counter cascade cannot.
+        rankingChainDefs*: seq[tuple[orderedVarNames: seq[string]]]
+        # Per-output-array post-processing rule for ranking decompositions whose
+        # auxiliary counter/reif machinery has been consumed (Phase 2B). At print
+        # time the output writer evaluates each element from the source variables
+        # rather than from a (now-gone) defining expression.
+        rankingOutputRules*: seq[tuple[
+            arrayName: string,
+            kind: int,                         # 0 = worstPosition (#fp_j >= fp_i),
+                                                #     1 = bestPosition (1 + #{j != i: fp_j > fp_i})
+            indexFpVarNames: seq[string],     # array index → fp var name
+            sourceFpVarNames: seq[string]]]   # union of all fp names participating
+        # Pair-wise rank/position consistency constraints to emit after
+        # translateVariables — used when consumeRankingDecomposition fires on a
+        # partial chain (pinned subset only) and we need the full N×N linkage
+        # between the source array (e.g. fPoints) and the finalPosition array
+        # to be enforced via simple per-pair disjunctions instead of the
+        # consumed counter cascade. finalAConst / finalBConst are -1 when the
+        # corresponding finalPos slot is a real variable; otherwise they hold
+        # the literal rank value pinned by MiniZinc.
+        rankingPairConstraintDefs*: seq[tuple[
+            fpA, fpB, finalA, finalB: string,
+            finalAConst, finalBConst: int]]
         # Detected product-sum atMost patterns (int_lin_le on bool2int(array_bool_and(..)) chains)
         productSumAtMostDefs*: seq[ProductSumAtMostDef]
         # Detected binary k-ary NAND clauses (int_lin_le([1,...,1], vars, k-1) on
@@ -980,6 +1011,11 @@ proc translate*(model: FznModel): FznTranslator =
     result.canonicalizeFznVarAliases()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
+    # Drop fzn_all_different_int constraints whose argument list is fully fixed
+    # by parameters / inline literal initializers / presolve-singleton domains —
+    # the constraint is then tautologically satisfied and only adds noise.
+    # Independent of channel detection so safe to run early.
+    result.detectFixedAllDifferent()
     # Detect circuit-time-propagation pattern (TSPTW/VRP: circuit + element chains + time windows)
     # MUST run before other detection to consume circuit + element + int_lin_eq + int_max early
     result.detectCircuitTimePropagation()
@@ -1052,6 +1088,30 @@ proc translate*(model: FznModel): FznTranslator =
     # passes that consume int_lin_le. Aggregates all such clauses into a single
     # ConjunctSumAtMost constraint emitted later by emitBinaryNandAggregate.
     result.detectBinaryNandAggregate()
+    # Detect pairs of complementary int_lin_le over the same small-domain vars whose
+    # joint feasible tuple set is small → tableIn (general). Runs after the various
+    # int_lin_le-consuming passes (atMost cliques, NAND aggregate, max-from-lin-le,
+    # spread, etc.) so it only catches genuinely uninterpreted pairs, and before
+    # detectReifChannels.
+    result.detectPairLinLeTable()
+    # Detect ranking-from-counters: arrays of variables where N pairwise reified
+    # comparisons are summed into N counters whose lower bounds form a permutation.
+    # Emit a redundant decreasing chain (general; helps any rank/priority model).
+    # We don't consume the original decomposition — this is purely additive.
+    result.detectRankingFromCounters()
+    # Tighten chain participants' declared bounds via monotone propagation. Runs
+    # before translateVariables so the new (lo, hi) flow into the channel domains
+    # the solver actually searches over. General to any decreasing/increasing
+    # chain over an array of variables.
+    result.propagateRankingChainBounds()
+    # Phase 2B: consume the rank decomposition (reified comparisons + counter
+    # int_lin_eqs + position-constraint sum bounds) once a chain has been
+    # detected. The chain is mathematically equivalent and cheaper to evaluate;
+    # the original decomposition only existed to compute worstPosition[]/
+    # bestPosition[] output values, which are now reconstructed at output time
+    # via rankingOutputRules. MUST run before detectReifChannels so the marked
+    # int_lin_le_reif's aren't channelised behind us.
+    result.consumeRankingDecomposition()
     # Detect crossing count max patterns (betweenness indicators → sum → array_int_maximum)
     # MUST run before detectReifChannels which would consume the intermediate bool2int/array_bool_and/int_lin_le_reif
     result.detectCrossingCountMaxPattern()
@@ -1233,6 +1293,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Emit a single ConjunctSumAtMost for all collected binary k-NAND clauses
     if result.binaryNandClauses.len > 0:
         result.emitBinaryNandAggregate()
+    # Emit tableIn constraints for pair-int_lin_le → table patterns
+    if result.pairLinLeTableDefs.len > 0:
+        result.emitPairLinLeTable()
     # Build expressions for bool2int identity aliases (int output → bool input's position)
     # MUST run before buildDefinedExpressions which may reference aliased vars
     for intName, boolName in result.bool2intIdentityAliases:
@@ -1250,6 +1313,14 @@ proc translate*(model: FznModel): FznTranslator =
     # Build expressions for defined variables using the now-created positions
     # (must run before emitMaxFromLinLeChannels which resolves source vars as expressions)
     result.buildDefinedExpressions()
+    # Emit redundant decreasing-chain inequalities for ranking-from-counters patterns.
+    # MUST run after buildDefinedExpressions so that defined-var entries (e.g. fPoints)
+    # are resolvable to either positions or expressions.
+    if result.rankingChainDefs.len > 0:
+        result.emitRankingChain()
+    # Emit pair-link disjunctive clauses for ranking-decomp consumption (Phase 4).
+    if result.rankingPairConstraintDefs.len > 0:
+        result.emitRankingPairConstraints()
     # Build expressions for equality copy aliases (copy → original's expression)
     for copyName, originalName in result.equalityCopyAliases:
         if originalName in result.varPositions:

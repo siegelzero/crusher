@@ -5,6 +5,7 @@
 # For satisfy problems, both bounds are ignored
 
 cable_tree_wiring_A031,2020/cable_tree_wiring/ctw.mzn,2020/cable_tree_wiring/A031.dzn,minimize,10000,24104,48208
+ecp_xIGData_22_12_22_5,2020/soccer-computational/ecp.mzn,2020/soccer-computational/xIGData_22_12_22_5.dzn,satisfy,10000,,
 lot_sizing_pigment15b,2020/lot-sizing/lot_sizing_cp.mzn,2020/lot-sizing/pigment15b.psp.dzn,minimize,10000,1123,10000
 racp_j30_26_2,2020/racp/racp.mzn,2020/racp/j30_26_2_1.0.dzn,minimize,10000,704,1408
 radiation_i6_9,2020/radiation/radiation.mzn,2020/radiation/i6-9.dzn,minimize,10000,338,676

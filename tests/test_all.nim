@@ -39,6 +39,7 @@ import test_forward_backward_equiv_channels
 import test_fzn_alias_and_diagonal
 import test_fzn_channel_detection
 import test_fzn_pattern_detection
+import test_fzn_ranking
 import test_fzn_parser
 import test_fzcrusher
 import test_fzn_solver

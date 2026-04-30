@@ -23,6 +23,48 @@ proc reconstructSet(tr: FznTranslator, info: SetVarInfo): seq[int] =
     if tr.sys.assignment[info.positions[idx]] != 0:
       result.add(info.lo + idx)
 
+proc lookupVarValue(tr: FznTranslator, varName: string): tuple[ok: bool, val: int] =
+  ## Finds the current value of a named variable: real position, defining
+  ## expression, or singleton parameter. Returns ok=false if none of those
+  ## apply.
+  if varName in tr.varPositions:
+    return (true, tr.sys.assignment[tr.varPositions[varName]])
+  if varName in tr.definedVarExprs:
+    return (true, tr.definedVarExprs[varName].evaluate(tr.sys.assignment))
+  if varName in tr.paramValues:
+    return (true, tr.paramValues[varName])
+  return (false, 0)
+
+proc tryComputeRankingOutput(tr: FznTranslator, arrName: string, idx: int): tuple[ok: bool, val: int] =
+  ## Computes worstPosition[idx]/bestPosition[idx] from the chain's source
+  ## variables when the rank decomposition has been consumed.
+  for rule in tr.rankingOutputRules:
+    if rule.arrayName != arrName: continue
+    if idx >= rule.indexFpVarNames.len: continue
+    let myFpName = rule.indexFpVarNames[idx]
+    if myFpName == "": continue   # this index is a literal in the FZN, handled by caller
+    let myLookup = tr.lookupVarValue(myFpName)
+    if not myLookup.ok: continue
+    let myVal = myLookup.val
+    case rule.kind
+    of 0:
+      # worstPosition[i] = #{ j : fp[j] >= fp[i] }  (count includes self)
+      var c = 0
+      for fpName in rule.sourceFpVarNames:
+        let look = tr.lookupVarValue(fpName)
+        if look.ok and look.val >= myVal: inc c
+      return (true, c)
+    of 1:
+      # bestPosition[i] = 1 + #{ j != i : fp[j] > fp[i] }
+      var c = 1
+      for fpName in rule.sourceFpVarNames:
+        if fpName == myFpName: continue
+        let look = tr.lookupVarValue(fpName)
+        if look.ok and look.val > myVal: inc c
+      return (true, c)
+    else: continue
+  return (false, 0)
+
 proc formatSolution*(tr: FznTranslator): string =
   ## Formats the current solution in FlatZinc output format.
   ## Prints output_var and output_array annotated variables.
@@ -99,6 +141,11 @@ proc formatSolution*(tr: FznTranslator): string =
               let v = tr.definedVarExprs[elemName].evaluate(tr.sys.assignment)
               vals[i] = if isBoolArr: formatBool(v) else: $v
               continue
+          # Ranking decomposition consumed — recompute from source array.
+          let r = tr.tryComputeRankingOutput(arr.name, i)
+          if r.ok:
+            vals[i] = if isBoolArr: formatBool(r.val) else: $r.val
+            continue
           vals[i] = if isBoolArr: "false" else: "0"  # fallback
         else:
           let v = tr.sys.assignment[pos]

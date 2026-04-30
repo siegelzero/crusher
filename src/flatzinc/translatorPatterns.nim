@@ -6715,6 +6715,1388 @@ proc detectDisconnectedAllDifferent*(tr: var FznTranslator) =
     if nElimConstraints > 0:
         stderr.writeLine(&"[FZN] Eliminated {nElimConstraints} disconnected all_different constraints ({nElimVars} variables)")
 
+proc tryResolveFznConst(tr: FznTranslator, e: FznExpr): tuple[ok: bool, val: int] =
+    ## Returns (true, k) if e is a literal integer, a parameter, or a variable whose
+    ## domain has been pinned to a singleton (by parameter or presolve). Otherwise
+    ## (false, 0). Pure: never raises, never mutates state.
+    case e.kind
+    of FznIntLit:
+        return (true, e.intVal)
+    of FznBoolLit:
+        return (true, if e.boolVal: 1 else: 0)
+    of FznIdent:
+        if e.ident in tr.paramValues:
+            return (true, tr.paramValues[e.ident])
+        if e.ident in tr.presolveDomains:
+            let dom = tr.presolveDomains[e.ident]
+            if dom.len == 1: return (true, dom[0])
+        # Inline-defined alias: var = literal in the FznModel decl
+        if e.ident in tr.varDomainIndex:
+            let decl = tr.model.variables[tr.varDomainIndex[e.ident]]
+            if decl.value != nil and decl.value.kind == FznIntLit:
+                return (true, decl.value.intVal)
+        return (false, 0)
+    else:
+        return (false, 0)
+
+proc detectFixedAllDifferent*(tr: var FznTranslator) =
+    ## Drops fzn_all_different_int(x_1,...,x_n) when every argument is fixed
+    ## (literal, parameter, or singleton-domain after presolve). If the fixed
+    ## values are pairwise distinct, the constraint is tautologically satisfied
+    ## and we mark it consumed. If a duplicate is present the model is UNSAT —
+    ## we leave the constraint live (so the caller's pipeline reports a non-zero
+    ## cost rather than silently accepting an infeasible assignment) and emit a
+    ## warning. This generalises beyond ranking problems: any presolve that
+    ## fully pins an alldifferent's argument list benefits.
+    tr.buildVarDomainIndex()
+    # Build an array-name → element-FznExpr map directly from declarations
+    # (tr.arrayElementNames isn't populated until translateVariables runs).
+    var declElems: Table[string, seq[FznExpr]]
+    for decl in tr.model.variables:
+        if not decl.isArray: continue
+        if decl.value == nil or decl.value.kind != FznArrayLit: continue
+        declElems[decl.name] = decl.value.elems
+    var nDropped = 0
+    var nDuplicate = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "fzn_all_different_int" and name != "all_different_int": continue
+        if con.args.len < 1: continue
+        # Collect the element list. Accept array literal, parameter array, or
+        # variable array name (look the inline initializer up from the decl).
+        var elems: seq[FznExpr]
+        case con.args[0].kind
+        of FznArrayLit:
+            elems = con.args[0].elems
+        of FznIdent:
+            let nm = con.args[0].ident
+            if nm in tr.arrayValues:
+                elems = @[]
+                for v in tr.arrayValues[nm]:
+                    elems.add(FznExpr(kind: FznIntLit, intVal: v))
+            elif nm in declElems:
+                elems = declElems[nm]
+            else:
+                continue
+        else:
+            continue
+
+        var allFixed = true
+        var values = newSeq[int](elems.len)
+        for i, e in elems:
+            let r = tr.tryResolveFznConst(e)
+            if not r.ok:
+                allFixed = false
+                break
+            values[i] = r.val
+        if not allFixed: continue
+
+        # Distinctness check
+        var seen: HashSet[int]
+        var dup = false
+        for v in values:
+            if v in seen:
+                dup = true
+                break
+            seen.incl(v)
+        if dup:
+            inc nDuplicate
+            continue
+        tr.definingConstraints.incl(ci)
+        inc nDropped
+
+    if nDropped > 0:
+        stderr.writeLine(&"[FZN] Fixed alldifferent: dropped {nDropped} tautological constraint(s)")
+    if nDuplicate > 0:
+        stderr.writeLine(&"[FZN] WARNING: {nDuplicate} all_different constraint(s) over fully-fixed arguments contain duplicates — model is infeasible")
+
+proc detectPairLinLeTable*(tr: var FznTranslator,
+                          maxDomainProduct: int = 256,
+                          maxAllowedTuples: int = 32) =
+    ## Detects two int_lin_le constraints over the same variable list whose
+    ## coefficient vectors are negations of each other and whose joint feasible
+    ## tuple set, after intersecting with each variable's domain, is small.
+    ## When the pattern matches, replace both inequalities with a single tableIn
+    ## constraint.
+    ##
+    ## Why this is general: any pair "a + b ≤ k1" / "-(a+b) ≤ -k2" (i.e.,
+    ## k2 ≤ a+b ≤ k1), or any other pair of complementary linear inequalities
+    ## over small-domain integer variables, encodes a finite small set of
+    ## allowed tuples. Tabu search benefits from the table form because (a) it
+    ## sees a single graduated penalty (Hamming distance to nearest allowed
+    ## tuple) rather than two scalar slack penalties, and (b) penalty maps
+    ## carry the joint structure rather than treating the two inequalities as
+    ## independent. The detector does not assume any application semantics.
+    ##
+    ## Bounds:
+    ## - maxDomainProduct: upper bound on the cartesian-product size we'll
+    ##   enumerate (skip larger). 256 = 4 vars × 4 values comfortably.
+    ## - maxAllowedTuples: don't replace if the allowed set is too large to
+    ##   profit (we'd just rebuild what int_lin_le already does).
+
+    type LinLe = tuple[ci: int, coeffs: seq[int], rhs: int, varNames: seq[string]]
+    var byKey: Table[string, seq[LinLe]]
+
+    # First pass: collect all int_lin_le's whose vars are simple FznIdent's
+    # already mapped to varPositions / declared variables.
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le": continue
+        if con.args.len < 3: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len == 0: continue
+        if coeffs.len != varElems.len: continue
+        if varElems.len < 2 or varElems.len > 4: continue
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        var varNames: seq[string]
+        var allIdents = true
+        for e in varElems:
+            if e.kind != FznIdent:
+                allIdents = false
+                break
+            varNames.add(e.ident)
+        if not allIdents: continue
+        # Key by the multiset of variable names (order-insensitive). We'll align
+        # coefficient vectors when pairing.
+        var sortedNames = varNames
+        sortedNames.sort()
+        let key = sortedNames.join("\x1f")
+        if key notin byKey: byKey[key] = @[]
+        byKey[key].add((ci: ci, coeffs: coeffs, rhs: rhs, varNames: varNames))
+
+    var nDetected = 0
+    var consumedCIs: PackedSet[int]
+
+    for key, group in byKey:
+        if group.len < 2: continue
+        # Try each unordered pair (i, j) and accept the first complementary match.
+        var matched: HashSet[int]
+        for i in 0..<group.len:
+            if i in matched: continue
+            if group[i].ci in consumedCIs: continue
+            for j in (i+1)..<group.len:
+                if j in matched: continue
+                if group[j].ci in consumedCIs: continue
+                let a = group[i]
+                let b = group[j]
+                # Align b's vars to a's vars
+                if a.varNames.len != b.varNames.len: continue
+                # Build permutation σ such that b.varNames[σ(k)] == a.varNames[k]
+                var perm = newSeq[int](a.varNames.len)
+                var taken = newSeq[bool](b.varNames.len)
+                var aligned = true
+                for k in 0..<a.varNames.len:
+                    var found = -1
+                    for m in 0..<b.varNames.len:
+                        if taken[m]: continue
+                        if b.varNames[m] == a.varNames[k]:
+                            found = m
+                            break
+                    if found < 0:
+                        aligned = false
+                        break
+                    perm[k] = found
+                    taken[found] = true
+                if not aligned: continue
+                # Check coefficient negation
+                var areNeg = true
+                for k in 0..<a.coeffs.len:
+                    if a.coeffs[k] != -b.coeffs[perm[k]]:
+                        areNeg = false
+                        break
+                if not areNeg: continue
+                # Resolve domains for each var via the FznModel declarations
+                # (we run before translateVariables, so tr.varPositions may be empty).
+                var domains: seq[seq[int]]
+                var domainsOk = true
+                for vn in a.varNames:
+                    let dom = tr.lookupVarDomain(vn)
+                    if dom.len == 0:
+                        domainsOk = false
+                        break
+                    # Intersect with presolveDomains if available
+                    var effective = dom
+                    if vn in tr.presolveDomains:
+                        effective = tr.presolveDomains[vn]
+                    domains.add(effective)
+                if not domainsOk: continue
+                # Bound on enumeration size
+                var prod = 1
+                for d in domains:
+                    if d.len == 0:
+                        prod = high(int)
+                        break
+                    if prod > maxDomainProduct div max(d.len, 1):
+                        prod = high(int)
+                        break
+                    prod *= d.len
+                if prod == high(int) or prod > maxDomainProduct: continue
+
+                # Enumerate the cartesian product, keep tuples satisfying both
+                let aRhs = a.rhs
+                let bRhs = b.rhs
+                var tuples: seq[seq[int]]
+                var idx = newSeq[int](domains.len)
+                while true:
+                    var t = newSeq[int](domains.len)
+                    var sumA = 0
+                    for k in 0..<domains.len:
+                        t[k] = domains[k][idx[k]]
+                        sumA += a.coeffs[k] * t[k]
+                    # b.coeffs were negated of a.coeffs with permutation; equivalently
+                    # b · t_b = -(a · t) when permutation is identity; with permutation,
+                    # b · perm(t) = -(a · t). Since perm is over names that are equal,
+                    # the sum stays equal up to permutation, so (sum over b) = -sumA.
+                    if sumA <= aRhs and -sumA <= bRhs:
+                        tuples.add(t)
+                    # increment idx
+                    var k = 0
+                    while k < domains.len:
+                        inc idx[k]
+                        if idx[k] < domains[k].len: break
+                        idx[k] = 0
+                        inc k
+                    if k == domains.len: break
+
+                if tuples.len == 0: continue        # infeasible — let original report
+                if tuples.len > maxAllowedTuples: continue
+                # Don't bother if the table is the entire cartesian product
+                if tuples.len == prod: continue
+
+                # Accept the pair
+                tr.pairLinLeTableDefs.add((varNames: a.varNames, tuples: tuples))
+                consumedCIs.incl(a.ci)
+                consumedCIs.incl(b.ci)
+                matched.incl(i)
+                matched.incl(j)
+                inc nDetected
+                break
+
+    for ci in consumedCIs.items:
+        tr.definingConstraints.incl(ci)
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Pair int_lin_le → table: {nDetected} pairs collapsed")
+
+
+proc emitPairLinLeTable*(tr: var FznTranslator) =
+    ## Emits tableIn constraints for patterns detected by detectPairLinLeTable.
+    ## Runs after translateVariables so positions are available.
+    if tr.pairLinLeTableDefs.len == 0: return
+    var nEmitted = 0
+    for def in tr.pairLinLeTableDefs:
+        var positions: seq[int]
+        var allFound = true
+        for vn in def.varNames:
+            if vn in tr.varPositions:
+                positions.add(tr.varPositions[vn])
+            else:
+                allFound = false
+                break
+        if not allFound: continue
+        tr.sys.addConstraint(tableIn[int](positions, def.tuples))
+        inc nEmitted
+    if nEmitted > 0:
+        stderr.writeLine(&"[FZN] Pair int_lin_le → table: emitted {nEmitted} tableIn constraint(s)")
+
+
+proc detectRankingFromCounters*(tr: var FznTranslator) =
+    ## Detects the textbook decomposition
+    ##   c[i] = #{ j != i : X[j] >= X[i] }              (worst-position counter)
+    ## materialised in FlatZinc as
+    ##   int_lin_le_reif([-1, +1], [X[j], X[i]], 0, r)  :: defines_var(r)
+    ##   bool2int(r, b)                                  :: defines_var(b)
+    ##   int_lin_eq([+1, -1, ..., -1], [c, b_1, ..., b_{N-1}], 1) :: defines_var(c)
+    ## (The constant `1` in the sum absorbs the trivially-true r when j==i, which
+    ## MiniZinc peels off during flattening. We accept either constant 0 or 1 to
+    ## handle both with-self and without-self sums.)
+    ##
+    ## When N such counters cover an array X[1..N] and each counter's lower bound
+    ## (declared or presolve-tightened) forms an alldifferent permutation of 1..N,
+    ## the conjunction is equivalent to: X must be sorted in the order prescribed
+    ## by the inverse permutation. We emit that as a redundant decreasing chain
+    ## of N-1 RelationalConstraint(`>=`)s. The chain is graduated (penalty grows
+    ## with the gap), so it gives tabu search a strong per-pair gradient that
+    ## the reified-counter cascade does not. The original decomposition is left
+    ## live for output correctness; tautology detection in the search loop
+    ## suppresses redundant constraints whose delta is identically zero.
+    ##
+    ## This pattern generalises beyond ranking: any model that pins a "counter
+    ## of greater-or-equals" per element to specific constants (e.g., scheduling
+    ## priorities, voting positions) will benefit from the same chain.
+
+    # 1. Index reified comparisons: r → (varA, varB) with semantics r ↔ (varB >= varA).
+    #    Accept both [-1,+1] and [+1,-1] coefficient orderings; canonicalise to A,B.
+    type ReifInfo = tuple[ci: int, varA: string, varB: string]
+    var reifByOutput: Table[string, ReifInfo]
+    for ci, con in tr.model.constraints:
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_le_reif": continue
+        if con.args.len < 4: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        if coeffs.len != 2: continue
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        if rhs != 0: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != 2: continue
+        if varElems[0].kind != FznIdent or varElems[1].kind != FznIdent: continue
+        if con.args[3].kind != FznIdent: continue
+        let outVar = con.args[3].ident
+        var a, b: string
+        if coeffs == @[-1, 1]:
+            # -X[0] + X[1] <= 0  ⇔  X[1] <= X[0]  ⇔  out ↔ (X[0] >= X[1])
+            a = varElems[1].ident   # the "smaller-or-equal" side
+            b = varElems[0].ident   # the "greater-or-equal" side
+        elif coeffs == @[1, -1]:
+            # X[0] - X[1] <= 0  ⇔  X[0] <= X[1]  ⇔  out ↔ (X[1] >= X[0])
+            a = varElems[0].ident
+            b = varElems[1].ident
+        else:
+            continue
+        # We store r ↔ (varB >= varA)
+        reifByOutput[outVar] = (ci: ci, varA: a, varB: b)
+
+    if reifByOutput.len == 0: return
+
+    # 2. Index bool2int: c → (ci, boolName) with c being the int output.
+    var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
+    for ci, con in tr.model.constraints:
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "bool2int": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        bool2intByOutput[con.args[1].ident] = (ci: ci, boolVar: con.args[0].ident)
+
+    # 3. Walk int_lin_eq constraints that look like a counter-sum:
+    #      counter = K + sum(indicator_k)
+    #    Encoded as int_lin_eq([+1, -1, ..., -1], [counter, ind_1, ..., ind_m], K)
+    #    or [-1, +1, ..., +1] / -K. The defined var is `counter`. For each candidate
+    #    counter, trace each indicator back through bool2int → int_lin_le_reif and
+    #    require that all reifs share a common "fixed" variable X[i] (the one being
+    #    counted against). Record (counterVar, X[i], collected X[j] names, K).
+    type CounterInfo = object
+        counterVar: string
+        fixedVar: string
+        otherVars: seq[string]   # one per indicator
+        constantOffset: int      # the +K from sum-over-self peeling
+    var counters: seq[CounterInfo]
+    var counterByVar: Table[string, int]      # fixedVar → counters index
+
+    for ci, con in tr.model.constraints:
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.args.len < 3: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        if coeffs.len < 3: continue   # need counter + at least 2 indicators
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if varElems.len != coeffs.len: continue
+        var allIdents = true
+        var varNames: seq[string]
+        for e in varElems:
+            if e.kind != FznIdent:
+                allIdents = false
+                break
+            varNames.add(e.ident)
+        if not allIdents: continue
+        # Find the unique odd-coefficient position: pattern is one [+1] and rest [-1]
+        # (or one [-1] and rest [+1]). Either is fine; flip rhs accordingly.
+        var counterIdx = -1
+        var indicatorSign = 0
+        if coeffs[0] == 1:
+            indicatorSign = -1
+            counterIdx = 0
+            for k in 1..<coeffs.len:
+                if coeffs[k] != indicatorSign: counterIdx = -2; break
+        elif coeffs[0] == -1:
+            indicatorSign = 1
+            counterIdx = 0
+            for k in 1..<coeffs.len:
+                if coeffs[k] != indicatorSign: counterIdx = -2; break
+        if counterIdx < 0: continue
+        # The defined var must be at counterIdx
+        let counterVar = varNames[counterIdx]
+        # Trace each indicator to its reified comparison
+        var fixedVarCandidate = ""
+        var otherVars: seq[string]
+        var allTraced = true
+        for k in 0..<varNames.len:
+            if k == counterIdx: continue
+            let intName = varNames[k]
+            if intName notin bool2intByOutput:
+                allTraced = false
+                break
+            let bn = bool2intByOutput[intName].boolVar
+            if bn notin reifByOutput:
+                allTraced = false
+                break
+            let ri = reifByOutput[bn]
+            # We have r ↔ (varB >= varA). The counter is supposed to count
+            # j != i such that X[j] >= X[i]; thus varA == X[i] (the fixed one)
+            # and varB == X[j]. Confirm consistency.
+            if fixedVarCandidate == "":
+                fixedVarCandidate = ri.varA
+            elif fixedVarCandidate != ri.varA:
+                allTraced = false
+                break
+            otherVars.add(ri.varB)
+        if not allTraced or fixedVarCandidate == "": continue
+        # Constant offset: with [+1, -1, …, -1] and rhs = K, counter - sum(ind) = K,
+        # i.e. counter = K + sum(ind). With [-1, +1, …, +1] and rhs = -K, same.
+        var constOffset = if indicatorSign == -1: rhs else: -rhs
+        if counterVar in counterByVar: continue   # already claimed
+        counters.add(CounterInfo(counterVar: counterVar,
+                                  fixedVar: fixedVarCandidate,
+                                  otherVars: otherVars,
+                                  constantOffset: constOffset))
+        counterByVar[counterVar] = counters.high
+
+    if counters.len < 3: return
+
+    # 4. Group counters by their source array: for each counter, gather the set
+    #    {fixedVar} ∪ {otherVars}; if all counters in a group have identical sets
+    #    of size N, they're all over the same N-element array X[1..N].
+    var groupKey: Table[string, seq[int]]   # sorted-set-key → counter indices
+    for idx, c in counters:
+        var members: HashSet[string]
+        members.incl(c.fixedVar)
+        for v in c.otherVars: members.incl(v)
+        var sorted = newSeq[string]()
+        for m in members: sorted.add(m)
+        sorted.sort()
+        let key = sorted.join("\x1f")
+        if key notin groupKey: groupKey[key] = @[]
+        groupKey[key].add(idx)
+
+    # 5. For each candidate group with |group| == N (= |members|), read each
+    #    counter's lower bound (a.k.a. K_i + offset). Build per-fixedVar K_i =
+    #    declaredLowerBound(counterVar) - constantOffset.
+    var nEmitted = 0
+    var nFullChain = 0
+    var nPartialChain = 0
+    tr.buildVarDomainIndex()
+    for key, members in groupKey:
+        let names = key.split('\x1f')
+        let N = names.len
+        if N < 3 or N > 200: continue   # sanity bounds
+
+        # Build the source-array set for this group (for literal-element rule
+        # below, we need to check whether an output_array's elements all live
+        # in this group's sourceFpSet).
+        var groupSet: HashSet[string]
+        for nm in names: groupSet.incl(nm)
+
+        # Step A: each counter we matched is worstPosition-style. Its declared
+        # lower bound is the prescribed rank K_i when the team is pinned with
+        # K_i ≥ 2; when K_i = 1, lb = 1 looks identical to "free" so we'll
+        # have to recover this via Step B (literal in bestPosition).
+        var K: Table[string, int]
+        for idx in members:
+            let c = counters[idx]
+            if c.counterVar notin tr.varDomainIndex: continue
+            let decl = tr.model.variables[tr.varDomainIndex[c.counterVar]]
+            var lb = low(int)
+            case decl.varType.kind
+            of FznIntRange: lb = decl.varType.lo
+            of FznIntSet:
+                if decl.varType.values.len > 0: lb = decl.varType.values[0]
+            else: continue
+            if lb >= 2: K[c.fixedVar] = lb
+
+        # Step B: identify the source-array's index → fp correspondence by
+        # finding an output_array whose elements (in order) are exactly this
+        # group's source set.
+        var fpAtIndex: seq[string]
+        for decl in tr.model.variables:
+            if not decl.isArray: continue
+            if not decl.hasAnnotation("output_array"): continue
+            if decl.value == nil or decl.value.kind != FznArrayLit: continue
+            if decl.value.elems.len != N: continue
+            var allInSet = true
+            var elems: seq[string]
+            for e in decl.value.elems:
+                if e.kind != FznIdent or e.ident notin groupSet:
+                    allInSet = false; break
+                elems.add(e.ident)
+            if allInSet:
+                fpAtIndex = elems
+                break
+
+        # Step C: walk every output_array of length N that contains at least
+        # one of our counter vars, and harvest two extra K signals:
+        #   - literal element at index i pins K_{fpAtIndex[i]} = literal value;
+        #   - non-counter FznIdent element with declared ub ≤ N-1 acts like a
+        #     bestPosition counter (ub = K).
+        if fpAtIndex.len == N:
+            for decl in tr.model.variables:
+                if not decl.isArray: continue
+                if not decl.hasAnnotation("output_array"): continue
+                if decl.value == nil or decl.value.kind != FznArrayLit: continue
+                if decl.value.elems.len != N: continue
+                # Skip the source array itself (its elements ARE the fps and
+                # carry no rank info). All other length-N output_arrays are
+                # candidates for K-pinning literals or bestPos-style ub bounds.
+                var elemsAllInSource = true
+                for e in decl.value.elems:
+                    if e.kind != FznIdent or e.ident notin groupSet:
+                        elemsAllInSource = false; break
+                if elemsAllInSource: continue
+                for i, e in decl.value.elems:
+                    let fp = fpAtIndex[i]
+                    if e.kind == FznIntLit:
+                        let k = e.intVal
+                        if k >= 1 and k <= N:
+                            if fp notin K or K[fp] < k:
+                                K[fp] = k
+                    elif e.kind == FznIdent:
+                        if e.ident notin tr.varDomainIndex: continue
+                        let d = tr.model.variables[tr.varDomainIndex[e.ident]]
+                        var hi = low(int)
+                        case d.varType.kind
+                        of FznIntRange: hi = d.varType.hi
+                        of FznIntSet:
+                            if d.varType.values.len > 0: hi = d.varType.values[^1]
+                        else: discard
+                        if hi != low(int) and hi <= N - 1:
+                            if fp notin K or K[fp] < hi:
+                                K[fp] = hi
+
+        # Step D: need at least 2 pinned teams to make any chain.
+        if K.len < 2: continue
+
+        # Step E: validate that the K values we accumulated are pairwise
+        # distinct and lie in 1..N.
+        var seenK: HashSet[int]
+        var allInRange = true
+        for v in K.values:
+            if v < 1 or v > N: allInRange = false; break
+            if v in seenK: allInRange = false; break
+            seenK.incl(v)
+        if not allInRange: continue
+
+        # Step F: build chain over pinned teams in K-ascending order.
+        var pairs: seq[(int, string)]
+        for vn, rank in K: pairs.add((rank, vn))
+        pairs.sort(proc(a, b: (int, string)): int = cmp(a[0], b[0]))
+        var orderedVarNames = newSeq[string](pairs.len)
+        for k, p in pairs: orderedVarNames[k] = p[1]
+
+        let isFull = K.len == N
+        tr.rankingChainDefs.add((orderedVarNames: orderedVarNames))
+        inc nEmitted
+        if isFull: inc nFullChain else: inc nPartialChain
+
+    if nEmitted > 0:
+        var totalChain = 0
+        for d in tr.rankingChainDefs: totalChain += max(0, d.orderedVarNames.len - 1)
+        stderr.writeLine(&"[FZN] Ranking-from-counters: detected {nEmitted} pattern(s) ({nFullChain} full / {nPartialChain} partial); will emit {totalChain} chain inequalities")
+
+
+proc propagateRankingChainBounds*(tr: var FznTranslator) =
+    ## For each detected ranking chain X[r[1]] >= X[r[2]] >= … >= X[r[N]],
+    ## tighten each X[r[k]]'s declared bounds using
+    ##   newLo[r[k]] = max(declaredLo[r[k]], newLo[r[k+1]])  (lb climbs upward)
+    ##   newHi[r[k]] = min(declaredHi[r[k]], newHi[r[k-1]])  (ub descends downward)
+    ## Apply the tightened (lo, hi) range by updating tr.presolveDomains for
+    ## search variables and tr.definedVarBounds for is_defined_var variables —
+    ## the existing translateVariables / buildDefinedExpressions paths will then
+    ## emit the necessary domain (or expr-bound) constraints.
+    ##
+    ## Generalises beyond ranking: any monotone chain over a variable array
+    ## benefits from this propagation.
+    if tr.rankingChainDefs.len == 0: return
+    tr.buildVarDomainIndex()
+    var nLoTightened = 0
+    var nHiTightened = 0
+    for def in tr.rankingChainDefs:
+        let names = def.orderedVarNames
+        let N = names.len
+        if N < 2: continue
+        # Read declared (lo, hi) per element (skip if missing).
+        var declLo = newSeq[int](N)
+        var declHi = newSeq[int](N)
+        var ok = true
+        for k, vn in names:
+            if vn notin tr.varDomainIndex:
+                ok = false
+                break
+            let decl = tr.model.variables[tr.varDomainIndex[vn]]
+            case decl.varType.kind
+            of FznIntRange:
+                declLo[k] = decl.varType.lo
+                declHi[k] = decl.varType.hi
+            of FznIntSet:
+                if decl.varType.values.len == 0:
+                    ok = false
+                    break
+                declLo[k] = decl.varType.values[0]
+                declHi[k] = decl.varType.values[^1]
+            else:
+                ok = false
+                break
+        if not ok: continue
+        # Initialise newLo/newHi from declared, tighten via existing presolveDomains
+        # so we don't loosen what presolve already tightened.
+        var newLo = declLo
+        var newHi = declHi
+        for k, vn in names:
+            if vn in tr.presolveDomains:
+                let pd = tr.presolveDomains[vn]
+                if pd.len > 0:
+                    if pd[0] > newLo[k]: newLo[k] = pd[0]
+                    if pd[^1] < newHi[k]: newHi[k] = pd[^1]
+        # lb climbs upward in the chain (better-ranked elements need at least the
+        # next element's lb).
+        for k in countdown(N - 2, 0):
+            if newLo[k + 1] > newLo[k]:
+                newLo[k] = newLo[k + 1]
+        # ub descends downward.
+        for k in 1 ..< N:
+            if newHi[k - 1] < newHi[k]:
+                newHi[k] = newHi[k - 1]
+        # Apply
+        for k, vn in names:
+            let lo = newLo[k]
+            let hi = newHi[k]
+            if lo > hi:
+                # Infeasible chain — leave as-is so the solver reports a hard penalty.
+                continue
+            var changed = false
+            if lo > declLo[k]:
+                changed = true
+                inc nLoTightened
+            if hi < declHi[k]:
+                changed = true
+                inc nHiTightened
+            if not changed: continue
+            # Update presolveDomains (for search vars).
+            tr.presolveDomains[vn] = toSeq(lo .. hi)
+            # Update definedVarBounds when this is an is_defined_var (so the
+            # post-translateVariables bound-emission picks up the tighter value).
+            if vn in tr.definedVarBounds:
+                tr.definedVarBounds[vn] = (lo, hi)
+    if nLoTightened > 0 or nHiTightened > 0:
+        stderr.writeLine(&"[FZN] Ranking-chain bound propagation: {nLoTightened} lb-tightenings, {nHiTightened} ub-tightenings")
+
+
+proc consumeRankingDecomposition*(tr: var FznTranslator) =
+    ## Phase 2B: after detectRankingFromCounters has matched a chain over a
+    ## source array X (e.g. fPoints), tear down the entire reified-counter
+    ## machinery that used to be channelised. The chain emitted by
+    ## emitRankingChain is mathematically equivalent — and as a tabu gradient
+    ## strictly stronger — so the original decomposition is dead weight whose
+    ## only effect was a 250+-channel cascade per X-position move.
+    ##
+    ## Consumed:
+    ##   - every `int_lin_le_reif([±1,∓1], [X[a],X[b]], 0, r)` whose pair lies
+    ##     in the chain's source array (the >= reif bank);
+    ##   - every `int_eq_reif(X[a], X[b], r)` over the same source array
+    ##     (tie reifications used by bestPosition);
+    ##   - every `bool2int(b, c)` channelling those reifs;
+    ##   - every aggregating `int_lin_eq` / `int_lin_le` whose terms (modulo a
+    ##     small number of defined "counter" variables) are exactly those
+    ##     bool2int outputs (worstPosition counter sums, bestPosition
+    ##     decompositions, and the strict-greater / strict-less position
+    ##     constraint counter sums).
+    ##
+    ## After consumption, output_array elements that referenced the now-defined
+    ## counter variables (typically `worstPosition[]` and `bestPosition[]`) have
+    ## no defining expression. We register output rules so the FZN output
+    ## writer can compute their values directly from X at print time.
+    ##
+    ## The pass is conservative in two ways: (a) it only fires when at least one
+    ## chain has been detected; (b) it only consumes constraints whose every
+    ## non-counter term traces back to a reif over the chain's exact source
+    ## array — anything else is left intact. For partial chains we also emit
+    ## one disjunctive clause per unordered pair {i, j} from the source array,
+    ## linking each pair's source values to their finalPosition values; that
+    ## per-pair linkage replaces the cascading worstPosition/bestPosition
+    ## machinery that previously enforced "finalPos respects the source's
+    ## descending order" for unpinned elements.
+    if tr.rankingChainDefs.len == 0: return
+
+    # Find a full source-array decl that matches one of our chains so we know
+    # the canonical "all elements of the source" to operate on. We use the
+    # *output_array* whose elements are exactly the chain's vars (in any
+    # superset for a partial chain — we promote to the full source).
+    var sourceFpSet: HashSet[string]
+    for d in tr.rankingChainDefs:
+        var chainSet: HashSet[string]
+        for nm in d.orderedVarNames: chainSet.incl(nm)
+        for decl in tr.model.variables:
+            if not decl.isArray or decl.value == nil or decl.value.kind != FznArrayLit: continue
+            # Look for a length-≥-chain output_array of FznIdents whose set
+            # *includes* the chain (this is the source array).
+            if decl.value.elems.len < d.orderedVarNames.len: continue
+            if not decl.hasAnnotation("output_array"): continue
+            var allIdents = true
+            var elems: HashSet[string]
+            for e in decl.value.elems:
+                if e.kind != FznIdent: allIdents = false; break
+                elems.incl(e.ident)
+            if not allIdents: continue
+            # All chain vars must be in elems (chain is a subset of source).
+            var subset = true
+            for nm in d.orderedVarNames:
+                if nm notin elems: subset = false; break
+            if not subset: continue
+            for nm in elems: sourceFpSet.incl(nm)
+            break
+    if sourceFpSet.len < 3: return
+
+    # ---------- pass 1: index reified comparisons over the source array ----------
+
+    # int_lin_le_reif outputs ↔ "X[vb] >= X[va]".
+    type LeReifInfo = tuple[ci: int, va, vb: string]
+    var leReifByOut: Table[string, LeReifInfo]
+    # int_eq_reif outputs ↔ "X[va] == X[vb]" (symmetric).
+    type EqReifInfo = tuple[ci: int, va, vb: string]
+    var eqReifByOut: Table[string, EqReifInfo]
+
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name == "int_lin_le_reif":
+            if con.args.len < 4: continue
+            let coeffs = try: tr.resolveIntArray(con.args[0])
+                         except ValueError, KeyError: continue
+            if coeffs.len != 2: continue
+            # Accept any rhs in {-1, 0, 1}: rhs=0 covers >= / <=, rhs=-1 covers
+            # strict <, rhs=1 covers strict > (after MiniZinc's k+1 ≤ b form).
+            let rhs = try: tr.resolveIntArg(con.args[2])
+                      except ValueError, KeyError: continue
+            if rhs != -1 and rhs != 0 and rhs != 1: continue
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            if elems.len != 2: continue
+            if elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
+            if con.args[3].kind != FznIdent: continue
+            var va, vb: string
+            if coeffs == @[-1, 1]:
+                va = elems[1].ident
+                vb = elems[0].ident
+            elif coeffs == @[1, -1]:
+                va = elems[0].ident
+                vb = elems[1].ident
+            else:
+                continue
+            if va notin sourceFpSet or vb notin sourceFpSet: continue
+            leReifByOut[con.args[3].ident] = (ci: ci, va: va, vb: vb)
+        elif name == "int_eq_reif":
+            if con.args.len < 3: continue
+            if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent or
+               con.args[2].kind != FznIdent: continue
+            let va = con.args[0].ident
+            let vb = con.args[1].ident
+            if va notin sourceFpSet or vb notin sourceFpSet: continue
+            eqReifByOut[con.args[2].ident] = (ci: ci, va: va, vb: vb)
+
+    if leReifByOut.len + eqReifByOut.len == 0: return
+
+    # bool2int's whose input is one of those reifs.
+    type B2iInfo = tuple[ci: int, boolIn: string, isLe: bool]
+    var b2iByOut: Table[string, B2iInfo]
+    for ci, con in tr.model.constraints:
+        if stripSolverPrefix(con.name) != "bool2int": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        let bn = con.args[0].ident
+        let cn = con.args[1].ident
+        if bn in leReifByOut:
+            b2iByOut[cn] = (ci: ci, boolIn: bn, isLe: true)
+        elif bn in eqReifByOut:
+            b2iByOut[cn] = (ci: ci, boolIn: bn, isLe: false)
+
+    # ---------- pass 2: identify aggregating int_lin_eq / int_lin_le ----------
+
+    # We accept any int_lin_eq / int_lin_le whose every term is either a b2i
+    # output from above OR (for int_lin_eq only) one of up to two "counter"
+    # variables not in b2iByOut. The counter is the variable being defined.
+
+    # Counter info, indexed by counter variable name.
+    type CounterMeta = object
+        ci: int                # the int_lin_eq / int_lin_le's index
+        kind: int              # 0 = worstPos-style (only le-reif b2is in sum),
+                                #     1 = bestPos-style (le-reif b2is + eq-reif b2is, with worstPos as the second non-b2i term),
+                                #     2 = positionConstraint counter (int_lin_le with strict >/< via le-reifs only — same as 0 for our purposes)
+        fixedFp: string        # the X[i] this counter counts against (the consistent va across feeding le-reifs)
+    var counterMeta: Table[string, CounterMeta]
+    var aggregateCIs: PackedSet[int]
+    var aggregateConsumesB2i: HashSet[string]   # b2i outputs consumed by aggregate
+
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name notin ["int_lin_eq", "int_lin_le"]: continue
+        if con.args.len < 3: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        let elems = tr.resolveVarArrayElems(con.args[1])
+        if elems.len != coeffs.len: continue
+        var varNames: seq[string]
+        var allIdents = true
+        for e in elems:
+            if e.kind != FznIdent: allIdents = false; break
+            varNames.add(e.ident)
+        if not allIdents: continue
+        # Classify terms; track the *intersection* of {va, vb} pairs across all
+        # reif-derived terms. If non-empty, the aggregate has a common fixed
+        # element — necessary for it to be a per-element counter. Also track
+        # which reif kinds appeared so we can distinguish a worst-position
+        # counter (all le-reif indicators ↔ count of >=) from a best-position
+        # counter (all eq-reif indicators ↔ count of ties).
+        var nonB2iIdxs: seq[int]
+        var anyB2i = false
+        var anyLeTerm = false
+        var anyEqTerm = false
+        var sharedFixed: HashSet[string]
+        var firstReif = true
+        for k, vn in varNames:
+            if vn in b2iByOut:
+                anyB2i = true
+                let info = b2iByOut[vn]
+                var pair: HashSet[string]
+                if info.isLe:
+                    anyLeTerm = true
+                    let r = leReifByOut[info.boolIn]
+                    pair.incl(r.va); pair.incl(r.vb)
+                else:
+                    anyEqTerm = true
+                    let r = eqReifByOut[info.boolIn]
+                    pair.incl(r.va); pair.incl(r.vb)
+                if firstReif:
+                    sharedFixed = pair
+                    firstReif = false
+                else:
+                    sharedFixed = sharedFixed * pair
+            else:
+                nonB2iIdxs.add(k)
+        if not anyB2i: continue
+        if sharedFixed.len == 0: continue
+        # Pick a representative fixed fp; the chain's existing detector already
+        # validated the canonical pairing per worstPosition counter, so for
+        # aggregate consumption any element of sharedFixed will do.
+        var leTermFixed = ""
+        for s in sharedFixed: leTermFixed = s; break
+        # int_lin_le: all-b2i, no counter — these are positionConstraint sum bounds.
+        if name == "int_lin_le":
+            if nonB2iIdxs.len != 0: continue
+            aggregateCIs.incl(ci)
+            for k, vn in varNames: aggregateConsumesB2i.incl(vn)
+            continue
+        # int_lin_eq: classify by # of non-b2i terms AND reif kinds.
+        if nonB2iIdxs.len == 1:
+            let counterVar = varNames[nonB2iIdxs[0]]
+            if leTermFixed == "": continue
+            # Only the canonical defining constraint (defines_var(counter))
+            # may classify the counter. A second constraint with the same
+            # counter as its non-b2i term (e.g. an alternate equation
+            # produced by presolve substituting bestPos[i]=K_i into the
+            # bestPos-from-worstPos definition) would otherwise overwrite
+            # the original kind. Aggregate-consume the constraint regardless.
+            var canClassify = con.hasAnnotation("defines_var")
+            if canClassify:
+                let dv = con.getAnnotation("defines_var")
+                if dv.args.len == 0 or dv.args[0].kind != FznIdent or dv.args[0].ident != counterVar:
+                    canClassify = false
+            if canClassify and counterVar notin counterMeta:
+                # Pure-le indicators → worstPosition-style counter.
+                # Pure-eq indicators → bestPosition-style counter where the
+                # paired worstPosition was already peeled to a constant by
+                # presolve (so this constraint is bestPos + sum(ties) =
+                # worstPosLiteral).
+                var inferredKind = -1
+                if anyEqTerm and not anyLeTerm:
+                    inferredKind = 1
+                elif anyLeTerm and not anyEqTerm:
+                    inferredKind = 0
+                if inferredKind >= 0:
+                    counterMeta[counterVar] = CounterMeta(ci: ci, kind: inferredKind, fixedFp: leTermFixed)
+            aggregateCIs.incl(ci)
+            for k, vn in varNames:
+                if k != nonB2iIdxs[0]: aggregateConsumesB2i.incl(vn)
+        elif nonB2iIdxs.len == 2:
+            # bestPos = worstPos − sum(ties), encoded as int_lin_eq with two non-b2i terms.
+            # We need to identify which is bestPos (the one being defined) and which is worstPos.
+            # Heuristic: the counter being defined is the term whose sign in the equation is +1
+            # and whose name is NOT itself a counterMeta entry (yet) for a worstPos-style counter.
+            # But counterMeta is being built in this loop; if we see a worstPos counter first
+            # and a bestPos second, the worstPos is already in counterMeta.
+            let aIdx = nonB2iIdxs[0]
+            let bIdx = nonB2iIdxs[1]
+            let aName = varNames[aIdx]
+            let bName = varNames[bIdx]
+            var bestPosName = ""
+            var worstPosName = ""
+            if aName in counterMeta and counterMeta[aName].kind == 0:
+                worstPosName = aName
+                bestPosName = bName
+            elif bName in counterMeta and counterMeta[bName].kind == 0:
+                worstPosName = bName
+                bestPosName = aName
+            else:
+                # Skip — pattern unclear (but will visit again on a second sweep below if order mattered).
+                continue
+            let fp = counterMeta[worstPosName].fixedFp
+            counterMeta[bestPosName] = CounterMeta(ci: ci, kind: 1, fixedFp: fp)
+            aggregateCIs.incl(ci)
+            for k, vn in varNames:
+                if k != aIdx and k != bIdx: aggregateConsumesB2i.incl(vn)
+
+    # If we discovered no aggregates at all, bail — nothing to consume.
+    if aggregateCIs.len == 0: return
+
+    # Second sweep to pick up bestPos int_lin_eqs that we skipped because the
+    # worstPos counter wasn't yet in counterMeta on first pass (constraint order).
+    var changed = true
+    var sweeps = 0
+    while changed and sweeps < 4:
+        changed = false
+        inc sweeps
+        for ci, con in tr.model.constraints:
+            if ci in aggregateCIs: continue
+            if stripSolverPrefix(con.name) != "int_lin_eq": continue
+            if con.args.len < 3: continue
+            let coeffs = try: tr.resolveIntArray(con.args[0])
+                         except ValueError, KeyError: continue
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            if elems.len != coeffs.len: continue
+            var varNames: seq[string]
+            var allIdents = true
+            for e in elems:
+                if e.kind != FznIdent: allIdents = false; break
+                varNames.add(e.ident)
+            if not allIdents: continue
+            var nonB2iIdxs: seq[int]
+            for k, vn in varNames:
+                if vn notin b2iByOut: nonB2iIdxs.add(k)
+            if nonB2iIdxs.len != 2: continue
+            let aName = varNames[nonB2iIdxs[0]]
+            let bName = varNames[nonB2iIdxs[1]]
+            var worstPosName = ""
+            var bestPosName = ""
+            if aName in counterMeta and counterMeta[aName].kind == 0:
+                worstPosName = aName; bestPosName = bName
+            elif bName in counterMeta and counterMeta[bName].kind == 0:
+                worstPosName = bName; bestPosName = aName
+            else: continue
+            let fp = counterMeta[worstPosName].fixedFp
+            counterMeta[bestPosName] = CounterMeta(ci: ci, kind: 1, fixedFp: fp)
+            aggregateCIs.incl(ci)
+            for k, vn in varNames:
+                if k != nonB2iIdxs[0] and k != nonB2iIdxs[1]:
+                    aggregateConsumesB2i.incl(vn)
+            changed = true
+
+    # ---------- pass 2.5: also consume any leftover constraint that
+    # references a counter variable we've decided is defined. Most commonly
+    # this is the `bestPosition[i] <= finalPosition[i] <= worstPosition[i]`
+    # linkage encoded as plain `int_lin_le([1,-1], [counter, finalPos], 0)`.
+    # The pair-link disjunctive clauses (or the chain in the full case)
+    # already enforce this linkage, so we drop the now-orphaned references.
+
+    var counterVarSet: HashSet[string]
+    for cn in counterMeta.keys: counterVarSet.incl(cn)
+    for ci, con in tr.model.constraints:
+        if ci in aggregateCIs: continue
+        if ci in tr.definingConstraints: continue
+        # Accept simple int_lin_le / int_lin_eq with at most 4 args; check vars
+        # via resolveVarArrayElems and FznIdent.
+        let name = stripSolverPrefix(con.name)
+        if name notin ["int_lin_le", "int_lin_eq"]: continue
+        if con.args.len < 3: continue
+        let elems = tr.resolveVarArrayElems(con.args[1])
+        var refsCounter = false
+        for e in elems:
+            if e.kind == FznIdent and e.ident in counterVarSet:
+                refsCounter = true; break
+        if refsCounter:
+            aggregateCIs.incl(ci)
+
+    # ---------- pass 3: mark consumed ----------
+
+    # Constraints
+    for ci in aggregateCIs.items: tr.definingConstraints.incl(ci)
+    # Now consume the underlying b2is and reifs that we relied on.
+    var consumedReifBools: HashSet[string]
+    var consumedB2iCIs: PackedSet[int]
+    for vn in aggregateConsumesB2i:
+        if vn notin b2iByOut: continue
+        let info = b2iByOut[vn]
+        consumedB2iCIs.incl(info.ci)
+        consumedReifBools.incl(info.boolIn)
+        tr.definedVarNames.incl(vn)
+    for ci in consumedB2iCIs.items: tr.definingConstraints.incl(ci)
+    var consumedReifCIs: PackedSet[int]
+    for bn in consumedReifBools:
+        if bn in leReifByOut:
+            consumedReifCIs.incl(leReifByOut[bn].ci)
+        elif bn in eqReifByOut:
+            consumedReifCIs.incl(eqReifByOut[bn].ci)
+        tr.definedVarNames.incl(bn)
+    for ci in consumedReifCIs.items: tr.definingConstraints.incl(ci)
+    # Counter vars become defined-without-expression.
+    for cn in counterMeta.keys: tr.definedVarNames.incl(cn)
+
+    # ---------- pass 4: build output rules ----------
+
+    # Find output_array decls whose elements contain any counter var. For each
+    # such array, build a rule covering all positions (literals stay as-is, only
+    # counter elements are computed).
+    for decl in tr.model.variables:
+        if not decl.isArray: continue
+        if not decl.hasAnnotation("output_array"): continue
+        if decl.value == nil or decl.value.kind != FznArrayLit: continue
+        var hasCounter = false
+        var ruleKind = -1
+        var indexFp = newSeq[string](decl.value.elems.len)
+        var nCounter = 0
+        for i, e in decl.value.elems:
+            if e.kind == FznIdent and e.ident in counterMeta:
+                hasCounter = true
+                inc nCounter
+                let m = counterMeta[e.ident]
+                indexFp[i] = m.fixedFp
+                if ruleKind < 0: ruleKind = m.kind
+                elif ruleKind != m.kind:
+                    ruleKind = -2     # mixed — bail
+                    break
+        if not hasCounter or ruleKind < 0: continue
+        var sources: seq[string]
+        for nm in sourceFpSet: sources.add(nm)
+        sources.sort()
+        tr.rankingOutputRules.add((arrayName: decl.name,
+                                    kind: ruleKind,
+                                    indexFpVarNames: indexFp,
+                                    sourceFpVarNames: sources))
+
+    # ---------- pass 5: pair-wise rank/position linkage constraints ----------
+    # When the chain is partial (covers only a subset of the source array), the
+    # decomposition we just consumed was the only thing tying free elements'
+    # finalPosition to the source array. Without it the search would happily
+    # produce a finalPosition permutation inconsistent with the source ordering.
+    # Replace the lost linkage with one disjunctive clause per unordered pair
+    # {i, j}: (finalPos_j - finalPos_i ≤ 0) OR (fp_j - fp_i ≤ 0). The clause is
+    # graduated (penalty = min of two slacks), giving tabu a smooth gradient
+    # without rebuilding the full reified-counter cascade.
+    #
+    # We always emit pair constraints when the decomposition is consumed; for a
+    # full chain they're redundant with the chain (and with each other under
+    # alldifferent), but the redundancy is cheap and uniform: each fp move
+    # touches O(N) clauses and tabu's tautology elimination silently disables
+    # the always-zero ones.
+
+    # Locate the "secondary" output array of length |source| that is neither
+    # the source array nor a counter (worstPos/bestPos) array. This is the
+    # canonical finalPosition array. We track each slot as either a var name
+    # or a constant value (literal pinned by MiniZinc).
+    var finalPosAtIndex: seq[string]
+    var finalPosConstAtIndex: seq[int]
+    block:
+        let N = sourceFpSet.len
+        for decl in tr.model.variables:
+            if not decl.isArray: continue
+            if not decl.hasAnnotation("output_array"): continue
+            if decl.value == nil or decl.value.kind != FznArrayLit: continue
+            if decl.value.elems.len != N: continue
+            var allInSource = true
+            for e in decl.value.elems:
+                if e.kind != FznIdent or e.ident notin sourceFpSet:
+                    allInSource = false; break
+            if allInSource: continue
+            var hasCounter = false
+            for e in decl.value.elems:
+                if e.kind == FznIdent and e.ident in counterMeta:
+                    hasCounter = true; break
+            if hasCounter: continue
+            finalPosAtIndex = newSeq[string](N)
+            finalPosConstAtIndex = newSeq[int](N)
+            for i, e in decl.value.elems:
+                case e.kind
+                of FznIdent:
+                    finalPosAtIndex[i] = e.ident
+                    finalPosConstAtIndex[i] = -1
+                of FznIntLit:
+                    finalPosAtIndex[i] = ""
+                    finalPosConstAtIndex[i] = e.intVal
+                else:
+                    finalPosAtIndex[i] = ""
+                    finalPosConstAtIndex[i] = -1
+            break
+
+    # We also need the source-array index correspondence (re-derive locally).
+    var fpAtIndex: seq[string]
+    block:
+        let N = sourceFpSet.len
+        for decl in tr.model.variables:
+            if not decl.isArray: continue
+            if not decl.hasAnnotation("output_array"): continue
+            if decl.value == nil or decl.value.kind != FznArrayLit: continue
+            if decl.value.elems.len != N: continue
+            var elems: seq[string]
+            var allInSet = true
+            for e in decl.value.elems:
+                if e.kind != FznIdent or e.ident notin sourceFpSet:
+                    allInSet = false; break
+                elems.add(e.ident)
+            if allInSet:
+                fpAtIndex = elems
+                break
+
+    var nPairs = 0
+    if finalPosAtIndex.len == sourceFpSet.len and fpAtIndex.len == sourceFpSet.len:
+        let N = sourceFpSet.len
+        for i in 0 ..< N - 1:
+            for j in (i+1) ..< N:
+                let fpI = fpAtIndex[i]
+                let fpJ = fpAtIndex[j]
+                let finalI = finalPosAtIndex[i]
+                let finalJ = finalPosAtIndex[j]
+                let constI = finalPosConstAtIndex[i]
+                let constJ = finalPosConstAtIndex[j]
+                # Both pinned (both literals): the relative order of i and j is
+                # fixed by the constants; the chain over pinned teams already
+                # enforces fp's matching order, so this pair is redundant.
+                if finalI == "" and finalJ == "":
+                    continue
+                # One disjunctive clause per unordered pair {i, j}. The clause
+                # has two disjuncts, each a conjunction of two ≤-terms; see
+                # emitRankingPairConstraints for the encoding details. With
+                # alldifferent on finalPos, exactly one disjunct can be fully
+                # satisfied (the one matching finalPos's strict ordering); the
+                # search drives fp into the matching shape via the still-active
+                # term in the *other* disjunct.
+                tr.rankingPairConstraintDefs.add(
+                    (fpA: fpI, fpB: fpJ, finalA: finalI, finalB: finalJ,
+                     finalAConst: constI, finalBConst: constJ))
+                inc nPairs
+
+    stderr.writeLine(&"[FZN] Ranking-decomp consumed: {aggregateCIs.len} aggregate, {consumedB2iCIs.len} bool2int, {consumedReifCIs.len} reif; {counterMeta.len} counter vars; {tr.rankingOutputRules.len} output rule(s); {nPairs} pair-link clause(s) queued")
+
+
+proc emitRankingPairConstraints*(tr: var FznTranslator) =
+    ## Emits one DisjunctiveClauseConstraint per queued unordered pair {i, j}
+    ## with two disjuncts, each a conjunction of two ≤-terms:
+    ##   D1: (finalPos_j ≤ finalPos_i) AND (fp_i ≤ fp_j)
+    ##   D2: (finalPos_i ≤ finalPos_j) AND (fp_j ≤ fp_i)
+    ## A consistent assignment satisfies exactly one disjunct fully (the one
+    ## whose finalPos ordering matches the fp ordering); an inconsistent one
+    ## violates both disjuncts and the disjunctive clause's penalty `min over
+    ## disjuncts of conjunction-violation` carries a magnitude-aware gradient
+    ## driving the search back to consistency.
+    ##
+    ## fp expressions are expanded down to the source array's defining
+    ## game-point positions (fp_i = iPoints[i] + Σ game_i) so the clause's
+    ## terms reference real variable positions and benefit from
+    ## DisjunctiveClauseConstraint's O(1) per-position incremental updates.
+    if tr.rankingPairConstraintDefs.len == 0: return
+
+    # Expand each fp variable into its underlying linear definition by walking
+    # the int_lin_eq with `defines_var(fp)` annotation. fp = iPoints[i] +
+    # sum(game positions). Cache the expansion per fp name.
+    type FpExpansion = object
+        gamePositions: seq[int]   # positions whose +1 contribution sums to fp - iPoints
+        constant: int             # iPoints[i]
+        ok: bool
+    var fpExpansions: Table[string, FpExpansion]
+    proc expandFp(tr: FznTranslator, vn: string): FpExpansion =
+        if vn in fpExpansions: return fpExpansions[vn]
+        # Find an int_lin_eq defining `vn` whose coefficients are
+        # [+1, -1, …, -1] (the canonical fp = iPoints + Σ shape) or
+        # [-1, +1, …, +1].
+        var found: FpExpansion
+        found.ok = false
+        for con in tr.model.constraints:
+            if not con.hasAnnotation("defines_var"): continue
+            let dv = con.getAnnotation("defines_var")
+            if dv.args.len == 0 or dv.args[0].kind != FznIdent: continue
+            if dv.args[0].ident != vn: continue
+            if stripSolverPrefix(con.name) != "int_lin_eq": continue
+            if con.args.len < 3: continue
+            let coeffs = try: tr.resolveIntArray(con.args[0])
+                         except ValueError, KeyError: continue
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            if elems.len != coeffs.len: continue
+            let rhs = try: tr.resolveIntArg(con.args[2])
+                      except ValueError, KeyError: continue
+            if coeffs.len < 2: continue
+            # fp at coeffs[0] must have coeff ±1, all other terms the opposite sign.
+            let fpCoef = coeffs[0]
+            if fpCoef != 1 and fpCoef != -1: continue
+            var sumCoef = -fpCoef    # other terms have opposite sign
+            var ok = true
+            for k in 1 ..< coeffs.len:
+                if coeffs[k] != sumCoef: ok = false; break
+            if not ok: continue
+            # vn must be at coeffs[0]. Check elems[0] matches.
+            if elems[0].kind != FznIdent or elems[0].ident != vn: continue
+            # Resolve game positions
+            var gp: seq[int]
+            var allResolved = true
+            for k in 1 ..< elems.len:
+                if elems[k].kind != FznIdent: allResolved = false; break
+                let gname = elems[k].ident
+                if gname in tr.varPositions:
+                    gp.add(tr.varPositions[gname])
+                elif gname in tr.paramValues:
+                    # Inline a constant — fold into the iPoints constant via rhs.
+                    discard
+                else:
+                    allResolved = false; break
+            if not allResolved: continue
+            # fp - sumCoef * sum(games) = rhs ⇒ fp = rhs + sumCoef * sum(games).
+            # Since fpCoef·fp + sumCoef·Σgames = rhs and we want fp expanded as
+            # iPoints + Σgames(coeff +1), with fpCoef=+1, sumCoef=-1 we get
+            # fp = rhs + sum(games), i.e., constant = rhs and gamePositions
+            # contribute +1 each. With fpCoef=-1, sumCoef=+1: -fp + Σ = rhs →
+            # fp = -rhs + Σ. Coefficients for games stay +1 (we want a +1 sum
+            # form for fp_b - fp_a expansion; just remember the constant).
+            var c = if fpCoef == 1: rhs else: -rhs
+            found = FpExpansion(gamePositions: gp, constant: c, ok: true)
+            break
+        fpExpansions[vn] = found
+        return found
+
+    # Helper: build the linear-term representation of (sign * (finalPos_X -
+    # finalPos_Y)) ≤ rhs accounting for either side being a constant. Returns
+    # (coeffs, positions, rhs, ok).
+    proc finalTerm(tr: FznTranslator,
+                   primaryName: string, primaryConst: int,
+                   secondaryName: string, secondaryConst: int):
+                       tuple[coeffs: seq[int], positions: seq[int], rhs: int, ok: bool] =
+        # We build "primary ≤ secondary", expanding constants where appropriate.
+        # Both const: 0 ≤ secondaryConst − primaryConst.
+        let pIsConst = primaryConst >= 0
+        let sIsConst = secondaryConst >= 0
+        if pIsConst and sIsConst:
+            return (coeffs: @[], positions: @[], rhs: secondaryConst - primaryConst, ok: true)
+        if pIsConst:
+            if secondaryName notin tr.varPositions: return (coeffs: @[], positions: @[], rhs: 0, ok: false)
+            # primaryConst ≤ secondaryVar  ⇔  -secondaryVar ≤ -primaryConst
+            return (coeffs: @[-1],
+                    positions: @[tr.varPositions[secondaryName]],
+                    rhs: -primaryConst, ok: true)
+        if sIsConst:
+            if primaryName notin tr.varPositions: return (coeffs: @[], positions: @[], rhs: 0, ok: false)
+            # primaryVar ≤ secondaryConst
+            return (coeffs: @[1],
+                    positions: @[tr.varPositions[primaryName]],
+                    rhs: secondaryConst, ok: true)
+        if primaryName notin tr.varPositions or secondaryName notin tr.varPositions:
+            return (coeffs: @[], positions: @[], rhs: 0, ok: false)
+        # primaryVar - secondaryVar ≤ 0
+        return (coeffs: @[1, -1],
+                positions: @[tr.varPositions[primaryName], tr.varPositions[secondaryName]],
+                rhs: 0, ok: true)
+
+    # Helper: build the fp_X - fp_Y ≤ 0 term using fp expansions. Returns
+    # the (coeffs, positions, rhs).
+    proc fpTerm(xX, xY: FpExpansion):
+                    tuple[coeffs: seq[int], positions: seq[int], rhs: int] =
+        var posToCoef: OrderedTable[int, int]
+        for p in xX.gamePositions:
+            posToCoef[p] = posToCoef.getOrDefault(p, 0) + 1
+        for p in xY.gamePositions:
+            posToCoef[p] = posToCoef.getOrDefault(p, 0) - 1
+        var coeffs: seq[int]
+        var positions: seq[int]
+        for p, c in posToCoef:
+            if c != 0:
+                coeffs.add(c)
+                positions.add(p)
+        return (coeffs: coeffs, positions: positions, rhs: xY.constant - xX.constant)
+
+    var nEmitted = 0
+    var nFailFp = 0
+    var nFailFinal = 0
+    var nSkipBothConst = 0
+    for def in tr.rankingPairConstraintDefs:
+        let aIsConst = def.finalAConst >= 0
+        let bIsConst = def.finalBConst >= 0
+        if aIsConst and bIsConst and def.finalAConst == def.finalBConst:
+            # Two pinned positions can't share a finalPos value (alldifferent
+            # filter already eliminates pinned-pinned pairs upstream, so this
+            # is just defensive).
+            inc nSkipBothConst
+            continue
+        let xA = expandFp(tr, def.fpA)
+        let xB = expandFp(tr, def.fpB)
+        if not (xA.ok and xB.ok):
+            inc nFailFp
+            continue
+        # D1: finalPos_B ≤ finalPos_A  AND  fp_A ≤ fp_B.
+        let d1FinalTerm = tr.finalTerm(def.finalB, def.finalBConst,
+                                       def.finalA, def.finalAConst)
+        if not d1FinalTerm.ok: inc nFailFinal; continue
+        let d1FpTerm = fpTerm(xA, xB)
+        # D2: finalPos_A ≤ finalPos_B  AND  fp_B ≤ fp_A.
+        let d2FinalTerm = tr.finalTerm(def.finalA, def.finalAConst,
+                                       def.finalB, def.finalBConst)
+        if not d2FinalTerm.ok: inc nFailFinal; continue
+        let d2FpTerm = fpTerm(xB, xA)
+        let disjuncts = @[
+            @[(coeffs: d1FinalTerm.coeffs, positions: d1FinalTerm.positions,
+               rhs: d1FinalTerm.rhs),
+              (coeffs: d1FpTerm.coeffs, positions: d1FpTerm.positions,
+               rhs: d1FpTerm.rhs)],
+            @[(coeffs: d2FinalTerm.coeffs, positions: d2FinalTerm.positions,
+               rhs: d2FinalTerm.rhs),
+              (coeffs: d2FpTerm.coeffs, positions: d2FpTerm.positions,
+               rhs: d2FpTerm.rhs)]
+        ]
+        let constraint = newDisjunctiveClauseConstraint[int](disjuncts)
+        var pset: PackedSet[int]
+        for p in d1FinalTerm.positions: pset.incl(p)
+        for p in d1FpTerm.positions: pset.incl(p)
+        for p in d2FinalTerm.positions: pset.incl(p)
+        for p in d2FpTerm.positions: pset.incl(p)
+        tr.sys.addConstraint(StatefulConstraint[int](
+            positions: pset,
+            stateType: DisjunctiveClauseType,
+            disjunctiveClauseState: constraint))
+        inc nEmitted
+    if nEmitted > 0:
+        stderr.writeLine(&"[FZN] Ranking-decomp: emitted {nEmitted} pair-link disjunctive clause(s)")
+
+
+proc emitRankingChain*(tr: var FznTranslator) =
+    ## Emits redundant decreasing-chain inequalities for ranking-from-counters
+    ## patterns, as N-1 magnitude-graduated `>=` relational constraints.
+    if tr.rankingChainDefs.len == 0: return
+    var nAdded = 0
+    var nSkipped = 0
+    for def in tr.rankingChainDefs:
+        var exprs = newSeq[AlgebraicExpression[int]](def.orderedVarNames.len)
+        var allFound = true
+        for k, vn in def.orderedVarNames:
+            if vn in tr.varPositions:
+                exprs[k] = tr.getExpr(tr.varPositions[vn])
+            elif vn in tr.definedVarExprs:
+                exprs[k] = tr.definedVarExprs[vn]
+            else:
+                stderr.writeLine(&"[FZN] Ranking-from-counters: skipping chain — var '{vn}' has no position or expression")
+                allFound = false
+                break
+        if not allFound:
+            inc nSkipped
+            continue
+        for k in 0 ..< exprs.len - 1:
+            tr.sys.addConstraint(exprs[k] >= exprs[k + 1])
+            inc nAdded
+    if nAdded > 0:
+        stderr.writeLine(&"[FZN] Ranking-from-counters: emitted {nAdded} redundant chain >= constraints")
+    if nSkipped > 0:
+        stderr.writeLine(&"[FZN] Ranking-from-counters: skipped {nSkipped} chain(s) due to unresolved variables")
+
+
 proc detectRedundantDisjunctions*(tr: var FznTranslator) =
     ## Detects disjunctive pairs that are implied by an existing max/min condition.
     ##
