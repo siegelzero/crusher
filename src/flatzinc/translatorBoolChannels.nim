@@ -1814,23 +1814,24 @@ proc detectImplicationOrChannels*(tr: var FznTranslator) =
     ## MUST run after detectReifChannels() so eq/ne reif maps are populated, and after
     ## the bool channel detectors that consume related clauses (detectBoolOrChannels,
     ## detectForwardBackwardEquivChannels). Skips clauses already in definingConstraints.
-    var eqReifBy: Table[string, tuple[srcVar: string, val: int]]
+    ##
+    ## All eligibility checks (binary domains for V and every W_i, no self-loop)
+    ## happen here, *before* anything is added to channelVarNames or
+    ## definingConstraints. If a candidate fails any check we leave the original
+    ## bool_clauses live so the standard constraint translator enforces the
+    ## implications.
+    var eqReifBy, neReifBy: Table[string, tuple[srcVar: string, val: int]]
     for ci in tr.reifChannelDefs:
         let con = tr.model.constraints[ci]
-        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        let nm = stripSolverPrefix(con.name)
+        if nm != "int_eq_reif" and nm != "int_ne_reif": continue
         if con.args.len < 3: continue
         if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
         let v = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
-        eqReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
-
-    var neReifBy: Table[string, tuple[srcVar: string, val: int]]
-    for ci in tr.reifChannelDefs:
-        let con = tr.model.constraints[ci]
-        if stripSolverPrefix(con.name) != "int_ne_reif": continue
-        if con.args.len < 3: continue
-        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
-        let v = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
-        neReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
+        if nm == "int_eq_reif":
+            eqReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
+        else:
+            neReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
 
     if eqReifBy.len == 0 or neReifBy.len == 0: return
 
@@ -1876,30 +1877,52 @@ proc detectImplicationOrChannels*(tr: var FznTranslator) =
 
     if forceMap.len == 0: return
 
-    # Defer channel binding construction to buildImplicationOrChannelBindings
-    # (runs after translateVariables, when varPositions is populated). Here we
-    # only collect candidate (target, sources) tuples and mark consumed clauses.
+    proc isBinaryDomain(dom: seq[int]): bool =
+        dom.len == 2 and dom[0] == 0 and dom[1] == 1
+
     var nDetected = 0
     var nClausesConsumed = 0
+    var nRejectedDomain = 0
     for vName, forces in forceMap.pairs:
         if forces.len < 2: continue
-        # Skip if V is already known to be defined or aliased (these are name-based;
-        # they remain valid before translateVariables).
+        # Skip if V is already claimed by another detector or aliased.
         if vName in tr.channelVarNames: continue
         if vName in tr.definedVarNames: continue
         if vName in tr.equalityCopyAliases: continue
-        # Defer position/domain validation to build phase.
+        # Validate V is binary {0,1}. lookupVarDomain returns @[0,1] for FznBool
+        # and the explicit range for FznIntRange/FznIntSet.
+        let vDom = tr.lookupVarDomain(vName)
+        if not isBinaryDomain(vDom):
+            nRejectedDomain += 1
+            continue
+        # Validate every W_i is binary, and there is no self-loop W_i == V.
+        var allBinary = true
         var sourceNames: seq[string]
+        var consumedClauses: seq[int]
         for f in forces:
+            if f.wName == vName:
+                allBinary = false
+                break
+            let wDom = tr.lookupVarDomain(f.wName)
+            if not isBinaryDomain(wDom):
+                allBinary = false
+                break
             sourceNames.add(f.wName)
-        tr.implicationOrChannelDefs.add((targetVar: vName, sourceVars: sourceNames))
-        # Mark V as a channel so other passes don't try to compete for it
+            consumedClauses.add(f.clauseCi)
+        if not allBinary:
+            nRejectedDomain += 1
+            continue
+        tr.implicationOrChannelDefs.add(
+            (targetVar: vName, sourceVars: sourceNames, consumedClauses: consumedClauses))
+        # Now safe to claim — every check the build phase will repeat has
+        # already passed at the FZN-declaration level.
         tr.channelVarNames.incl(vName)
-        for f in forces:
-            tr.definingConstraints.incl(f.clauseCi)
+        for ci in consumedClauses:
+            tr.definingConstraints.incl(ci)
         nDetected += 1
-        nClausesConsumed += forces.len
+        nClausesConsumed += consumedClauses.len
 
-    if nDetected > 0:
+    if nDetected > 0 or nRejectedDomain > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} implication-OR channel candidates " &
-                         &"(V = OR(W_i) from {nClausesConsumed} bool_clauses; deferred to build phase)")
+                         &"(V = OR(W_i) from {nClausesConsumed} bool_clauses; " &
+                         &"rejected {nRejectedDomain} non-binary; deferred to build phase)")

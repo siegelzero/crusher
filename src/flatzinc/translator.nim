@@ -351,8 +351,12 @@ type
         # array_bool_and/array_bool_or with defines_var → channel variables
         boolAndOrChannelDefs*: seq[int]
         # Implication-OR channel defs (V = OR(W_i) synthesized from
-        # int_eq_reif(V,1)/int_ne_reif(W,1)/bool_clause patterns)
-        implicationOrChannelDefs*: seq[tuple[targetVar: string, sourceVars: seq[string]]]
+        # int_eq_reif(V,1)/int_ne_reif(W,1)/bool_clause patterns).
+        # consumedClauses lets the build phase revert (excl from
+        # definingConstraints) if it has to skip — keeping the implications live.
+        implicationOrChannelDefs*: seq[tuple[targetVar: string,
+                                             sourceVars: seq[string],
+                                             consumedClauses: seq[int]]]
         # Overlap channel defs: overlap = NOT sep via bool_not chain
         overlapChannelDefs*: seq[tuple[ci: int, overlapVar: string, sepVar: string]]
         # Consumed disjunctive pair indices (replaced by cumulative constraints)

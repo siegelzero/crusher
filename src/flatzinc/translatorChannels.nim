@@ -1083,21 +1083,30 @@ proc buildImplicationOrChannelBindings*(tr: var FznTranslator) =
     ## For each (V, [W_1, ..., W_n]) candidate:
     ##   V = element(W_1 + W_2 + ... + W_n, [0, 1, 1, ..., 1])
     ##
-    ## Validates that V and all W_i are present in varPositions and have binary
-    ## domain {0, 1}. Skips otherwise — the original bool_clauses are already
-    ## marked as defining at detect time, so an aborted binding leaves the
-    ## constraint network well-formed (V remains a search var with implications
-    ## handled via the standard constraint translation path).
+    ## The detector already validated binary domains at the FZN-declaration level.
+    ## Skips here only fire when post-detect aliasing or domain narrowing changed
+    ## the picture. On skip we revert the detect-time consumption (excl from
+    ## channelVarNames + definingConstraints) so the original implications remain
+    ## enforced via the standard constraint translation path.
+    proc revert(tr: var FznTranslator,
+                def: tuple[targetVar: string, sourceVars: seq[string],
+                           consumedClauses: seq[int]]) =
+        tr.channelVarNames.excl(def.targetVar)
+        for ci in def.consumedClauses:
+            tr.definingConstraints.excl(ci)
+
     var nBuilt = 0
     var nSkipped = 0
     for def in tr.implicationOrChannelDefs:
         let vName = def.targetVar
         if vName notin tr.varPositions:
+            tr.revert(def)
             nSkipped += 1
             continue
         let vPos = tr.varPositions[vName]
         let vDom = tr.sys.baseArray.domain[vPos]
         if vDom.len != 2 or 0 notin vDom or 1 notin vDom:
+            tr.revert(def)
             nSkipped += 1
             continue
 
@@ -1117,6 +1126,7 @@ proc buildImplicationOrChannelBindings*(tr: var FznTranslator) =
                 break
             wPositions.add(wPos)
         if not allValid:
+            tr.revert(def)
             nSkipped += 1
             continue
 

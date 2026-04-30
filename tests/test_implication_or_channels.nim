@@ -60,7 +60,10 @@ solve satisfy;
     check not tr.implicationOrChannelDefs.anyIt(it.targetVar == "V")
 
   test "channel propagates V = OR(W1, W2, W3) at runtime":
-    ## End-to-end: search forces W1=1, expect V=1 via channel.
+    ## End-to-end: with W's free, channel binding propagates correctly.
+    ## Use int_lin_eq to *constrain* the W sum without narrowing W's domains
+    ## via presolve (presolve singletons would skip the build phase, which is
+    ## tested separately below).
     let src = """
 var 0..1: V :: output_var;
 var 0..1: W1 :: output_var;
@@ -77,9 +80,7 @@ constraint int_ne_reif(W3, 1, N3) :: defines_var(N3);
 constraint bool_clause([N1, B], []);
 constraint bool_clause([N2, B], []);
 constraint bool_clause([N3, B], []);
-constraint int_eq(W1, 1);
-constraint int_eq(W2, 0);
-constraint int_eq(W3, 0);
+constraint int_lin_eq([1, 1, 1], [W1, W2, W3], 1);
 solve satisfy;
 """
     let model = parseFzn(src)
@@ -89,10 +90,16 @@ solve satisfy;
 
     let vVal = tr.sys.assignment[tr.varPositions["V"]]
     let w1Val = tr.sys.assignment[tr.varPositions["W1"]]
-    check w1Val == 1
-    check vVal == 1  # V = OR(1, 0, 0) = 1
+    let w2Val = tr.sys.assignment[tr.varPositions["W2"]]
+    let w3Val = tr.sys.assignment[tr.varPositions["W3"]]
+    check w1Val + w2Val + w3Val == 1
+    check vVal == 1  # V = OR(W1, W2, W3); exactly one W is 1, so V = 1
 
-  test "channel propagates V = 0 when all W_i = 0":
+  test "channel agrees with OR(W) for any assignment the solver finds":
+    ## Pure channel-propagation check: no extra constraints, solver picks
+    ## *some* binary assignment for W's, channel must compute V = OR(W_i)
+    ## consistently. Avoids domain-narrowing constraints that would skip the
+    ## build phase (covered by the presolve-skip test below).
     let src = """
 var 0..1: V :: output_var;
 var 0..1: W1 :: output_var;
@@ -105,8 +112,6 @@ constraint int_ne_reif(W1, 1, N1) :: defines_var(N1);
 constraint int_ne_reif(W2, 1, N2) :: defines_var(N2);
 constraint bool_clause([N1, B], []);
 constraint bool_clause([N2, B], []);
-constraint int_eq(W1, 0);
-constraint int_eq(W2, 0);
 solve satisfy;
 """
     let model = parseFzn(src)
@@ -115,7 +120,48 @@ solve satisfy;
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
 
     let vVal = tr.sys.assignment[tr.varPositions["V"]]
-    check vVal == 0  # V = OR(0, 0) = 0
+    let w1Val = tr.sys.assignment[tr.varPositions["W1"]]
+    let w2Val = tr.sys.assignment[tr.varPositions["W2"]]
+    check vVal == max(w1Val, w2Val)  # V = OR(W1, W2)
+
+  test "implications still enforced when presolve narrows W and build skips":
+    ## Defense-in-depth: when presolve narrows W's domain (e.g., int_eq fixes
+    ## it to {1}), the build phase skips because W is no longer fully binary.
+    ## Build then reverts the detect-time consumption (excl from
+    ## channelVarNames + definingConstraints) so the original bool_clauses get
+    ## translated normally and the implication W=1 → V=1 is still enforced.
+    let src = """
+var 0..1: V :: output_var;
+var 0..1: W1 :: output_var;
+var 0..1: W2 :: output_var;
+var bool: B :: var_is_introduced :: is_defined_var;
+var bool: N1 :: var_is_introduced :: is_defined_var;
+var bool: N2 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(V, 1, B) :: defines_var(B);
+constraint int_ne_reif(W1, 1, N1) :: defines_var(N1);
+constraint int_ne_reif(W2, 1, N2) :: defines_var(N2);
+constraint bool_clause([N1, B], []);
+constraint bool_clause([N2, B], []);
+constraint int_eq(W1, 1);
+constraint int_eq(W2, 0);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Channel was reverted (presolve narrowed W1/W2 to singleton domains).
+    check "V" notin tr.channelVarNames
+    # Bool_clauses must be live (not in definingConstraints) so the
+    # implications still enforce correctness.
+    var clauseCis: seq[int]
+    for ci, con in model.constraints:
+      if con.name == "bool_clause":
+        clauseCis.add(ci)
+    for ci in clauseCis:
+      check ci notin tr.definingConstraints
+
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let vVal = tr.sys.assignment[tr.varPositions["V"]]
+    check vVal == 1  # W1=1 forces V=1 via the (now-translated) bool_clause
 
   test "consumed bool_clauses are in definingConstraints":
     ## After channelization the 2-literal bool_clauses should be skipped during
@@ -166,9 +212,7 @@ solve satisfy;
     let model = parseFzn(src)
     var tr = translate(model)
 
-    # Detection records the candidate name-based, but the build phase rejects it
-    # because V's domain isn't {0, 1}. We ensure no spurious channel binding shows up.
-    let nBindingsAfter = tr.sys.baseArray.channelBindings.len
+    # Detect now rejects up-front because V's FZN-declared domain isn't {0,1}.
     # No build of an OR channel for V (V lacks a binary domain).
     # Look for a channelBinding whose channelPosition matches V's position.
     let vPos = tr.varPositions["V"]
