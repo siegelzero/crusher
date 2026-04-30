@@ -498,12 +498,14 @@ type
         # partial chain (pinned subset only) and we need the full N×N linkage
         # between the source array (e.g. fPoints) and the finalPosition array
         # to be enforced via simple per-pair disjunctions instead of the
-        # consumed counter cascade. finalAConst / finalBConst are -1 when the
-        # corresponding finalPos slot is a real variable; otherwise they hold
-        # the literal rank value pinned by MiniZinc.
+        # consumed counter cascade. When finalAIsConst/finalBIsConst is true,
+        # finalAConst/finalBConst holds the literal rank value pinned by
+        # MiniZinc; otherwise the corresponding finalPos slot is a real
+        # variable referenced by name.
         rankingPairConstraintDefs*: seq[tuple[
             fpA, fpB, finalA, finalB: string,
-            finalAConst, finalBConst: int]]
+            finalAConst, finalBConst: int,
+            finalAIsConst, finalBIsConst: bool]]
         # Detected product-sum atMost patterns (int_lin_le on bool2int(array_bool_and(..)) chains)
         productSumAtMostDefs*: seq[ProductSumAtMostDef]
         # Detected binary k-ary NAND clauses (int_lin_le([1,...,1], vars, k-1) on

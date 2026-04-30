@@ -6965,8 +6965,16 @@ proc detectPairLinLeTable*(tr: var FznTranslator,
 
                 if tuples.len == 0: continue        # infeasible — let original report
                 if tuples.len > maxAllowedTuples: continue
-                # Don't bother if the table is the entire cartesian product
-                if tuples.len == prod: continue
+                # Tautological pair: every cartesian-product tuple satisfies
+                # both inequalities. Don't emit a redundant table — but do
+                # mark both inequalities consumed so downstream passes don't
+                # see the dead constraints.
+                if tuples.len == prod:
+                    consumedCIs.incl(a.ci)
+                    consumedCIs.incl(b.ci)
+                    matched.incl(i)
+                    matched.incl(j)
+                    break
 
                 # Accept the pair
                 tr.pairLinLeTableDefs.add((varNames: a.varNames, tuples: tuples))
@@ -6988,20 +6996,26 @@ proc emitPairLinLeTable*(tr: var FznTranslator) =
     ## Runs after translateVariables so positions are available.
     if tr.pairLinLeTableDefs.len == 0: return
     var nEmitted = 0
+    var nSkipped = 0
     for def in tr.pairLinLeTableDefs:
         var positions: seq[int]
-        var allFound = true
+        var missingVar = ""
         for vn in def.varNames:
             if vn in tr.varPositions:
                 positions.add(tr.varPositions[vn])
             else:
-                allFound = false
+                missingVar = vn
                 break
-        if not allFound: continue
+        if missingVar != "":
+            inc nSkipped
+            stderr.writeLine(&"[FZN] Pair int_lin_le → table: skipping table — var '{missingVar}' has no position")
+            continue
         tr.sys.addConstraint(tableIn[int](positions, def.tuples))
         inc nEmitted
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] Pair int_lin_le → table: emitted {nEmitted} tableIn constraint(s)")
+    if nSkipped > 0:
+        stderr.writeLine(&"[FZN] Pair int_lin_le → table: skipped {nSkipped} table(s) due to unresolved variables")
 
 
 proc detectRankingFromCounters*(tr: var FznTranslator) =
@@ -7380,8 +7394,20 @@ proc propagateRankingChainBounds*(tr: var FznTranslator) =
                 changed = true
                 inc nHiTightened
             if not changed: continue
-            # Update presolveDomains (for search vars).
-            tr.presolveDomains[vn] = toSeq(lo .. hi)
+            # Update presolveDomains (for search vars). Preserve any holes in
+            # the existing domain — we tighten by intersection, not by
+            # rebuilding a contiguous range.
+            if vn in tr.presolveDomains:
+                let pd = tr.presolveDomains[vn]
+                var filtered: seq[int]
+                for v in pd:
+                    if v >= lo and v <= hi: filtered.add(v)
+                if filtered.len > 0:
+                    tr.presolveDomains[vn] = filtered
+                # else: tightening would empty the domain — leave the original
+                # in place so the caller's pipeline reports infeasibility.
+            else:
+                tr.presolveDomains[vn] = toSeq(lo .. hi)
             # Update definedVarBounds when this is an is_defined_var (so the
             # post-translateVariables bound-emission picks up the tighter value).
             if vn in tr.definedVarBounds:
@@ -7696,30 +7722,56 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
                     aggregateConsumesB2i.incl(vn)
             changed = true
 
-    # ---------- pass 2.5: also consume any leftover constraint that
-    # references a counter variable we've decided is defined. Most commonly
-    # this is the `bestPosition[i] <= finalPosition[i] <= worstPosition[i]`
-    # linkage encoded as plain `int_lin_le([1,-1], [counter, finalPos], 0)`.
-    # The pair-link disjunctive clauses (or the chain in the full case)
-    # already enforce this linkage, so we drop the now-orphaned references.
-
+    # ---------- pass 2.5: also consume the canonical
+    # `bestPosition[i] <= finalPosition[i] <= worstPosition[i]` linkage
+    # encoded as plain 2-term int_lin_le([1,-1], [counter, otherVar], 0) or
+    # [-1,1]. The pair-link disjunctive clauses (or the chain in the full
+    # case) already enforce this linkage, so we drop the now-orphaned
+    # references. We deliberately match a narrow shape — anything else that
+    # mentions a counter (e.g. a user-written objective `sum(worstPosition)`)
+    # is left intact.
     var counterVarSet: HashSet[string]
     for cn in counterMeta.keys: counterVarSet.incl(cn)
+    var nLeftoverConsumed = 0
+    var nLeftoverSpared = 0
     for ci, con in tr.model.constraints:
         if ci in aggregateCIs: continue
         if ci in tr.definingConstraints: continue
-        # Accept simple int_lin_le / int_lin_eq with at most 4 args; check vars
-        # via resolveVarArrayElems and FznIdent.
         let name = stripSolverPrefix(con.name)
-        if name notin ["int_lin_le", "int_lin_eq"]: continue
+        if name != "int_lin_le": continue
         if con.args.len < 3: continue
+        let coeffs = try: tr.resolveIntArray(con.args[0])
+                     except ValueError, KeyError: continue
+        if coeffs.len != 2: continue
+        if not ((coeffs[0] == 1 and coeffs[1] == -1) or
+                (coeffs[0] == -1 and coeffs[1] == 1)): continue
+        let rhs = try: tr.resolveIntArg(con.args[2])
+                  except ValueError, KeyError: continue
+        if rhs != 0: continue
         let elems = tr.resolveVarArrayElems(con.args[1])
-        var refsCounter = false
-        for e in elems:
-            if e.kind == FznIdent and e.ident in counterVarSet:
-                refsCounter = true; break
-        if refsCounter:
-            aggregateCIs.incl(ci)
+        if elems.len != 2: continue
+        if elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
+        let v0 = elems[0].ident
+        let v1 = elems[1].ident
+        let v0IsCounter = v0 in counterVarSet
+        let v1IsCounter = v1 in counterVarSet
+        # The canonical linkage is exactly one counter side and one finalPos
+        # side. Two-counter pairs (e.g. bestPos ≤ worstPos) are also part of
+        # the consumed cascade and safe to drop.
+        if not (v0IsCounter or v1IsCounter):
+            continue
+        # If the non-counter side isn't a known variable / defined-var, the
+        # constraint is structurally outside the linkage we replaced — spare it.
+        let otherName = if v0IsCounter: v1 else: v0
+        if (not v0IsCounter or not v1IsCounter) and
+           otherName notin tr.varDomainIndex and
+           otherName notin tr.definedVarNames:
+            inc nLeftoverSpared
+            continue
+        aggregateCIs.incl(ci)
+        inc nLeftoverConsumed
+    if nLeftoverConsumed > 0 or nLeftoverSpared > 0:
+        stderr.writeLine(&"[FZN] Ranking-decomp linkage sweep: consumed {nLeftoverConsumed}, spared {nLeftoverSpared} (outside the canonical 2-term [±1,∓1] shape)")
 
     # ---------- pass 3: mark consumed ----------
 
@@ -7800,8 +7852,11 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     # or a constant value (literal pinned by MiniZinc).
     var finalPosAtIndex: seq[string]
     var finalPosConstAtIndex: seq[int]
+    var finalPosIsConstAtIndex: seq[bool]
     block:
         let N = sourceFpSet.len
+        var matchedDecl: string
+        var nMatches = 0
         for decl in tr.model.variables:
             if not decl.isArray: continue
             if not decl.hasAnnotation("output_array"): continue
@@ -7817,20 +7872,32 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
                 if e.kind == FznIdent and e.ident in counterMeta:
                     hasCounter = true; break
             if hasCounter: continue
+            inc nMatches
+            if nMatches > 1:
+                # Ambiguous — multiple secondary length-N output arrays. We
+                # can't tell which is finalPosition; leave pair-link emission
+                # disabled rather than guess.
+                finalPosAtIndex.setLen(0)
+                finalPosConstAtIndex.setLen(0)
+                finalPosIsConstAtIndex.setLen(0)
+                stderr.writeLine(&"[FZN] Ranking-decomp: multiple length-{N} secondary output_arrays found ('{matchedDecl}', '{decl.name}', …) — skipping pair-link emission to avoid mis-binding")
+                break
+            matchedDecl = decl.name
             finalPosAtIndex = newSeq[string](N)
             finalPosConstAtIndex = newSeq[int](N)
+            finalPosIsConstAtIndex = newSeq[bool](N)
             for i, e in decl.value.elems:
                 case e.kind
                 of FznIdent:
                     finalPosAtIndex[i] = e.ident
-                    finalPosConstAtIndex[i] = -1
+                    finalPosIsConstAtIndex[i] = false
                 of FznIntLit:
                     finalPosAtIndex[i] = ""
                     finalPosConstAtIndex[i] = e.intVal
+                    finalPosIsConstAtIndex[i] = true
                 else:
                     finalPosAtIndex[i] = ""
-                    finalPosConstAtIndex[i] = -1
-            break
+                    finalPosIsConstAtIndex[i] = false
 
     # We also need the source-array index correspondence (re-derive locally).
     var fpAtIndex: seq[string]
@@ -7862,11 +7929,18 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
                 let finalJ = finalPosAtIndex[j]
                 let constI = finalPosConstAtIndex[i]
                 let constJ = finalPosConstAtIndex[j]
+                let isConstI = finalPosIsConstAtIndex[i]
+                let isConstJ = finalPosIsConstAtIndex[j]
                 # Both pinned (both literals): the relative order of i and j is
                 # fixed by the constants; the chain over pinned teams already
                 # enforces fp's matching order, so this pair is redundant.
-                if finalI == "" and finalJ == "":
+                if isConstI and isConstJ:
                     continue
+                # Skip slots whose finalPos slot is neither a literal nor a var
+                # (e.g. an FznArrayAccess we couldn't resolve) — we have no
+                # reference to encode against.
+                if (not isConstI) and finalI == "": continue
+                if (not isConstJ) and finalJ == "": continue
                 # One disjunctive clause per unordered pair {i, j}. The clause
                 # has two disjuncts, each a conjunction of two ≤-terms; see
                 # emitRankingPairConstraints for the encoding details. With
@@ -7876,7 +7950,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
                 # term in the *other* disjunct.
                 tr.rankingPairConstraintDefs.add(
                     (fpA: fpI, fpB: fpJ, finalA: finalI, finalB: finalJ,
-                     finalAConst: constI, finalBConst: constJ))
+                     finalAConst: constI, finalBConst: constJ,
+                     finalAIsConst: isConstI, finalBIsConst: isConstJ))
                 inc nPairs
 
     stderr.writeLine(&"[FZN] Ranking-decomp consumed: {aggregateCIs.len} aggregate, {consumedB2iCIs.len} bool2int, {consumedReifCIs.len} reif; {counterMeta.len} counter vars; {tr.rankingOutputRules.len} output rule(s); {nPairs} pair-link clause(s) queued")
@@ -7938,8 +8013,11 @@ proc emitRankingPairConstraints*(tr: var FznTranslator) =
             if not ok: continue
             # vn must be at coeffs[0]. Check elems[0] matches.
             if elems[0].kind != FznIdent or elems[0].ident != vn: continue
-            # Resolve game positions
+            # Resolve game positions. FznIdent terms must be either real
+            # variable positions (added to gp) or parameters (folded into the
+            # constant). Anything else aborts the match.
             var gp: seq[int]
+            var paramSum = 0
             var allResolved = true
             for k in 1 ..< elems.len:
                 if elems[k].kind != FznIdent: allResolved = false; break
@@ -7947,35 +8025,35 @@ proc emitRankingPairConstraints*(tr: var FznTranslator) =
                 if gname in tr.varPositions:
                     gp.add(tr.varPositions[gname])
                 elif gname in tr.paramValues:
-                    # Inline a constant — fold into the iPoints constant via rhs.
-                    discard
+                    paramSum += tr.paramValues[gname]
                 else:
                     allResolved = false; break
             if not allResolved: continue
-            # fp - sumCoef * sum(games) = rhs ⇒ fp = rhs + sumCoef * sum(games).
-            # Since fpCoef·fp + sumCoef·Σgames = rhs and we want fp expanded as
-            # iPoints + Σgames(coeff +1), with fpCoef=+1, sumCoef=-1 we get
-            # fp = rhs + sum(games), i.e., constant = rhs and gamePositions
-            # contribute +1 each. With fpCoef=-1, sumCoef=+1: -fp + Σ = rhs →
-            # fp = -rhs + Σ. Coefficients for games stay +1 (we want a +1 sum
-            # form for fp_b - fp_a expansion; just remember the constant).
+            # fpCoef·fp + sumCoef·Σ(games + params) = rhs.
+            # Solving for fp:
+            #   fp = (rhs − sumCoef·Σ) / fpCoef
+            # We want fp = constant + Σ_vars(+1) (the canonical form used by
+            # fpTerm). Σ_vars contributes -sumCoef/fpCoef per var — for the
+            # cases below (fpCoef=±1, sumCoef=∓fpCoef), that simplifies to +1
+            # per var. Constants pull in -sumCoef·paramSum / fpCoef.
+            #   fpCoef=+1, sumCoef=-1: fp = rhs + Σvars + paramSum
+            #   fpCoef=-1, sumCoef=+1: fp = -rhs + Σvars + paramSum
             var c = if fpCoef == 1: rhs else: -rhs
+            c += paramSum
             found = FpExpansion(gamePositions: gp, constant: c, ok: true)
             break
         fpExpansions[vn] = found
         return found
 
-    # Helper: build the linear-term representation of (sign * (finalPos_X -
-    # finalPos_Y)) ≤ rhs accounting for either side being a constant. Returns
-    # (coeffs, positions, rhs, ok).
+    # Helper: build the linear-term representation of "primary ≤ secondary"
+    # accounting for either side being a constant. Returns (coeffs, positions,
+    # rhs, ok). The pIsConst/sIsConst flags tell us authoritatively which side
+    # is a literal — we don't infer it from sentinel values.
     proc finalTerm(tr: FznTranslator,
-                   primaryName: string, primaryConst: int,
-                   secondaryName: string, secondaryConst: int):
+                   primaryName: string, primaryConst: int, pIsConst: bool,
+                   secondaryName: string, secondaryConst: int, sIsConst: bool):
                        tuple[coeffs: seq[int], positions: seq[int], rhs: int, ok: bool] =
-        # We build "primary ≤ secondary", expanding constants where appropriate.
         # Both const: 0 ≤ secondaryConst − primaryConst.
-        let pIsConst = primaryConst >= 0
-        let sIsConst = secondaryConst >= 0
         if pIsConst and sIsConst:
             return (coeffs: @[], positions: @[], rhs: secondaryConst - primaryConst, ok: true)
         if pIsConst:
@@ -8019,8 +8097,8 @@ proc emitRankingPairConstraints*(tr: var FznTranslator) =
     var nFailFinal = 0
     var nSkipBothConst = 0
     for def in tr.rankingPairConstraintDefs:
-        let aIsConst = def.finalAConst >= 0
-        let bIsConst = def.finalBConst >= 0
+        let aIsConst = def.finalAIsConst
+        let bIsConst = def.finalBIsConst
         if aIsConst and bIsConst and def.finalAConst == def.finalBConst:
             # Two pinned positions can't share a finalPos value (alldifferent
             # filter already eliminates pinned-pinned pairs upstream, so this
@@ -8033,13 +8111,13 @@ proc emitRankingPairConstraints*(tr: var FznTranslator) =
             inc nFailFp
             continue
         # D1: finalPos_B ≤ finalPos_A  AND  fp_A ≤ fp_B.
-        let d1FinalTerm = tr.finalTerm(def.finalB, def.finalBConst,
-                                       def.finalA, def.finalAConst)
+        let d1FinalTerm = tr.finalTerm(def.finalB, def.finalBConst, bIsConst,
+                                       def.finalA, def.finalAConst, aIsConst)
         if not d1FinalTerm.ok: inc nFailFinal; continue
         let d1FpTerm = fpTerm(xA, xB)
         # D2: finalPos_A ≤ finalPos_B  AND  fp_B ≤ fp_A.
-        let d2FinalTerm = tr.finalTerm(def.finalA, def.finalAConst,
-                                       def.finalB, def.finalBConst)
+        let d2FinalTerm = tr.finalTerm(def.finalA, def.finalAConst, aIsConst,
+                                       def.finalB, def.finalBConst, bIsConst)
         if not d2FinalTerm.ok: inc nFailFinal; continue
         let d2FpTerm = fpTerm(xB, xA)
         let disjuncts = @[
