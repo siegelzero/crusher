@@ -350,6 +350,9 @@ type
         setInReifChannelDefs*: seq[int]
         # array_bool_and/array_bool_or with defines_var → channel variables
         boolAndOrChannelDefs*: seq[int]
+        # Implication-OR channel defs (V = OR(W_i) synthesized from
+        # int_eq_reif(V,1)/int_ne_reif(W,1)/bool_clause patterns)
+        implicationOrChannelDefs*: seq[tuple[targetVar: string, sourceVars: seq[string]]]
         # Overlap channel defs: overlap = NOT sep via bool_not chain
         overlapChannelDefs*: seq[tuple[ci: int, overlapVar: string, sepVar: string]]
         # Consumed disjunctive pair indices (replaced by cumulative constraints)
@@ -1098,6 +1101,12 @@ proc translate*(model: FznModel): FznTranslator =
     # MUST run after detectReifChannels (needs ne/eq reif maps) and detectBoolAndChannels
     # (needs AND definitions). Produces CaseAnalysisDef entries for existing binding builder.
     result.detectForwardBackwardEquivChannels()
+    # Detect implication-OR channels: V = OR(W_i) from a set of "W_i = 1 → V = 1"
+    # implications encoded via int_eq_reif/int_ne_reif intermediates and bool_clause
+    # disjunctions. Critical for SFC-style problems where selected_nodes[v] is held
+    # high by multiple incident link_selection arcs and a count constraint pulls V
+    # toward 0; without channelization, single-flip moves are stuck at delta ≥ 0.
+    result.detectImplicationOrChannels()
     # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
     # MUST run after detectReifChannels() and detectBoolAndChannels()
     result.detectConditionalImplicationChannels()
@@ -2365,6 +2374,9 @@ proc translate*(model: FznModel): FznTranslator =
     result.buildConditionalExpressionChannelBindings()
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
+    # Build channel bindings for implication-OR patterns (V = OR(W_i) detected
+    # via int_eq_reif/int_ne_reif/bool_clause patterns)
+    result.buildImplicationOrChannelBindings()
     # Build channel bindings for bool_xor / array_bool_xor variable channels
     result.buildBoolXorVarChannelBindings()
     # Build channel bindings for one-hot indicator variables

@@ -483,7 +483,14 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         # State 0: seeded (handled separately in initPoolWorker), shift min/max to 1/2
         for i in 0..<populationSize:
             strategies[i] = initStrategyForPopulation(i - 1, populationSize - 1)
-    # else: all isRandom (default)
+    elif populationSize >= 3:
+        # Initial feasibility solve: workers 0/1 get domain min/max for diversity
+        # (helps problems where extreme inits like all-zeros are near-feasible),
+        # rest use random.
+        strategies[0] = isDomainMin
+        strategies[1] = isDomainMax
+        for i in 2..<populationSize:
+            strategies[i] = isRandom
 
     # Initialize TabuStates in parallel using work-stealing pool.
     # Workers grab the next state to init via atomic counter — no batch boundaries.

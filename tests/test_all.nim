@@ -8,6 +8,7 @@ import test_atmost
 import test_conjunct_sum_at_most
 import test_bool_equiv_gated_channels
 import test_bool_iff_or_channels
+import test_implication_or_channels
 import test_boolean_constraints
 import test_canonicalize_linear_reifs
 import test_channel_dependencies

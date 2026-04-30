@@ -1,4 +1,4 @@
-import std/[algorithm, math, packedsets, random, sequtils, strutils, tables, atomics, strformat]
+import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
@@ -4023,10 +4023,71 @@ proc logProgress[T](state: TabuState[T], lastImprovement: int) =
     state.lastLogIteration = state.iteration
 
 
+proc logViolatedBreakdown[T](state: TabuState[T]) =
+    ## Dumps per-type violation breakdown plus top-K violated constraints.
+    ## Only meaningful when state.cost > 0; reflects the *current* assignment,
+    ## which is typically the best-known when search exhausts at a local optimum.
+    if state.cost == 0:
+        return
+    var typePenalty: array[StatefulConstraintType, int]
+    var typeCount: array[StatefulConstraintType, int]
+    type Violation = tuple[idx: int, ct: StatefulConstraintType, pen: int, npos: int]
+    var top: seq[Violation]
+    for i, c in state.constraints:
+        let p = int(c.penalty())
+        if p > 0:
+            typePenalty[c.stateType] += p
+            typeCount[c.stateType] += 1
+            top.add((idx: i, ct: c.stateType, pen: p, npos: c.positions.len))
+    echo &"[Tabu S{state.id}] Violation breakdown by type (cost={state.cost}):"
+    for ct in StatefulConstraintType:
+        if typeCount[ct] > 0:
+            echo &"  {ct}: {typeCount[ct]} violated, total_pen={typePenalty[ct]}"
+    # Sort by penalty descending and print top 10
+    top.sort(proc(a, b: Violation): int = b.pen - a.pen)
+    let k = min(10, top.len)
+    echo &"[Tabu S{state.id}] Top {k} violated constraints:"
+    for i in 0..<k:
+        var detail = ""
+        let c = state.constraints[top[i].idx]
+        if c.stateType == RelationalType:
+            let rc = c.relationalState
+            var leftDesc = "?"
+            var rightDesc = "?"
+            case rc.leftExpr.kind:
+                of SumExpr:
+                    let sumLen = if rc.leftExpr.sumExpr.evalMethod == PositionBased:
+                                     rc.leftExpr.sumExpr.coefficient.len
+                                 else: -1
+                    let sumVal = rc.leftValue
+                    leftDesc = &"Sum({sumLen} terms, val={sumVal}, eval={rc.leftExpr.sumExpr.evalMethod})"
+                of ConstantExpr: leftDesc = &"Const({rc.leftExpr.constantValue})"
+                else: leftDesc = $rc.leftExpr.kind
+            case rc.rightExpr.kind:
+                of SumExpr:
+                    let sumLen = if rc.rightExpr.sumExpr.evalMethod == PositionBased:
+                                     rc.rightExpr.sumExpr.coefficient.len
+                                 else: -1
+                    rightDesc = &"Sum({sumLen} terms, val={rc.rightValue})"
+                of ConstantExpr: rightDesc = &"Const({rc.rightExpr.constantValue})"
+                else: rightDesc = $rc.rightExpr.kind
+            detail = &" {leftDesc} {rc.relation} {rightDesc} graduated={rc.graduated}"
+        # Count search vs channel positions
+        var nSearch = 0
+        var nChannel = 0
+        var nFixed = 0
+        for pos in c.positions:
+            if pos in state.carray.fixedPositions: nFixed += 1
+            elif pos in state.carray.channelPositions: nChannel += 1
+            else: nSearch += 1
+        echo &"  ci={top[i].idx} type={top[i].ct} pen={top[i].pen} positions={top[i].npos} (search={nSearch} channel={nChannel} fixed={nFixed}){detail}"
+
 proc logExitStats[T](state: TabuState[T], label: string) =
     let elapsed = epochTime() - state.startTime
     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
     echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+    if state.id == 0 and state.bestCost > 0 and label == "Exhausted":
+        state.logViolatedBreakdown()
     when ProfileIteration:
         let iters = max(1, state.iteration).float
         echo &"[Profile S{state.id}] bestMoves={state.timeBestMoves:.3f}s ({state.timeBestMoves/max(elapsed,0.001)*100:.1f}%) " &
@@ -4300,6 +4361,25 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via linear repair")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Try compound-flip count repair during deeper stagnation: handles cases
+        # where single-position flips give delta=0 due to coupled implications.
+        # When an improvement is found, iterate (compound moves often chain).
+        if state.iteration - lastImprovement >= 200 and
+           (state.iteration - lastImprovement) mod 50 == 0:
+            var iterations = 0
+            const MAX_COMPOUND_ITERATIONS = 50
+            while iterations < MAX_COMPOUND_ITERATIONS and state.tryCompoundCountRepair():
+                iterations += 1
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via compound count repair")
                         state.lastImprovementIter = lastImprovement
                         return state
 

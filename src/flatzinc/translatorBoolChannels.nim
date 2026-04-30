@@ -1791,3 +1791,115 @@ proc detectForwardBackwardEquivChannels*(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Forward-backward equiv channels: {nDetected} detected, " &
             &"{nConsumed} clauses consumed")
+
+
+proc detectImplicationOrChannels*(tr: var FznTranslator) =
+    ## Detects "V is forced ≥ OR(W_i)" patterns and channelizes V = OR(W_i).
+    ##
+    ## Pattern in FlatZinc:
+    ##   int_eq_reif(V, 1, B)        :: defines_var(B)   -- B ↔ (V = 1)
+    ##   int_ne_reif(W_i, 1, N_i)    :: defines_var(N_i) -- N_i ↔ (W_i ≠ 1)
+    ##   bool_clause([N_i, B], [])                       -- W_i = 1 → V = 1
+    ##
+    ## When V is binary {0,1} and held high by *multiple* W_i implications, AND V has
+    ## a count constraint pulling it toward 0 (e.g., int_lin_eq with target K), then in
+    ## any feasible/optimal solution V = OR(W_i) — the implications and count together
+    ## ensure V is minimal subject to the forcers. Channelizing tightens the search
+    ## space without losing solutions, and removes V from the search positions, breaking
+    ## the implication-coupling that traps tabu local search.
+    ##
+    ## Use case: SFC chain — `selected_nodes[v] = OR(link_selection[arc] for arc incident to v)`,
+    ## with the count `n_fun_nodes = vnflist_size` providing the "minimal" pull.
+    ##
+    ## MUST run after detectReifChannels() so eq/ne reif maps are populated, and after
+    ## the bool channel detectors that consume related clauses (detectBoolOrChannels,
+    ## detectForwardBackwardEquivChannels). Skips clauses already in definingConstraints.
+    var eqReifBy: Table[string, tuple[srcVar: string, val: int]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let v = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        eqReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
+
+    var neReifBy: Table[string, tuple[srcVar: string, val: int]]
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_ne_reif": continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let v = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        neReifBy[con.args[2].ident] = (srcVar: con.args[0].ident, val: v)
+
+    if eqReifBy.len == 0 or neReifBy.len == 0: return
+
+    # Group implications by target var V: forceMap[V] = seq of (W_name, clause_ci)
+    type ForceEntry = tuple[wName: string, clauseCi: int]
+    var forceMap: Table[string, seq[ForceEntry]]
+    var alreadySeenW: Table[string, HashSet[string]]  # V → set of W's already added (dedup)
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        let posArg = con.args[0]
+        let negArg = con.args[1]
+        if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+        if negArg.elems.len != 0: continue   # only pure-positive 2-literal clauses
+        if posArg.elems.len != 2: continue
+        let a = posArg.elems[0]
+        let b = posArg.elems[1]
+        if a.kind != FznIdent or b.kind != FznIdent: continue
+
+        # Try both orderings: (a=ne, b=eq) and (a=eq, b=ne)
+        var matched = false
+        var vName, wName: string
+        for (neC, eqC) in [(a.ident, b.ident), (b.ident, a.ident)]:
+            if neC notin neReifBy or eqC notin eqReifBy: continue
+            let neInfo = neReifBy[neC]
+            let eqInfo = eqReifBy[eqC]
+            # We want: ne(W != 1) ∨ eq(V == 1) ≡ W = 1 → V = 1
+            if neInfo.val != 1 or eqInfo.val != 1: continue
+            vName = eqInfo.srcVar
+            wName = neInfo.srcVar
+            matched = true
+            break
+        if not matched: continue
+
+        # Dedup
+        if vName notin alreadySeenW:
+            alreadySeenW[vName] = initHashSet[string]()
+        if wName in alreadySeenW[vName]: continue
+        alreadySeenW[vName].incl(wName)
+        forceMap.mgetOrPut(vName, @[]).add((wName: wName, clauseCi: ci))
+
+    if forceMap.len == 0: return
+
+    # Defer channel binding construction to buildImplicationOrChannelBindings
+    # (runs after translateVariables, when varPositions is populated). Here we
+    # only collect candidate (target, sources) tuples and mark consumed clauses.
+    var nDetected = 0
+    var nClausesConsumed = 0
+    for vName, forces in forceMap.pairs:
+        if forces.len < 2: continue
+        # Skip if V is already known to be defined or aliased (these are name-based;
+        # they remain valid before translateVariables).
+        if vName in tr.channelVarNames: continue
+        if vName in tr.definedVarNames: continue
+        if vName in tr.equalityCopyAliases: continue
+        # Defer position/domain validation to build phase.
+        var sourceNames: seq[string]
+        for f in forces:
+            sourceNames.add(f.wName)
+        tr.implicationOrChannelDefs.add((targetVar: vName, sourceVars: sourceNames))
+        # Mark V as a channel so other passes don't try to compete for it
+        tr.channelVarNames.incl(vName)
+        for f in forces:
+            tr.definingConstraints.incl(f.clauseCi)
+        nDetected += 1
+        nClausesConsumed += forces.len
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} implication-OR channel candidates " &
+                         &"(V = OR(W_i) from {nClausesConsumed} bool_clauses; deferred to build phase)")

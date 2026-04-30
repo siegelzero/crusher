@@ -1076,6 +1076,67 @@ proc buildBoolLogicChannelBindings(tr: var FznTranslator) =
                                           &"(total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc buildImplicationOrChannelBindings*(tr: var FznTranslator) =
+    ## Builds element-encoded OR channel bindings for implication-OR patterns
+    ## detected by detectImplicationOrChannels.
+    ##
+    ## For each (V, [W_1, ..., W_n]) candidate:
+    ##   V = element(W_1 + W_2 + ... + W_n, [0, 1, 1, ..., 1])
+    ##
+    ## Validates that V and all W_i are present in varPositions and have binary
+    ## domain {0, 1}. Skips otherwise — the original bool_clauses are already
+    ## marked as defining at detect time, so an aborted binding leaves the
+    ## constraint network well-formed (V remains a search var with implications
+    ## handled via the standard constraint translation path).
+    var nBuilt = 0
+    var nSkipped = 0
+    for def in tr.implicationOrChannelDefs:
+        let vName = def.targetVar
+        if vName notin tr.varPositions:
+            nSkipped += 1
+            continue
+        let vPos = tr.varPositions[vName]
+        let vDom = tr.sys.baseArray.domain[vPos]
+        if vDom.len != 2 or 0 notin vDom or 1 notin vDom:
+            nSkipped += 1
+            continue
+
+        var wPositions: seq[int]
+        var allValid = true
+        for wName in def.sourceVars:
+            if wName notin tr.varPositions:
+                allValid = false
+                break
+            let wPos = tr.varPositions[wName]
+            let wDom = tr.sys.baseArray.domain[wPos]
+            if wDom.len != 2 or 0 notin wDom or 1 notin wDom:
+                allValid = false
+                break
+            if wPos == vPos:
+                allValid = false
+                break
+            wPositions.add(wPos)
+        if not allValid:
+            nSkipped += 1
+            continue
+
+        let n = wPositions.len
+        var indexExpr = tr.getExpr(wPositions[0])
+        for i in 1..<n:
+            indexExpr = indexExpr + tr.getExpr(wPositions[i])
+        var arrayElems: seq[ArrayElement[int]]
+        arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 0))
+        for i in 1..n:
+            arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
+
+        tr.sys.baseArray.addChannelBinding(vPos, indexExpr, arrayElems)
+        nBuilt += 1
+
+    if tr.implicationOrChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} implication-OR channel bindings " &
+                         &"(skipped {nSkipped}, total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
 proc buildBoolXorVarChannelBindings*(tr: var FznTranslator) =
     ## Builds channel bindings for bool_xor / array_bool_xor variable channel defs.
     ## bool_xor(a, b, result):        result = a XOR b = element(a*2+b, [0,1,1,0])
