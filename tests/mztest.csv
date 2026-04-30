@@ -9,6 +9,7 @@ lot_sizing_pigment15b,2020/lot-sizing/lot_sizing_cp.mzn,2020/lot-sizing/pigment1
 racp_j30_26_2,2020/racp/racp.mzn,2020/racp/j30_26_2_1.0.dzn,minimize,10000,704,1408
 radiation_i6_9,2020/radiation/radiation.mzn,2020/radiation/i6-9.dzn,minimize,10000,338,676
 sdn_chain_d10n780_1,2020/sdn-chain/model.mzn,2020/sdn-chain/d10n780-1.dzn,minimize,10000,10,20
+skill_allocation_1m_1,2020/skill-allocation/skill_allocation_only.mzn,2020/skill-allocation/skill_allocation_mzn_1m_1.dzn,minimize,10000,10,100
 sparse_mds_breast_cancer4,2020/minimal-decision-sets/sparse_mds.mzn,2020/minimal-decision-sets/breast-cancer_train4.dzn,minimize,10000,102,200
 
 carpet_cutting_rnd_01,2021/carpet-cutting/cc_base.mzn,2021/carpet-cutting/mzn_rnd_test.01.dzn,minimize,10000,621,700
