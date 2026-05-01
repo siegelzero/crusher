@@ -158,12 +158,19 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     ## (search-position + new domain value) whose full cost delta best reduces
     ## the global cost.
     ##
-    ## This is essentially "greedy 1-flip pre-processing": repeat scans until
-    ## no further improvement, capped by `MaxScans`. Cheap relative to the
-    ## main tabu loop (one cost-delta call per (position, value) pair, no
-    ## tabu-list bookkeeping) and only run at init, so it's not in the
-    ## per-iteration hot path.
+    ## Three phases — single, pair, triple greedy descent — each run until
+    ## exhaustion, with cap-bounded scans for the higher-arity phases. Cheap
+    ## relative to the main tabu loop (no tabu-list bookkeeping) and only run
+    ## at init, so it's not in the per-iteration hot path.
     let carray = state.carray
+
+    # Inverse groups force changes at peer positions when one of their members
+    # is reassigned. Pair/triple search captures `old2 = state.assignment[p2]`
+    # *after* a lean assign of p1; if p1 is in an inverse group covering p2,
+    # `old2` is the post-forced value, not the original, and the eventual
+    # revert can't restore the true initial state. Bailing out is safer than
+    # a partial fix — the standard tabu loop handles the inverse-group case.
+    if state.inverseEnabled: return
 
     var hasChannelInequality = false
     for constraint in state.constraints:
@@ -278,11 +285,17 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     # 1-unit overflow" that 1- and 2-flip moves can't reach. Capped tightly
     # because a full O(N³·D³) scan is expensive — for 20-position models with
     # domain ~10 it's ~10⁸ evaluations, so we sample triples and fall back as
-    # soon as the cap is hit. Small models stay fully covered.
+    # soon as the cap is hit. Each scan rotates the position list by a stride
+    # so high-index positions still anchor triples on later scans (without the
+    # rotation, the cap always trips before they're reached).
     const MaxTripleScans = 5
     const MaxTripleCandidates = 5_000_000
     var nTriple = 0
     if state.cost > 0:
+        var basePositions: seq[int]
+        for p in carray.allSearchPositions():
+            basePositions.add(p)
+        let rotateStride = max(1, basePositions.len div MaxTripleScans)
         for scan in 0..<MaxTripleScans:
             let scanStartCost = state.cost
             var bestP1, bestP2, bestP3 = -1
@@ -290,9 +303,11 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
             var bestTripleDelta = 0
             var nEvals = 0
             block searchTriple:
-                var positions: seq[int]
-                for p in carray.allSearchPositions():
-                    positions.add(p)
+                var positions = newSeq[int](basePositions.len)
+                if basePositions.len > 0:
+                    let offset = (scan * rotateStride) mod basePositions.len
+                    for ii in 0..<basePositions.len:
+                        positions[ii] = basePositions[(ii + offset) mod basePositions.len]
                 for i in 0..<positions.len:
                     let p1 = positions[i]
                     let dom1 = state.sharedDomain[][p1]

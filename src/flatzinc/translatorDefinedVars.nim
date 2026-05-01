@@ -896,7 +896,12 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
         # Capture the declared range BEFORE marking the var as defined; the original
         # constraint was the only thing pinning the target into [lo, hi], so we need
         # to re-emit that bound after positions exist (see emitImplicitLinEqRangeBounds).
-        let (_, lo, hi) = tr.getTightenedBounds(targetName)
+        let (dom, lo, hi) = tr.getTightenedBounds(targetName)
+        # Skip when the domain lookup failed — getTightenedBounds returns an empty
+        # domain with (lo=0, hi=0) when the var is unknown to presolve. Recording
+        # those zeros would emit `expr = 0` later, silently overconstraining the
+        # model. We'd rather leave the var as a search position than risk that.
+        if dom.len == 0: continue
         # Mark the variable as defined and the constraint as consumed.
         tr.definedVarNames.incl(targetName)
         tr.definingConstraints.incl(ci)
