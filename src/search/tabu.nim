@@ -3004,6 +3004,26 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         echo "[Init] Partition groups: " & $state.partitionGroups.len &
              " groups, members: " & state.partitionGroups.mapIt($it.searchPositions.len).join("/")
 
+    # Channel-only inequality repair: greedy 1-flip pre-pass on graduated `≥`/`≤`
+    # bounds whose SumExpr has no search-position term (e.g. bin-packing capacity
+    # bounds emitted by the implicit-lin-eq detector with all indicator-product
+    # channel inputs). The default init strategy gives every preference its
+    # domain-min value, which on tightly-packed instances starts the search 50+
+    # cost units in the hole; this pass uses costDelta + assignValue to greedy
+    # down to a near-feasible state before tabu starts. Only runs at fresh init
+    # (skipped for path-relinking states which have their own seed assignment).
+    if not forRelinking and initialAssignment.len == 0:
+        state.repairChannelInequalities(verbose, id)
+        # Capture the post-repair state as the new best so tabu's main loop
+        # doesn't start tracking improvements from the pre-repair value (which
+        # was already snapshotted at line ~1792). Without this, a repair that
+        # finds feasibility (cost=0) is still reported as "best=<pre-repair>"
+        # and the solver eventually emits UNKNOWN even though it had a
+        # feasible assignment in hand.
+        if state.cost <= state.bestCost:
+            state.bestCost = state.cost
+            state.bestAssignment = state.assignment
+
 
 proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom): TabuState[T] =
     new(result)

@@ -40,6 +40,7 @@ import test_fzn_alias_and_diagonal
 import test_fzn_channel_detection
 import test_fzn_pattern_detection
 import test_fzn_ranking
+import test_implicit_lin_eq_channel
 import test_fzn_parser
 import test_fzcrusher
 import test_fzn_solver

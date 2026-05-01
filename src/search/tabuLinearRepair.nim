@@ -147,6 +147,206 @@ proc repairLinearEqualities*[T](state: TabuState[T], verbose: bool, id: int) =
              " -> " & $totalResidual
 
 
+proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) =
+    ## Initialization repair for graduated `≥`/`≤` inequalities whose SumExpr
+    ## consists entirely of channel positions — the case the standard
+    ## `repairLinearEqualities` skips because it has no search-position term to
+    ## adjust. Comes up in bin-packing-style models where the bin-capacity
+    ## bound is `available − Σ_p t_pg ≥ 0` and every t_pg is an indicator-product
+    ## channel; the channel positions are not directly assignable, so we
+    ## instead iterate every search position in the model and pick the move
+    ## (search-position + new domain value) whose full cost delta best reduces
+    ## the global cost.
+    ##
+    ## This is essentially "greedy 1-flip pre-processing": repeat scans until
+    ## no further improvement, capped by `MaxScans`. Cheap relative to the
+    ## main tabu loop (one cost-delta call per (position, value) pair, no
+    ## tabu-list bookkeeping) and only run at init, so it's not in the
+    ## per-iteration hot path.
+    let carray = state.carray
+
+    var hasChannelInequality = false
+    for constraint in state.constraints:
+        if constraint.stateType != RelationalType: continue
+        let rc = constraint.relationalState
+        if rc.relation notin {GreaterThanEq, LessThanEq}: continue
+        if rc.leftExpr.kind != SumExpr or rc.leftExpr.sumExpr.evalMethod != PositionBased: continue
+        if rc.rightExpr.kind != ConstantExpr: continue
+        # Confirm the SumExpr's coefficient table is all-channel — the case
+        # `repairLinearEqualities` already covered handles search-position slacks.
+        var allChannel = true
+        for pos, _ in rc.leftExpr.sumExpr.coefficient.pairs:
+            if pos notin carray.channelPositions and pos notin carray.fixedPositions:
+                allChannel = false; break
+        if allChannel:
+            hasChannelInequality = true
+            break
+    if not hasChannelInequality: return
+
+    let initialCost = state.cost
+    if initialCost == 0: return
+
+    const MaxSingleScans = 30
+    const MaxPairScans = 100
+    const MaxPairCandidates = 200_000  # cap (positions × domain)² evaluations
+    var nSingle = 0
+    var nPair = 0
+
+    # Phase 1: greedy single-flip pre-pass.
+    for scan in 0..<MaxSingleScans:
+        var bestPos = -1
+        var bestNewVal: T = 0
+        var bestDelta = 0
+
+        for pos in carray.allSearchPositions():
+            let dom = state.sharedDomain[][pos]
+            if dom.len < 2: continue
+            let oldVal = state.assignment[pos]
+            for v in dom:
+                if v == oldVal: continue
+                let delta = state.costDelta(pos, v)
+                if delta < bestDelta:
+                    bestDelta = delta
+                    bestPos = pos
+                    bestNewVal = v
+
+        if bestPos < 0: break
+        state.assignValue(bestPos, bestNewVal)
+        state.updateNeighborPenalties(bestPos)
+        inc nSingle
+        if state.cost == 0: break
+
+    # Phase 2: greedy 2-flip pre-pass. Single flips give delta ≥ 0 at this
+    # point (we'd have moved already otherwise) — typical of bin-packing
+    # plateaus where moving one person from an overflowing bin requires
+    # someone else to move too. A naive O(N²·D²) scan is bounded by
+    # MaxPairCandidates so it stays tractable on larger instances.
+    if state.cost > 0:
+        for scan in 0..<MaxPairScans:
+            let scanStartCost = state.cost
+            var bestP1, bestP2 = -1
+            var bestV1, bestV2: T = 0
+            var bestPairDelta = 0
+            var nEvals = 0
+            block searchPair:
+                var positions: seq[int]
+                for p in carray.allSearchPositions():
+                    positions.add(p)
+                for i in 0..<positions.len:
+                    let p1 = positions[i]
+                    let dom1 = state.sharedDomain[][p1]
+                    if dom1.len < 2: continue
+                    let old1 = state.assignment[p1]
+                    for v1 in dom1:
+                        if v1 == old1: continue
+                        # Apply p1 ← v1 tentatively (lean: no penalty bookkeeping).
+                        # state.cost will reflect the cost after this move only;
+                        # adding costDelta(p2, v2) from this transient state gives
+                        # the cost after both moves, and subtracting scanStartCost
+                        # yields the joint-move delta.
+                        state.assignValueLean(p1, v1)
+                        for j in (i+1)..<positions.len:
+                            let p2 = positions[j]
+                            let dom2 = state.sharedDomain[][p2]
+                            if dom2.len < 2: continue
+                            let old2 = state.assignment[p2]
+                            for v2 in dom2:
+                                if v2 == old2: continue
+                                let pairDelta = state.cost + state.costDelta(p2, v2) - scanStartCost
+                                if pairDelta < bestPairDelta:
+                                    bestPairDelta = pairDelta
+                                    bestP1 = p1; bestV1 = v1
+                                    bestP2 = p2; bestV2 = v2
+                                inc nEvals
+                                if nEvals >= MaxPairCandidates:
+                                    state.assignValueLean(p1, old1)
+                                    break searchPair
+                        # Revert p1.
+                        state.assignValueLean(p1, old1)
+
+            if bestP1 < 0: break
+            # Apply the winning pair move.
+            state.assignValue(bestP1, bestV1)
+            state.updateNeighborPenalties(bestP1)
+            state.assignValue(bestP2, bestV2)
+            state.updateNeighborPenalties(bestP2)
+            inc nPair
+            if state.cost == 0: break
+
+    # Phase 3: greedy 3-flip pre-pass when pair flips have plateaued. Covers
+    # cases like "rotate three persons across three bins to absorb a residual
+    # 1-unit overflow" that 1- and 2-flip moves can't reach. Capped tightly
+    # because a full O(N³·D³) scan is expensive — for 20-position models with
+    # domain ~10 it's ~10⁸ evaluations, so we sample triples and fall back as
+    # soon as the cap is hit. Small models stay fully covered.
+    const MaxTripleScans = 5
+    const MaxTripleCandidates = 5_000_000
+    var nTriple = 0
+    if state.cost > 0:
+        for scan in 0..<MaxTripleScans:
+            let scanStartCost = state.cost
+            var bestP1, bestP2, bestP3 = -1
+            var bestV1, bestV2, bestV3: T = 0
+            var bestTripleDelta = 0
+            var nEvals = 0
+            block searchTriple:
+                var positions: seq[int]
+                for p in carray.allSearchPositions():
+                    positions.add(p)
+                for i in 0..<positions.len:
+                    let p1 = positions[i]
+                    let dom1 = state.sharedDomain[][p1]
+                    if dom1.len < 2: continue
+                    let old1 = state.assignment[p1]
+                    for v1 in dom1:
+                        if v1 == old1: continue
+                        state.assignValueLean(p1, v1)
+                        for j in (i+1)..<positions.len:
+                            let p2 = positions[j]
+                            let dom2 = state.sharedDomain[][p2]
+                            if dom2.len < 2: continue
+                            let old2 = state.assignment[p2]
+                            for v2 in dom2:
+                                if v2 == old2: continue
+                                state.assignValueLean(p2, v2)
+                                for k in (j+1)..<positions.len:
+                                    let p3 = positions[k]
+                                    let dom3 = state.sharedDomain[][p3]
+                                    if dom3.len < 2: continue
+                                    let old3 = state.assignment[p3]
+                                    for v3 in dom3:
+                                        if v3 == old3: continue
+                                        let tripleDelta = state.cost +
+                                            state.costDelta(p3, v3) - scanStartCost
+                                        if tripleDelta < bestTripleDelta:
+                                            bestTripleDelta = tripleDelta
+                                            bestP1 = p1; bestV1 = v1
+                                            bestP2 = p2; bestV2 = v2
+                                            bestP3 = p3; bestV3 = v3
+                                        inc nEvals
+                                        if nEvals >= MaxTripleCandidates:
+                                            state.assignValueLean(p2, old2)
+                                            state.assignValueLean(p1, old1)
+                                            break searchTriple
+                                state.assignValueLean(p2, old2)
+                        state.assignValueLean(p1, old1)
+
+            if bestP1 < 0: break
+            state.assignValue(bestP1, bestV1)
+            state.updateNeighborPenalties(bestP1)
+            state.assignValue(bestP2, bestV2)
+            state.updateNeighborPenalties(bestP2)
+            state.assignValue(bestP3, bestV3)
+            state.updateNeighborPenalties(bestP3)
+            inc nTriple
+            if state.cost == 0: break
+
+    if (nSingle > 0 or nPair > 0 or nTriple > 0) and verbose and id == 0:
+        echo "[Init] Channel-inequality repair: " & $nSingle &
+             " single + " & $nPair & " pair + " & $nTriple &
+             " triple adjustments, cost " & $initialCost & " -> " & $state.cost
+
+
 proc tryLinearRepairMoves*[T](state: TabuState[T]): bool =
     ## During search: find violated EqualTo constraints and make coordinated
     ## single-position adjustments via assignValue to reduce violations.

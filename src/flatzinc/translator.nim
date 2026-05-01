@@ -315,6 +315,16 @@ type
         linEqReifChannelDefs*: seq[int] # int_lin_eq_reif channel constraint indices
         # Reif-equation defined vars: int_lin_eq_reif where one var is promoted to defined var
         reifEqDefinedVars*: Table[int, string] # constraint index -> target var name
+        # Implicit defined vars from int_lin_eq WITHOUT defines_var annotation.
+        # Maps constraint index -> the variable we treat as defined by that constraint
+        # (coefficient ±1, no other definer, not search-annotated). The constraint's
+        # role flips from "balance equation" to "expression for the target var"; the
+        # remaining range constraint is enforced after translateVariables via
+        # implicitLinEqRangeBounds (the original int_lin_eq's only "constraint role"
+        # was to keep the target in its declared domain, so we must emit that bound
+        # explicitly — it's not implied by any other model constraint).
+        implicitLinEqDefinedVars*: Table[int, string]
+        implicitLinEqRangeBounds*: seq[tuple[ci: int, varName: string, lo, hi: int]]
         # Detected implication table patterns: (condVar, targetVar) -> allowed tuples
         implicationTables*: seq[tuple[condVar, targetVar: string, tuples: seq[seq[int]]]]
         # One-hot channel defs: indicator vars to convert to channels of integer vars
@@ -968,6 +978,8 @@ proc translate*(model: FznModel): FznTranslator =
     result.definedVarBounds = initTable[string, (int, int)]()
     result.channelVarNames = initHashSet[string]()
     result.channelConstraints = initTable[int, string]()
+    result.implicitLinEqDefinedVars = initTable[int, string]()
+    result.implicitLinEqRangeBounds = @[]
     result.objectivePos = ObjPosNone
     result.objectiveLoBound = low(int)
     result.objectiveHiBound = high(int)
@@ -1252,6 +1264,17 @@ proc translate*(model: FznModel): FznTranslator =
     # DISABLED: removing disconnected variables can hurt search quality in some cases
     # (e.g., GCC swap groups lose diversity when the permutation pool shrinks).
     # result.detectDisconnectedAllDifferent()
+    # Promote unannotated int_lin_eq vars to defined channels (sum+slack=capacity).
+    # MUST run last among defined-var detectors so any specialised pattern that wants
+    # to consume the int_lin_eq has already had its chance, and before translateVariables
+    # so the promoted vars don't get search positions allocated.
+    result.detectImplicitLinEqDefinedVars()
+    # Re-run defined-var rescue: a var promoted by detectImplicitLinEqDefinedVars
+    # may also appear as an element of a var-indexed array (e.g. remainder[good[p]]
+    # in stable-goods) and therefore needs an actual position to be channeled into.
+    # rescueDefinedVarsToChannels is idempotent; the second call only acts on the
+    # newly-promoted names.
+    result.rescueDefinedVarsToChannels()
     result.translateVariables()
     # Detect bivalent integer vars structurally pinned by another var via a
     # shared reif bool, and channel them so they stop being search positions.
@@ -1447,6 +1470,66 @@ proc translate*(model: FznModel): FznTranslator =
         stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped + nObjBoundsSkipped} defined-var bounds (range={nBoundsSkipped} channel={nChannelBoundsSkipped} objective={nObjBoundsSkipped})")
     if nObjBoundsSkipped > 0:
         stderr.writeLine(&"[FZN] Objective domain bounds [{result.objectiveLoBound}..{result.objectiveHiBound}] deferred to optimizer")
+    # Emit range bounds for implicit-lin-eq promoted vars. The original int_lin_eq
+    # constraint was the only enforcement of these vars' declared domains; promotion
+    # consumed it, so we re-emit the bounds explicitly. Vars promoted then rescued
+    # to channels live in `varPositions` (channel binding produces their value);
+    # vars that stayed defined live in `definedVarExprs`. Either way we want the
+    # constraint expr ≥ lo / expr ≤ hi to fire when the binding output strays.
+    var nImplicitBoundsEmitted = 0
+    var nImplicitBoundsSkipped = 0
+    for entry in result.implicitLinEqRangeBounds:
+        # Reconstruct the linear expression `target = (rhs - sum_{i!=t} c_i * v_i) / c_t`
+        # directly from the int_lin_eq constraint. We can't use the position-as-expression
+        # for bounds estimation because the position carries the var's *declared* domain,
+        # which is exactly what we're trying to enforce — so estimateRange would return
+        # the declared bounds and skip every emit. The underlying linear sum's natural
+        # range, in contrast, can be computed from the input vars' actual domains and
+        # exposes when the bound is non-trivial.
+        let con = result.model.constraints[entry.ci]
+        let coeffs = result.resolveIntArray(con.args[0])
+        let varElems = result.resolveVarArrayElems(con.args[1])
+        let rhs = result.resolveIntArg(con.args[2])
+        var definedIdx = -1
+        for vi, v in varElems:
+            if v.kind == FznIdent and v.ident == entry.varName:
+                definedIdx = vi
+                break
+        if definedIdx < 0: continue
+        let defCoeff = coeffs[definedIdx]
+        if defCoeff != 1 and defCoeff != -1: continue
+        let sign = if defCoeff == 1: -1 else: 1
+        var expr: AlgebraicExpression[int]
+        var first = true
+        for vi, v in varElems:
+            if vi == definedIdx: continue
+            let term = (sign * coeffs[vi]) * result.resolveExprArg(v)
+            if first: expr = term; first = false
+            else: expr = expr + term
+        let constTerm = if defCoeff == 1: rhs else: -rhs
+        if constTerm != 0:
+            if first:
+                expr = newAlgebraicExpression[int](
+                    positions = initPackedSet[int](),
+                    node = ExpressionNode[int](kind: LiteralNode, value: constTerm),
+                    linear = true)
+                first = false
+            else:
+                expr = expr + constTerm
+        if expr.isNil: continue
+        let (exprMin, exprMax) = result.estimateRange(expr.node)
+        if entry.lo > low(int) and entry.lo > exprMin:
+            result.sys.addConstraint(expr >= entry.lo)
+            inc nImplicitBoundsEmitted
+        else:
+            inc nImplicitBoundsSkipped
+        if entry.hi < high(int) and entry.hi < exprMax:
+            result.sys.addConstraint(expr <= entry.hi)
+            inc nImplicitBoundsEmitted
+        else:
+            inc nImplicitBoundsSkipped
+    if result.implicitLinEqRangeBounds.len > 0:
+        stderr.writeLine(&"[FZN] Implicit lin_eq range bounds: emitted {nImplicitBoundsEmitted} (skipped {nImplicitBoundsSkipped} naturally implied)")
     # Build matrix infos for matrix_element pattern detection
     result.buildMatrixInfos()
 

@@ -20,7 +20,11 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
     ## times — late-added defined vars (e.g., from twin-defining-equations rescue) will
     ## still be picked up.
 
-    # Phase 1: var-indexed array element rescue
+    # Phase 1: var-indexed array element rescue.
+    # NOTE: we scan every array_var_int_element regardless of definingConstraints
+    # membership. Element constraints with defines_var are themselves marked as
+    # defining (they install the channel binding for the result var) but their
+    # array-element inputs still need positions for the binding to read from.
     block:
         var rescueNames = initHashSet[string]()
         for ci, con in tr.model.constraints:
@@ -49,6 +53,13 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
                         let cName = con.args[2].ident
                         if cName in rescueNames:
                             tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+                    elif name == "int_lin_eq" and ci in tr.implicitLinEqDefinedVars:
+                        # int_lin_eq without defines_var, but promoted by
+                        # detectImplicitLinEqDefinedVars. The constraint defines
+                        # the var stored in the implicitLinEqDefinedVars table.
+                        let cName = tr.implicitLinEqDefinedVars[ci]
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
 
             for name in rescueNames:
                 tr.definedVarNames.excl(name)
@@ -59,6 +70,13 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
     block:
         var rescueNames = initHashSet[string]()
         for ci, con in tr.model.constraints:
+            # Skip already-consumed cumulatives — e.g. detectMultiMachineNoOverlap
+            # collapses pairs of cumulatives into a single MultiMachineNoOverlap
+            # and adds the cumulative ci to definingConstraints. The original
+            # height vars still appear in the consumed cumulative's signature, but
+            # they don't need positions because the replacement constraint reads
+            # the source assignment vars directly.
+            if ci in tr.definingConstraints: continue
             let name = stripSolverPrefix(con.name)
             if name notin ["fzn_cumulative", "fzn_cumulatives", "fzn_disjunctive", "fzn_disjunctive_strict"]:
                 continue
@@ -86,6 +104,10 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
                     if cname == "int_times" and con.args.len >= 3 and
                          con.args[2].kind == FznIdent:
                         let cName = con.args[2].ident
+                        if cName in rescueNames:
+                            tr.rescuedChannelDefs.add((ci: ci, varName: cName))
+                    elif cname == "int_lin_eq" and ci in tr.implicitLinEqDefinedVars:
+                        let cName = tr.implicitLinEqDefinedVars[ci]
                         if cName in rescueNames:
                             tr.rescuedChannelDefs.add((ci: ci, varName: cName))
 
@@ -481,17 +503,24 @@ proc tryBuildDefinedExpression(tr: var FznTranslator, ci: int): bool =
         tr.definedVarExprs[defName] = tr.resolveExprArg(bArg)
         return true
 
-    # Only process defining constraints with defines_var
+    # Only process defining constraints with defines_var, or int_lin_eq picked up
+    # by detectImplicitLinEqDefinedVars (no annotation, but registered in the
+    # implicitLinEqDefinedVars side-table — see detectImplicitLinEqDefinedVars).
+    let isImplicitLinEq = name == "int_lin_eq" and ci in tr.implicitLinEqDefinedVars
     if name notin ["int_lin_eq", "int_abs", "int_max", "int_min", "int_times",
                                     "array_int_minimum", "array_int_maximum"] or
-         not con.hasAnnotation("defines_var"):
+         (not con.hasAnnotation("defines_var") and not isImplicitLinEq):
         return true  # not our concern, treat as done
-    var ann: FznAnnotation
-    for a in con.annotations:
-        if a.name == "defines_var":
-            ann = a
-            break
-    let definedName = ann.args[0].ident
+    var definedName: string
+    if isImplicitLinEq:
+        definedName = tr.implicitLinEqDefinedVars[ci]
+    else:
+        var ann: FznAnnotation
+        for a in con.annotations:
+            if a.name == "defines_var":
+                ann = a
+                break
+        definedName = ann.args[0].ident
     # Min/max channel vars get positions and channel bindings, not expressions
     if definedName in tr.channelVarNames:
         return true
@@ -764,6 +793,121 @@ proc detectReifEquationChannelVars(tr: var FznTranslator) =
 
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} reif-equation channel vars (int_lin_eq_reif → channel, {iterations} iterations)")
+
+proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
+    ## Promotes one variable per int_lin_eq constraint without `defines_var` to
+    ## a defined-var expression. Runs late, after all specialised pattern
+    ## detection has had a chance to consume int_lin_eq's. Catches the common
+    ## "user wrote `sum + slack = capacity` instead of `slack = capacity - sum`"
+    ## pattern that MZN does not auto-annotate. Eliminating these search
+    ## positions is generic across bin-packing, accounting, balance-equation
+    ## models — wherever a balance variable's only role is to soak up the
+    ## difference between a sum and a constant.
+    ##
+    ## Eligibility for var V in `sum_i coef_i * v_i = c`:
+    ##   - V's coefficient is ±1 (so the rewrite is exact integer arithmetic)
+    ##   - V is not a parameter, search-annotated, defined, or channel
+    ##   - V is not the target of any other `defines_var` annotation in the model
+    ##   - V is not the result variable of any other defining constraint shape
+    ##     (int_times/int_min/int_max/element/etc with defines_var)
+    ##   - The constraint is not already in `definingConstraints`
+    ##   - At most one variable in the constraint qualifies (no ambiguity)
+    ##
+    ## The constraint becomes the expression for V; V's declared range is later
+    ## emitted as bound constraints by the existing `definedVarBounds` pipeline,
+    ## which automatically skips bounds that are naturally implied by the
+    ## expression's range. So `sum_p t_pg + remainder[g] = available[g]` with
+    ## `remainder[g] ∈ [0, available[g]]` becomes the expression
+    ## `remainder[g] = available[g] - sum_p t_pg` plus the implicit
+    ## `sum_p t_pg ≤ available[g]` lower-bound enforcement (the upper bound is
+    ## naturally implied since each t_pg is non-negative).
+
+    # Step 1: collect every variable that some constraint already claims as a
+    # defined target. We must not steal a variable that another (annotated)
+    # constraint defines; doing so would create two definitions for the same var.
+    var alreadyDefined = initHashSet[string]()
+    for ci, con in tr.model.constraints:
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                alreadyDefined.incl(ann.args[0].ident)
+
+
+    # Step 2: scan int_lin_eq constraints without defines_var and identify the
+    # subset that has a unique eligible candidate variable.
+    var nDetected = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name != "int_lin_eq": continue
+        if con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        # Skip constraints already claimed by specialised pattern detectors that
+        # don't register through `definingConstraints`. These detectors install
+        # better-targeted bindings (count_eq channels, conditional counts, etc.)
+        # — stealing the int_lin_eq here would conflict with the variable mapping
+        # those detectors set up downstream.
+        if ci in tr.countEqPatterns: continue
+        if ci in tr.constantCountPatterns: continue
+        if ci in tr.conditionalCountEqPatterns: continue
+        if ci in tr.argmaxPatterns: continue
+        if ci in tr.reifEqDefinedVars: continue
+
+        var coefs: seq[int]
+        try: coefs = tr.resolveIntArray(con.args[0])
+        except CatchableError: continue
+        let varElems = tr.resolveVarArrayElems(con.args[1])
+        if coefs.len != varElems.len or varElems.len == 0: continue
+        # Restrict to the "sum + slack = capacity" shape: ≥ 3 variables and
+        # every coefficient is ±1. This is the pattern where the modeller
+        # encoded a balance equation that should really have been a defining
+        # expression, and it's where MZN reliably refuses to add a defines_var
+        # annotation. Other ±1-coefficient int_lin_eqs (binary equalities like
+        # `a - b = c`, scaled-objective summations like `5*c1 + 3*c2 + c3 - obj
+        # = 0`) carry richer downstream usage that other detectors handle —
+        # taking those over here causes regressions (matrix-element diagonal
+        # exclusion, GCC count channels, etc.).
+        if varElems.len < 3: continue
+        var allUnit = true
+        for c in coefs:
+            if c != 1 and c != -1:
+                allUnit = false; break
+        if not allUnit: continue
+
+        var candidateIdx = -1
+        var ambiguous = false
+        for vi, v in varElems:
+            if v.kind != FznIdent: continue
+            let vName = v.ident
+            if vName in tr.paramValues: continue
+            if vName in tr.annotatedSearchVarNames: continue
+            if vName in tr.definedVarNames: continue
+            if vName in tr.channelVarNames: continue
+            if vName in alreadyDefined: continue
+            if coefs[vi] != 1 and coefs[vi] != -1: continue
+            if candidateIdx == -1:
+                candidateIdx = vi
+            else:
+                ambiguous = true
+                break
+        if ambiguous or candidateIdx == -1: continue
+
+        let targetName = varElems[candidateIdx].ident
+        # Capture the declared range BEFORE marking the var as defined; the original
+        # constraint was the only thing pinning the target into [lo, hi], so we need
+        # to re-emit that bound after positions exist (see emitImplicitLinEqRangeBounds).
+        let (_, lo, hi) = tr.getTightenedBounds(targetName)
+        # Mark the variable as defined and the constraint as consumed.
+        tr.definedVarNames.incl(targetName)
+        tr.definingConstraints.incl(ci)
+        tr.implicitLinEqDefinedVars[ci] = targetName
+        tr.implicitLinEqRangeBounds.add((ci: ci, varName: targetName, lo: lo, hi: hi))
+        # Reserve the name so a subsequent int_lin_eq cannot also claim it.
+        alreadyDefined.incl(targetName)
+        inc nDetected
+
+    if nDetected > 0:
+        stderr.writeLine(&"[FZN] Promoted {nDetected} unannotated int_lin_eq vars to defined channels (sum+slack=capacity pattern)")
 
 proc buildDefinedExpressions(tr: var FznTranslator) =
     ## Second pass: build AlgebraicExpressions for defined variables using the positions
