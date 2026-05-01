@@ -164,14 +164,6 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     ## at init, so it's not in the per-iteration hot path.
     let carray = state.carray
 
-    # Inverse groups force changes at peer positions when one of their members
-    # is reassigned. Pair/triple search captures `old2 = state.assignment[p2]`
-    # *after* a lean assign of p1; if p1 is in an inverse group covering p2,
-    # `old2` is the post-forced value, not the original, and the eventual
-    # revert can't restore the true initial state. Bailing out is safer than
-    # a partial fix — the standard tabu loop handles the inverse-group case.
-    if state.inverseEnabled: return
-
     var hasChannelInequality = false
     for constraint in state.constraints:
         if constraint.stateType != RelationalType: continue
@@ -286,12 +278,19 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     # because a full O(N³·D³) scan is expensive — for 20-position models with
     # domain ~10 it's ~10⁸ evaluations, so we sample triples and fall back as
     # soon as the cap is hit. Each scan rotates the position list by a stride
-    # so high-index positions still anchor triples on later scans (without the
-    # rotation, the cap always trips before they're reached).
+    # so high-index positions still anchor triples on later scans (without
+    # rotation, the cap always trips before they're reached). Scan 0 starts at
+    # offset 0 — small models that fit under the cap behave identically.
+    ##
+    ## Skipped when inverse groups are enabled: phase 3 lean-assigns p2 then
+    ## reverts via `assignValueLean(p2, old2)`, but `old2` was captured *after*
+    ## p1's lean assign, which may have triggered an inverse-forced change at
+    ## p2. The wrong revert leaves state corrupted, biasing all subsequent
+    ## costDelta reads. Phases 1 and 2 don't write p2 so they're safe.
     const MaxTripleScans = 5
     const MaxTripleCandidates = 5_000_000
     var nTriple = 0
-    if state.cost > 0:
+    if state.cost > 0 and not state.inverseEnabled:
         var basePositions: seq[int]
         for p in carray.allSearchPositions():
             basePositions.add(p)

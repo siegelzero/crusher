@@ -397,3 +397,149 @@ solve satisfy;
         check cnt1 <= 2
         check cnt2 <= 2
         # Capacities sum: 4 persons + 2 slack-per-good = 4. Implied by feasibility.
+
+
+suite "Channel-inequality repair gating":
+    ## These tests defend the gating discipline that prevents `repairChannelInequalities`
+    ## from firing on models it wasn't designed for. Without these guards the repair
+    ## destabilises ~20 mznchallenge tests by collapsing parallel-worker diversity
+    ## (see commits 01842d3 and follow-up). The gate has three pieces, each tested
+    ## here:
+    ##
+    ##   1. Translator sets `baseArray.enableChannelInequalityRepair = true` ONLY
+    ##      when `detectImplicitLinEqDefinedVars` actually emits range bounds.
+    ##   2. `ConstrainedArray.deepCopy` propagates the flag (workers won't see it
+    ##      otherwise — and the parallel solver always works on copies).
+    ##   3. Models without the implicit-lin-eq sum+slack pattern leave the flag
+    ##      unset even if they have channel-only `≥`/`≤` constraints from other
+    ##      sources (count constraints, indicator-sum bounds, etc.).
+    ##
+    ## If any of these tests fail, the repair gate is broken and a full mztest
+    ## run will likely show 20+ regressions.
+
+    test "translator sets enableChannelInequalityRepair when implicit-lin-eq emits bounds":
+        ## Same shape as the bin-packing end-to-end test: 4 persons × 2 goods,
+        ## sum-of-indicators + slack = capacity. The detector promotes both slacks
+        ## and emits bounds, which must set the flag.
+        let src = """
+var 1..2: g1 :: output_var;
+var 1..2: g2 :: output_var;
+var 1..2: g3 :: output_var;
+var 1..2: g4 :: output_var;
+var bool: b11 :: var_is_introduced :: is_defined_var;
+var bool: b21 :: var_is_introduced :: is_defined_var;
+var bool: b31 :: var_is_introduced :: is_defined_var;
+var bool: b41 :: var_is_introduced :: is_defined_var;
+var bool: b12 :: var_is_introduced :: is_defined_var;
+var bool: b22 :: var_is_introduced :: is_defined_var;
+var bool: b32 :: var_is_introduced :: is_defined_var;
+var bool: b42 :: var_is_introduced :: is_defined_var;
+var 0..1: i11 :: var_is_introduced :: is_defined_var;
+var 0..1: i21 :: var_is_introduced :: is_defined_var;
+var 0..1: i31 :: var_is_introduced :: is_defined_var;
+var 0..1: i41 :: var_is_introduced :: is_defined_var;
+var 0..1: i12 :: var_is_introduced :: is_defined_var;
+var 0..1: i22 :: var_is_introduced :: is_defined_var;
+var 0..1: i32 :: var_is_introduced :: is_defined_var;
+var 0..1: i42 :: var_is_introduced :: is_defined_var;
+var 0..2: slack1 :: var_is_introduced;
+var 0..2: slack2 :: var_is_introduced;
+constraint int_eq_reif(g1, 1, b11) :: defines_var(b11);
+constraint int_eq_reif(g2, 1, b21) :: defines_var(b21);
+constraint int_eq_reif(g3, 1, b31) :: defines_var(b31);
+constraint int_eq_reif(g4, 1, b41) :: defines_var(b41);
+constraint int_eq_reif(g1, 2, b12) :: defines_var(b12);
+constraint int_eq_reif(g2, 2, b22) :: defines_var(b22);
+constraint int_eq_reif(g3, 2, b32) :: defines_var(b32);
+constraint int_eq_reif(g4, 2, b42) :: defines_var(b42);
+constraint bool2int(b11, i11) :: defines_var(i11);
+constraint bool2int(b21, i21) :: defines_var(i21);
+constraint bool2int(b31, i31) :: defines_var(i31);
+constraint bool2int(b41, i41) :: defines_var(i41);
+constraint bool2int(b12, i12) :: defines_var(i12);
+constraint bool2int(b22, i22) :: defines_var(i22);
+constraint bool2int(b32, i32) :: defines_var(i32);
+constraint bool2int(b42, i42) :: defines_var(i42);
+constraint int_lin_eq([1,1,1,1,1],[i11,i21,i31,i41,slack1],2);
+constraint int_lin_eq([1,1,1,1,1],[i12,i22,i32,i42,slack2],2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        # Sanity: detector promoted both slacks (precondition for the flag).
+        check tr.implicitLinEqDefinedVars.len == 2
+        # The flag must be set so the repair pre-pass fires for this model.
+        check tr.sys.baseArray.enableChannelInequalityRepair
+
+    test "translator leaves flag unset for trivial all_different model":
+        ## No int_lin_eq at all → detector never fires → flag must stay false.
+        ## Establishes the unset-by-default baseline.
+        let src = """
+var 1..3: x1;
+var 1..3: x2;
+var 1..3: x3;
+constraint fzn_all_different_int([x1,x2,x3]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.implicitLinEqDefinedVars.len == 0
+        check not tr.sys.baseArray.enableChannelInequalityRepair
+
+    test "translator leaves flag unset when only counter-style channel ineq exists":
+        ## This is the regression-catcher. The model has a channel-only `≤`
+        ## constraint from a count-of-indicators pattern (the indicators get
+        ## promoted to channel positions via int_eq_reif → bool2int), so the
+        ## constraint matches `repairChannelInequalities`'s `hasChannelInequality`
+        ## test. But there's NO int_lin_eq sum+slack pattern, so the implicit-
+        ## lin-eq detector never emits bounds — the flag must stay false even
+        ## though the channel-only inequality structure is present.
+        ##
+        ## If a future change widens the flag-setting condition (e.g., sets it
+        ## whenever `hasChannelInequality` would match), this test fails — and
+        ## ~20 mznchallenge tests will silently regress until someone re-runs
+        ## the full integration suite.
+        let src = """
+var 1..4: x;
+var bool: b1 :: var_is_introduced :: is_defined_var;
+var bool: b2 :: var_is_introduced :: is_defined_var;
+var bool: b3 :: var_is_introduced :: is_defined_var;
+var bool: b4 :: var_is_introduced :: is_defined_var;
+var 0..1: i1 :: var_is_introduced :: is_defined_var;
+var 0..1: i2 :: var_is_introduced :: is_defined_var;
+var 0..1: i3 :: var_is_introduced :: is_defined_var;
+var 0..1: i4 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(x, 1, b1) :: defines_var(b1);
+constraint int_eq_reif(x, 2, b2) :: defines_var(b2);
+constraint int_eq_reif(x, 3, b3) :: defines_var(b3);
+constraint int_eq_reif(x, 4, b4) :: defines_var(b4);
+constraint bool2int(b1, i1) :: defines_var(i1);
+constraint bool2int(b2, i2) :: defines_var(i2);
+constraint bool2int(b3, i3) :: defines_var(i3);
+constraint bool2int(b4, i4) :: defines_var(i4);
+constraint int_lin_le([1,1,1,1],[i1,i2,i3,i4],2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        # Detector did not fire (no int_lin_eq with sum+slack=capacity shape).
+        check tr.implicitLinEqDefinedVars.len == 0
+        # Flag must stay unset — this is the invariant the repair gating relies on.
+        check not tr.sys.baseArray.enableChannelInequalityRepair
+
+    test "ConstrainedArray.deepCopy preserves enableChannelInequalityRepair":
+        ## The parallel solver always works on `baseArray.deepCopy()` (see
+        ## parallelResolution.nim, scatterSearch.nim — multiple call sites).
+        ## If deepCopy drops the flag, parallel workers never run the repair,
+        ## even when the translator correctly set it on baseArray.
+        var arr = initConstrainedArray[int](3)
+        check not arr.enableChannelInequalityRepair  # default
+
+        arr.enableChannelInequalityRepair = true
+        let copy1 = arr.deepCopy()
+        check copy1.enableChannelInequalityRepair
+
+        arr.enableChannelInequalityRepair = false
+        let copy2 = arr.deepCopy()
+        check not copy2.enableChannelInequalityRepair

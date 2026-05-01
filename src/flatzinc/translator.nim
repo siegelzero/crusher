@@ -1530,6 +1530,13 @@ proc translate*(model: FznModel): FznTranslator =
             inc nImplicitBoundsSkipped
     if result.implicitLinEqRangeBounds.len > 0:
         stderr.writeLine(&"[FZN] Implicit lin_eq range bounds: emitted {nImplicitBoundsEmitted} (skipped {nImplicitBoundsSkipped} naturally implied)")
+    # Enable the channel-inequality repair pre-pass only when this detector
+    # actually emitted bounds. Other models can also have channel-only `≥`/`≤`
+    # constraints (counters, indicator-sum bounds, etc.) but the greedy descent
+    # is destabilising for them — gating on this flag scopes it to the
+    # bin-packing-shape models the pass was designed for.
+    if nImplicitBoundsEmitted > 0:
+        result.sys.baseArray.enableChannelInequalityRepair = true
     # Build matrix infos for matrix_element pattern detection
     result.buildMatrixInfos()
 

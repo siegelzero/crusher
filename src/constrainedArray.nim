@@ -143,6 +143,14 @@ type
         binaryPartitions*: seq[seq[int]]  # groups of binary positions where exactly one is 1
         # Conditional separation infos for domain reduction
         conditionalSeparations*: seq[tuple[varPos: int, lo: T, hi: T, guardPos: int]]
+        # Set by the FlatZinc translator when it emits implicit-lin-eq range bounds
+        # (channel-only `≥`/`≤` constraints from sum+slack=capacity promotion). The
+        # repair pre-pass should only fire when these bounds exist — gating it on
+        # this flag prevents the greedy 1/2/3-flip descent from running on models
+        # whose channel-only inequalities come from unrelated sources, where the
+        # descent collapses parallel-worker diversity and traps tabu in a poor
+        # init state.
+        enableChannelInequalityRepair*: bool
 
 ################################################################################
 # Value Extraction
@@ -5286,6 +5294,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     result.inverseChannelsAtPosition = arr.inverseChannelsAtPosition
     result.fixedPositions = arr.fixedPositions
     result.elementInverseDetected = arr.elementInverseDetected
+    result.enableChannelInequalityRepair = arr.enableChannelInequalityRepair
 
     # Dormancy bindings are all value types — shallow copy is fine
     result.dormancyBindings = arr.dormancyBindings
