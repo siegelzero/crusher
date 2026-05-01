@@ -9,7 +9,7 @@ ecp_xIGData_22_12_22_5,2020/soccer-computational/ecp.mzn,2020/soccer-computation
 lot_sizing_pigment15b,2020/lot-sizing/lot_sizing_cp.mzn,2020/lot-sizing/pigment15b.psp.dzn,minimize,10000,1123,10000
 racp_j30_26_2,2020/racp/racp.mzn,2020/racp/j30_26_2_1.0.dzn,minimize,10000,704,1408
 radiation_i6_9,2020/radiation/radiation.mzn,2020/radiation/i6-9.dzn,minimize,10000,338,676
-sdn_chain_d10n780_1,2020/sdn-chain/model.mzn,2020/sdn-chain/d10n780-1.dzn,minimize,10000,10,20
+sdn_chain_d10n780_1,2020/sdn-chain/model.mzn,2020/sdn-chain/d10n780-1.dzn,minimize,15000,10,20
 skill_allocation_1m_1,2020/skill-allocation/skill_allocation_only.mzn,2020/skill-allocation/skill_allocation_mzn_1m_1.dzn,minimize,10000,10,100
 sparse_mds_breast_cancer4,2020/minimal-decision-sets/sparse_mds.mzn,2020/minimal-decision-sets/breast-cancer_train4.dzn,minimize,10000,102,200
 
@@ -30,7 +30,7 @@ spot5_404,2022/spot5/spot5.mzn,2022/spot5/404.dzn,minimize,10000,114,120
 team_assign_d1_4_6,2022/team-assignment/model.mzn,2022/team-assignment/data1_4_6.dzn,maximize,10000,2900,2948
 tower_070_070_15_070_09,2022/tower/tower.mzn,2022/tower/tower_070_070_15_070-09.dzn,maximize,10000,0,57
 triangular_n10,2022/triangular/triangular.mzn,2022/triangular/n10.dzn,maximize,10000,20,20
-wordpress_12_500,2022/wordpress/wordpress.mzn,2022/wordpress/Wordpress12_Offers500.dzn,minimize,10000,3580,30000
+wordpress_12_500,2022/wordpress/wordpress.mzn,2022/wordpress/Wordpress12_Offers500.dzn,minimize,10000,3580,65030
 
 chessboard4,2023/chessboard/chessboard.mzn,2023/chessboard/chessboard4.dzn,maximize,10000,24,25
 kidney_exchange_3_20,2023/kidney-exchange/ccmcp.mzn,2023/kidney-exchange/3_20_0.15_3.dzn,maximize,10000,500,815
@@ -43,11 +43,11 @@ roster_shifts_bool_small,2023/roster-shifts-bool/bool-model.mzn,2023/roster-shif
 table_layout_small,2023/table-layout/TableLayout.mzn,2023/table-layout/p1000_m3_r100_c10.dzn,minimize,10000,3814,20000
 test_sched_t20m10r10,2023/test-scheduling/test-scheduling.mzn,2023/test-scheduling/t20m10r10-17.dzn,minimize,10000,1069,1200
 ttp_n10_k3,2023/travelling-thief/ttp.mzn,2023/travelling-thief/data/n10_k3_c5000_l10000_u10100_r46.dzn,maximize,10000,1454500,1454500
-unit_commit_L3,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L3-T6G5L5.dzn,minimize,10000,75950,200000
+unit_commit_L3,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L3-T6G5L5.dzn,minimize,10000,75950,6288300
 unit_commit_L7,2023/unit-commitment/Unit-Commitment.mzn,2023/unit-commitment/L7-T12G5L5.dzn,minimize,10000,130950,300000
 
 accap_a3_f20_t10,2024/accap/accap.mzn,2024/accap/accap_a3_f20_t10.json,minimize,10000,104,110
-aircraft_disassembly_01,2024/aircraft-disassembly/aircraft.mzn,2024/aircraft-disassembly/B737NG-600-01-Anon.json.dzn,minimize,10000,3297500,25000000
+aircraft_disassembly_01,2024/aircraft-disassembly/aircraft.mzn,2024/aircraft-disassembly/B737NG-600-01-Anon.json.dzn,minimize,10000,3297500,250000000
 community_detection_mexican,2024/community-detection/community-detection.mzn,2024/community-detection/mexican.s26.k4.dzn,maximize,10000,715070,715070
 concert_hall_cap_mznc2018,2024/concert-hall-cap/concert-hall-cap.mzn,2024/concert-hall-cap/concert-cap.mznc2018.04.dzn,minimize,10000,36778,36778
 graph_clear_n20_14,2024/graph-clear/graph_clear_cp.mzn,2024/graph-clear/planar_n20_seed2022_14.json,minimize,10000,54,120
@@ -56,14 +56,14 @@ hoist_benchmark_PU_2_4_3,2024/hoist-benchmark/hoist-benchmark.mzn,2024/hoist-ben
 neighbours_new_2,2024/neighbours/neighbours-rect.mzn,2024/neighbours/neightbours-new-2.dzn,maximize,10000,17,17
 peaceable_queens_n9,2024/peacable_queens/peaceable_queens_mznc2021.mzn,2024/peacable_queens/pq_n9.dzn,maximize,10000,12,12
 
-groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,10000,90,225
+groupsplitter_u12g2p0,2025/groupsplitter/group.mzn,2025/groupsplitter/u12g2pref0.dzn,maximize,15000,90,225
 gt_sort_n7,2025/gt-sort/gt-sort.mzn,2025/gt-sort/n7_ub20_75.0_BEST.json,minimize,10000,79,86
 hitori_h5_1,2025/hitori/hitori.mzn,2025/hitori/h5-1.dzn,maximize,10000,17,17
 is_9aGFgDaHX7,2025/is/model.mzn,2025/is/9aGFgDaHX7.dzn,minimize,5000,,688128
 mondoku_8_8_4,2025/mondoku/mondoku-gcc-model-balance.mzn,2025/mondoku/8-8-4.dzn,minimize,10000,0,4
-products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,2025/products-and-shelves/ps-25-01.dzn,minimize,10000,5,5
+products_and_shelves_ps_25_01,2025/products-and-shelves/product-and-shelves.mzn,2025/products-and-shelves/ps-25-01.dzn,minimize,10000,5,6
 proteindesign12_1HZ5,2025/proteindesign12/wcsp.mzn,2025/proteindesign12/1HZ5.12p.9aa.usingEref_self.dzn,minimize,10000,1473,1480
 tower_050_050_10_050_03,2025/tower/tower.mzn,2025/tower/tower_050_050_10_050-03.dzn,maximize,10000,25,45
 tsptw_n20w140_005,2025/tsptw/tsptw.mzn,2025/tsptw/n20w140.005.dzn,minimize,10000,275,320
-work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,4000
+work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025/work-task-variation/generated-seed-3-length-10-open-8-workers-12-block-15.dzn,minimize,10000,193,4775
 
