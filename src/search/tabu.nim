@@ -2855,7 +2855,20 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             for binding in carray.argmaxChannelBindings:
                 aggregateChannelPositions.incl(binding.channelPosition)
 
+            # Count how many cascades reach each constraint. A constraint reachable
+            # from multiple search positions can be violated by a SEQUENCE of moves
+            # even when no SINGLE move from the initial state changes its penalty.
+            # Marking such a constraint tautological hides genuine violations once
+            # the search drifts away from the initial assignment. Only constraints
+            # reachable from a single cascade are safe to disable based on init-time
+            # single-step delta evaluation.
+            var cascadeCount = newSeq[int](state.channelDepConstraints.len)
+            for cascadeIdx in 0..<state.cdCascadeConstraintIds.len:
+                for ci in state.cdCascadeConstraintIds[cascadeIdx]:
+                    cascadeCount[ci] += 1
+
             var tautCount = 0
+            var tautSkippedMultiCascade = 0
             for ci in 0..<state.channelDepConstraints.len:
                 if state.cdPerConstraintMaxDelta[ci] == 0:
                     # Check if constraint references any aggregate channel position
@@ -2866,12 +2879,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             break
                     if touchesAggregate:
                         continue  # Don't disable — aggregate channels can become non-tautological
+                    if cascadeCount[ci] >= 2:
+                        tautSkippedMultiCascade += 1
+                        continue  # Multiple search positions reach this — multi-step changes can violate it
                     state.channelDepConstraintActive[ci] = false
                     tautCount += 1
-            if tautCount > 0:
+            if tautCount > 0 or tautSkippedMultiCascade > 0:
                 if verbose and id == 0:
                     echo "[Init] Disabled " & $tautCount & "/" & $state.channelDepConstraints.len &
-                         " tautological channel-dep constraints (zero delta across all moves)"
+                         " tautological channel-dep constraints (zero delta across all moves" &
+                         (if tautSkippedMultiCascade > 0: "; kept " & $tautSkippedMultiCascade & " multi-cascade" else: "") & ")"
                     var tautByType, activeByType: array[StatefulConstraintType, int]
                     for ci in 0..<state.channelDepConstraints.len:
                         let ct = state.channelDepConstraints[ci].stateType
