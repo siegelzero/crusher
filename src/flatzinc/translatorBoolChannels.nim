@@ -1926,3 +1926,297 @@ proc detectImplicationOrChannels*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Detected {nDetected} implication-OR channel candidates " &
                          &"(V = OR(W_i) from {nClausesConsumed} bool_clauses; " &
                          &"rejected {nRejectedDomain} non-binary; deferred to build phase)")
+
+
+proc detectImplicationAndChannels*(tr: var FznTranslator) =
+    ## Detects boolean indicators forced up by one or more bool_clauses and
+    ## summed via a single bool2int into a count-style constraint. Channelizes
+    ## each indicator as the OR of each clause's force-AND, removing it from
+    ## the search positions.
+    ##
+    ## Pattern (per indicator b):
+    ##   1. K ≥ 1 bool_clauses, each of the form
+    ##      bool_clause([..., b, ...], [N_1, ..., N_n])
+    ##      i.e. b ∨ P_2 ∨ ... ∨ P_m ∨ ¬N_1 ∨ ... ∨ ¬N_n  (so LHS → b where
+    ##      LHS = ¬P_2 ∧ ... ∧ ¬P_m ∧ N_1 ∧ ... ∧ N_n)
+    ##   2. b appears as a positive literal in EVERY clause it's part of, and
+    ##      never as a negative literal anywhere.
+    ##   3. bool2int(b, c)                                — c sums into a count
+    ##   4. c appears in exactly one int_lin_eq or int_lin_le where the
+    ##      coefficient on c is +1 (so the sum is monotone-non-decreasing in c).
+    ##      For ≥-direction sums we'd over-constrain — those are rejected.
+    ##   5. b has no other constraint references.
+    ##
+    ## When detected, b is rewritten as b = OR over k of (clause_k's force AND).
+    ## In any feasible solution of the original model, b takes the value forced
+    ## by its implications (else either an implication or the count is
+    ## violated), so the rewrite preserves all feasible solutions and improves
+    ## local-search gradients by tying b's value directly to its forcing
+    ## literals instead of leaving it as a free search position.
+    ##
+    ## This is a strict generalization of detectBoolAndChannels (which only
+    ## fires for K=1, m=1 with all N_i pre-channeled) and complements
+    ## detectImplicationOrChannels (which only handles K≥2 single-literal
+    ## clauses of the form [N_i, B], []).
+    ##
+    ## Originally motivated by HRC (MZN Challenge 2019/hrc): single_bp's are
+    ## K=1 forcers (≈250) and coup_bp's are K=2 forcers (≈100). Without this
+    ## rewrite they remain free search positions, severing the gradient
+    ## between the pos vars and the bp-count constraint.
+    ##
+    ## Must run after detectReifChannels and the standard bool channel
+    ## detectors so already-claimed variables (channelVarNames, definedVarNames,
+    ## already-consumed bool_clauses via definingConstraints) are skipped.
+
+    # Step 1: count clause-occurrences for each bool var (positive AND negative)
+    # so we can confirm "appears in exactly one bool_clause" and that the var
+    # appears as a positive literal in that one clause.
+    type ClauseOccurrence = object
+        ci: int
+        asPositive: bool
+    var clauseOccurrences = initTable[string, seq[ClauseOccurrence]]()
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+        for elem in con.args[0].elems:
+            if elem.kind != FznIdent: continue
+            clauseOccurrences.mgetOrPut(elem.ident, @[]).add(
+                ClauseOccurrence(ci: ci, asPositive: true))
+        for elem in con.args[1].elems:
+            if elem.kind != FznIdent: continue
+            clauseOccurrences.mgetOrPut(elem.ident, @[]).add(
+                ClauseOccurrence(ci: ci, asPositive: false))
+
+    # Step 2: index bool2int(b, c) → c-name, per b. We require exactly one such
+    # bool2int per candidate b (and conversely, that c is used in exactly one
+    # downstream sum constraint).
+    type Bool2IntEntry = object
+        ci: int
+        cName: string
+    var bool2intByB = initTable[string, seq[Bool2IntEntry]]()
+    # NOTE: bool2int(b, c) with defines_var(c) is typically already in
+    # definingConstraints (claimed by detectReifChannels), but the bool2int
+    # *relation* still holds — c is a channel of b. We need it to identify b's
+    # usages and confirm the sum couples through. So don't skip on
+    # definingConstraints here.
+    for ci, con in tr.model.constraints:
+        if stripSolverPrefix(con.name) != "bool2int": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+        bool2intByB.mgetOrPut(con.args[0].ident, @[]).add(
+            Bool2IntEntry(ci: ci, cName: con.args[1].ident))
+
+    # Step 3: index, for each c-name, which int_lin_{eq,le} constraints reference
+    # it and at what coefficient. (We accept arrays inlined as FznArrayLit and
+    # arrays referenced by name via arrayValues.)
+    type LinEntry = object
+        ci: int
+        op: string         # "int_lin_eq" or "int_lin_le"
+        coef: int          # coefficient on this c in the sum
+    var linByC = initTable[string, seq[LinEntry]]()
+
+    proc resolveCoefArray(tr: FznTranslator, arg: FznExpr): seq[int] =
+        ## Returns coefficient values from an inlined array literal or named
+        ## param array. Empty seq if it doesn't resolve cleanly.
+        if arg.kind == FznArrayLit:
+            for e in arg.elems:
+                if e.kind == FznIntLit: result.add(e.intVal)
+                else: return @[]
+            return
+        if arg.kind == FznIdent and arg.ident in tr.arrayValues:
+            for v in tr.arrayValues[arg.ident]:
+                result.add(v)
+
+    # Build a local array-name → element-names map by scanning model.variables.
+    # We can't rely on tr.arrayElementNames because translateVariables() runs
+    # AFTER this detection phase. The map only needs to cover named var arrays
+    # whose values are FznArrayLits of identifiers (and constants).
+    var arrayElems = initTable[string, seq[string]]()
+    for decl in tr.model.variables:
+        if not decl.isArray: continue
+        if decl.value == nil or decl.value.kind != FznArrayLit: continue
+        var elems = newSeq[string](decl.value.elems.len)
+        for i, e in decl.value.elems:
+            if e.kind == FznIdent: elems[i] = e.ident
+            # Constant entries are left as empty strings — they can't be a c
+            # var, but we keep them positionally so length matches the coef
+            # array.
+        arrayElems[decl.name] = elems
+
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let nm = stripSolverPrefix(con.name)
+        if nm != "int_lin_eq" and nm != "int_lin_le": continue
+        if con.args.len < 3: continue
+        let coefs = resolveCoefArray(tr, con.args[0])
+        if coefs.len == 0: continue
+
+        # Resolve the variable array — either inline or a named array.
+        var varNames: seq[string]
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: varNames.add(e.ident)
+                else: varNames.add("")
+        elif con.args[1].kind == FznIdent and con.args[1].ident in arrayElems:
+            varNames = arrayElems[con.args[1].ident]
+        else:
+            continue
+        if varNames.len != coefs.len: continue
+        for k, name in varNames:
+            if name.len == 0: continue
+            linByC.mgetOrPut(name, @[]).add(LinEntry(ci: ci, op: nm, coef: coefs[k]))
+
+    # Helpers for "this var has no other constraint usage we'd be breaking".
+    # We've indexed the clause + bool2int + lin uses already. To be conservative,
+    # we also scan once for "any other reference to b" and reject if found.
+    proc countOtherRefs(tr: FznTranslator, name: string,
+                        skipBoolClauseCi, skipBool2intCi: int): int =
+        # Count constraint occurrences of name outside the two we already know.
+        for ci, con in tr.model.constraints:
+            if ci == skipBoolClauseCi or ci == skipBool2intCi: continue
+            if ci in tr.definingConstraints: continue
+            for arg in con.args:
+                case arg.kind
+                of FznIdent:
+                    if arg.ident == name: result += 1
+                of FznArrayLit:
+                    for e in arg.elems:
+                        if e.kind == FznIdent and e.ident == name: result += 1
+                else: discard
+
+    var nDetected = 0
+    var nRejectedDegree = 0
+    var nRejectedSum = 0
+    var nRejectedDomain = 0
+    var clausesUsedAsDef = initHashSet[int]()  # at most one positive per clause
+
+    # Step 4: scan candidates. A candidate b is a bool var that:
+    #   - is not already a channel/defined var
+    #   - appears in K ≥ 1 bool_clauses, ALL as positive literals (no negatives)
+    #   - has exactly 1 bool2int(b, c) entry
+    #   - c has exactly 1 int_lin_{eq,le} entry, with coef = +1
+    #     We reject coef[c] = -1 (≥-style) to preserve feasibility.
+    #   - has no OTHER constraint references besides the bool_clauses + bool2int
+    var nMultiClauseDetected = 0
+    for bName, occs in clauseOccurrences.pairs:
+        if occs.len < 1: continue
+        # All occurrences must be positive (b can't appear as a negative literal
+        # anywhere, else the rewrite changes b's polarity in some clause).
+        var allPos = true
+        for o in occs:
+            if not o.asPositive: allPos = false; break
+        if not allPos: continue
+        if bName in tr.channelVarNames: continue
+        if bName in tr.definedVarNames: continue
+        if bName in tr.equalityCopyAliases: continue
+
+        # Skip if any of these clauses was already reserved by another candidate.
+        var anyReserved = false
+        for o in occs:
+            if o.ci in clausesUsedAsDef: anyReserved = true; break
+        if anyReserved: continue
+
+        # Domain must be binary {0,1}/bool.
+        let dom = tr.lookupVarDomain(bName)
+        if not (dom.len == 2 and 0 in dom and 1 in dom):
+            nRejectedDomain += 1
+            continue
+
+        # Need exactly one bool2int with this b as input.
+        if bName notin bool2intByB:
+            nRejectedDegree += 1
+            continue
+        let b2i = bool2intByB[bName]
+        if b2i.len != 1:
+            nRejectedDegree += 1
+            continue
+        let cName = b2i[0].cName
+        let bool2intCi = b2i[0].ci
+
+        # c must be used in exactly one int_lin_eq/le, with coef = +1.
+        if cName notin linByC:
+            nRejectedSum += 1
+            continue
+        let linUses = linByC[cName]
+        if linUses.len != 1:
+            nRejectedSum += 1
+            continue
+        let lin = linUses[0]
+        if lin.coef != 1:
+            nRejectedSum += 1
+            continue
+
+        # No other constraint references to b. countOtherRefs accepts a single
+        # skipBoolClauseCi — extend to a set of K clause CIs.
+        proc countOtherRefsMulti(tr: FznTranslator, name: string,
+                                 skipClauseCis: HashSet[int],
+                                 skipBool2intCi: int): int =
+            for ci, con in tr.model.constraints:
+                if ci in skipClauseCis or ci == skipBool2intCi: continue
+                if ci in tr.definingConstraints: continue
+                for arg in con.args:
+                    case arg.kind
+                    of FznIdent:
+                        if arg.ident == name: result += 1
+                    of FznArrayLit:
+                        for e in arg.elems:
+                            if e.kind == FznIdent and e.ident == name: result += 1
+                    else: discard
+
+        var skipCis = initHashSet[int]()
+        for o in occs: skipCis.incl(o.ci)
+        let other = countOtherRefsMulti(tr, bName, skipCis, bool2intCi)
+        if other > 0:
+            nRejectedDegree += 1
+            continue
+
+        # For each forcing clause, extract its other positives + negatives.
+        type ClauseLits = tuple[ci: int, otherPosLits, negLits: seq[string]]
+        var clauseDefs: seq[ClauseLits]
+        var allClausesOk = true
+        for o in occs:
+            let con = tr.model.constraints[o.ci]
+            var otherPos: seq[string]
+            var negs: seq[string]
+            var clauseOk = true
+            for elem in con.args[0].elems:
+                if elem.kind != FznIdent: clauseOk = false; break
+                if elem.ident == bName: continue
+                otherPos.add(elem.ident)
+            if not clauseOk:
+                allClausesOk = false; break
+            for elem in con.args[1].elems:
+                if elem.kind != FznIdent: clauseOk = false; break
+                if elem.ident == bName:
+                    # b in both polarities → trivially true; skip the whole
+                    # candidate rather than channelizing nonsense.
+                    clauseOk = false; break
+                negs.add(elem.ident)
+            if not clauseOk:
+                allClausesOk = false; break
+            # A clause whose body is empty (otherPos + negs both empty) means
+            # the clause forces b unconditionally. That's a presolve case and
+            # poisons the channel (b = OR(... TRUE ...) = TRUE always). Skip.
+            if otherPos.len == 0 and negs.len == 0:
+                allClausesOk = false; break
+            clauseDefs.add((ci: o.ci, otherPosLits: otherPos, negLits: negs))
+        if not allClausesOk: continue
+        if clauseDefs.len == 0: continue
+
+        # Claim: b becomes a channel; all clauses are consumed.
+        tr.implicationAndChannelDefs.add(
+            (targetVar: bName, clauses: clauseDefs))
+        tr.channelVarNames.incl(bName)
+        for cd in clauseDefs:
+            tr.definingConstraints.incl(cd.ci)
+            clausesUsedAsDef.incl(cd.ci)
+        nDetected += 1
+        if clauseDefs.len > 1: nMultiClauseDetected += 1
+
+    if nDetected > 0 or nRejectedDegree > 0 or nRejectedSum > 0:
+        stderr.writeLine(&"[FZN] Detected {nDetected} implication-AND channel candidates " &
+                         &"({nMultiClauseDetected} multi-clause OR-of-AND; rejected " &
+                         &"{nRejectedDegree} degree, {nRejectedSum} sum-shape, " &
+                         &"{nRejectedDomain} non-binary)")

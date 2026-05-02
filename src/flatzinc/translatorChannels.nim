@@ -1147,6 +1147,165 @@ proc buildImplicationOrChannelBindings*(tr: var FznTranslator) =
                          &"(skipped {nSkipped}, total channels: {tr.sys.baseArray.channelBindings.len})")
 
 
+proc buildImplicationAndChannelBindings*(tr: var FznTranslator) =
+    ## Builds channel bindings for implication-AND candidates.
+    ##
+    ## Single-clause case (K=1): b is encoded directly as element(idx, [0,...,0,1])
+    ## where idx counts how many of the (m-1+n) "force" conditions hold:
+    ##   idx = (m-1) + Σ N - Σ P_others
+    ## with array length (m-1+n+1), 1 only at the maximum index.
+    ##
+    ## Multi-clause case (K≥2): b = OR over k of (clause k's force-AND). We
+    ## allocate K helper bool vars `force_k`, each channeled as that clause's
+    ## force-AND with the same element-encoding as above. Then b is channeled
+    ## as element(Σ force_k, [0,1,...,1]) — the standard OR-via-element form.
+    ##
+    ## On any post-detect failure (e.g. a literal got aliased away or the var
+    ## domain narrowed), revert: drop b from channelVarNames and re-enable
+    ## the original bool_clauses so the standard translator enforces them.
+    proc revert(tr: var FznTranslator,
+                def: tuple[targetVar: string,
+                           clauses: seq[tuple[ci: int,
+                                              otherPosLits, negLits: seq[string]]]]) =
+        tr.channelVarNames.excl(def.targetVar)
+        for c in def.clauses:
+            tr.definingConstraints.excl(c.ci)
+
+    proc resolveLitExpr(tr: var FznTranslator, name: string,
+                        selfPos: int): (AlgebraicExpression[int], bool) =
+        let zeroExpr = newAlgebraicExpression[int](
+            positions = initPackedSet[int](),
+            node = ExpressionNode[int](kind: LiteralNode, value: 0),
+            linear = true)
+        if name notin tr.varPositions: return (zeroExpr, false)
+        let p = tr.varPositions[name]
+        if p == selfPos: return (zeroExpr, false)
+        let dom = tr.sys.baseArray.domain[p]
+        # Constant literal (single-value domain). Skip the {0,1} check so
+        # domain-tightened literals still work.
+        if dom.len == 1:
+            return (newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: dom[0]),
+                linear = true), true)
+        if dom.len != 2 or 0 notin dom or 1 notin dom:
+            return (zeroExpr, false)
+        return (tr.getExpr(p), true)
+
+    proc buildAndIndexExpr(negExprs, posOtherExprs: seq[AlgebraicExpression[int]],
+                           mMinus1: int): AlgebraicExpression[int] =
+        ## Index is (m-1) + Σ N - Σ P_others; ranges 0..(m-1+n).
+        var started = false
+        for e in negExprs:
+            if not started: result = e; started = true
+            else: result = result + e
+        for e in posOtherExprs:
+            if not started: result = 0 - e; started = true
+            else: result = result - e
+        if mMinus1 > 0: result = result + mMinus1
+
+    var nBuilt = 0
+    var nSkipped = 0
+    var nMultiBuilt = 0
+    for def in tr.implicationAndChannelDefs:
+        let bName = def.targetVar
+        if bName notin tr.varPositions:
+            tr.revert(def); nSkipped += 1; continue
+        let bPos = tr.varPositions[bName]
+        let bDom = tr.sys.baseArray.domain[bPos]
+        if bDom.len != 2 or 0 notin bDom or 1 notin bDom:
+            tr.revert(def); nSkipped += 1; continue
+
+        # Resolve every literal up-front so we can revert as a unit if any
+        # clause is malformed.
+        type ResolvedClause = tuple[
+            negExprs, posOtherExprs: seq[AlgebraicExpression[int]],
+            mMinus1, nNeg, totalForcers: int]
+        var resolved: seq[ResolvedClause]
+        var allOk = true
+        for c in def.clauses:
+            var rc: ResolvedClause
+            for nm in c.negLits:
+                let (e, ok) = resolveLitExpr(tr, nm, bPos)
+                if not ok: allOk = false; break
+                rc.negExprs.add(e)
+            if not allOk: break
+            for nm in c.otherPosLits:
+                let (e, ok) = resolveLitExpr(tr, nm, bPos)
+                if not ok: allOk = false; break
+                rc.posOtherExprs.add(e)
+            if not allOk: break
+            rc.mMinus1 = rc.posOtherExprs.len
+            rc.nNeg = rc.negExprs.len
+            rc.totalForcers = rc.mMinus1 + rc.nNeg
+            if rc.totalForcers == 0:
+                allOk = false; break
+            resolved.add(rc)
+        if not allOk or resolved.len == 0:
+            tr.revert(def); nSkipped += 1; continue
+
+        if resolved.len == 1:
+            # Single-clause: bind b directly to the AND.
+            let rc = resolved[0]
+            let indexExpr = buildAndIndexExpr(rc.negExprs, rc.posOtherExprs, rc.mMinus1)
+            var arr: seq[ArrayElement[int]]
+            for i in 0..<rc.totalForcers:
+                arr.add(ArrayElement[int](isConstant: true, constantValue: 0))
+            arr.add(ArrayElement[int](isConstant: true, constantValue: 1))
+            tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arr)
+        else:
+            # Multi-clause: encode b = OR over k of (clause k's AND) via a
+            # polynomial index. With K clauses each having T_k forcing literals,
+            # let count_k be the AlgebraicExpression that counts the satisfied
+            # forcers in clause k (range 0..T_k). Pack all counts into a single
+            # index using mixed-radix:
+            #   idx = count_0 + count_1*(T_0+1) + count_2*(T_0+1)*(T_1+1) + ...
+            # then lookup[idx] = 1 iff some count_k == T_k. Total table size is
+            # ∏(T_k+1), so we cap K and total size to keep this finite.
+            const maxLookup = 4096
+            var totalSize = 1
+            for rc in resolved: totalSize *= rc.totalForcers + 1
+            if totalSize > maxLookup:
+                tr.revert(def); nSkipped += 1; continue
+
+            var indexExpr: AlgebraicExpression[int]
+            var stride = 1
+            for k, rc in resolved:
+                # countExpr_k = mMinus1 + Σ N - Σ P_others (range 0..T_k).
+                let countExpr = buildAndIndexExpr(rc.negExprs, rc.posOtherExprs, rc.mMinus1)
+                let scaled =
+                    if stride == 1: countExpr
+                    else: countExpr * stride
+                if k == 0: indexExpr = scaled
+                else: indexExpr = indexExpr + scaled
+                stride *= rc.totalForcers + 1
+
+            # Build lookup: for each combined idx, decode counts and check if
+            # ANY count_k == T_k.
+            var arr = newSeq[ArrayElement[int]](totalSize)
+            for i in 0..<totalSize:
+                var rem = i
+                var fired = false
+                for k, rc in resolved:
+                    let m = rc.totalForcers + 1
+                    let cnt = rem mod m
+                    rem = rem div m
+                    if cnt == rc.totalForcers:
+                        fired = true
+                        break
+                arr[i] = ArrayElement[int](
+                    isConstant: true,
+                    constantValue: if fired: 1 else: 0)
+            tr.sys.baseArray.addChannelBinding(bPos, indexExpr, arr)
+            nMultiBuilt += 1
+        nBuilt += 1
+
+    if tr.implicationAndChannelDefs.len > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} implication-AND channel bindings " &
+                         &"({nMultiBuilt} multi-clause; skipped {nSkipped}; " &
+                         &"total channels: {tr.sys.baseArray.channelBindings.len})")
+
+
 proc buildBoolXorVarChannelBindings*(tr: var FznTranslator) =
     ## Builds channel bindings for bool_xor / array_bool_xor variable channel defs.
     ## bool_xor(a, b, result):        result = a XOR b = element(a*2+b, [0,1,1,0])

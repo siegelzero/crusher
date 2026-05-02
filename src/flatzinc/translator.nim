@@ -367,6 +367,16 @@ type
         implicationOrChannelDefs*: seq[tuple[targetVar: string,
                                              sourceVars: seq[string],
                                              consumedClauses: seq[int]]]
+        # Implication-AND channel defs. Each candidate has K≥1 forcing
+        # bool_clauses; b is channeled as the OR over each clause's force-AND
+        # (i.e. the conjunction of negated other-positives and positive-
+        # negatives). With K=1 the OR collapses to a single AND.
+        # Pattern: bool_clause([..., b, ...], [N's]) appearing K times, plus a
+        # single bool2int(b, c) feeding a positive-coeff equality or
+        # upper-bound sum, and no other references to b.
+        implicationAndChannelDefs*: seq[tuple[
+            targetVar: string,
+            clauses: seq[tuple[ci: int, otherPosLits, negLits: seq[string]]]]]
         # Overlap channel defs: overlap = NOT sep via bool_not chain
         overlapChannelDefs*: seq[tuple[ci: int, overlapVar: string, sepVar: string]]
         # Consumed disjunctive pair indices (replaced by cumulative constraints)
@@ -1189,6 +1199,12 @@ proc translate*(model: FznModel): FznTranslator =
     # high by multiple incident link_selection arcs and a count constraint pulls V
     # toward 0; without channelization, single-flip moves are stuck at delta ≥ 0.
     result.detectImplicationOrChannels()
+    # Detect implication-AND channels: degree-2 indicators forced up by a single
+    # bool_clause and summed via bool2int into a count constraint. The dual of
+    # implication-OR — channels b directly to the AND of its forcing literals.
+    # MUST run after detectImplicationOrChannels and detectBoolAndChannels so
+    # already-claimed targets / consumed clauses are skipped.
+    result.detectImplicationAndChannels()
     # Detect conditional implication channels: binary (min/max pair) and one-hot (permutation lookup)
     # MUST run after detectReifChannels() and detectBoolAndChannels()
     result.detectConditionalImplicationChannels()
@@ -2550,6 +2566,9 @@ proc translate*(model: FznModel): FznTranslator =
     # Build channel bindings for implication-OR patterns (V = OR(W_i) detected
     # via int_eq_reif/int_ne_reif/bool_clause patterns)
     result.buildImplicationOrChannelBindings()
+    # Build channel bindings for implication-AND patterns (b = AND of forcing
+    # literals from a single bool_clause + bool2int into a sum)
+    result.buildImplicationAndChannelBindings()
     # Build channel bindings for bool_xor / array_bool_xor variable channels
     result.buildBoolXorVarChannelBindings()
     # Build channel bindings for one-hot indicator variables
