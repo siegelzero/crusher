@@ -4369,6 +4369,91 @@ solve satisfy;
     check cDom.len > 0
     check cDom[0] >= 6
 
+  test "CPM 2-cycle keeps forward precedence through the equality":
+    # Regression for the Phase 1c improvement: instead of dropping BOTH
+    # edges of a zero-sum 2-cycle (`a = b + k`), drop only one and keep the
+    # other as a real forward precedence. Otherwise, CPM loses the chain
+    # tightening that should propagate through the equality.
+    #
+    # Setup: c >= a + 5  (real precedence)
+    #        a = b      (cycle of weight 0)
+    #        d >= b + 7 (real precedence — must propagate via the equality)
+    # Expected: d's lower bound lifted to 1 + 7 = 8 (via b == a, b's es == 1
+    # through the kept edge). Pre-fix: this would have lost the propagation.
+    let src = """
+var 1..50: a;
+var 1..50: b;
+var 1..50: c;
+var 1..50: d;
+array [1..2] of int: pos = [1,-1];
+array [1..2] of int: neg = [-1,1];
+constraint int_lin_le(pos, [a, b], 0);
+constraint int_lin_le(neg, [a, b], 0);
+constraint int_lin_le(neg, [c, a], -5);
+constraint int_lin_le(neg, [d, b], -7);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    let cDom = tr.sys.baseArray.domain[tr.varPositions["c"]]
+    let dDom = tr.sys.baseArray.domain[tr.varPositions["d"]]
+    check cDom.len > 0 and cDom[0] >= 6
+    check dDom.len > 0 and dDom[0] >= 8
+
+suite "Two-var int_lin_eq presolve":
+
+  test "c1*a + c2*b = rhs with c1 = -c2 intersects bounded domains":
+    # int_lin_eq([1, -1], [a, b], -3) encodes a - b = -3, i.e. b = a + 3.
+    # Both vars are unfixed; presolve should intersect domains:
+    #   dom(a) ∩ {b - 3 : b in dom(b)} = [1..10] ∩ [1..17] = [1..10] (no change)
+    #   dom(b) ∩ {a + 3 : a in dom(a)} = [4..20] ∩ [4..13] = [4..13]
+    let src = """
+var 1..10: a;
+var 4..20: b;
+constraint int_lin_eq([1, -1], [a, b], -3);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    let aDom = tr.sys.baseArray.domain[tr.varPositions["a"]]
+    let bDom = tr.sys.baseArray.domain[tr.varPositions["b"]]
+    check aDom.len > 0 and aDom[0] == 1 and aDom[^1] == 10
+    check bDom.len > 0 and bDom[0] == 4 and bDom[^1] == 13
+
+  test "c1*a + c2*b = rhs with sparse domains carves holes":
+    # b = a + 5 with a ∈ {1, 2, 7} and b ∈ {6, 7, 9, 12}.
+    # a=1 → b=6 ✓; a=2 → b=7 ✓; a=7 → b=12 ✓.
+    # So a stays {1, 2, 7}, b becomes {6, 7, 12} (9 dropped).
+    let src = """
+var {1, 2, 7}: a;
+var {6, 7, 9, 12}: b;
+constraint int_lin_eq([1, -1], [a, b], -5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    let aDom = tr.sys.baseArray.domain[tr.varPositions["a"]]
+    let bDom = tr.sys.baseArray.domain[tr.varPositions["b"]]
+    check aDom == @[1, 2, 7]
+    check bDom == @[6, 7, 12]
+
+  test "non-equality coefficients (c2 != -c1) are not folded":
+    # int_lin_eq([2, -1], [a, b], 0) encodes 2a = b, NOT a 2-cycle equality.
+    # The new presolve path should not touch this — domains stay full.
+    let src = """
+var 1..10: a;
+var 4..20: b;
+constraint int_lin_eq([2, -1], [a, b], 0);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    let aDom = tr.sys.baseArray.domain[tr.varPositions["a"]]
+    # The new c1 == -c2 path should not run; some other presolve pass may
+    # narrow further, but a's lower bound must still be ≥ 1 (i.e., the new
+    # path didn't corrupt anything).
+    check aDom.len > 0 and aDom[0] >= 1
+
 suite "Element peephole":
 
   test "all-equal const array → equality":

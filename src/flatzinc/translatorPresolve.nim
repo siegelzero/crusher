@@ -348,8 +348,10 @@ proc simplifyConstraints(tr: FznTranslator,
                                         result = true
                                     if infeasible: break
                                 # New dom(b) = dom(b) ∩ {a - k : a in dom(a)}.
-                                # Recompute against the (possibly tightened) aSet.
-                                let aSet2 = (if newA.len > 0: newA else: aDom).toPackedSet()
+                                # newA already holds the up-to-date intersection
+                                # of dom(a) with shift(dom(b), k), so it's the
+                                # right set whether or not we just tightened.
+                                let aSet2 = newA.toPackedSet()
                                 var newB: seq[int]
                                 for v in bDom:
                                     if (v + k) in aSet2:
@@ -2464,14 +2466,15 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
     if candidates.len == 0: return false
 
-    # Phase 1c: Detect deterministic-equality 2-cycles and drop their edges.
+    # Phase 1c: Detect deterministic-equality 2-cycles and drop one direction.
     # MZN flattens `int_lin_eq` into a pair of `int_lin_le`s, which become two
     # constant edges with weights summing to zero (`a→b w` and `b→a -w`),
     # encoding `b = a + w`. Treating these as precedence edges trips the
     # topological sort (CPM bailed on the whole unison graph because of
-    # this). Dropping them keeps the rest of the precedence DAG intact —
-    # the equality itself is propagated by the `int_lin_eq` presolve pass
-    # (or its already-tight domains).
+    # this). Dropping the reverse edge breaks the cycle while preserving the
+    # forward precedence `b ≥ a + w`, so downstream chain tightening still
+    # propagates through the equality on the forward pass (and through the
+    # backward pass for `ls`).
     var dropAsEquality: HashSet[(string, string)]
     block:
         # Build a forward map keeping the MAX weight per (from, to) pair —
@@ -2480,23 +2483,29 @@ proc cpmBoundsPropagate(tr: FznTranslator,
         var fwdEdges = initTable[(string, string), int]()
         for cand in candidates:
             if cand.durVar != "": continue
+            if cand.fromVar == cand.toVar: continue  # self-loops are skipped at addEdge
             let key = (cand.fromVar, cand.toVar)
             if key in fwdEdges:
                 fwdEdges[key] = max(fwdEdges[key], cand.constWeight)
             else:
                 fwdEdges[key] = cand.constWeight
-        # Detect 2-cycles whose weights sum to zero (deterministic equality
-        # `b = a + k`). Mark both edges to be dropped from the precedence
-        # graph — they encode an equality that does not constrain the
-        # topological order. The equality itself is propagated by the
-        # int_lin_eq presolve pass.
+        # For each 2-cycle whose weights sum to zero, drop exactly one edge.
+        # Pick the one with the smaller weight (i.e., keep the positive /
+        # "real" forward precedence — for `b = a + w` with w > 0, we keep
+        # `a→b` weight w and drop `b→a` weight -w). On weight ties (w == 0),
+        # break by lex order of the (from, to) pair so we mark each cycle
+        # exactly once.
         for k, w in fwdEdges:
             let rev = (k[1], k[0])
             if rev notin fwdEdges: continue
             if fwdEdges[rev] + w != 0: continue
-            # k[0] != k[1] is guaranteed (no self-loop edges added).
-            dropAsEquality.incl(k)
-            dropAsEquality.incl(rev)
+            let revW = fwdEdges[rev]
+            let dropThis =
+                if w < revW: true
+                elif w > revW: false
+                else: k > rev
+            if dropThis:
+                dropAsEquality.incl(k)
 
     # Phase 2: Resolve 3-var candidates into edges.
     # For pattern A, determine which +1 var is start (source) vs duration (weight).
