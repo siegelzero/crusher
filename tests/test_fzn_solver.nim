@@ -4338,3 +4338,98 @@ solve satisfy;
     # x1 is 1 (3 descendants) and x4 is 4 (3 ancestors)
     check tr.sys.baseArray.domain[tr.varPositions["x1"]] == @[1]
     check tr.sys.baseArray.domain[tr.varPositions["x4"]] == @[4]
+
+  test "CPM survives equality 2-cycles in precedence graph":
+    # Regression for the unison failure mode: MZN flattens an equality
+    # `a = b + k` into TWO int_lin_le constraints, which CPM previously
+    # interpreted as a 2-cycle in the precedence graph (a→b with weight k
+    # AND b→a with weight -k). The topological sort then bailed and CPM
+    # tightened nothing for the entire model, even outside the cycle.
+    # Phase 1c drops these zero-sum 2-cycle pairs so the rest of the DAG
+    # still tightens.
+    let src = """
+var 1..30: a;
+var 1..30: b;
+var 1..30: c;
+array [1..2] of int: pos = [1,-1];
+array [1..2] of int: neg = [-1,1];
+% Equality a = b: emitted as both a-b<=0 and b-a<=0.
+constraint int_lin_le(pos, [a, b], 0);
+constraint int_lin_le(neg, [a, b], 0);
+% Real precedence c >= a + 5 (acyclic)
+constraint int_lin_le(neg, [c, a], -5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Despite the a/b 2-cycle, CPM should still lift `c`'s lower bound
+    # to 1 + 5 = 6 via the precedence on a.
+    let cPos = tr.varPositions["c"]
+    let cDom = tr.sys.baseArray.domain[cPos]
+    check cDom.len > 0
+    check cDom[0] >= 6
+
+suite "Element peephole":
+
+  test "all-equal const array → equality":
+    # array_int_element(idx, [7,7,7,7], y): every reachable slot is the same
+    # constant 7, so the element should reduce to y = 7. Index domain need
+    # not be touched (out-of-bounds values are inside the FZN-emitted bound).
+    let src = """
+var 1..4: idx;
+var 0..10: y :: output_var;
+array [1..4] of int: a = [7, 7, 7, 7];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.elementPeepholeCount == 1
+    # y is forced to 7
+    let yPos = tr.varPositions["y"]
+    check tr.sys.baseArray.domain[yPos] == @[7]
+
+  test "two distinct const values → element kept":
+    let src = """
+var 1..2: idx;
+var 0..10: y :: output_var;
+array [1..2] of int: a = [3, 5];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.elementPeepholeCount == 0
+
+  test "presolve-fixed singleton index → equality":
+    # When the index domain has been pruned to a singleton via int_eq,
+    # the element constraint reduces to y = a[idx_value-1].
+    let src = """
+var 1..3: idx;
+var 0..30: y :: output_var;
+array [1..3] of int: a = [11, 22, 33];
+constraint int_eq(idx, 2);
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.elementPeepholeCount == 1
+    let yPos = tr.varPositions["y"]
+    # After peephole + presolve, y is fixed to 22.
+    check tr.sys.baseArray.domain[yPos] == @[22]
+
+  test "all-equal var-array slots → equality":
+    # array_var_int_element where every reachable slot points to the same
+    # underlying variable. Folds to y = z (same position).
+    let src = """
+var 0..10: z;
+var 1..3: idx;
+var 0..10: y :: output_var;
+array [1..3] of var int: a = [z, z, z];
+constraint array_var_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.elementPeepholeCount == 1

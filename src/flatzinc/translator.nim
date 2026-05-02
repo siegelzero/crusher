@@ -605,6 +605,10 @@ type
         nTableToNotIn*: int
         # Counter for redundant NAND constraints skipped during translation
         nSkippedRedundantNand*: int
+        # Counter for element constraints replaced by plain equality via the
+        # all-equal-reachable-slot peephole (tryEqElementPeephole).
+        elementPeepholeCount*: int
+        elementPeepholeAttempts*: int
         # Stats for `reachableValuesPropagate`: domains tightened + total values removed
         reachableValuesTightened*: int
         reachableValuesRemoved*: int
@@ -1759,6 +1763,8 @@ proc translate*(model: FznModel): FznTranslator =
 
     nTranslated -= result.nSkippedTautological + result.nSkippedRedundantNand
     stderr.writeLine(&"[FZN] Constraint translation: {nSkippedDefining} skipped (defining), {nSkippedRedundant} skipped (redundant), {result.nSkippedTautological} skipped (tautological), {result.nSkippedRedundantNand} skipped (redundant NAND), {nTranslated} translated")
+    if result.elementPeepholeAttempts > 0:
+        stderr.writeLine(&"[FZN] Element peephole: {result.elementPeepholeCount}/{result.elementPeepholeAttempts} array_*_element → equality (single reachable value)")
     if result.nTableToNotIn > 0:
         stderr.writeLine(&"[FZN] Table complement conversion: {result.nTableToNotIn} tableIn → tableNotIn")
     if result.nBinaryLinFixings > 0:

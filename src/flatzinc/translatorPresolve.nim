@@ -314,6 +314,50 @@ proc simplifyConstraints(tr: FznTranslator,
                                         if presolveTightenDomain(domains, vn, @[1], infeasible):
                                             result = true
 
+                    # Two-var equality `c1*a + c2*b = rhs` with c1 = -c2 => a = b + k.
+                    # Intersect domains: dom(a) ∩= shift(dom(b), k) and vice versa.
+                    # General — applies to register-class equalities, slack-balance
+                    # equalities, etc., wherever MZN flattens `a = b` to a 2-term
+                    # int_lin_eq. Both vars must be present + have known domains.
+                    elif allFixed and nUnfixed == 2 and nArgs == 2:
+                        let c1 = con.args[0].elems[0].intVal
+                        let c2 = con.args[0].elems[1].intVal
+                        if c1 != 0 and c2 == -c1:
+                            let aExpr = con.args[1].elems[0]
+                            let bExpr = con.args[1].elems[1]
+                            let aName = presolveVarName(aExpr)
+                            let bName = presolveVarName(bExpr)
+                            # rhs already absorbed any fixed-var contributions
+                            # (none here since both unfixed). For c1*a + c2*b = rhs
+                            # with c2 = -c1, we get c1*(a - b) = rhs, i.e.,
+                            # a - b = rhs/c1, i.e., a = b + (rhs / c1).
+                            if aName != "" and bName != "" and aName != bName and
+                               aName in domains and bName in domains and
+                               rhs mod c1 == 0:
+                                let k = rhs div c1
+                                let aDom = domains[aName]
+                                let bDom = domains[bName]
+                                let bSet = bDom.toPackedSet()
+                                # New dom(a) = dom(a) ∩ {b + k : b in dom(b)}
+                                var newA: seq[int]
+                                for v in aDom:
+                                    if (v - k) in bSet:
+                                        newA.add(v)
+                                if newA.len < aDom.len:
+                                    if presolveTightenDomain(domains, aName, newA, infeasible):
+                                        result = true
+                                    if infeasible: break
+                                # New dom(b) = dom(b) ∩ {a - k : a in dom(a)}.
+                                # Recompute against the (possibly tightened) aSet.
+                                let aSet2 = (if newA.len > 0: newA else: aDom).toPackedSet()
+                                var newB: seq[int]
+                                for v in bDom:
+                                    if (v + k) in aSet2:
+                                        newB.add(v)
+                                if newB.len < bDom.len:
+                                    if presolveTightenDomain(domains, bName, newB, infeasible):
+                                        result = true
+
             # Handle parameter-referenced coefficient array for cardinality forcing
             elif con.args[0].kind == FznIdent and
                  (con.args[1].kind == FznArrayLit or con.args[1].kind == FznIdent) and
@@ -2420,6 +2464,40 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
     if candidates.len == 0: return false
 
+    # Phase 1c: Detect deterministic-equality 2-cycles and drop their edges.
+    # MZN flattens `int_lin_eq` into a pair of `int_lin_le`s, which become two
+    # constant edges with weights summing to zero (`a→b w` and `b→a -w`),
+    # encoding `b = a + w`. Treating these as precedence edges trips the
+    # topological sort (CPM bailed on the whole unison graph because of
+    # this). Dropping them keeps the rest of the precedence DAG intact —
+    # the equality itself is propagated by the `int_lin_eq` presolve pass
+    # (or its already-tight domains).
+    var dropAsEquality: HashSet[(string, string)]
+    block:
+        # Build a forward map keeping the MAX weight per (from, to) pair —
+        # multiple candidates may target the same edge, and max gives the
+        # tightest forward bound (this matches addEdge's merge rule).
+        var fwdEdges = initTable[(string, string), int]()
+        for cand in candidates:
+            if cand.durVar != "": continue
+            let key = (cand.fromVar, cand.toVar)
+            if key in fwdEdges:
+                fwdEdges[key] = max(fwdEdges[key], cand.constWeight)
+            else:
+                fwdEdges[key] = cand.constWeight
+        # Detect 2-cycles whose weights sum to zero (deterministic equality
+        # `b = a + k`). Mark both edges to be dropped from the precedence
+        # graph — they encode an equality that does not constrain the
+        # topological order. The equality itself is propagated by the
+        # int_lin_eq presolve pass.
+        for k, w in fwdEdges:
+            let rev = (k[1], k[0])
+            if rev notin fwdEdges: continue
+            if fwdEdges[rev] + w != 0: continue
+            # k[0] != k[1] is guaranteed (no self-loop edges added).
+            dropAsEquality.incl(k)
+            dropAsEquality.incl(rev)
+
     # Phase 2: Resolve 3-var candidates into edges.
     # For pattern A, determine which +1 var is start (source) vs duration (weight).
     # destVars contains all vars that appear with coeff=-1 somewhere — these are start vars.
@@ -2443,6 +2521,8 @@ proc cpmBoundsPropagate(tr: FznTranslator,
     var nEdges = 0
 
     proc addEdge(fromId, toId, minW, maxW: int) =
+        # Skip self-loops introduced by equality-class merging.
+        if fromId == toId: return
         while adjFwd.len <= max(fromId, toId):
             adjFwd.add(@[])
         # Merge parallel edges: keep tightest (max weight)
@@ -2456,7 +2536,10 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
     for cand in candidates:
         if cand.durVar == "":
-            # Constant weight edge
+            # Constant weight edge — skip if this edge is part of a detected
+            # 2-cycle equality (handled outside CPM).
+            if (cand.fromVar, cand.toVar) in dropAsEquality:
+                continue
             let fId = getId(cand.fromVar)
             let tId = getId(cand.toVar)
             addEdge(fId, tId, cand.constWeight, cand.constWeight)
@@ -2530,7 +2613,8 @@ proc cpmBoundsPropagate(tr: FznTranslator,
                 queue.add(e.toId)
 
     if topoOrder.len != n:
-        # Cycle detected — skip CPM
+        # Cycle detected — skip CPM. (Should be rare after Phase 1c drops the
+        # zero-sum 2-cycle equalities; longer SCCs would need full Tarjan.)
         return false
 
     # Phase 4: Forward pass — compute earliest start times
@@ -2568,7 +2652,7 @@ proc cpmBoundsPropagate(tr: FznTranslator,
             if newLS < ls[u]:
                 ls[u] = newLS
 
-    # Phase 6: Tighten domains
+    # Phase 6: Tighten domains.
     var nTightened = 0
     for i in 0..<n:
         let nm = idToName[i]
@@ -2840,35 +2924,61 @@ proc tablePropagate(tr: FznTranslator,
         if con.args.len < 2: continue
         let varsArg = con.args[0]
         let tableArg = con.args[1]
-        if varsArg.kind != FznArrayLit or tableArg.kind != FznArrayLit: continue
-        let arity = varsArg.elems.len
-        if arity < 2: continue
+
+        # Resolve variable column elements (inline array or named array decl).
+        var varElems: seq[FznExpr]
+        case varsArg.kind
+        of FznArrayLit:
+            varElems = varsArg.elems
+        of FznIdent:
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == varsArg.ident and
+                        decl.value != nil and decl.value.kind == FznArrayLit:
+                    varElems = decl.value.elems
+                    break
+        else:
+            discard
+        if varElems.len < 2: continue
+        let arity = varElems.len
 
         # Resolve variable names for all columns
         var varNames = newSeq[string](arity)
         var allValid = true
         for col in 0..<arity:
-            varNames[col] = presolveVarName(varsArg.elems[col])
+            varNames[col] = presolveVarName(varElems[col])
             if varNames[col] == "":
                 allValid = false
                 break
         if not allValid: continue
 
-        # Parse flat table into tuples
-        let flatElems = tableArg.elems
-        if flatElems.len mod arity != 0: continue
-        let nTuples = flatElems.len div arity
-        var tuples = newSeq[seq[int]](nTuples)
+        # Resolve the int-table parameter (inline FznArrayLit or named param array).
+        var tuples: seq[seq[int]]
         var parseOk = true
-        for i in 0..<nTuples:
-            tuples[i] = newSeq[int](arity)
-            for col in 0..<arity:
-                let elem = flatElems[i * arity + col]
-                if elem.kind != FznIntLit:
-                    parseOk = false
-                    break
-                tuples[i][col] = elem.intVal
-            if not parseOk: break
+        if tableArg.kind == FznArrayLit:
+            let flatElems = tableArg.elems
+            if flatElems.len mod arity != 0: continue
+            let nTuples = flatElems.len div arity
+            tuples = newSeq[seq[int]](nTuples)
+            for i in 0..<nTuples:
+                tuples[i] = newSeq[int](arity)
+                for col in 0..<arity:
+                    let elem = flatElems[i * arity + col]
+                    if elem.kind != FznIntLit:
+                        parseOk = false
+                        break
+                    tuples[i][col] = elem.intVal
+                if not parseOk: break
+        elif tableArg.kind == FznIdent and tableArg.ident in tr.arrayValues:
+            let flatVals = tr.arrayValues[tableArg.ident]
+            if flatVals.len mod arity != 0: continue
+            let nTuples = flatVals.len div arity
+            tuples = newSeq[seq[int]](nTuples)
+            for i in 0..<nTuples:
+                tuples[i] = newSeq[int](arity)
+                for col in 0..<arity:
+                    tuples[i][col] = flatVals[i * arity + col]
+        else:
+            continue
         if not parseOk: continue
 
         # Resolve fixed values and build domain sets for each column
@@ -2876,9 +2986,9 @@ proc tablePropagate(tr: FznTranslator,
         var fixedVal = newSeq[int](arity)
         var domSets = newSeq[PackedSet[int]](arity)
         for col in 0..<arity:
-            if tr.presolveIsFixed(varsArg.elems[col], fixedVars):
+            if tr.presolveIsFixed(varElems[col], fixedVars):
                 fixedCol[col] = true
-                fixedVal[col] = tr.presolveResolve(varsArg.elems[col], fixedVars)
+                fixedVal[col] = tr.presolveResolve(varElems[col], fixedVars)
             elif varNames[col] in domains:
                 domSets[col] = domains[varNames[col]].toPackedSet()
 
@@ -5284,6 +5394,15 @@ proc presolve*(tr: var FznTranslator) =
         inc totalIterations
         if not changed:
             break
+
+    # Re-run CPM after the fixpoint loop. The pre-loop call uses raw FZN
+    # domains; running CPM again here picks up tightenings from reif
+    # propagation (e.g. mandatory-op `a[o]=1 → c[o]≥0`), which can lift the
+    # forward-pass earliest-start values substantially. Cheap (O(V+E)) and
+    # only logs if it actually tightens.
+    if not infeasible:
+        if cpmBoundsPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            discard fixSingletons(domains, fixedVars)
 
     if infeasible:
         stderr.writeLine(&"[FZN] Presolve: infeasibility detected at iteration {totalIterations}")

@@ -715,6 +715,96 @@ proc getExprBounds(tr: var FznTranslator, arg: FznExpr): tuple[lo: int, hi: int,
     else:
         return (0, 0, false)
 
+proc tryEqElementPeephole*(tr: var FznTranslator, indexArg, arrayArg: FznExpr,
+                            valueExpr: AlgebraicExpression[int], isShifted: bool): bool =
+    ## Replace `array_*_element(idx, arr, val)` with a plain equality `val = arr[k]`
+    ## when the index domain restricts the reachable slots to a single distinct
+    ## element. Returns true if it emitted the equality (caller should skip the
+    ## element constraint).
+    ##
+    ## Two cases handled (both safe regardless of constraint kind):
+    ##   * idx domain is a singleton  → val = arr[idx_value - shift]
+    ##   * all reachable arr[i] are syntactically the same constant or variable
+    ##     position (e.g. MZN-flattened `if-then-else` where both branches pick
+    ##     the same temp).
+    ##
+    ## Also requires that every idx value falls inside the array bounds — we
+    ## refuse to drop the element constraint if a domain value would be
+    ## out-of-range, since the original element implicitly enforces that.
+    inc tr.elementPeepholeAttempts
+    if indexArg.kind == FznIntLit:
+        # Index is a fixed constant — element trivially picks one slot.
+        let v = indexArg.intVal
+        let shift = if isShifted: 1 else: 0
+        let arrIdx = v - shift
+        var elems: seq[ArrayElement[int]]
+        try:
+            elems = tr.resolveMixedArray(arrayArg)
+        except:
+            return false
+        if arrIdx < 0 or arrIdx >= elems.len:
+            return false
+        let chosen = elems[arrIdx]
+        if chosen.isConstant:
+            tr.sys.addConstraint(valueExpr == chosen.constantValue)
+        else:
+            tr.sys.addConstraint(valueExpr == tr.getExpr(chosen.variablePosition))
+        inc tr.elementPeepholeCount
+        return true
+
+    if indexArg.kind != FznIdent:
+        return false
+    if indexArg.ident notin tr.varPositions:
+        return false
+    let idxPos = tr.varPositions[indexArg.ident]
+    let idxDom = tr.sys.baseArray.domain[idxPos]
+    if idxDom.len == 0:
+        return false
+
+    # Resolve the array as mixed (constant or positioned-var) elements. Bail
+    # if anything is unresolvable — we'd rather emit the full element than
+    # silently miss an equality.
+    var elems: seq[ArrayElement[int]]
+    try:
+        elems = tr.resolveMixedArray(arrayArg)
+    except:
+        return false
+    if elems.len == 0:
+        return false
+
+    let shift = if isShifted: 1 else: 0
+    var firstSlot = -1
+    var allSame = true
+    for v in idxDom:
+        let arrIdx = v - shift
+        if arrIdx < 0 or arrIdx >= elems.len:
+            # Index value would index out-of-bounds; element constraint still
+            # carries useful information (forbidding this idx value), so skip.
+            return false
+        if firstSlot < 0:
+            firstSlot = arrIdx
+            continue
+        let a = elems[firstSlot]
+        let b = elems[arrIdx]
+        if a.isConstant != b.isConstant:
+            allSame = false; break
+        if a.isConstant:
+            if a.constantValue != b.constantValue:
+                allSame = false; break
+        else:
+            if a.variablePosition != b.variablePosition:
+                allSame = false; break
+    if not allSame:
+        return false
+
+    let chosen = elems[firstSlot]
+    if chosen.isConstant:
+        tr.sys.addConstraint(valueExpr == chosen.constantValue)
+    else:
+        tr.sys.addConstraint(valueExpr == tr.getExpr(chosen.variablePosition))
+    inc tr.elementPeepholeCount
+    return true
+
 proc isLinTautological(tr: var FznTranslator, coeffs: seq[int], varArrayArg: FznExpr, rhs: int): bool =
     ## Check if int_lin_le(coeffs, vars, rhs) is tautological by computing
     ## the maximum possible value of sum(coeffs*vars) from domain bounds.
@@ -1276,21 +1366,34 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # FlatZinc uses 1-based indexing, Crusher uses 0-based
         let indexExpr = tr.resolveExprArg(con.args[0])
         let valueExpr = tr.resolveExprArg(con.args[2])
+        let isShifted = stripSolverPrefix(con.name) == "array_int_element"
         let adjustedIndex = indexExpr - 1
-        # Use elementExpr since adjustedIndex is an expression (not a simple RefNode)
-        try:
-            let constArray = tr.resolveIntArray(con.args[1])
-            tr.sys.addConstraint(elementExpr(adjustedIndex, constArray, valueExpr))
-        except:
-            let arrayExprs = tr.resolveExprArray(con.args[1])
-            tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
+        # Peephole: if the index domain restricts the reachable array slots to a
+        # single distinct value, replace the element constraint with a plain
+        # equality. Saves a position + per-move element evaluation.
+        if not tr.tryEqElementPeephole(con.args[0], con.args[1], valueExpr, isShifted):
+            # Use elementExpr since adjustedIndex is an expression (not a simple RefNode)
+            try:
+                let constArray = tr.resolveIntArray(con.args[1])
+                tr.sys.addConstraint(elementExpr(adjustedIndex, constArray, valueExpr))
+            except:
+                let arrayExprs = tr.resolveExprArray(con.args[1])
+                tr.sys.addConstraint(elementExpr(adjustedIndex, arrayExprs, valueExpr))
 
     of "array_var_int_element", "array_var_int_element_nonshifted":
         # array_var_int_element(index, var_array, value)
         # FlatZinc uses 1-based indexing
         let indexExpr = tr.resolveExprArg(con.args[0])
         let valueExpr = tr.resolveExprArg(con.args[2])
+        let isShifted = stripSolverPrefix(con.name) == "array_var_int_element"
         let adjustedIndex = indexExpr - 1
+
+        # Peephole: if all reachable elements are syntactically equal, replace
+        # with a plain equality. Common when the index domain has been pruned
+        # to a singleton or when MZN compiles `if-then-else` with both branches
+        # picking the same temp/value.
+        if tr.tryEqElementPeephole(con.args[0], con.args[1], valueExpr, isShifted):
+            return
 
         # Try matrix element pattern: index is a simple RefNode and value is a simple RefNode
         var emitted = false
@@ -1334,6 +1437,8 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let indexExpr = tr.resolveExprArg(con.args[0])
         let valueExpr = tr.resolveExprArg(con.args[2])
         let adjustedIndex = indexExpr - 1
+        if tr.tryEqElementPeephole(con.args[0], con.args[1], valueExpr, isShifted = true):
+            return
         try:
             let constArray = tr.resolveIntArray(con.args[1])
             tr.sys.addConstraint(elementExpr(adjustedIndex, constArray, valueExpr))
@@ -1345,7 +1450,11 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # Same as array_var_int_element but with booleans (bools are 0/1 ints)
         let indexExpr = tr.resolveExprArg(con.args[0])
         let valueExpr = tr.resolveExprArg(con.args[2])
+        let isShifted = stripSolverPrefix(con.name) == "array_var_bool_element"
         let adjustedIndex = indexExpr - 1
+
+        if tr.tryEqElementPeephole(con.args[0], con.args[1], valueExpr, isShifted):
+            return
 
         var emitted = false
         if adjustedIndex.node.kind == RefNode and valueExpr.node.kind == RefNode and
