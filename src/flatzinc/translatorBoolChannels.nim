@@ -1930,9 +1930,9 @@ proc detectImplicationOrChannels*(tr: var FznTranslator) =
 
 proc detectImplicationAndChannels*(tr: var FznTranslator) =
     ## Detects boolean indicators forced up by one or more bool_clauses and
-    ## summed via a single bool2int into a count-style constraint. Channelizes
-    ## each indicator as the OR of each clause's force-AND, removing it from
-    ## the search positions.
+    ## summed via a single bool2int into an upper-bound count constraint.
+    ## Channelizes each indicator as the OR of each clause's force-AND,
+    ## removing it from the search positions.
     ##
     ## Pattern (per indicator b):
     ##   1. K ≥ 1 bool_clauses, each of the form
@@ -1942,17 +1942,27 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     ##   2. b appears as a positive literal in EVERY clause it's part of, and
     ##      never as a negative literal anywhere.
     ##   3. bool2int(b, c)                                — c sums into a count
-    ##   4. c appears in exactly one int_lin_eq or int_lin_le where the
-    ##      coefficient on c is +1 (so the sum is monotone-non-decreasing in c).
-    ##      For ≥-direction sums we'd over-constrain — those are rejected.
-    ##   5. b has no other constraint references.
+    ##   4. c appears in exactly one int_lin_le where the coefficient on c is
+    ##      +1 (so the sum is monotone-non-decreasing in c — increasing c can
+    ##      only tighten an upper bound, never enable a previously-infeasible
+    ##      solution). int_lin_eq is rejected: with `Σ b = K` the original
+    ##      may legitimately set some b > LHS to reach K when Σ LHS < K, and
+    ##      forcing b = LHS would lose those feasible solutions. ≥-style sums
+    ##      (coef = -1 on c) are rejected for the same reason.
+    ##   5. b has no other constraint references besides those K clauses + the
+    ##      bool2int.
+    ##   6. c has no other constraint references besides the bool2int + the
+    ##      single int_lin_le. Without this, the rewrite would silently change
+    ##      c's value (via the bool2int channel chain) and could violate other
+    ##      constraints involving c.
     ##
     ## When detected, b is rewritten as b = OR over k of (clause_k's force AND).
-    ## In any feasible solution of the original model, b takes the value forced
-    ## by its implications (else either an implication or the count is
-    ## violated), so the rewrite preserves all feasible solutions and improves
-    ## local-search gradients by tying b's value directly to its forcing
-    ## literals instead of leaving it as a free search position.
+    ## Soundness: every feasible original solution maps to a rewrite-feasible
+    ## solution by setting b = LHS_eff (the OR of all clause-LHSs). The
+    ## implications enforce b ≥ LHS_eff already; the only freedom in the
+    ## original is to set b above LHS_eff, which strictly increases c, which
+    ## can only push the int_lin_le sum closer to its upper bound (never
+    ## creating new feasibility). So no original solutions are lost.
     ##
     ## This is a strict generalization of detectBoolAndChannels (which only
     ## fires for K=1, m=1 with all N_i pre-channeled) and complements
@@ -1960,9 +1970,12 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     ## clauses of the form [N_i, B], []).
     ##
     ## Originally motivated by HRC (MZN Challenge 2019/hrc): single_bp's are
-    ## K=1 forcers (≈250) and coup_bp's are K=2 forcers (≈100). Without this
-    ## rewrite they remain free search positions, severing the gradient
-    ## between the pos vars and the bp-count constraint.
+    ## K=1 forcers and coup_bp's are K=2 forcers. Without this rewrite they
+    ## remain free search positions, severing the gradient between the pos
+    ## vars and the bp-count constraint. (HRC's specific top-level constraint
+    ## is `Σ bp = num_bp` which after num_bp's defining-constraint demotion
+    ## leaves an int_lin_le if num_bp has been bounded; otherwise this
+    ## detector defers to the standard translation path.)
     ##
     ## Must run after detectReifChannels and the standard bool channel
     ## detectors so already-claimed variables (channelVarNames, definedVarNames,
@@ -2008,12 +2021,12 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
         bool2intByB.mgetOrPut(con.args[0].ident, @[]).add(
             Bool2IntEntry(ci: ci, cName: con.args[1].ident))
 
-    # Step 3: index, for each c-name, which int_lin_{eq,le} constraints reference
+    # Step 3: index, for each c-name, which int_lin_le constraints reference
     # it and at what coefficient. (We accept arrays inlined as FznArrayLit and
-    # arrays referenced by name via arrayValues.)
+    # arrays referenced by name via arrayValues.) int_lin_eq is intentionally
+    # NOT accepted — see docstring for soundness rationale.
     type LinEntry = object
         ci: int
-        op: string         # "int_lin_eq" or "int_lin_le"
         coef: int          # coefficient on this c in the sum
     var linByC = initTable[string, seq[LinEntry]]()
 
@@ -2048,7 +2061,7 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     for ci, con in tr.model.constraints:
         if ci in tr.definingConstraints: continue
         let nm = stripSolverPrefix(con.name)
-        if nm != "int_lin_eq" and nm != "int_lin_le": continue
+        if nm != "int_lin_le": continue
         if con.args.len < 3: continue
         let coefs = resolveCoefArray(tr, con.args[0])
         if coefs.len == 0: continue
@@ -2066,16 +2079,17 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
         if varNames.len != coefs.len: continue
         for k, name in varNames:
             if name.len == 0: continue
-            linByC.mgetOrPut(name, @[]).add(LinEntry(ci: ci, op: nm, coef: coefs[k]))
+            linByC.mgetOrPut(name, @[]).add(LinEntry(ci: ci, coef: coefs[k]))
 
-    # Helpers for "this var has no other constraint usage we'd be breaking".
-    # We've indexed the clause + bool2int + lin uses already. To be conservative,
-    # we also scan once for "any other reference to b" and reject if found.
+    # Helper: count references to `name` outside a set of constraint indices
+    # we expect to consume. Defining constraints are skipped (they're already
+    # claimed by another translator pass and won't enforce the original
+    # relation). Used for both the "no other refs to b" and "no other refs to
+    # c" checks below.
     proc countOtherRefs(tr: FznTranslator, name: string,
-                        skipBoolClauseCi, skipBool2intCi: int): int =
-        # Count constraint occurrences of name outside the two we already know.
+                        skipCis: HashSet[int]): int =
         for ci, con in tr.model.constraints:
-            if ci == skipBoolClauseCi or ci == skipBool2intCi: continue
+            if ci in skipCis: continue
             if ci in tr.definingConstraints: continue
             for arg in con.args:
                 case arg.kind
@@ -2089,18 +2103,36 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     var nDetected = 0
     var nRejectedDegree = 0
     var nRejectedSum = 0
+    var nRejectedCRef = 0
     var nRejectedDomain = 0
     var clausesUsedAsDef = initHashSet[int]()  # at most one positive per clause
+
+    # Iterate candidate b's in declaration order (using varDomainIndex which is
+    # populated by lookupVarDomain) so detection results are deterministic
+    # across runs. Without sorting, Table.pairs iteration order depends on
+    # hash bucketing and changes which candidate "wins" any clause contention.
+    discard tr.lookupVarDomain("")  # ensure varDomainIndex is built
+    var candidateNames: seq[string]
+    for n in clauseOccurrences.keys: candidateNames.add(n)
+    let varDomainIndex = tr.varDomainIndex  # local copy so the sort closure
+                                            # doesn't capture `var FznTranslator`
+    candidateNames.sort(proc(a, b: string): int =
+        let ai = if a in varDomainIndex: varDomainIndex[a] else: int.high
+        let bi = if b in varDomainIndex: varDomainIndex[b] else: int.high
+        if ai != bi: return cmp(ai, bi)
+        return cmp(a, b))
 
     # Step 4: scan candidates. A candidate b is a bool var that:
     #   - is not already a channel/defined var
     #   - appears in K ≥ 1 bool_clauses, ALL as positive literals (no negatives)
     #   - has exactly 1 bool2int(b, c) entry
-    #   - c has exactly 1 int_lin_{eq,le} entry, with coef = +1
-    #     We reject coef[c] = -1 (≥-style) to preserve feasibility.
+    #   - c has exactly 1 int_lin_le entry, with coef = +1
+    #     int_lin_eq and coef[c] = -1 (≥-style) are both rejected — see docstring.
     #   - has no OTHER constraint references besides the bool_clauses + bool2int
+    #   - c has no OTHER constraint references besides the bool2int + int_lin_le
     var nMultiClauseDetected = 0
-    for bName, occs in clauseOccurrences.pairs:
+    for bName in candidateNames:
+        let occs = clauseOccurrences[bName]
         if occs.len < 1: continue
         # All occurrences must be positive (b can't appear as a negative literal
         # anywhere, else the rewrite changes b's polarity in some clause).
@@ -2148,28 +2180,24 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
             nRejectedSum += 1
             continue
 
-        # No other constraint references to b. countOtherRefs accepts a single
-        # skipBoolClauseCi — extend to a set of K clause CIs.
-        proc countOtherRefsMulti(tr: FznTranslator, name: string,
-                                 skipClauseCis: HashSet[int],
-                                 skipBool2intCi: int): int =
-            for ci, con in tr.model.constraints:
-                if ci in skipClauseCis or ci == skipBool2intCi: continue
-                if ci in tr.definingConstraints: continue
-                for arg in con.args:
-                    case arg.kind
-                    of FznIdent:
-                        if arg.ident == name: result += 1
-                    of FznArrayLit:
-                        for e in arg.elems:
-                            if e.kind == FznIdent and e.ident == name: result += 1
-                    else: discard
-
+        # No other constraint references to b. b's expected usages are the K
+        # bool_clauses + the single bool2int.
         var skipCis = initHashSet[int]()
         for o in occs: skipCis.incl(o.ci)
-        let other = countOtherRefsMulti(tr, bName, skipCis, bool2intCi)
-        if other > 0:
+        skipCis.incl(bool2intCi)
+        if countOtherRefs(tr, bName, skipCis) > 0:
             nRejectedDegree += 1
+            continue
+
+        # No other constraint references to c. c's expected usages are the
+        # bool2int + the single int_lin_le. Without this check, the rewrite
+        # would silently change c via the bool2int channel chain and could
+        # break unrelated constraints involving c (e.g., int_ne(c, 0)).
+        var cSkipCis = initHashSet[int]()
+        cSkipCis.incl(bool2intCi)
+        cSkipCis.incl(lin.ci)
+        if countOtherRefs(tr, cName, cSkipCis) > 0:
+            nRejectedCRef += 1
             continue
 
         # For each forcing clause, extract its other positives + negatives.
@@ -2215,8 +2243,8 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
         nDetected += 1
         if clauseDefs.len > 1: nMultiClauseDetected += 1
 
-    if nDetected > 0 or nRejectedDegree > 0 or nRejectedSum > 0:
+    if nDetected > 0 or nRejectedDegree > 0 or nRejectedSum > 0 or nRejectedCRef > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} implication-AND channel candidates " &
                          &"({nMultiClauseDetected} multi-clause OR-of-AND; rejected " &
                          &"{nRejectedDegree} degree, {nRejectedSum} sum-shape, " &
-                         &"{nRejectedDomain} non-binary)")
+                         &"{nRejectedCRef} c-reused, {nRejectedDomain} non-binary)")
