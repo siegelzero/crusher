@@ -2668,6 +2668,68 @@ proc translate*(model: FznModel): FznTranslator =
                             result.sys.baseArray.channelsAtPosition[pos].add(bi)
             stderr.writeLine(&"[FZN] Deduplicated {dedupCount} element channel bindings ({kept.len} remaining)")
 
+    # Enforce declared variable bounds on element-channel result positions when
+    # the constant array can produce values outside the result's declared domain.
+    # Common pattern: MZN models use sentinel values (-1, INFINITY) in lookup arrays
+    # to encode infeasible (input → output) tuples, then gate them via a `result >= 0`
+    # constraint that the FZN compiler folds into the variable's declared domain.
+    # The element channel binding alone produces these sentinel values without a
+    # penalty signal, so the search drifts to infeasible cells. We add an explicit
+    # bounds constraint on the channel position so the relational penalty grows
+    # with the distance from the declared domain.
+    #
+    # We use the *original* FZN-declared bounds (not the post-presolve domain),
+    # because presolve may narrow a channel's domain to a singleton. A bound
+    # constraint against that singleton would conflict with case-analysis lookup
+    # tables whose unreachable cells carry placeholder values inside the FZN
+    # domain but outside the post-presolve singleton.
+    block:
+        var fznDeclLo: Table[int, int]
+        var fznDeclHi: Table[int, int]
+        for decl in result.model.variables:
+            if decl.isArray: continue
+            if decl.name notin result.varPositions: continue
+            if decl.varType.kind != FznIntRange: continue
+            let pos = result.varPositions[decl.name]
+            fznDeclLo[pos] = decl.varType.lo
+            fznDeclHi[pos] = decl.varType.hi
+
+        var nEmittedLo = 0
+        var nEmittedHi = 0
+        var nNaturallyInDomain = 0
+        for binding in result.sys.baseArray.channelBindings:
+            let chPos = binding.channelPosition
+            if chPos notin fznDeclLo: continue
+            let lo = fznDeclLo[chPos]
+            let hi = fznDeclHi[chPos]
+
+            # Only handle constant-array bindings. Variable arrays would need to
+            # bound by the union of input element domains, which are tracked on
+            # the array element positions themselves.
+            var allConst = true
+            var arrMin = high(int)
+            var arrMax = low(int)
+            for elem in binding.arrayElements:
+                if not elem.isConstant:
+                    allConst = false
+                    break
+                if elem.constantValue < arrMin: arrMin = elem.constantValue
+                if elem.constantValue > arrMax: arrMax = elem.constantValue
+            if not allConst: continue
+            if arrMin >= lo and arrMax <= hi:
+                inc nNaturallyInDomain
+                continue
+
+            let expr = result.sys.baseArray[chPos]
+            if arrMin < lo:
+                result.sys.addConstraint(expr >= lo)
+                inc nEmittedLo
+            if arrMax > hi:
+                result.sys.addConstraint(expr <= hi)
+                inc nEmittedHi
+        if nEmittedLo + nEmittedHi > 0:
+            stderr.writeLine(&"[FZN] Channel bound enforcement: {nEmittedLo} lower + {nEmittedHi} upper bounds added on element channels with sentinel values ({nNaturallyInDomain} naturally in domain)")
+
     result.translateSolve()
 
     # Tighten objective lower bound: if objective is max(diff_i) where each diff_i = max(counts) - min(counts),

@@ -13,6 +13,7 @@ import test_implication_and_channels
 import test_boolean_constraints
 import test_canonicalize_linear_reifs
 import test_channel_dependencies
+import test_channel_result_bounds
 import test_channel_substitution
 import test_circuit
 import test_circuit_time_prop
