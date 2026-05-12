@@ -7,7 +7,7 @@
 ## binding silently writes the sentinel into the channel value with no penalty.
 
 import unittest
-import std/[tables, sequtils, packedsets]
+import std/[tables, packedsets]
 import crusher
 import flatzinc/[parser, translator]
 import constraints/[types, constraintNode]
@@ -116,13 +116,12 @@ solve minimize R;
                     inc nBoundsOnR
         check nBoundsOnR == 0
 
-    test "no bound on bool channel when presolve narrows post-FZN domain":
-        ## Bool channel `b` with declared domain bool (0..1). After int_eq(x, 2)
-        ## fixes x, presolve may narrow b's domain to a singleton {1}, but the
-        ## reification array is [0, 1, 0] and the channel correctly produces 1.
-        ## Using FZN-declared bounds (not post-presolve), we must NOT emit
-        ## `b >= 1` or `b <= 1` — that would conflict with case-analysis
-        ## lookup tables whose unreachable cells carry placeholder values.
+    test "bool channel result with reification array stays unbounded (naturally in domain)":
+        ## Bool channel `b` declared `var bool` → FZN-declared bounds [0, 1].
+        ## The reification array `int_eq_reif(x, 2, b)` for x ∈ 1..3 is [0, 1, 0],
+        ## entirely within [0, 1]. The pass should hit the "naturally in domain"
+        ## branch and emit nothing — bool channels with proper {0, 1} arrays
+        ## carry no sentinels.
         let src = """
 var 1..3: x :: output_var;
 var bool: b :: var_is_introduced :: is_defined_var;
@@ -144,3 +143,62 @@ solve satisfy;
                     if bPos in rs.positions:
                         inc nBoundsOnB
             check nBoundsOnB == 0
+
+    test "case-analysis lookup table with post-presolve singleton emits no spurious bound":
+        ## Exercises the FZN-declared-vs-post-presolve guard. R is declared
+        ## `var 0..100`, but `int_eq(R, 7)` lets presolve narrow R's domain
+        ## to {7}. The lookup table `[5, 7, 10]` has values inside the FZN
+        ## domain (0..100) but two of them (5, 10) outside the post-presolve
+        ## singleton. The pass MUST use FZN-declared bounds and emit nothing:
+        ## the array is naturally in [0..100], even though it strays outside
+        ## {7}. Emitting against the post-presolve singleton would falsely
+        ## penalise reachable cells in models where presolve only tightens
+        ## one branch of a case analysis.
+        let src = """
+var 1..3: idx :: output_var;
+var 0..100: R :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of int: arr = [5, 7, 10];
+constraint array_int_element(idx, arr, R) :: defines_var(R);
+constraint int_eq(R, 7);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+
+        check "R" in tr.varPositions
+        let rPos = tr.varPositions["R"]
+        var nBoundsOnR = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            let rs = c.relationalState
+            if rs.relation in {GreaterThanEq, LessThanEq}:
+                if rPos in rs.positions:
+                    inc nBoundsOnR
+        check nBoundsOnR == 0
+
+    test "FznIntSet declared variable picks up min/max bounds":
+        ## Variable declared with enumerated set `var {0, 5, 10}` → bounds
+        ## [0, 10]. Array `[-1, 5, -1]` has -1 outside [0, 10], so a lower
+        ## bound `R >= 0` should be emitted. (This previously fell through
+        ## the `FznIntRange`-only filter and emitted nothing.)
+        let src = """
+var 1..3: idx :: output_var;
+var {0, 5, 10}: R :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of int: arr = [-1, 5, -1];
+constraint array_int_element(idx, arr, R) :: defines_var(R);
+solve minimize R;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+
+        check "R" in tr.varPositions
+        let rPos = tr.varPositions["R"]
+        var foundLowerBound = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            let rs = c.relationalState
+            if rs.relation != GreaterThanEq: continue
+            if rPos in rs.positions:
+                foundLowerBound = true
+                break
+        check foundLowerBound

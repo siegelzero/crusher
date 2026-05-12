@@ -2683,16 +2683,35 @@ proc translate*(model: FznModel): FznTranslator =
     # constraint against that singleton would conflict with case-analysis lookup
     # tables whose unreachable cells carry placeholder values inside the FZN
     # domain but outside the post-presolve singleton.
+    #
+    # Scope: applies only to element channelBindings. Other channel kinds
+    # (min/max, count_eq, argmax, expression) derive their result from input
+    # variable domains, so the sentinel-array problem doesn't arise.
     block:
         var fznDeclLo: Table[int, int]
         var fznDeclHi: Table[int, int]
         for decl in result.model.variables:
             if decl.isArray: continue
             if decl.name notin result.varPositions: continue
-            if decl.varType.kind != FznIntRange: continue
             let pos = result.varPositions[decl.name]
-            fznDeclLo[pos] = decl.varType.lo
-            fznDeclHi[pos] = decl.varType.hi
+            case decl.varType.kind
+            of FznIntRange:
+                fznDeclLo[pos] = decl.varType.lo
+                fznDeclHi[pos] = decl.varType.hi
+            of FznIntSet:
+                if decl.varType.values.len == 0: continue
+                var lo = high(int)
+                var hi = low(int)
+                for v in decl.varType.values:
+                    if v < lo: lo = v
+                    if v > hi: hi = v
+                fznDeclLo[pos] = lo
+                fznDeclHi[pos] = hi
+            of FznBool:
+                fznDeclLo[pos] = 0
+                fznDeclHi[pos] = 1
+            else:
+                discard
 
         var nEmittedLo = 0
         var nEmittedHi = 0
@@ -2706,6 +2725,7 @@ proc translate*(model: FznModel): FznTranslator =
             # Only handle constant-array bindings. Variable arrays would need to
             # bound by the union of input element domains, which are tracked on
             # the array element positions themselves.
+            if binding.arrayElements.len == 0: continue
             var allConst = true
             var arrMin = high(int)
             var arrMax = low(int)
