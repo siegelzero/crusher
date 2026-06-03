@@ -3,13 +3,14 @@
 ##
 ## Usage: fzcrusher [options] <file.fzn>
 ##   -a            all solutions (not yet implemented; prints first)
+##   -f            free search (Crusher ignores search annotations; accepted as a no-op)
+##   -i            print intermediate (improving) solutions during optimization
 ##   -p <N>        number of parallel workers (0 = auto)
 ##   -v            verbose output
 ##   -s            print statistics
 ##   -t <ms>       time limit in milliseconds (MiniZinc standard flag)
 ##   --time-limit <ms>  alias for -t
 ##   --tabu <N>    tabu threshold (default 10000)
-##   -f            fast mode (lower tabu threshold)
 
 import std/[os, strutils, strformat, times, posix]
 
@@ -56,6 +57,7 @@ proc main() =
   var tabuThreshold = 10000
   var numWorkers = 0
   var allSolutions = false
+  var streamSolutions = false
   var timeLimitMs = 0
 
   # Parse command line arguments
@@ -65,6 +67,12 @@ proc main() =
     case arg
     of "-a":
       allSolutions = true
+    of "-f":
+      # Free search: Crusher is a local-search solver and ignores the model's
+      # search annotations, so free search is its native mode. Accept as a no-op.
+      discard
+    of "-i":
+      streamSolutions = true
     of "-p":
       inc i
       if i <= paramCount():
@@ -81,8 +89,6 @@ proc main() =
       inc i
       if i <= paramCount():
         tabuThreshold = parseInt(paramStr(i))
-    of "-f":
-      tabuThreshold = 1000
     else:
       if arg.startsWith("-"):
         stderr.writeLine(&"Unknown option: {arg}")
@@ -94,13 +100,14 @@ proc main() =
     stderr.writeLine("Usage: fzcrusher [options] <file.fzn>")
     stderr.writeLine("Options:")
     stderr.writeLine("  -a              all solutions")
+    stderr.writeLine("  -f              free search (no-op; Crusher ignores search annotations)")
+    stderr.writeLine("  -i              print intermediate solutions during optimization")
     stderr.writeLine("  -p <N>          parallel workers (0=auto)")
     stderr.writeLine("  -v              verbose")
     stderr.writeLine("  -s              statistics")
     stderr.writeLine("  -t <ms>         time limit in milliseconds")
     stderr.writeLine("  --time-limit <ms>  alias for -t")
     stderr.writeLine("  --tabu <N>      tabu threshold (default 10000)")
-    stderr.writeLine("  -f              fast mode")
     quit(1)
 
   if not fileExists(filename):
@@ -110,19 +117,39 @@ proc main() =
   let startTime = cpuTime()
   let wallStart = epochTime()
 
-  # Parse the FlatZinc file
-  if verbose:
-    stderr.writeLine(&"[FZN] Parsing {filename}...")
-  let model = parseFznFile(filename)
-  if verbose:
-    stderr.writeLine(&"[FZN] Parsed: {model.variables.len} variables, {model.parameters.len} parameters, {model.constraints.len} constraints")
+  # Parse and translate. Any failure here (e.g. an unsupported FlatZinc
+  # construct such as a float literal) must degrade to UNKNOWN rather than
+  # crash with a stack trace — every challenge instance must yield valid output.
+  var model: FznModel
+  var tr: FznTranslator
+  try:
+    if verbose:
+      stderr.writeLine(&"[FZN] Parsing {filename}...")
+    model = parseFznFile(filename)
+    if verbose:
+      stderr.writeLine(&"[FZN] Parsed: {model.variables.len} variables, {model.parameters.len} parameters, {model.constraints.len} constraints")
 
-  # Translate to ConstraintSystem
-  if verbose:
-    stderr.writeLine("[FZN] Translating...")
-  var tr = translate(model)
-  if verbose:
-    stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
+    # Translate to ConstraintSystem
+    if verbose:
+      stderr.writeLine("[FZN] Translating...")
+    tr = translate(model)
+    if verbose:
+      stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
+  except CatchableError as e:
+    stderr.writeLine(&"[FZN] Parse/translate failed: {e.msg}")
+    printUnknown()
+    flushFile(stdout)
+    immediateExit(0)
+
+  # If translation dropped any constraint Crusher cannot enforce natively, a
+  # found assignment may violate the model. Report UNKNOWN instead of emitting
+  # an invalid solution.
+  if tr.unsupportedConstraints.len > 0:
+    stderr.writeLine(&"[FZN] {tr.unsupportedConstraints.len} unsupported constraint(s) " &
+      "could not be enforced; reporting UNKNOWN: " & tr.unsupportedConstraints.join(", "))
+    printUnknown()
+    flushFile(stdout)
+    immediateExit(0)
 
   # MiniZinc's --time-limit includes its own compilation time (before we start).
   # Anchor to process start and subtract a small margin. If our deadline doesn't
@@ -140,6 +167,23 @@ proc main() =
   signal(SIGTERM, sigTermHandler)
   signal(SIGINT, sigTermHandler)
   signal(SIGPIPE, SIG_IGN)  # Ignore broken pipe (MiniZinc may close stdout early)
+
+  # Intermediate-solution streaming (`-i`). During solving, stdout is redirected to
+  # stderr, so we write each improving solution directly to the *real* stdout (savedFd)
+  # via a raw write — no buffering, no interference with the redirected solver output.
+  # Streaming is disabled for geost-converted models because their board values are only
+  # reconstructed in the final output path (formatSolution alone would be incomplete);
+  # the final print / SIGTERM handler still emits a correct solution for those.
+  let canStream = streamSolutions and tr.geostConversion.tileValues.len == 0
+  var lastStreamedAssignment: seq[int] = @[]
+  proc streamSolution(assignment: seq[int]) =
+    tr.sys.assignment = assignment
+    let s = tr.formatSolution() & "\n----------\n"
+    if savedFd >= 0 and s.len > 0:
+      discard posix.write(savedFd, cast[pointer](s.cstring), s.len)
+      lastStreamedAssignment = assignment
+  let onSol: proc(assignment: seq[int]) {.closure.} =
+    if canStream: streamSolution else: nil
 
   # Solve
   let solveStart = cpuTime()
@@ -172,7 +216,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       elif tr.objectivePos == ObjPosBinaryPairwiseSum:
         minimize(tr.sys, tr.binaryPairwiseSumExpr,
@@ -182,7 +227,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       else:
         let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
@@ -195,7 +241,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       solved = true
     except TimeLimitExceededError:
@@ -221,7 +268,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       elif tr.objectivePos == ObjPosBinaryPairwiseSum:
         maximize(tr.sys, tr.binaryPairwiseSumExpr,
@@ -231,7 +279,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       else:
         let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
@@ -244,7 +293,8 @@ proc main() =
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
-          upperBound = tr.objectiveHiBound
+          upperBound = tr.objectiveHiBound,
+          onSolution = onSol
         )
       solved = true
     except TimeLimitExceededError:
@@ -284,7 +334,12 @@ proc main() =
         for cellIdx in gc.allPlacements[t][placementIdx]:
           tr.sys.assignment[gc.boardPositions[cellIdx]] = gc.tileValues[t]
 
-    tr.printSolution()
+    # Print the final solution, unless `-i` already streamed this exact assignment
+    # (avoid a redundant trailing duplicate block). Streaming never fires for geost
+    # models, so those always print here.
+    if not (canStream and lastStreamedAssignment.len > 0 and
+            tr.sys.assignment == lastStreamedAssignment):
+      tr.printSolution()
     if tr.sys.optimalityProven:
       printComplete()  # Domain reduction proved no better solution exists
   else:

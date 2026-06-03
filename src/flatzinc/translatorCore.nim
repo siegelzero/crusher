@@ -3000,8 +3000,11 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             (if allUnit: "count" else: "weighted count") & " channels")
 
     else:
-        # Unknown constraint - warn and skip
+        # Unknown constraint: Crusher has no native handler. Record it so the FZN
+        # driver reports UNKNOWN — silently dropping it would let the solver emit
+        # an assignment that violates this constraint (an invalid "solution").
         stderr.writeLine(&"[FZN] Warning: unsupported constraint '{con.name}' (normalized: '{name}'), skipping")
+        tr.unsupportedConstraints.add(con.name)
 
 proc translateSolve(tr: var FznTranslator) =
     ## Handles the solve directive.

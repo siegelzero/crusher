@@ -662,6 +662,11 @@ type
             consumedReifCIs: seq[int],
             consumedBool2intCIs: seq[int],
             consumedVarNames: seq[string]]]  # intermediate vars to suppress
+        # Unsupported constraints encountered during translation that were
+        # silently dropped (no native handler). If non-empty, Crusher cannot
+        # guarantee the solution satisfies the full model, so the FZN driver
+        # must report UNKNOWN rather than emit a possibly-invalid assignment.
+        unsupportedConstraints*: seq[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]

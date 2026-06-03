@@ -54,7 +54,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                       lowerBound=low(int),
                       upperBound=high(int),
                       deadline: float = 0.0,
+                      onSolution: proc(assignment: seq[T]) {.closure.} = nil,
                       ) =
+        # onSolution, if supplied, is invoked on the main thread immediately after
+        # each new incumbent is stored (initial + every improvement). It is used to
+        # stream intermediate FlatZinc solutions for the MiniZinc Challenge `-i` mode.
         # Compute effective population size: 0 means auto-detect (2 * worker threads)
         let effectivePopSize = when compileOption("threads"):
             if populationSize > 0: populationSize
@@ -82,6 +86,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         system.bestAssignmentValid = false
         system.bestFeasibleAssignment = system.assignment
         system.bestAssignmentValid = true
+        if onSolution != nil: onSolution(system.bestFeasibleAssignment)
 
         # Detect "low iteration rate" workloads. When the per-move cost is so
         # high that tabu only manages a few iterations per second (typically
@@ -265,6 +270,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.bestAssignmentValid = false
                 system.bestFeasibleAssignment = system.assignment
                 system.bestAssignmentValid = true
+                if onSolution != nil: onSolution(system.bestFeasibleAssignment)
                 echo "[Opt] Improved: ", objective.value
                 flushFile(stdout)
                 if verbose:
@@ -400,6 +406,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.bestAssignmentValid = false
                     system.bestFeasibleAssignment = system.assignment
                     system.bestAssignmentValid = true
+                    if onSolution != nil: onSolution(system.bestFeasibleAssignment)
                     echo "[Opt] Retry improved: ", currentCost
                     flushFile(stdout)
                     retryThreshold = tabuThreshold  # reset on success
@@ -472,6 +479,7 @@ template algebraicWrapper(procName: untyped) =
                       lowerBound=low(int),
                       upperBound=high(int),
                       deadline: float = 0.0,
+                      onSolution: proc(assignment: seq[T]) {.closure.} = nil,
                       ) =
         if objective.linear:
             # Automatically linearize for O(1) incremental updates
@@ -481,7 +489,7 @@ template algebraicWrapper(procName: untyped) =
                     populationSize=populationSize, numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy, verbose=verbose,
                     lowerBound=lowerBound, upperBound=upperBound,
-                    deadline=deadline)
+                    deadline=deadline, onSolution=onSolution)
         else:
             let statefulObjective = newStatefulAlgebraicExpression(objective)
             procName(system, statefulObjective, parallel=parallel, tabuThreshold=tabuThreshold,
@@ -489,7 +497,7 @@ template algebraicWrapper(procName: untyped) =
                     populationSize=populationSize, numWorkers=numWorkers,
                     scatterStrategy=scatterStrategy, verbose=verbose,
                     lowerBound=lowerBound, upperBound=upperBound,
-                    deadline=deadline)
+                    deadline=deadline, onSolution=onSolution)
 
 # Generate AlgebraicExpression wrappers
 algebraicWrapper(minimize)
