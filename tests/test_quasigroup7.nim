@@ -55,16 +55,13 @@ proc validateQuasigroup7(matrix: seq[seq[int]], n: int): bool =
 suite "Quasigroup7 Tests":
 
     test "quasigroup7 n=5 via FlatZinc pipeline":
-        # Compile with MiniZinc
-        let fznPath = "/tmp/qg7_test_5.fzn"
-        let mznPath = "tests/data/quasigroup7/quasigroup7.mzn"
-        let solverPath = os.getCurrentDir() / "minizinc"
-
-        let cmd = "MZN_SOLVER_PATH=" & solverPath &
-                  " minizinc --compile --solver crusher" &
-                  " -D \"n=5\" " & mznPath & " -o " & fznPath & " 2>/dev/null"
-        let exitCode = execShellCmd(cmd)
-        check exitCode == 0
+        # Use a pre-compiled FlatZinc fixture so `make test` does not require the
+        # minizinc CLI. Regenerate with:
+        #   MZN_SOLVER_PATH="$(pwd)/minizinc" minizinc --compile --solver crusher \
+        #     -D "n=5" tests/data/quasigroup7/quasigroup7.mzn \
+        #     -o tests/data/quasigroup7/quasigroup7_n5.fzn
+        let fznPath = "tests/data/quasigroup7/quasigroup7_n5.fzn"
+        check fileExists(fznPath)
 
         # Parse and translate
         let model = parseFznFile(fznPath)

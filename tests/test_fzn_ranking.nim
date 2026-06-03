@@ -7,7 +7,7 @@
 ##   - emitRankingPairConstraints (Phase 4)
 
 import unittest
-import std/[tables, sets, strutils, osproc]
+import std/[tables, sets, strutils, os]
 import crusher
 import flatzinc/[parser, translator, output]
 import constraints/types
@@ -188,19 +188,14 @@ solve satisfy;
 # tests check downstream invariants (chain emitted, decomposition consumed,
 # output rules built) rather than exact constraint counts.
 
-const BenchModelMzn = "minizinc_challenge/2020/soccer-computational/ecp.mzn"
-
-proc compileEcp(dzn: string): string =
-    ## Compiles an ECP instance to FZN via minizinc and returns the FZN text.
-    let outPath = "/tmp/test_fzn_ranking_" & dzn.split('/')[^1].replace(".dzn", ".fzn")
-    let cmd = "minizinc -c --solver minizinc/crusher.msc " &
-              BenchModelMzn & " " & dzn & " -o " & outPath & " 2>/dev/null"
-    let exitCode = execCmd(cmd)
-    doAssert exitCode == 0, "minizinc compile failed for " & dzn
-    return readFile(outPath)
-
 proc parseEcp(dzn: string): FznModel =
-    parseFzn(compileEcp("minizinc_challenge/2020/soccer-computational/" & dzn))
+    ## Parses a pre-compiled ECP FlatZinc fixture so `make test` does not require
+    ## the minizinc CLI. Regenerate from the 2020 soccer-computational benchmark:
+    ##   minizinc -c --solver minizinc/crusher.msc ecp.mzn <instance>.dzn \
+    ##     -o tests/data/fzn_ranking/<instance>.fzn
+    let fznPath = "tests/data/fzn_ranking/" & dzn.replace(".dzn", ".fzn")
+    doAssert fileExists(fznPath), "missing FZN fixture: " & fznPath
+    parseFzn(readFile(fznPath))
 
 suite "Ranking-from-counters: full chain (xIGData_22_12_22_5)":
     ## All 22 teams pinned by op=1 positionConstraints.
