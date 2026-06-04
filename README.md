@@ -7,7 +7,7 @@ Crusher is a parallel tabu-search constraint solver written in [Nim](https://nim
 - **Tabu search** with penalty maps for O(1) move evaluation
 - **Parallel search** across multiple worker threads with scatter search and path relinking
 - **FlatZinc interface** (`fzcrusher`) that plugs into the MiniZinc toolchain
-- **40+ global constraints** including allDifferent, cumulative, circuit, diffn, regular, table, geost, and more
+- **40+ global constraints** spanning distinctness (allDifferent), cardinality (global cardinality, nvalue, count), scheduling/packing (cumulative, diffn, geost, reservoir), routing (circuit, subcircuit), and extensional/automaton (table, regular) — see [CONSTRAINTS.md](CONSTRAINTS.md)
 - **Channel variables** (element, min/max, count_eq) that propagate automatically, with channel-dependent penalty maps for indirect cost reasoning
 - **Algebraic expressions** for objectives: linear sums, piecewise-linear, min/max, weighted-same-value
 - **Pattern detection** in the FlatZinc translator to recover global constraints from decomposed models (reification chains, implication-to-table, element-to-inverse, etc.)
