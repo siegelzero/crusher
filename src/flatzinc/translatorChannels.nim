@@ -1649,23 +1649,36 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
 
         # Enforce the channel result variable's declared domain. MiniZinc folds
         # constraints such as `max(x) <= k` / `min(x) >= k` into the domain of the
-        # result variable rather than emitting an explicit int_le/int_ge, so without
-        # this the bound is silently dropped — local search then reports solutions
-        # where max/min violates the (invisible) bound.
-        #   max channel: result <= hi  ⟺  every input <= hi   (conjunctive)
-        #   min channel: result >= lo  ⟺  every input >= lo   (conjunctive)
-        # We constrain the inputs directly so the penalty uses the normal cost path.
-        # The opposite directions (max >= lo, min <= hi) are disjunctive; they are
-        # left to the channel value itself and are typically redundant in practice.
-        # These bounds are always sound: x_i <= max(x) = result <= hi and
-        # x_i >= min(x) = result >= lo, so they never cut a valid solution
-        # regardless of how the result's domain bound arose. A bare-variable
-        # input already inside the bound is skipped to avoid spurious constraints
-        # on large min/max arrays.
+        # result variable rather than emitting an explicit int_le/int_ge. Because a
+        # min/max channel is a *derived* position, that declared domain is never
+        # enforced during search, so unless it is re-imposed local search reports
+        # solutions where the channel value violates its (invisible) bound — and
+        # even prints the channel variable outside its own declared domain.
+        #
+        # The two directions need different handling:
+        #   conjunctive — max result <= hi  ⟺  every input <= hi
+        #                 min result >= lo  ⟺  every input >= lo
+        #       Pushed onto the inputs, so every offending input feeds the penalty
+        #       gradient (the normal cost path), not just the current extremum.
+        #   disjunctive — max result >= lo  ⟺  some input >= lo
+        #                 min result <= hi  ⟺  some input <= hi
+        #       Cannot be expressed per-input (it asserts *one* input reaches the
+        #       bound), so it is enforced on the channel value itself. addConstraint
+        #       bypasses the FlatZinc-level tautology check that would otherwise drop
+        #       `result >= lo` as redundant against result's declared domain — the
+        #       very domain that goes unenforced for a derived position.
+        #
+        # All four bounds are sound: result = max(x)/min(x) and result's declared
+        # domain forces result into [lo, hi], so x_i <= max(x) = result <= hi,
+        # x_i >= min(x) = result >= lo, max(x) = result >= lo and min(x) = result <= hi
+        # all hold in every valid solution — none can cut one. Bounds already
+        # guaranteed by the input domains are skipped to avoid dead constraints on
+        # large min/max arrays.
         let chDom = tr.sys.baseArray.domain[channelPos]
         if chDom.len > 0:
             let hi = max(chDom)
             let lo = min(chDom)
+            # Conjunctive direction: bound every input.
             for inputExpr in inputExprs:
                 if not def.isMin:
                     if inputExpr.node.kind == RefNode:
@@ -1677,6 +1690,34 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
                         let d = tr.sys.baseArray.domain[inputExpr.node.position]
                         if d.len > 0 and min(d) >= lo: continue
                     tr.sys.addConstraint(inputExpr >= lo)
+            # Disjunctive direction: bound the channel value. Skip only when the
+            # input domains already guarantee it — for max, the smallest achievable
+            # max(x) is max_i(min(dom_i)); for min, the largest achievable min(x) is
+            # min_i(max(dom_i)). A non-bare-variable input (or unknown domain) is
+            # treated as unbounded, forcing the bound to be emitted.
+            let channelExpr = tr.sys.baseArray[channelPos]
+            if not def.isMin:
+                var minOfMax = low(int)      # least value max(x) can take
+                for inputExpr in inputExprs:
+                    if inputExpr.node.kind != RefNode:
+                        minOfMax = low(int); break
+                    let d = tr.sys.baseArray.domain[inputExpr.node.position]
+                    if d.len == 0:
+                        minOfMax = low(int); break
+                    minOfMax = max(minOfMax, min(d))
+                if minOfMax < lo:
+                    tr.sys.addConstraint(channelExpr >= lo)
+            else:
+                var maxOfMin = high(int)      # greatest value min(x) can take
+                for inputExpr in inputExprs:
+                    if inputExpr.node.kind != RefNode:
+                        maxOfMin = high(int); break
+                    let d = tr.sys.baseArray.domain[inputExpr.node.position]
+                    if d.len == 0:
+                        maxOfMin = high(int); break
+                    maxOfMin = min(maxOfMin, max(d))
+                if maxOfMin > hi:
+                    tr.sys.addConstraint(channelExpr <= hi)
 
     if tr.sys.baseArray.minMaxChannelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")

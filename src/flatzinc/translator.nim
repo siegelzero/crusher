@@ -2689,9 +2689,14 @@ proc translate*(model: FznModel): FznTranslator =
     # tables whose unreachable cells carry placeholder values inside the FZN
     # domain but outside the post-presolve singleton.
     #
-    # Scope: applies only to element channelBindings. Other channel kinds
-    # (min/max, count_eq, argmax, expression) derive their result from input
-    # variable domains, so the sentinel-array problem doesn't arise.
+    # Scope: applies only to element channelBindings, whose results come from a
+    # constant array (the sentinel-array problem). Min/max channels have the same
+    # hazard — a declared domain tighter than the input-derived range goes
+    # unenforced for the derived position — but it is handled at their source in
+    # buildMinMaxChannelBindings (translatorChannels.nim), so it is not repeated
+    # here. count_eq/argmax/expression channels are NOT covered by either pass; if
+    # their declared domain can be tighter than what the inputs produce, they need
+    # the same treatment.
     block:
         var fznDeclLo: Table[int, int]
         var fznDeclHi: Table[int, int]

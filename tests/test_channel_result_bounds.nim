@@ -292,6 +292,144 @@ solve satisfy;
                     inc nBounds
         check nBounds == 0
 
+    test "max channel: declared lower bound enforced on channel value":
+        ## `m = max(x)` with m declared `var 2..5` and inputs `var 0..1`. The
+        ## lower bound `max(x) >= 2` is *disjunctive* (some input must reach 2);
+        ## it cannot be pushed onto individual inputs, so it must land on the
+        ## channel value itself as `m >= 2`. Inputs can never reach 2, so it is a
+        ## live (non-redundant) constraint. Pre-fix this bound was dropped and the
+        ## solver reported `m` below its own declared domain.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 0..1: x1 :: output_var;
+var 0..1: x2 :: output_var;
+var 0..1: x3 :: output_var;
+var 2..5: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let mPos = tr.varPositions["m"]
+        let lo = min(tr.sys.baseArray.domain[mPos])
+        var enforced = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation == GreaterThanEq and
+                 mPos in c.relationalState.positions:
+                enforced = true
+                break
+        check lo == 2
+        check enforced
+
+    test "min channel: declared upper bound enforced on channel value":
+        ## Mirror of the above: `m = min(x)`, m declared `var 5..8`, inputs
+        ## `var 9..10`. The upper bound `min(x) <= 8` is disjunctive, so it lands
+        ## on the channel value as `m <= 8`. Inputs can never reach 8 → live bound.
+        let src = """
+predicate array_int_minimum(var int: m,array [int] of var int: x);
+var 9..10: x1 :: output_var;
+var 9..10: x2 :: output_var;
+var 9..10: x3 :: output_var;
+var 5..8: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_minimum(m, xs) :: defines_var(m);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let mPos = tr.varPositions["m"]
+        let hi = max(tr.sys.baseArray.domain[mPos])
+        var enforced = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation == LessThanEq and
+                 mPos in c.relationalState.positions:
+                enforced = true
+                break
+        check hi == 8
+        check enforced
+
+    test "max channel: search respects disjunctive lower bound":
+        ## m = max(x) in [2,5], sum(x) <= 6 pulls values toward 0. Without the
+        ## disjunctive bound, all-0 (max=0) is a false zero-cost "solution".
+        ## With it, search must keep max(x) >= 2 (and <= 5 from the conjunctive
+        ## side), e.g. 2,0,0.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..10: x3 :: output_var;
+var 2..5: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+constraint int_lin_le([1,1,1],[x1,x2,x3],6);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
+
+        let v = [tr.sys.assignment[tr.varPositions["x1"]],
+                 tr.sys.assignment[tr.varPositions["x2"]],
+                 tr.sys.assignment[tr.varPositions["x3"]]]
+        check max(v) >= 2          # disjunctive lower bound holds
+        check max(v) <= 5          # conjunctive upper bound still holds
+        check v[0] + v[1] + v[2] <= 6
+
+    test "min channel: search respects disjunctive upper bound":
+        ## m = min(x) in [5,8], sum(x) >= 27 pushes values toward 10. Without the
+        ## disjunctive bound, all-10 (min=10) is a false zero-cost "solution".
+        ## With it, search must keep min(x) <= 8 (and >= 5 from the conjunctive
+        ## side), e.g. 8,10,10.
+        let src = """
+predicate array_int_minimum(var int: m,array [int] of var int: x);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..10: x3 :: output_var;
+var 5..8: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_minimum(m, xs) :: defines_var(m);
+constraint int_lin_le([-1,-1,-1],[x1,x2,x3],-27);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
+
+        let v = [tr.sys.assignment[tr.varPositions["x1"]],
+                 tr.sys.assignment[tr.varPositions["x2"]],
+                 tr.sys.assignment[tr.varPositions["x3"]]]
+        check min(v) <= 8          # disjunctive upper bound holds
+        check min(v) >= 5          # conjunctive lower bound still holds
+        check v[0] + v[1] + v[2] >= 27
+
+    test "min/max channel: no disjunctive bound when inputs already guarantee it":
+        ## Inputs `var 2..5`, result `m = max(x)` declared `var 2..5`. Every input
+        ## is already >= 2, so max(x) >= 2 is guaranteed and the disjunctive guard
+        ## must emit nothing on the channel value.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 2..5: x1 :: output_var;
+var 2..5: x2 :: output_var;
+var 2..5: x3 :: output_var;
+var 2..5: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let mPos = tr.varPositions["m"]
+        var nBoundsOnM = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation in {LessThanEq, GreaterThanEq} and
+                 mPos in c.relationalState.positions:
+                inc nBoundsOnM
+        check nBoundsOnM == 0
+
     test "FznIntSet declared variable picks up min/max bounds":
         ## Variable declared with enumerated set `var {0, 5, 10}` → bounds
         ## [0, 10]. Array `[-1, 5, -1]` has -1 outside [0, 10], so a lower
