@@ -82,11 +82,29 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         objective.initialize(system.assignment)
         var currentCost = objective.value
         var hasBoundConstraint = false
-        system.hasFeasibleSolution = true
-        system.bestAssignmentValid = false
-        system.bestFeasibleAssignment = system.assignment
-        system.bestAssignmentValid = true
-        if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+
+        # The initial resolve ignores the objective variable's declared domain
+        # bounds — they are deferred to the optimizer (see translator.nim). So
+        # the assignment found here can satisfy every hard constraint yet still
+        # have an objective value outside [lowerBound..upperBound]. Such an
+        # assignment is NOT a valid solution of the original model, so we must
+        # not record it as an incumbent or stream it via onSolution; doing so
+        # would emit an out-of-domain "solution" (e.g. objective=51 for a
+        # `var 1..20` objective) that the MiniZinc checker rejects as incorrect.
+        var boundsViolated = false
+        if upperBound != high(int) and currentCost > upperBound:
+            boundsViolated = true
+        if lowerBound != low(int) and currentCost < lowerBound:
+            boundsViolated = true
+
+        if not boundsViolated:
+            system.hasFeasibleSolution = true
+            system.bestAssignmentValid = false
+            system.bestFeasibleAssignment = system.assignment
+            system.bestAssignmentValid = true
+            if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+        else:
+            system.hasFeasibleSolution = false
 
         # Detect "low iteration rate" workloads. When the per-move cost is so
         # high that tabu only manages a few iterations per second (typically
@@ -113,53 +131,57 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Add domain bounds as permanent constraints only when the initial solution
         # violates them. Adding trivially-satisfied bounds wastes per-iteration work
         # (full penalty map rebuilds at all positions on every move).
-        block:
-            var boundsViolated = false
-            if upperBound != high(int) and currentCost > upperBound:
-                boundsViolated = true
-            if lowerBound != low(int) and currentCost < lowerBound:
-                boundsViolated = true
-
-            if boundsViolated:
-                if upperBound != high(int):
-                    system.addConstraint(objective <= upperBound)
-                if lowerBound != low(int):
-                    system.addConstraint(objective >= lowerBound)
-                echo "[Opt] Objective ", currentCost, " outside domain [", lowerBound, "..", upperBound, "], constraining..."
-                flushFile(stdout)
-                system.hasFeasibleSolution = false
-                let savedAssignment = system.assignment
-                var domainResolved = false
-                # Try parallel resolve with scatter search, retrying with fresh seeds.
-                for attempt in 1..5:
-                    if deadline > 0 and epochTime() > deadline:
-                        raise newException(TimeLimitExceededError, "Time limit exceeded")
-                    system.baseArray.reducedDomain = @[]  # Force recomputation
-                    system.adaptedTabuThreshold = 0  # Use full threshold
-                    try:
-                        system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
-                                      scatterThreshold=max(scatterThreshold, 3),
-                                      populationSize=effectivePopSize, numWorkers=numWorkers,
-                                      scatterStrategy=scatterStrategy, verbose=verbose,
-                                      deadline=deadline)
-                        domainResolved = true
-                        break
-                    except NoSolutionFoundError:
-                        if verbose:
-                            echo "[Opt] Domain bound resolve attempt ", attempt, " failed"
-                        flushFile(stdout)
-                    except InfeasibleError:
-                        raise
-                if not domainResolved:
+        if boundsViolated:
+            if upperBound != high(int):
+                system.addConstraint(objective <= upperBound)
+            if lowerBound != low(int):
+                system.addConstraint(objective >= lowerBound)
+            echo "[Opt] Objective ", currentCost, " outside domain [", lowerBound, "..", upperBound, "], constraining..."
+            flushFile(stdout)
+            system.hasFeasibleSolution = false
+            let savedAssignment = system.assignment
+            var domainResolved = false
+            # Try parallel resolve with scatter search, retrying with fresh seeds.
+            for attempt in 1..5:
+                if deadline > 0 and epochTime() > deadline:
+                    raise newException(TimeLimitExceededError, "Time limit exceeded")
+                system.baseArray.reducedDomain = @[]  # Force recomputation
+                system.adaptedTabuThreshold = 0  # Use full threshold
+                try:
+                    system.resolve(parallel=parallel, tabuThreshold=tabuThreshold,
+                                  scatterThreshold=max(scatterThreshold, 3),
+                                  populationSize=effectivePopSize, numWorkers=numWorkers,
+                                  scatterStrategy=scatterStrategy, verbose=verbose,
+                                  deadline=deadline)
+                    domainResolved = true
+                    break
+                except NoSolutionFoundError:
                     if verbose:
-                        echo "[Opt] Trying sequential from saved assignment"
-                        flushFile(stdout)
-                    system.resolveFromAssignment(savedAssignment, tabuThreshold, verbose, deadline)
-                objective.initialize(system.assignment)
-                currentCost = objective.value
-                system.hasFeasibleSolution = true
-                echo "[Opt] Resolved within domain bounds: ", currentCost
-                flushFile(stdout)
+                        echo "[Opt] Domain bound resolve attempt ", attempt, " failed"
+                    flushFile(stdout)
+                except InfeasibleError:
+                    raise
+            if not domainResolved:
+                if verbose:
+                    echo "[Opt] Trying sequential from saved assignment"
+                    flushFile(stdout)
+                # Raises NoSolutionFoundError if no in-bounds assignment is found,
+                # which propagates to the caller as UNKNOWN. This is correct: we
+                # must never fall through and report the out-of-domain initial
+                # assignment as a solution.
+                system.resolveFromAssignment(savedAssignment, tabuThreshold, verbose, deadline)
+            # Reaching here means an in-bounds assignment was found (resolve only
+            # returns on a zero-penalty solution, which now includes the objective
+            # bound constraints). Record it as the first valid incumbent.
+            objective.initialize(system.assignment)
+            currentCost = objective.value
+            system.hasFeasibleSolution = true
+            system.bestAssignmentValid = false
+            system.bestFeasibleAssignment = system.assignment
+            system.bestAssignmentValid = true
+            if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+            echo "[Opt] Resolved within domain bounds: ", currentCost
+            flushFile(stdout)
 
         # Cache the base reduced domain and fixed positions (after any domain bound constraints).
         # Subsequent iterations only change the search bound — no need to recompute.

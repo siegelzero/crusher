@@ -316,6 +316,59 @@ suite "Optimization with objective bounds":
             actualSum += x.assignment[i]
         check actualSum == 15  # 1+2+3+4+5
 
+    test "initial out-of-domain solution is never streamed or reported (minimize)":
+        # Regression for the all_different_except_0 suite failure:
+        #   x = [0,0,0,0,11,12,8,0,0,20]; objective = 51  (objective var is 0..20)
+        # The initial resolve ignores the objective variable's declared domain
+        # bound (it is deferred to the optimizer). That initial assignment can
+        # satisfy every hard constraint yet have an objective far above the
+        # upperBound. It must NOT be recorded as an incumbent or streamed via
+        # onSolution — otherwise the solver emits an out-of-domain "solution"
+        # that the MiniZinc checker rejects as incorrect.
+        #
+        # Setup mirrors suite/test_all_different_except_0.mzn:
+        #   10 vars in 0..20, allDifferentExcept0, at least 4 non-zero,
+        #   minimize sum with the objective constrained to <= 20.
+        # Optimal within bound: 1+2+3+4 = 10. Any initial random assignment of
+        # 4+ distinct non-zero values almost always sums well above 20.
+        let n = 10
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(n)
+        x.setDomain(toSeq(0..20))
+        sys.addConstraint(allDifferentExcept0(x))
+        sys.addConstraint(atMost[int](toSeq(0..<n), 0, n - 4))  # >= 4 non-zero
+
+        var total: AlgebraicExpression[int] = x[0]
+        for i in 1..<n:
+            total = total + x[i]
+
+        # Every incumbent passed to onSolution must respect the upper bound.
+        var streamedObjectives: seq[int] = @[]
+        proc capture(assignment: seq[int]) {.closure.} =
+            var s = 0
+            for v in assignment:
+                s += v
+            streamedObjectives.add(s)
+
+        sys.minimize(total, parallel=true, tabuThreshold=1000,
+                     upperBound=20, onSolution=capture)
+
+        for s in streamedObjectives:
+            check s <= 20  # no out-of-domain solution was ever streamed
+
+        let solution = x.assignment
+        var actualSum = 0
+        for v in solution:
+            actualSum += v
+        # All non-zero values distinct (all_different_except_0)
+        var nonZero: seq[int] = @[]
+        for v in solution:
+            if v != 0: nonZero.add(v)
+        check nonZero.len == nonZero.deduplicate().len
+        check nonZero.len >= 4               # at least 4 non-zero
+        check actualSum <= 20                 # respects objective domain
+        check actualSum == 10                 # true optimum: 1+2+3+4
+
     test "loProven set only by InfeasibleError not by domain bound":
         # 3 variables in {1..5}, allDifferent, minimize sum = 6.
         # lowerBound=6 (exact). The optimizer finds 6 and proves optimal
