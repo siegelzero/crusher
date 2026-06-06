@@ -91,3 +91,4 @@ import test_simple_element
 import test_sparse_clamp_channels
 import test_table_constraint
 import test_unified_api
+import test_worker_count

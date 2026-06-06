@@ -1,0 +1,18 @@
+# Keep the build context small: the image only needs the Nim sources, the
+# Makefile/config.nims, and the minizinc/ overrides to compile fzcrusher.
+.git
+.claude
+tests
+csplib
+models
+docs
+challenge2026
+
+# Build artifacts and local binaries (recompiled inside the image).
+fzcrusher
+fzcrusher-profile
+nimcache
+nimblecache
+*.out
+*.ozn
+*~

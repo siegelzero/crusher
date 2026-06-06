@@ -112,8 +112,11 @@ solve satisfy;
     var tr = translate(model)
     var timedOut = false
     try:
+      # Deadline already in the past: the timeout must fire before any solution
+      # is found, making this deterministic (a tiny positive deadline was racy —
+      # the solver occasionally found the assignment within the window first).
       tr.sys.resolve(parallel = true, tabuThreshold = 100000,
-                     verbose = false, deadline = epochTime() + 0.001)
+                     verbose = false, deadline = epochTime() - 1.0)
     except TimeLimitExceededError:
       timedOut = true
     except NoSolutionFoundError:

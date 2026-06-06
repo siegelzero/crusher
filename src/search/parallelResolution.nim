@@ -1,4 +1,4 @@
-import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, random, algorithm, sequtils]
+import std/[typedthreads, atomics, cpuinfo, locks, os, times, strformat, strutils, random, algorithm, sequtils]
 
 import tabu
 import candidatePool
@@ -35,7 +35,19 @@ type
         pool*: ptr StatePool[T]
 
 proc getOptimalWorkerCount*(): int =
-    # Use CPU count, but cap at reasonable maximum
+    # The MiniZinc Challenge harness exposes the container's core allocation via
+    # the NUM_CPUS environment variable and expects solvers to honour it, so use
+    # it verbatim when present (no artificial cap — the budget is whatever the
+    # harness grants). Fall back to the detected CPU count (capped at a
+    # reasonable maximum) for ordinary library/CLI use where NUM_CPUS is unset.
+    let envCpus = getEnv("NUM_CPUS").strip()
+    if envCpus.len > 0:
+        try:
+            let n = parseInt(envCpus)
+            if n > 0:
+                return n
+        except ValueError:
+            discard  # malformed value — ignore and fall back
     min(countProcessors(), 8)
 
 # Parallel state initialization (work-stealing pool)

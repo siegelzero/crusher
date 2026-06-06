@@ -3871,7 +3871,10 @@ solve satisfy;
     check "wait1" in tr.varPositions
     check "wait2" in tr.varPositions
 
-    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+    # Tabu search is randomized (randomize() seeds from entropy). Use the parallel
+    # path: several differently-seeded workers plus a scatter-search fallback make
+    # it converge reliably, where a single sequential run occasionally got stuck.
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
 
     # Verify channel propagation: wait = depart - arrive
     let a1 = tr.sys.assignment[tr.varPositions["arrive1"]]
@@ -3919,7 +3922,10 @@ solve satisfy;
     check "d2" in tr.channelVarNames
     check "d3" in tr.channelVarNames
 
-    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+    # Tabu search is randomized (randomize() seeds from entropy). Use the parallel
+    # path: several differently-seeded workers plus a scatter-search fallback make
+    # it converge reliably, where a single sequential run occasionally got stuck.
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
 
     let sv1 = tr.sys.assignment[tr.varPositions["s1"]]
     let ev1 = tr.sys.assignment[tr.varPositions["e1"]]
