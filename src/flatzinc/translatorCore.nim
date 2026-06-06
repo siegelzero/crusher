@@ -687,6 +687,16 @@ proc constSetExpr(info: tuple[isConst: bool, constVals: HashSet[int], varInfo: S
                 linear = true)
 
 
+proc setArgPossibleElements(info: tuple[isConst: bool, constVals: HashSet[int],
+                                        varInfo: SetVarInfo]): HashSet[int] =
+    ## The elements a set argument could possibly contain: a constant's members,
+    ## or a set variable's whole universe [lo..hi].
+    if info.isConst:
+        return info.constVals
+    result = initHashSet[int]()
+    for e in info.varInfo.lo .. info.varInfo.hi:
+        result.incl(e)
+
 proc getExprBounds(tr: var FznTranslator, arg: FznExpr): tuple[lo: int, hi: int, known: bool] =
     ## Returns domain bounds (min, max) for a FznExpr element.
     ## known=false if bounds cannot be determined.
@@ -2446,7 +2456,18 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let bInfo = tr.resolveSetArg(con.args[1])
         let cInfo = tr.resolveSetArg(con.args[2])
         if cInfo.isConst:
-            discard  # Constant result — no constraint needed
+            # C is a constant set. This is still a real constraint when A or B is
+            # a variable: for every candidate element e, max(A[e], B[e]) must
+            # equal (e in C ? 1 : 0). Only when BOTH A and B are constant is the
+            # constraint a static fact with nothing to enforce.
+            if not (aInfo.isConst and bInfo.isConst):
+                var elems = setArgPossibleElements(aInfo) + setArgPossibleElements(bInfo)
+                elems = elems + cInfo.constVals
+                for elem in elems:
+                    let aExpr = constSetExpr(aInfo, tr, elem)
+                    let bExpr = constSetExpr(bInfo, tr, elem)
+                    let cExpr = constSetExpr(cInfo, tr, elem)
+                    tr.sys.addConstraint(cExpr == binaryMax(aExpr, bExpr))
         else:
             let cVar = cInfo.varInfo
             for idx in 0..<cVar.positions.len:
@@ -2464,7 +2485,23 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let bInfo = tr.resolveSetArg(con.args[1])
         let cInfo = tr.resolveSetArg(con.args[2])
         if cInfo.isConst:
-            discard
+            # C is a constant set (e.g. all_disjoint decomposes to
+            # set_intersect(A, B, 1..0) — the intersection must be empty). This
+            # is still a real constraint when A or B is a variable: for every
+            # candidate element e, min(A[e], B[e]) must equal (e in C ? 1 : 0).
+            # Only when BOTH A and B are constant is there nothing to enforce.
+            if not (aInfo.isConst and bInfo.isConst):
+                # min(A[e], B[e]) is only ever 1 when both could contain e, so the
+                # candidate universe is (possibleA ∩ possibleB), plus any element
+                # C requires (so an infeasible C surfaces as unsatisfiable rather
+                # than being silently dropped).
+                var elems = setArgPossibleElements(aInfo) * setArgPossibleElements(bInfo)
+                elems = elems + cInfo.constVals
+                for elem in elems:
+                    let aExpr = constSetExpr(aInfo, tr, elem)
+                    let bExpr = constSetExpr(bInfo, tr, elem)
+                    let cExpr = constSetExpr(cInfo, tr, elem)
+                    tr.sys.addConstraint(cExpr == binaryMin(aExpr, bExpr))
         else:
             let cVar = cInfo.varInfo
             for idx in 0..<cVar.positions.len:

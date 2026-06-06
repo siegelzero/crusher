@@ -46,6 +46,7 @@ import test_implicit_lin_eq_channel
 import test_fzn_parser
 import test_fzcrusher
 import test_fzn_solver
+import test_fzn_set_disjoint
 import test_geost
 import test_global_cardinality
 import test_incremental_cascade
