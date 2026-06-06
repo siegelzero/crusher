@@ -10,10 +10,11 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
     var predArrayName = ""
     var predVarNames: seq[string]
 
-    # Step 1: Find fzn_circuit constraint
+    # Step 1: Find the circuit constraint (crusher's mznlib lowers fzn_circuit to
+    # the native crusher_circuit global, see minizinc/mznlib/fzn_circuit.mzn).
     for ci, con in tr.model.constraints:
         let name = stripSolverPrefix(con.name)
-        if name != "fzn_circuit": continue
+        if name != "crusher_circuit": continue
         if con.args.len < 1: continue
 
         # Get pred array

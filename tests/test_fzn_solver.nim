@@ -287,6 +287,47 @@ solve satisfy;
     check cur == 0
     check visited.len == 4
 
+  test "non-1-based circuit via FlatZinc (offset recovered from domains)":
+    # Regression for suite/test_circuit.mzn: a circuit over an index set that is
+    # neither 0- nor 1-based (here nodes 2..5). Crusher's mznlib tightens each
+    # successor to the node set, so the FZN successor domains are 2..5 and the
+    # backend must recover value offset = 2. Previously it assumed 1-based and
+    # produced successors outside 2..5 (e.g. value 1), an invalid circuit.
+    let src = """
+var 2..5: x1;
+var 2..5: x2;
+var 2..5: x3;
+var 2..5: x4;
+array [1..4] of var int: x:: output_array([1..4]) = [x1,x2,x3,x4];
+constraint fzn_all_different_int(x);
+constraint crusher_circuit(x);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    tr.sys.resolve(parallel = true, tabuThreshold = 10000, verbose = false)
+
+    let positions = tr.arrayPositions["x"]
+    var values = newSeq[int](4)
+    for i, pos in positions:
+      values[i] = tr.sys.assignment[pos]
+
+    # Every successor must stay within the node set 2..5.
+    for v in values:
+      check v >= 2 and v <= 5
+    # All different and a single Hamiltonian cycle over nodes 2..5.
+    check values.toHashSet.len == 4
+    # Array index (i) holds the successor of node (i + 2); follow the cycle.
+    var visited = initPackedSet[int]()
+    var cur = 2
+    for step in 0..<4:
+      check cur >= 2 and cur <= 5
+      check cur notin visited
+      visited.incl(cur)
+      cur = values[cur - 2]
+    check cur == 2            # closed the cycle back to the start node
+    check visited.len == 4    # visited every node exactly once
+
   test "bool_not channel detection":
     # bool_not(a, b) with defines_var(b) should make b a channel = 1 - a.
     # We force a = 1 via int_eq, so b should be 0.

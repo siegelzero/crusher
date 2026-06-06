@@ -974,6 +974,32 @@ proc isRedundantNandLinLe(tr: FznTranslator, coeffs: seq[int], varArrayArg: FznE
     boolNames.sort()
     return boolNames in tr.nandBoolClauses
 
+proc detectCircuitValueOffset(tr: FznTranslator, positions: seq[int], n: int): int =
+    ## Recover the value offset of a (sub)circuit from its successor domains.
+    ##
+    ## Crusher's mznlib tightens each successor to index_set(x), so for a circuit
+    ## over nodes l..l+n-1 the union of all position domains is exactly that range
+    ## and its minimum is the offset l (1 for the usual 1-based circuit, 0 for a
+    ## 0-based one, 2 for an array indexed 2..5, ...). When the domains have NOT
+    ## been tightened to an n-wide span (e.g. raw FlatZinc from another toolchain),
+    ## fall back to the historical heuristic: 0-based if values include 0 but not
+    ## n, otherwise 1-based.
+    var minVal = high(int)
+    var maxVal = low(int)
+    for pos in positions:
+        for v in tr.sys.baseArray.domain[pos]:
+            if v < minVal: minVal = v
+            if v > maxVal: maxVal = v
+    if minVal <= maxVal and (maxVal - minVal + 1) == n:
+        return minVal
+    var hasZero = false
+    var hasN = false
+    for pos in positions:
+        for v in tr.sys.baseArray.domain[pos]:
+            if v == 0: hasZero = true
+            if v == n: hasN = true
+    return if hasZero and not hasN: 0 else: 1
+
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     ## Translates a single FlatZinc constraint to a Crusher constraint.
     let name = stripSolverPrefix(con.name)
@@ -1807,10 +1833,12 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 sizeExprs[i] = flatSize[i*k ..< (i+1)*k]
         tr.sys.addConstraint(diffnK[int](n, k, posExprs, sizeExprs))
 
-    of "fzn_circuit":
+    of "crusher_circuit", "fzn_circuit":
+        # crusher_circuit is the native global crusher's mznlib lowers circuit to;
+        # "fzn_circuit" is still accepted for raw FlatZinc fed directly (without
+        # crusher's library), where domains may be untightened.
         let exprs = tr.resolveExprArray(con.args[0])
         let (allRefs, positions) = isAllRefs(exprs)
-        # Detect value offset: 0-based (offset=0) if values include 0 but not n
         var circuitPositions: seq[int]
         if allRefs:
             circuitPositions = positions
@@ -1824,21 +1852,14 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                     v.setDomain(@[int(e.node.value)])
                     circuitPositions.add(pos)
                 else:
-                    raise newException(ValueError, "fzn_circuit: unsupported expression node kind " & $e.node.kind)
+                    raise newException(ValueError, "crusher_circuit: unsupported expression node kind " & $e.node.kind)
         let n = circuitPositions.len
-        var hasZero = false
-        var hasN = false
-        for pos in circuitPositions:
-            let dom = tr.sys.baseArray.domain[pos]
-            for v in dom:
-                if v == 0: hasZero = true
-                if v == n: hasN = true
-        let valueOffset = if hasZero and not hasN: 0 else: 1
-        if valueOffset == 0:
-            stderr.writeLine(&"[FZN] Circuit with {n} nodes uses 0-based indexing")
+        let valueOffset = tr.detectCircuitValueOffset(circuitPositions, n)
+        if valueOffset != 1:
+            stderr.writeLine(&"[FZN] Circuit with {n} nodes uses value offset {valueOffset}")
         tr.sys.addConstraint(circuit[int](circuitPositions, valueOffset))
 
-    of "fzn_subcircuit":
+    of "crusher_subcircuit", "fzn_subcircuit":
         let exprs = tr.resolveExprArray(con.args[0])
         let (allRefs, positions) = isAllRefs(exprs)
         var subcircuitPositions: seq[int]
@@ -1854,16 +1875,9 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                     v.setDomain(@[int(e.node.value)])
                     subcircuitPositions.add(pos)
                 else:
-                    raise newException(ValueError, "fzn_subcircuit: unsupported expression node kind " & $e.node.kind)
+                    raise newException(ValueError, "crusher_subcircuit: unsupported expression node kind " & $e.node.kind)
         let nSub = subcircuitPositions.len
-        var hasZeroSub = false
-        var hasNSub = false
-        for pos in subcircuitPositions:
-            let dom = tr.sys.baseArray.domain[pos]
-            for v in dom:
-                if v == 0: hasZeroSub = true
-                if v == nSub: hasNSub = true
-        let valueOffsetSub = if hasZeroSub and not hasNSub: 0 else: 1
+        let valueOffsetSub = tr.detectCircuitValueOffset(subcircuitPositions, nSub)
         tr.sys.addConstraint(subcircuit[int](subcircuitPositions, valueOffsetSub))
         tr.sys.addConstraint(allDifferent[int](subcircuitPositions))
 
