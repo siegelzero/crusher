@@ -3,6 +3,7 @@
 !*/
 !*.*
 !Makefile
+!Dockerfile
 
 # Generated MiniZinc output files
 *.ozn
