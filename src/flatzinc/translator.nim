@@ -1777,10 +1777,12 @@ proc translate*(model: FznModel): FznTranslator =
             for elem in p.inputElems:
                 inputExprs.add(result.resolveExprArg(elem))
             # Offset comes from the decomposition's ne_reif index base (the array
-            # index set), NOT the declared domain min. They coincide today because
-            # detection requires the full contiguous index range, but a domain
-            # tightened from below (e.g. a folded `arg_max(x) >= k`) would shift the
-            # min while the true indices are unchanged — using domain[0] there would
+            # index set), NOT the declared domain min. Detection keys off the
+            # ne_reif indices being contiguous and matching the input count
+            # (detectArgmaxPattern), never the declared domain, so the two can
+            # diverge: a domain extended below the base (`var 0..n: r` over a
+            # 1-based array) or tightened from below (a folded `arg_max(x) >= k`)
+            # moves domain[0] off the true index base. Using domain[0] would then
             # add a spurious offset to every reported index. Channel value =
             # argmax(inputs, 0-based) + indexBase.
             let valueOffset = p.indexBase
@@ -1788,13 +1790,15 @@ proc translate*(model: FznModel): FznTranslator =
             result.channelVarNames.incl(p.argmaxVarName)
             # Defensive declared-domain enforcement. argmax is a derived position,
             # so a declared domain tighter than the natural index range
-            # [base, base+n-1] is not enforced during search. Detection currently
-            # only fires when the domain spans the full range (so these bounds are
-            # no-ops today), but if a tighter domain ever reaches here the channel
-            # value could be reported outside its own domain — as min/max and
-            # expression channels could before they were bounded. The index that
-            # attains the max is disjunctive, so the bound goes on the channel value
-            # itself; redundant bounds are skipped.
+            # [base, base+n-1] is not enforced during search — the channel value
+            # could be reported outside its own domain, as min/max and expression
+            # channels could before they were bounded. Detection is domain-
+            # independent (it keys off the ne_reif index structure, not the declared
+            # domain), so a tighter domain genuinely reaches here: the bound is live,
+            # not a no-op (see the "argmax channel: defensive bound on tightened
+            # declared domain" test). The index that attains the max is disjunctive,
+            # so the bound goes on the channel value itself; bounds already implied
+            # by the natural index range are skipped.
             let amDom = result.sys.baseArray.domain[argmaxPos]
             if amDom.len > 0:
                 let natLo = valueOffset
@@ -2720,10 +2724,10 @@ proc translate*(model: FznModel): FznTranslator =
     # position — exists for other channel kinds, and each is handled at its source:
     # min/max and int_times/int_plus/etc. expression channels in
     # translatorChannels.nim; count_eq channels in their GCC, bin_packing, and
-    # conditional builders. argmax channels carry no explicit bound because the
-    # pattern is only detected when the result's domain spans the full input index
-    # range, so the channel value is always in-domain — relax that detection and a
-    # bound would be needed here too.
+    # conditional builders; argmax channels at their binding site above (a defensive
+    # bound on the channel value). argmax detection is domain-independent — it keys
+    # off the ne_reif index structure, not the declared domain — so a tighter
+    # declared domain can reach the binding site and the bound there can be live.
     block:
         var fznDeclLo: Table[int, int]
         var fznDeclHi: Table[int, int]
