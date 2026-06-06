@@ -28,7 +28,7 @@
 ##
 ## **Performance**: O(k) incremental move evaluation where k = number of affected adjacent pairs
 
-import std/[packedsets, sequtils, tables, algorithm]
+import std/[packedsets, sequtils, tables]
 
 import ../expressions/[expressions, types]
 
@@ -72,16 +72,19 @@ template violatesOrdering[T](val1, val2: T, orderingType: OrderingType): bool =
 
 func newOrderingConstraint*[T](positions: openArray[int], orderingType: OrderingType): OrderingConstraint[T] =
     new(result)
-    # For all ordering types, we always sort positions in ascending order
-    # The ordering type determines how we check values, not position order
-    let sortedPositions = sorted(@positions)
-
+    # The sequence order is the order positions are given in — NOT their numeric
+    # index order. The FlatZinc translator, for example, materializes array
+    # literals (e.g. the reversed array of a `decreasing` decomposition) as
+    # singleton-domain variables appended at high indices, so the array order and
+    # the position-index order differ. Sorting here would silently scramble the
+    # chain and accept non-monotonic assignments. `sortedPositions` therefore
+    # holds the positions verbatim in their given (adjacency) order.
     result = OrderingConstraint[T](
         orderingType: orderingType,
         cost: 0,
         evalMethod: PositionBased,
         positions: toPackedSet[int](positions),
-        sortedPositions: sortedPositions,
+        sortedPositions: @positions,
         currentAssignment: initTable[int, T](),
     )
 

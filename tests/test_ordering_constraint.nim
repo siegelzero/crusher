@@ -557,3 +557,70 @@ suite "Ordering Constraint Tests":
 
         check(validateStrictlyIncreasing(expressionValues))
         check(expressionValues == @[2, 5, 6])
+
+    # ------------------------------------------------------------------
+    # Regression: the position-based ordering constraint must honour the
+    # order positions are given in, NOT their numeric index order. It used
+    # to sort the positions, which silently scrambled the chain whenever the
+    # sequence order differed from the index order (e.g. the FlatZinc
+    # translator materializes `decreasing(x)`'s reversed array as
+    # singleton-domain variables appended at high indices). See
+    # suite/test_decreasing.mzn.
+    # ------------------------------------------------------------------
+
+    test "Position order is honoured for descending position lists":
+        # Chain X[4] <= X[3] <= X[2] <= X[1] <= X[0] — i.e. natural array order
+        # is non-increasing. With X[4] (the chain's smallest) pinned to 3 and the
+        # chain's largest, X[0], minimized, the only feasible optimum is X[0]==3
+        # (everything collapses to 3). If positions were sorted, the chain would
+        # degenerate into X[0] <= ... <= X[4]==3, letting X[0] drop to the domain
+        # minimum (1) — a different, wrong optimum. Using minimize keeps the test
+        # bounded so a reintroduced bug fails cleanly instead of hanging.
+        var sys = initConstraintSystem[int]()
+        var X = sys.newConstrainedSequence(5)
+        X.setDomain(toSeq(1..10))
+
+        sys.addConstraint(increasing[int]([4, 3, 2, 1, 0]))
+        sys.addConstraint(X[4] == 3)   # chain start (smallest)
+
+        sys.minimize(X[0])             # chain end (largest)
+
+        let assignment = X.assignment
+        # Chain in given order must be non-decreasing: X[4]..X[0].
+        check(validateIncreasing(@[assignment[4], assignment[3], assignment[2], assignment[1], assignment[0]]))
+        # Equivalently, the natural array order must be non-increasing.
+        check(validateDecreasing(assignment))
+        check(assignment[0] == 3)
+        check(assignment[4] == 3)
+
+    test "Interleaved high-index constants (decreasing decomposition shape)":
+        # Faithful reproduction of suite/test_decreasing.mzn: search variables
+        # live at low positions, the literal constants of the reversed array are
+        # materialized as singleton vars at higher positions, and the increasing
+        # chain interleaves them: [C0=1, a, C1=3, b, C2=5] must be increasing,
+        # i.e. 1 <= a <= 3 <= b <= 5. Minimizing a+b the optimum is a=1, b=3
+        # (sum 4). Sorting the positions would instead require a <= b <= 1,
+        # collapsing to a=b=1 (sum 2) and accepting a non-monotonic chain.
+        var sys = initConstraintSystem[int]()
+        var V = sys.newConstrainedSequence(2)   # a = V[0] (pos 0), b = V[1] (pos 1)
+        V.setDomain(toSeq(1..10))
+        var C = sys.newConstrainedSequence(3)   # constants at the higher positions 2,3,4
+        C.setDomain(toSeq(1..10))
+        sys.addConstraint(C[0] == 1)
+        sys.addConstraint(C[1] == 3)
+        sys.addConstraint(C[2] == 5)
+
+        # Chain positions in sequence order: [C0, a, C1, b, C2] = [2, 0, 3, 1, 4].
+        sys.addConstraint(increasing[int]([2, 0, 3, 1, 4]))
+
+        sys.minimize(V[0] + V[1])
+
+        let assignment = sys.assignment
+        let a = assignment[0]
+        let b = assignment[1]
+        # The interleaved chain must be non-decreasing.
+        check(validateIncreasing(@[assignment[2], a, assignment[3], b, assignment[4]]))
+        # And the optimum respects 1 <= a <= 3 <= b <= 5.
+        check(a + b == 4)
+        check(a == 1)
+        check(b == 3)
