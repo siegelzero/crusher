@@ -1647,6 +1647,37 @@ proc buildMinMaxChannelBindings(tr: var FznTranslator) =
         let isImplicit = not defCon.hasAnnotation("defines_var")
         tr.sys.baseArray.addMinMaxChannelBinding(channelPos, def.isMin, inputExprs, isImplicit)
 
+        # Enforce the channel result variable's declared domain. MiniZinc folds
+        # constraints such as `max(x) <= k` / `min(x) >= k` into the domain of the
+        # result variable rather than emitting an explicit int_le/int_ge, so without
+        # this the bound is silently dropped — local search then reports solutions
+        # where max/min violates the (invisible) bound.
+        #   max channel: result <= hi  ⟺  every input <= hi   (conjunctive)
+        #   min channel: result >= lo  ⟺  every input >= lo   (conjunctive)
+        # We constrain the inputs directly so the penalty uses the normal cost path.
+        # The opposite directions (max >= lo, min <= hi) are disjunctive; they are
+        # left to the channel value itself and are typically redundant in practice.
+        # These bounds are always sound: x_i <= max(x) = result <= hi and
+        # x_i >= min(x) = result >= lo, so they never cut a valid solution
+        # regardless of how the result's domain bound arose. A bare-variable
+        # input already inside the bound is skipped to avoid spurious constraints
+        # on large min/max arrays.
+        let chDom = tr.sys.baseArray.domain[channelPos]
+        if chDom.len > 0:
+            let hi = max(chDom)
+            let lo = min(chDom)
+            for inputExpr in inputExprs:
+                if not def.isMin:
+                    if inputExpr.node.kind == RefNode:
+                        let d = tr.sys.baseArray.domain[inputExpr.node.position]
+                        if d.len > 0 and max(d) <= hi: continue
+                    tr.sys.addConstraint(inputExpr <= hi)
+                else:
+                    if inputExpr.node.kind == RefNode:
+                        let d = tr.sys.baseArray.domain[inputExpr.node.position]
+                        if d.len > 0 and min(d) >= lo: continue
+                    tr.sys.addConstraint(inputExpr >= lo)
+
     if tr.sys.baseArray.minMaxChannelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.minMaxChannelBindings.len} min/max channel variables")
 

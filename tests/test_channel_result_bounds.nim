@@ -176,6 +176,122 @@ solve satisfy;
                     inc nBoundsOnR
         check nBoundsOnR == 0
 
+    test "max channel: declared upper bound enforced on inputs":
+        ## `m = max(x)` with m declared `var 2..5`. MiniZinc folds a constraint
+        ## like `max(x) <= 5` into m's domain rather than emitting an int_le, so
+        ## without bound enforcement the bound is silently dropped. The translator
+        ## must constrain each input to x_i <= 5 (sound: x_i <= max(x) = m <= 5).
+        ## The enforcement may surface either as a surviving LessThanEq constraint
+        ## or — when presolve absorbs it — as a tightened input domain; either is
+        ## acceptable, both prove the bound reached the inputs.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..10: x3 :: output_var;
+var 2..5: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+
+        check tr.sys.baseArray.minMaxChannelBindings.len == 1
+        # The result var's declared upper bound — the value inputs must not exceed.
+        let resultHi = max(tr.sys.baseArray.domain[tr.varPositions["m"]])
+        for vn in ["x1", "x2", "x3"]:
+            let p = tr.varPositions[vn]
+            var enforced = false
+            for c in tr.sys.baseArray.constraints:
+                if c.stateType != RelationalType: continue
+                if c.relationalState.relation == LessThanEq and p in c.relationalState.positions:
+                    enforced = true
+                    break
+            if not enforced:
+                # Absorbed into the domain: the input's max must have dropped to
+                # the result's upper bound.
+                enforced = max(tr.sys.baseArray.domain[p]) <= resultHi
+            check enforced
+
+    test "max channel: search respects folded-in upper bound":
+        ## sum(x) >= 12 pushes values up, but max(x) <= 5 caps them. The only
+        ## feasible region is x_i in [0,5] summing to >= 12 (e.g. 5,5,2).
+        ## Pre-fix, search produced values like 10 with max(x)=10 > 5.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..10: x3 :: output_var;
+var 2..5: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+constraint int_lin_le([-1,-1,-1],[x1,x2,x3],-12);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+
+        let v = [tr.sys.assignment[tr.varPositions["x1"]],
+                 tr.sys.assignment[tr.varPositions["x2"]],
+                 tr.sys.assignment[tr.varPositions["x3"]]]
+        check max(v) <= 5          # the folded-in bound holds
+        check v[0] + v[1] + v[2] >= 12
+
+    test "min channel: search respects folded-in lower bound":
+        ## `m = min(x)` with m declared `var 5..8` encodes min(x) >= 5.
+        ## sum(x) <= 18 pulls values down, but every input must stay >= 5.
+        ## Pre-fix, search produced values like 0 with min(x)=0 < 5.
+        let src = """
+predicate array_int_minimum(var int: m,array [int] of var int: x);
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..10: x3 :: output_var;
+var 5..8: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_minimum(m, xs) :: defines_var(m);
+constraint int_lin_le([1,1,1],[x1,x2,x3],18);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+
+        let v = [tr.sys.assignment[tr.varPositions["x1"]],
+                 tr.sys.assignment[tr.varPositions["x2"]],
+                 tr.sys.assignment[tr.varPositions["x3"]]]
+        check min(v) >= 5          # the folded-in bound holds
+        check v[0] + v[1] + v[2] <= 18
+
+    test "min/max channel: no spurious bound when inputs already within result domain":
+        ## Inputs declared `var 0..5`, result `m = max(x)` declared `var 0..10`.
+        ## Each bare-variable input already satisfies x_i <= 10, so the redundancy
+        ## guard should emit nothing — avoids piling trivial constraints onto
+        ## large min/max arrays.
+        let src = """
+predicate array_int_maximum(var int: m,array [int] of var int: x);
+var 0..5: x1 :: output_var;
+var 0..5: x2 :: output_var;
+var 0..5: x3 :: output_var;
+var 0..10: m :: var_is_introduced :: is_defined_var :: output_var;
+array [1..3] of var int: xs ::var_is_introduced = [x1,x2,x3];
+constraint array_int_maximum(m, xs) :: defines_var(m);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+
+        var nBounds = 0
+        for vn in ["x1", "x2", "x3"]:
+            let p = tr.varPositions[vn]
+            for c in tr.sys.baseArray.constraints:
+                if c.stateType != RelationalType: continue
+                if c.relationalState.relation in {LessThanEq, GreaterThanEq} and
+                     p in c.relationalState.positions:
+                    inc nBounds
+        check nBounds == 0
+
     test "FznIntSet declared variable picks up min/max bounds":
         ## Variable declared with enumerated set `var {0, 5, 10}` → bounds
         ## [0, 10]. Array `[-1, 5, -1]` has -1 outside [0, 10], so a lower
