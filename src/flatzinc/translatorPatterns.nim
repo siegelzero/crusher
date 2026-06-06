@@ -2535,6 +2535,7 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
             argmaxVarName: argmaxVarName,
             maxVarName: matchedMaxVar,
             inputElems: inputElems,
+            indexBase: minT,   # array index base, e.g. 1 for 1-based arrays
         )
 
         # Consume all comp-reif CIs except the trigger

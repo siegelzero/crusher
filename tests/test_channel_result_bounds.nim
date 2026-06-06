@@ -521,6 +521,107 @@ solve satisfy;
         check a * b >= 0
         check a + b >= 10
 
+    test "argmax channel: offset uses index base, not declared domain min":
+        ## tower = argmax([s1,s2,s3]) with tower declared `var 0..5` — a domain
+        ## whose min (0) sits below the 1-based array index base. The channel
+        ## offset must come from the ne_reif index values (base = 1), not
+        ## domain[0] = 0; otherwise every reported index is shifted down by one.
+        let src = """
+var 0..5: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s2, max_s], 0, ne2);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        check tr.argmaxPatterns.len == 1
+        let tPos = tr.varPositions["tower"]
+        var found = false
+        for b in tr.sys.baseArray.argmaxChannelBindings:
+            if b.channelPosition == tPos:
+                check b.valueOffset == 1     # index base, not domain min (0)
+                found = true
+        check found
+
+    test "argmax channel: end-to-end index correct with low domain min":
+        ## Same shape with inputs fixed so s2 is the max → arg_max = 2 (1-based).
+        ## Confirms the offset fix end-to-end: pre-fix this reported tower = 1.
+        let src = """
+var 0..5: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s2, max_s], 0, ne2);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+constraint int_eq(s1, 3);
+constraint int_eq(s2, 9);
+constraint int_eq(s3, 4);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 1000, verbose = false)
+        check tr.sys.assignment[tr.varPositions["tower"]] == 2
+
+    test "argmax channel: defensive bound on tightened declared domain":
+        ## tower declared `var 1..2` but the array has 3 inputs (natural index
+        ## range [1,3]). argmax is a derived position, so without a bound tower=3
+        ## could be reported outside its domain. A defensive `tower <= 2` must be
+        ## emitted on the channel value. Detection still fires because the ne_reif
+        ## indices are contiguous; the bound is a no-op once the domain spans the
+        ## full range, which is why normal argmax models gain nothing here.
+        let src = """
+var 1..2: tower :: output_var;
+var 1..10: s1 :: output_var;
+var 1..10: s2 :: output_var;
+var 1..10: s3 :: output_var;
+var 1..10: max_s :: var_is_introduced :: is_defined_var;
+var bool: ne1 :: var_is_introduced :: is_defined_var;
+var bool: ne2 :: var_is_introduced :: is_defined_var;
+var bool: ne3 :: var_is_introduced :: is_defined_var;
+constraint int_ne_reif(tower, 1, ne1) :: defines_var(ne1);
+constraint int_ne_reif(tower, 2, ne2) :: defines_var(ne2);
+constraint int_ne_reif(tower, 3, ne3) :: defines_var(ne3);
+constraint int_lin_le_reif([1, -1], [s1, max_s], 0, ne1);
+constraint int_lin_le_reif([1, -1], [s2, max_s], 0, ne2);
+constraint int_lin_le_reif([1, -1], [s3, max_s], 0, ne3);
+constraint array_int_maximum(max_s, [s1, s2, s3]) :: defines_var(max_s);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        check tr.argmaxPatterns.len == 1
+        let tPos = tr.varPositions["tower"]
+        var upperEnforced = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation == LessThanEq and
+                 tPos in c.relationalState.positions:
+                upperEnforced = true
+                break
+        check upperEnforced
+
     test "FznIntSet declared variable picks up min/max bounds":
         ## Variable declared with enumerated set `var {0, 5, 10}` → bounds
         ## [0, 10]. Array `[-1, 5, -1]` has -1 outside [0, 10], so a lower

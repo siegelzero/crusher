@@ -217,6 +217,8 @@ type
         argmaxVarName*: string        # argmax result (search variable)
         maxVarName*: string           # max(inputs) channel variable
         inputElems*: seq[FznExpr]     # input array elements (idents or int literals)
+        indexBase*: int               # smallest ne_reif index (the array index base,
+                                      # e.g. 1 for 1-based); the channel value offset
 
     MaxFromLinLeDef* = object
         ## A detected max-from-lin-le pattern:
@@ -1774,10 +1776,33 @@ proc translate*(model: FznModel): FznTranslator =
             var inputExprs: seq[AlgebraicExpression[int]]
             for elem in p.inputElems:
                 inputExprs.add(result.resolveExprArg(elem))
-            let argmaxDomain = result.sys.baseArray.domain[argmaxPos]
-            let valueOffset = argmaxDomain[0]  # min value (e.g., 1 for 1-based indexing)
+            # Offset comes from the decomposition's ne_reif index base (the array
+            # index set), NOT the declared domain min. They coincide today because
+            # detection requires the full contiguous index range, but a domain
+            # tightened from below (e.g. a folded `arg_max(x) >= k`) would shift the
+            # min while the true indices are unchanged — using domain[0] there would
+            # add a spurious offset to every reported index. Channel value =
+            # argmax(inputs, 0-based) + indexBase.
+            let valueOffset = p.indexBase
             result.sys.baseArray.addArgmaxChannelBinding(argmaxPos, inputExprs, valueOffset)
             result.channelVarNames.incl(p.argmaxVarName)
+            # Defensive declared-domain enforcement. argmax is a derived position,
+            # so a declared domain tighter than the natural index range
+            # [base, base+n-1] is not enforced during search. Detection currently
+            # only fires when the domain spans the full range (so these bounds are
+            # no-ops today), but if a tighter domain ever reaches here the channel
+            # value could be reported outside its own domain — as min/max and
+            # expression channels could before they were bounded. The index that
+            # attains the max is disjunctive, so the bound goes on the channel value
+            # itself; redundant bounds are skipped.
+            let amDom = result.sys.baseArray.domain[argmaxPos]
+            if amDom.len > 0:
+                let natLo = valueOffset
+                let natHi = valueOffset + inputExprs.len - 1
+                if natLo < min(amDom):
+                    result.sys.addConstraint(result.getExpr(argmaxPos) >= min(amDom))
+                if natHi > max(amDom):
+                    result.sys.addConstraint(result.getExpr(argmaxPos) <= max(amDom))
         else:
             inc nTranslated
             result.translateConstraint(con)
