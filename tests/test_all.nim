@@ -75,6 +75,7 @@ import test_objective_slack_bools
 import test_optimization_seed_clamp
 import test_ordering_constraint
 import test_parallel_search
+import test_value_precede
 import test_pseudo_bool_lin_le
 import test_pentominoes_geost
 import test_quasigroup7
