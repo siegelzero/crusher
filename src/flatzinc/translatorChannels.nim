@@ -1484,6 +1484,39 @@ proc buildExpressionChannelBindings(tr: var FznTranslator) =
             continue
         tr.sys.baseArray.addExpressionChannelBinding(channelPos, expr)
         inc nBuilt
+
+        # Enforce the channel result's declared domain. An expression channel is a
+        # derived position, so a declared domain tighter than the expression's
+        # natural range (e.g. `var 0..20: y` with y = a*b, a,b in 0..10) is not
+        # enforced during search — without this the solver returns solutions with y
+        # outside its own domain. Bounding the expression is sound (y = expr and
+        # y's domain forces y into [lo, hi], so expr in [lo, hi] in every valid
+        # solution) and routes the penalty through the normal input cost path. A
+        # bound already guaranteed by the input ranges is skipped to avoid dead
+        # constraints; div/mod and non-bare inputs fall back to emitting both.
+        let chDom = tr.sys.baseArray.domain[channelPos]
+        if chDom.len > 0:
+            let lo = min(chDom)
+            let hi = max(chDom)
+            var exLo, exHi: int
+            var known = false
+            const lim = 1_000_000_000  # keep plus/times interval arithmetic in range
+            if arg0.node.kind == RefNode and arg1.node.kind == RefNode:
+                let d0 = tr.sys.baseArray.domain[arg0.node.position]
+                let d1 = tr.sys.baseArray.domain[arg1.node.position]
+                if d0.len > 0 and d1.len > 0:
+                    let a0 = min(d0); let b0 = max(d0)
+                    let a1 = min(d1); let b1 = max(d1)
+                    if a0 >= -lim and b0 <= lim and a1 >= -lim and b1 <= lim:
+                        if name == "int_plus":
+                            exLo = a0 + a1; exHi = b0 + b1; known = true
+                        elif name == "int_times":
+                            let p = [a0 * a1, a0 * b1, b0 * a1, b0 * b1]
+                            exLo = min(p); exHi = max(p); known = true
+            if not (known and exLo >= lo):
+                tr.sys.addConstraint(expr >= lo)
+            if not (known and exHi <= hi):
+                tr.sys.addConstraint(expr <= hi)
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} expression channel bindings (int_times/int_div/int_mod/int_plus)")
 

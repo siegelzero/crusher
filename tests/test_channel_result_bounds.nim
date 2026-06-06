@@ -430,6 +430,97 @@ solve satisfy;
                 inc nBoundsOnM
         check nBoundsOnM == 0
 
+    test "expression channel (int_times): declared upper bound enforced":
+        ## y = x1 * x2 with x1,x2 in 2..3 (product range [4,9]) but y declared
+        ## `var 0..3`. An expression channel is a derived position, so the folded
+        ## upper bound y <= 3 is otherwise dropped and search reports y outside its
+        ## domain. The fix bounds the expression (x1*x2 <= 3), which references the
+        ## input positions. The lower bound 0 is guaranteed by the inputs → skipped.
+        let src = """
+var 2..3: x1 :: output_var;
+var 2..3: x2 :: output_var;
+var 0..3: y :: var_is_introduced :: is_defined_var :: output_var;
+constraint int_times(x1, x2, y) :: defines_var(y);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let p1 = tr.varPositions["x1"]
+        var upperEnforced = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation == LessThanEq and
+                 p1 in c.relationalState.positions:
+                upperEnforced = true
+                break
+        check upperEnforced
+
+    test "expression channel (int_plus): declared upper bound enforced":
+        ## y = x1 + x2 with x1,x2 in 6..10 (sum range [12,20]) but y declared
+        ## `var 0..5`. Upper bound y <= 5 must be enforced on the sum expression.
+        let src = """
+var 6..10: x1 :: output_var;
+var 6..10: x2 :: output_var;
+var 0..5: y :: var_is_introduced :: is_defined_var :: output_var;
+constraint int_plus(x1, x2, y) :: defines_var(y);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let p1 = tr.varPositions["x1"]
+        var upperEnforced = false
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation == LessThanEq and
+                 p1 in c.relationalState.positions:
+                upperEnforced = true
+                break
+        check upperEnforced
+
+    test "expression channel: no bound when product already within result domain":
+        ## y = x1 * x2 with x1,x2 in 0..3 (product range [0,9]) and y declared
+        ## `var 0..20`. Both bounds are guaranteed by the inputs, so the redundancy
+        ## guard must emit nothing.
+        let src = """
+var 0..3: x1 :: output_var;
+var 0..3: x2 :: output_var;
+var 0..20: y :: var_is_introduced :: is_defined_var :: output_var;
+constraint int_times(x1, x2, y) :: defines_var(y);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        let tr = translate(model)
+        let p1 = tr.varPositions["x1"]
+        let p2 = tr.varPositions["x2"]
+        var nBounds = 0
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType != RelationalType: continue
+            if c.relationalState.relation in {LessThanEq, GreaterThanEq} and
+                 (p1 in c.relationalState.positions or p2 in c.relationalState.positions):
+                inc nBounds
+        check nBounds == 0
+
+    test "expression channel (int_times): search respects declared bound":
+        ## y = x1 * x2 in [0,20], x1,x2 in 0..10, x1+x2 >= 10 keeps values up.
+        ## Without enforcement, x1=x2=10 (y=100) is a false zero-cost "solution".
+        ## With it, search must keep the product <= 20 (e.g. 10,1 or 2,8).
+        let src = """
+var 0..10: x1 :: output_var;
+var 0..10: x2 :: output_var;
+var 0..20: y :: var_is_introduced :: is_defined_var :: output_var;
+constraint int_times(x1, x2, y) :: defines_var(y);
+constraint int_lin_le([-1,-1],[x1,x2],-10);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        tr.sys.resolve(parallel = false, tabuThreshold = 3000, verbose = false)
+        let a = tr.sys.assignment[tr.varPositions["x1"]]
+        let b = tr.sys.assignment[tr.varPositions["x2"]]
+        check a * b <= 20          # the folded-in product bound holds
+        check a * b >= 0
+        check a + b >= 10
+
     test "FznIntSet declared variable picks up min/max bounds":
         ## Variable declared with enumerated set `var {0, 5, 10}` → bounds
         ## [0, 10]. Array `[-1, 5, -1]` has -1 outside [0, 10], so a lower

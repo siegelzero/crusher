@@ -2690,13 +2690,15 @@ proc translate*(model: FznModel): FznTranslator =
     # domain but outside the post-presolve singleton.
     #
     # Scope: applies only to element channelBindings, whose results come from a
-    # constant array (the sentinel-array problem). Min/max channels have the same
-    # hazard — a declared domain tighter than the input-derived range goes
-    # unenforced for the derived position — but it is handled at their source in
-    # buildMinMaxChannelBindings (translatorChannels.nim), so it is not repeated
-    # here. count_eq/argmax/expression channels are NOT covered by either pass; if
-    # their declared domain can be tighter than what the inputs produce, they need
-    # the same treatment.
+    # constant array (the sentinel-array problem). The same hazard — a declared
+    # domain tighter than the input-derived range going unenforced on a derived
+    # position — exists for other channel kinds, and each is handled at its source:
+    # min/max and int_times/int_plus/etc. expression channels in
+    # translatorChannels.nim; count_eq channels in their GCC, bin_packing, and
+    # conditional builders. argmax channels carry no explicit bound because the
+    # pattern is only detected when the result's domain spans the full input index
+    # range, so the channel value is always in-domain — relax that detection and a
+    # bound would be needed here too.
     block:
         var fznDeclLo: Table[int, int]
         var fznDeclHi: Table[int, int]
