@@ -92,6 +92,47 @@ proc latinSquare(n: int) =
 
 More examples are in the `models/` directory (magic squares, Latin squares, Langford sequences, employee scheduling, knapsack, MIP, etc.).
 
+## Docker (MiniZinc Challenge 2026)
+
+The `Dockerfile` builds Crusher's [MiniZinc Challenge 2026](https://www.minizinc.org/challenge/2026/) entry (Local Search class). It is a multi-stage build on the official `minizinc/mznc2026:latest` base: the builder stage installs Nim and compiles `fzcrusher`, and the runtime stage carries only the binary, the MiniZinc library overrides, and the solver config (`minizinc/crusher.docker.msc`), registering **Crusher as the default MiniZinc solver** inside the image.
+
+### Build and test
+
+```bash
+make docker-image     # docker build -t crusher:mznc2026 .
+make docker-test      # build, then run the challenge invocation on the toy instance
+```
+
+Override the tag with `make docker-image DOCKER_IMAGE=myrepo/crusher:latest`. The equivalent raw commands:
+
+```bash
+docker build -t crusher:mznc2026 .
+docker run --rm crusher:mznc2026 \
+    minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
+```
+
+A successful `docker-test` prints a solution to the baked-in toy model and exits 0. The build also runs a sanity check (`minizinc --solvers | grep -qi crusher`) so the build fails if Crusher isn't resolvable as the default solver.
+
+### Linux (x86_64)
+
+This is the native target — the challenge harness builds and runs the image on x86_64 Linux, so this is the path to verify before submission. Just install Docker and run the commands above; no emulation is involved and the build is straightforward:
+
+```bash
+make docker-image && make docker-test
+```
+
+### macOS (Apple Silicon)
+
+The base image is amd64-only, so on Apple Silicon Docker must emulate x86_64. Use a backend with **Rosetta 2** translation — qemu's TCG software emulation hits an intermittent gcc internal compiler error (`cc1` SIGSEGV) while compiling the solver under `-O3`. With [Colima](https://github.com/abiosoft/colima):
+
+```bash
+colima delete
+colima start --vm-type=vz --vz-rosetta --cpu 6 --memory 12
+make docker-image     # now builds reliably under Rosetta (slower than native)
+```
+
+Docker Desktop works too, provided "Use Rosetta for x86/amd64 emulation" is enabled in its settings. Note that `make test` (the native Nim test suite) is unaffected by any of this — it builds an arm64 binary directly and never touches Docker.
+
 ## Project Structure
 
 ```

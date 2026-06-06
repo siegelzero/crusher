@@ -1,7 +1,11 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test fzcrusher fzcrusher-profile mztest
+.PHONY: help test fzcrusher fzcrusher-profile mztest docker-image docker-test
+
+# Docker image tag for the MiniZinc Challenge 2026 entry (override on the
+# command line, e.g. `make docker-image DOCKER_IMAGE=myrepo/crusher:latest`).
+DOCKER_IMAGE ?= crusher:mznc2026
 
 # Default target
 help:
@@ -15,6 +19,8 @@ help:
 	@echo "  fzcrusher-profile - Build fzcrusher with iteration/moveDelta profiling enabled"
 	@echo "                       (run with -v to see [Profile] lines)"
 	@echo "  mztest            - Run MiniZinc integration tests"
+	@echo "  docker-image      - Build the MiniZinc Challenge Docker image ($(DOCKER_IMAGE))"
+	@echo "  docker-test       - Build the image and smoke-test the toy instance"
 	@echo ""
 
 test:
@@ -35,3 +41,15 @@ fzcrusher-profile:
 
 mztest: fzcrusher
 	@bash tests/mztest.sh
+
+# Build the MiniZinc Challenge 2026 image. Builds natively on x86_64 Linux; on
+# Apple Silicon you must emulate amd64 via Rosetta (see README "Docker" section)
+# — qemu's TCG software emulation hits a gcc ICE while compiling the solver.
+docker-image:
+	docker build -t $(DOCKER_IMAGE) .
+
+# Smoke-test the built image: run the exact challenge invocation against the
+# toy instance baked into the image. Should print a solution and exit 0.
+docker-test: docker-image
+	docker run --rm $(DOCKER_IMAGE) \
+	    minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
