@@ -133,6 +133,26 @@ make docker-image     # now builds reliably under Rosetta (slower than native)
 
 Docker Desktop works too, provided "Use Rosetta for x86/amd64 emulation" is enabled in its settings. Note that `make test` (the native Nim test suite) is unaffected by any of this — it builds an arm64 binary directly and never touches Docker.
 
+### Publishing and submission
+
+To enter the image in the challenge it must be pullable from a public registry (Docker Hub by convention). Build it natively on **x86_64 Linux** so the pushed image is amd64 — the architecture the challenge harness runs.
+
+```bash
+docker login        # once, interactively
+make docker-push    # build, tag, push (defaults to siegelzero/crusher:mznc2026)
+```
+
+`docker-push` builds the image (reusing Docker's layer cache), tags it as `DOCKER_PUSH_IMAGE`, and pushes that reference. It defaults to `siegelzero/crusher:mznc2026`; override for your own namespace with `make docker-push DOCKER_PUSH_IMAGE=youruser/crusher:mznc2026`. Then:
+
+1. **Make the Docker Hub repository public** so the harness can pull it without credentials.
+2. **Verify a clean pull** — drop the local copy and run the challenge invocation from the registry:
+   ```bash
+   docker rmi siegelzero/crusher:mznc2026
+   docker run --rm siegelzero/crusher:mznc2026 \
+       minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
+   ```
+3. **Register on the challenge page** — submit the public image reference (`siegelzero/crusher:mznc2026`) and the solver class (**Local Search**) per the instructions at <https://www.minizinc.org/challenge/2026/>.
+
 ## Project Structure
 
 ```

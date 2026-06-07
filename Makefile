@@ -1,11 +1,16 @@
 # Crusher CSP Solver Makefile
 # ============================
 
-.PHONY: help test fzcrusher fzcrusher-profile mztest docker-image docker-test
+.PHONY: help test fzcrusher fzcrusher-profile mztest docker-image docker-test docker-push
 
 # Docker image tag for the MiniZinc Challenge 2026 entry (override on the
 # command line, e.g. `make docker-image DOCKER_IMAGE=myrepo/crusher:latest`).
 DOCKER_IMAGE ?= crusher:mznc2026
+
+# Public registry reference to publish for the challenge submission. Defaults to
+# the maintainer's Docker Hub namespace; override for your own, e.g.
+#   make docker-push DOCKER_PUSH_IMAGE=youruser/crusher:mznc2026
+DOCKER_PUSH_IMAGE ?= siegelzero/crusher:mznc2026
 
 # Default target
 help:
@@ -21,6 +26,8 @@ help:
 	@echo "  mztest            - Run MiniZinc integration tests"
 	@echo "  docker-image      - Build the MiniZinc Challenge Docker image ($(DOCKER_IMAGE))"
 	@echo "  docker-test       - Build the image and smoke-test the toy instance"
+	@echo "  docker-push       - Tag the built image as DOCKER_PUSH_IMAGE and push it"
+	@echo "                       (run 'docker login' first; defaults to $(DOCKER_PUSH_IMAGE))"
 	@echo ""
 
 test:
@@ -53,3 +60,11 @@ docker-image:
 docker-test: docker-image
 	docker run --rm $(DOCKER_IMAGE) \
 	    minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
+
+# Publish the image for the challenge submission: build it, tag it under the
+# public registry reference, and push. Run `docker login` first and make the
+# repository public so the challenge harness can pull it without credentials.
+# Example: make docker-push DOCKER_PUSH_IMAGE=youruser/crusher:mznc2026
+docker-push: docker-image
+	docker tag $(DOCKER_IMAGE) $(DOCKER_PUSH_IMAGE)
+	docker push $(DOCKER_PUSH_IMAGE)
