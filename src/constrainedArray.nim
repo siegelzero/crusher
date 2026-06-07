@@ -2300,17 +2300,35 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 let endMax = dom[^1] + durations[i]
                 if endMax > maxEnd: maxEnd = endMax
         of ExpressionBased:
+            let emptyAsg = initTable[int, T]()
             for i in 0..<nTasks:
                 let expr = cumState.originExpressions[i]
-                for pos in expr.positions.items:
-                    let dom = carray.domain[pos]
-                    if dom.len == 0: continue
-                    if dom[0] < minStart: minStart = dom[0]
-                    if dom[^1] > maxEnd: maxEnd = dom[^1]
-                # ExpressionBased: maxEnd is approximate (from position domains, not expr evaluation)
-                # Add maximum possible duration shift
-                maxEnd += durations[i]
+                # Bound this task's start from below and above. A constant start
+                # expression (no referenced positions — e.g. a fixed MiniZinc
+                # start time) contributes its literal value; evaluating it against
+                # an empty assignment is safe because it has no RefNodes. Otherwise
+                # approximate from the domains of the referenced positions.
+                var startMin = T.high
+                var startMax = T.low
+                if expr.positions.len == 0:
+                    let s = expr.evaluate(emptyAsg)
+                    startMin = s
+                    startMax = s
+                else:
+                    for pos in expr.positions.items:
+                        let dom = carray.domain[pos]
+                        if dom.len == 0: continue
+                        if dom[0] < startMin: startMin = dom[0]
+                        if dom[^1] > startMax: startMax = dom[^1]
+                if startMin == T.high: continue  # no usable bound for this task
+                if startMin < minStart: minStart = startMin
+                let endMax = startMax + durations[i]
+                if endMax > maxEnd: maxEnd = endMax
 
+        # If no task yielded a usable window (every start constant-free with empty
+        # domains, or all origins fixed but unreadable), skip the energy bound
+        # rather than underflow computing T.low - T.high.
+        if minStart == T.high or maxEnd == T.low: continue
         let makespanMax = maxEnd - minStart
         if makespanMax <= T(0): continue
 

@@ -3874,6 +3874,37 @@ solve satisfy;
     let nonOverlapping = (s1 + 4 <= s2) or (s2 + 4 <= s1)
     check nonOverlapping or lim >= 6
 
+  test "all-constant tasks with variable limit does not overflow (peak capacity)":
+    # Regression: every task's start/duration/height is a constant, so the
+    # cumulative is ExpressionBased with constant (position-free) start
+    # expressions. The energy-bound pass computed its makespan window by scanning
+    # the start expressions' referenced positions — of which there are none — so
+    # minStart stayed high(int) and maxEnd stayed low(int), and `maxEnd - minStart`
+    # raised OverflowDefect (the solver returned ERROR / no solution).
+    #
+    # The resource profile peaks at 6 over [8,9): tasks (start 4,dur 5,h 1),
+    # (start 8,dur 1,h 3) and (start 8,dur 4,h 2). With bound in 1..6 the only
+    # feasible capacity is 6.
+    let src = """
+predicate fzn_cumulative(array [int] of var int: s, array [int] of var int: d, array [int] of var int: r, var int: b);
+var 1..6: bound;
+constraint fzn_cumulative([0, 3, 4, 6, 8, 8], [3, 2, 5, 2, 1, 4], [2, 3, 1, 4, 3, 2], bound);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+
+    var nCumulative = 0
+    for c in tr.sys.baseArray.constraints:
+      if c.stateType == CumulativeType:
+        inc nCumulative
+    check nCumulative == 1
+
+    # Must not raise OverflowDefect during setup, and must find the unique
+    # feasible capacity.
+    tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+    check tr.sys.assignment[tr.varPositions["bound"]] == 6
+
 suite "FlatZinc Variable-Duration Cumulative/Disjunctive":
 
   test "defined-var durations rescued as channels for disjunctive":
