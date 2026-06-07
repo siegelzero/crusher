@@ -326,6 +326,22 @@ proc decomposeWithIndicators(tr: var FznTranslator,
             tr.sys.addConstraint((xExpr == litV) <-> (indicatorExpr == 1))
         tr.sys.addConstraint(sum[int](indicators) == countExprs[i])
 
+proc setChannelDomainFromLookup(tr: var FznTranslator, depPos: int, lookup: seq[int]) =
+    ## A functional-dependency channel can output exactly the values present in
+    ## its lookup table. Reset the dependent variable's domain to that reachable
+    ## set so earlier bound tightening (e.g. propagated from the objective) cannot
+    ## clip a value the channel will legitimately produce during search. Without
+    ## this, a tightened domain both corrupts the channel's penalty map and lets
+    ## the tuple pre-filter drop high-cost rows (see WCSP "top" costs).
+    var seen: HashSet[int]
+    var dom: seq[int]
+    for v in lookup:
+        if v notin seen:
+            seen.incl(v)
+            dom.add(v)
+    dom.sort()
+    tr.sys.baseArray.domain[depPos] = dom
+
 proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
                         tuples: seq[seq[int]], keyCol: int): bool =
     ## Try column keyCol as a unique functional key.
@@ -334,16 +350,29 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
     if nCols < 2:
         return false
 
+    # Only consider tuples whose key value lies in the key variable's domain.
+    # The dependent columns are functionally determined by the key, so we must
+    # keep every reachable key's TRUE dependent value — even one that lies
+    # outside the dependent variable's (possibly objective-tightened) domain.
+    # Filtering on a dependent column would drop such rows and silently fall back
+    # to a default cost, corrupting the channel.
+    let keyDomSet = toHashSet(tr.sys.baseArray.domain[positions[keyCol]])
+
     var keyValues: PackedSet[int]
     var keyMin = high(int)
     var keyMax = low(int)
-    for t in tuples:
+    var firstIdx = -1
+    for ti, t in tuples:
+        if t[keyCol] notin keyDomSet: continue
         let k = t[keyCol]
         if k in keyValues:
             return false  # duplicate — not a unique key
         keyValues.incl(k)
         if k < keyMin: keyMin = k
         if k > keyMax: keyMax = k
+        if firstIdx < 0: firstIdx = ti
+    if firstIdx < 0:
+        return false
 
     let keyRange = keyMax - keyMin + 1
     if keyRange > tuples.len * 2:
@@ -355,13 +384,14 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
         if c != keyCol:
             depCols.add(c)
 
-    # Use first tuple's value as default for gap indices — keyRange may exceed
-    # tuples.len when keys are sparse, and a low(int) sentinel propagates through
-    # constraint evaluation as overflow during initial channel computation.
+    # Use first in-domain tuple's value as default for gap indices — keyRange may
+    # exceed the number of keys when keys are sparse, and a low(int) sentinel
+    # propagates through constraint evaluation as overflow.
     var lookups = newSeq[seq[int]](depCols.len)
     for i, depCol in depCols:
-        lookups[i] = newSeqWith(keyRange, tuples[0][depCol])
+        lookups[i] = newSeqWith(keyRange, tuples[firstIdx][depCol])
     for t in tuples:
+        if t[keyCol] notin keyDomSet: continue
         let idx = t[keyCol] - keyMin
         for i, depCol in depCols:
             lookups[i][idx] = t[depCol]
@@ -383,6 +413,7 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
         for j in 0..<keyRange:
             arrayElems[j] = ArrayElement[int](isConstant: true, constantValue: lookups[i][j])
         tr.sys.baseArray.addChannelBinding(depPos, keyExpr, arrayElems)
+        tr.setChannelDomainFromLookup(depPos, lookups[i])
 
     return true
 
@@ -399,17 +430,35 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
     if nKeys < 1 or nKeys >= nCols:
         return false
 
-    # Compute ranges for each key column
+    # Only consider tuples whose key values all lie within their key variables'
+    # domains (see trySingleColumnKey): the dependent columns are functionally
+    # determined, so they must retain their true values and are never filtered.
+    var keyDomSets = newSeq[HashSet[int]](nKeys)
+    for i in 0..<nKeys:
+        keyDomSets[i] = toHashSet(tr.sys.baseArray.domain[positions[keyCols[i]]])
+
+    proc keyInDom(t: seq[int]): bool =
+        for i in 0..<nKeys:
+            if t[keyCols[i]] notin keyDomSets[i]:
+                return false
+        return true
+
+    # Compute ranges for each key column over in-domain tuples
     var keyMins = newSeq[int](nKeys)
     var keyMaxs = newSeq[int](nKeys)
     for i in 0..<nKeys:
         keyMins[i] = high(int)
         keyMaxs[i] = low(int)
-    for t in tuples:
+    var firstIdx = -1
+    for ti, t in tuples:
+        if not keyInDom(t): continue
+        if firstIdx < 0: firstIdx = ti
         for i in 0..<nKeys:
             let v = t[keyCols[i]]
             if v < keyMins[i]: keyMins[i] = v
             if v > keyMaxs[i]: keyMaxs[i] = v
+    if firstIdx < 0:
+        return false
 
     var keyRanges = newSeq[int](nKeys)
     var totalRange = 1
@@ -431,6 +480,7 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
 
     var compositeKeys: PackedSet[int]
     for t in tuples:
+        if not keyInDom(t): continue
         let lk = linearizeKey(t, keyCols, keyMins, keyRanges)
         if lk in compositeKeys:
             return false
@@ -439,6 +489,7 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
     # Filter key columns' domains to values present in the table
     var keyValueSets = newSeq[PackedSet[int]](nKeys)
     for t in tuples:
+        if not keyInDom(t): continue
         for i in 0..<nKeys:
             keyValueSets[i].incl(t[keyCols[i]])
     for i in 0..<nKeys:
@@ -462,13 +513,14 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
     if depCols.len == 0:
         return false
 
-    # Build linearized lookup arrays, using first tuple's values as default
-    # for gaps (avoids sentinel low(int) causing overflow in constraint evaluation)
+    # Build linearized lookup arrays, using first in-domain tuple's values as
+    # default for gaps (avoids sentinel low(int) causing overflow in evaluation)
     var lookups = newSeq[seq[int]](depCols.len)
     for i in 0..<depCols.len:
-        let defaultVal = tuples[0][depCols[i]]
+        let defaultVal = tuples[firstIdx][depCols[i]]
         lookups[i] = newSeqWith(totalRange, defaultVal)
     for t in tuples:
+        if not keyInDom(t): continue
         let idx = linearizeKey(t, keyCols, keyMins, keyRanges)
         for i, depCol in depCols:
             lookups[i][idx] = t[depCol]
@@ -484,6 +536,7 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
         for j in 0..<totalRange:
             arrayElems[j] = ArrayElement[int](isConstant: true, constantValue: lookups[i][j])
         tr.sys.baseArray.addChannelBinding(depPos, compositeExpr, arrayElems)
+        tr.setChannelDomainFromLookup(depPos, lookups[i])
 
     return true
 
@@ -2026,50 +2079,57 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         reducedDefinesVarCol = reducedIdx
                     inc reducedIdx
 
-            # Filter tuples by variable domains (remove rows with unsupported values)
-            var domainFiltered: seq[seq[int]]
-            var domainSets = newSeq[HashSet[int]](reducedPositions.len)
-            for col in 0..<reducedPositions.len:
-                domainSets[col] = toHashSet(tr.sys.baseArray.domain[reducedPositions[col]])
-            for t in filtered:
-                var valid = true
-                for col in 0..<t.len:
-                    if t[col] notin domainSets[col]:
-                        valid = false
-                        break
-                if valid:
-                    domainFiltered.add(t)
-            filtered = domainFiltered
-
-            if filtered.len > 0:
-                # Try functional dependency: if col0 values are unique, dependent cols become channels
-                if not tr.tryTableFunctionalDep(reducedPositions, filtered, reducedDefinesVarCol):
-                    if not tr.tryTableComplementConversion(reducedPositions, filtered):
-                        tr.sys.addConstraint(tableIn[int](reducedPositions, filtered))
-            else:
+            # Try functional dependency on the singleton-projected table FIRST,
+            # before any dependent-column domain filtering: the key procs filter
+            # on key columns only and keep each reachable key's true dependent
+            # value (if col0 values are unique, dependent cols become channels).
+            if filtered.len == 0:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
+            elif not tr.tryTableFunctionalDep(reducedPositions, filtered, reducedDefinesVarCol):
+                # Not functional — fall back to penalty-based tableIn, where
+                # filtering tuples by variable domains is sound.
+                var domainFiltered: seq[seq[int]]
+                var domainSets = newSeq[HashSet[int]](reducedPositions.len)
+                for col in 0..<reducedPositions.len:
+                    domainSets[col] = toHashSet(tr.sys.baseArray.domain[reducedPositions[col]])
+                for t in filtered:
+                    var valid = true
+                    for col in 0..<t.len:
+                        if t[col] notin domainSets[col]:
+                            valid = false
+                            break
+                    if valid:
+                        domainFiltered.add(t)
+                if domainFiltered.len > 0:
+                    if not tr.tryTableComplementConversion(reducedPositions, domainFiltered):
+                        tr.sys.addConstraint(tableIn[int](reducedPositions, domainFiltered))
+                else:
+                    stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
         elif allRefs:
-            # Filter tuples by variable domains (remove rows with unsupported values)
-            var domainFiltered: seq[seq[int]]
-            var domainSets = newSeq[HashSet[int]](positions.len)
-            for col in 0..<positions.len:
-                domainSets[col] = toHashSet(tr.sys.baseArray.domain[positions[col]])
-            for t in tuples:
-                var valid = true
-                for col in 0..<t.len:
-                    if t[col] notin domainSets[col]:
-                        valid = false
-                        break
-                if valid:
-                    domainFiltered.add(t)
-
-            if domainFiltered.len > 0:
-                # Try functional dependency on the domain-filtered table
-                if not tr.tryTableFunctionalDep(positions, domainFiltered, definesVarCol):
+            # Try functional dependency on the FULL table first — see
+            # trySingleColumnKey: filtering tuples by a (possibly objective-
+            # tightened) dependent column's domain would drop high-cost rows and
+            # replace those keys' costs with a default value.
+            if not tr.tryTableFunctionalDep(positions, tuples, definesVarCol):
+                # Not functional — penalty-based tableIn, where filtering tuples
+                # by variable domains is sound.
+                var domainFiltered: seq[seq[int]]
+                var domainSets = newSeq[HashSet[int]](positions.len)
+                for col in 0..<positions.len:
+                    domainSets[col] = toHashSet(tr.sys.baseArray.domain[positions[col]])
+                for t in tuples:
+                    var valid = true
+                    for col in 0..<t.len:
+                        if t[col] notin domainSets[col]:
+                            valid = false
+                            break
+                    if valid:
+                        domainFiltered.add(t)
+                if domainFiltered.len > 0:
                     if not tr.tryTableComplementConversion(positions, domainFiltered):
                         tr.sys.addConstraint(tableIn[int](positions, domainFiltered))
-            else:
-                stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
+                else:
+                    stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
         else:
             # Some expressions are not simple variable references (e.g., defined vars
             # with linear expressions, or constants). Materialize them:
