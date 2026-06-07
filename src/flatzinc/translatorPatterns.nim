@@ -4238,6 +4238,18 @@ proc detectSetIntersectCardPattern(tr: var FznTranslator) =
             if arg.kind == FznIdent and arg.ident in cardVarRefCount:
                 cardVarRefCount[arg.ident] += 1
 
+    # The optimisation objective is referenced in the solve item, not in any
+    # constraint's args, so the refcount check below cannot see it. When the
+    # cardinality variable IS the objective its VALUE is read (maximised), but the
+    # fused penalty constraint only bounds |A∩B| and never computes the cardinality
+    # — fusing would leave the objective disconnected. Fall back to the general
+    # set_intersect + set_card decomposition, which channels n = Σ C.bools.
+    var objectiveName = ""
+    if tr.model.solve.kind in {Minimize, Maximize} and
+       tr.model.solve.objective != nil and
+       tr.model.solve.objective.kind == FznIdent:
+        objectiveName = tr.model.solve.objective.ident
+
     # Step 4: Match and record fused patterns
     var nDetected = 0
     var nBoolsSkipped = 0
@@ -4245,6 +4257,9 @@ proc detectSetIntersectCardPattern(tr: var FznTranslator) =
         let intersectInfo = intersectResults[sName]
         # Check cardinality variable is only used in the set_card constraint (refcount == 1)
         if cardInfo.cardVarName != "" and cardVarRefCount.getOrDefault(cardInfo.cardVarName, 0) != 1:
+            continue
+        # Don't fuse when the cardinality variable is the objective (see above).
+        if cardInfo.cardVarName != "" and cardInfo.cardVarName == objectiveName:
             continue
 
         # Mark set_intersect as defining (we'll create channel bindings instead)

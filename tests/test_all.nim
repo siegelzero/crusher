@@ -89,6 +89,7 @@ import test_send_more_money
 import test_sequence
 import test_set_equality_table
 import test_set_intersect_card
+import test_set_intersect_card_objective
 import test_simple_element
 import test_sparse_clamp_channels
 import test_table_constraint
