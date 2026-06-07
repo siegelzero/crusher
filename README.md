@@ -39,21 +39,27 @@ All targets compile with `nim c --threads:on --mm:arc --deepcopy:on -d:release`.
 # Parallel with 8 workers, verbose output, statistics
 ./fzcrusher -p 8 -v -s --time-limit 60000 problem.fzn
 
-# Fast mode (lower tabu threshold for quicker convergence)
-./fzcrusher -f --time-limit 10000 problem.fzn
+# Cap peak memory: fit the worker count under a 2 GiB budget
+./fzcrusher --memory 2048 --time-limit 10000 problem.fzn
 ```
 
 **Always pass `--time-limit <ms>`** to avoid unbounded runs. The time limit is in milliseconds.
 
 | Flag | Description |
 |------|-------------|
-| `-p <N>` | Number of parallel workers (0 = auto) |
+| `-p <N>` | Number of parallel workers (0 = auto, honours `NUM_CPUS`) |
 | `-v` | Verbose output to stderr |
 | `-s` | Print solve statistics |
+| `-i` | Stream intermediate (improving) solutions |
 | `-t <ms>`, `--time-limit <ms>` | Time limit in milliseconds |
 | `--tabu <N>` | Tabu threshold (default 10000) |
-| `-f` | Fast mode (threshold = 1000) |
+| `--memory <MiB>` | Memory budget; caps workers to fit (also reads `MEMORY_LIMIT` / cgroup) |
 | `-a` | All solutions mode |
+
+Under a memory budget, Crusher measures one worker state's resident size and
+reduces the worker count (and scatter population) so peak memory stays within
+budget — trading parallelism for a lower footprint rather than risking an
+out-of-memory kill.
 
 ### With MiniZinc
 
@@ -108,7 +114,7 @@ Override the tag with `make docker-image DOCKER_IMAGE=myrepo/crusher:latest`. Th
 ```bash
 docker build -t crusher:mznc2026 .
 docker run --rm crusher:mznc2026 \
-    minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
+    minizinc -i --output-mode dzn --output-objective /crusher/test.mzn
 ```
 
 A successful `docker-test` prints a solution to the baked-in toy model and exits 0. The build also runs a sanity check (`minizinc --solvers | grep -qi crusher`) so the build fails if Crusher isn't resolvable as the default solver.
@@ -149,7 +155,7 @@ make docker-push    # build, tag, push (defaults to siegelzero/crusher:mznc2026)
    ```bash
    docker rmi siegelzero/crusher:mznc2026
    docker run --rm siegelzero/crusher:mznc2026 \
-       minizinc -i --output-mode dzn --output-objective -f /crusher/test.mzn
+       minizinc -i --output-mode dzn --output-objective /crusher/test.mzn
    ```
 3. **Register on the challenge page** — submit the public image reference (`siegelzero/crusher:mznc2026`) and the solver class (**Local Search**) per the instructions at <https://www.minizinc.org/challenge/2026/>.
 
