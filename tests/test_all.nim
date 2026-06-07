@@ -54,6 +54,7 @@ import test_increasing_constraint
 import test_intuitive_operators
 import test_irdcs
 import test_knapsack
+import test_memory_budget
 import test_langford_sequence
 import test_latin_square
 import test_lex_order

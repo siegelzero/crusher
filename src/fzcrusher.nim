@@ -11,6 +11,8 @@
 ##   -t <ms>       time limit in milliseconds (MiniZinc standard flag)
 ##   --time-limit <ms>  alias for -t
 ##   --tabu <N>    tabu threshold (default 10000)
+##   --memory <MiB>  memory budget; caps workers so peak memory fits (also reads
+##                   the MEMORY_LIMIT env var and the cgroup limit)
 
 import std/[os, strutils, strformat, times, posix]
 
@@ -59,6 +61,7 @@ proc main() =
   var allSolutions = false
   var streamSolutions = false
   var timeLimitMs = 0
+  var memoryLimitMB = 0
 
   # Parse command line arguments
   var i = 1
@@ -89,6 +92,13 @@ proc main() =
       inc i
       if i <= paramCount():
         tabuThreshold = parseInt(paramStr(i))
+    of "--memory":
+      # Memory budget override (MiB, or with a g/m suffix). Caps the worker count
+      # so peak memory stays under budget. Also read from the MEMORY_LIMIT env var
+      # and the cgroup limit when this flag is absent (see memoryBudget.nim).
+      inc i
+      if i <= paramCount():
+        memoryLimitMB = parseMemMB(paramStr(i))
     else:
       if arg.startsWith("-"):
         stderr.writeLine(&"Unknown option: {arg}")
@@ -108,6 +118,7 @@ proc main() =
     stderr.writeLine("  -t <ms>         time limit in milliseconds")
     stderr.writeLine("  --time-limit <ms>  alias for -t")
     stderr.writeLine("  --tabu <N>      tabu threshold (default 10000)")
+    stderr.writeLine("  --memory <MiB>  memory budget; caps workers to fit (also reads MEMORY_LIMIT)")
     quit(1)
 
   if not fileExists(filename):
@@ -168,6 +179,11 @@ proc main() =
   signal(SIGINT, sigTermHandler)
   signal(SIGPIPE, SIG_IGN)  # Ignore broken pipe (MiniZinc may close stdout early)
 
+  # Honour a memory budget (--memory / MEMORY_LIMIT / cgroup) by capping the
+  # worker count — peak memory is dominated by per-worker state copies, so fewer
+  # workers means lower peak. No-op (workers unchanged) when no budget applies.
+  let effectiveWorkers = memoryFittedWorkerCount(tr.sys, numWorkers, memoryLimitMB, verbose)
+
   # Intermediate-solution streaming (`-i`). During solving, stdout is redirected to
   # stderr, so we write each improving solution directly to the *real* stdout (savedFd)
   # via a raw write — no buffering, no interference with the redirected solver output.
@@ -195,7 +211,7 @@ proc main() =
       tr.sys.resolve(
         parallel = parallel,
         tabuThreshold = tabuThreshold,
-        numWorkers = numWorkers,
+        numWorkers = effectiveWorkers,
         verbose = verbose,
         deadline = deadline
       )
@@ -212,7 +228,7 @@ proc main() =
         minimize(tr.sys, tr.weightedSameValueExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
@@ -223,7 +239,7 @@ proc main() =
         minimize(tr.sys, tr.binaryPairwiseSumExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
@@ -237,7 +253,7 @@ proc main() =
         minimize(tr.sys, objExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
@@ -264,7 +280,7 @@ proc main() =
         maximize(tr.sys, tr.weightedSameValueExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
@@ -275,7 +291,7 @@ proc main() =
         maximize(tr.sys, tr.binaryPairwiseSumExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
@@ -289,7 +305,7 @@ proc main() =
         maximize(tr.sys, objExpr,
           parallel = parallel,
           tabuThreshold = tabuThreshold,
-          numWorkers = numWorkers,
+          numWorkers = effectiveWorkers,
           verbose = verbose,
           deadline = deadline,
           lowerBound = tr.objectiveLoBound,
