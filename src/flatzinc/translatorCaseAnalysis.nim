@@ -1469,11 +1469,19 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
                     synthSources[di] = c.sourceVar
                     inc coveredCount
             if coveredCount == 0: inc dbgNoArray; continue
-            # Fill uncovered slots with the target itself (tautological "T = T").
-            # Without this the channel would over-constrain: search would assume
-            # T equals some specific source for cond values we have no info on.
-            for i in 0..<synthSources.len:
-                if synthSources[i] == "": synthSources[i] = targetVar
+            # Require FULL coverage: every condition value must map to a real
+            # source for the channel to be a sound functional definition of T.
+            # If some cond values are uncovered, T is not functionally determined
+            # there — that signals a genuine disjunction with an escape branch
+            # (e.g. seat-moving's "target seat was empty" alternative), where the
+            # target-equality is only one disjunct, not a forced definition.
+            # Channelizing T then both over-constrains the covered values (forcing
+            # an equality the model only offers as one option) and discards the
+            # escape branch, silently dropping the constraint. Reject instead of
+            # papering over the gap with a tautological "T = T" default.
+            if coveredCount < condDom.len:
+                inc dbgOther
+                continue
             tr.channelVarNames.incl(targetVar)
             tr.conditionalSourceDefs.add(ConditionalSourceDef(
                 targetVarName: targetVar,
@@ -1543,31 +1551,15 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
             inc dbgOther
             continue
 
-        # Fill uncovered slots: use target's own array index if available
+        # Require FULL coverage (see the synthetic-source path above for the
+        # rationale): an uncovered condition value means T is not functionally
+        # determined there, signalling a disjunction with an escape branch rather
+        # than a true conditional definition. Filling the gap with a default
+        # source would both over-constrain the covered values and silently drop
+        # the escape branch, so reject the def instead.
         if coveredCount < condDom.len:
-            var hasDefault = false
-            if targetVar in varToArrays:
-                var tArr = ""
-                var tIdx = -1
-                for a in varToArrays[targetVar]:
-                    if a.arrayName == commonArrayName:
-                        tArr = a.arrayName
-                        tIdx = a.idx
-                        break
-                if tArr == commonArrayName and tIdx >= 0:
-                    for i in 0..<sourceMap.len:
-                        if sourceMap[i] == 0:
-                            sourceMap[i] = tIdx + 1
-                    hasDefault = true
-            if not hasDefault:
-                var defaultIdx = 0
-                for si in sourceMap:
-                    if si > 0: defaultIdx = si; break
-                if defaultIdx > 0:
-                    for i in 0..<sourceMap.len:
-                        if sourceMap[i] == 0: sourceMap[i] = defaultIdx
-                    hasDefault = true
-            if not hasDefault: continue
+            inc dbgOther
+            continue
 
         # Validate sourceMap
         let arrayMembers = varArrayMembers[commonArrayName]
