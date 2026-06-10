@@ -4,6 +4,8 @@
 # Leave min_obj or max_obj empty to skip that bound check
 # For satisfy problems, both bounds are ignored
 
+seat_moving_sm_10_20_05,2018/seat-moving/seat-moving.mzn,2018/seat-moving/sm-10-20-05.dzn,minimize,20000,90,100
+
 cable_tree_wiring_A031,2020/cable_tree_wiring/ctw.mzn,2020/cable_tree_wiring/A031.dzn,minimize,10000,24104,48208
 ecp_xIGData_22_12_22_5,2020/soccer-computational/ecp.mzn,2020/soccer-computational/xIGData_22_12_22_5.dzn,satisfy,10000,,
 lot_sizing_pigment15b,2020/lot-sizing/lot_sizing_cp.mzn,2020/lot-sizing/pigment15b.psp.dzn,minimize,10000,1123,10000

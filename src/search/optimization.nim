@@ -2,6 +2,7 @@
 import resolution
 from std/times import epochTime
 import std/packedsets
+import std/tables
 import ../constraints/[types, circuitTimeProp]
 
 when compileOption("threads"):
@@ -37,6 +38,34 @@ import ../constrainedArray
 type
     OptimizationDirection* = enum
         Minimize, Maximize
+
+proc applyObjectiveStaging[T](system: ConstraintSystem[T], targetBound: int, verbose: bool) =
+    ## When the objective upper bound `targetBound` implies the dominant gating
+    ## variable `v <= k`, apply the precomputed staged-presolve fixings (singleton
+    ## domain + fixedPositions) so the gated blocks collapse before local search runs.
+    ## Sound: each fixing was derived by presolve under `v <= k`, and is applied only
+    ## when `objective <= targetBound` requires `v <= k`. Minimize / weight>0 only.
+    let st = system.objectiveStaging
+    if not st.active or st.weight <= 0: return
+    # objective >= weight*v + minRest and objective <= targetBound
+    #   => v <= floor((targetBound - minRest) / weight)
+    let num = targetBound - st.minRest
+    var kB = num div st.weight
+    if num < 0 and (num mod st.weight) != 0:
+        dec kB   # floor division for a negative numerator
+    if kB >= st.vHi: return    # bound does not constrain v
+    if kB < st.vLo: return     # implies v below its domain: subproblem infeasible — let search report it
+    if kB notin st.fixingsByBound: return
+    let fixes = st.fixingsByBound[kB]
+    if fixes.len == 0: return
+    for (pos, val) in fixes:
+        system.baseArray.reducedDomain[pos] = @[val]
+        system.baseArray.fixedPositions.incl(pos)
+    system.baseArray.tightenReducedDomain()
+    if verbose:
+        echo "[Opt] Staging: objective<=", targetBound, " implies v<=", kB,
+             " (fixed ", fixes.len, " gated positions)"
+        flushFile(stdout)
 
 
 
@@ -236,6 +265,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             system.baseArray.reducedDomain = baseReducedDomain
             system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
             system.baseArray.tightenReducedDomain()
+            when direction == Minimize:
+                applyObjectiveStaging(system, target, verbose)
 
             if verbose:
                 echo "[Opt] Trying ", target, " [", lo, "..", hi, "]"
@@ -319,10 +350,29 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = target - 1
                     hiProven = true
             except NoSolutionFoundError:
-                # Tabu-only couldn't find — break to retry with scatter search
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
-                break
+                # If staging fixed gated blocks at this target (i.e. the target forced
+                # the dominant variable v into a stage), a failure means that stage is
+                # too tight at this bound — narrow UP and keep bisecting toward the
+                # feasible stage rather than abandoning to the retry phase. Without
+                # staging (full model), keep the original behaviour: break to scatter.
+                var stagedTarget = false
+                when direction == Minimize:
+                    let st = system.objectiveStaging
+                    if st.active and st.weight > 0:
+                        let num = target - st.minRest
+                        var kB = num div st.weight
+                        if num < 0 and (num mod st.weight) != 0: dec kB
+                        if kB >= st.vLo and kB < st.vHi: stagedTarget = true
+                if stagedTarget:
+                    when direction == Minimize:
+                        lo = target + 1
+                    else:
+                        hi = target - 1
+                else:
+                    # Tabu-only couldn't find — break to retry with scatter search
+                    break
             finally:
                 system.baseArray.constraints = savedConstraints
                 system.baseArray.fixedPositions = copyPackedSet(savedFixed)
@@ -380,6 +430,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.baseArray.reducedDomain = baseReducedDomain
                 system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
                 system.baseArray.tightenReducedDomain()
+                when direction == Minimize:
+                    applyObjectiveStaging(system, currentCost - 1, verbose)
 
                 let savedConstraints2 = system.baseArray.constraints
                 let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)

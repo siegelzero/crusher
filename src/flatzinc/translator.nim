@@ -437,6 +437,13 @@ type
         varDomainIndex*: Table[string, int]
         # Presolve-tightened domains: applied during translateVariables, not during pattern detection
         presolveDomains*: Table[string, seq[int]]
+        # Staged-presolve probe controls. When stagingBoundActive, presolve() intersects
+        # the initial domain of stagingBoundVar with [.. stagingBoundHi]; presolveQuiet
+        # suppresses presolve's stderr summary during repeated staged probes.
+        stagingBoundActive*: bool
+        stagingBoundVar*: string
+        stagingBoundHi*: int
+        presolveQuiet*: bool
         # Synthetic element channels: precomputed lookup tables for conditional gain variables
         syntheticElementChannels*: seq[tuple[varName: string, originVar: string, lookupTable: seq[int]]]
         # int_mod channel defs: Z = X mod C implemented as element channel with lookup table
@@ -979,6 +986,118 @@ include translatorBoolChannels
 include translatorObjectiveSlack
 include translatorScheduling
 include translatorCircuitTime
+
+proc buildObjectiveStaging(tr: var FznTranslator) =
+    ## Detect a linear objective dominated by a small-domain decision variable that
+    ## gates structural blocks via reified implications, and precompute — for each
+    ## value bound `v <= k` — the extra variable-fixings that bound implies once
+    ## presolve cascades it through the gating clauses. The optimizer applies the
+    ## matching fixings whenever its objective bound implies `v <= k`. This is keyed
+    ## on objective/gating structure (makespan/stage/mode-style variables), not on
+    ## any particular model. Reuses the existing `presolve()` as the propagator, so
+    ## the fixings are exactly as sound as presolve itself.
+    # Supported case: minimize with a positive-weight dominant term (`v` bounded above
+    # as the objective improves). The symmetric maximize / negative-weight cases are
+    # future work — guarding here keeps the optimizer-side bound arithmetic unambiguous.
+    if tr.model.solve.kind != Minimize: return
+    if tr.objectivePos != ObjPosDefinedExpr: return
+    if tr.objectiveDefExpr.isNil or not tr.objectiveDefExpr.linear: return
+    let lin = linearize(tr.objectiveDefExpr)
+    if lin.coefficient.len < 2: return   # need a dominant term plus a residual
+
+    # position -> variable name (only named, non-channel search vars qualify as `v`)
+    var posToName = initTable[int, string]()
+    for name, p in tr.varPositions:
+        posToName[p] = name
+
+    const StageMaxDomain = 32   # bounds the number of staged presolve probes
+    var bestPos = -1
+    var bestW = 0
+    for pos, w in lin.coefficient:
+        if w == 0: continue
+        if pos notin posToName: continue
+        if pos < 0 or pos >= tr.sys.baseArray.len: continue
+        if pos in tr.sys.baseArray.channelPositions: continue
+        let dsize = tr.sys.baseArray.domain[pos].len
+        if dsize < 2 or dsize > StageMaxDomain: continue
+        if abs(w) > abs(bestW):
+            bestW = w
+            bestPos = pos
+    if bestPos < 0: return
+
+    if bestW <= 0: return   # minimize: only a positive-weight term is bounded above
+
+    let vname = posToName[bestPos]
+    let vdom = tr.sys.baseArray.domain[bestPos]
+    let vLo = vdom.min
+    let vHi = vdom.max
+    if vHi - vLo < 1: return
+
+    # Valid lower bound on (objective - weight*v): extreme contribution of every other
+    # objective term over its declared domain, plus the constant.
+    var minRest = lin.constant
+    for pos, w in lin.coefficient:
+        if pos == bestPos or w == 0: continue
+        if pos < 0 or pos >= tr.sys.baseArray.len: return
+        let d = tr.sys.baseArray.domain[pos]
+        if d.len == 0: return
+        minRest += (if w > 0: w * d.min else: w * d.max)
+
+    var baselineFixed = initHashSet[string]()
+    for nm, dom in tr.presolveDomains:
+        if dom.len == 1: baselineFixed.incl(nm)
+
+    # Snapshot presolve-mutated translator state, probe each k, then restore.
+    let savedPD = tr.presolveDomains
+    let savedDC = tr.definingConstraints
+    let savedRVt = tr.reachableValuesTightened
+    let savedRVr = tr.reachableValuesRemoved
+    tr.presolveQuiet = true
+    tr.stagingBoundActive = true
+    tr.stagingBoundVar = vname
+
+    var fixingsByBound = initTable[int, seq[(int, int)]]()
+    var maxFixes = 0
+    for k in vLo ..< vHi:
+        tr.stagingBoundHi = k
+        tr.presolve()
+        var fixes: seq[(int, int)] = @[]
+        for nm, dom in tr.presolveDomains:
+            if dom.len != 1: continue
+            if nm == vname or nm in baselineFixed: continue
+            if nm notin tr.varPositions: continue
+            let p = tr.varPositions[nm]
+            if p in tr.sys.baseArray.channelPositions: continue
+            if p in tr.sys.baseArray.fixedPositions: continue
+            fixes.add((p, dom[0]))
+        fixingsByBound[k] = fixes
+        maxFixes = max(maxFixes, fixes.len)
+        tr.presolveDomains = savedPD
+        tr.definingConstraints = savedDC
+
+    tr.stagingBoundActive = false
+    tr.stagingBoundVar = ""
+    tr.stagingBoundHi = 0
+    tr.presolveQuiet = false
+    tr.presolveDomains = savedPD
+    tr.definingConstraints = savedDC
+    tr.reachableValuesTightened = savedRVt
+    tr.reachableValuesRemoved = savedRVr
+
+    const MinFixesToActivate = 2
+    if maxFixes < MinFixesToActivate: return
+
+    tr.sys.objectiveStaging = ObjectiveStaging(
+        active: true,
+        boundVar: bestPos,
+        weight: bestW,
+        minRest: minRest,
+        vLo: vLo,
+        vHi: vHi,
+        fixingsByBound: fixingsByBound,
+    )
+    stderr.writeLine(&"[FZN] Objective staging: var '{vname}' (weight={bestW}, dom {vLo}..{vHi}), " &
+                     &"{vHi - vLo} stages, up to {maxFixes} positions fixed per stage")
 
 proc translate*(model: FznModel): FznTranslator =
     ## Translates a complete FznModel to a ConstraintSystem.
@@ -3034,3 +3153,7 @@ proc translate*(model: FznModel): FznTranslator =
     if result.model.solve.kind in {Minimize, Maximize} and
        (result.objectivePos >= 0 or result.objectivePos == ObjPosDefinedExpr):
         result.tightenObjectiveBoundsKnapsack()
+
+    # Precompute staged-presolve fixings for an objective dominated by a small-domain
+    # gating variable (applied by the optimizer when its objective bound implies them).
+    result.buildObjectiveStaging()

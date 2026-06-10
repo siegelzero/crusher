@@ -1,7 +1,7 @@
 ## Tests for the conditional-source channel + clause-pruning extensions
 ## (translatorCaseAnalysis.nim, translatorChannels.nim).
 ##
-## Three behaviours are covered:
+## Four behaviours are covered:
 ##   1. derive2LitClauseCondVals — picks up the "else" branch from a
 ##      no-neg 2-literal disjunction clause [cond_reif, eq_reif]. Without
 ##      this the detector saw only the implication clauses and built
@@ -14,6 +14,11 @@
 ##      tr.disjunctiveClauses entries that are tautologically satisfied
 ##      once the channel is built. Catches the lot-sizing case where
 ##      14+14 phantom clauses produced 65% of the initial cost.
+##   4. Full-coverage requirement — when some condition values have no source
+##      mapping, T is a genuine disjunction with an escape branch, not a forced
+##      definition. The detector must REJECT the def (both the legacy and the
+##      synthetic path) instead of filling the hole with a tautological default,
+##      which would over-constrain and let the prune drop the escape clause.
 
 import unittest
 import std/[sequtils, sets, strutils, tables]
@@ -276,3 +281,153 @@ solve satisfy;
     tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
     # cond=0 → t = a = 4.
     check tr.sys.assignment[tr.varPositions["t"]] == 4
+
+
+suite "Conditional-source: partial coverage (escape branch) rejected":
+  ## Regression guard for the disjunction-with-escape soundness fix in
+  ## detectConditionalSourceChannels. When a condition value has no source
+  ## mapping, T is not functionally determined there — the target-equality is
+  ## just one disjunct of a real disjunction (e.g. seat-moving's "target seat
+  ## was empty" alternative), not a forced definition. Channelizing T anyway
+  ## both over-constrains the covered values AND lets the prune pass drop the
+  ## escape clause, silently weakening the model. The detector must reject the
+  ## def in BOTH the legacy common-array path and the synthetic cross-array
+  ## path, leaving the original clauses for search.
+  ##
+  ## Each model uses two per-value implication clauses (no catch-all
+  ## disjunction), so cond value 2 is left genuinely uncovered.
+
+  test "legacy path: an uncovered cond value blocks the channel":
+    ## cond ∈ {0,1,2}; only 0→a and 1→b are mapped, both sources in src_arr.
+    ## coveredCount (2) < |condDom| (3) ⇒ no def is built.
+    let src = """
+var 0..2: cond :: output_var;
+var 0..9: a :: output_var;
+var 0..9: b :: output_var;
+var 0..9: t :: output_var;
+array [1..2] of var int: src_arr ::var_is_introduced = [a, b];
+var bool: b_cond0 ::var_is_introduced ::is_defined_var;
+var bool: b_cond1 ::var_is_introduced ::is_defined_var;
+var bool: b_a ::var_is_introduced ::is_defined_var;
+var bool: b_b ::var_is_introduced ::is_defined_var;
+constraint int_eq_reif(cond, 0, b_cond0) :: defines_var(b_cond0);
+constraint int_eq_reif(cond, 1, b_cond1) :: defines_var(b_cond1);
+constraint int_eq_reif(t, a, b_a) :: defines_var(b_a);
+constraint int_eq_reif(t, b, b_b) :: defines_var(b_b);
+constraint bool_clause([b_a], [b_cond0]);
+constraint bool_clause([b_b], [b_cond1]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.conditionalSourceDefs.len == 0
+    check "t" notin tr.channelVarNames
+
+  test "legacy path: full coverage of the same shape still builds the channel":
+    ## Positive control: add c and map cond=2→c so every value is covered. The
+    ## def IS built, proving the hole (not an unrelated rejection) is what
+    ## blocks the partial case above.
+    let src = """
+var 0..2: cond :: output_var;
+var 0..9: a :: output_var;
+var 0..9: b :: output_var;
+var 0..9: c :: output_var;
+var 0..9: t :: output_var;
+array [1..3] of var int: src_arr ::var_is_introduced = [a, b, c];
+var bool: b_cond0 ::var_is_introduced ::is_defined_var;
+var bool: b_cond1 ::var_is_introduced ::is_defined_var;
+var bool: b_cond2 ::var_is_introduced ::is_defined_var;
+var bool: b_a ::var_is_introduced ::is_defined_var;
+var bool: b_b ::var_is_introduced ::is_defined_var;
+var bool: b_c ::var_is_introduced ::is_defined_var;
+constraint int_eq_reif(cond, 0, b_cond0) :: defines_var(b_cond0);
+constraint int_eq_reif(cond, 1, b_cond1) :: defines_var(b_cond1);
+constraint int_eq_reif(cond, 2, b_cond2) :: defines_var(b_cond2);
+constraint int_eq_reif(t, a, b_a) :: defines_var(b_a);
+constraint int_eq_reif(t, b, b_b) :: defines_var(b_b);
+constraint int_eq_reif(t, c, b_c) :: defines_var(b_c);
+constraint bool_clause([b_a], [b_cond0]);
+constraint bool_clause([b_b], [b_cond1]);
+constraint bool_clause([b_c], [b_cond2]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # Full coverage ⇒ T is functionally determined, so it MUST be channelized
+    # (unlike the hole case above, which leaves the escape clause for search).
+    # The overlapping case-analysis detector runs first and also requires full
+    # coverage, so on this common-array shape it claims T; the conditional-source
+    # detector is the fallback. Either is sound — what the positive control proves
+    # is that full coverage, not an unrelated rejection, is what builds the channel.
+    check "t" in tr.channelVarNames
+    check (tr.conditionalSourceDefs.len == 1) or (tr.caseAnalysisDefs.len >= 1)
+    # If the conditional-source path claimed it, verify its recovered mapping.
+    if tr.conditionalSourceDefs.len == 1:
+      let def = tr.conditionalSourceDefs[0]
+      check def.condVarName == "cond"
+      # All three covered: cond=0→a(1), 1→b(2), 2→c(3).
+      if def.sourceVars.len > 0:
+        check def.sourceVars == @["a", "b", "c"]
+      else:
+        check def.sourceMap == @[1, 2, 3]
+
+  test "synthetic path: an uncovered cond value blocks the channel":
+    ## Same hole, but the branches read from different declared arrays, so the
+    ## detector takes the synthetic-sourceVars path. It must reject there too
+    ## (the other branch the fix changed).
+    let src = """
+var 0..2: cond :: output_var;
+var 0..9: a :: output_var;
+var 0..9: b :: output_var;
+var 0..9: t :: output_var;
+array [1..1] of var int: arr_then ::var_is_introduced = [a];
+array [1..1] of var int: arr_else ::var_is_introduced = [b];
+var bool: b_cond0 ::var_is_introduced ::is_defined_var;
+var bool: b_cond1 ::var_is_introduced ::is_defined_var;
+var bool: b_a ::var_is_introduced ::is_defined_var;
+var bool: b_b ::var_is_introduced ::is_defined_var;
+constraint int_eq_reif(cond, 0, b_cond0) :: defines_var(b_cond0);
+constraint int_eq_reif(cond, 1, b_cond1) :: defines_var(b_cond1);
+constraint int_eq_reif(t, a, b_a) :: defines_var(b_a);
+constraint int_eq_reif(t, b, b_b) :: defines_var(b_b);
+constraint bool_clause([b_a], [b_cond0]);
+constraint bool_clause([b_b], [b_cond1]);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.conditionalSourceDefs.len == 0
+    check "t" notin tr.channelVarNames
+
+  test "escape branch is honored when solving the uncovered value":
+    ## End-to-end: pin cond to the uncovered value 2. Had the channel been
+    ## (wrongly) built, the default fill would force T to a source; here T must
+    ## stay free to satisfy int_eq(t, 5) with 5 ∉ {a=3, b=7}. Reaching t == 5
+    ## confirms the escape branch survived translation.
+    let src = """
+var 0..2: cond :: output_var;
+var 0..9: a :: output_var;
+var 0..9: b :: output_var;
+var 0..9: t :: output_var;
+array [1..2] of var int: src_arr ::var_is_introduced = [a, b];
+var bool: b_cond0 ::var_is_introduced ::is_defined_var;
+var bool: b_cond1 ::var_is_introduced ::is_defined_var;
+var bool: b_a ::var_is_introduced ::is_defined_var;
+var bool: b_b ::var_is_introduced ::is_defined_var;
+constraint int_eq_reif(cond, 0, b_cond0) :: defines_var(b_cond0);
+constraint int_eq_reif(cond, 1, b_cond1) :: defines_var(b_cond1);
+constraint int_eq_reif(t, a, b_a) :: defines_var(b_a);
+constraint int_eq_reif(t, b, b_b) :: defines_var(b_b);
+constraint bool_clause([b_a], [b_cond0]);
+constraint bool_clause([b_b], [b_cond1]);
+constraint int_eq(cond, 2);
+constraint int_eq(a, 3);
+constraint int_eq(b, 7);
+constraint int_eq(t, 5);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.conditionalSourceDefs.len == 0
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    check tr.sys.assignment[tr.varPositions["t"]] == 5

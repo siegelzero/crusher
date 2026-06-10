@@ -5229,6 +5229,11 @@ proc applyPresolveResults(tr: var FznTranslator,
 proc presolve*(tr: var FznTranslator) =
     ## Main entry point: fixpoint propagation loop.
     var domains = tr.initPresolveDomains()
+    # Staged-presolve probe: intersect the dominant variable's initial domain with
+    # [.. stagingBoundHi] so the fixpoint cascades the implied `v <= k` bound through
+    # the model's gating clauses (see ObjectiveStaging). No effect when inactive.
+    if tr.stagingBoundActive and tr.stagingBoundVar.len > 0 and tr.stagingBoundVar in domains:
+        domains[tr.stagingBoundVar] = domains[tr.stagingBoundVar].filterIt(it <= tr.stagingBoundHi)
     var fixedVars = initTable[string, int]()
     var eliminated = initPackedSet[int]()
     var infeasible = false
@@ -5414,7 +5419,8 @@ proc presolve*(tr: var FznTranslator) =
             discard fixSingletons(domains, fixedVars)
 
     if infeasible:
-        stderr.writeLine(&"[FZN] Presolve: infeasibility detected at iteration {totalIterations}")
+        if not tr.presolveQuiet:
+            stderr.writeLine(&"[FZN] Presolve: infeasibility detected at iteration {totalIterations}")
         # Still apply what we can — the solver will discover infeasibility
         tr.applyPresolveResults(domains, fixedVars, eliminated)
         return
@@ -5427,10 +5433,11 @@ proc presolve*(tr: var FznTranslator) =
 
     tr.applyPresolveResults(domains, fixedVars, eliminated)
 
-    if nFixed > 0 or eliminated.len > 0 or tr.presolveDomains.len > 0:
-        stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated, {tr.presolveDomains.len} domains tightened")
-    if tr.reachableValuesTightened > 0:
-        stderr.writeLine(&"[FZN] Presolve: reachable-values propagation tightened {tr.reachableValuesTightened} domains ({tr.reachableValuesRemoved} values removed)")
+    if not tr.presolveQuiet:
+        if nFixed > 0 or eliminated.len > 0 or tr.presolveDomains.len > 0:
+            stderr.writeLine(&"[FZN] Presolve: {totalIterations} iterations, {nFixed} vars fixed, {eliminated.len} constraints eliminated, {tr.presolveDomains.len} domains tightened")
+        if tr.reachableValuesTightened > 0:
+            stderr.writeLine(&"[FZN] Presolve: reachable-values propagation tightened {tr.reachableValuesTightened} domains ({tr.reachableValuesRemoved} values removed)")
 
 proc repropagateBounds*(tr: var FznTranslator) =
     ## Run linear bounds propagation + big-M indicator pruning AFTER detection

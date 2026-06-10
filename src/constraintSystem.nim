@@ -28,6 +28,24 @@ type
     ConstrainedMatrix*[T] = ref object of VariableContainer[T]
         m*, n*: int
 
+    ObjectiveStaging* = object
+        ## Precomputed "staged presolve" data for a linear objective dominated by a
+        ## small-domain decision variable `v` that gates structural blocks via reified
+        ## implications (e.g. a makespan/stage/mode variable). For a minimization with
+        ## `objective = weight*v + rest` (weight > 0), bounding the objective implies a
+        ## bound `v <= k`, which — once propagated through the model's gating
+        ## clauses by presolve — fixes whole blocks of variables. We precompute those
+        ## extra fixings per `k` at translate time and apply them in the optimizer
+        ## whenever its objective bound implies `v <= k`. Sound: every fixing comes from
+        ## presolve under `v <= k`, applied only when `v <= k` is required.
+        active*: bool
+        boundVar*: int          # position of the dominant variable v (informational)
+        weight*: int            # coefficient of v in the objective (currently always > 0)
+        minRest*: int           # valid lower bound on (objective - weight*v)
+        vLo*, vHi*: int         # domain bounds of v
+        # k -> list of (position, value) to fix when the objective bound implies v <= k
+        fixingsByBound*: Table[int, seq[(int, int)]]
+
     ConstraintSystem*[T] = ref object
         size*: int
         variables*: seq[VariableContainer[T]]
@@ -40,6 +58,7 @@ type
         bestAssignmentValid*: bool  # Guard for signal handler: false during write, true after
         optimalityProven*: bool  # Domain reduction proved no better solution exists
         adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
+        objectiveStaging*: ObjectiveStaging  # Staged-presolve fixings (inactive by default)
 
 ################################################################################
 # ConstraintSystem creation
