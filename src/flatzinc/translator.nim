@@ -1415,6 +1415,13 @@ proc translate*(model: FznModel): FznTranslator =
     # to consume the int_lin_eq has already had its chance, and before translateVariables
     # so the promoted vars don't get search positions allocated.
     result.detectImplicitLinEqDefinedVars()
+    # Promote leftover unannotated constant-array element constraints to channel
+    # variables (MZN sometimes omits defines_var on table-lookup outputs).
+    # MUST run after all element-consuming pattern detectors (circuit-time,
+    # scheduling, etc. — consumed constraints sit in definingConstraints) and
+    # after detectImplicitLinEqDefinedVars (whose targets feed the cycle check),
+    # and before translateVariables so channel vars get positions.
+    result.detectImplicitElementChannels()
     # Re-run defined-var rescue: a var promoted by detectImplicitLinEqDefinedVars
     # may also appear as an element of a var-indexed array (e.g. remainder[good[p]]
     # in stable-goods) and therefore needs an actual position to be channeled into.

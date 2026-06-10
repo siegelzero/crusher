@@ -914,6 +914,224 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Promoted {nDetected} unannotated int_lin_eq vars to defined channels (sum+slack=capacity pattern)")
 
+proc detectImplicitElementChannels*(tr: var FznTranslator) =
+    ## Promotes constant-array element constraints WITHOUT `defines_var` to
+    ## channel variables. MiniZinc sometimes omits the annotation on element
+    ## outputs (observed on cost-table lookups feeding the objective), leaving
+    ## the result var to be SEARCHED with a hard Element constraint: every index
+    ## move then violates the constraint until the result var is separately
+    ## repaired, so penalty maps never see the true cost delta of the index move
+    ## and search stalls on the coupled repair.
+    ##
+    ## Eligibility for `array_int_element(idx, arr, y)` / `array_bool_element`
+    ## without defines_var:
+    ##   - idx and y are idents; y is a declared scalar var without inline
+    ##     value, not a parameter, not the objective
+    ##   - y is not search-annotated (respect an explicit search hint), not
+    ##     already defined/channeled, and not claimed by any defines_var
+    ##   - y is the element result of exactly ONE element constraint in the
+    ##     model (unique functional definition)
+    ##   - every value in idx's (presolved) domain lands inside the array, and
+    ##     more than one distinct value is reachable (single-value elements are
+    ##     left for the element peephole, which folds them into equalities)
+    ##   - y's declared domain is an interval, or every reachable array value
+    ##     lies in it:
+    ##     channel bound enforcement (translator.nim) emits interval bounds
+    ##     only, so a holey domain that excludes reachable array values cannot
+    ##     be enforced on a derived position and the element must stay a
+    ##     hard constraint
+    ##   - idx's defining chain does not reach y (no channel cascade cycle)
+    ##
+    ## Var-array element forms are NOT promoted: their value range is unknown
+    ## at translation time, so a result domain tighter than the elements' range
+    ## could not be enforced after promotion.
+    ##
+    ## MUST run after all specialised pattern detectors (they get first pick of
+    ## element constraints; consumed ones sit in definingConstraints) and
+    ## before translateVariables (channel vars need positions allocated).
+    const constElementNames = ["array_int_element", "array_int_element_nonshifted",
+                                                         "array_bool_element"]
+    const allElementNames = ["array_var_int_element", "array_var_int_element_nonshifted",
+                                                     "array_int_element", "array_int_element_nonshifted",
+                                                     "array_var_bool_element", "array_var_bool_element_nonshifted",
+                                                     "array_bool_element"]
+
+    # Vars claimed as defined targets by any annotation in the model.
+    var alreadyDefined = initHashSet[string]()
+    for con in tr.model.constraints:
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                alreadyDefined.incl(ann.args[0].ident)
+
+    # Element-result occurrence counts: a var produced by two element
+    # constraints has no unique functional definition.
+    var resultCount = initCountTable[string]()
+    for con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if name in allElementNames and con.args.len >= 3 and con.args[2].kind == FznIdent:
+            resultCount.inc(con.args[2].ident)
+
+    # Conservative dependency graph over defined/channeled vars for the cycle
+    # check. Where a defining constraint's target is known (annotation or
+    # implicit lin_eq promotion), edge target -> every other ident; where it is
+    # ambiguous (constraints consumed by pattern detectors), every defined or
+    # channeled var in the constraint is treated as a target. Over-approximates:
+    # may reject a legal promotion, never accepts a cyclic one.
+    proc addDeps(defDeps: var Table[string, HashSet[string]],
+                             con: FznConstraint, target: string) =
+        var deps = initHashSet[string]()
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident != target:
+                deps.incl(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for elem in arg.elems:
+                    if elem.kind == FznIdent and elem.ident != target:
+                        deps.incl(elem.ident)
+        if target in defDeps:
+            for d in deps:
+                defDeps[target].incl(d)
+        else:
+            defDeps[target] = deps
+
+    var defDeps: Table[string, HashSet[string]]
+    for ci in tr.definingConstraints:
+        let con = tr.model.constraints[ci]
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                addDeps(defDeps, con, ann.args[0].ident)
+            continue
+        if ci in tr.implicitLinEqDefinedVars:
+            addDeps(defDeps, con, tr.implicitLinEqDefinedVars[ci])
+            continue
+        # Target unknown: over-approximate with every defined/channeled ident
+        for arg in con.args:
+            if arg.kind == FznIdent:
+                if arg.ident in tr.channelVarNames or arg.ident in tr.definedVarNames:
+                    addDeps(defDeps, con, arg.ident)
+            elif arg.kind == FznArrayLit:
+                for elem in arg.elems:
+                    if elem.kind == FznIdent and
+                         (elem.ident in tr.channelVarNames or elem.ident in tr.definedVarNames):
+                        addDeps(defDeps, con, elem.ident)
+
+    proc chainReaches(defDeps: Table[string, HashSet[string]],
+                                        start, goal: string): bool =
+        ## BFS along defining-dependency edges: true if `goal` is (transitively)
+        ## upstream of `start`.
+        if start == goal: return true
+        var visited = initHashSet[string]()
+        var queue = @[start]
+        visited.incl(start)
+        while queue.len > 0:
+            let cur = queue.pop()
+            if cur in defDeps:
+                for nxt in defDeps[cur]:
+                    if nxt == goal: return true
+                    if nxt notin visited:
+                        visited.incl(nxt)
+                        queue.add(nxt)
+        return false
+
+    tr.buildVarDomainIndex()
+    var objVarName = ""
+    if tr.model.solve.kind in {Minimize, Maximize} and
+         tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        objVarName = tr.model.solve.objective.ident
+
+    var nPromoted = 0
+    for ci, con in tr.model.constraints:
+        if ci in tr.definingConstraints: continue
+        let name = stripSolverPrefix(con.name)
+        if name notin constElementNames: continue
+        if con.hasAnnotation("defines_var"): continue
+        if con.args.len < 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let idxName = con.args[0].ident
+        let yName = con.args[2].ident
+        if yName == idxName or yName == objVarName: continue
+        if yName in tr.paramValues or idxName in tr.paramValues: continue
+        if yName in tr.annotatedSearchVarNames: continue
+        if yName in tr.definedVarNames or yName in tr.channelVarNames: continue
+        if yName in alreadyDefined: continue
+        if resultCount[yName] != 1: continue
+        if yName notin tr.varDomainIndex: continue
+        let decl = tr.model.variables[tr.varDomainIndex[yName]]
+        if decl.value != nil: continue
+
+        var arrVals: seq[int]
+        try:
+            arrVals = tr.resolveIntArray(con.args[1])
+        except CatchableError:
+            continue
+        if arrVals.len == 0: continue
+
+        # Every index value must land inside the array: an element whose index
+        # domain exceeds the array bounds prunes the index and must stay a hard
+        # constraint (a channel binding would also index out of range).
+        let idxDom = tr.lookupTightenedDomain(idxName)
+        if idxDom.len == 0: continue
+        var inBounds = true
+        var reachable: seq[int]
+        for v in idxDom:
+            if v < 1 or v > arrVals.len:
+                inBounds = false
+                break
+            reachable.add(arrVals[v - 1])
+        if not inBounds: continue
+
+        # Single reachable value: leave for the element peephole, which folds
+        # the constraint into a plain equality during constraint translation.
+        var allSameVal = true
+        for v in reachable:
+            if v != reachable[0]:
+                allSameVal = false
+                break
+        if allSameVal: continue
+
+        # Domain coverage: interval domains are enforceable by channel bound
+        # enforcement; holey set domains only if no reachable array value can
+        # land in a hole.
+        var domainOk = false
+        case decl.varType.kind
+        of FznIntRange, FznBool, FznInt:
+            domainOk = true
+        of FznIntSet:
+            let vals = decl.varType.values
+            if vals.len > 0:
+                var lo = vals[0]
+                var hi = vals[0]
+                for v in vals:
+                    if v < lo: lo = v
+                    if v > hi: hi = v
+                if hi - lo + 1 == vals.len:
+                    domainOk = true  # contiguous set == interval
+                else:
+                    let valSet = vals.toHashSet
+                    domainOk = true
+                    for v in reachable:
+                        if v notin valSet:
+                            domainOk = false
+                            break
+        else:
+            discard
+        if not domainOk: continue
+
+        if chainReaches(defDeps, idxName, yName): continue
+
+        # Promote: identical bookkeeping to the annotated element-channel path
+        # in collectDefinedVars.
+        tr.channelVarNames.incl(yName)
+        tr.channelConstraints[ci] = yName
+        tr.definingConstraints.incl(ci)
+        # Later candidates must not form a cycle through y.
+        addDeps(defDeps, con, yName)
+        inc nPromoted
+
+    if nPromoted > 0:
+        stderr.writeLine(&"[FZN] Promoted {nPromoted} unannotated element constraints to channels")
+
 proc buildDefinedExpressions(tr: var FznTranslator) =
     ## Second pass: build AlgebraicExpressions for defined variables using the positions
     ## of non-defined variables that are already created.

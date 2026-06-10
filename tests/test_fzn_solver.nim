@@ -4596,3 +4596,178 @@ solve satisfy;
     let model = parseFzn(src)
     var tr = translate(model)
     check tr.elementPeepholeCount == 1
+
+suite "Implicit element channel promotion":
+  # detectImplicitElementChannels: constant-array element constraints WITHOUT
+  # defines_var whose result var is uniquely functionally defined become
+  # channel variables instead of search positions + hard Element constraints.
+
+  proc hasChannelBindingFor(tr: FznTranslator, varName: string): bool =
+    if varName notin tr.varPositions: return false
+    let pos = tr.varPositions[varName]
+    for b in tr.sys.baseArray.channelBindings:
+      if b.channelPosition == pos: return true
+    false
+
+  test "unannotated const-array element → channel":
+    # Multiple distinct reachable values, interval result domain: y must be
+    # promoted to a channel with a binding, not searched.
+    let src = """
+var 1..4: idx;
+var 0..50: y :: output_var;
+array [1..4] of int: a = [10, 20, 30, 40];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" in tr.channelVarNames
+    check tr.hasChannelBindingFor("y")
+    check tr.varPositions["y"] in tr.sys.baseArray.channelPositions
+    check tr.elementPeepholeCount == 0
+
+  test "promoted channel solves consistently end-to-end":
+    # y >= 25 restricts idx to {3, 4}; the channel must track a[idx] exactly.
+    let src = """
+var 1..4: idx :: output_var;
+var 0..50: y :: output_var;
+array [1..4] of int: a = [10, 20, 30, 40];
+constraint array_int_element(idx, a, y);
+constraint int_lin_le([-1], [y], -25);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" in tr.channelVarNames
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let arr = [10, 20, 30, 40]
+    let idxVal = tr.sys.assignment[tr.varPositions["idx"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check yVal == arr[idxVal - 1]
+    check yVal >= 25
+
+  test "search-annotated result var is not promoted":
+    # An explicit int_search listing y is respected: y stays a search position
+    # and the element stays a hard constraint.
+    let src = """
+var 1..3: idx;
+var 0..30: y;
+array [1..3] of int: a = [5, 15, 25];
+constraint array_int_element(idx, a, y);
+solve :: int_search([idx, y], first_fail, indomain_min, complete) satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" notin tr.channelVarNames
+    check not tr.hasChannelBindingFor("y")
+
+  test "result var claimed by defines_var elsewhere is not promoted":
+    # y is functionally defined by the int_lin_eq (y = 2x); the element is a
+    # genuine constraint on y and must not be stolen as a channel definition.
+    let src = """
+var 1..3: idx;
+var 0..15: x;
+var 0..30: y :: is_defined_var;
+array [1..3] of int: a = [6, 14, 22];
+constraint int_lin_eq([2, -1], [x, y], 0) :: defines_var(y);
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" notin tr.channelVarNames
+    for _, chanName in tr.channelConstraints:
+      check chanName != "y"
+
+  test "result var produced by two element constraints is not promoted":
+    # No unique functional definition: both elements constrain the same y
+    # (an implicit equality between two lookups) and both must stay.
+    let src = """
+var 1..3: i1;
+var 1..3: i2;
+var 0..30: y;
+array [1..3] of int: a = [5, 15, 25];
+array [1..3] of int: b = [5, 10, 25];
+constraint array_int_element(i1, a, y);
+constraint array_int_element(i2, b, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" notin tr.channelVarNames
+    check not tr.hasChannelBindingFor("y")
+
+  test "single reachable value is left to the element peephole":
+    # All-equal array: the peephole folds the element into y = 7; the
+    # promotion pass must not claim it first. (y is an output var so the
+    # dead-element consumption path doesn't take it either.)
+    let src = """
+var 1..4: idx;
+var 0..10: y :: output_var;
+array [1..4] of int: a = [7, 7, 7, 7];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    # The element constraint must not be claimed as a channel definition
+    # (presolve-fixed vars may enter channelVarNames through other machinery,
+    # so assert on channelConstraints rather than the name set).
+    for _, chanName in tr.channelConstraints:
+      check chanName != "y"
+    check tr.elementPeepholeCount == 1
+
+  test "sentinel value below result domain → promoted with bound enforcement":
+    # Mirrors the directCost pattern from liner-sf-repositioning: -1 marks
+    # infeasible slots and y's domain starts at 0. The element is promoted and
+    # the channel-bound machinery forbids the sentinel, so idx=1 (value -1)
+    # never appears in a solution.
+    let src = """
+var 1..3: idx :: output_var;
+var 0..50: y :: output_var;
+array [1..3] of int: a = [-1, 20, 30];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" in tr.channelVarNames
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let idxVal = tr.sys.assignment[tr.varPositions["idx"]]
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check idxVal >= 2
+    check yVal == [-1, 20, 30][idxVal - 1]
+
+  test "holey result domain with presolve-pruned reachable set → promoted soundly":
+    # y ∈ {3, 5, 9} and a = [3, 5, 7]: presolve prunes idx to {1, 2} (7 is
+    # unreachable), after which every reachable value sits in y's domain and
+    # promotion is sound. Solutions must never produce y = 7.
+    let src = """
+var 1..3: idx :: output_var;
+var {3, 5, 9}: y :: output_var;
+array [1..3] of int: a = [3, 5, 7];
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" in tr.channelVarNames
+    tr.sys.resolve(parallel = true, tabuThreshold = 5000, verbose = false)
+    let yVal = tr.sys.assignment[tr.varPositions["y"]]
+    check yVal in [3, 5]
+
+  test "cycle through defined index var is not promoted":
+    # idx is defined as 4 - y, so promoting the element would make y's channel
+    # evaluation depend on itself. The cycle guard must keep it a constraint.
+    let src = """
+var 1..3: idx :: is_defined_var;
+var 1..3: y;
+array [1..3] of int: a = [2, 3, 1];
+constraint int_lin_eq([1, 1], [y, idx], 4) :: defines_var(idx);
+constraint array_int_element(idx, a, y);
+solve satisfy;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check "y" notin tr.channelVarNames
+    check not tr.hasChannelBindingFor("y")
