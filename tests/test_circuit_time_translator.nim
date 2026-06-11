@@ -84,9 +84,10 @@ suite "Circuit-time successor-form detection":
         check cand.distMatrix[3][1] == 6 + 3   # 2 -> 4
         check cand.distMatrix[0][2] == 2 + 0   # 3 -> 1
         check cand.distMatrix[0][3] == 0       # node 4 unconstrained: zero row
-        # Time windows: fixed node pinned, others from domains
+        # Time windows: fixed node pinned, others from (presolve-tightened)
+        # domains — t1 <= 48 and t2 <= 47 follow from the lin_le chains
         check cand.earlyTimes == @[0, 0, 0, 0]
-        check cand.lateTimes == @[50, 50, 0, 50]
+        check cand.lateTimes == @[48, 47, 0, 50]
         # Emitted as the only global constraint; the circuit was consumed
         check tr.countType(CircuitTimePropType) == 1
         check tr.countType(CircuitType) == 0
@@ -111,7 +112,10 @@ suite "Circuit-time successor-form detection":
         check tr.countType(CircuitTimePropType) == 1
 
     test "round-trip: solution is a circuit with exact earliest times":
-        var tr = translate(parseFzn(SuccBase & "solve satisfy;\n"))
+        # minimize m so the inequality->earliest projection applies (under
+        # plain satisfy with an observed max the verifier rejects, by design)
+        var tr = translate(parseFzn(SuccBase & "solve minimize m;\n"))
+        check tr.circuitTimeCandidates.len == 1
         tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
         let s = @[tr.val("s1"), tr.val("s2"), tr.val("s3"), 3]
         # Hamiltonian circuit over 4 nodes
@@ -212,6 +216,14 @@ suite "Circuit-time objective linkage and soundness verification":
 
     test "maximize over observed times: candidate rejected":
         let tr = translate(parseFzn(SuccBase & "solve maximize m;\n"))
+        check tr.circuitTimeCandidates.len == 0
+        check tr.countType(CircuitTimePropType) == 0
+        check tr.countType(CircuitType) == 1
+
+    test "satisfy with observed max: candidate rejected":
+        # No objective direction justifies projecting times to their minima
+        # while a max over them is observable.
+        let tr = translate(parseFzn(SuccBase & "solve satisfy;\n"))
         check tr.circuitTimeCandidates.len == 0
         check tr.countType(CircuitTimePropType) == 0
         check tr.countType(CircuitType) == 1

@@ -844,22 +844,26 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
                 var cObj = 0
                 for vi, vn in varNames:
                     if vn == objName: cObj = coeffs[vi]
+                # Pass 1: drop candidates whose max enters the objective with a
+                # non-positive effective weight (w = -c_v / c_obj): minimizing
+                # the objective then presses those times UP, so the
+                # earliest-time projection is unsound.
+                for vi, vn in varNames:
+                    if vn == objName or vn notin maxOwner: continue
+                    let signNum = -coeffs[vi] * (if cObj < 0: -1 else: 1)
+                    if signNum <= 0:
+                        keep[maxOwner[vn]] = false
+                # Pass 2: cleanliness — bound distribution is only valid when
+                # EVERY non-objective term is a full-coverage max owned by a
+                # surviving candidate (a dropped or partial term's objective
+                # contribution would be missing from the bound formula).
                 var clean = cObj == 1 or cObj == -1
                 for vi, vn in varNames:
                     if vn == objName: continue
-                    if vn notin maxOwner or not keep[maxOwner[vn]]:
-                        # Extra terms, or a max owned by a dropped candidate:
-                        # the bound formula would omit its objective
-                        # contribution, so no bound distribution at all.
+                    if vn notin maxOwner or not keep[maxOwner[vn]] or
+                       not maxCoverage.getOrDefault(vn, false):
                         clean = false
-                        continue
-                    # effective weight sign: w = -c_v / c_obj; minimizing the
-                    # objective must press the max (and the times) DOWN.
-                    let signNum = -coeffs[vi] * (if cObj < 0: -1 else: 1)
-                    if signNum <= 0:
-                        keep[maxOwner[vn]] = false   # unsound projection
-                    if not maxCoverage.getOrDefault(vn, false):
-                        clean = false   # partial max: weights would over-prune
+                        break
                 if clean:
                     for vi, vn in varNames:
                         if vn == objName or vn notin maxOwner: continue
