@@ -2882,17 +2882,26 @@ func valueSupport*[T](cellPos: int, neighbourPositions: seq[int], maxVal: T): St
 ################################################################################
 
 func circuitTimeProp*[T](
-        predPositions: openArray[int],
+        linkPositions: openArray[int],
         distanceMatrix: seq[seq[T]],
         earlyTimes, lateTimes: seq[T],
         depotIndex: int,
         depotDeparture: T,
         arrivalPositions, departurePositions: seq[int],
-        valueOffset: int = 1
+        valueOffset: int = 1,
+        forward: bool = false,
+        fixedLinks: seq[int] = @[],
+        outConstrained: seq[bool] = @[],
+        useMaxMetric: bool = false,
+        objectiveWeight: int = 0,
+        objectiveMetricLo: T = T(0),
+        objectiveConstOffset: T = T(0)
     ): StatefulConstraint[T] =
     let c = newCircuitTimePropConstraint[T](
-        predPositions, distanceMatrix, earlyTimes, lateTimes,
-        depotIndex, depotDeparture, arrivalPositions, departurePositions, valueOffset)
+        linkPositions, distanceMatrix, earlyTimes, lateTimes,
+        depotIndex, depotDeparture, arrivalPositions, departurePositions, valueOffset,
+        forward, fixedLinks, outConstrained, useMaxMetric,
+        objectiveWeight, objectiveMetricLo, objectiveConstOffset)
     return StatefulConstraint[T](
         positions: c.positions,
         stateType: CircuitTimePropType,

@@ -2430,6 +2430,13 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
     ## The A positions become channel variables.
     ## Also consumes matching GCC/alldifferent_except_0 constraints on A.
 
+    # Circuit-time link variables must remain searchable: the emitted
+    # CircuitTimeProp constraints are attached to their positions.
+    var ctProtected: HashSet[string]
+    for cand in tr.circuitTimeCandidates:
+        for vn in cand.linkVarNames:
+            if vn.len > 0: ctProtected.incl(vn)
+
     # Step 1: Group array_var_int_element constraints by their array argument
     var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
     for ci, con in tr.model.constraints:
@@ -2516,6 +2523,15 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
         if not resultValsValid:
             continue
 
+        # Never channelize arrays containing circuit-time link variables
+        var containsProtected = false
+        for en in arrayElemNames:
+            if en in ctProtected:
+                containsProtected = true
+                break
+        if containsProtected:
+            continue
+
         # Find matching GCC or alldifferent_except_0 constraints on the array positions
         let arrayPosSet = toPackedSet(arrayPositions)
         var gccCIs: seq[int]
@@ -2591,7 +2607,28 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
                 if pos in posToVarName: channeledByB.incl(posToVarName[pos])
             if patA.indexVarNames.toHashSet() == channeledByB and
                patB.indexVarNames.toHashSet() == channeledByA:
-                # Mutual inverse pair: keep i (patA), suppress j (patB)
+                # Mutual inverse pair: channelize the side holding fewer
+                # annotated search variables (deterministic, instead of
+                # detection-order-dependent). Annotated vars carry the
+                # modeller's search strategy and should remain searchable.
+                var scoreA = 0
+                for en in channeledByA:
+                    if en in tr.annotatedSearchVarNames: inc scoreA
+                var scoreB = 0
+                for en in channeledByB:
+                    if en in tr.annotatedSearchVarNames: inc scoreB
+                if scoreA > scoreB:
+                    # patA's array holds the annotated vars: suppress patA, keep patB
+                    tr.suppressedInversePatterns.incl(i)
+                    for ci in patA.elementCIs:
+                        tr.definingConstraints.excl(ci)
+                    for ci in patA.gccCIs:
+                        tr.definingConstraints.excl(ci)
+                    stderr.writeLine(&"[FZN] Suppressed mutual-inverse secondary pattern on " &
+                                     &"'{patA.arrayName}' ('{patB.arrayName}' is channel, " &
+                                     &"'{patA.arrayName}' positions remain searchable)")
+                    break  # pattern i is suppressed; stop pairing it
+                # Keep i (patA), suppress j (patB)
                 tr.suppressedInversePatterns.incl(j)
                 # Un-consume the suppressed pattern's constraints so they remain active
                 for ci in patB.elementCIs:

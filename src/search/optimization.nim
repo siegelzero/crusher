@@ -39,6 +39,48 @@ type
     OptimizationDirection* = enum
         Minimize, Maximize
 
+proc applyCircuitTimeObjectiveBounds[T](system: ConstraintSystem[T],
+                                        target: T, minimize: bool) =
+    ## Distribute a global objective upper bound across CircuitTimeProp
+    ## instances. The translator links instances to the objective as
+    ##   objective = sum_i w_i * metric_i + constOffset   (all w_i > 0)
+    ## so any solution with objective <= target satisfies, for each instance i:
+    ##   metric_i <= (target - constOffset - sum_{j != i} w_j * metricLo_j) / w_i
+    ## Instances with objectiveWeight == 0 are not linked to the objective and
+    ## get no bound. The single-instance TSPTW case (weight 1, offset 0,
+    ## metricLo 0) reduces to the plain bound metric <= target.
+    var linked: seq[CircuitTimePropConstraint[T]]
+    for c in system.baseArray.constraints:
+        if c.stateType == CircuitTimePropType:
+            if minimize and c.circuitTimePropState.objectiveWeight > 0:
+                linked.add(c.circuitTimePropState)
+            else:
+                c.circuitTimePropState.clearObjectiveBound()
+    if linked.len == 0: return
+    # All linked instances must agree on the objective's constant offset (they
+    # were extracted from the same linear definition). If they don't (e.g. a
+    # legacy pred-form instance mixed with weighted successor-form instances),
+    # fall back to the plain bound metric <= target, which is looser and
+    # therefore sound for weights >= 1 and non-negative metric lower bounds.
+    var offsetsAgree = true
+    for c in linked:
+        if c.objectiveConstOffset != linked[0].objectiveConstOffset:
+            offsetsAgree = false
+            break
+    if not offsetsAgree:
+        for c in linked:
+            c.setObjectiveBound(target)
+        return
+    var weightedLoSum: T = linked[0].objectiveConstOffset
+    for c in linked:
+        weightedLoSum += T(c.objectiveWeight) * c.objectiveMetricLo
+    for c in linked:
+        let slack = target - (weightedLoSum - T(c.objectiveWeight) * c.objectiveMetricLo)
+        var bound = slack div T(c.objectiveWeight)
+        if slack < 0 and (slack mod T(c.objectiveWeight)) != 0:
+            dec bound   # floor division for a negative numerator
+        c.setObjectiveBound(bound)
+
 proc applyObjectiveStaging[T](system: ConstraintSystem[T], targetBound: int, verbose: bool) =
     ## When the objective upper bound `targetBound` implies the dominant gating
     ## variable `v <= k`, apply the precomputed staged-presolve fixings (singleton
@@ -256,12 +298,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.addConstraint(objective >= target)
             hasBoundConstraint = true
             # Set objective bound on CircuitTimeProp constraints (if any)
-            for c in system.baseArray.constraints:
-                if c.stateType == CircuitTimePropType:
-                    when direction == Minimize:
-                        c.circuitTimePropState.setObjectiveBound(target)
-                    else:
-                        c.circuitTimePropState.clearObjectiveBound()
+            system.applyCircuitTimeObjectiveBounds(target, direction == Minimize)
             system.baseArray.reducedDomain = baseReducedDomain
             system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
             system.baseArray.tightenReducedDomain()
@@ -421,12 +458,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.addConstraint(objective >= currentCost + 1)
                 hasBoundConstraint = true
                 # Set objective bound on CircuitTimeProp constraints (retry loop)
-                for c in system.baseArray.constraints:
-                    if c.stateType == CircuitTimePropType:
-                        when direction == Minimize:
-                            c.circuitTimePropState.setObjectiveBound(currentCost - 1)
-                        else:
-                            c.circuitTimePropState.clearObjectiveBound()
+                system.applyCircuitTimeObjectiveBounds(currentCost - 1, direction == Minimize)
                 system.baseArray.reducedDomain = baseReducedDomain
                 system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
                 system.baseArray.tightenReducedDomain()

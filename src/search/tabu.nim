@@ -177,6 +177,7 @@ type
 
         # Circuit-time-prop writeback: after updatePosition, write computed times to assignment
         circuitTimePropConstraints*: seq[CircuitTimePropConstraint[T]]
+        ctpChangedBuf*: seq[int]                   # reusable buffer for writeback-changed time positions
 
         # Cached list of tableIn constraint indices for fast stagnation-time table moves
         tableInConstraintIndices*: seq[int]
@@ -1725,7 +1726,50 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 let newVal = evaluateFlatMinMax(fb, state.assignment)
                 state.assignment[fb.channelPosition] = newVal
 
+    # Initialize CircuitTimeProp constraints first and write their computed
+    # times back into the assignment, so channels reading time positions
+    # (e.g. an objective max over arrival times) and the remaining constraints
+    # initialize against consistent values.
+    if state.circuitTimePropConstraints.len > 0:
+        for constraint in state.constraints:
+            if constraint.stateType == CircuitTimePropType:
+                constraint.initialize(state.assignment)
+        for ctc in state.circuitTimePropConstraints:
+            for i in 0..<ctc.n:
+                if ctc.arrivalPositions[i] >= 0:
+                    state.assignment[ctc.arrivalPositions[i]] = ctc.arrivalTime[i]
+                if ctc.departurePositions[i] >= 0:
+                    state.assignment[ctc.departurePositions[i]] = ctc.departureTime[i]
+        # Re-evaluate channels that may read the written-back time positions
+        var ctpChanged = true
+        var ctpIter = 0
+        while ctpChanged and ctpIter < 50:
+            ctpChanged = false
+            inc ctpIter
+            for binding in carray.channelBindings:
+                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                if idxVal >= 0 and idxVal < binding.arrayElements.len:
+                    let elem = binding.arrayElements[idxVal]
+                    let newVal = if elem.isConstant: elem.constantValue
+                                 else: state.assignment[elem.variablePosition] + elem.offset
+                    if newVal != state.assignment[binding.channelPosition]:
+                        state.assignment[binding.channelPosition] = newVal
+                        ctpChanged = true
+            for binding in carray.expressionChannelBindings:
+                let newVal = binding.expression.evaluate(state.assignment)
+                if newVal != state.assignment[binding.channelPosition]:
+                    state.assignment[binding.channelPosition] = newVal
+                    ctpChanged = true
+            if state.flatMinMaxBindings.len > 0:
+                for fb in state.flatMinMaxBindings:
+                    let newVal = evaluateFlatMinMax(fb, state.assignment)
+                    if newVal != state.assignment[fb.channelPosition]:
+                        state.assignment[fb.channelPosition] = newVal
+                        ctpChanged = true
+
     for constraint in state.constraints:
+        if constraint.stateType == CircuitTimePropType:
+            continue  # already initialized above (or no instances exist)
         constraint.initialize(state.assignment)
 
     # Compute maxNetDelta for RelationalType constraints to enable slack-based
@@ -3481,6 +3525,49 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
 
+proc writebackCircuitTimes[T](state: TabuState[T], position: int,
+                              forced: openArray[(int, int, int)],
+                              changedBuf: var seq[int]) =
+    ## Copy computed arrival/departure times from CircuitTimeProp constraints
+    ## touched by this move (directly or via inverse forced changes) into the
+    ## assignment. Collects the positions whose value actually changed into
+    ## changedBuf (cleared first) and updates constraints listening on them,
+    ## mirroring channel-binding propagation semantics. Callers must then
+    ## propagate channels from the changed positions so downstream channels
+    ## (e.g. an objective max over arrival times) stay consistent.
+    changedBuf.setLen(0)
+    for ctc in state.circuitTimePropConstraints:
+        var touched = position in ctc.positionToIndex
+        if not touched:
+            for (fPos, fOld, fNew) in forced:
+                if fPos in ctc.positionToIndex:
+                    touched = true
+                    break
+        if not touched: continue
+        for i in 0..<ctc.n:
+            if ctc.arrivalPositions[i] >= 0:
+                let p = ctc.arrivalPositions[i]
+                if state.assignment[p] != ctc.arrivalTime[i]:
+                    state.assignment[p] = ctc.arrivalTime[i]
+                    changedBuf.add(p)
+            if ctc.departurePositions[i] >= 0:
+                let p = ctc.departurePositions[i]
+                if state.assignment[p] != ctc.departureTime[i]:
+                    state.assignment[p] = ctc.departureTime[i]
+                    changedBuf.add(p)
+    for p in changedBuf:
+        for c in state.constraintsAtPosition[p]:
+            let oldPenalty = c.penalty()
+            c.updatePosition(p, state.assignment[p])
+            let newPenalty = c.penalty()
+            state.cost += newPenalty - oldPenalty
+            if oldPenalty > 0 and newPenalty == 0:
+                for pos in c.positions.items:
+                    state.violationCount[pos] -= 1
+            elif oldPenalty == 0 and newPenalty > 0:
+                for pos in c.positions.items:
+                    state.violationCount[pos] += 1
+
 proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## Lightweight assignment: updates constraint state and cost but skips
     ## penalty map updates. Used during path relinking for fast traversal.
@@ -3500,17 +3587,9 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
             for pos in constraint.positions.items:
                 state.violationCount[pos] += 1
 
-    # Circuit-time-prop writeback (lean path)
-    for ctc in state.circuitTimePropConstraints:
-        if position in ctc.positionToIndex:
-            for i in 0..<ctc.n:
-                if ctc.arrivalPositions[i] >= 0:
-                    state.assignment[ctc.arrivalPositions[i]] = ctc.arrivalTime[i]
-                if ctc.departurePositions[i] >= 0:
-                    state.assignment[ctc.departurePositions[i]] = ctc.departureTime[i]
-
     # Apply forced changes from inverse group compound move
-    if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
+    let hasInverseMoveLean = state.inverseEnabled and state.posToInverseGroup[position] >= 0
+    if hasInverseMoveLean:
         state.computeInverseForcedChanges(position, value, oldValueLean, oldValueProvided = true)
         # Safe to iterate inverseForcedChanges directly: propagateChannelsLean doesn't modify it
         for (fPos, fOld, fNew) in state.inverseForcedChanges:
@@ -3529,6 +3608,16 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
             state.propagateChannelsLean(fPos)
 
     state.propagateChannelsLean(position)
+
+    # Circuit-time-prop writeback (lean path): copy computed times to assignment
+    # positions and propagate downstream channels (e.g. objective max channels).
+    if state.circuitTimePropConstraints.len > 0:
+        if hasInverseMoveLean:
+            state.writebackCircuitTimes(position, state.inverseForcedChanges, state.ctpChangedBuf)
+        else:
+            state.writebackCircuitTimes(position, [], state.ctpChangedBuf)
+        for tp in state.ctpChangedBuf:
+            state.propagateChannelsLean(tp)
 
 proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     when ProfileIteration:
@@ -3549,15 +3638,6 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         elif oldPenalty == 0 and newPenalty > 0:
             for pos in constraint.positions.items:
                 state.violationCount[pos] += 1
-
-    # Circuit-time-prop writeback: copy computed times to assignment positions
-    for ctc in state.circuitTimePropConstraints:
-        if position in ctc.positionToIndex:
-            for i in 0..<ctc.n:
-                if ctc.arrivalPositions[i] >= 0:
-                    state.assignment[ctc.arrivalPositions[i]] = ctc.arrivalTime[i]
-                if ctc.departurePositions[i] >= 0:
-                    state.assignment[ctc.departurePositions[i]] = ctc.departureTime[i]
 
     # Apply forced changes from inverse group compound move
     let hasInverseMove = state.inverseEnabled and state.posToInverseGroup[position] >= 0
@@ -3595,6 +3675,17 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         for (fPos, fOld, fNew) in localForced:
             let forcedChanged = state.propagateChannels(fPos, state.forcedChannelsBuf2)
             if forcedChanged:
+                for ch in state.forcedChannelsBuf2:
+                    state.changedChannelsBuf.add(ch)
+
+    # Circuit-time-prop writeback: copy computed times to assignment positions
+    # and propagate downstream channels (e.g. objective max over arrival times).
+    if state.circuitTimePropConstraints.len > 0:
+        state.writebackCircuitTimes(position, localForced, state.ctpChangedBuf)
+        for tp in state.ctpChangedBuf:
+            state.changedChannelsBuf.add(tp)
+            let tpChanged = state.propagateChannels(tp, state.forcedChannelsBuf2)
+            if tpChanged:
                 for ch in state.forcedChannelsBuf2:
                     state.changedChannelsBuf.add(ch)
 

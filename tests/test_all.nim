@@ -17,6 +17,7 @@ import test_channel_result_bounds
 import test_channel_substitution
 import test_circuit
 import test_circuit_time_prop
+import test_circuit_time_translator
 import test_conditional_count_eq_channels
 import test_conditional_counter_element_channels
 import test_conditional_expr_channels

@@ -21,7 +21,7 @@ suite "CircuitTimeProp Constraint":
         # pred[l] = predecessor of l. Tour: 0→1→2→3→4→0
         # So pred = [4, 0, 1, 2, 3] (pred of 0 is 4, pred of 1 is 0, etc.)
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -51,7 +51,7 @@ suite "CircuitTimeProp Constraint":
 
     test "Two-cycle configuration has circuit penalty":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -73,7 +73,7 @@ suite "CircuitTimeProp Constraint":
 
     test "moveDelta consistency":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -108,7 +108,7 @@ suite "CircuitTimeProp Constraint":
         # Use tight late times so the valid tour violates some
         let tightLate = @[100, 50, 60, 30, 80]  # late[3]=30, but arrival[3]=32
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = tightLate,
@@ -130,7 +130,7 @@ suite "CircuitTimeProp Constraint":
 
     test "Objective bound penalty":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -163,7 +163,7 @@ suite "CircuitTimeProp Constraint":
 
     test "deepCopy preserves objective bound":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -208,7 +208,7 @@ suite "CircuitTimeProp Constraint":
             echo "Solver did not find feasible. Best assignment: ", x.assignment()
             # Re-initialize constraint with the solver's assignment and check
             let c2 = newCircuitTimePropConstraint[int](
-                predPositions = @[0,1,2,3,4], distanceMatrix = dist,
+                linkPositions = @[0,1,2,3,4], distanceMatrix = dist,
                 earlyTimes = early, lateTimes = late,
                 depotIndex = 0, depotDeparture = 0,
                 arrivalPositions = @[-1,-1,-1,-1,-1],
@@ -220,7 +220,7 @@ suite "CircuitTimeProp Constraint":
 
     test "1-based indexing":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,
@@ -238,7 +238,7 @@ suite "CircuitTimeProp Constraint":
 
     test "Duplicate values create unreachable nodes":
         var c = newCircuitTimePropConstraint[int](
-            predPositions = @[0,1,2,3,4],
+            linkPositions = @[0,1,2,3,4],
             distanceMatrix = dist,
             earlyTimes = early,
             lateTimes = late,

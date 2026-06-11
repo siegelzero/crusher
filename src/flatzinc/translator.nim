@@ -260,6 +260,30 @@ type
         maxVal*: int
         consumedCIs*: seq[int]
 
+    CircuitTimeCandidate* = object
+        ## One circuit-time-propagation instance (TSPTW/VRP time chain on a circuit).
+        circuitCI*: int
+        forward*: bool                  # link vars are successors (else predecessors)
+        linkVarNames*: seq[string]      # per node; "" = fixed link (literal in the circuit array)
+        rawFixedLinks*: seq[int]        # raw FZN link value for fixed nodes (1-based)
+        distMatrix*: seq[seq[int]]      # [to][from], 0-based; service times folded in (succ form)
+        earlyTimes*: seq[int]
+        lateTimes*: seq[int]
+        outConstrained*: seq[bool]      # arc out of node carries a time constraint (empty = all)
+        depotIdx*: int                  # 0-based walk anchor (fixed-time node)
+        depotDep*: int
+        arrivalVars*: seq[string]       # writeback target per node, "" = none
+        departureVars*: seq[string]
+        consumedCIs*: PackedSet[int]
+        channelVars*: seq[string]       # vars to mark as channels (times + intermediates)
+        timeVarNames*: seq[string]      # per node; "" if the node's time is a constant
+        maxOutputs*: seq[string]        # array_int_maximum outputs over this instance's times
+        maxCIs*: seq[int]
+        useMaxMetric*: bool
+        objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
+        objectiveMetricLo*: int
+        objectiveConstOffset*: int
+
     FznTranslator* = object
         sys*: ConstraintSystem[int]
         # Maps FZN variable name -> position in the ConstrainedArray
@@ -639,17 +663,8 @@ type
         nandBoolClauses*: HashSet[seq[string]]
         # Maps bool2int output var name → input bool var name
         bool2intSourceMap*: Table[string, string]
-        # Detected circuit-time-propagation pattern (TSPTW/VRP)
-        circuitTimePropDetected*: bool
-        circuitTimePropPredVars*: seq[string]
-        circuitTimePropDistMatrix*: seq[seq[int]]
-        circuitTimePropEarlyTimes*: seq[int]
-        circuitTimePropLateTimes*: seq[int]
-        circuitTimePropDepotIdx*: int
-        circuitTimePropDepotDep*: int
-        circuitTimePropArrivalVars*: seq[string]
-        circuitTimePropDepartureVars*: seq[string]
-        circuitTimePropConsumedCIs*: PackedSet[int]
+        # Detected circuit-time-propagation instances (TSPTW/VRP), one per circuit
+        circuitTimeCandidates*: seq[CircuitTimeCandidate]
         # Detected pairwise atMost-1 cliques: groups of binary vars with complete pairwise exclusion
         atMostPairCliques*: seq[seq[string]]
         # Bool2int identity aliases: int output → bool input (eliminates identity channels)
@@ -986,6 +1001,7 @@ include translatorBoolChannels
 include translatorObjectiveSlack
 include translatorScheduling
 include translatorCircuitTime
+include translatorInverseRewrite
 
 proc buildObjectiveStaging(tr: var FznTranslator) =
     ## Detect a linear objective dominated by a small-domain decision variable that
@@ -1706,6 +1722,12 @@ proc translate*(model: FznModel): FznTranslator =
     # the same suffix permutation, the idx vars are the inverse permutation
     # (offset by +1 for the sentinel).
     result.detectSentinelInverseChannelPatterns()
+
+    # Drop circuits implied by inverse channelization (the inverse of a
+    # Hamiltonian circuit is a Hamiltonian circuit) and rewrite element
+    # constraints indexed by channel-side variables onto the forward side.
+    result.dropImpliedInverseCircuits()
+    result.rewriteInverseChannelIndexedElements()
 
     # Detect if-then-else channels (int_lin_ne_reif + int_eq_reif + bool_clause → 2D table channel)
     result.detectIfThenElseChannels()
