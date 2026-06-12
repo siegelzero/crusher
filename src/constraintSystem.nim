@@ -59,6 +59,9 @@ type
         optimalityProven*: bool  # Domain reduction proved no better solution exists
         adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
         objectiveStaging*: ObjectiveStaging  # Staged-presolve fixings (inactive by default)
+        circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
+                                          # minimized objective exactly: its metric bound
+                                          # replaces the explicit objective<=target constraint
 
 ################################################################################
 # ConstraintSystem creation

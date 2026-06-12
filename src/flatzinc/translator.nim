@@ -280,6 +280,9 @@ type
         maxOutputs*: seq[string]        # array_int_maximum outputs over this instance's times
         maxCIs*: seq[int]
         useMaxMetric*: bool
+        useSumMetric*: bool             # metric = weighted sum of observed departures
+        sumMetricWeights*: seq[int]     # per node; objective weight of the node's time (with useSumMetric)
+        equalityChain*: bool            # exact accumulator chain (no clamp, two-sided windows)
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int

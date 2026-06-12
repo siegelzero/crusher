@@ -3,12 +3,18 @@
 ##     predecessor-form (equality) matching, multi-instance, service-time
 ##     folding, fixed links, unconstrained arcs, depot anchoring
 ##   - verifyCircuitTimeCandidates: projection-soundness rejection cases and
-##     objective linkage extraction (direct max, weighted sum of maxima)
+##     objective linkage extraction (direct max, weighted sum of maxima,
+##     direct sum of times -> weighted-sum metric)
+##   - tryMatchSuccFormAccumulators: equality accumulator chains (CVRP load /
+##     vehicle painting), forward/backward anchoring guards, one instance per
+##     value array across mirror circuits
+##   - objective bound delegation (circuitTimeObjectiveExact)
 ##   - dropImpliedInverseCircuits: circuit over the channel side of an inverse
 ##     pair is consumed when the forward side is circuit-enforced
 ##   - deterministic mutual-inverse suppression (annotated side stays searchable)
 ##   - rewriteInverseChannelIndexedElements: channel-index elements rewritten
-##     to forward-side elements, with subsumption and tautology elimination
+##     to forward-side elements, with subsumption (including circuit-time-
+##     consumed witnesses) and tautology elimination
 
 import unittest
 import std/[strutils, tables, sets, packedsets]
@@ -308,6 +314,8 @@ solve minimize arr1;
         check cand.outConstrained.len == 0      # all arcs constrained
         check cand.useMaxMetric == false
         check cand.objectiveWeight == 1          # legacy: bound = target
+        # Legacy linkage is heuristic, not exact: no bound delegation
+        check tr.sys.circuitTimeObjectiveExact == false
         check tr.countType(CircuitTimePropType) == 1
         check tr.countType(CircuitType) == 0
 
@@ -492,3 +500,330 @@ solve :: int_search([s1, s2, s3], input_order, indomain_min, complete) minimize 
             check tr.pos(name) notin tr.sys.baseArray.channelPositions
         for name in ["q1", "q2", "q4"]:
             check tr.pos(name) in tr.sys.baseArray.channelPositions
+
+# ---------------------------------------------------------------------------
+# Direct linear objective observer (sum of times -> weighted-sum metric)
+# ---------------------------------------------------------------------------
+
+proc succSumSrc(objDef: string): string =
+    ## SuccBase without the array_int_maximum observer, plus an objective var
+    ## and the given objective definition / solve item.
+    for line in SuccBase.splitLines():
+        if "array_int_maximum" notin line and not line.startsWith("var 0..50: m"):
+            result.add(line & "\n")
+    result.add("var 0..200: obj;\n")
+    result.add(objDef)
+
+suite "Circuit-time direct sum-of-times objective":
+
+    test "objective = sum of times: accepted with per-node sum weights":
+        # obj = t1 + t2 + t4 (node 3's time is the fixed literal 0)
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, -1], [obj, t1, t2, t4], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 1
+        let cand = tr.circuitTimeCandidates[0]
+        check cand.useSumMetric == true
+        check cand.sumMetricWeights == @[1, 1, 0, 1]
+        check cand.objectiveWeight == 1
+        check cand.objectiveConstOffset == 0
+        check cand.objectiveMetricLo == 0
+        check tr.countType(CircuitTimePropType) == 1
+        check tr.countType(CircuitType) == 0
+
+    test "weighted partial sum: only observed times carry weights":
+        # obj = 2*t1 + t4; t2 is unobserved (projection still sound)
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -2, -1], [obj, t1, t4], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 1
+        let cand = tr.circuitTimeCandidates[0]
+        check cand.useSumMetric == true
+        check cand.sumMetricWeights == @[2, 0, 0, 1]
+        check cand.objectiveWeight == 1
+
+    test "constant offset extracted from the rhs":
+        # obj - t1 - t2 - t4 = 5  =>  obj = sum + 5
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, -1], [obj, t1, t2, t4], 5) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 1
+        check tr.circuitTimeCandidates[0].objectiveConstOffset == 5
+        check tr.circuitTimeCandidates[0].useSumMetric == true
+
+    test "named coefficient/variable arrays (FZN flattener output shape)":
+        let tr = translate(parseFzn(succSumSrc(
+            "array [1..4] of int: oc = [1, -1, -1, -1];\n" &
+            "array [1..4] of var int: ov = [obj, t1, t2, t4];\n" &
+            "constraint int_lin_eq(oc, ov, 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 1
+        check tr.circuitTimeCandidates[0].useSumMetric == true
+        check tr.circuitTimeCandidates[0].sumMetricWeights == @[1, 1, 0, 1]
+
+    test "negative effective weight: candidate rejected":
+        # obj = t1 + t2 - t4: minimizing presses t4 UP -> projection unsound
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, 1], [obj, t1, t2, t4], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 0
+        check tr.countType(CircuitTimePropType) == 0
+        check tr.countType(CircuitType) == 1
+
+    test "maximize over a direct sum: candidate rejected":
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, -1], [obj, t1, t2, t4], 0) :: defines_var(obj);\n" &
+            "solve maximize obj;\n")))
+        check tr.circuitTimeCandidates.len == 0
+        check tr.countType(CircuitType) == 1
+
+    test "lin_eq over times not defining the objective: rejected":
+        # Same shape but defines an unrelated var -> foreign observer
+        let tr = translate(parseFzn(succSumSrc(
+            "var 0..200: other;\n" &
+            "constraint int_lin_eq([1, -1, -1, -1], [other, t1, t2, t4], 0) :: defines_var(other);\n" &
+            "constraint int_lin_le([1], [obj], 200);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 0
+        check tr.countType(CircuitType) == 1
+
+    test "round-trip: earliest times hold under a sum objective":
+        # (obj itself is expression-defined and has no search position)
+        var tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, -1], [obj, t1, t2, t4], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.circuitTimeCandidates.len == 1
+        tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+        let s = @[tr.val("s1"), tr.val("s2"), tr.val("s3"), 3]
+        let t = @[tr.val("t1"), tr.val("t2"), 0, tr.val("t4")]
+        let rows = @[@[0, 3, 9, 4], @[3, 0, 9, 6], @[2, 5, 0, 9]]
+        let service = @[2, 3, 0]
+        for n in 0..<3:
+            check t[s[n] - 1] == t[n] + service[n] + rows[n][s[n] - 1]
+
+# ---------------------------------------------------------------------------
+# Equality accumulator chains (CVRP load / vehicle painting)
+# ---------------------------------------------------------------------------
+
+## Load chain: 2 customers with demands 2 and 3, start depot 3 (load literal
+## 0), end depot 4 (free load = route load, capacity via domain 0..6). The
+## start-depot arc uses the constant-result element form (L[s3] = 0); the
+## customer arcs use defines_var elements + offset lin_eqs.
+const AccumLoadSrc = """
+var 1..4: s1;
+var 1..4: s2;
+var 1..4: s3;
+var 0..6: l1;
+var 0..6: l2;
+var 0..6: l4;
+var 0..6: r1;
+var 0..6: r2;
+array [1..4] of var int: L = [l1, l2, 0, l4];
+constraint crusher_circuit([s1, s2, s3, 3]);
+constraint array_var_int_element(s1, L, r1) :: defines_var(r1);
+constraint int_lin_eq([1, -1], [l1, r1], -2);
+constraint array_var_int_element(s2, L, r2) :: defines_var(r2);
+constraint int_lin_eq([1, -1], [l2, r2], -3);
+constraint array_var_int_element(s3, L, 0);
+"""
+
+## Vehicle painting: customer values free, depot values fixed by literals;
+## only customer arcs are chained (zero offset, unified result = own var), so
+## the anchors sit at segment ENDS (backward anchoring).
+const AccumVehSrc = """
+var 1..4: s1;
+var 1..4: s2;
+var 1..4: s3;
+var 1..3: v1;
+var 1..3: v2;
+array [1..4] of var int: V = [v1, v2, 1, 1];
+constraint crusher_circuit([s1, s2, s3, 3]);
+constraint array_var_int_element(s1, V, v1);
+constraint array_var_int_element(s2, V, v2);
+"""
+
+suite "Circuit accumulator chains (equality form)":
+
+    test "load chain: forward-anchored accumulator detected and consumed":
+        let tr = translate(parseFzn(AccumLoadSrc & "solve satisfy;\n"))
+        check tr.circuitTimeCandidates.len == 1
+        let cand = tr.circuitTimeCandidates[0]
+        check cand.equalityChain == true
+        check cand.forward == true
+        check cand.linkVarNames == @["s1", "s2", "s3", ""]
+        check cand.depotIdx == 2                 # node 3, the fixed literal 0
+        check cand.depotDep == 0
+        check cand.outConstrained == @[true, true, true, false]
+        # Offset matrix: uniform rows dist[to][from] = demand_from
+        for toN in 0..<4:
+            check cand.distMatrix[toN][0] == 2
+            check cand.distMatrix[toN][1] == 3
+            check cand.distMatrix[toN][2] == 0   # depot arc: offset 0
+            check cand.distMatrix[toN][3] == 0   # unconstrained
+        # Capacity becomes the two-sided window (presolve tightens the
+        # customer loads through the offset equations: l1 <= 6-2, l2 <= 6-3)
+        check cand.earlyTimes == @[0, 0, 0, 0]
+        check cand.lateTimes == @[4, 3, 0, 6]
+        check cand.departureVars == @["l1", "l2", "", "l4"]
+        check tr.countType(CircuitTimePropType) == 1
+        check tr.countType(CircuitType) == 0
+        # Value vars and element results are channels; links stay searchable
+        for name in ["l1", "l2", "l4", "r1", "r2"]:
+            check tr.pos(name) in tr.sys.baseArray.channelPositions
+        for name in ["s1", "s2", "s3"]:
+            check tr.pos(name) notin tr.sys.baseArray.channelPositions
+
+    test "load chain round-trip: exact prefix-sum loads along the tour":
+        var tr = translate(parseFzn(AccumLoadSrc & "solve satisfy;\n"))
+        tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+        let s = @[tr.val("s1"), tr.val("s2"), tr.val("s3"), 3]
+        let load = @[tr.val("l1"), tr.val("l2"), 0, tr.val("l4")]
+        let demand = @[2, 3, 0]
+        for n in 0..<3:
+            check load[s[n] - 1] == load[n] + demand[n]
+        check load[3] == 5                       # route load at the end depot
+
+    test "vehicle painting: backward-anchored zero-offset chain":
+        let tr = translate(parseFzn(AccumVehSrc & "solve satisfy;\n"))
+        check tr.circuitTimeCandidates.len == 1
+        let cand = tr.circuitTimeCandidates[0]
+        check cand.equalityChain == true
+        check cand.outConstrained == @[true, true, false, false]
+        check cand.departureVars == @["v1", "v2", "", ""]
+        for toN in 0..<4:
+            for fromN in 0..<4:
+                check cand.distMatrix[toN][fromN] == 0
+        check tr.countType(CircuitTimePropType) == 1
+        check tr.countType(CircuitType) == 0
+        check tr.countType(ElementType) == 0     # both elements consumed
+
+    test "vehicle painting round-trip: values painted from the anchors":
+        var tr = translate(parseFzn(AccumVehSrc & "solve satisfy;\n"))
+        tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+        check tr.val("v1") == 1
+        check tr.val("v2") == 1
+
+    test "no anchored end (both guards fail): family rejected":
+        # End depot value free AND segment starts free -> neither forward nor
+        # backward anchoring is sound; elements must translate normally.
+        let src = """
+var 1..4: s1;
+var 1..4: s2;
+var 1..4: s3;
+var 1..3: v1;
+var 1..3: v2;
+var 1..3: v4;
+array [1..4] of var int: V = [v1, v2, 1, v4];
+constraint crusher_circuit([s1, s2, s3, 3]);
+constraint array_var_int_element(s1, V, v1);
+constraint array_var_int_element(s2, V, v2);
+solve satisfy;
+"""
+        let tr = translate(parseFzn(src))
+        check tr.circuitTimeCandidates.len == 0
+        check tr.countType(CircuitTimePropType) == 0
+        check tr.countType(CircuitType) == 1
+        check tr.countType(ElementType) == 2
+
+    test "time chain and load chain coexist on one circuit (CVRP shape)":
+        let tr = translate(parseFzn(SuccBase & """
+var 0..6: l1;
+var 0..6: l2;
+var 0..6: l4;
+var 0..6: r1;
+var 0..6: r2;
+array [1..4] of var int: L = [l1, l2, 0, l4];
+constraint array_var_int_element(s1, L, r1) :: defines_var(r1);
+constraint int_lin_eq([1, -1], [l1, r1], -2);
+constraint array_var_int_element(s2, L, r2) :: defines_var(r2);
+constraint int_lin_eq([1, -1], [l2, r2], -3);
+constraint array_var_int_element(s3, L, 0);
+solve minimize m;
+"""))
+        check tr.circuitTimeCandidates.len == 2
+        var nEquality, nTime: int
+        for cand in tr.circuitTimeCandidates:
+            if cand.equalityChain: inc nEquality
+            else: inc nTime
+        check nEquality == 1
+        check nTime == 1
+        check tr.countType(CircuitTimePropType) == 2
+        check tr.countType(CircuitType) == 0
+
+    test "mirror circuit: one instance per value array, rewrite subsumed":
+        # Mutual-inverse pair S/P with vehicle painting expressed on BOTH
+        # sides. The S-side accumulator wins; the P-side family is skipped
+        # (one instance per array), and the pred-indexed elements are
+        # subsumed by the circuit-time-consumed forward elements instead of
+        # being re-emitted.
+        let src = """
+var 1..4: s1;
+var 1..4: s2;
+var 1..4: s3;
+var 1..4: q1;
+var 1..4: q2;
+var 1..4: q4;
+var 1..3: v1;
+var 1..3: v2;
+array [1..4] of var int: S = [s1, s2, s3, 3];
+array [1..4] of var int: P = [q1, q2, 4, q4];
+array [1..4] of var int: V = [v1, v2, 1, 1];
+constraint crusher_circuit(S);
+constraint crusher_circuit(P);
+constraint array_var_int_element(s1, P, 1);
+constraint array_var_int_element(s2, P, 2);
+constraint array_var_int_element(s3, P, 3);
+constraint array_var_int_element(s1, V, v1);
+constraint array_var_int_element(s2, V, v2);
+constraint array_var_int_element(q1, V, v1);
+constraint array_var_int_element(q2, V, v2);
+solve :: int_search([s1, s2, s3], input_order, indomain_min, complete) satisfy;
+"""
+        let tr = translate(parseFzn(src))
+        check tr.circuitTimeCandidates.len == 1
+        check tr.circuitTimeCandidates[0].equalityChain == true
+        check tr.countType(CircuitTimePropType) == 1
+        check tr.countType(CircuitType) == 0     # S consumed, P implied-dropped
+        # The q1/q2-indexed V elements are subsumed by the circuit-time-
+        # consumed forward elements. One rewrite IS emitted: the s3 slot
+        # (pred-of-customer = depot 3 => vehicle = V[3]) has no forward twin.
+        check tr.countType(ElementType) == 1
+        var consumedPredElems = 0
+        for ci, con in tr.model.constraints:
+            if con.name == "array_var_int_element" and
+               con.args[0].kind == FznIdent and
+               con.args[0].ident in ["q1", "q2"] and
+               con.args[1].kind == FznIdent and con.args[1].ident == "V":
+                check ci in tr.definingConstraints
+                inc consumedPredElems
+        check consumedPredElems == 2
+        for name in ["q1", "q2", "q4"]:
+            check tr.pos(name) in tr.sys.baseArray.channelPositions
+
+# ---------------------------------------------------------------------------
+# Objective bound delegation
+# ---------------------------------------------------------------------------
+
+suite "Objective bound delegation (circuitTimeObjectiveExact)":
+
+    test "single sum-linked successor instance: delegation enabled":
+        let tr = translate(parseFzn(succSumSrc(
+            "constraint int_lin_eq([1, -1, -1, -1], [obj, t1, t2, t4], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")))
+        check tr.sys.circuitTimeObjectiveExact == true
+
+    test "single max-linked successor instance: delegation enabled":
+        let tr = translate(parseFzn(SuccBase & "solve minimize m;\n"))
+        check tr.sys.circuitTimeObjectiveExact == true
+
+    test "two linked instances: no delegation (joint bound needed)":
+        let src = twoScenarioSrc(
+            "constraint int_lin_eq([1, -3, -2], [obj, ma, mb], 0) :: defines_var(obj);\n" &
+            "solve minimize obj;\n")
+        let tr = translate(parseFzn(src))
+        check tr.circuitTimeCandidates.len == 2
+        check tr.sys.circuitTimeObjectiveExact == false
+
+    test "unlinked accumulator instance: no delegation":
+        let tr = translate(parseFzn(AccumLoadSrc & "solve satisfy;\n"))
+        check tr.sys.circuitTimeObjectiveExact == false

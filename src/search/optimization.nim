@@ -291,12 +291,19 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
             if hasBoundConstraint:
                 system.removeLastConstraint()
+                hasBoundConstraint = false
 
             when direction == Minimize:
-                system.addConstraint(objective <= target)
+                # With an exact single-instance circuit-time linkage the metric
+                # bound (applied below) is equivalent to objective <= target;
+                # the explicit relational over the objective's channel terms
+                # only duplicates the pressure at much higher per-move cost.
+                if not system.circuitTimeObjectiveExact:
+                    system.addConstraint(objective <= target)
+                    hasBoundConstraint = true
             else:
                 system.addConstraint(objective >= target)
-            hasBoundConstraint = true
+                hasBoundConstraint = true
             # Set objective bound on CircuitTimeProp constraints (if any)
             system.applyCircuitTimeObjectiveBounds(target, direction == Minimize)
             system.baseArray.reducedDomain = baseReducedDomain
@@ -451,12 +458,17 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 let bestSolution = system.assignment
                 if hasBoundConstraint:
                     system.removeLastConstraint()
+                    hasBoundConstraint = false
 
                 when direction == Minimize:
-                    system.addConstraint(objective <= currentCost - 1)
+                    # See the binary-search phase: an exact circuit-time
+                    # linkage replaces the explicit objective bound.
+                    if not system.circuitTimeObjectiveExact:
+                        system.addConstraint(objective <= currentCost - 1)
+                        hasBoundConstraint = true
                 else:
                     system.addConstraint(objective >= currentCost + 1)
-                hasBoundConstraint = true
+                    hasBoundConstraint = true
                 # Set objective bound on CircuitTimeProp constraints (retry loop)
                 system.applyCircuitTimeObjectiveBounds(currentCost - 1, direction == Minimize)
                 system.baseArray.reducedDomain = baseReducedDomain

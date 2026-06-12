@@ -2895,13 +2895,17 @@ func circuitTimeProp*[T](
         useMaxMetric: bool = false,
         objectiveWeight: int = 0,
         objectiveMetricLo: T = T(0),
-        objectiveConstOffset: T = T(0)
+        objectiveConstOffset: T = T(0),
+        useSumMetric: bool = false,
+        sumMetricWeights: seq[T] = @[],
+        equalityChain: bool = false
     ): StatefulConstraint[T] =
     let c = newCircuitTimePropConstraint[T](
         linkPositions, distanceMatrix, earlyTimes, lateTimes,
         depotIndex, depotDeparture, arrivalPositions, departurePositions, valueOffset,
         forward, fixedLinks, outConstrained, useMaxMetric,
-        objectiveWeight, objectiveMetricLo, objectiveConstOffset)
+        objectiveWeight, objectiveMetricLo, objectiveConstOffset,
+        useSumMetric, sumMetricWeights, equalityChain)
     return StatefulConstraint[T](
         positions: c.positions,
         stateType: CircuitTimePropType,

@@ -129,17 +129,29 @@ proc rewriteInverseChannelIndexedElements(tr: var FznTranslator) =
         else:
             return ""
 
+    # Elements consumed by circuit-time instances still enforce their
+    # semantics (the instance computes the values along the tour), so they
+    # remain valid subsumption witnesses — without this, redundant mirror
+    # elements (e.g. vehicle[pred[n]] = vehicle[n]) get re-emitted on the
+    # forward side and duplicate constraints the instance already covers.
+    var ctConsumed = initPackedSet[int]()
+    for cand in tr.circuitTimeCandidates:
+        for cci in cand.consumedCIs.items:
+            ctConsumed.incl(cci)
+
     for ci, con in tr.model.constraints:
-        if ci in tr.definingConstraints: continue
+        let ctElem = ci in ctConsumed
+        if ci in tr.definingConstraints and not ctElem: continue
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
-        if con.hasAnnotation("defines_var"): continue
+        if not ctElem and con.hasAnnotation("defines_var"): continue
         if con.args.len < 3: continue
         if con.args[0].kind != FznIdent: continue
         if con.args[2].kind notin {FznIdent, FznIntLit}: continue
         let key = arrayKeyOf(con.args[1])
         if key == "": continue
         existingElems.mgetOrPut((con.args[0].ident, key), @[]).add(con.args[2])
+        if ctElem: continue   # consumed: subsumption witness only
         if con.args[0].ident notin chanElemOwner: continue
         let (pi, k) = chanElemOwner[con.args[0].ident]
         groups.mgetOrPut((pi, key), @[]).add(InvElemOrig(ci: ci, k: k, target: con.args[2]))
