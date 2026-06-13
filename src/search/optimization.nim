@@ -1,9 +1,10 @@
 
 import resolution
 from std/times import epochTime
-import std/packedsets
+import std/[algorithm, packedsets]
 import std/tables
-import ../constraints/[types, circuitTimeProp]
+import ../constraints/[types, circuitTimeProp, stateful]
+import ../expressions/expressions
 
 when compileOption("threads"):
     import parallelResolution
@@ -280,7 +281,12 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             echo "[Opt] Binary search [", lo, "..", hi, "]"
             flushFile(stdout)
 
-        while lo <= hi and not lowIterRate:
+        # Product objectives skip bisection: a midpoint product bound has no
+        # gradient and no factor decomposition — the retry loop's factor
+        # staging ratchets the shape down directly instead.
+        let skipBisection = lowIterRate or
+            (direction == Minimize and system.objectiveProduct.active)
+        while lo <= hi and not skipBisection:
             if deadline > 0 and epochTime() > deadline:
                 system.searchCompleted = false
                 break
@@ -476,6 +482,112 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 system.baseArray.tightenReducedDomain()
                 when direction == Minimize:
                     applyObjectiveStaging(system, currentCost - 1, verbose)
+
+                # Product-objective factor staging: try bounding the factors
+                # directly before the plain composite retry. `obj ≤ T` alone is
+                # a flat ±1 penalty with no direction; `a ≤ wa` propagates into
+                # the factor's defining structure (typically a max over
+                # placements) and penalises each offending element, giving
+                # local search a gradient toward the smaller shape.
+                when direction == Minimize:
+                    if system.objectiveProduct.active and not system.circuitTimeObjectiveExact:
+                        let op = system.objectiveProduct
+                        let target = currentCost - 1
+                        let curA = int(op.aExpr.evaluate(system.assignment))
+                        let curB = int(op.bExpr.evaluate(system.assignment))
+                        # Pareto-maximal splits (wa, hb): wa·hb ≤ target, no split
+                        # dominated by another. Iterate wa descending; hb is then
+                        # forced, and only strictly increasing hb survive.
+                        var splits: seq[(int, int)]
+                        var bestHb = low(int)
+                        for wa in countdown(op.aHi, max(op.aLo, 1)):
+                            let hb = min(op.bHi, target div wa)
+                            if hb < op.bLo: continue
+                            if hb > bestHb:
+                                splits.add((wa, hb))
+                                bestHb = hb
+                                if hb == op.bHi: break
+                        # Closest-to-incumbent shapes first: least repacking work
+                        splits.sort(proc(x, y: (int, int)): int =
+                            cmp(abs(x[0]-curA) + abs(x[1]-curB), abs(y[0]-curA) + abs(y[1]-curB)))
+                        if splits.len > 3: splits.setLen(3)
+
+                        var stagedImproved = false
+                        for (wa, hb) in splits:
+                            if deadline > 0 and epochTime() > deadline:
+                                break
+                            system.baseArray.reducedDomain = baseReducedDomain
+                            system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
+                            let savedConstraintsP = system.baseArray.constraints
+                            let savedFixedP = copyPackedSet(system.baseArray.fixedPositions)
+                            # Per-input bounds when the factor is a max channel:
+                            # each protruding element contributes its own
+                            # graduated violation (gradient), unlike a single
+                            # flat bound on the max.
+                            if op.aInputs.len > 0:
+                                for ie in op.aInputs:
+                                    system.addConstraint(ie <= T(wa - op.aShift))
+                            else:
+                                system.addConstraint(op.aExpr <= T(wa))
+                            if op.bInputs.len > 0:
+                                for ie in op.bInputs:
+                                    system.addConstraint(ie <= T(hb - op.bShift))
+                            else:
+                                system.addConstraint(op.bExpr <= T(hb))
+                            system.baseArray.tightenReducedDomain()
+                            try:
+                                if verbose:
+                                    echo "[Opt] Retry targeting ", target, " via factor bounds ", wa, "x", hb
+                                    flushFile(stdout)
+                                system.resolve(
+                                    parallel=parallel,
+                                    tabuThreshold=retryThreshold,
+                                    scatterThreshold=scatterThreshold,
+                                    populationSize=effectivePopSize,
+                                    numWorkers=numWorkers,
+                                    scatterStrategy=scatterStrategy,
+                                    verbose=verbose,
+                                    deadline=deadline,
+                                    seedAssignment=bestSolution,
+                                )
+                                objective.initialize(system.assignment)
+                                currentCost = objective.value
+                                if domainLoBound != low(int) and currentCost < domainLoBound:
+                                    system.initialize(bestSolution)
+                                    objective.initialize(system.assignment)
+                                    currentCost = objective.value
+                                else:
+                                    stagedImproved = true
+                            except TimeLimitExceededError:
+                                system.initialize(bestSolution)
+                                objective.initialize(system.assignment)
+                                system.searchCompleted = false
+                            except InfeasibleError:
+                                # Only this split's box is proven empty — other
+                                # splits at the same target may still work.
+                                system.initialize(bestSolution)
+                                objective.initialize(system.assignment)
+                            except NoSolutionFoundError:
+                                system.initialize(bestSolution)
+                                objective.initialize(system.assignment)
+                            finally:
+                                system.baseArray.constraints = savedConstraintsP
+                                system.baseArray.fixedPositions = copyPackedSet(savedFixedP)
+                            if stagedImproved:
+                                break
+
+                        if stagedImproved:
+                            system.bestAssignmentValid = false
+                            system.bestFeasibleAssignment = system.assignment
+                            system.bestAssignmentValid = true
+                            if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+                            echo "[Opt] Retry improved (factor bounds): ", currentCost
+                            flushFile(stdout)
+                            retryThreshold = tabuThreshold
+                            continue
+                        if deadline > 0 and epochTime() > deadline:
+                            system.searchCompleted = false
+                            break retryLoop
 
                 let savedConstraints2 = system.baseArray.constraints
                 let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)

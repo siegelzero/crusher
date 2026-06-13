@@ -16,6 +16,7 @@ type
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition*: Table[int, seq[int]]
+                exprValues*: seq[T]  # cached per-expression values
 
 ################################################################################
 # MinExpression creation
@@ -54,7 +55,17 @@ func initialize*[T](state: MinExpression[T], assignment: seq[T]) =
     # Initialize the MinExpression with the given assignment, and updates the value.
     for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
-    state.value = state.evaluate(assignment)
+    if state.evalMethod == ExpressionBased:
+        # Cache per-expression values: updates re-evaluate only affected
+        # expressions and recompute the min by scanning the cache.
+        state.exprValues = newSeq[T](state.expressions.len)
+        for i in 0..<state.expressions.len:
+            state.exprValues[i] = state.expressions[i].evaluate(assignment)
+        state.value = high(T)
+        for v in state.exprValues:
+            if v < state.value: state.value = v
+    else:
+        state.value = state.evaluate(assignment)
 
 func evaluate*[T](state: MinExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     var minValue: T = high(T)
@@ -87,13 +98,22 @@ func updatePosition*[T](state: MinExpression[T], position: int, newValue: T) {.i
             elif oldValue == state.value and newValue > oldValue:
                 # We're replacing the current minimum with a larger value
                 # Need to find the new minimum among all values
-                state.value = min(state.currentAssignment.values.toSeq)
+                var newMin = high(T)
+                for v in state.currentAssignment.values:
+                    if v < newMin: newMin = v
+                state.value = newMin
             # Otherwise, the minimum doesn't change
 
         of ExpressionBased:
-            # For expression-based, always recalculate since tracking which expression
-            # previously provided the min is complex (the old optimization was buggy)
-            state.value = state.evaluate(state.currentAssignment)
+            # Re-evaluate only affected expressions into the cache, then
+            # recompute the min by scanning cached values (no tree walks).
+            if position in state.expressionsAtPosition:
+                for i in state.expressionsAtPosition[position]:
+                    state.exprValues[i] = state.expressions[i].evaluate(state.currentAssignment)
+            var newMin = high(T)
+            for v in state.exprValues:
+                if v < newMin: newMin = v
+            state.value = newMin
 
 func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in minimum value obtained by reassigning position from oldValue to newValue.
@@ -124,12 +144,8 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
 
             let affected = state.expressionsAtPosition[position]
 
-            # Compute min of affected expressions with current (old) value
-            var minOldAffected: T = high(T)
-            for i in affected:
-                minOldAffected = min(minOldAffected, state.expressions[i].evaluate(state.currentAssignment))
-
-            # Compute min of affected expressions with new value
+            # Evaluate affected expressions once with the new value; combine
+            # with cached values of unaffected expressions (no extra walks).
             state.currentAssignment[position] = newValue
             var minNewAffected: T = high(T)
             for i in affected:
@@ -138,14 +154,11 @@ func moveDelta*[T](state: MinExpression[T], position: int, oldValue, newValue: T
 
             if minNewAffected < currentMin:
                 return minNewAffected - currentMin
-            elif minOldAffected <= currentMin and minNewAffected > minOldAffected:
-                # Min-providing expression increased — need full scan
-                state.currentAssignment[position] = newValue
-                let newMin = state.evaluate(state.currentAssignment)
-                state.currentAssignment[position] = oldValue
-                return newMin - currentMin
-            else:
-                return 0
+            var newMin = minNewAffected
+            for i in 0..<state.exprValues.len:
+                if i notin affected and state.exprValues[i] < newMin:
+                    newMin = state.exprValues[i]
+            return newMin - currentMin
 
 proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
     # Creates a deep copy of a MinExpression for thread-safe parallel processing
@@ -168,7 +181,8 @@ proc deepCopy*[T](state: MinExpression[T]): MinExpression[T] =
                 positions: state.positions,  # PackedSet is a value type, safe to copy
                 currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
                 expressions: copiedExpressions,
-                expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
+                expressionsAtPosition: state.expressionsAtPosition,  # Table is a value type, safe to copy
+                exprValues: state.exprValues
             )
 
 ################################################################################

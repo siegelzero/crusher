@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe
+import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe
 
 ################################################################################
 # Shared constraint type definitions
@@ -40,6 +40,7 @@ type
         ConditionalNoOverlapPairType,
         ConditionalDayCapacityType,
         DisjunctiveClauseType,
+        AdjacencyEqualType,
         ValueSupportType,
         MultiResourceNoOverlapType,
         CircuitTimePropType,
@@ -143,6 +144,8 @@ type
                 conditionalDayCapacityState*: ConditionalDayCapacityConstraint[T]
             of DisjunctiveClauseType:
                 disjunctiveClauseState*: DisjunctiveClauseConstraint[T]
+            of AdjacencyEqualType:
+                adjacencyEqualState*: AdjacencyEqualConstraint[T]
             of ValueSupportType:
                 valueSupportState*: ValueSupportConstraint[T]
             of MultiResourceNoOverlapType:

@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -60,6 +60,12 @@ type
 
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
+        # Search budget handles, set by tabuImprove on entry. Long-running
+        # auxiliary scans (swap/permutation/compound-repair helpers) check
+        # these periodically so a single helper call cannot overrun the
+        # deadline by its full scan length.
+        searchDeadline*: float
+        stopSignal*: ptr Atomic[bool]
         carray*: ConstrainedArray[T]
         sharedDomain*: ptr seq[seq[T]]  # Points to shared reducedDomain (never copied per state)
         constraintsAtPosition*: seq[seq[StatefulConstraint[T]]]
@@ -366,6 +372,8 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.conditionalDayCapacityState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             result = constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
+        of AdjacencyEqualType:
+            result = constraint.adjacencyEqualState.moveDelta(position, oldValue, newValue)
         of ConditionalLinearType:
             result = constraint.conditionalLinearState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
@@ -467,6 +475,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == DisjunctiveClauseType:
             let p = constraint.disjunctiveClauseState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == AdjacencyEqualType:
+            let p = constraint.adjacencyEqualState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
         elif constraint.stateType == ConditionalLinearType:
@@ -585,6 +597,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == DisjunctiveClauseType:
             let penalties = constraint.disjunctiveClauseState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == AdjacencyEqualType:
+            let penalties = constraint.adjacencyEqualState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -727,6 +745,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             state.constraintPenalties[position][localIdx][i] = newP
     elif constraint.stateType == DisjunctiveClauseType:
         let penalties = constraint.disjunctiveClauseState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == AdjacencyEqualType:
+        let penalties = constraint.adjacencyEqualState.batchMovePenalty(
             position, state.assignment[position], domain)
         for i in 0..<domain.len:
             let newP = penalties[i]
@@ -1156,7 +1182,7 @@ proc initStrategyForPopulation*(id, populationSize: int): InitStrategy =
         if id == 1: return isDomainMax
     isRandom
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false) =
+proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false, deadline: float = 0.0) =
     state.id = id
     state.carray = carray
     # Use shared domain pointer if available (parallel path), otherwise own copy (sequential path)
@@ -3081,7 +3107,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Skipped for path-relinking states which have their own seed assignment.
     if not forRelinking and initialAssignment.len == 0 and
             carray.enableChannelInequalityRepair:
-        state.repairChannelInequalities(verbose, id)
+        state.repairChannelInequalities(verbose, id, deadline)
         # Capture the post-repair state as the new best so tabu's main loop
         # doesn't start tracking improvements from the pre-repair value.
         if state.cost <= state.bestCost:
@@ -3089,9 +3115,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.bestAssignment = state.assignment
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom): TabuState[T] =
+proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom, deadline: float = 0.0): TabuState[T] =
     new(result)
-    result.init(carray, verbose, id, initStrategy = initStrategy)
+    result.init(carray, verbose, id, initStrategy = initStrategy, deadline = deadline)
 
 proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
@@ -3965,6 +3991,14 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
 
         inc posChecked
         let domain = state.sharedDomain[][position]
+        # Batch the channel-dep deltas once per position: one cascade pass
+        # fills channelDepPenalties[position] for every domain value, instead
+        # of simulating the full cascade per candidate value in costDelta.
+        let hasChanDep = state.hasChannelDeps and
+            position < state.channelDepPenalties.len and
+            state.channelDepPenalties[position].len > 0
+        if hasChanDep:
+            state.computeChannelDepPenaltiesAt(position)
         for di in 0..<domain.len:
             let value = domain[di]
             if value == oldValue: continue
@@ -3976,7 +4010,13 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
                bestDelta >= state.bestCost - state.cost:
                 continue  # tabu and no aspiration
 
-            let delta = state.costDelta(position, value)
+            var delta = 0
+            for constraint in state.constraintsAtPosition[position]:
+                delta += state.movePenalty(constraint, position, value)
+            if hasChanDep:
+                delta += state.channelDepPenalties[position][di]
+            if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
+                delta += state.computeInverseDeltaAt(position, value)
             if delta < bestDelta:
                 bestDelta = delta
                 bestPos = position
@@ -4346,6 +4386,8 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
 
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
+    state.searchDeadline = deadline
+    state.stopSignal = shouldStop
     var lastImprovement = 0
 
     # Reset timing and profiling counters for this run
@@ -4407,12 +4449,22 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.lastImprovementIter = lastImprovement
             return state
 
-        # Check deadline every 1024 iterations
-        if deadline > 0 and (state.iteration and 0x3FF) == 0 and epochTime() > deadline:
+        # Check deadline every 64 iterations. The granularity matters: on
+        # channel-heavy models an iteration costs ~0.1-1s (stagnation helpers
+        # can run full swap scans inside one iteration), so a coarse mask
+        # overruns the deadline by minutes.
+        if deadline > 0 and (state.iteration and 0x3F) == 0 and epochTime() > deadline:
             if state.verbose:
                 state.logExitStats("Deadline")
             state.lastImprovementIter = lastImprovement
             return state
+
+        # The stagnation helpers below can each burn seconds per call (full
+        # cascade evaluations over many candidate moves); gate them on the
+        # remaining budget or they overrun the deadline by minutes.
+        template outOfBudget(): bool =
+            (shouldStop != nil and shouldStop[].load()) or
+            (deadline > 0 and epochTime() > deadline)
 
         if useLeanSearch:
             state.applyFirstImprovingMove()
@@ -4433,7 +4485,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Try ejection chain moves periodically during stagnation
         if state.flowEnabled and
            state.iteration - lastImprovement >= 50 and
-           (state.iteration - lastImprovement) mod 50 == 0:
+           (state.iteration - lastImprovement) mod 50 == 0 and
+           not outOfBudget():
             if state.tryChainMoves():
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
@@ -4448,7 +4501,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Try general swap moves periodically during stagnation
         if state.searchPositions.len <= 200 and
            state.iteration - lastImprovement >= 20 and
-           (state.iteration - lastImprovement) mod 20 == 0:
+           (state.iteration - lastImprovement) mod 20 == 0 and
+           not outOfBudget():
             if state.tryGeneralSwapMoves():
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
@@ -4466,7 +4520,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # heavy problems): allow perturbation to escape local optima.
         if state.tableInConstraintIndices.len > 0 and
            state.iteration - lastImprovement >= 100 and
-           (state.iteration - lastImprovement) mod 100 == 0:
+           (state.iteration - lastImprovement) mod 100 == 0 and
+           not outOfBudget():
             let deepStag = state.tableInConstraintIndices.len >= 10 and
                            state.iteration - lastImprovement >= 500
             if state.tryTableMoves(allowPerturb = deepStag):
@@ -4483,7 +4538,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Try linear repair moves during stagnation: coordinate multi-variable
         # adjustments on violated EqualTo constraints (e.g., flow conservation)
         if state.iteration - lastImprovement >= 100 and
-           (state.iteration - lastImprovement) mod 100 == 0:
+           (state.iteration - lastImprovement) mod 100 == 0 and
+           not outOfBudget():
             if state.tryLinearRepairMoves():
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
@@ -4499,10 +4555,12 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # where single-position flips give delta=0 due to coupled implications.
         # When an improvement is found, iterate (compound moves often chain).
         if state.iteration - lastImprovement >= 200 and
-           (state.iteration - lastImprovement) mod 50 == 0:
+           (state.iteration - lastImprovement) mod 50 == 0 and
+           not outOfBudget():
             var iterations = 0
             const MAX_COMPOUND_ITERATIONS = 50
-            while iterations < MAX_COMPOUND_ITERATIONS and state.tryCompoundCountRepair():
+            while iterations < MAX_COMPOUND_ITERATIONS and not outOfBudget() and
+                    state.tryCompoundCountRepair():
                 iterations += 1
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration

@@ -18,6 +18,13 @@ type
         positions*: PackedSet[int]
         value*: T
         currentAssignment*: Table[int, T]
+        # Additive-term decomposition with per-term value caching: a position
+        # update re-evaluates only the summands that reference it, instead of
+        # walking the whole tree. A non-additive root degrades to one term —
+        # identical cost to whole-tree evaluation.
+        terms*: seq[ExpressionNode[T]]
+        termsAtPosition*: Table[int, seq[int]]
+        termValues*: seq[T]
 
 func newStatefulAlgebraicExpression*[T](expression: AlgebraicExpression[T]): StatefulAlgebraicExpression[T] =
     result = StatefulAlgebraicExpression[T](
@@ -26,24 +33,32 @@ func newStatefulAlgebraicExpression*[T](expression: AlgebraicExpression[T]): Sta
         value: default(T),
         currentAssignment: initTable[int, T]()
     )
+    result.terms = extractAdditiveTerms(expression.node)
+    result.termValues = newSeq[T](result.terms.len)
+    for ti in 0..<result.terms.len:
+        for pos in collectPositions(result.terms[ti]).items:
+            result.termsAtPosition.mgetOrPut(pos, @[]).add(ti)
 
+{.push overflowChecks: off.}
 func initialize*[T](expression: StatefulAlgebraicExpression[T], assignment: seq[T]) =
     # Initialize with the given assignment
     expression.currentAssignment.clear()
     for position in expression.positions.items:
         expression.currentAssignment[position] = assignment[position]
-    expression.value = expression.algebraicExpr.evaluate(assignment)
+    expression.value = 0
+    for ti in 0..<expression.terms.len:
+        expression.termValues[ti] = expression.terms[ti].evaluate(assignment)
+        expression.value += expression.termValues[ti]
 
 func updatePosition*[T](expression: StatefulAlgebraicExpression[T], position: int, newValue: T) =
-    # Update a single position incrementally
+    # Update a single position incrementally: re-evaluate affected terms only.
     if position in expression.positions:
-        # Calculate the delta first for incremental update
-        let oldValue = expression.currentAssignment[position]
-        let delta = expression.moveDelta(position, oldValue, newValue)
-
-        # Update assignment and value incrementally
         expression.currentAssignment[position] = newValue
-        expression.value += delta
+        if position in expression.termsAtPosition:
+            for ti in expression.termsAtPosition[position]:
+                let newTermValue = expression.terms[ti].evaluate(expression.currentAssignment)
+                expression.value += newTermValue - expression.termValues[ti]
+                expression.termValues[ti] = newTermValue
 
 # Calculate the change in cost
 func moveDelta*[T](expression: StatefulAlgebraicExpression[T],
@@ -52,16 +67,17 @@ func moveDelta*[T](expression: StatefulAlgebraicExpression[T],
     # Fast exit: if position isn't in this expression, no change
     if position notin expression.positions:
         return 0
-    let currentValue = expression.value
-    # Temporarily update and evaluate using table-based evaluation
+    if position notin expression.termsAtPosition:
+        return 0
+    # Temporarily update, evaluate affected terms against cached old values, restore
     let savedValue = expression.currentAssignment[position]
     expression.currentAssignment[position] = newValue
-    let newTotalValue = expression.algebraicExpr.evaluate(expression.currentAssignment)
-
-    # Restore original value
+    result = 0
+    for ti in expression.termsAtPosition[position]:
+        result += expression.terms[ti].evaluate(expression.currentAssignment) -
+                  expression.termValues[ti]
     expression.currentAssignment[position] = savedValue
-
-    return newTotalValue - currentValue
+{.pop.}
 
 ################################################################################
 # Unified Expression wrapper type
@@ -232,8 +248,13 @@ proc deepCopy*[T](expression: StatefulAlgebraicExpression[T]): StatefulAlgebraic
         algebraicExpr: expression.algebraicExpr.deepCopy(),  # Deep copy the underlying algebraic expression
         positions: expression.positions,  # PackedSet is a value type, safe to copy
         value: expression.value,
-        currentAssignment: expression.currentAssignment  # Table is a value type, safe to copy
+        currentAssignment: expression.currentAssignment,  # Table is a value type, safe to copy
+        termsAtPosition: expression.termsAtPosition,
+        termValues: expression.termValues
     )
+    result.terms = newSeq[ExpressionNode[T]](expression.terms.len)
+    for ti in 0..<expression.terms.len:
+        result.terms[ti] = expression.terms[ti].deepCopy()
 
 proc deepCopy*[T](expression: Expression[T]): Expression[T] =
     ## Creates a deep copy of an Expression preserving all runtime state

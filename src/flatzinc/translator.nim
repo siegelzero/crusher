@@ -6,7 +6,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue, binaryPairwiseSum]
 
 const
@@ -2127,6 +2127,131 @@ proc translate*(model: FznModel): FznTranslator =
     if nCondLinEmitted > 0:
         stderr.writeLine(&"[FZN] Emitted {nCondLinEmitted} conditional linear constraints")
 
+    # Coalesce adjacency-shaped clause groups into AdjacencyEqual constraints.
+    # Shape per clause: (labelEq ∨ lin ≤ r1 ∨ −lin ≤ r2) with r1 + r2 = −2,
+    # i.e. "lin ≠ r1+1 unless labelEq" — the pairwise trace-cut/separation
+    # pattern that O(n²) decompositions produce. One incremental constraint
+    # replaces the whole group: a coordinate move re-checks only the ±1
+    # neighborhoods of the moved item instead of every clause it appears in.
+    block detectAdjacencyEqual:
+        type CanonTerm = tuple[positions: seq[int], coeffs: seq[int], rhs: int]
+
+        proc canonicalize(tr: FznTranslator, term: DisjunctiveClauseTerm):
+                tuple[ok: bool, ct: CanonTerm] =
+            ## Resolve var names to positions, fold parameters into rhs,
+            ## merge duplicate positions, sort by position.
+            var byPos = initTable[int, int]()
+            var rhs = term.rhs
+            for k in 0..<term.varNames.len:
+                let vn = term.varNames[k]
+                if vn in tr.varPositions:
+                    let pos = tr.varPositions[vn]
+                    byPos[pos] = byPos.getOrDefault(pos, 0) + term.coeffs[k]
+                elif vn in tr.paramValues:
+                    rhs -= term.coeffs[k] * tr.paramValues[vn]
+                else:
+                    return (false, (positions: newSeq[int](), coeffs: newSeq[int](), rhs: 0))
+            var poss: seq[int]
+            for pos in byPos.keys: poss.add(pos)
+            poss.sort()
+            var coeffs: seq[int]
+            var kept: seq[int]
+            for pos in poss:
+                if byPos[pos] != 0:
+                    kept.add(pos)
+                    coeffs.add(byPos[pos])
+            return (true, (positions: kept, coeffs: coeffs, rhs: rhs))
+
+        proc negated(ct: CanonTerm): seq[int] =
+            for c in ct.coeffs: result.add(-c)
+
+        const MinAdjacencyClauses = 8
+        var adjItems: seq[AdjItemForm[int]]
+        var adjPairs: seq[AdjPairSpec[int]]
+        var itemKeyToIdx = initTable[(seq[int], seq[int], int), int32]()
+        var detected = newSeq[bool](result.disjunctiveClauses.len)
+        var nDetected = 0
+
+        proc itemIdx(positions: seq[int], coeffs: seq[int], constant: int): int32 =
+            let key = (positions, coeffs, constant)
+            if key in itemKeyToIdx:
+                return itemKeyToIdx[key]
+            result = int32(adjItems.len)
+            adjItems.add(AdjItemForm[int](
+                positions: positions, coeffs: coeffs, constant: constant))
+            itemKeyToIdx[key] = result
+
+        for cli, clause in result.disjunctiveClauses:
+            if clause.disjuncts.len != 3: continue
+            # Classify disjuncts: two single-term (the mirrored lin pair) and
+            # one two-term (the label equality from an eq-reif).
+            var singleIdx: seq[int]
+            var eqIdx = -1
+            var shapeOk = true
+            for d in 0..<3:
+                case clause.disjuncts[d].len
+                of 1: singleIdx.add(d)
+                of 2:
+                    if eqIdx >= 0: shapeOk = false
+                    eqIdx = d
+                else: shapeOk = false
+            if not shapeOk or singleIdx.len != 2 or eqIdx < 0: continue
+
+            let (ok1, t1) = canonicalize(result, clause.disjuncts[singleIdx[0]][0])
+            let (ok2, t2) = canonicalize(result, clause.disjuncts[singleIdx[1]][0])
+            if not ok1 or not ok2: continue
+            # Mirrored pair: t2 = −t1, with r1 + r2 = −2 (forbidden point r1+1)
+            if t2.positions != t1.positions or t2.coeffs != negated(t1): continue
+            if t1.rhs + t2.rhs != -2: continue
+
+            let (okA, eqA) = canonicalize(result, clause.disjuncts[eqIdx][0])
+            let (okB, eqB) = canonicalize(result, clause.disjuncts[eqIdx][1])
+            if not okA or not okB: continue
+            # Mirrored equality: eqB = −eqA with rhs sum 0 ⇒ exempt iff lin == rhs
+            if eqB.positions != eqA.positions or eqB.coeffs != negated(eqA): continue
+            if eqA.rhs + eqB.rhs != 0: continue
+            if eqA.positions.len == 0: continue  # constant equality — degenerate
+
+            # Split t1 into the two coordinate forms: positive part = item a,
+            # negated negative part (+ rhs constant) = item b. Violation:
+            # coord(a) == coord(b) + 1.
+            var aPos, aCoef, bPos, bCoef: seq[int]
+            for k in 0..<t1.positions.len:
+                if t1.coeffs[k] > 0:
+                    aPos.add(t1.positions[k]); aCoef.add(t1.coeffs[k])
+                else:
+                    bPos.add(t1.positions[k]); bCoef.add(-t1.coeffs[k])
+            let a = itemIdx(aPos, aCoef, 0)
+            let b = itemIdx(bPos, bCoef, t1.rhs)
+            adjPairs.add(AdjPairSpec[int](
+                a: a, b: b,
+                labelPositions: eqA.positions,
+                labelCoeffs: eqA.coeffs,
+                labelRhs: eqA.rhs))
+            detected[cli] = true
+            inc nDetected
+
+        if nDetected >= MinAdjacencyClauses:
+            var survivors: seq[DisjunctiveClause]
+            for cli, clause in result.disjunctiveClauses:
+                if not detected[cli]:
+                    survivors.add(clause)
+            result.disjunctiveClauses = survivors
+
+            var adjPositions = initPackedSet[int]()
+            for item in adjItems:
+                for p in item.positions: adjPositions.incl(p)
+            for pair in adjPairs:
+                for p in pair.labelPositions: adjPositions.incl(p)
+
+            let adjState = newAdjacencyEqualConstraint[int](adjItems, adjPairs)
+            result.sys.addConstraint(StatefulConstraint[int](
+                positions: adjPositions,
+                stateType: AdjacencyEqualType,
+                adjacencyEqualState: adjState))
+            stderr.writeLine(&"[FZN] Coalesced {nDetected} adjacency clauses into 1 AdjacencyEqual constraint " &
+                             &"({adjItems.len} items, {adjPairs.len} pairs, {adjPositions.len} positions)")
+
     # Add generalized disjunctive clause constraints using dedicated DisjunctiveClauseType
     for clause in result.disjunctiveClauses:
         var disjuncts: seq[seq[tuple[coeffs: seq[int], positions: seq[int], rhs: int]]]
@@ -2985,6 +3110,75 @@ proc translate*(model: FznModel): FznTranslator =
                         result.objectiveLoBound = max(result.objectiveLoBound, 0)
                         if result.objectiveLoBound != oldLo:
                             stderr.writeLine(&"[FZN] Objective lower bound tightened: {oldLo} → {result.objectiveLoBound}")
+
+    # Detect a product objective (objective = a × b, e.g. board area = w × h).
+    # The optimizer uses this to bound the factors directly instead of the
+    # composite product: a flat `obj ≤ T` bound gives local search a single
+    # ±1 penalty with no gradient, while `a ≤ wa` propagates into the factor's
+    # defining structure (typically a max over placements) and penalises each
+    # offending element individually.
+    if result.model.solve.kind == Minimize and
+            result.model.solve.objective != nil and
+            result.model.solve.objective.kind == FznIdent:
+        let objName = result.model.solve.objective.ident
+        for con in result.model.constraints:
+            if stripSolverPrefix(con.name) != "int_times": continue
+            if con.args.len < 3: continue
+            if con.args[2].kind != FznIdent or con.args[2].ident != objName: continue
+            if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+            let aName = con.args[0].ident
+            let bName = con.args[1].ident
+            let aDom = result.lookupVarDomain(aName)
+            let bDom = result.lookupVarDomain(bName)
+            if aDom.len == 0 or bDom.len == 0: continue
+            # Factor staging only helps when both factors are genuinely variable
+            # and non-negative (sign flips would invert the bound direction).
+            if aDom[0] < 0 or bDom[0] < 0: continue
+            if aDom[0] == aDom[^1] or bDom[0] == bDom[^1]: continue
+            # Factors are frequently defined vars (board_w = max(...) − 1)
+            # without own positions — resolve to expressions, which the
+            # optimizer can bound directly.
+            let aExpr = result.resolveExprArg(con.args[0])
+            let bExpr = result.resolveExprArg(con.args[1])
+            if aExpr.isNil or bExpr.isNil: continue
+
+            # If a factor is (max-channel + shift), record the max's inputs:
+            # `factor ≤ w` then decomposes into per-input bounds, one graduated
+            # violation per protruding element instead of a flat max violation.
+            proc maxChannelInputs(tr: FznTranslator, e: AlgebraicExpression[int]):
+                    (seq[AlgebraicExpression[int]], int) =
+                var chanPos = -1
+                var shift = 0
+                let n = e.node
+                if n.kind == RefNode:
+                    chanPos = n.position
+                elif n.kind == BinaryOpNode and n.left != nil and n.right != nil:
+                    if n.binaryOp == Addition and n.left.kind == RefNode and n.right.kind == LiteralNode:
+                        chanPos = n.left.position; shift = n.right.value
+                    elif n.binaryOp == Addition and n.left.kind == LiteralNode and n.right.kind == RefNode:
+                        chanPos = n.right.position; shift = n.left.value
+                    elif n.binaryOp == Subtraction and n.left.kind == RefNode and n.right.kind == LiteralNode:
+                        chanPos = n.left.position; shift = -n.right.value
+                if chanPos < 0: return (@[], 0)
+                for b in tr.sys.baseArray.minMaxChannelBindings:
+                    if b.channelPosition == chanPos and not b.isMin:
+                        return (b.inputExprs, shift)
+                return (@[], 0)
+
+            let (aInputs, aShift) = maxChannelInputs(result, aExpr)
+            let (bInputs, bShift) = maxChannelInputs(result, bExpr)
+            result.sys.objectiveProduct = ObjectiveProduct[int](
+                active: true,
+                aExpr: aExpr,
+                bExpr: bExpr,
+                aLo: aDom[0], aHi: aDom[^1],
+                bLo: bDom[0], bHi: bDom[^1],
+                aInputs: aInputs, aShift: aShift,
+                bInputs: bInputs, bShift: bShift)
+            stderr.writeLine(&"[FZN] Objective product staging: {objName} = {aName} × {bName} " &
+                             &"({aDom[0]}..{aDom[^1]} × {bDom[0]}..{bDom[^1]}, " &
+                             &"max-inputs {aInputs.len}/{bInputs.len})")
+            break
 
     # Detect partition groups: sum-of-channels == 1 constraints where channels
     # trace back through bool2int → int_ne_reif to search positions.

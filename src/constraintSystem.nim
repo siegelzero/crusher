@@ -46,6 +46,25 @@ type
         # k -> list of (position, value) to fix when the objective bound implies v <= k
         fixingsByBound*: Table[int, seq[(int, int)]]
 
+    ObjectiveProduct*[T] = object
+        ## Detected `objective = a × b` structure (e.g. board area = w × h).
+        ## When minimizing with a target bound T, the optimizer can bound the
+        ## factors directly (a ≤ wa, b ≤ hb with wa·hb ≤ T) instead of the
+        ## composite product. Factor bounds propagate through the factors'
+        ## defining structure (typically max-channels over placements), giving
+        ## local search a per-element gradient the flat product bound lacks.
+        ## The factors are kept as expressions: they are often defined vars
+        ## (no own position), e.g. board_w = max(...) − 1.
+        active*: bool
+        aExpr*, bExpr*: AlgebraicExpression[T]
+        aLo*, aHi*: int         # domain bounds of factor a
+        bLo*, bHi*: int         # domain bounds of factor b
+        # When a factor is (max-channel + shift), `factor ≤ w` decomposes into
+        # per-input bounds input_i ≤ w − shift — one graduated violation per
+        # protruding element instead of a single flat max violation.
+        aInputs*, bInputs*: seq[AlgebraicExpression[T]]
+        aShift*, bShift*: int
+
     ConstraintSystem*[T] = ref object
         size*: int
         variables*: seq[VariableContainer[T]]
@@ -59,6 +78,7 @@ type
         optimalityProven*: bool  # Domain reduction proved no better solution exists
         adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
         objectiveStaging*: ObjectiveStaging  # Staged-presolve fixings (inactive by default)
+        objectiveProduct*: ObjectiveProduct[T]  # objective = a×b factor staging (inactive by default)
         circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
                                           # minimized objective exactly: its metric bound
                                           # replaces the explicit objective<=target constraint

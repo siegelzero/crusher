@@ -1,4 +1,5 @@
 # Combined test runner - single compilation for all tests
+import test_adjacency_equal
 import test_agatha
 import test_all_different_except0
 import test_binary_pairwise_sum

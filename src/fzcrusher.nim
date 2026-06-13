@@ -26,6 +26,20 @@ proc immediateExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noRet
 var gSavedFd: cint = -1
 var gTranslator: ptr FznTranslator = nil
 var gHasSolution: ptr bool = nil
+var gWatchdogThread: Thread[float]
+
+proc watchdogProc(deadline: float) {.thread.} =
+  ## Hard time-limit backstop: the search loops check the deadline
+  ## cooperatively, but any code path that misses a check (long auxiliary
+  ## scans, rare scheduling stalls) would otherwise overrun the limit.
+  ## Deliver SIGTERM to ourselves shortly after the deadline so the signal
+  ## handler prints the best incumbent and exits cleanly.
+  while epochTime() < deadline:
+    sleep(250)
+  stderr.writeLine("[Watchdog] deadline passed — sending SIGTERM (t=" &
+                   $epochTime() & ")")
+  stderr.flushFile()
+  discard posix.kill(posix.getpid(), SIGTERM)
 
 proc sigTermHandler(sig: cint) {.noconv.} =
   flushFile(stdout)
@@ -125,7 +139,6 @@ proc main() =
     stderr.writeLine(&"Error: file not found: {filename}")
     quit(1)
 
-  let startTime = cpuTime()
   let wallStart = epochTime()
 
   # Parse and translate. Any failure here (e.g. an unsupported FlatZinc
@@ -179,6 +192,11 @@ proc main() =
   signal(SIGINT, sigTermHandler)
   signal(SIGPIPE, SIG_IGN)  # Ignore broken pipe (MiniZinc may close stdout early)
 
+  # Hard watchdog: SIGTERM ourselves 10s past the deadline if still running
+  # (cooperative deadline checks normally exit well before this fires).
+  if deadline > 0:
+    createThread(gWatchdogThread, watchdogProc, deadline + 10.0)
+
   # Honour a memory budget (--memory / MEMORY_LIMIT / cgroup) by capping the
   # worker count — peak memory is dominated by per-worker state copies, so fewer
   # workers means lower peak. No-op (workers unchanged) when no budget applies.
@@ -202,7 +220,7 @@ proc main() =
     if canStream: streamSolution else: nil
 
   # Solve
-  let solveStart = cpuTime()
+  let solveWallStart = epochTime()
   var solved = false
   var timedOut = false
   case model.solve.kind
@@ -363,9 +381,11 @@ proc main() =
     printUnknown()
 
   if stats:
-    let solveTime = cpuTime() - solveStart
+    # Wall-clock times — cpuTime() sums across threads, inflating parallel
+    # solves by roughly the worker count.
+    let solveTime = epochTime() - solveWallStart
     stderr.writeLine(&"%%%mzn-stat: solveTime={solveTime:.3f}")
-    stderr.writeLine(&"%%%mzn-stat: initTime={solveStart - startTime:.3f}")
+    stderr.writeLine(&"%%%mzn-stat: initTime={solveWallStart - wallStart:.3f}")
     stderr.writeLine(&"%%%mzn-stat: nodes={tr.sys.lastIterations}")
     stderr.writeLine("%%%mzn-stat-end")
 

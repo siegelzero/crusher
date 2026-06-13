@@ -60,6 +60,7 @@ type
         nextTaskIndex: Atomic[int]
         totalTasks: int
         verbose: bool
+        deadline: float  ## Solve deadline (0 = none); bounds init-time repair passes
 
     InitWorkerData[T] = object
         workerId: int
@@ -81,7 +82,8 @@ proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
                 else:
                     pool.results[idx] = newTabuState[T](pool.carrays[idx],
                         verbose = pool.verbose and idx == 0, id = idx,
-                        initStrategy = pool.strategies[idx])
+                        initStrategy = pool.strategies[idx],
+                        deadline = pool.deadline)
             except CatchableError as e:
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Error on state " & $idx & ": " & e.msg)
                 stderr.writeLine("[InitWorker " & $data.workerId & "] Stack: " & e.getStackTrace())
@@ -98,6 +100,8 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
                 break
 
             if pool.solutionFound.load():
+                break
+            if pool.deadline > 0 and epochTime() > pool.deadline:
                 break
 
             discard  # Worker picks up task silently
@@ -278,6 +282,9 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
             if idx >= pool.totalTasks:
                 break
             if pool.solutionFound.load():
+                break
+
+            if pool.deadline > 0 and epochTime() > pool.deadline:
                 break
 
             # Wait for main thread to create this carray (lazy creation)
@@ -514,7 +521,8 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         strategies: cast[ptr UncheckedArray[InitStrategy]](addr strategies[0]),
         seedAssignment: seedAssignment,
         totalTasks: populationSize,
-        verbose: verbose
+        verbose: verbose,
+        deadline: deadline
     )
     initPool.nextTaskIndex.store(0)
 

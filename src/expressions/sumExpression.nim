@@ -17,6 +17,7 @@ type
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition*: Table[int, seq[int]]
+                exprValues*: seq[T]  # cached per-expression values
 
 ################################################################################
 # SumExpression Creation
@@ -75,7 +76,16 @@ func initialize*[T](state: SumExpression[T], assignment: seq[T]) =
     # Initialize the SumExpression with the given assignment, and updates the value.
     for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
-    state.value = state.evaluate(assignment)
+    if state.evalMethod == ExpressionBased:
+        # Cache per-expression values so updates evaluate each affected
+        # expression once instead of twice (old + new).
+        state.exprValues = newSeq[T](state.expressions.len)
+        state.value = state.constant
+        for i in 0..<state.expressions.len:
+            state.exprValues[i] = state.expressions[i].evaluate(assignment)
+            state.value += state.exprValues[i]
+    else:
+        state.value = state.evaluate(assignment)
 
 {.push overflowChecks: off.}
 func evaluate*[T](state: SumExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
@@ -115,17 +125,12 @@ func updatePosition*[T](state: SumExpression[T], position: int, newValue: T) {.i
             state.value += state.coefficient[position] * (newValue - oldValue)
 
         of ExpressionBased:
-            # For expression-based: re-evaluate affected expressions
+            # For expression-based: re-evaluate affected expressions once,
+            # using the cached old value for the delta.
             for i in state.expressionsAtPosition[position]:
-                # Subtract old expression value
-                state.currentAssignment[position] = oldValue
-                let oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
-
-                # Add new expression value
-                state.currentAssignment[position] = newValue
                 let newExpValue = state.expressions[i].evaluate(state.currentAssignment)
-
-                state.value += (newExpValue - oldExpValue)
+                state.value += newExpValue - state.exprValues[i]
+                state.exprValues[i] = newExpValue
 
 func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T): int {.inline.} =
     # Returns the change in value obtained by reassigning position from oldValue to newValue.
@@ -136,18 +141,14 @@ func moveDelta*[T](state: SumExpression[T], position: int, oldValue, newValue: T
             return state.coefficient[position] * (newValue - oldValue)
 
         of ExpressionBased:
-            # Temporarily mutate, evaluate, restore (avoids table copy)
+            # Temporarily mutate, evaluate, restore (avoids table copy).
+            # Old values come from the per-expression cache.
             result = 0
+            state.currentAssignment[position] = newValue
             for i in state.expressionsAtPosition[position]:
-                # Calculate old expression value (assignment already has oldValue)
-                let oldExpValue = state.expressions[i].evaluate(state.currentAssignment)
-
-                # Calculate new expression value
-                state.currentAssignment[position] = newValue
                 let newExpValue = state.expressions[i].evaluate(state.currentAssignment)
-                state.currentAssignment[position] = oldValue
-
-                result += (newExpValue - oldExpValue)
+                result += int(newExpValue - state.exprValues[i])
+            state.currentAssignment[position] = oldValue
 {.pop.}
 
 func linearize*[T](expression: AlgebraicExpression[T]): SumExpression[T] =
@@ -191,7 +192,8 @@ proc deepCopy*[T](state: SumExpression[T]): SumExpression[T] =
                 currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
                 evalMethod: ExpressionBased,
                 expressions: copiedExpressions,
-                expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
+                expressionsAtPosition: state.expressionsAtPosition,  # Table is a value type, safe to copy
+                exprValues: state.exprValues
             )
 
 func mergeLinearExpressions[T](expressions: openArray[AlgebraicExpression[T]],

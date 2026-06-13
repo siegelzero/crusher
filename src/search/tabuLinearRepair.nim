@@ -147,7 +147,8 @@ proc repairLinearEqualities*[T](state: TabuState[T], verbose: bool, id: int) =
              " -> " & $totalResidual
 
 
-proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) =
+proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
+                                   deadline: float = 0.0) =
     ## Initialization repair for graduated `≥`/`≤` inequalities whose SumExpr
     ## consists entirely of channel positions — the case the standard
     ## `repairLinearEqualities` skips because it has no search-position term to
@@ -185,6 +186,25 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     let initialCost = state.cost
     if initialCost == 0: return
 
+    # Wall-clock budget. The eval-count caps below were sized for models where
+    # costDelta is nanoseconds-cheap; on channel-heavy models a single eval can
+    # cascade through dozens of channels and cost tens of microseconds, turning
+    # the capped scans into minutes of init time before the first tabu
+    # iteration. Bound the pass by time — generously above what cheap models
+    # ever use — and by a fraction of the remaining solve window so init can
+    # never consume the whole time limit.
+    const RepairBudgetSeconds = 3.0
+    const RepairBudgetFraction = 0.1
+    const BudgetCheckMask = 255  # check the clock every 256 evals
+    let repairStart = epochTime()
+    var budget = RepairBudgetSeconds
+    if deadline > 0:
+        budget = min(budget, (deadline - repairStart) * RepairBudgetFraction)
+    if budget <= 0: return
+    let budgetEnd = repairStart + budget
+    var nBudgetEvals = 0
+    var outOfTime = false
+
     const MaxSingleScans = 30
     const MaxPairScans = 100
     const MaxPairCandidates = 200_000  # cap (positions × domain)² evaluations
@@ -197,30 +217,35 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
         var bestNewVal: T = 0
         var bestDelta = 0
 
-        for pos in carray.allSearchPositions():
-            let dom = state.sharedDomain[][pos]
-            if dom.len < 2: continue
-            let oldVal = state.assignment[pos]
-            for v in dom:
-                if v == oldVal: continue
-                let delta = state.costDelta(pos, v)
-                if delta < bestDelta:
-                    bestDelta = delta
-                    bestPos = pos
-                    bestNewVal = v
+        block scanSingle:
+            for pos in carray.allSearchPositions():
+                let dom = state.sharedDomain[][pos]
+                if dom.len < 2: continue
+                let oldVal = state.assignment[pos]
+                for v in dom:
+                    if v == oldVal: continue
+                    let delta = state.costDelta(pos, v)
+                    inc nBudgetEvals
+                    if (nBudgetEvals and BudgetCheckMask) == 0 and epochTime() > budgetEnd:
+                        outOfTime = true
+                        break scanSingle
+                    if delta < bestDelta:
+                        bestDelta = delta
+                        bestPos = pos
+                        bestNewVal = v
 
         if bestPos < 0: break
         state.assignValue(bestPos, bestNewVal)
         state.updateNeighborPenalties(bestPos)
         inc nSingle
-        if state.cost == 0: break
+        if state.cost == 0 or outOfTime: break
 
     # Phase 2: greedy 2-flip pre-pass. Single flips give delta ≥ 0 at this
     # point (we'd have moved already otherwise) — typical of bin-packing
     # plateaus where moving one person from an overflowing bin requires
     # someone else to move too. A naive O(N²·D²) scan is bounded by
     # MaxPairCandidates so it stays tractable on larger instances.
-    if state.cost > 0:
+    if state.cost > 0 and not outOfTime:
         for scan in 0..<MaxPairScans:
             let scanStartCost = state.cost
             var bestP1, bestP2 = -1
@@ -257,7 +282,10 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
                                     bestP1 = p1; bestV1 = v1
                                     bestP2 = p2; bestV2 = v2
                                 inc nEvals
-                                if nEvals >= MaxPairCandidates:
+                                inc nBudgetEvals
+                                if (nBudgetEvals and BudgetCheckMask) == 0 and epochTime() > budgetEnd:
+                                    outOfTime = true
+                                if nEvals >= MaxPairCandidates or outOfTime:
                                     state.assignValueLean(p1, old1)
                                     break searchPair
                         # Revert p1.
@@ -270,7 +298,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
             state.assignValue(bestP2, bestV2)
             state.updateNeighborPenalties(bestP2)
             inc nPair
-            if state.cost == 0: break
+            if state.cost == 0 or outOfTime: break
 
     # Phase 3: greedy 3-flip pre-pass when pair flips have plateaued. Covers
     # cases like "rotate three persons across three bins to absorb a residual
@@ -290,7 +318,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
     const MaxTripleScans = 5
     const MaxTripleCandidates = 5_000_000
     var nTriple = 0
-    if state.cost > 0 and not state.inverseEnabled:
+    if state.cost > 0 and not state.inverseEnabled and not outOfTime:
         var basePositions: seq[int]
         for p in carray.allSearchPositions():
             basePositions.add(p)
@@ -338,7 +366,10 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
                                             bestP2 = p2; bestV2 = v2
                                             bestP3 = p3; bestV3 = v3
                                         inc nEvals
-                                        if nEvals >= MaxTripleCandidates:
+                                        inc nBudgetEvals
+                                        if (nBudgetEvals and BudgetCheckMask) == 0 and epochTime() > budgetEnd:
+                                            outOfTime = true
+                                        if nEvals >= MaxTripleCandidates or outOfTime:
                                             state.assignValueLean(p2, old2)
                                             state.assignValueLean(p1, old1)
                                             break searchTriple
@@ -353,12 +384,14 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int) 
             state.assignValue(bestP3, bestV3)
             state.updateNeighborPenalties(bestP3)
             inc nTriple
-            if state.cost == 0: break
+            if state.cost == 0 or outOfTime: break
 
-    if (nSingle > 0 or nPair > 0 or nTriple > 0) and verbose and id == 0:
+    if (nSingle > 0 or nPair > 0 or nTriple > 0 or outOfTime) and verbose and id == 0:
+        let budgetNote = if outOfTime: &" (stopped at {budget:.2f}s budget)" else: ""
         echo "[Init] Channel-inequality repair: " & $nSingle &
              " single + " & $nPair & " pair + " & $nTriple &
-             " triple adjustments, cost " & $initialCost & " -> " & $state.cost
+             " triple adjustments, cost " & $initialCost & " -> " & $state.cost &
+             budgetNote
 
 
 proc tryLinearRepairMoves*[T](state: TabuState[T]): bool =
@@ -480,6 +513,9 @@ proc tryCompoundCountRepair*[T](state: TabuState[T]): bool =
         var bestMove: seq[(int, T)]  # (pos, newVal) for accepted compound move
 
         for anchor in anchors:
+            if (state.stopSignal != nil and state.stopSignal[].load()) or
+                    (state.searchDeadline > 0 and epochTime() > state.searchDeadline):
+                return improved
             let oldA = state.assignment[anchor]
             let newA: T = if oldA == 0: T(1) else: T(0)
             let origCost = state.cost

@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, sets, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
@@ -304,6 +304,8 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "SetIntersectCard Constraint"
         of DisjunctiveClauseType:
             return "DisjunctiveClause Constraint"
+        of AdjacencyEqualType:
+            return "AdjacencyEqual Constraint"
         of ValueSupportType:
             return "ValueSupport Constraint"
         of MultiResourceNoOverlapType:
@@ -391,6 +393,8 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.setIntersectCardState.cost
         of DisjunctiveClauseType:
             return constraint.disjunctiveClauseState.cost
+        of AdjacencyEqualType:
+            return constraint.adjacencyEqualState.cost
         of ValueSupportType:
             return constraint.valueSupportState.cost
         of MultiResourceNoOverlapType:
@@ -1184,6 +1188,8 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.setIntersectCardState.initialize(assignment)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.initialize(assignment)
+        of AdjacencyEqualType:
+            constraint.adjacencyEqualState.initialize(assignment)
         of ValueSupportType:
             constraint.valueSupportState.initialize(assignment)
         of MultiResourceNoOverlapType:
@@ -1268,6 +1274,8 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.setIntersectCardState.moveDelta(position, oldValue, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.moveDelta(position, oldValue, newValue)
+        of AdjacencyEqualType:
+            constraint.adjacencyEqualState.moveDelta(position, oldValue, newValue)
         of ValueSupportType:
             constraint.valueSupportState.moveDelta(position, oldValue, newValue)
         of MultiResourceNoOverlapType:
@@ -1352,6 +1360,8 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.setIntersectCardState.updatePosition(position, newValue)
         of DisjunctiveClauseType:
             constraint.disjunctiveClauseState.updatePosition(position, newValue)
+        of AdjacencyEqualType:
+            constraint.adjacencyEqualState.updatePosition(position, newValue)
         of ValueSupportType:
             constraint.valueSupportState.updatePosition(position, newValue)
         of MultiResourceNoOverlapType:
@@ -2061,6 +2071,12 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 positions: constraint.positions,
                 stateType: DisjunctiveClauseType,
                 disjunctiveClauseState: constraint.disjunctiveClauseState.deepCopy()
+            )
+        of AdjacencyEqualType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: AdjacencyEqualType,
+                adjacencyEqualState: constraint.adjacencyEqualState.deepCopy()
             )
         of ValueSupportType:
             result = StatefulConstraint[T](

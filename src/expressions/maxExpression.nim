@@ -16,6 +16,7 @@ type
             of ExpressionBased:
                 expressions*: seq[AlgebraicExpression[T]]
                 expressionsAtPosition*: Table[int, seq[int]]
+                exprValues*: seq[T]  # cached per-expression values
 
 ################################################################################
 # MaxExpression creation
@@ -54,7 +55,17 @@ func initialize*[T](state: MaxExpression[T], assignment: seq[T]) =
     # Initialize the MaxExpression with the given assignment, and updates the value.
     for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
-    state.value = state.evaluate(assignment)
+    if state.evalMethod == ExpressionBased:
+        # Cache per-expression values: updates re-evaluate only affected
+        # expressions and recompute the max by scanning the cache.
+        state.exprValues = newSeq[T](state.expressions.len)
+        for i in 0..<state.expressions.len:
+            state.exprValues[i] = state.expressions[i].evaluate(assignment)
+        state.value = low(T)
+        for v in state.exprValues:
+            if v > state.value: state.value = v
+    else:
+        state.value = state.evaluate(assignment)
 
 func evaluate*[T](state: MaxExpression[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
     var maxValue: T = low(T)
@@ -87,13 +98,22 @@ func updatePosition*[T](state: MaxExpression[T], position: int, newValue: T) {.i
             elif oldValue == state.value and newValue < oldValue:
                 # We're replacing the current maximum with a smaller value
                 # Need to find the new maximum among all values
-                state.value = max(state.currentAssignment.values.toSeq)
+                var newMax = low(T)
+                for v in state.currentAssignment.values:
+                    if v > newMax: newMax = v
+                state.value = newMax
             # Otherwise, the maximum doesn't change
 
         of ExpressionBased:
-            # For expression-based, always recalculate since tracking which expression
-            # previously provided the max is complex (the old optimization was buggy)
-            state.value = state.evaluate(state.currentAssignment)
+            # Re-evaluate only affected expressions into the cache, then
+            # recompute the max by scanning cached values (no tree walks).
+            if position in state.expressionsAtPosition:
+                for i in state.expressionsAtPosition[position]:
+                    state.exprValues[i] = state.expressions[i].evaluate(state.currentAssignment)
+            var newMax = low(T)
+            for v in state.exprValues:
+                if v > newMax: newMax = v
+            state.value = newMax
 
 func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T): T {.inline.} =
     # Returns the change in maximum value obtained by reassigning position from oldValue to newValue.
@@ -124,12 +144,8 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
 
             let affected = state.expressionsAtPosition[position]
 
-            # Compute max of affected expressions with current (old) value
-            var maxOldAffected: T = low(T)
-            for i in affected:
-                maxOldAffected = max(maxOldAffected, state.expressions[i].evaluate(state.currentAssignment))
-
-            # Compute max of affected expressions with new value
+            # Evaluate affected expressions once with the new value; combine
+            # with cached values of unaffected expressions (no extra walks).
             state.currentAssignment[position] = newValue
             var maxNewAffected: T = low(T)
             for i in affected:
@@ -138,14 +154,11 @@ func moveDelta*[T](state: MaxExpression[T], position: int, oldValue, newValue: T
 
             if maxNewAffected > currentMax:
                 return maxNewAffected - currentMax
-            elif maxOldAffected >= currentMax and maxNewAffected < maxOldAffected:
-                # Max-providing expression decreased — need full scan
-                state.currentAssignment[position] = newValue
-                let newMax = state.evaluate(state.currentAssignment)
-                state.currentAssignment[position] = oldValue
-                return newMax - currentMax
-            else:
-                return 0
+            var newMax = maxNewAffected
+            for i in 0..<state.exprValues.len:
+                if i notin affected and state.exprValues[i] > newMax:
+                    newMax = state.exprValues[i]
+            return newMax - currentMax
 
 proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
     # Creates a deep copy of a MaxExpression for thread-safe parallel processing
@@ -168,7 +181,8 @@ proc deepCopy*[T](state: MaxExpression[T]): MaxExpression[T] =
                 positions: state.positions,  # PackedSet is a value type, safe to copy
                 currentAssignment: state.currentAssignment,  # Table is a value type, safe to copy
                 expressions: copiedExpressions,
-                expressionsAtPosition: state.expressionsAtPosition  # Table is a value type, safe to copy
+                expressionsAtPosition: state.expressionsAtPosition,  # Table is a value type, safe to copy
+                exprValues: state.exprValues
             )
 
 ################################################################################

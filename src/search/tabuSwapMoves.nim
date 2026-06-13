@@ -292,6 +292,10 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
             state.assignValueLean(p1, val1)
 
             inc evalsCount
+            if (evalsCount and 63) == 0 and (
+                    (state.stopSignal != nil and state.stopSignal[].load()) or
+                    (state.searchDeadline > 0 and epochTime() > state.searchDeadline)):
+                return false
 
             let aspiration = origCost + delta < state.bestCost
             if tabu1 and tabu2 and not aspiration:
