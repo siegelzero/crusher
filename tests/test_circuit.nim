@@ -333,3 +333,36 @@ suite "Circuit Constraint":
 
         let sol = x.assignment()
         check validateCircuit(sol, 6, offset = 0)
+
+    test "Cycle-structure accessors expose subtour partition":
+        # Accessors backing the cross-cycle merge neighborhood (tabuCircuitMoves).
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(6)
+        x.setDomain(toSeq(1..6))
+        sys.addConstraint(circuit(x))
+        let positions = toSeq(x.offset..<(x.offset + x.size))
+
+        # Three disjoint 2-cycles: (1 2)(3 4)(5 6).
+        sys.initialize(@[2, 1, 4, 3, 6, 5])
+        let cc = sys.baseArray.constraints[0].circuitState
+        check cc.distinctCycleCount == 3
+
+        # Every node is on a cycle (no tails); exactly 3 distinct cycle ids, each
+        # containing two positions that match the (1 2)(3 4)(5 6) pairing.
+        let members = cc.nodeCycleIds()
+        check members.len == 6
+        var byCycle = initTable[int, seq[int]]()
+        for (pos, cid) in members:
+            check cid >= 0                       # no tail nodes for a permutation
+            byCycle.mgetOrPut(cid, @[]).add(pos)
+        check byCycle.len == 3
+        for cid, members2 in byCycle:
+            check members2.len == 2
+
+        # A single Hamiltonian circuit collapses to one cycle, no tails.
+        sys.initialize(@[2, 3, 4, 5, 6, 1])
+        check cc.distinctCycleCount == 1
+        for (_, cid) in cc.nodeCycleIds():
+            check cid >= 0
+
+        discard positions

@@ -301,6 +301,15 @@ proc subcircuit*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # Returns constraint requiring that values form at most one circuit (self-loops allowed).
     subcircuit[T](cvar.positions)
 
+proc unionCycle*[T](x, y: VariableContainer[T], valueOffset: int = 1): StatefulConstraint[T] =
+    # union-cycle constraint over two successor arrays (matchings).
+    # Holds iff the graph with edges {i—x[i]} ∪ {i—y[i]} is connected.
+    unionCycle[T](x.positions, y.positions, valueOffset)
+
+proc involution*[T](cvar: VariableContainer[T], valueOffset: int = 1): StatefulConstraint[T] =
+    # involution constraint: x[x[i]] = i (self-inverse permutation / matching).
+    involution[T](cvar.positions, valueOffset)
+
 proc increasing*[T](cvar: VariableContainer[T]): StatefulConstraint[T] =
     # increasing constraint for the variable
     # Returns constraint requiring that all values in the container be in non-decreasing order.

@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe
+import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe
 
 ################################################################################
 # Shared constraint type definitions
@@ -25,6 +25,8 @@ type
         IrdcsType,
         CircuitType,
         SubcircuitType,
+        UnionCycleType,
+        InvolutionType,
         AllDifferentExcept0Type,
         LexOrderType,
         TableConstraintType,
@@ -114,6 +116,10 @@ type
                 circuitState*: CircuitConstraint[T]
             of SubcircuitType:
                 subcircuitState*: SubcircuitConstraint[T]
+            of UnionCycleType:
+                unionCycleState*: UnionCycleConstraint[T]
+            of InvolutionType:
+                involutionState*: InvolutionConstraint[T]
             of AllDifferentExcept0Type:
                 allDifferentExcept0State*: AllDifferentExcept0Constraint[T]
             of LexOrderType:

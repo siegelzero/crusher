@@ -1,7 +1,7 @@
-import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat]
+import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -188,6 +188,16 @@ type
         # Cached list of tableIn constraint indices for fast stagnation-time table moves
         tableInConstraintIndices*: seq[int]
 
+        # Cached circuit constraint states (direct-variable only) for circuit-repair moves
+        circuitConstraints*: seq[CircuitConstraint[T]]
+        # Circuit constraints over channel (derived) positions: their successors are
+        # selected by index variables, so a cross-cycle merge is realized by flipping
+        # those selectors rather than assigning the channel directly.
+        channelCircuitConstraints*: seq[CircuitConstraint[T]]
+        cPosToBinding*: Table[int, int]            # channel position -> element channelBinding index
+        circuitMergesApplied*: int                 # count of applied cross-cycle merge moves
+        circuitMoveCalls*: int                     # times a circuit merge was invoked (for self-disable)
+
         # Channel-dep optimized simulation state (position-indexed arrays instead of hash tables)
         cdIsChanged: seq[bool]           # position-indexed, true if changed during simulation
         cdSavedVal: seq[T]               # position-indexed, original value before simulation
@@ -342,6 +352,10 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.circuitState.moveDelta(position, oldValue, newValue)
         of SubcircuitType:
             result = constraint.subcircuitState.moveDelta(position, oldValue, newValue)
+        of UnionCycleType:
+            result = constraint.unionCycleState.moveDelta(position, oldValue, newValue)
+        of InvolutionType:
+            result = constraint.involutionState.moveDelta(position, oldValue, newValue)
         of AllDifferentExcept0Type:
             result = constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
         of LexOrderType:
@@ -407,6 +421,7 @@ include tabuElementImplied
 include tabuSwapMoves
 include tabuFlowMoves
 include tabuLinearRepair
+include tabuCircuitMoves
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -1230,6 +1245,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # Collect CircuitTimeProp constraints for writeback
         if constraint.stateType == CircuitTimePropType:
             state.circuitTimePropConstraints.add(constraint.circuitTimePropState)
+        # Cache circuit constraints for stagnation-time cross-cycle merge moves.
+        # Skip circuits over channel positions: their successor values are derived
+        # from source variables and cannot be assigned directly (same reasoning as
+        # the table-move guard below), so the swap move does not apply to them.
+        if constraint.stateType == CircuitType and not existsEnv("CRUSHER_NO_CIRCUIT_MOVES"):
+            var hasChannelPos = false
+            for pos in constraint.circuitState.positions.items:
+                if pos in carray.channelPositions:
+                    hasChannelPos = true
+                    break
+            if not hasChannelPos:
+                state.circuitConstraints.add(constraint.circuitState)
+            else:
+                # Circuit over derived positions: repaired via index-selector flips
+                # (see tabuCircuitMoves / tryChannelCircuitMoves).
+                state.channelCircuitConstraints.add(constraint.circuitState)
         # Cache tableIn constraint indices for fast stagnation-time table moves.
         # Skip constraints whose positions include any channel position: channel
         # values are derived from source vars, so directly assigning a tuple to
@@ -1246,6 +1277,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     break
             if not hasChannelPos:
                 state.tableInConstraintIndices.add(ci)
+
+    # Map each channel position to its element channel binding, so circuit-merge
+    # moves can realize a successor change by flipping the selecting index variable.
+    if state.channelCircuitConstraints.len > 0:
+        state.cPosToBinding = initTable[int, int]()
+        for bi in 0..<carray.channelBindings.len:
+            state.cPosToBinding[carray.channelBindings[bi].channelPosition] = bi
 
     # Build O(1) constraint index lookup
     state.constraintIdxAt = newSeq[Table[pointer, int]](carray.len)
@@ -4256,7 +4294,8 @@ proc logViolatedBreakdown[T](state: TabuState[T]) =
 proc logExitStats[T](state: TabuState[T], label: string) =
     let elapsed = epochTime() - state.startTime
     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
-    echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s"
+    echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s" &
+        (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
     if state.id == 0 and state.bestCost > 0 and label == "Exhausted":
         state.logViolatedBreakdown()
     when ProfileIteration:
@@ -4513,6 +4552,67 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                             state.logExitStats("Solution found via swap")
                         state.lastImprovementIter = lastImprovement
                         return state
+
+        # Try circuit cross-cycle merge moves during stagnation: when a circuit
+        # constraint has split into disjoint subtours, a 2-opt swap of successors
+        # across two cycles merges them — an escape single-variable moves cannot
+        # reach. A k-subtour circuit needs k-1 merges, so chain strictly-improving
+        # merges until none remain.
+        # Self-disable: if the merge has been tried enough times without ever
+        # applying, the circuit's domains are too sparse for cross-cycle value
+        # swaps to be feasible (e.g. knight's tour). Stop scanning so the helper
+        # costs nothing on problems it cannot help.
+        if state.circuitConstraints.len > 0 and
+           not (state.circuitMoveCalls >= 8 and state.circuitMergesApplied == 0) and
+           state.iteration - lastImprovement >= 20 and
+           (state.iteration - lastImprovement) mod 20 == 0 and
+           not outOfBudget():
+            var iterations = 0
+            const MAX_CIRCUIT_ITERATIONS = 200
+            var progressed = false
+            while iterations < MAX_CIRCUIT_ITERATIONS and not outOfBudget() and
+                    state.tryCircuitMoves(allowPerturb = false):
+                iterations += 1
+                progressed = true
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via circuit merge")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            # Deep stagnation with no improving merge available: take one gentle
+            # perturbation to break the plateau so the next round finds new merges.
+            if not progressed and state.iteration - lastImprovement >= 300:
+                discard state.tryCircuitMoves(allowPerturb = true)
+
+        # Same cross-cycle merge for circuits over channel (derived) variables,
+        # realized through index-selector flips (e.g. p1f's union-of-matchings).
+        if state.channelCircuitConstraints.len > 0 and
+           not (state.circuitMoveCalls >= 12 and state.circuitMergesApplied == 0) and
+           state.iteration - lastImprovement >= 20 and
+           (state.iteration - lastImprovement) mod 20 == 0 and
+           not outOfBudget():
+            var citers = 0
+            const MAX_CHANNEL_CIRCUIT_ITERATIONS = 200
+            var cprogressed = false
+            while citers < MAX_CHANNEL_CIRCUIT_ITERATIONS and not outOfBudget() and
+                    state.tryChannelCircuitMoves(allowPerturb = false):
+                citers += 1
+                cprogressed = true
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via channel circuit merge")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            if not cprogressed and state.iteration - lastImprovement >= 300:
+                discard state.tryChannelCircuitMoves(allowPerturb = true)
 
         # Try table moves during stagnation: switch a table constraint to a
         # different valid tuple, changing multiple variables simultaneously.

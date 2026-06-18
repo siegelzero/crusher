@@ -505,6 +505,23 @@ proc updatePosition*[T](constraint: CircuitConstraint[T], position: int, newValu
     constraint.cost = max(0, constraint.numCycles - 1) + constraint.numTailNodes
 
 ################################################################################
+# Cycle-structure accessors (for circuit-repair move neighborhoods)
+################################################################################
+
+proc distinctCycleCount*[T](constraint: CircuitConstraint[T]): int =
+    ## Number of disjoint cycles in the current functional graph. A satisfied
+    ## circuit has exactly 1; >= 2 means there are subtours that must be merged.
+    constraint.numCycles
+
+proc nodeCycleIds*[T](constraint: CircuitConstraint[T]): seq[tuple[pos, cycleId: int]] =
+    ## Current cycle membership of every node, as (variable position, cycleId).
+    ## cycleId == -1 marks a tail node (one not on any cycle). Reflects the
+    ## incrementally-maintained metadata, so it is O(n) with no traversal.
+    result = newSeqOfCap[tuple[pos, cycleId: int]](constraint.n)
+    for nodeIdx in 0..<constraint.n:
+        result.add((constraint.positionArray[nodeIdx], constraint.cycleId[nodeIdx]))
+
+################################################################################
 # Deep copy
 ################################################################################
 

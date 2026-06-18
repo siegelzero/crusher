@@ -1005,6 +1005,7 @@ include translatorObjectiveSlack
 include translatorScheduling
 include translatorCircuitTime
 include translatorInverseRewrite
+include translatorUnionCircuit
 
 proc buildObjectiveStaging(tr: var FznTranslator) =
     ## Detect a linear objective dominated by a small-domain decision variable that
@@ -1731,6 +1732,10 @@ proc translate*(model: FznModel): FznTranslator =
     # constraints indexed by channel-side variables onto the forward side.
     result.dropImpliedInverseCircuits()
     result.rewriteInverseChannelIndexedElements()
+
+    # Detect union_circuit(x, y) decompositions (channel circuit over 2-way
+    # selectors between two matchings) and rewrite to unionCycle + involution.
+    result.detectUnionCircuits()
 
     # Detect if-then-else channels (int_lin_ne_reif + int_eq_reif + bool_clause → 2D table channel)
     result.detectIfThenElseChannels()

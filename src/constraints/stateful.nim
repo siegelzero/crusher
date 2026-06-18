@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, sets, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
@@ -268,6 +268,10 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "Circuit Constraint"
         of SubcircuitType:
             return "Subcircuit Constraint"
+        of UnionCycleType:
+            return "Union-Cycle Constraint"
+        of InvolutionType:
+            return "Involution Constraint"
         of AllDifferentExcept0Type:
             return "AllDifferentExcept0 Constraint"
         of LexOrderType:
@@ -357,6 +361,10 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.circuitState.cost
         of SubcircuitType:
             return constraint.subcircuitState.cost
+        of UnionCycleType:
+            return constraint.unionCycleState.cost
+        of InvolutionType:
+            return constraint.involutionState.cost
         of AllDifferentExcept0Type:
             return constraint.allDifferentExcept0State.cost
         of LexOrderType:
@@ -1152,6 +1160,10 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.circuitState.initialize(assignment)
         of SubcircuitType:
             constraint.subcircuitState.initialize(assignment)
+        of UnionCycleType:
+            constraint.unionCycleState.initialize(assignment)
+        of InvolutionType:
+            constraint.involutionState.initialize(assignment)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.initialize(assignment)
         of LexOrderType:
@@ -1238,6 +1250,10 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.circuitState.moveDelta(position, oldValue, newValue)
         of SubcircuitType:
             constraint.subcircuitState.moveDelta(position, oldValue, newValue)
+        of UnionCycleType:
+            constraint.unionCycleState.moveDelta(position, oldValue, newValue)
+        of InvolutionType:
+            constraint.involutionState.moveDelta(position, oldValue, newValue)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.moveDelta(position, oldValue, newValue)
         of LexOrderType:
@@ -1324,6 +1340,10 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.circuitState.updatePosition(position, newValue)
         of SubcircuitType:
             constraint.subcircuitState.updatePosition(position, newValue)
+        of UnionCycleType:
+            constraint.unionCycleState.updatePosition(position, newValue)
+        of InvolutionType:
+            constraint.involutionState.updatePosition(position, newValue)
         of AllDifferentExcept0Type:
             constraint.allDifferentExcept0State.updatePosition(position, newValue)
         of LexOrderType:
@@ -1937,6 +1957,18 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: CircuitType,
                 circuitState: constraint.circuitState.deepCopy()
             )
+        of UnionCycleType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: UnionCycleType,
+                unionCycleState: constraint.unionCycleState.deepCopy()
+            )
+        of InvolutionType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: InvolutionType,
+                involutionState: constraint.involutionState.deepCopy()
+            )
         of SubcircuitType:
             result = StatefulConstraint[T](
                 positions: constraint.positions,
@@ -2530,6 +2562,39 @@ func circuit*[T](positions: openArray[int], valueOffset: int = 1): StatefulConst
         positions: circuitConstraint.positions,
         stateType: CircuitType,
         circuitState: circuitConstraint
+    )
+
+################################################################################
+# Union-cycle wrapper functions
+################################################################################
+
+func unionCycle*[T](xPositions, yPositions: openArray[int],
+                    valueOffset: int = 1): StatefulConstraint[T] =
+    ## Creates a Union-Cycle constraint: the undirected graph with edges
+    ## { i — x[i] } ∪ { i — y[i] } is connected (a single component).
+    ##
+    ## This is the matching-level form of `union_circuit(x, y)`: with x, y
+    ## fixed-point-free involutions and x[i] != y[i] (column all-different), it
+    ## holds iff x ∪ y is a single Hamiltonian alternating cycle.
+    ##
+    ## **Violation Cost**: max(0, numComponents - 1)
+    let c = newUnionCycleConstraint[T](xPositions, yPositions, valueOffset)
+    return StatefulConstraint[T](
+        positions: c.positions,
+        stateType: UnionCycleType,
+        unionCycleState: c
+    )
+
+func involution*[T](positions: openArray[int],
+                    valueOffset: int = 1): StatefulConstraint[T] =
+    ## Creates an Involution constraint: x[x[i]] = i for all i (a self-inverse
+    ## permutation). With self-excluding domains this is a fixed-point-free
+    ## involution — a perfect matching. **Violation Cost**: # of violating i.
+    let c = newInvolutionConstraint[T](positions, valueOffset)
+    return StatefulConstraint[T](
+        positions: c.positions,
+        stateType: InvolutionType,
+        involutionState: c
     )
 
 ################################################################################
