@@ -75,7 +75,7 @@ proc tryCircuitMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
                     let cycleB = posCycle.getOrDefault(pb, -1)
                     if cycleB < 0 or cycleB == cycleA: continue   # need a different cycle
                     # Swap is pa <- w (== valB) and pb <- valA; check pb accepts valA.
-                    if state.domainIndex[pb].getOrDefault(valA, -1) < 0: continue
+                    if state.domIdx(pb, valA) < 0: continue
                     let valB = w
 
                     # Score the swap by its true global delta.
@@ -110,10 +110,10 @@ proc tryCircuitMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
 
     # Apply for real: tabu the displaced values, then commit both assignments.
     let tabuTenure = state.iteration + 1 + state.iteration mod 10
-    let idxA = state.domainIndex[pa].getOrDefault(valA, -1)
+    let idxA = state.domIdx(pa, valA)
     if idxA >= 0 and not state.isLazy[pa]:
         state.tabu[pa][idxA] = tabuTenure
-    let idxB = state.domainIndex[pb].getOrDefault(valB, -1)
+    let idxB = state.domIdx(pb, valB)
     if idxB >= 0 and not state.isLazy[pb]:
         state.tabu[pb][idxB] = tabuTenure
     state.assignValue(pa, valB)
@@ -249,9 +249,9 @@ proc tryChannelCircuitMoves[T](state: TabuState[T], allowPerturb: bool = false):
     let tabuTenure = state.iteration + 1 + state.iteration mod 10
     let oldA = state.assignment[ipA]
     let oldB = state.assignment[ipB]
-    let idxA = state.domainIndex[ipA].getOrDefault(oldA, -1)
+    let idxA = state.domIdx(ipA, oldA)
     if idxA >= 0 and not state.isLazy[ipA]: state.tabu[ipA][idxA] = tabuTenure
-    let idxB = state.domainIndex[ipB].getOrDefault(oldB, -1)
+    let idxB = state.domIdx(ipB, oldB)
     if idxB >= 0 and not state.isLazy[ipB]: state.tabu[ipB][idxB] = tabuTenure
     state.assignValue(ipA, ivA)
     state.assignValue(ipB, ivB)

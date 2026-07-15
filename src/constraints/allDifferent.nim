@@ -39,6 +39,13 @@ type
     AllDifferentConstraint*[T] = ref object
         currentAssignment*: Table[int, T]
         countTable: Table[T, int]
+        # Dense value-count window: counts for values in
+        # [winLo, winLo + denseCounts.len) are kept in denseCounts with O(1)
+        # array indexing; countTable is only the fallback for values outside
+        # the window. Installed via setValueWindow (from domain bounds) before
+        # initialize; empty denseCounts means all counts go through countTable.
+        winLo: int64
+        denseCounts: seq[int32]
         cost*: int
         lastOldValue*: T
         lastNewValue*: T
@@ -53,7 +60,11 @@ type
                 exprCoeffs*: seq[Table[int, T]]  # [expr_idx][position] -> coefficient
                 exprConstants*: seq[T]  # constant term per expression
                 allLinear*: bool  # true if all expressions are linear
-                lastAffectedPositions*: PackedSet[int]  # positions affected by last updatePosition
+                # Precomputed per-position affected sets: union of positions of
+                # all expressions containing that position. updatePosition just
+                # records the moved position; no per-call set building.
+                affectedByPos: Table[int, PackedSet[int]]
+                lastAffectedKey: int  # position of last updatePosition (-1 = none)
 
 ################################################################################
 # AllDifferentConstraint creation
@@ -84,6 +95,15 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
 
     result.expressionsAtPosition = buildExpressionPositionMap(expressions)
 
+    # Precompute per-position affected sets for getAffectedPositions
+    result.lastAffectedKey = -1
+    result.affectedByPos = initTable[int, PackedSet[int]]()
+    for pos, exprIndices in result.expressionsAtPosition.pairs:
+        var affected = initPackedSet[int]()
+        for i in exprIndices:
+            affected.incl(expressions[i].positions)
+        result.affectedByPos[pos] = affected
+
     # Extract linear coefficients for O(1) moveDelta
     result.allLinear = true
     result.exprValues = newSeq[T](expressions.len)
@@ -109,16 +129,47 @@ func newAllDifferentConstraint*[T](expressions: seq[AlgebraicExpression[T]]): Al
 ################################################################################
 
 
+const AllDiffMaxWindow = 1 shl 20  # max dense window entries (4MB of int32)
+
+proc setValueWindow*[T](state: AllDifferentConstraint[T], lo, hi: int64) =
+    ## Install a dense count window covering [lo, hi]. Call before initialize.
+    ## Values observed outside the window still work via the table fallback.
+    let size = hi - lo + 1
+    if size <= 0 or size > AllDiffMaxWindow:
+        return
+    state.winLo = lo
+    state.denseCounts = newSeq[int32](int(size))
+
+func cnt[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
+    when T is SomeInteger:
+        if state.denseCounts.len > 0:
+            let idx = int64(value) - state.winLo
+            if idx >= 0 and idx < state.denseCounts.len:
+                return int(state.denseCounts[idx])
+    getCount(state.countTable, value)
+
+proc bumpCount[T](state: AllDifferentConstraint[T], value: T, delta: int) {.inline.} =
+    when T is SomeInteger:
+        if state.denseCounts.len > 0:
+            let idx = int64(value) - state.winLo
+            if idx >= 0 and idx < state.denseCounts.len:
+                state.denseCounts[idx] += int32(delta)
+                return
+    if delta > 0:
+        incrementCount(state.countTable, value)
+    else:
+        decrementCount(state.countTable, value)
+
 func contribution[T](state: AllDifferentConstraint[T], value: T): int {.inline.} =
-    max(0, getCount(state.countTable, value) - 1)
+    max(0, state.cnt(value) - 1)
 
 
 proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.inline.} =
     # Adjust value counts and state cost for the removal of oldValue and addition of newValue
     state.cost -= state.contribution(oldValue)
     state.cost -= state.contribution(newValue)
-    decrementCount(state.countTable, oldValue)
-    incrementCount(state.countTable, newValue)
+    state.bumpCount(oldValue, -1)
+    state.bumpCount(newValue, 1)
     state.cost += state.contribution(oldValue)
     state.cost += state.contribution(newValue)
 
@@ -128,6 +179,8 @@ proc adjustCounts[T](state: AllDifferentConstraint[T], oldValue, newValue: T) {.
 
 proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
     state.countTable.clear()
+    for i in 0..<state.denseCounts.len:
+        state.denseCounts[i] = 0
     state.cost = 0
     var value: T
     case state.evalMethod:
@@ -135,7 +188,7 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
             for pos in state.positions.items:
                 value = assignment[pos]
                 state.currentAssignment[pos] = value
-                incrementCount(state.countTable, value)
+                state.bumpCount(value, 1)
 
         of ExpressionBased:
             for pos in state.expressionsAtPosition.keys:
@@ -144,11 +197,13 @@ proc initialize*[T](state: AllDifferentConstraint[T], assignment: seq[T]) =
             for i, exp in state.expressions:
                 value = exp.evaluate(state.currentAssignment)
                 state.exprValues[i] = value
-                incrementCount(state.countTable, value)
+                state.bumpCount(value, 1)
 
-    # Calculate cost from count table for both methods
+    # Calculate cost from both count structures
     for value, count in state.countTable.pairs:
         state.cost += max(0, count - 1)
+    for count in state.denseCounts:
+        state.cost += max(0, int(count) - 1)
 
 
 proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValue: T) =
@@ -163,11 +218,9 @@ proc updatePosition*[T](state: AllDifferentConstraint[T], position: int, newValu
                 state.adjustCounts(oldValue, newValue)
 
             of ExpressionBased:
-                state.lastAffectedPositions = initPackedSet[int]()
+                state.lastAffectedKey = position
                 var oldExpValue, newExpValue: T
                 for i in state.expressionsAtPosition[position]:
-                    for pos in state.expressions[i].positions.items:
-                        state.lastAffectedPositions.incl(pos)
                     oldExpValue = state.exprValues[i]
                     state.currentAssignment[position] = newValue
                     if state.allLinear:
@@ -188,13 +241,13 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
 
     case state.evalMethod:
         of PositionBased:
-            oldValueCount = getCount(state.countTable, oldValue)
+            oldValueCount = state.cnt(oldValue)
             doAssert oldValueCount >= 1, "oldValue should exist in count table"
             result -= oldValueCount - 1
             oldValueCount -= 1
             result += max(0, oldValueCount - 1)
 
-            newValueCount = getCount(state.countTable, newValue)
+            newValueCount = state.cnt(newValue)
             result -= max(0, newValueCount - 1)
             newValueCount += 1
             result += newValueCount - 1
@@ -203,7 +256,7 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
             for i in state.expressionsAtPosition[position]:
                 oldExpValue = state.exprValues[i]
 
-                oldValueCount = getCount(state.countTable, oldExpValue)
+                oldValueCount = state.cnt(oldExpValue)
                 result -= oldValueCount - 1
                 oldValueCount -= 1
                 result += max(0, oldValueCount - 1)
@@ -216,7 +269,7 @@ proc moveDelta*[T](state: AllDifferentConstraint[T], position: int, oldValue, ne
                     newExpValue = state.expressions[i].evaluate(state.currentAssignment)
                     state.currentAssignment[position] = oldValue
 
-                newValueCount = getCount(state.countTable, newExpValue)
+                newValueCount = state.cnt(newExpValue)
                 result -= max(0, newValueCount - 1)
                 newValueCount += 1
                 result += newValueCount - 1
@@ -227,7 +280,9 @@ func getAffectedPositions*[T](state: AllDifferentConstraint[T]): PackedSet[int] 
         of PositionBased:
             return state.positions
         of ExpressionBased:
-            return state.lastAffectedPositions
+            if state.lastAffectedKey >= 0:
+                return state.affectedByPos.getOrDefault(state.lastAffectedKey)
+            return initPackedSet[int]()
 
 
 func getAffectedDomainValues*[T](state: AllDifferentConstraint[T], position: int): seq[T] =

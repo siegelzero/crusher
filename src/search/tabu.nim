@@ -75,6 +75,11 @@ type
 
         # Dense array penalty tracking (indexed by domain-local index)
         domainIndex*: seq[Table[T, int]]  # [position][value] -> index in reducedDomain
+        # Contiguous-domain fast path: when reducedDomain[pos] is exactly
+        # lo, lo+1, ..., value→index is arithmetic and the hash table above is
+        # neither built nor consulted. Always false for lazy positions.
+        domIdxContiguous*: seq[bool]
+        domIdxLo*: seq[T]
         penaltyMap*: seq[seq[int]]  # [position][domainIdx] -> total penalty
         constraintPenalties*: seq[seq[seq[int]]]  # [pos][local_constraint_idx][domainIdx]
         tabu*: seq[seq[int]]  # [position][domainIdx] -> tabu expiration iteration
@@ -106,6 +111,10 @@ type
         # Per-constraint search position cache (excludes channel positions)
         constraintSearchPos*: Table[pointer, PackedSet[int]]
 
+        # True if the carray has any channel bindings at all. When false,
+        # channel propagation is a no-op and can be skipped entirely
+        # (avoids worklist allocation + 9 table lookups per assignment).
+        anyChannels*: bool
         # Channel-dependent constraint support
         hasChannelDeps*: bool
         channelDepConstraints*: seq[StatefulConstraint[T]]
@@ -305,6 +314,19 @@ proc findLocalConstraintIdx[T](state: TabuState[T], position: int, constraint: S
 proc updatePenaltiesForPosition[T](state: TabuState[T], position: int)
 proc updateNeighborPenalties*[T](state: TabuState[T], position: int)
 
+proc domIdx*[T](state: TabuState[T], position: int, value: T): int {.inline.} =
+    ## Index of `value` in the reduced domain at `position`, or -1 if absent.
+    ## Arithmetic fast path for contiguous domains, hash lookup otherwise.
+    ## Lazy positions have neither flag nor table set and always return -1,
+    ## matching the previous getOrDefault(-1) behavior.
+    when T is SomeInteger:
+        if state.domIdxContiguous[position]:
+            let off = int(value - state.domIdxLo[position])
+            if off >= 0 and off < state.sharedDomain[][position].len:
+                return off
+            return -1
+    state.domainIndex[position].getOrDefault(value, -1)
+
 ################################################################################
 # Penalty Routines
 ################################################################################
@@ -431,7 +453,7 @@ proc penaltyAt*[T](state: TabuState[T], position: int, value: T): int {.inline.}
     ## Look up penalty for a (position, value) pair using dense arrays.
     if state.isLazy[position]:
         return state.costDelta(position, value)
-    let idx = state.domainIndex[position].getOrDefault(value, -1)
+    let idx = state.domIdx(position, value)
     if idx >= 0: state.penaltyMap[position][idx] else: 0
 
 proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
@@ -450,7 +472,7 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
     ## Batch-compute cost delta for all domain values at a lazy position.
     ## Returns (bestCostDelta, bestValue, movesEvaluated).
     ## Uses batchMovePenalty for constraint types that support it.
-    let domain = state.sharedDomain[][position]
+    let domain {.cursor.} = state.sharedDomain[][position]
     let dLen = domain.len
     let oldValue = state.assignment[position]
 
@@ -551,7 +573,7 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
     ## Uses batch computation for cumulative constraints (prefix-sum approach).
     if state.isLazy[position]: return
     if state.hasDormancy and state.isDormant[position]: return
-    let domain = state.sharedDomain[][position]
+    let domain {.cursor.} = state.sharedDomain[][position]
     let dLen = domain.len
     if dLen == 0: return
 
@@ -689,7 +711,7 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
     ## Uses batch prefix-sum method for cumulative constraints.
     if state.isLazy[position]: return
     let constraint = state.constraintsAtPosition[position][localIdx]
-    let domain = state.sharedDomain[][position]
+    let domain {.cursor.} = state.sharedDomain[][position]
 
     if constraint.stateType == CumulativeType and
        (constraint.cumulativeState.evalMethod == PositionBased or
@@ -829,7 +851,7 @@ proc updateConstraintAtPositionValues[T](state: TabuState[T], position: int, loc
     if state.isLazy[position]: return
     let constraint = state.constraintsAtPosition[position][localIdx]
     for value in values:
-        let idx = state.domainIndex[position].getOrDefault(value, -1)
+        let idx = state.domIdx(position, value)
         if idx < 0:
             continue
         let newP = state.movePenalty(constraint, position, value)
@@ -897,7 +919,7 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                     if rc.relation != EqualTo and pos notin affectedPositions:
                         continue
 
-                    let domain = state.sharedDomain[][pos]
+                    let domain {.cursor.} = state.sharedDomain[][pos]
                     if domain.len != 2 or domain[0] != T(0) or domain[1] != T(1):
                         # Non-binary: fall back to standard update
                         if pos notin affectedPositions:
@@ -949,7 +971,7 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                 if state.isLazy[pos]: continue
                 if pos notin affectedPositions: continue
 
-                let domain = state.sharedDomain[][pos]
+                let domain {.cursor.} = state.sharedDomain[][pos]
                 if domain.len != 2 or domain[0] != T(0) or domain[1] != T(1):
                     # Non-binary: fall back to standard update
                     when ProfileIteration:
@@ -1067,7 +1089,7 @@ proc balanceBinarySums[T](state: TabuState[T]) =
         var allBinaryUnitCoeff = true
         var positions: seq[int] = @[]
         for pos in s.positions.items:
-            let dom = state.sharedDomain[][pos]
+            let dom {.cursor.} = state.sharedDomain[][pos]
             let coeff = s.coefficient.getOrDefault(pos, T(0))
             if coeff != 1 or dom.len != 2 or dom[0] != 0 or dom[1] != 1:
                 allBinaryUnitCoeff = false
@@ -1168,7 +1190,7 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
             for i in 0..<remainingValues.len:
                 if not assigned[i]:
                     # Check domain compatibility
-                    let dom = state.sharedDomain[][pos]
+                    let dom {.cursor.} = state.sharedDomain[][pos]
                     var inDomain = false
                     for dv in dom:
                         if dv == remainingValues[i]:
@@ -1205,6 +1227,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.sharedDomain = state.carray.sharedDomainPtr
     else:
         state.sharedDomain = addr state.carray.reducedDomain
+    state.anyChannels = carray.channelsAtPosition.len > 0 or
+        carray.minMaxChannelsAtPosition.len > 0 or
+        carray.countEqChannelsAtPosition.len > 0 or
+        carray.weightedCountEqChannelsAtPosition.len > 0 or
+        carray.conditionalCountEqChannelsAtPosition.len > 0 or
+        carray.argmaxChannelsAtPosition.len > 0 or
+        carray.expressionChannelsAtPosition.len > 0 or
+        carray.crossingCountMaxChannelsAtPosition.len > 0 or
+        carray.inverseChannelsAtPosition.len > 0
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
 
@@ -1349,7 +1380,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if pos in carray.channelPositions:
                 state.assignment[pos] = initialAssignment[pos]
             else:
-                let dom = state.sharedDomain[][pos]
+                let dom {.cursor.} = state.sharedDomain[][pos]
                 if dom.len > 0 and initialAssignment[pos] notin dom:
                     if pos in inverseGroupPositions:
                         for gi in positionToInverseGroups[pos]:
@@ -1370,7 +1401,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # Inverse group positions are initialized below as involutions
             state.assignment[pos] = state.sharedDomain[][pos][0]
         else:
-            let dom = state.sharedDomain[][pos]
+            let dom {.cursor.} = state.sharedDomain[][pos]
             case initStrategy
             of isRandom: state.assignment[pos] = sample(dom)
             of isDomainMin: state.assignment[pos] = dom[0]
@@ -1478,7 +1509,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 var domainOk = true
                 var dist = 0
                 for col, pos in tc.sortedPositions:
-                    let dom = state.sharedDomain[][pos]
+                    let dom {.cursor.} = state.sharedDomain[][pos]
                     if tup[col] notin dom:
                         domainOk = false
                         break
@@ -1831,6 +1862,52 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         state.assignment[fb.channelPosition] = newVal
                         ctpChanged = true
 
+    # Install dense value-count windows on AllDifferent constraints before
+    # initialization: exact value bounds derived from the domains let counts
+    # use O(1) array indexing instead of hash lookups in the moveDelta /
+    # updatePosition hot paths. Values outside the window (e.g. on channel
+    # positions with shrunk domains) still work via the table fallback.
+    when T is SomeInteger:
+        for constraint in state.constraints:
+            if constraint.stateType != AllDifferentType: continue
+            let ad = constraint.allDifferentState
+            var lo = int64.high
+            var hi = int64.low
+            if ad.evalMethod == PositionBased:
+                for pos in constraint.positions.items:
+                    for v in state.sharedDomain[][pos]:
+                        if int64(v) < lo: lo = int64(v)
+                        if int64(v) > hi: hi = int64(v)
+            elif ad.allLinear:
+                var ok = true
+                for i in 0..<ad.expressions.len:
+                    var elo = int64(ad.exprConstants[i])
+                    var ehi = elo
+                    for pos, coeff in ad.exprCoeffs[i].pairs:
+                        let domain {.cursor.} = state.sharedDomain[][pos]
+                        if domain.len == 0:
+                            ok = false
+                            break
+                        var dmin = domain[0]
+                        var dmax = domain[0]
+                        for v in domain:
+                            if v < dmin: dmin = v
+                            if v > dmax: dmax = v
+                        if coeff >= 0:
+                            elo += int64(coeff) * int64(dmin)
+                            ehi += int64(coeff) * int64(dmax)
+                        else:
+                            elo += int64(coeff) * int64(dmax)
+                            ehi += int64(coeff) * int64(dmin)
+                    if not ok: break
+                    if elo < lo: lo = elo
+                    if ehi > hi: hi = ehi
+                if not ok: continue
+            else:
+                continue
+            if lo <= hi:
+                ad.setValueWindow(lo, hi)
+
     for constraint in state.constraints:
         if constraint.stateType == CircuitTimePropType:
             continue  # already initialized above (or no instances exist)
@@ -1848,7 +1925,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # Compute max |leftDelta - rightDelta| for any single position flip
             var maxDelta: T = 0
             for pos in rc.positions.items:
-                let domain = state.sharedDomain[][pos]
+                let domain {.cursor.} = state.sharedDomain[][pos]
                 if domain.len < 2: continue
                 let dMin = domain[0]
                 let dMax = domain[^1]
@@ -2229,15 +2306,32 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  " (noCh=" & $failNoChannels & " fewBind=" & $failFewBindings &
                  " badIdx=" & $failIndexExpr & " badArr=" & $failArrayCheck & ")"
 
-    # Build domain index: value -> local array index
+    # Build domain index: value -> local array index. Contiguous domains
+    # (the common case) use arithmetic indexing via domIdx and skip the
+    # hash table entirely.
     let domIdxStart = epochTime()
     state.domainIndex = newSeq[Table[T, int]](carray.len)
+    state.domIdxContiguous = newSeq[bool](carray.len)
+    state.domIdxLo = newSeq[T](carray.len)
     for pos in carray.allPositions():
         if state.isLazy[pos]:
             continue  # Lazy positions don't need domainIndex (use linear scan or direct computation)
-        state.domainIndex[pos] = initTable[T, int]()
-        for i, v in state.sharedDomain[][pos]:
-            state.domainIndex[pos][v] = i
+        var contiguous = false
+        when T is SomeInteger:
+            let dom {.cursor.} = state.sharedDomain[][pos]
+            if dom.len > 0:
+                contiguous = true
+                for i in 1..<dom.len:
+                    if dom[i] != dom[0] + T(i):
+                        contiguous = false
+                        break
+                if contiguous:
+                    state.domIdxContiguous[pos] = true
+                    state.domIdxLo[pos] = dom[0]
+        if not contiguous:
+            state.domainIndex[pos] = initTable[T, int]()
+            for i, v in state.sharedDomain[][pos]:
+                state.domainIndex[pos][v] = i
     if verbose and id == 0:
         echo "[Init] Built domainIndex in " & $(epochTime() - domIdxStart) & "s"
 
@@ -2326,7 +2420,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             let lo = state.oneHotLo[pos]
             for arrayIdx in 0..<changes.len:
                 let val = T(arrayIdx + lo)
-                let domIdx = state.domainIndex[pos].getOrDefault(val, -1)
+                let domIdx = state.domIdx(pos, val)
                 if domIdx < 0: continue
                 var seenConstraints: PackedSet[int]
                 for (chanPos, _) in changes[arrayIdx]:
@@ -2554,7 +2648,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 continue
 
             # Build channel values
-            let domain = state.sharedDomain[][pos]
+            let domain {.cursor.} = state.sharedDomain[][pos]
             let nChans = topoOrder.len
             let nDom = domain.len
             var chanValues: seq[seq[T]]
@@ -3180,6 +3274,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
     ## allowing positions to be re-enqueued when their value changes through
     ## different dependency paths (e.g., multi-layer set comprehension cascades).
     changedChannels.setLen(0)
+    if not state.anyChannels:
+        return false
     var worklist = @[position]
     var inWorklist: PackedSet[int]
     inWorklist.incl(position)
@@ -3438,6 +3534,8 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
     ## but skips penalty map updates entirely. For use during path relinking.
+    if not state.anyChannels:
+        return
     var worklist = @[position]
     var inWorklist: PackedSet[int]
     inWorklist.incl(position)
@@ -3871,7 +3969,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             let oldValue = state.assignment[position]
             let lazy1 = state.isLazy[position]
-            let oldIdx = if lazy1: -1 else: state.domainIndex[position].getOrDefault(oldValue, -1)
+            let oldIdx = if lazy1: -1 else: state.domIdx(position, oldValue)
             if not lazy1 and oldIdx < 0:
                 continue
 
@@ -3884,7 +3982,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             inc positionsChecked
 
-            let domain = state.sharedDomain[][position]
+            let domain {.cursor.} = state.sharedDomain[][position]
             let dLen = domain.len
 
             # Evaluate domain values — batch for eligible lazy positions, sampling otherwise
@@ -3901,6 +3999,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     result = @[(position, bestVal)]
                     bestMoveCost = newCost
             else:
+                let pmRow {.cursor.} = state.penaltyMap[position]
+                let tabuRow {.cursor.} = state.tabu[position]
                 for s in 0..<min(dLen, MAX_CANDIDATES_PER_POS):
                     let i = rand(dLen - 1)
                     if lazy1:
@@ -3912,10 +4012,10 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     if lazy1:
                         newCost = state.cost + state.costDelta(position, domain[i])
                     else:
-                        newCost = state.cost + state.penaltyMap[position][i]
+                        newCost = state.cost + pmRow[i]
                         if hasInverse1:
                             newCost += state.inverseDelta[position][i]
-                    if lazy1 or state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                    if lazy1 or tabuRow[i] <= state.iteration or newCost < state.bestCost:
                         if newCost < bestMoveCost:
                             result = @[(position, domain[i])]
                             bestMoveCost = newCost
@@ -3934,7 +4034,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
 
             let oldValue = state.assignment[position]
             let lazy2 = state.isLazy[position]
-            let oldIdx = if lazy2: -1 else: state.domainIndex[position].getOrDefault(oldValue, -1)
+            let oldIdx = if lazy2: -1 else: state.domIdx(position, oldValue)
             if not lazy2 and oldIdx < 0:
                 continue
 
@@ -3945,7 +4045,7 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
             if state.hasDormancy and state.isDormant[position]:
                 continue
 
-            let domain = state.sharedDomain[][position]
+            let domain {.cursor.} = state.sharedDomain[][position]
             let dLen = domain.len
             let hasInverse2 = state.inverseEnabled and state.posToInverseGroup[position] >= 0
             let useBatch2 = lazy2 and dLen <= BatchLazyMax and
@@ -3962,6 +4062,8 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                 elif newCost == bestMoveCost:
                     result.add((position, bestVal))
             elif dLen <= MAX_CANDIDATES_PER_POS:
+                let pmRow {.cursor.} = state.penaltyMap[position]
+                let tabuRow {.cursor.} = state.tabu[position]
                 for i in 0..<dLen:
                     if lazy2:
                         if domain[i] == oldValue: continue
@@ -3972,16 +4074,18 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     if lazy2:
                         newCost = state.cost + state.costDelta(position, domain[i])
                     else:
-                        newCost = state.cost + state.penaltyMap[position][i]
+                        newCost = state.cost + pmRow[i]
                         if hasInverse2:
                             newCost += state.inverseDelta[position][i]
-                    if lazy2 or state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                    if lazy2 or tabuRow[i] <= state.iteration or newCost < state.bestCost:
                         if newCost < bestMoveCost:
                             result = @[(position, domain[i])]
                             bestMoveCost = newCost
                         elif newCost == bestMoveCost:
                             result.add((position, domain[i]))
             else:
+                let pmRow {.cursor.} = state.penaltyMap[position]
+                let tabuRow {.cursor.} = state.tabu[position]
                 for s in 0..<MAX_CANDIDATES_PER_POS:
                     let i = rand(dLen - 1)
                     if lazy2:
@@ -3993,10 +4097,10 @@ proc bestMoves[T](state: TabuState[T]): seq[(int, T)] =
                     if lazy2:
                         newCost = state.cost + state.costDelta(position, domain[i])
                     else:
-                        newCost = state.cost + state.penaltyMap[position][i]
+                        newCost = state.cost + pmRow[i]
                         if hasInverse2:
                             newCost += state.inverseDelta[position][i]
-                    if lazy2 or state.tabu[position][i] <= state.iteration or newCost < state.bestCost:
+                    if lazy2 or tabuRow[i] <= state.iteration or newCost < state.bestCost:
                         if newCost < bestMoveCost:
                             result = @[(position, domain[i])]
                             bestMoveCost = newCost
@@ -4028,7 +4132,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             continue
 
         inc posChecked
-        let domain = state.sharedDomain[][position]
+        let domain {.cursor.} = state.sharedDomain[][position]
         # Batch the channel-dep deltas once per position: one cascade pass
         # fills channelDepPenalties[position] for every domain value, instead
         # of simulating the full cascade per candidate value in costDelta.
@@ -4042,7 +4146,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             if value == oldValue: continue
 
             # Tabu check
-            let dIdx = state.domainIndex[position].getOrDefault(value, -1)
+            let dIdx = state.domIdx(position, value)
             if dIdx >= 0 and not state.isLazy[position] and
                state.tabu[position][dIdx] > state.iteration and
                bestDelta >= state.bestCost - state.cost:
@@ -4079,9 +4183,9 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             state.assignValueLean(pp1, pnv1)
             state.assignValueLean(pp2, pnv2)
             let tabuTenure = state.iteration + 1 + state.iteration mod 10
-            let oi1 = state.domainIndex[pp1].getOrDefault(pov1, -1)
+            let oi1 = state.domIdx(pp1, pov1)
             if oi1 >= 0 and not state.isLazy[pp1]: state.tabu[pp1][oi1] = tabuTenure
-            let oi2 = state.domainIndex[pp2].getOrDefault(pov2, -1)
+            let oi2 = state.domIdx(pp2, pov2)
             if oi2 >= 0 and not state.isLazy[pp2]: state.tabu[pp2][oi2] = tabuTenure
             state.applyElementImpliedMoves(pp1)
             state.applyElementImpliedMoves(pp2)
@@ -4091,7 +4195,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
         let oldValue = state.assignment[bestPos]
         state.assignValueLean(bestPos, bestVal)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
-        let oldIdx = state.domainIndex[bestPos].getOrDefault(oldValue, -1)
+        let oldIdx = state.domIdx(bestPos, oldValue)
         if oldIdx >= 0 and not state.isLazy[bestPos]:
             state.tabu[bestPos][oldIdx] = tabuTenure
 
@@ -4124,7 +4228,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         if state.isLazy[pos]:
             singleCost = state.cost + state.costDelta(pos, val)
         else:
-            let idx = state.domainIndex[pos].getOrDefault(val, -1)
+            let idx = state.domIdx(pos, val)
             if idx >= 0:
                 singleCost = state.cost + state.penaltyMap[pos][idx]
                 if state.inverseEnabled and state.posToInverseGroup[pos] >= 0:
@@ -4140,11 +4244,11 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.assignValue(pp2, pNewVal2)
         let pTabuTenure = state.iteration + 1 + state.iteration mod 10
         if not state.isLazy[pp1]:
-            let pOldIdx1 = state.domainIndex[pp1].getOrDefault(pOldVal1, -1)
+            let pOldIdx1 = state.domIdx(pp1, pOldVal1)
             if pOldIdx1 >= 0:
                 state.tabu[pp1][pOldIdx1] = pTabuTenure
         if not state.isLazy[pp2]:
-            let pOldIdx2 = state.domainIndex[pp2].getOrDefault(pOldVal2, -1)
+            let pOldIdx2 = state.domIdx(pp2, pOldVal2)
             if pOldIdx2 >= 0:
                 state.tabu[pp2][pOldIdx2] = pTabuTenure
         state.applyElementImpliedMoves(pp1)
@@ -4157,10 +4261,10 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.assignValue(deactPos, groupNullVal)
         state.assignValue(actPos, newVal)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
-        let oldIdx1 = state.domainIndex[deactPos].getOrDefault(oldActiveVal, -1)
+        let oldIdx1 = state.domIdx(deactPos, oldActiveVal)
         if oldIdx1 >= 0 and not state.isLazy[deactPos]:
             state.tabu[deactPos][oldIdx1] = tabuTenure
-        let oldIdx2 = state.domainIndex[actPos].getOrDefault(groupNullVal, -1)
+        let oldIdx2 = state.domIdx(actPos, groupNullVal)
         if oldIdx2 >= 0 and not state.isLazy[actPos]:
             state.tabu[actPos][oldIdx2] = tabuTenure
         state.applyElementImpliedMoves(deactPos)
@@ -4174,11 +4278,11 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.assignValue(p2, newVal2)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
         if not state.isLazy[p1]:
-            let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
+            let oldIdx1 = state.domIdx(p1, oldVal1)
             if oldIdx1 >= 0:
                 state.tabu[p1][oldIdx1] = tabuTenure
         if not state.isLazy[p2]:
-            let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
+            let oldIdx2 = state.domIdx(p2, oldVal2)
             if oldIdx2 >= 0:
                 state.tabu[p2][oldIdx2] = tabuTenure
         state.applyElementImpliedMoves(p1)
@@ -4194,12 +4298,12 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
                 forcedOldValues.add((fPos, T(fOld)))
         state.assignValue(position, newValue)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
-        let oldIdx = state.domainIndex[position].getOrDefault(oldValue, -1)
+        let oldIdx = state.domIdx(position, oldValue)
         if oldIdx >= 0 and not state.isLazy[position]:
             state.tabu[position][oldIdx] = tabuTenure
         # Set tabu on forced positions' old values
         for (fPos, fOldVal) in forcedOldValues:
-            let fOldIdx = state.domainIndex[fPos].getOrDefault(fOldVal, -1)
+            let fOldIdx = state.domIdx(fPos, fOldVal)
             if fOldIdx >= 0 and not state.isLazy[fPos]:
                 state.tabu[fPos][fOldIdx] = tabuTenure
         state.applyElementImpliedMoves(position)
@@ -4376,7 +4480,7 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
                 let curVal = state.assignment[pos]
                 if tup[col] != curVal:
                     same = false
-                    let dom = state.sharedDomain[][pos]
+                    let dom {.cursor.} = state.sharedDomain[][pos]
                     if tup[col] notin dom:
                         domainOk = false
                         break
@@ -4417,7 +4521,7 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
         let pos = tc.sortedPositions[col]
         let oldVal = state.assignment[pos]
         if tup[col] != oldVal:
-            let oldIdx = state.domainIndex[pos].getOrDefault(oldVal, -1)
+            let oldIdx = state.domIdx(pos, oldVal)
             if oldIdx >= 0 and not state.isLazy[pos]:
                 state.tabu[pos][oldIdx] = tabuTenure
             state.assignValue(pos, tup[col])

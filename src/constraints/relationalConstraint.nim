@@ -29,7 +29,11 @@ type
         leftValue*: T
         rightValue*: T
         # Track which positions were affected by last updatePosition
-        lastAffectedPositions*: PackedSet[int]
+        # Tri-state affected-positions tracking: after updatePosition, either
+        # no penalty entries changed (false) or all positions are affected
+        # (true). Stored as a flag so the hot updatePosition path never
+        # allocates or copies a PackedSet.
+        lastAffectsAll*: bool
         lastOldLeftValue*: T
         lastOldRightValue*: T
         # Max |leftDelta - rightDelta| from any single position change.
@@ -174,7 +178,7 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
     constraint.cost = constraint.computeCost(constraint.leftValue, constraint.rightValue)
 
     # Track affected positions: only positions in expressions whose values changed
-    constraint.lastAffectedPositions = initPackedSet[int]()
+    constraint.lastAffectsAll = false
     let leftChanged = constraint.leftValue != constraint.lastOldLeftValue
     let rightChanged = constraint.rightValue != constraint.lastOldRightValue
 
@@ -211,7 +215,7 @@ func updatePosition*[T](constraint: RelationalConstraint[T],
             if leftChanged or rightChanged:
                 # When either expression value changes, penalty at ALL positions is affected
                 # because movePenalty(P) = f(leftValue, rightValue, P) depends on both values
-                constraint.lastAffectedPositions = constraint.positions
+                constraint.lastAffectsAll = true
 
 # Get the current penalty
 func penalty*[T](constraint: RelationalConstraint[T]): int =
@@ -220,7 +224,9 @@ func penalty*[T](constraint: RelationalConstraint[T]): int =
 func getAffectedPositions*[T](constraint: RelationalConstraint[T]): PackedSet[int] =
     ## Returns positions affected by the last updatePosition call.
     ## Only includes positions of expressions whose values actually changed.
-    return constraint.lastAffectedPositions
+    if constraint.lastAffectsAll:
+        return constraint.positions
+    return initPackedSet[int]()
 
 func getAffectedDomainValues*[T](constraint: RelationalConstraint[T], position: int): seq[T] =
     ## Returns empty (all values need recalculation) since expression-based

@@ -12,7 +12,7 @@ proc initSwapStructures[T](state: TabuState[T]) =
 
     # Find all search positions with domain exactly {0, 1}
     for pos in state.searchPositions:
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         if domain.len == 2 and
            ((domain[0] == 0 and domain[1] == 1) or (domain[0] == 1 and domain[1] == 0)):
             state.binaryPosIndex[pos] = state.binaryPositions.len
@@ -82,11 +82,50 @@ proc initSwapStructures[T](state: TabuState[T]) =
             echo "[Init] Swap moves: " & $state.binaryPositions.len & " binary positions, " & $totalPairs & " swap pairs"
 
 
+proc fastSwapEvalOk[T](state: TabuState[T]): bool {.inline.} =
+    ## True when a two-position double-assignment's cost delta can be computed
+    ## exactly by per-constraint decomposition: no channel bindings, inverse
+    ## groups, or circuit-time writebacks through which the change could
+    ## propagate beyond the constraints at the two positions.
+    not state.anyChannels and not state.inverseEnabled and
+        state.circuitTimePropConstraints.len == 0
+
+proc exactSwapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
+    ## Exact cost delta for simultaneously assigning p1→newVal1 and p2→newVal2.
+    ## Decomposes into per-constraint deltas: moveDelta for constraints seeing
+    ## one position, joint apply/undo evaluation for constraints seeing both.
+    ## Equivalent to (but much cheaper than) simulating via 4x assignValueLean:
+    ## no violation-count churn, no channel scans, no per-position penalty calls.
+    ## Only valid when fastSwapEvalOk holds.
+    for c in state.constraintsAtPosition[p1]:
+        if p2 in c.positions:
+            # Shared constraint: joint delta
+            if c.stateType == AllDifferentType and
+               c.allDifferentState.evalMethod == PositionBased and
+               newVal1 == state.assignment[p2] and newVal2 == state.assignment[p1]:
+                # Pure value exchange preserves value counts: joint delta is 0
+                discard
+            else:
+                # Joint delta by sequential composition: delta(p1 move) plus
+                # delta(p2 move evaluated with p1 applied). One apply/undo pair
+                # instead of two.
+                result += state.movePenalty(c, p1, newVal1)
+                c.updatePosition(p1, newVal1)
+                result += state.movePenalty(c, p2, newVal2)
+                c.updatePosition(p1, state.assignment[p1])
+        else:
+            result += state.movePenalty(c, p1, newVal1)
+    for c in state.constraintsAtPosition[p2]:
+        if p1 in c.positions:
+            continue  # shared: handled above
+        result += state.movePenalty(c, p2, newVal2)
+
+
 proc swapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
     ## Compute the cost delta for simultaneously assigning p1→newVal1 and p2→newVal2.
     ## Uses penalty maps for independent contributions and corrects for shared constraints.
-    let newIdx1 = state.domainIndex[p1].getOrDefault(newVal1, -1)
-    let newIdx2 = state.domainIndex[p2].getOrDefault(newVal2, -1)
+    let newIdx1 = state.domIdx(p1, newVal1)
+    let newIdx2 = state.domIdx(p2, newVal2)
     if newIdx1 < 0 or newIdx2 < 0:
         return high(int)
 
@@ -225,8 +264,8 @@ proc bestSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], int) =
             inc swapsEvaluated
 
             # Tabu check: swap is tabu only if BOTH legs are tabu AND no aspiration
-            let newIdx1 = state.domainIndex[p1].getOrDefault(newVal1, -1)
-            let newIdx2 = state.domainIndex[p2].getOrDefault(newVal2, -1)
+            let newIdx1 = state.domIdx(p1, newVal1)
+            let newIdx2 = state.domIdx(p2, newVal2)
             let tabu1 = newIdx1 >= 0 and not state.isLazy[p1] and state.tabu[p1][newIdx1] > state.iteration
             let tabu2 = newIdx2 >= 0 and not state.isLazy[p2] and state.tabu[p2][newIdx2] > state.iteration
             let isTabu = tabu1 and tabu2
@@ -260,6 +299,7 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
     var bestDelta = 0
     var bestSwaps: seq[(int, int)] = @[]
     var evalsCount = 0
+    let fastEval = state.fastSwapEvalOk
 
     for i in 0..<state.searchPositions.len:
         let p1 = state.searchPositions[i]
@@ -275,21 +315,25 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
                 continue
 
             # Check both values are in each other's domain
-            let idx1 = state.domainIndex[p1].getOrDefault(val2, -1)
-            let idx2 = state.domainIndex[p2].getOrDefault(val1, -1)
+            let idx1 = state.domIdx(p1, val2)
+            let idx2 = state.domIdx(p2, val1)
             if idx1 < 0 or idx2 < 0:
                 continue
             let tabu1 = not state.isLazy[p1] and state.tabu[p1][idx1] > state.iteration
             let tabu2 = not state.isLazy[p2] and state.tabu[p2][idx2] > state.iteration
 
-            # Simulate swap via 4x assignValueLean
-            let origCost = state.cost
-            state.assignValueLean(p1, val2)
-            state.assignValueLean(p2, val1)
-            let delta = state.cost - origCost
-            # Restore (reverse order)
-            state.assignValueLean(p2, val2)
-            state.assignValueLean(p1, val1)
+            # Exact swap delta: decomposed when safe, else full simulation
+            var delta: int
+            if fastEval:
+                delta = state.exactSwapDelta(p1, p2, val2, val1)
+            else:
+                let origCost = state.cost
+                state.assignValueLean(p1, val2)
+                state.assignValueLean(p2, val1)
+                delta = state.cost - origCost
+                # Restore (reverse order)
+                state.assignValueLean(p2, val2)
+                state.assignValueLean(p1, val1)
 
             inc evalsCount
             if (evalsCount and 63) == 0 and (
@@ -297,7 +341,7 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
                     (state.searchDeadline > 0 and epochTime() > state.searchDeadline)):
                 return false
 
-            let aspiration = origCost + delta < state.bestCost
+            let aspiration = state.cost + delta < state.bestCost
             if tabu1 and tabu2 and not aspiration:
                 continue
 
@@ -324,10 +368,10 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
 
     # Set tabu on old values
     let tabuTenure = state.iteration + 1 + state.iteration mod 10
-    let oldIdx1 = state.domainIndex[p1].getOrDefault(oldVal1, -1)
+    let oldIdx1 = state.domIdx(p1, oldVal1)
     if oldIdx1 >= 0 and not state.isLazy[p1]:
         state.tabu[p1][oldIdx1] = tabuTenure
-    let oldIdx2 = state.domainIndex[p2].getOrDefault(oldVal2, -1)
+    let oldIdx2 = state.domIdx(p2, oldVal2)
     if oldIdx2 >= 0 and not state.isLazy[p2]:
         state.tabu[p2][oldIdx2] = tabuTenure
     return true
@@ -344,6 +388,7 @@ proc bestPartitionSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, int)], i
 
     var bestCost = high(int)
     var moves: seq[(int, int, T, int)] = @[]
+    let fastEval = state.fastSwapEvalOk
 
     for gi, group in state.partitionGroups:
         let nullVal = group.nullValue
@@ -362,21 +407,25 @@ proc bestPartitionSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, int)], i
             if pos == activePos: continue
             if state.assignment[pos] != nullVal: continue
 
-            let domain = state.sharedDomain[][pos]
+            let domain {.cursor.} = state.sharedDomain[][pos]
             for newVal in domain:
                 if newVal == nullVal: continue
 
-                # Simulate swap and compute exact cost
-                state.assignValueLean(activePos, nullVal)
-                state.assignValueLean(pos, newVal)
-                let newCost = state.cost
-                # Restore
-                state.assignValueLean(pos, nullVal)
-                state.assignValueLean(activePos, activeVal)
+                # Exact double-assign delta: decomposed when safe, else simulation
+                var newCost: int
+                if fastEval:
+                    newCost = state.cost + state.exactSwapDelta(activePos, pos, nullVal, newVal)
+                else:
+                    state.assignValueLean(activePos, nullVal)
+                    state.assignValueLean(pos, newVal)
+                    newCost = state.cost
+                    # Restore
+                    state.assignValueLean(pos, nullVal)
+                    state.assignValueLean(activePos, activeVal)
 
                 # Tabu check: both legs must be tabu AND no aspiration
-                let nullIdx = state.domainIndex[activePos].getOrDefault(nullVal, -1)
-                let newIdx = state.domainIndex[pos].getOrDefault(newVal, -1)
+                let nullIdx = state.domIdx(activePos, nullVal)
+                let newIdx = state.domIdx(pos, newVal)
                 let tabu1 = nullIdx >= 0 and not state.isLazy[activePos] and
                             state.tabu[activePos][nullIdx] > state.iteration
                 let tabu2 = newIdx >= 0 and not state.isLazy[pos] and
@@ -407,6 +456,7 @@ proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], i
     var bestCost = high(int)
     var moves: seq[(int, int, T, T)] = @[]
     var evalsCount = 0
+    let fastEval = state.fastSwapEvalOk
 
     for group in state.gccGroupPositions:
         for i in 0..<group.len:
@@ -423,20 +473,24 @@ proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], i
                 if val1 == val2: continue
 
                 # Check domain compatibility
-                let idx1 = state.domainIndex[p1].getOrDefault(val2, -1)
-                let idx2 = state.domainIndex[p2].getOrDefault(val1, -1)
+                let idx1 = state.domIdx(p1, val2)
+                let idx2 = state.domIdx(p2, val1)
                 if idx1 < 0 or idx2 < 0: continue
 
-                # Simulate swap via assignValueLean for exact cost
-                let origCost = state.cost
-                state.assignValueLean(p1, val2)
-                state.assignValueLean(p2, val1)
-                let delta = state.cost - origCost
-                # Restore
-                state.assignValueLean(p2, val2)
-                state.assignValueLean(p1, val1)
+                # Exact swap delta: decomposed when safe, else full simulation
+                var delta: int
+                if fastEval:
+                    delta = state.exactSwapDelta(p1, p2, val2, val1)
+                else:
+                    let origCost = state.cost
+                    state.assignValueLean(p1, val2)
+                    state.assignValueLean(p2, val1)
+                    delta = state.cost - origCost
+                    # Restore
+                    state.assignValueLean(p2, val2)
+                    state.assignValueLean(p1, val1)
 
-                let newCost = origCost + delta
+                let newCost = state.cost + delta
                 inc evalsCount
 
                 # Tabu: both legs must be tabu to block

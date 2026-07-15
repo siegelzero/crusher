@@ -12,7 +12,7 @@ proc recomputeElementImpliedDiscounts[T](state: TabuState[T]) =
     let channelPos = state.carray.channelPositions
 
     for idxPos, constraints in state.elementImpliedMoves.pairs:
-        let domain = state.sharedDomain[][idxPos]
+        let domain {.cursor.} = state.sharedDomain[][idxPos]
         let dLen = domain.len
         if dLen == 0: continue
 
@@ -66,7 +66,7 @@ proc recomputeElementImpliedDiscounts[T](state: TabuState[T]) =
                 if targetPos < 0 or targetPos in channelPos or targetPos == idxPos:
                     continue
 
-                if targetValue in state.domainIndex[targetPos]:
+                if state.domIdx(targetPos, targetValue) >= 0:
                     discount -= 1
 
             state.elementImpliedDiscount[idxPos][i] = discount
@@ -186,7 +186,7 @@ proc applyElementImpliedMoves[T](state: TabuState[T], movedPosition: int) =
             continue
 
         # Check if target value is in the domain
-        let domIdx = state.domainIndex[targetPos].getOrDefault(targetValue, -1)
+        let domIdx = state.domIdx(targetPos, targetValue)
         if domIdx < 0:
             continue
 
@@ -205,7 +205,7 @@ proc applyElementImpliedMoves[T](state: TabuState[T], movedPosition: int) =
         let oldValue = state.assignment[targetPos]
         state.assignValue(targetPos, targetValue)
         # Set tabu on the old value to prevent undoing
-        let oldIdx = state.domainIndex[targetPos].getOrDefault(oldValue, -1)
+        let oldIdx = state.domIdx(targetPos, oldValue)
         if oldIdx >= 0 and not state.isLazy[targetPos]:
             state.tabu[targetPos][oldIdx] = state.iteration + 1 + state.iteration mod 10
 
@@ -298,7 +298,7 @@ proc applyReverseElementImpliedMoves[T](state: TabuState[T]) =
                 continue  # Already satisfied
 
             # Try to find a better index value
-            let domain = state.sharedDomain[][idxPos]
+            let domain {.cursor.} = state.sharedDomain[][idxPos]
             let currentIdxValue = state.assignment[idxPos]
             var bestValue = currentIdxValue
             var bestDelta = 0
@@ -306,7 +306,7 @@ proc applyReverseElementImpliedMoves[T](state: TabuState[T]) =
             for v in domain:
                 if v == currentIdxValue: continue
                 # Check tabu
-                let domIdx = state.domainIndex[idxPos].getOrDefault(v, -1)
+                let domIdx = state.domIdx(idxPos, v)
                 if domIdx < 0: continue
                 if not state.isLazy[idxPos] and state.tabu[idxPos][domIdx] > state.iteration:
                     continue  # Skip tabu values
@@ -329,6 +329,6 @@ proc applyReverseElementImpliedMoves[T](state: TabuState[T]) =
                 let oldValue = state.assignment[idxPos]
                 state.assignValue(idxPos, bestValue)
                 # Set tabu on old value
-                let oldIdx = state.domainIndex[idxPos].getOrDefault(oldValue, -1)
+                let oldIdx = state.domIdx(idxPos, oldValue)
                 if oldIdx >= 0 and not state.isLazy[idxPos]:
                     state.tabu[idxPos][oldIdx] = state.iteration + 1 + state.iteration mod 10

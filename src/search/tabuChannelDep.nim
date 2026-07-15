@@ -238,7 +238,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     if pos in state.cdCascadePos:
         let cascadeIdx = state.cdCascadePos[pos]
         if state.cdCascadeIsStatic[cascadeIdx]:
-            let di = state.domainIndex[pos].getOrDefault(candidateValue, -1)
+            let di = state.domIdx(pos, candidateValue)
             if di < 0: return 0
             let chans = state.cdCascadeChans[cascadeIdx]
             let chanVals = state.cdCascadeValues[cascadeIdx]
@@ -699,7 +699,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
     ## Incremental cascade evaluation: only re-evaluate entries affected by changed
     ## external positions. Uses cached values for unaffected entries, with dirty
     ## propagation through forward deps when an entry's value changes.
-    let domain = state.sharedDomain[][pos]
+    let domain {.cursor.} = state.sharedDomain[][pos]
     let cascadeIdx = state.cdCascadePos[pos]
     let nChans = state.cdCascadeChans[cascadeIdx].len
     let nDom = domain.len
@@ -828,7 +828,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
     ## Uses cascade topology for batch evaluation (both static and dynamic).
     ## Static cascades use precomputed channel values; dynamic cascades evaluate at runtime.
     ## Falls back to per-value computeChannelDepDelta for positions without cascade topology.
-    let domain = state.sharedDomain[][pos]
+    let domain {.cursor.} = state.sharedDomain[][pos]
     if pos in state.cdCascadePos:
         let cascadeIdx = state.cdCascadePos[pos]
         let nChans = state.cdCascadeChans[cascadeIdx].len
@@ -932,7 +932,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
     ## For non-cascade positions: falls back to full per-value recomputation.
     if pos notin state.cdCascadePos:
         # Non-cascade: full recomputation
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         for i in 0..<domain.len:
             let newDep = state.computeChannelDepDelta(pos, domain[i])
             let oldDep = state.channelDepPenalties[pos][i]
@@ -961,7 +961,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         for chanPos in changedChannels:
             if chanPos in externalDeps:
                 changedExternals.incl(chanPos)
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         var oldPenalties = newSeq[int](domain.len)
         for i in 0..<domain.len:
             oldPenalties[i] = state.channelDepPenalties[pos][i]
@@ -977,7 +977,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         # Element cascade values are stable (no element deps changed). For each domain value,
         # set the min/max's cascade inputs from cache, evaluate min/max, store in cache.
         # Pass cache directly to computeCascadePenalties (it only reads min/max entries).
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         let nDom = domain.len
         let bindings = state.cdCascadeBindings[cascadeIdx]
         let mmIndices = state.cdCascadeMinMaxIdx[cascadeIdx]
@@ -1020,7 +1020,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
     if anyDepChanged:
         # External deps changed but no min/max entries to fast-path — full cascade recompute.
         # (Shouldn't happen: min/max-only deps imply min/max entries, but handle defensively.)
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         var oldPenalties = newSeq[int](domain.len)
         for i in 0..<domain.len:
             oldPenalties[i] = state.channelDepPenalties[pos][i]
@@ -1042,7 +1042,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
             if savedCost != newCost:
                 uniformDelta += savedCost - newCost
         if uniformDelta != 0:
-            let domain = state.sharedDomain[][pos]
+            let domain {.cursor.} = state.sharedDomain[][pos]
             for i in 0..<domain.len:
                 state.channelDepPenalties[pos][i] += uniformDelta
                 state.penaltyMap[pos][i] += uniformDelta
@@ -1078,7 +1078,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos, affectedIndices in state.cdTargetedUpdates.pairs:
             if state.isLazy[pos]: continue
             let currentVal = state.assignment[pos]
-            let currentIdx = state.domainIndex[pos].getOrDefault(currentVal, -1)
+            let currentIdx = state.domIdx(pos, currentVal)
             if currentIdx >= 0 and currentIdx in affectedIndices:
                 # Full recomputation — use uniform delta
                 when ProfileIteration: state.cdFullPos += 1
@@ -1086,7 +1086,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
             else:
                 # Targeted recomputation — only affected domain values
                 when ProfileIteration: state.cdTargetedPos += 1
-                let domain = state.sharedDomain[][pos]
+                let domain {.cursor.} = state.sharedDomain[][pos]
                 for i in affectedIndices.items:
                     when ProfileIteration: state.cdTotalCalls += 1
                     let newDep = state.computeChannelDepDelta(pos, domain[i])

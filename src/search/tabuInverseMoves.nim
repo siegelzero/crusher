@@ -100,7 +100,7 @@ proc recomputeAllInverseDeltas[T](state: TabuState[T]) =
                 continue
             if state.isLazy[pos]:
                 continue
-            let domain = state.sharedDomain[][pos]
+            let domain {.cursor.} = state.sharedDomain[][pos]
             for i in 0..<domain.len:
                 state.inverseDelta[pos][i] = state.computeInverseDeltaAt(pos, domain[i])
 
@@ -129,7 +129,7 @@ proc recomputeInverseDeltasTargeted[T](state: TabuState[T],
             continue
         if state.isLazy[pos]:
             continue
-        let domain = state.sharedDomain[][pos]
+        let domain {.cursor.} = state.sharedDomain[][pos]
         let localIdx = state.posToGroupLocalIdx[pos]
         let oldJ = int(state.assignment[pos]) + offset
 
@@ -143,7 +143,7 @@ proc recomputeInverseDeltasTargeted[T](state: TabuState[T],
             # Convert changed local indices → domain values → domain indices via domainIndex.
             for cl in changedLocalIdxs.items:
                 let targetValue = T(cl - offset)
-                let domIdx = state.domainIndex[pos].getOrDefault(targetValue, -1)
+                let domIdx = state.domIdx(pos, targetValue)
                 if domIdx >= 0:
                     state.inverseDelta[pos][domIdx] = state.computeInverseDeltaAt(pos, targetValue)
 

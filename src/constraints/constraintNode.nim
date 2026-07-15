@@ -100,7 +100,7 @@ func evaluate*[T](node: ConstraintNode[T], assignment: seq[T] | Table[int, T]): 
 
 
 {.push overflowChecks: off.}
-func penalty*[T](relation: BinaryRelation, left, right: T): T =
+func penalty*[T](relation: BinaryRelation, left, right: T): T {.inline.} =
     ## Graduated penalty for inequalities - returns degree of violation
     ## Binary penalty for equality/other relations where gradient doesn't help
     ## overflowChecks off: intermediate search states can produce wrapped expression

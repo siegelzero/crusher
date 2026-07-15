@@ -100,7 +100,7 @@ proc repairLinearEqualities*[T](state: TabuState[T], verbose: bool, id: int) =
                 let coeff = term.coeff
                 if coeff == T(0): continue
 
-                let dom = state.sharedDomain[][pos]
+                let dom {.cursor.} = state.sharedDomain[][pos]
                 if dom.len == 0: continue
 
                 let oldVal = state.assignment[pos]
@@ -219,7 +219,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
 
         block scanSingle:
             for pos in carray.allSearchPositions():
-                let dom = state.sharedDomain[][pos]
+                let dom {.cursor.} = state.sharedDomain[][pos]
                 if dom.len < 2: continue
                 let oldVal = state.assignment[pos]
                 for v in dom:
@@ -258,7 +258,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
                     positions.add(p)
                 for i in 0..<positions.len:
                     let p1 = positions[i]
-                    let dom1 = state.sharedDomain[][p1]
+                    let dom1 {.cursor.} = state.sharedDomain[][p1]
                     if dom1.len < 2: continue
                     let old1 = state.assignment[p1]
                     for v1 in dom1:
@@ -271,7 +271,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
                         state.assignValueLean(p1, v1)
                         for j in (i+1)..<positions.len:
                             let p2 = positions[j]
-                            let dom2 = state.sharedDomain[][p2]
+                            let dom2 {.cursor.} = state.sharedDomain[][p2]
                             if dom2.len < 2: continue
                             let old2 = state.assignment[p2]
                             for v2 in dom2:
@@ -337,7 +337,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
                         positions[ii] = basePositions[(ii + offset) mod basePositions.len]
                 for i in 0..<positions.len:
                     let p1 = positions[i]
-                    let dom1 = state.sharedDomain[][p1]
+                    let dom1 {.cursor.} = state.sharedDomain[][p1]
                     if dom1.len < 2: continue
                     let old1 = state.assignment[p1]
                     for v1 in dom1:
@@ -345,7 +345,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
                         state.assignValueLean(p1, v1)
                         for j in (i+1)..<positions.len:
                             let p2 = positions[j]
-                            let dom2 = state.sharedDomain[][p2]
+                            let dom2 {.cursor.} = state.sharedDomain[][p2]
                             if dom2.len < 2: continue
                             let old2 = state.assignment[p2]
                             for v2 in dom2:
@@ -353,7 +353,7 @@ proc repairChannelInequalities*[T](state: TabuState[T], verbose: bool, id: int,
                                 state.assignValueLean(p2, v2)
                                 for k in (j+1)..<positions.len:
                                     let p3 = positions[k]
-                                    let dom3 = state.sharedDomain[][p3]
+                                    let dom3 {.cursor.} = state.sharedDomain[][p3]
                                     if dom3.len < 2: continue
                                     let old3 = state.assignment[p3]
                                     for v3 in dom3:
@@ -428,7 +428,7 @@ proc tryLinearRepairMoves*[T](state: TabuState[T]): bool =
             if pos in carray.channelPositions or pos in carray.fixedPositions:
                 continue
 
-            let dom = state.sharedDomain[][pos]
+            let dom {.cursor.} = state.sharedDomain[][pos]
             if dom.len == 0: continue
 
             let oldVal = state.assignment[pos]
@@ -490,7 +490,7 @@ proc tryCompoundCountRepair*[T](state: TabuState[T]): bool =
         for pos, coeff in sumExpr.coefficient.pairs:
             if abs(coeff) != 1: continue
             if pos in carray.fixedPositions or pos in carray.channelPositions: continue
-            let dom = state.sharedDomain[][pos]
+            let dom {.cursor.} = state.sharedDomain[][pos]
             if dom.len < 2: continue
             # Verify binary domain {0, 1} for compound move semantics
             if dom[0] != 0 or dom[^1] != 1 or dom.len != 2: continue
@@ -583,7 +583,7 @@ proc tryCompoundCountRepair*[T](state: TabuState[T]): bool =
                         if cp == src: alreadyFlipped = true
                     if alreadyFlipped or src == anchor: continue
                     if src in carray.fixedPositions or src in carray.channelPositions: continue
-                    let ds = state.sharedDomain[][src]
+                    let ds {.cursor.} = state.sharedDomain[][src]
                     if ds.len != 2 or ds[0] != 0 or ds[^1] != 1: continue
                     let oldS = state.assignment[src]
                     let newS: T = if oldS == 0: T(1) else: T(0)

@@ -234,7 +234,7 @@ proc tryChainMoves*[T](state: TabuState[T]): bool =
         for i in 0..<chain.len:
             let (pos, _) = chain[i]
             let oldVal = oldValues[i]
-            let oldIdx = state.domainIndex[pos].getOrDefault(oldVal, -1)
+            let oldIdx = state.domIdx(pos, oldVal)
             if oldIdx >= 0 and not state.isLazy[pos]:
                 state.tabu[pos][oldIdx] = state.iteration + 1 + state.iteration mod 10
         return true
