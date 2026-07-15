@@ -55,7 +55,8 @@ proc detectBivalentIndicatorChannels*(tr: var FznTranslator) =
 
     # Phase 2: scan for non-defining int_eq/ne_reif on the same b that link
     # to a different variable, and channel the bivalent source X to it.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let cname = stripSolverPrefix(con.name)
         if cname != "int_eq_reif" and cname != "int_ne_reif": continue
@@ -2274,7 +2275,8 @@ proc detectInversePatterns(tr: var FznTranslator) =
 
     # Step 1: Group array_var_int_element constraints by their array argument
     var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2395,7 +2397,8 @@ proc detectInversePatterns(tr: var FznTranslator) =
 
         # Find and mark matching fzn_all_different_int constraints on the same positions
         var nAllDiffRemoved = 0
-        for ci2, con2 in tr.model.constraints:
+        for ci2 in 0 ..< tr.model.constraints.len:
+            let con2 {.cursor.} = tr.model.constraints[ci2]
             if ci2 in tr.definingConstraints:
                 continue
             let cname = stripSolverPrefix(con2.name)
@@ -2439,7 +2442,8 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
 
     # Step 1: Group array_var_int_element constraints by their array argument
     var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2535,7 +2539,8 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
         # Find matching GCC or alldifferent_except_0 constraints on the array positions
         let arrayPosSet = toPackedSet(arrayPositions)
         var gccCIs: seq[int]
-        for ci2, con2 in tr.model.constraints:
+        for ci2 in 0 ..< tr.model.constraints.len:
+            let con2 {.cursor.} = tr.model.constraints[ci2]
             if ci2 in tr.definingConstraints:
                 continue
             let cname = stripSolverPrefix(con2.name)
@@ -2664,7 +2669,8 @@ proc detectSentinelInverseChannelPatterns(tr: var FznTranslator) =
         elemArrName: string  # name of the FZN array (for consuming later)
 
     var candidates: seq[Candidate]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
@@ -2987,7 +2993,8 @@ proc tightenMatrixDiagonalDomains(tr: var FznTranslator) =
 
     # Group element constraints by shared flat-index var.
     var indexToConstraints: Table[string, seq[int]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["array_int_element", "array_int_element_nonshifted"]:
             continue
@@ -3133,7 +3140,8 @@ type BoolClauseEntry = object
 
 proc indexBoolClauses(tr: FznTranslator): Table[string, seq[BoolClauseEntry]] =
     ## Index bool_clause constraints by all their literals for efficient lookup.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if con.name != "bool_clause": continue
         if con.args.len < 2: continue
@@ -3169,7 +3177,8 @@ proc detectIfThenElseChannels(tr: var FznTranslator) =
 
     var linNeReifMap: Table[string, LinNeReifEntry]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         # Don't skip definingConstraints: int_lin_ne_reif may already be channelized
         # by detectLinEqReifChannels, but we still need prevVar/currVar info to detect
         # the full if-then-else pattern and convert the result to a 2D table channel.
@@ -3404,7 +3413,8 @@ proc detectConditionalCounterChannels*(tr: var FznTranslator) =
 
     var linEqIncrMap: Table[string, LinEqIncrEntry]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let cname = stripSolverPrefix(con.name)
         if cname != "int_lin_eq_reif": continue
         if con.args.len < 4: continue
@@ -3567,7 +3577,8 @@ proc detectConditionalElementChannels*(tr: var FznTranslator) =
 
     var elemByResult: Table[string, ElemInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let cname = stripSolverPrefix(con.name)
         if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
@@ -3734,7 +3745,8 @@ proc detectGccCountChannels(tr: var FznTranslator) =
 
     var totalChannels = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = con.name
         if name != "fzn_global_cardinality": continue

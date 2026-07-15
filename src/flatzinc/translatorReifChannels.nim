@@ -107,7 +107,8 @@ proc detectReifChannels(tr: var FznTranslator) =
     ##   - Variable val: b = (x == y) ? 1 : 0 → 2D element lookup on (x,y) domains
 
     # First pass: find int_eq_reif with defines_var, not already consumed
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -147,7 +148,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.reifChannelDefs.add(ci)
 
     # Second pass: find bool2int with defines_var, not already consumed
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -176,7 +178,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.bool2intChannelDefs.add(ci)
 
     # Pass 2b: find bool_not with defines_var (b = 1 - a)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -205,7 +208,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.boolNotChannelDefs.add(ci)
 
     # Third pass: find bool_clause_reif with defines_var
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -241,7 +245,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.boolClauseReifChannelDefs.add(ci)
 
     # Fourth pass: find set_in_reif with defines_var
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -282,7 +287,8 @@ proc detectReifChannels(tr: var FznTranslator) =
                 continue
 
     # Fifth pass: find array_bool_and/array_bool_or with defines_var
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -314,7 +320,8 @@ proc detectReifChannels(tr: var FznTranslator) =
         tr.boolAndOrChannelDefs.add(ci)
 
     # Sixth pass: find int_le_reif/int_lt_reif with defines_var
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -352,7 +359,8 @@ proc detectReifChannels(tr: var FznTranslator) =
 
     # Seventh pass: find int_lin_le_reif with defines_var
     # These define boolean variables as channels: b <-> sum(coeffs*vars) <= rhs
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -381,7 +389,8 @@ proc detectReifChannels(tr: var FznTranslator) =
     # Eighth pass: find bool_eq_reif/bool_ne_reif with defines_var
     # bool_eq_reif(a, b, r): r = (a == b) where a, b are boolean
     # bool_ne_reif(a, b, r): r = (a != b) where a, b are boolean
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -486,7 +495,8 @@ proc detectConditionalBinaryChannels*(tr: var FznTranslator) =
     # Build map: positive literal var name → seq of bool_clause indices
     # for bool_clause([b3], [condBool]) patterns
     var posLiteralBoolClauses: Table[string, seq[tuple[condVar: string, ci: int]]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -532,7 +542,8 @@ proc detectLinEqReifChannels*(tr: var FznTranslator) =
     ## b becomes a channel: b = (sum(coeffs*vars) == rhs) ? 1 : 0  (or != for ne)
     ## Must run AFTER detectCaseAnalysisChannels (which uses int_lin_eq_reif via linEqReifMap).
     var nEq, nNe = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" and name != "int_lin_ne_reif": continue
         if not con.hasAnnotation("defines_var"): continue

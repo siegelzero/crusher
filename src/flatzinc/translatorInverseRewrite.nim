@@ -46,7 +46,8 @@ proc dropImpliedInverseCircuits(tr: var FznTranslator) =
 
     # Circuit constraints by (named) array argument
     var circuitByArray: Table[string, seq[int]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) notin ["crusher_circuit", "fzn_circuit"]: continue
         if con.args.len < 1 or con.args[0].kind != FznIdent: continue
         circuitByArray.mgetOrPut(con.args[0].ident, @[]).add(ci)
@@ -139,7 +140,8 @@ proc rewriteInverseChannelIndexedElements(tr: var FznTranslator) =
         for cci in cand.consumedCIs.items:
             ctConsumed.incl(cci)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let ctElem = ci in ctConsumed
         if ci in tr.definingConstraints and not ctElem: continue
         let name = stripSolverPrefix(con.name)

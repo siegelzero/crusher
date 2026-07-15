@@ -49,7 +49,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     # Step 1a: Also pick up int_eq_reif :: defines_var entries where the test value is
     # a defined variable (these were skipped by detectReifChannels because defined vars
     # don't have positions, but they're still useful for case analysis pattern matching).
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif" or not con.hasAnnotation("defines_var"): continue
@@ -75,7 +76,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
 
     var linEqReifMap: Table[string, LinEqReifEntry]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
@@ -164,7 +166,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
 
     # Step 1e: Extract single-variable int_lin_eq_reif :: defines_var into eqReifMap.
     # When int_lin_eq_reif has a single variable (coeffs=[c], vars=[x], rhs=r): x == r/c.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" or not con.hasAnnotation("defines_var"): continue
@@ -252,7 +255,8 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
 
     var casesByTarget: Table[string, seq[CaseEntry]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1134,7 +1138,8 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
     # bool vars), but the bool var → (sourceVar, testVal) mapping is still
     # valid here and is needed to identify cond reifs in disjunctive clauses.
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if con.args.len < 3 or con.args[2].kind != FznIdent: continue
@@ -1152,7 +1157,8 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
         boolVar: string      # B_k (arg[2])
     var eqReifByTarget: Table[string, seq[EqReifEntry]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if con.args.len < 3: continue
@@ -1246,7 +1252,8 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
                 if setInReifCondMap[posElem.ident].sourceVar == condVar: continue
             boolToCondVals[posElem.ident] = (condVar: condVar, condVals: condVals)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1324,7 +1331,8 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
     while boolToCondVals.len != prevCondCount:
         prevCondCount = boolToCondVals.len
         # Propagate through array_bool_and: AND result → inputs
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name != "array_bool_and": continue
             if con.args.len < 2 or con.args[1].kind != FznIdent: continue
@@ -1336,7 +1344,8 @@ proc detectConditionalSourceChannels(tr: var FznTranslator) =
                     if elem.kind == FznIdent and elem.ident notin boolToCondVals:
                         boolToCondVals[elem.ident] = cv
         # Also propagate through bool_clause chains (including multi-neg patterns)
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name != "bool_clause": continue
             if con.args.len < 2: continue
@@ -1612,7 +1621,8 @@ proc pruneClausesImpliedByConditionalSource*(tr: var FznTranslator) =
         constVal: int        # for rkConst
         varB: string         # for rkVarVar: arg1
     var reifInfo: Table[string, ReifInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "int_eq_reif": continue
         if con.args.len < 3 or con.args[2].kind != FznIdent: continue
         let boolVar = con.args[2].ident
@@ -1745,7 +1755,8 @@ proc pruneClausesImpliedByConditionalSource*(tr: var FznTranslator) =
 
     # 1. Prune raw bool_clauses still in tr.model.constraints.
     var nClauseConsumed = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -1867,7 +1878,8 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
                 boolVarNames.incl(decl.name)
         else: discard
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         case name
         of "int_eq_reif":
@@ -1915,7 +1927,8 @@ proc detectImplicationPatterns(tr: var FznTranslator) =
     var nVacuous = 0
     var nStay = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -2105,7 +2118,8 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
     # Step 1: Find int_eq_reif(V, 0, B_zero) patterns
     # These may already be consumed by reif channel detection, but we scan all constraints.
     var zeroReifVars: Table[string, tuple[ci: int, boolVar: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name == "int_eq_reif" and con.args.len >= 3:
             if con.args[0].kind == FznIdent and
@@ -2129,7 +2143,8 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
         boolVar: string
 
     var linEqReifs: Table[string, LinEqReifInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq_reif" or con.args.len < 4: continue
@@ -2171,7 +2186,8 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
         negLits: seq[string]
 
     var boolClausesByPosLit: Table[string, seq[BoolClauseInfo]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause" or con.args.len < 2: continue
@@ -2201,7 +2217,8 @@ proc detectConditionalGainChannels(tr: var FznTranslator) =
         isRightConst: bool
 
     var leReifByBool: Table[string, LeReifInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["int_le_reif", "int_lt_reif"] or con.args.len < 3: continue
         if con.args[2].kind != FznIdent: continue

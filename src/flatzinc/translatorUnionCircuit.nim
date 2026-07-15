@@ -24,7 +24,8 @@ proc detectUnionCircuits(tr: var FznTranslator) =
     # elements carry `defines_var(c_i)`, so they are marked consumed (channelized)
     # before this pass. We only read their structure to recover the matchings.
     var selectorByResult: Table[string, tuple[idxName, arrName: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
             continue
         if con.args.len < 3: continue
@@ -41,7 +42,8 @@ proc detectUnionCircuits(tr: var FznTranslator) =
     var rowsToPost: seq[seq[int]]
     var nDetected = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue           # circuit must be live
         if stripSolverPrefix(con.name) notin ["crusher_circuit", "fzn_circuit"]: continue
         if con.args.len < 1 or con.args[0].kind != FznIdent: continue

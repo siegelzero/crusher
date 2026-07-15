@@ -297,6 +297,14 @@ type
         arrayPositions*: Table[string, seq[int]]
         # Maps FZN array name -> constant int values (for parameter arrays)
         arrayValues*: Table[string, seq[int]]
+        # Maps declaration name -> its FznArrayLit value (variables shadow
+        # parameters). Built once in translate(); presolve passes resolve
+        # array arguments through this instead of scanning every declaration.
+        arrayLitByName*: Table[string, FznExpr]
+        # Total solve time budget in seconds (0 = unknown). Optional analysis
+        # passes (objective staging probes) size their own time caps from it
+        # so translation can never consume the whole solve budget.
+        timeBudgetSecs*: float
         # Tracks which variables have output_var annotation
         outputVars*: seq[string]
         # Tracks which arrays have output_array annotation, with their index ranges
@@ -1076,9 +1084,23 @@ proc buildObjectiveStaging(tr: var FznTranslator) =
     tr.stagingBoundActive = true
     tr.stagingBoundVar = vname
 
+    # Each probe below is a full presolve fixed-point over the whole model —
+    # on large models (thousands of constraints) that can cost seconds per
+    # probe, and there can be up to StageMaxDomain of them. Cap the total
+    # probe time so staging can never eat the solve budget; when time runs
+    # out, abandon staging entirely (partial fixing tables are not kept).
+    let stagingBudget =
+        if tr.timeBudgetSecs > 0: max(1.0, min(5.0, 0.15 * tr.timeBudgetSecs))
+        else: 5.0
+    let stagingDeadline = epochTime() + stagingBudget
+    var stagingTimedOut = false
+
     var fixingsByBound = initTable[int, seq[(int, int)]]()
     var maxFixes = 0
     for k in vLo ..< vHi:
+        if epochTime() > stagingDeadline:
+            stagingTimedOut = true
+            break
         tr.stagingBoundHi = k
         tr.presolve()
         var fixes: seq[(int, int)] = @[]
@@ -1104,6 +1126,11 @@ proc buildObjectiveStaging(tr: var FznTranslator) =
     tr.reachableValuesTightened = savedRVt
     tr.reachableValuesRemoved = savedRVr
 
+    if stagingTimedOut:
+        stderr.writeLine(&"[FZN] Objective staging abandoned: probe budget " &
+                         &"({stagingBudget:.1f}s) exhausted")
+        return
+
     const MinFixesToActivate = 2
     if maxFixes < MinFixesToActivate: return
 
@@ -1119,14 +1146,25 @@ proc buildObjectiveStaging(tr: var FznTranslator) =
     stderr.writeLine(&"[FZN] Objective staging: var '{vname}' (weight={bestW}, dom {vLo}..{vHi}), " &
                      &"{vHi - vLo} stages, up to {maxFixes} positions fixed per stage")
 
-proc translate*(model: FznModel): FznTranslator =
+proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     ## Translates a complete FznModel to a ConstraintSystem.
+    ## timeBudgetSecs is the caller's total solve budget (0 = unknown); optional
+    ## analysis passes cap their own runtime from it.
     result.sys = initConstraintSystem[int]()
+    result.timeBudgetSecs = timeBudgetSecs
     result.model = model
     result.varPositions = initTable[string, int]()
     result.paramValues = initTable[string, int]()
     result.arrayPositions = initTable[string, seq[int]]()
     result.arrayValues = initTable[string, seq[int]]()
+    result.arrayLitByName = initTable[string, FznExpr]()
+    for decl in model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            result.arrayLitByName[decl.name] = decl.value
+    for decl in model.parameters:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            if decl.name notin result.arrayLitByName:
+                result.arrayLitByName[decl.name] = decl.value
     result.definedVarNames = initHashSet[string]()
     result.definedVarExprs = initTable[string, AlgebraicExpression[int]]()
     result.arrayElementNames = initTable[string, seq[string]]()
@@ -1809,7 +1847,8 @@ proc translate*(model: FznModel): FznTranslator =
         #      formally in `definingConstraints`. Counting refs from these keeps
         #      element results that feed into reification/min/max channels alive.
         var varRefCount: Table[string, int]
-        for ci, con in model.constraints:
+        for ci in 0 ..< model.constraints.len:
+            let con {.cursor.} = model.constraints[ci]
             if ci in result.redundantOrderings: continue
             for arg in con.args:
                 case arg.kind
@@ -1830,7 +1869,8 @@ proc translate*(model: FznModel): FznTranslator =
                         varRefCount.mgetOrPut(annArg.ident, 0) += 1
 
         var nElementConsumed = 0
-        for ci, con in model.constraints:
+        for ci in 0 ..< model.constraints.len:
+            let con {.cursor.} = model.constraints[ci]
             if ci in result.definingConstraints: continue
             let name = stripSolverPrefix(con.name)
             if name notin ["array_int_element", "array_int_element_nonshifted",
@@ -1854,7 +1894,8 @@ proc translate*(model: FznModel): FznTranslator =
             stderr.writeLine(&"[FZN] Consumed {nElementConsumed} dead element constraints (result variable unreferenced)")
 
     var nSkippedDefining, nSkippedRedundant, nTranslated = 0
-    for ci, con in model.constraints:
+    for ci in 0 ..< model.constraints.len:
+        let con {.cursor.} = model.constraints[ci]
         if ci in result.definingConstraints:
             inc nSkippedDefining
             continue

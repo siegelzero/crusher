@@ -27,7 +27,8 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
     # array-element inputs still need positions for the binding to read from.
     block:
         var rescueNames = initHashSet[string]()
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name notin ["array_var_int_element", "array_var_int_element_nonshifted",
                                         "array_var_bool_element", "array_var_bool_element_nonshifted"]:
@@ -38,7 +39,8 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
                     rescueNames.incl(elem.ident)
 
         if rescueNames.len > 0:
-            for ci, con in tr.model.constraints:
+            for ci in 0 ..< tr.model.constraints.len:
+                let con {.cursor.} = tr.model.constraints[ci]
                 if ci notin tr.definingConstraints: continue
                 if con.hasAnnotation("defines_var"):
                     let ann = con.getAnnotation("defines_var")
@@ -69,7 +71,8 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
     # Phase 2: cumulative/disjunctive duration & height rescue
     block:
         var rescueNames = initHashSet[string]()
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             # Skip already-consumed cumulatives — e.g. detectMultiMachineNoOverlap
             # collapses pairs of cumulatives into a single MultiMachineNoOverlap
             # and adds the cumulative ci to definingConstraints. The original
@@ -91,7 +94,8 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
                         rescueNames.incl(elem.ident)
 
         if rescueNames.len > 0:
-            for ci, con in tr.model.constraints:
+            for ci in 0 ..< tr.model.constraints.len:
+                let con {.cursor.} = tr.model.constraints[ci]
                 if ci notin tr.definingConstraints: continue
                 if con.hasAnnotation("defines_var"):
                     let ann = con.getAnnotation("defines_var")
@@ -121,7 +125,8 @@ proc collectDefinedVars(tr: var FznTranslator) =
     ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
     ## These variables will be replaced by their defining expressions instead of being created as positions.
     var definedVarNames: Table[string, bool]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name == "int_lin_eq" and con.hasAnnotation("defines_var"):
             # Find the defines_var annotation
@@ -147,7 +152,8 @@ proc collectDefinedVars(tr: var FznTranslator) =
     # int_times candidates are collected first, then filtered by fan-out guard below.
     type IntTimesCand = tuple[ci: int, definedName: string]
     var intTimesCands: seq[IntTimesCand]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name in ["int_abs", "int_max", "int_min", "int_times"] and con.hasAnnotation("defines_var"):
             let ann = con.getAnnotation("defines_var")
@@ -225,7 +231,8 @@ proc collectDefinedVars(tr: var FznTranslator) =
     # Detect int_times(a, b, c) WITHOUT defines_var where c can be treated as defined.
     # MiniZinc sometimes doesn't annotate cube variables (x^2 * x = x^3) with defines_var
     # even though the result is fully determined. These can have enormous domains (54M+).
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_times": continue
@@ -304,7 +311,8 @@ proc collectDefinedVars(tr: var FznTranslator) =
     var elementChannelMap: Table[ElementKey, string]  # key -> first channel var name
     var elementArrayCache: Table[string, seq[int]]  # channel var name -> resolved array (for verification)
     var nElementAliases = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name in ["array_var_int_element", "array_var_int_element_nonshifted",
                                 "array_int_element", "array_int_element_nonshifted",
@@ -379,7 +387,8 @@ proc collectDefinedVars(tr: var FznTranslator) =
 
         # Collect all variable references from non-defining constraints
         var referencedVars = initHashSet[string]()
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in tr.definingConstraints:
                 continue
             for arg in con.args:
@@ -661,7 +670,8 @@ proc detectImplicitMaxChannels(tr: var FznTranslator) =
     var lhsCount: Table[string, int]     # varName -> # times it is LHS of array_int_max/min
     var lhsCi: Table[string, int]        # varName -> constraint index of (single) LHS occurrence
     var lhsIsMin: Table[string, bool]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name notin targetNames: continue
@@ -715,7 +725,8 @@ proc detectReifEquationChannelVars(tr: var FznTranslator) =
     while changed and iterations < 30:
         changed = false
         inc iterations
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name != "int_lin_eq_reif": continue
             if con.args.len < 4: continue
@@ -826,7 +837,8 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
     # defined target. We must not steal a variable that another (annotated)
     # constraint defines; doing so would create two definitions for the same var.
     var alreadyDefined = initHashSet[string]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if con.hasAnnotation("defines_var"):
             let ann = con.getAnnotation("defines_var")
             if ann.args.len > 0 and ann.args[0].kind == FznIdent:
@@ -836,7 +848,8 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
     # Step 2: scan int_lin_eq constraints without defines_var and identify the
     # subset that has a unique eligible candidate variable.
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
@@ -1041,7 +1054,8 @@ proc detectImplicitElementChannels*(tr: var FznTranslator) =
         objVarName = tr.model.solve.objective.ident
 
     var nPromoted = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name notin constElementNames: continue

@@ -159,7 +159,8 @@ proc simplifyConstraints(tr: FznTranslator,
                          infeasible: var bool): bool =
     ## Substitute fixed values into constraints and simplify.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -484,7 +485,8 @@ proc boundsPropagate(tr: FznTranslator,
     ## Linear bounds propagation: for int_lin_le and int_lin_eq, compute
     ## tightest bounds on each unfixed variable from other variables' domain bounds.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -702,7 +704,8 @@ proc reachableValuesPropagate(tr: var FznTranslator,
     result = false
     var nTightened = 0
     var nValuesRemoved = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -865,7 +868,8 @@ proc bigMDomainPruning(tr: FznTranslator,
     type LinLePair = tuple[coeffX, coeffY: int, rhs: int, ci: int]
     var pairConstraints: Table[(string, string), seq[LinLePair]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -1025,7 +1029,8 @@ proc allDiffPropagate(tr: FznTranslator,
                       infeasible: var bool): bool =
     ## For allDifferent constraints, remove fixed values from other variables' domains.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -1164,7 +1169,8 @@ proc resolveReifications(tr: FznTranslator,
     # Build a map from reification output boolean name → defining constraint index.
     # Used by bool_clause handler for chain propagation through reification.
     var reifDefMap: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name in ["int_eq_reif", "int_ne_reif", "int_le_reif", "int_lt_reif"] and
@@ -1174,7 +1180,8 @@ proc resolveReifications(tr: FznTranslator,
              con.args.len >= 4 and con.args[3].kind == FznIdent:
             reifDefMap[con.args[3].ident] = ci
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -1776,8 +1783,8 @@ proc resolveReifications(tr: FznTranslator,
         # --- bool_clause(pos, neg): OR(pos) v OR(NOT neg) ---
         elif name == "bool_clause" and con.args.len >= 2:
             if con.args[0].kind == FznArrayLit and con.args[1].kind == FznArrayLit:
-                let posElems = con.args[0].elems
-                let negElems = con.args[1].elems
+                let posElems {.cursor.} = con.args[0].elems
+                let negElems {.cursor.} = con.args[1].elems
                 # Check if satisfied by any fixed literal
                 var satisfied = false
                 var unfixedPos: seq[string]
@@ -1866,15 +1873,16 @@ proc implicationPropagate(tr: FznTranslator,
     var posImplGraph: Table[string, seq[ImplEdge]]  # a=1 → b=1
     var negImplGraph: Table[string, seq[ImplEdge]]  # a=0 → b=0 (from bool_clause([], [a, b]))
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
         if con.args.len < 2: continue
         if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
 
-        let posElems = con.args[0].elems
-        let negElems = con.args[1].elems
+        let posElems {.cursor.} = con.args[0].elems
+        let negElems {.cursor.} = con.args[1].elems
 
         if posElems.len == 1 and negElems.len == 1:
             # bool_clause([b], [a]) → a=1 implies b=1
@@ -2045,7 +2053,8 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
     # happen in well-formed FZN, but we don't audit that) is dropped.
     var eqMap: Table[string, (string, int)]
     var conflict: HashSet[string]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "int_eq_reif": continue
         if con.args.len < 3: continue
@@ -2140,7 +2149,8 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
         return changed
 
     # Phase 2a: bool_clause([pos], []) — the implicit-true OR.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
@@ -2148,7 +2158,7 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
         if con.args[0].kind != FznArrayLit: continue
         if con.args[1].kind != FznArrayLit: continue
         if con.args[1].elems.len > 0: continue
-        let posElems = con.args[0].elems
+        let posElems {.cursor.} = con.args[0].elems
         if posElems.len < 2: continue
         let m = collectMembership(posElems, eqMap)
         if not m.ok or m.x == "": continue
@@ -2157,13 +2167,14 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
             result = true
 
     # Phase 2b: array_bool_or([pos], b) — reified OR, both directions.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "array_bool_or": continue
         if con.args.len < 2: continue
         if con.args[0].kind != FznArrayLit: continue
-        let posElems = con.args[0].elems
+        let posElems {.cursor.} = con.args[0].elems
         if posElems.len < 2: continue
         let m = collectMembership(posElems, eqMap)
         if not m.ok or m.x == "": continue
@@ -2172,7 +2183,8 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
             result = true
 
     # Phase 2c: bool_clause_reif([pos], [], b) — reified OR with empty negs.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "bool_clause_reif": continue
@@ -2180,7 +2192,7 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
         if con.args[0].kind != FznArrayLit: continue
         if con.args[1].kind != FznArrayLit: continue
         if con.args[1].elems.len > 0: continue
-        let posElems = con.args[0].elems
+        let posElems {.cursor.} = con.args[0].elems
         if posElems.len < 2: continue
         let m = collectMembership(posElems, eqMap)
         if not m.ok or m.x == "": continue
@@ -2219,7 +2231,8 @@ proc nonMembershipPropagate(tr: FznTranslator,
     var eqMap: Table[string, (string, int)]
     var neMap: Table[string, (string, int)]
     var eqConflict, neConflict: HashSet[string]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if con.args.len < 3: continue
@@ -2242,13 +2255,14 @@ proc nonMembershipPropagate(tr: FznTranslator,
 
     if eqMap.len == 0 and neMap.len == 0: return
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "array_bool_and": continue
         if con.args.len < 2: continue
         if con.args[0].kind != FznArrayLit: continue
-        let elems = con.args[0].elems
+        let elems {.cursor.} = con.args[0].elems
         if elems.len < 2: continue
 
         # Classify: are all elements ne_reif on a shared x, or eq_reif on
@@ -2352,7 +2366,8 @@ proc cpmBoundsPropagate(tr: FznTranslator,
     var candidates: seq[CpmCandidate]
     var destVars: HashSet[string]  # vars appearing with coeff=-1
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -2410,7 +2425,8 @@ proc cpmBoundsPropagate(tr: FznTranslator,
     block:
         # Build mapping: max/min output var → (input1, input2, isMax)
         var maxMinDefs: Table[string, tuple[input1, input2: string, isMax: bool]]
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in eliminated: continue
             let name = stripSolverPrefix(con.name)
             let isMax = name == "int_max"
@@ -2694,7 +2710,8 @@ proc permutationCountingPropagate(tr: FznTranslator,
     # Step 1: Collect all_different groups as sets of variable names.
     # Handle both array literal and array name arguments.
     var allDiffGroups: seq[HashSet[string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name != "fzn_all_different_int": continue
@@ -2723,7 +2740,8 @@ proc permutationCountingPropagate(tr: FznTranslator,
     # Pattern: coeffs=[-1,1], vars=[to, from], rhs=-w → same
     type Edge = tuple[fromVar, toVar: string, weight: int]
     var edges: seq[Edge]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -2737,7 +2755,7 @@ proc permutationCountingPropagate(tr: FznTranslator,
         if not tr.presolveIsFixed(con.args[2], fixedVars): continue
         let rhs = tr.presolveResolve(con.args[2], fixedVars)
         if con.args[1].kind != FznArrayLit: continue
-        let elems = con.args[1].elems
+        let elems {.cursor.} = con.args[1].elems
         if elems.len != 2 or elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
         let v0 = elems[0].ident
         let v1 = elems[1].ident
@@ -2843,7 +2861,8 @@ proc nonRenewableResourcePruning(tr: FznTranslator,
     ## rhs is fixed (non-renewable resource pattern: sum of demands <= capacity),
     ## each variable's max feasible value is capacity minus the sum of other mins.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -2925,7 +2944,8 @@ proc tablePropagate(tr: FznTranslator,
     ## For each variable in each table constraint, remove domain values
     ## that have no support in any tuple (given current domains of all other variables).
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -3071,7 +3091,8 @@ proc arrayMinMaxPropagate(tr: FznTranslator,
     ## `max_i hi(f_i)`. Running to fixed-point couples tightening in both
     ## directions as the component f_i bounds shrink.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -3221,7 +3242,8 @@ proc intMaxMinPropagate(tr: FznTranslator,
         # Unknown bounds — can't propagate
         return (lo: low(int) div 2, hi: high(int) div 2, name: vn, isFixed: true)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -3320,7 +3342,8 @@ proc intTimesPropagate(tr: FznTranslator,
                 return (lo: dom[0], hi: dom[^1], name: vn, isFixed: false)
         return (lo: low(int) div 2, hi: high(int) div 2, name: vn, isFixed: true)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -3458,7 +3481,8 @@ proc productChainBoundPropagate(tr: FznTranslator,
     var productsByFactor: Table[string, seq[ProductDef]]
     var prodToSmall: Table[string, string]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         if stripSolverPrefix(con.name) != "int_times": continue
         if con.args.len < 3: continue
@@ -3497,7 +3521,8 @@ proc productChainBoundPropagate(tr: FznTranslator,
 
         var chainLinks: seq[ChainLink]
 
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in eliminated: continue
             if stripSolverPrefix(con.name) != "int_lin_le": continue
             let parsed = tr.resolveLinLeArgs(con)
@@ -3633,7 +3658,8 @@ proc productChainBoundPropagate(tr: FznTranslator,
             var foundClosing = false
 
             if realChainEnd != "":
-                for ci, con in tr.model.constraints:
+                for ci in 0 ..< tr.model.constraints.len:
+                    let con {.cursor.} = tr.model.constraints[ci]
                     if ci in eliminated: continue
                     if stripSolverPrefix(con.name) != "int_lin_le": continue
                     let parsed = tr.resolveLinLeArgs(con)
@@ -3661,7 +3687,8 @@ proc productChainBoundPropagate(tr: FznTranslator,
                 if sn != "": smallNameSet.incl(sn)
 
             var sumBound = int.high
-            for ci, con in tr.model.constraints:
+            for ci in 0 ..< tr.model.constraints.len:
+                let con {.cursor.} = tr.model.constraints[ci]
                 if ci in eliminated: continue
                 if stripSolverPrefix(con.name) != "int_lin_le": continue
                 let parsed = tr.resolveLinLeArgs(con)
@@ -3734,7 +3761,8 @@ proc varElementPropagate(tr: FznTranslator,
     ## Forward:  val ∈ ∪{arr[i].domain : i ∈ domain(idx)}
     ## Backward: prune idx values where arr[i].domain ∩ val.domain = ∅
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -3903,7 +3931,8 @@ proc varElementArrayBackwardPropagate(tr: FznTranslator,
 
     var arrayAccessors: Table[string, Table[int, BoundsInfo]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -4018,7 +4047,8 @@ proc elementPropagate(tr: FznTranslator,
     ## Forward:  val domain ⊆ {constArr[i-1] : i ∈ domain(idx)}
     ## Backward: idx domain ⊆ {i : constArr[i-1] ∈ domain(val)}
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -4108,27 +4138,16 @@ proc ppResolveConstIntSeq(tr: FznTranslator, arg: FznExpr): tuple[vals: seq[int]
         return (s, true)
     return (@[], false)
 
-proc ppResolveVarExprSeq(tr: FznTranslator, arg: FznExpr): tuple[items: seq[FznExpr], ok: bool] =
-    ## Resolve an int_lin_* vars argument to a flat seq[FznExpr]. Handles both
-    ## inline FznArrayLit and FznIdent references to array declarations.
-    var a = arg
-    if a.kind == FznIdent:
-        var found = false
-        for decl in tr.model.variables:
-            if decl.isArray and decl.name == a.ident and decl.value != nil and
-                    decl.value.kind == FznArrayLit:
-                a = decl.value
-                found = true
-                break
-        if not found:
-            for decl in tr.model.parameters:
-                if decl.isArray and decl.name == a.ident and decl.value != nil and
-                        decl.value.kind == FznArrayLit:
-                    a = decl.value
-                    break
-    if a.kind == FznArrayLit:
-        return (a.elems, true)
-    return (@[], false)
+proc ppResolveVarArrayLit(tr: FznTranslator, arg: FznExpr): FznExpr =
+    ## Resolve an int_lin_* vars argument to its FznArrayLit expression (nil if
+    ## not resolvable). Handles both inline FznArrayLit and FznIdent references
+    ## to array declarations via the arrayLitByName index — O(1) per call and
+    ## no element-seq copy, unlike scanning every declaration.
+    if arg.kind == FznArrayLit:
+        return arg
+    if arg.kind == FznIdent:
+        return tr.arrayLitByName.getOrDefault(arg.ident)
+    return nil
 
 proc computeVarDirections(tr: FznTranslator,
                           domains: Table[string, seq[int]],
@@ -4193,15 +4212,17 @@ proc computeVarDirections(tr: FznTranslator,
     # For sum(c_i * x_i) ≤ rhs: bigger c_i * x_i is worse for feasibility, so
     # positive c → dir[x] = −1, negative c → dir[x] = +1. Multiple votes for the
     # same variable aggregate via setDir, with conflict collapsing to 0.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
         if cname != "int_lin_le" and cname != "int_lin_lt": continue
         if con.args.len < 3: continue
         let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
         if not okC: continue
-        let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
-        if not okV: continue
+        let varsArr = ppResolveVarArrayLit(tr, con.args[1])
+        if varsArr.isNil: continue
+        let vars {.cursor.} = varsArr.elems
         if coeffs.len != vars.len: continue
         for i in 0..<vars.len:
             if vars[i].kind != FznIdent: continue
@@ -4213,7 +4234,8 @@ proc computeVarDirections(tr: FznTranslator,
     # Phase C: iterated backward propagation through defines_var chains.
     for iter in 0..<32:
         var changed = false
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in eliminated: continue
             if not con.hasAnnotation("defines_var"): continue
             let defAnn = con.getAnnotation("defines_var")
@@ -4230,8 +4252,9 @@ proc computeVarDirections(tr: FznTranslator,
             if cname == "int_lin_eq" and con.args.len >= 3:
                 let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
                 if not okC: continue
-                let (vars, okV) = ppResolveVarExprSeq(tr, con.args[1])
-                if not okV: continue
+                let varsArr = ppResolveVarArrayLit(tr, con.args[1])
+                if varsArr.isNil: continue
+                let vars {.cursor.} = varsArr.elems
                 if coeffs.len != vars.len: continue
 
                 var cy = 0
@@ -4349,9 +4372,9 @@ proc computeVarDirections(tr: FznTranslator,
                     con.args.len == 2:
                 let argM = con.args[0]
                 if argM.kind != FznIdent or argM.ident != defName: continue
-                let (arrVars, okV) = ppResolveVarExprSeq(tr, con.args[1])
-                if not okV: continue
-                for x in arrVars:
+                let arrLit = ppResolveVarArrayLit(tr, con.args[1])
+                if arrLit.isNil: continue
+                for x in arrLit.elems:
                     if x.kind == FznIdent and setDir(result, x.ident, dirDef):
                         changed = true
 
@@ -4388,7 +4411,8 @@ proc paretoElementIndexPrune(tr: FznTranslator,
     var elementUses = initTable[string, seq[IndexUse]]()
 
     # Pass 1: collect candidate index variables and their element constraints.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
         if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
@@ -4433,9 +4457,9 @@ proc paretoElementIndexPrune(tr: FznTranslator,
                 invalidated.incl(arg.ident)
                 return
             # Might be a named variable array; resolve and scan its elements.
-            let (items, ok) = ppResolveVarExprSeq(tr, arg)
-            if ok:
-                for e in items:
+            let arrLit = ppResolveVarArrayLit(tr, arg)
+            if not arrLit.isNil:
+                for e in arrLit.elems:
                     if e.kind == FznIdent and e.ident in elementUses:
                         invalidated.incl(e.ident)
         of FznArrayLit:
@@ -4444,7 +4468,8 @@ proc paretoElementIndexPrune(tr: FznTranslator,
                     invalidated.incl(e.ident)
         else: discard
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
         let isElement =
@@ -4582,7 +4607,8 @@ proc regularPropagate(tr: FznTranslator,
     ## Arc consistency propagation for fzn_regular constraints.
     ## Uses forward/backward DFA reachability to eliminate values unsupported by the DFA.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -4607,7 +4633,7 @@ proc regularPropagate(tr: FznTranslator,
         var trans: seq[int]  # trans[(q-1)*S + (s-1)] = next state (1-indexed)
         case con.args[3].kind
         of FznArrayLit:
-            let transElems = con.args[3].elems
+            let transElems {.cursor.} = con.args[3].elems
             if transElems.len != Q * S: continue
             var ok = true
             for e in transElems:
@@ -4712,7 +4738,8 @@ proc gccPropagate(tr: FznTranslator,
     ## Enforces count bounds: if a value's canCount == requiredCount, all remaining vars
     ## that can take it must take it; if mustCount == requiredCount, remove from others.
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -4795,7 +4822,8 @@ proc partitionPropagate(tr: FznTranslator,
     var bool2intMap = initTable[string, Bool2IntInfo]()  # sel_var → bool source
     var neReifMap = initTable[string, NeReifInfo]()  # bool_var → place source + null value
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
         if name == "bool2int" and con.args.len >= 2:
@@ -4815,7 +4843,8 @@ proc partitionPropagate(tr: FznTranslator,
                 neReifMap[bArg.ident] = NeReifInfo(placeVar: xArg.ident, nullVal: nullVal)
 
     # Find partition groups: int_lin_eq([1,...,1], [sel_1,...,sel_n], 1)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let name = stripSolverPrefix(con.name)
@@ -4828,8 +4857,8 @@ proc partitionPropagate(tr: FznTranslator,
         let rhs = tr.presolveResolve(con.args[2], fixedVars)
         if rhs != 1: continue
 
-        let coeffs = con.args[0].elems
-        let vars = con.args[1].elems
+        let coeffs {.cursor.} = con.args[0].elems
+        let vars {.cursor.} = con.args[1].elems
         if coeffs.len != vars.len or coeffs.len < 2: continue
 
         # Check all coefficients are 1
@@ -4930,7 +4959,8 @@ proc binPackingLoadPropagate(tr: FznTranslator,
     ## loads feed downstream bound propagation (e.g. objective ≥ max load).
     const subsetSumLimit = 8192
     result = false
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if infeasible: return
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
@@ -5034,7 +5064,8 @@ proc inferUnboundedDomains(tr: FznTranslator,
     result = false
 
     # --- Strategy 1: Element result inference ---
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
         if cname notin ["array_int_element", "array_int_element_nonshifted"]: continue
@@ -5073,7 +5104,8 @@ proc inferUnboundedDomains(tr: FznTranslator,
     # --- Strategy 2: If-then-else reification inference ---
     # Collect int_eq_reif constraints grouped by first argument (unbounded vars only)
     var reifsByVar: Table[string, seq[tuple[boolVar: string, valArg: FznExpr]]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         let cname = stripSolverPrefix(con.name)
         if cname != "int_eq_reif": continue
@@ -5094,7 +5126,8 @@ proc inferUnboundedDomains(tr: FznTranslator,
     var impliedByPos: Table[string, seq[string]]  # b → conds where cond → b
     var impliedByNeg: Table[string, seq[string]]  # b → conds where ¬cond → b
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
         if con.name != "bool_clause": continue
         if con.args.len < 2: continue

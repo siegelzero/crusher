@@ -99,7 +99,8 @@ proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     constElementCIs.setLen(n)
     var foundDist = newSeq[bool](n)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         # Note: don't skip definingConstraints — we need to find defines_var constraints
         let name = stripSolverPrefix(con.name)
         if name notin ["array_int_element", "array_int_element_nonshifted"]: continue
@@ -139,7 +140,8 @@ proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     varElementCIs.setLen(n)
     var foundVarElem = newSeq[bool](n)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
         if con.args.len < 3: continue
@@ -184,7 +186,8 @@ proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var linEqCIs = newSeq[int](n)
     var foundLinEq = newSeq[bool](n)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
         if con.args.len < 3: continue
@@ -248,7 +251,8 @@ proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
                     break
 
     if depotIndex >= 0 and departureVarNames[depotIndex] == "":
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
             if ci notin varElementCIs: continue
@@ -262,7 +266,8 @@ proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     foundMax[depotIndex] = true
     earlyTimes[depotIndex] = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_max": continue
         if con.args.len < 3: continue
@@ -397,7 +402,8 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var durVars = newSeq[string](n)
     var constElemCI = newSeq[int](n)
     var hasDist = newSeq[bool](n)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["array_int_element", "array_int_element_nonshifted"]: continue
         if con.args.len < 3: continue
@@ -419,7 +425,8 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var atVars = newSeq[string](n)
     var varElemCI = newSeq[int](n)
     var hasAt = newSeq[bool](n)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
         if con.args.len < 3: continue
@@ -500,7 +507,8 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var linLeCI = newSeq[int](n)
     var hasLinLe = newSeq[bool](n)
     var serviceTimes = newSeq[int](n)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "int_lin_le": continue
         if con.args.len < 3: continue
         var coeffs: seq[int]
@@ -736,7 +744,8 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
     # Pre-index untaken int_lin_eq constraints by referenced variable for the
     # offset lookups (r_n = A_n + offset_n).
     var linEqByVar: Table[string, seq[int]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in claimed: continue
         if stripSolverPrefix(con.name) != "int_lin_eq": continue
         let (parsed, _, eqVars, _) = tr.circuitTimeParseLinEq(con)
@@ -753,7 +762,8 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         hasDefVar: bool
     var families: OrderedTable[string, Table[int, AccElemInfo]]
     var familyElems: Table[string, seq[FznExpr]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in claimed: continue
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]:
@@ -1023,7 +1033,8 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
         var maxOutputs: seq[string]
         var maxCIs: seq[int]
         var ok = true
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in allConsumed: continue
             var refsTime = false
             var refsInternal = false
@@ -1164,7 +1175,8 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
 
     var objLinEqCI = -1
     if maxOwner.len > 0:
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in allConsumed or ci in maxCIset: continue
             var refs: seq[string]
             for arg in con.args:
@@ -1296,7 +1308,8 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
     var candidates: seq[CircuitTimeCandidate]
     var claimed: PackedSet[int]   # constraints already matched by a candidate
     var accumArrays: HashSet[string]   # value arrays already chained by an accumulator
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "crusher_circuit": continue

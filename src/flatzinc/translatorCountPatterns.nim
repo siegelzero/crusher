@@ -12,7 +12,8 @@ proc buildVarRefConstraints(tr: FznTranslator): Table[string, PackedSet[int]] =
             for e in expr.elems:
                 collectIdents(e, result)
         else: discard
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         var idents: seq[string]
         for arg in con.args:
             collectIdents(arg, idents)
@@ -82,7 +83,8 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
     var intEqReifDefs: Table[string, int]  # boolVar name → constraint index
     var arrayBoolAndDefs: Table[string, int]  # AND output var name → constraint index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -103,7 +105,8 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
     # Note: also check definingConstraints — collectDefinedVars may have claimed the
     # int_lin_eq for expression inlining, but we want to convert it to a channel instead.
     var nCandidates = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq" or not con.hasAnnotation("defines_var"):
             continue
@@ -186,7 +189,7 @@ proc detectConditionalCountPatterns(tr: var FznTranslator) =
                 let andCon = tr.model.constraints[andIdx]
                 if andCon.args[0].kind != FznArrayLit:
                     valid = false; break
-                let andInputs = andCon.args[0].elems
+                let andInputs {.cursor.} = andCon.args[0].elems
                 if andInputs.len != 2:
                     valid = false; break
                 if andInputs[0].kind != FznIdent or andInputs[1].kind != FznIdent:
@@ -370,7 +373,8 @@ proc detectCountPatterns(tr: var FznTranslator) =
     # int_eq_reif(x, val, boolVar) :: defines_var(boolVar) → boolVar maps to constraint index
     var intEqReifDefs: Table[string, int]  # bool var name → constraint index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue  # Already consumed by defined-var elimination
         let name = stripSolverPrefix(con.name)
@@ -390,7 +394,8 @@ proc detectCountPatterns(tr: var FznTranslator) =
     # Note: we do NOT skip definingConstraints here — collectDefinedVars may have claimed
     # int_lin_eq constraints with defines_var that are actually countEq patterns.
     # countEq is a better translation; if detected, we unclaim from definingConstraints.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.countEqPatterns:
             continue
         let name = stripSolverPrefix(con.name)
@@ -503,7 +508,8 @@ proc detectCountPatterns(tr: var FznTranslator) =
     # Second pass: balanced count patterns (count(A) = count(B))
     # Pattern: int_lin_eq([1,...,1,-1,...,-1], [indA_1,...,indA_m, indB_1,...,indB_n], 0)
     # where +1 indicators trace to int_eq_reif(x, valueA, b) and -1 to int_eq_reif(x, valueB, b)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints or ci in tr.countEqPatterns:
             continue
         let name = stripSolverPrefix(con.name)
@@ -623,7 +629,8 @@ proc detectCountPatterns(tr: var FznTranslator) =
     # to trace through them for pattern detection.
     var allBool2intDefs: Table[string, int]
     var allIntEqReifDefs: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name == "bool2int" and con.hasAnnotation("defines_var"):
             if con.args.len >= 2 and con.args[1].kind == FznIdent:
@@ -632,7 +639,8 @@ proc detectCountPatterns(tr: var FznTranslator) =
             if con.args.len >= 3 and con.args[2].kind == FznIdent:
                 allIntEqReifDefs[con.args[2].ident] = ci
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints or ci in tr.countEqPatterns or ci in tr.constantCountPatterns:
             continue
         let name = stripSolverPrefix(con.name)

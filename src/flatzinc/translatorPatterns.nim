@@ -32,7 +32,8 @@ proc detectBinaryPairwiseSumPattern(tr: var FznTranslator) =
     type CostEqReifEntry = tuple[testVal: int, boolVar: string, ci: int]
     var costEqReifs: Table[string, seq[CostEqReifEntry]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif" or not con.hasAnnotation("defines_var"): continue
         if con.args.len < 3 or con.args[2].kind != FznIdent: continue
@@ -49,7 +50,8 @@ proc detectBinaryPairwiseSumPattern(tr: var FznTranslator) =
     # Don't skip definingConstraints — clauses may be already claimed by other passes
     type ClauseInfo = tuple[ci: int, negLits: seq[string]]
     var clauseByPosLit: Table[string, seq[ClauseInfo]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
         if con.args.len < 2: continue
@@ -71,7 +73,8 @@ proc detectBinaryPairwiseSumPattern(tr: var FznTranslator) =
 
     # Find the int_lin_eq defining the objective
     # Note: don't skip definingConstraints — collectDefinedVars may have already claimed this
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
         let ann = con.getAnnotation("defines_var")
@@ -280,7 +283,8 @@ proc detectBinaryPairwiseSumPattern(tr: var FznTranslator) =
         # These are the default-value implications for the cost variables, e.g.,
         # bool_clause([cond, zeroBool], []) where zeroBool was consumed.
         var nExtraClauses = 0
-        for xci, xcon in tr.model.constraints:
+        for xci in 0 ..< tr.model.constraints.len:
+            let xcon {.cursor.} = tr.model.constraints[xci]
             if xci in tr.definingConstraints: continue
             if stripSolverPrefix(xcon.name) != "bool_clause": continue
             if xcon.args.len < 2: continue
@@ -310,7 +314,8 @@ proc detectBinaryPartitionConstraints(tr: var FznTranslator) =
     ## These represent "exactly one" partition constraints: exactly one of the binary
     ## variables is 1. Used for domain reduction during channel binding propagation.
     var detected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
@@ -376,7 +381,8 @@ proc detectWeightedSameValuePattern(tr: var FznTranslator) =
     var bool2intDefs: Table[string, int]  # indicator var → constraint index
     var intEqReifDefs: Table[string, int]  # bool var → constraint index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -396,7 +402,8 @@ proc detectWeightedSameValuePattern(tr: var FznTranslator) =
 
     # Find the int_lin_eq that defines the objective
     # Note: don't skip definingConstraints — collectDefinedVars may have already claimed this
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.countEqPatterns:
             continue
         let name = stripSolverPrefix(con.name)
@@ -537,7 +544,8 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
     var unions: seq[UnionRec]
     var producedBy: Table[string, int]  # cName -> index into unions
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -643,7 +651,8 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
 
     # Build reverse map: variable name -> constraint that defines it (via defines_var)
     var definedByCI: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if not con.hasAnnotation("defines_var"):
             continue
         let ann = con.getAnnotation("defines_var")
@@ -652,7 +661,8 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
 
     # Build singleton map: set_card(S, 1) → S name + ci
     var singletonCardCI: Table[string, int]  # S name -> set_card ci
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -662,7 +672,8 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
 
     # Build set_in map: set_in(val_expr, S) → (ci, val_expr)
     var singletonInCI: Table[string, tuple[ci: int, valArg: FznExpr]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -719,8 +730,8 @@ proc detectSetUnionChannels(tr: var FznTranslator) =
             if defName == "int_lin_eq" and defCon.args.len >= 3 and
                  defCon.args[0].kind == FznArrayLit and defCon.args[1].kind == FznArrayLit:
                 # Pattern 1: int_lin_eq([k,-1],[product,val_expr],0) → val_expr = k * product
-                let coeffs = defCon.args[0].elems
-                let vars = defCon.args[1].elems
+                let coeffs {.cursor.} = defCon.args[0].elems
+                let vars {.cursor.} = defCon.args[1].elems
                 if coeffs.len == 2 and vars.len == 2 and
                      coeffs[0].kind == FznIntLit and coeffs[1].kind == FznIntLit and
                      coeffs[1].intVal == -1 and vars[0].kind == FznIdent:
@@ -780,7 +791,8 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
     # equality-copy elimination. Channel-defining constraints (reif channels, element
     # channels) are excluded since their inputs may be equality copy candidates.
     var nonDefinesVarRefs: HashSet[string]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             # Check if this defines an expression variable (definedVarNames) vs a channel variable
             if con.hasAnnotation("defines_var"):
@@ -825,7 +837,8 @@ proc detectEqualityCopyVars(tr: var FznTranslator) =
                 if elems.len > 0:
                     arrElems[decl.name] = elems
         # Find arrays referenced in any constraint
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             for arg in con.args:
                 if arg.kind == FznIdent and arg.ident in arrElems:
                     for elemName in arrElems[arg.ident]:
@@ -1098,7 +1111,8 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
             result[resultVar] = if inSet: 1 else: 0
             changed = true
         # Evaluate int_lin_eq with defines_var (for compound index expressions)
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let cname = stripSolverPrefix(con.name)
             if cname != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
             var ann: FznAnnotation
@@ -1140,7 +1154,8 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
             result[definedName] = defVal
             changed = true
         # Evaluate all array_int_element constraints (including non-defines_var)
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let cname = stripSolverPrefix(con.name)
             if cname != "array_int_element": continue
             if con.args.len < 3: continue
@@ -1162,7 +1177,8 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
             result[resultArg.ident] = arr[i]
             changed = true
         # Evaluate int_lin_eq_reif / int_lin_ne_reif with defines_var
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let cname = stripSolverPrefix(con.name)
             if cname != "int_lin_eq_reif" and cname != "int_lin_ne_reif": continue
             if not con.hasAnnotation("defines_var"): continue
@@ -1192,7 +1208,8 @@ proc buildValueMapping(tr: FznTranslator, sourceValues: Table[string, int]): Tab
                 result[resultVar] = if linSum != rhs: 1 else: 0
             changed = true
         # Evaluate int_times/int_div/int_abs/int_mod/int_plus with defines_var
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci notin tr.definingConstraints: continue
             let cname = stripSolverPrefix(con.name)
             if cname notin ["int_times", "int_div", "int_abs", "int_mod", "int_plus"]: continue
@@ -1275,7 +1292,8 @@ proc eliminateDeadIntEqReifChannels(tr: var FznTranslator,
     ## For int_eq_reif constraints in candidateCIs, eliminate those whose boolean
     ## output has no remaining live references (at most 1, from the defining constraint itself).
     var liveRefCount: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         for arg in con.args:
             if arg.kind == FznIdent:
@@ -1318,7 +1336,8 @@ proc detectSkillAllocationPattern(tr: var FznTranslator) =
     var intEqReifByResult: Table[string, int]  # b_name -> constraint index
     var boolAndByResult: Table[string, int]    # b_name -> constraint index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -1341,7 +1360,8 @@ proc detectSkillAllocationPattern(tr: var FznTranslator) =
     var allConsumedCIs: PackedSet[int]
     var allConsumedVars: HashSet[string]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1561,7 +1581,8 @@ proc detectSkillAllocationPattern(tr: var FznTranslator) =
     # have NO remaining (non-consumed) consumers.
     if nDetected > 0:
         var candidateCIs: PackedSet[int]
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in tr.definingConstraints: continue
             if not con.hasAnnotation("defines_var"): continue
             if stripSolverPrefix(con.name) != "int_eq_reif": continue
@@ -1584,7 +1605,8 @@ proc pruneUnreferencedSkillValues(tr: var FznTranslator) =
     ## This removes skill values never required by any job.
     var referencedValues: Table[string, PackedSet[int]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
@@ -1819,7 +1841,8 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
     # Build index: bool output var name -> (constraint index, source var name, constant value)
     var intEqReifByOutput: Table[string, tuple[ci: int, srcVar: string, constVal: int]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -1838,7 +1861,8 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
     # Build index: bool2int int output var name -> (constraint index, bool input var name)
     var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -1854,7 +1878,8 @@ proc detectAtMostThroughReif*(tr: var FznTranslator) =
     var consumedEqReifCIs: PackedSet[int]
     var consumedBoolVarNames: HashSet[string]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -2077,7 +2102,8 @@ proc detectProductSumAtMost*(tr: var FznTranslator) =
 
     # Build index: bool var name (output of array_bool_and) -> (ci, factor names)
     var boolAndByOutput: Table[string, tuple[ci: int, factors: seq[string]]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -2102,7 +2128,8 @@ proc detectProductSumAtMost*(tr: var FznTranslator) =
 
     # Build index: int var name (output of bool2int) -> (ci, source bool name)
     var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -2138,7 +2165,8 @@ proc detectProductSumAtMost*(tr: var FznTranslator) =
     var nAndTerms = 0
     var nPlainTerms = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -2388,7 +2416,8 @@ proc detectArgmaxPattern(tr: var FznTranslator) =
     # Handles both int_lin_le_reif (variable inputs) and int_le_reif (constant inputs).
     # These are NOT consumed by detectReifChannels (no defines_var annotation).
     var compReifByBoolVar: Table[string, tuple[ci: int, con: FznConstraint]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2584,7 +2613,8 @@ proc findMinimizedVarNames*(tr: FznTranslator): HashSet[string] =
     if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent: return
     let objName = tr.model.solve.objective.ident
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
         if not con.hasAnnotation("defines_var"): continue
@@ -2621,7 +2651,8 @@ proc findForcedLargeVarNames*(tr: FznTranslator): HashSet[string] =
     if tr.model.solve.objective == nil or tr.model.solve.objective.kind != FznIdent: return
     let objName = tr.model.solve.objective.ident
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
         if not con.hasAnnotation("defines_var"): continue
@@ -2674,7 +2705,8 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
     type LinLeInfo = tuple[sourceVar: string, offset: int, ci: int]
     var groups: Table[string, seq[LinLeInfo]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -2728,7 +2760,8 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
             for info in infos: s.incl(info.ci)
             s
         var nonConsumed = 0
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in tr.definingConstraints: continue
             if ci in consumedCIs: continue
             # Check if ceiling variable appears in this constraint's args
@@ -2827,7 +2860,8 @@ proc detectSpreadPattern*(tr: var FznTranslator) =
     type SpreadInfo = tuple[posVar, negVar: string, rhs: int, ci: int]
     var spreadGroups: Table[string, seq[SpreadInfo]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -3006,7 +3040,8 @@ proc tightenDiffnTimeProfile*(tr: var FznTranslator) =
     ## on max(y + dy). Tightens ceiling variable domains from max-from-lin-le patterns.
     if tr.maxFromLinLeDefs.len == 0: return
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "fzn_diffn": continue
@@ -3394,7 +3429,8 @@ proc tightenSpreadFromDiffnProfile*(tr: var FznTranslator) =
     ## non-overlapping, so spread >= groupMaxLoad - 1.
     if tr.spreadPatternDefs.len == 0: return
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "fzn_diffn": continue
@@ -3477,7 +3513,8 @@ proc detectIntModChannels(tr: var FznTranslator) =
     ## These can be implemented as element channel bindings with a precomputed
     ## lookup table: Z = table[X - xLo] where table[i] = (xLo + i) mod C.
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_mod": continue
 
@@ -3525,7 +3562,8 @@ proc detectIntDivChannels(tr: var FznTranslator) =
     ## These can be implemented as element channel bindings with a precomputed
     ## lookup table: Z = table[X - xLo] where table[i] = (xLo + i) div C.
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_div": continue
 
@@ -3593,7 +3631,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
         constSets: seq[seq[int]]
     var arraySetElemTarget: Table[string, ArraySetElemInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "array_set_element": continue
@@ -3645,7 +3684,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
         aName, leafName: string
     var producedBy: Table[string, UnionDefInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_union": continue
@@ -3661,7 +3701,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
 
     # Phase 3: Build singleton maps
     var cardOneSets: Table[string, int]  # set name -> set_card CI
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_card" or con.args.len < 2: continue
@@ -3673,7 +3714,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
                 cardOneSets[con.args[0].ident] = ci
 
     var setInMap: Table[string, tuple[ci: int, xVarName: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_in" or con.args.len < 2: continue
@@ -3699,7 +3741,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
         # C = (if table has any value): we need the actual C.
     # Re-extract modulus properly from int_mod constraints
     intModOrigin.clear()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_mod": continue
         if con.args[0].kind != FznIdent or con.args[1].kind != FznIntLit or con.args[2].kind != FznIdent:
@@ -3710,7 +3753,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
 
     # Phase 4: Find non-defines_var set_union(A, B, C) where C is an array_set_element target
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_union": continue
@@ -3813,7 +3857,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
                     if origin in tr.definedVarNames:
                         # Check if defined by int_lin_eq([1,-1],[searchVar, origin], offset)
                         var found = false
-                        for dci, dcon in tr.model.constraints:
+                        for dci in 0 ..< tr.model.constraints.len:
+                            let dcon {.cursor.} = tr.model.constraints[dci]
                             if not dcon.hasAnnotation("defines_var"): continue
                             let dann = dcon.getAnnotation("defines_var")
                             if dann.args.len == 0 or dann.args[0].kind != FznIdent: continue
@@ -3822,8 +3867,8 @@ proc detectSetEqualityTablePattern(tr: var FznTranslator) =
                             if dname == "int_lin_eq" and dcon.args.len >= 3 and
                                  dcon.args[0].kind == FznArrayLit and dcon.args[1].kind == FznArrayLit and
                                  dcon.args[2].kind == FznIntLit:
-                                let coeffs = dcon.args[0].elems
-                                let vars = dcon.args[1].elems
+                                let coeffs {.cursor.} = dcon.args[0].elems
+                                let vars {.cursor.} = dcon.args[1].elems
                                 let rhs = dcon.args[2].intVal
                                 # Pattern: [1,-1] * [x, y] = c means y = x - c
                                 if coeffs.len == 2 and vars.len == 2 and
@@ -4196,7 +4241,8 @@ proc detectSetIntersectCardPattern(tr: var FznTranslator) =
 
     # Step 1: Build map of set_intersect results: C name -> (ci, A name, B name)
     var intersectResults: Table[string, tuple[ci: int, aName, bName: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_intersect" or con.args.len < 3: continue
@@ -4213,7 +4259,8 @@ proc detectSetIntersectCardPattern(tr: var FznTranslator) =
 
     # Step 2: Build map of set_card constraints: S name -> (ci, card var name)
     var setCardMap: Table[string, tuple[ci: int, cardVarName: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_card" or con.args.len < 2: continue
@@ -4233,7 +4280,8 @@ proc detectSetIntersectCardPattern(tr: var FznTranslator) =
     for sName, info in setCardMap:
         if info.cardVarName != "":
             cardVarRefCount[info.cardVarName] = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         for arg in con.args:
             if arg.kind == FznIdent and arg.ident in cardVarRefCount:
                 cardVarRefCount[arg.ident] += 1
@@ -4296,7 +4344,8 @@ proc emitSetIntersectCardConstraints(tr: var FznTranslator) =
 
     # Build map of set name -> max cardinality from set_card constraints on primary sets
     var setMaxCard: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_card" or con.args.len < 2: continue
@@ -4375,7 +4424,8 @@ proc detectSingletonSetChannels(tr: var FznTranslator) =
 
     # Step 1: Find all set_card(S, 1) constraints
     var cardOneSets: Table[string, int]  # set name -> constraint index
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_card" or con.args.len < 2: continue
@@ -4388,7 +4438,8 @@ proc detectSingletonSetChannels(tr: var FznTranslator) =
 
     # Step 2: Find matching set_in(x, S) where S is in cardOneSets and x is a variable
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "set_in" or con.args.len < 2: continue
@@ -4449,7 +4500,8 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
     var eqReifByBool: Table[string, EqReifInfo]   # b -> (x, v) from int_eq_reif(x, v, b)
     var leReifByBool: Table[string, LeReifInfo]   # b -> (x, t) from int_le_reif(x, t, b)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if not con.hasAnnotation("defines_var"): continue
@@ -4481,7 +4533,8 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
 
     var matches: seq[ClauseMatch]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause" or con.args.len < 2: continue
@@ -4489,7 +4542,7 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
         # Must have all-positive literals and no negative literals
         if con.args[1].kind == FznArrayLit and con.args[1].elems.len > 0: continue
         if con.args[0].kind != FznArrayLit: continue
-        let posLits = con.args[0].elems
+        let posLits {.cursor.} = con.args[0].elems
         if posLits.len < 2: continue  # need at least escape + one neighbour
 
         # Classify each literal
@@ -4622,7 +4675,8 @@ proc detectValueSupportPattern(tr: var FznTranslator) =
 
     # Scan all non-consumed constraints for references to value-support bools
     var boolInUse: HashSet[string]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         for ai in 0..<con.args.len:
             let arg = con.args[ai]
@@ -4673,7 +4727,8 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
     var stoichCoeffs: seq[seq[int]]
     var stoichVarNames: seq[seq[string]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -4925,7 +4980,8 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
     var vToZBool: Table[string, string]
     var zToZint: Table[string, string]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -4949,7 +5005,8 @@ proc detectNetFlowPairs*(tr: var FznTranslator) =
                     zintToPair[zToZint[z]] = pid
 
     var revConstraints: seq[int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -5153,7 +5210,8 @@ proc detectAtMostPairCliques(tr: var FznTranslator) =
         varA, varB: string  # Canonical order: varA < varB
 
     var pairs: seq[PairInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         if ci in tr.redundantOrderings:
@@ -5388,7 +5446,8 @@ proc detectBinaryNandAggregate*(tr: var FznTranslator) =
     # annotation as the authoritative test.
     tr.buildVarDomainIndex()
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if ci in tr.redundantOrderings: continue
         let name = stripSolverPrefix(con.name)
@@ -5612,7 +5671,8 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
     var objConstant = 0
     var objFound = false
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
         if con.args.len < 3: continue
@@ -5668,7 +5728,8 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
             capacity: int
 
         var knapsacks: seq[KnapsackInfo]
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name != "int_lin_le": continue
             if con.args.len < 3: continue
@@ -5745,7 +5806,8 @@ proc tightenObjectiveBoundsKnapsack(tr: var FznTranslator) =
         var atMost1Groups: seq[AtMost1Group]
 
         # Source 1: Explicit int_lin_le with all-1 coefficients and rhs=1
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             let name = stripSolverPrefix(con.name)
             if name != "int_lin_le": continue
             if con.args.len < 3: continue
@@ -6674,7 +6736,8 @@ proc detectDisconnectedAllDifferent*(tr: var FznTranslator) =
     # Build variable reference count from non-consumed constraints.
     # For array name arguments, resolve to element names so individual variables are counted.
     var varRefCount: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if ci in tr.redundantOrderings: continue
         for arg in con.args:
@@ -6695,7 +6758,8 @@ proc detectDisconnectedAllDifferent*(tr: var FznTranslator) =
     # Scan all_different constraints for disconnected variable groups
     var nElimVars = 0
     var nElimConstraints = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "fzn_all_different_int": continue
@@ -6774,7 +6838,8 @@ proc detectFixedAllDifferent*(tr: var FznTranslator) =
         declElems[decl.name] = decl.value.elems
     var nDropped = 0
     var nDuplicate = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "fzn_all_different_int" and name != "all_different_int": continue
@@ -6856,7 +6921,8 @@ proc detectPairLinLeTable*(tr: var FznTranslator,
 
     # First pass: collect all int_lin_le's whose vars are simple FznIdent's
     # already mapped to varPositions / declared variables.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -7063,7 +7129,8 @@ proc detectRankingFromCounters*(tr: var FznTranslator) =
     #    Accept both [-1,+1] and [+1,-1] coefficient orderings; canonicalise to A,B.
     type ReifInfo = tuple[ci: int, varA: string, varB: string]
     var reifByOutput: Table[string, ReifInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le_reif": continue
@@ -7097,7 +7164,8 @@ proc detectRankingFromCounters*(tr: var FznTranslator) =
 
     # 2. Index bool2int: c → (ci, boolName) with c being the int output.
     var bool2intByOutput: Table[string, tuple[ci: int, boolVar: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
         if name != "bool2int": continue
@@ -7120,7 +7188,8 @@ proc detectRankingFromCounters*(tr: var FznTranslator) =
     var counters: seq[CounterInfo]
     var counterByVar: Table[string, int]      # fixedVar → counters index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_eq": continue
@@ -7506,7 +7575,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     type EqReifInfo = tuple[ci: int, va, vb: string]
     var eqReifByOut: Table[string, EqReifInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name == "int_lin_le_reif":
             if con.args.len < 4: continue
@@ -7547,7 +7617,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     # bool2int's whose input is one of those reifs.
     type B2iInfo = tuple[ci: int, boolIn: string, isLe: bool]
     var b2iByOut: Table[string, B2iInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "bool2int": continue
         if con.args.len < 2: continue
         if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
@@ -7575,7 +7646,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     var aggregateCIs: PackedSet[int]
     var aggregateConsumesB2i: HashSet[string]   # b2i outputs consumed by aggregate
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["int_lin_eq", "int_lin_le"]: continue
         if con.args.len < 3: continue
@@ -7703,7 +7775,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     while changed and sweeps < 4:
         changed = false
         inc sweeps
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in aggregateCIs: continue
             if stripSolverPrefix(con.name) != "int_lin_eq": continue
             if con.args.len < 3: continue
@@ -7750,7 +7823,8 @@ proc consumeRankingDecomposition*(tr: var FznTranslator) =
     for cn in counterMeta.keys: counterVarSet.incl(cn)
     var nLeftoverConsumed = 0
     var nLeftoverSpared = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in aggregateCIs: continue
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
@@ -8209,7 +8283,8 @@ proc detectRedundantDisjunctions*(tr: var FznTranslator) =
         outputVar: string
         isMax: bool  # true for int_max, false for int_min
     var maxMinLookup: Table[tuple[a, b: string], MaxMinInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         let isMax = name == "int_max"
         let isMin = name == "int_min"
@@ -8230,7 +8305,8 @@ proc detectRedundantDisjunctions*(tr: var FznTranslator) =
     # Build set of precedence constraints: (fromVar, toVar) meaning fromVar < toVar
     # from int_lin_le([1,-1], [from, to], -1) or int_lin_le([-1,1], [to, from], -1)
     var precedences: HashSet[tuple[fromVar, toVar: string]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -8242,7 +8318,7 @@ proc detectRedundantDisjunctions*(tr: var FznTranslator) =
             continue
         if coeffs.len != 2: continue
         if con.args[1].kind != FznArrayLit: continue
-        let elems = con.args[1].elems
+        let elems {.cursor.} = con.args[1].elems
         if elems.len != 2 or elems[0].kind != FznIdent or elems[1].kind != FznIdent: continue
         let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
         if rhs != -1: continue

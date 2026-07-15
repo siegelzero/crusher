@@ -48,7 +48,8 @@ proc detectObjectiveSlackBools*(tr: var FznTranslator) =
         vars: seq[string]
     var linEqByDefinedVar = initTable[string, LinEqInfo]()
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "int_lin_eq": continue
         if not con.hasAnnotation("defines_var"): continue
         if con.args.len < 3: continue
@@ -139,7 +140,8 @@ proc detectObjectiveSlackBools*(tr: var FznTranslator) =
                     disq.incl(e.ident)
         else: discard
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         case name
         of "bool_clause":

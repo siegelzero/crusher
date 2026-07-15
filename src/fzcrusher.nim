@@ -156,7 +156,7 @@ proc main() =
     # Translate to ConstraintSystem
     if verbose:
       stderr.writeLine("[FZN] Translating...")
-    tr = translate(model)
+    tr = translate(model, timeBudgetSecs = timeLimitMs.float / 1000.0)
     if verbose:
       stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
   except CatchableError as e:

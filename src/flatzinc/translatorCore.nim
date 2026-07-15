@@ -969,7 +969,8 @@ proc detectNandRedundancy*(tr: var FznTranslator) =
             tr.bool2intSourceMap[con.args[1].ident] = con.args[0].ident
 
     # Collect NAND clauses from bool_clause([], [b_1, ..., b_k]) for k >= 2
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
         if con.args.len < 2: continue

@@ -136,7 +136,8 @@ proc detectConditionalSeparationPattern(tr: var FznTranslator) =
 
     # Scan bool_clause constraints for the separation pattern
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -206,7 +207,8 @@ proc detectReservoirPattern(tr: var FznTranslator) =
 
     # Step 1: Build bool2int map: int output name → bool input name + constraint index
     var bool2intMap: Table[string, tuple[boolVar: string, ci: int]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool2int": continue
@@ -251,7 +253,8 @@ proc detectReservoirPattern(tr: var FznTranslator) =
     # b_ij <=> start_i - start_j <= 0 <=> start_i <= start_j
     type LeReifInfo = tuple[ci: int, var1, var2: string]
     var leReifMap: Table[string, LeReifInfo]  # bool output → (ci, var1, var2)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le_reif": continue
@@ -285,7 +288,8 @@ proc detectReservoirPattern(tr: var FznTranslator) =
         consumedBool2intCIs: seq[int]
 
     var candidates: seq[ReservoirCandidate]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -520,7 +524,8 @@ proc detectReservoirPattern(tr: var FznTranslator) =
                 consumedBoolVars.incl(vn)
 
         var nTotalityConsumed = 0
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in tr.definingConstraints: continue
             let name = stripSolverPrefix(con.name)
             if name != "bool_clause": continue
@@ -560,7 +565,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     var linLeReifDefines: Table[string, int]  # result var name → constraint index
     var leReifDefines: Table[string, int]     # bool name → int_le_reif CI
     var eqReifDefines: Table[string, int]     # bool name → int_eq_reif CI
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if not con.hasAnnotation("defines_var"): continue
@@ -587,7 +593,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # Step 1b: Build mapping from result var name → (constraint index, input var names)
     # for all array_bool_and with defines_var annotation
     var arrayBoolAndDefines: Table[string, tuple[ci: int, inputs: seq[string]]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "array_bool_and": continue
@@ -612,7 +619,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # Also build a total reference count (including consumed constraints) for N-literal handler.
     var varRefCount: Table[string, int]
     var varTotalRefCount: Table[string, int]  # includes refs from consumed constraints
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         # Count total references (all constraints, including consumed)
         case name
@@ -707,7 +715,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # a channel — but we still emit the algebraic constraint using the underlying vars.
     var nPairConsumed = 0
     var nTautological = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -851,7 +860,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     var nNLiteralClauses = 0
     var nNLiteralConsumed = 0
     var nNLiteralBoolElim = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -953,7 +963,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # where a is from int_lin_le_reif and d is from array_bool_and([b, c, ...])
     # with all inputs from int_lin_le_reif
     var nPatternB = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1024,7 +1035,8 @@ proc detectDisjunctivePairs(tr: var FznTranslator) =
     # where ALL positive literals are from array_bool_and, each with inputs from int_lin_le_reif.
     # This handles double-track FIFO patterns: each disjunct is a conjunction of linear inequalities.
     var nPatternC = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1093,7 +1105,8 @@ proc detectConditionalLinearPatterns(tr: var FznTranslator) =
 
     # Step 1: Build mapping from result var → constraint index for int_lin_le_reif
     var linLeReifDefines: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le_reif": continue
@@ -1107,7 +1120,8 @@ proc detectConditionalLinearPatterns(tr: var FznTranslator) =
 
     # Step 2: Count references to each bool var in non-defining constraints
     var varRefCount: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         case name
@@ -1138,7 +1152,8 @@ proc detectConditionalLinearPatterns(tr: var FznTranslator) =
     # Step 3: Scan bool_clause([b, guard], []) where b is from int_lin_le_reif
     # and guard is NOT from int_lin_le_reif.
     var nDetected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1400,7 +1415,8 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
     for product in products:
         var linLeCIs: seq[int]
         var allLinLe = true
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in tr.definingConstraints: continue
             if ci in consumedLinLe: continue
             var refsProd = false
@@ -1505,7 +1521,8 @@ proc substituteChannelVarsInClauses(tr: var FznTranslator) =
     # Map from (v1, v2) sorted pair → channel def
     var channelDefs: Table[tuple[a, b: string], seq[LinearChannelDef]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if con.name != "int_lin_eq": continue
         # Check for defines_var annotation
         var definesVar = ""
@@ -1851,7 +1868,8 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
     var linEqDefs: Table[string, int]    # defined var name → int_lin_eq constraint index
     var minMaxDefs: Table[string, int]   # channel var name → int_min/int_max constraint index
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if not con.hasAnnotation("defines_var"): continue
         let ann = con.getAnnotation("defines_var")
@@ -1980,7 +1998,8 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
     # Track which bool_clause constraints each bool appears in, so we can check
     # if ALL its references are covered by NoOverlap patterns.
     var boolVarRefClauses: Table[string, seq[int]]  # bool var → list of bool_clause constraint indices
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1996,7 +2015,8 @@ proc detectNoOverlapPatterns(tr: var FznTranslator) =
     var nConsumed = 0
     var nSixLit = 0
     var nFailPair = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -2226,7 +2246,8 @@ proc detectDfaGeostPattern(tr: var FznTranslator) =
     var regularIndices: seq[int]
     var boardArrayArg: FznExpr = nil
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2324,7 +2345,8 @@ proc detectDfaGeostPattern(tr: var FznTranslator) =
             elemToIdx[name] = i
 
     # Scan for int_eq constraints setting board vars to constants
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2357,7 +2379,8 @@ proc detectDfaGeostPattern(tr: var FznTranslator) =
                     sentinelValue = e.intVal
 
     # Scan for int_ne constraints on board vars (these will be auto-satisfied by geost)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -2476,7 +2499,8 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
 
     var reifByOutputVar: Table[string, ReifInfo]  # output bool var -> info
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if not con.hasAnnotation("defines_var"): continue
         let name = stripSolverPrefix(con.name)
@@ -2551,7 +2575,8 @@ proc detectConditionalNoOverlapPairs(tr: var FznTranslator) =
     var nPatientPatient = 0
     var detected: seq[ConditionalNoOverlapInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -2723,7 +2748,8 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
     var elementInfos: seq[ElementInfo]
     var elementByResult: Table[string, int]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["array_var_int_element", "array_var_int_element_nonshifted"]: continue
         if con.args.len < 3: continue
@@ -2773,7 +2799,8 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
 
     var eqReifByResult: Table[string, EqReifInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if con.args.len < 3: continue
@@ -2792,7 +2819,8 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
     # Pattern: bool_clause([B], [sel]) where B is the eq_reif bool output
     # Build set of eq_reif bool var names for quick lookup
     var eqReifBoolVars: Table[string, string]  # boolVarName -> resultVarName
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if con.args.len < 3: continue
@@ -2800,7 +2828,8 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
         if con.args[0].ident in eqReifByResult:
             eqReifBoolVars[con.args[2].ident] = con.args[0].ident
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -2837,7 +2866,8 @@ proc detectConditionalCumulativePattern(tr: var FznTranslator) =
 
     var conditionalCumulatives: seq[ConditionalCumulativeInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name notin ["fzn_cumulative", "fzn_cumulatives"]: continue
         if ci in tr.definingConstraints: continue
@@ -3052,7 +3082,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
     # int_eq_reif: outputVar -> (sourceVar, value)
     var eqReifSource: Table[string, tuple[sourceVar: string, value: int]]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name == "bool2int" and con.annotations.len > 0:
@@ -3083,7 +3114,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
                 eqReifSource[con.args[2].ident] = (con.args[0].ident, con.args[1].intVal)
 
     # Also scan definingConstraints for eq_reif that were already consumed by reif channel detection
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name == "int_eq_reif" and con.args[0].kind == FznIdent and
               con.args[1].kind == FznIntLit and con.args[2].kind == FznIdent:
@@ -3152,7 +3184,8 @@ proc detectConditionalDayCapacityPattern(tr: var FznTranslator) =
     var nDetected = 0
     var perDayConstraints: seq[PerDayConstraint]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le": continue
@@ -3380,7 +3413,8 @@ proc detectRedundantOrderings(tr: var FznTranslator) =
     #   [1,-1], [a,b], rhs  →  a - b <= rhs  →  a + (-rhs) <= b  →  edge a→b weight -rhs
     #   [-1,1], [a,b], rhs  →  -a + b <= rhs  →  b + (-rhs) <= a  →  edge b→a weight -rhs
     #   [c,-c], [a,b], rhs (c>0)  →  c(a-b) <= rhs  →  a - b <= rhs/c  →  edge a→b weight -rhs/c
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         if con.name != "int_lin_le":
@@ -3600,7 +3634,8 @@ proc pruneZeroCapacityDays(tr: var FznTranslator) =
 
     # Step 1: Build defines_var map for chain tracing
     var definerOf: Table[string, int]  # varName → constraint index
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if con.hasAnnotation("defines_var"):
             let ann = con.getAnnotation("defines_var")
             if ann.args.len > 0 and ann.args[0].kind == FznIdent:
@@ -3613,7 +3648,8 @@ proc pruneZeroCapacityDays(tr: var FznTranslator) =
 
     var zeroCaps: seq[CapInfo]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le":
             continue
@@ -3703,7 +3739,8 @@ proc pruneZeroCapacityDays(tr: var FznTranslator) =
             otZeroDayCount[cap.day] += 1
 
     # Count total OT constraints per day from ALL int_lin_le (not just zero ones)
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_lin_le":
             continue
@@ -3891,7 +3928,8 @@ proc detectMultiResourceNoOverlapPairs*(tr: var FznTranslator) =
         neg0, neg1, neg2: string  # the three negative literal variable names
 
     var threeNegClauses: seq[ClauseInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -3956,7 +3994,8 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
 
     # Step 1: Build defines_var lookup: output_varname → constraint index
     var definesVarMap: Table[string, int]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if con.hasAnnotation("defines_var"):
             let ann = con.getAnnotation("defines_var")
@@ -3967,7 +4006,8 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
     # int_eq_reif(var, val, boolOut) :: defines_var(boolOut)
     # Map (input_var, compared_value) → (output_bool, constraint_index)
     var eqReifByInput: Table[(string, int), (string, int)]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
@@ -3980,7 +4020,8 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
     # bool_clause([posLit], [negLit]) means negLit → posLit
     # Map: posLit → (negLit, constraint_index)
     var boolImpliedBy: Table[string, (string, int)]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -4001,7 +4042,8 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
         heightArrayElems: seq[FznExpr]
 
     var cumulatives: seq[CumulativeInfo]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name notin ["fzn_cumulative", "fzn_cumulatives"]: continue

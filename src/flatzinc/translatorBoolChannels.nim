@@ -13,7 +13,8 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
 
     # Pass 1: count how many bool_clause constraints have each var as sole positive literal
     var posLiteralCount = initTable[string, int]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -28,7 +29,8 @@ proc detectBoolAndChannels*(tr: var FznTranslator) =
     # Pass 2: for constraints where the positive literal appears exactly once and
     # all negative literals are channel variables, detect the AND pattern
     var detected = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -86,7 +88,8 @@ proc detectBoolEquivalenceChannels*(tr: var FznTranslator) =
 
     var forwardImpls = initTable[string, seq[ImplEdge]]()  # from → edges (from→to means "to implies from")
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -261,7 +264,8 @@ proc detectBoolClauseIffChannels*(tr: var FznTranslator) =
     var simpleByNeg = initTable[string, seq[SimpleImpl]]()  # c → [(b, ci)]
     var multiByNeg = initTable[string, seq[MultiClause]]()   # b → [(posLits, otherNegs, ci)]
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -392,7 +396,8 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
 
     # Step 2: Build index of simple implications: c → b from bool_clause([b],[c])
     var implByChannel = initTable[string, seq[tuple[bVar: string, ci: int]]]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -411,7 +416,8 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
     # a channel). We scan ALL constraints here — we don't consume them, just use the info.
     # Maps b → [(prev, eq, ci)]
     var boolEqReifByFirst = initTable[string, seq[tuple[prevVar, eqVar: string, ci: int]]]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "bool_eq_reif": continue
         if not con.hasAnnotation("defines_var"): continue
@@ -425,7 +431,8 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
     # Step 4: Build index of forcing clauses: bool_clause([eq, ...], [])
     # Maps eq var → [(allPosLits, ci)]
     var forcingByEq = initTable[string, seq[tuple[otherLits: HashSet[string], ci: int]]]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -519,7 +526,8 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
     # some eq_reif outputs end up as definedVars rather than channels, but
     # the semantic relationship (b ↔ x == val) is still needed for matching.
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
         if not con.hasAnnotation("defines_var"): continue
@@ -572,7 +580,8 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
     # (e.g. N-literal disjunctive clause detection) may consume clauses that are
     # part of the gated pattern. The semantic checks below prevent false matches,
     # and if gated detection succeeds, the disjunctive constraint becomes tautological.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
         let posArg = con.args[0]
@@ -670,7 +679,8 @@ proc detectBoolGatedVariableChannels*(tr: var FznTranslator) =
         ci: int
         litA, litB: string  # the two positive literals
     var defaultClausesByLit = initTable[string, seq[DefaultClauseEntry]]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
         let posArg = con.args[0]
@@ -899,7 +909,8 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
         eqReifCI: int
 
     var defaultsByTarget: Table[string, DefaultEntry]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -1080,7 +1091,8 @@ proc detectConditionalImplicationChannels*(tr: var FznTranslator) =
         testVal: FznExpr       # value from eq_reif (constant or variable)
 
     var implByTarget: Table[string, seq[ImplEntry]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -1215,7 +1227,8 @@ proc detectBoolXorSimplification(tr: var FznTranslator) =
     ## - bool_xor(const_a, var_b, result) → result = var_b (if a=false) or result = 1-var_b (if a=true)
     ## - bool_xor(var_a, const_b, result) → similarly
     var nFolded = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_xor": continue
@@ -1293,7 +1306,8 @@ proc detectBoolXorConstResultChannels*(tr: var FznTranslator) =
     ## as channels when reif detection processes bool_eq_reif using them as inputs.
     var nIdentity = 0
     var nNegation = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_xor": continue
@@ -1359,7 +1373,8 @@ proc detectBoolXorVarChannels*(tr: var FznTranslator) =
     var nBoolXor = 0
     var nArrayBoolXor = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
 
@@ -1440,7 +1455,8 @@ proc detectBool2intIdentityAliases(tr: var FznTranslator) =
     ## MUST run after detectAtMostPairCliques (which references int var names)
     ## and before detectReifChannels (which would otherwise create channels for these).
     var nAliased = 0
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
             continue
         let name = stripSolverPrefix(con.name)
@@ -1554,7 +1570,8 @@ proc detectForwardBackwardEquivChannels*(tr: var FznTranslator) =
         clauseIdx: int
 
     var backwardByTarget: Table[string, seq[BackwardEntry]]
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1579,7 +1596,8 @@ proc detectForwardBackwardEquivChannels*(tr: var FznTranslator) =
 
     var nDetected, nConsumed = 0
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let name = stripSolverPrefix(con.name)
         if name != "bool_clause": continue
@@ -1840,7 +1858,8 @@ proc detectImplicationOrChannels*(tr: var FznTranslator) =
     var forceMap: Table[string, seq[ForceEntry]]
     var alreadySeenW: Table[string, HashSet[string]]  # V → set of W's already added (dedup)
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -1988,7 +2007,8 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
         ci: int
         asPositive: bool
     var clauseOccurrences = initTable[string, seq[ClauseOccurrence]]()
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
@@ -2014,7 +2034,8 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     # *relation* still holds — c is a channel of b. We need it to identify b's
     # usages and confirm the sum couples through. So don't skip on
     # definingConstraints here.
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if stripSolverPrefix(con.name) != "bool2int": continue
         if con.args.len < 2: continue
         if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
@@ -2058,7 +2079,8 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
             # array.
         arrayElems[decl.name] = elems
 
-    for ci, con in tr.model.constraints:
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         let nm = stripSolverPrefix(con.name)
         if nm != "int_lin_le": continue
@@ -2088,7 +2110,8 @@ proc detectImplicationAndChannels*(tr: var FznTranslator) =
     # c" checks below.
     proc countOtherRefs(tr: FznTranslator, name: string,
                         skipCis: HashSet[int]): int =
-        for ci, con in tr.model.constraints:
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
             if ci in skipCis: continue
             if ci in tr.definingConstraints: continue
             for arg in con.args:
