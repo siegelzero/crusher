@@ -28,12 +28,14 @@ proc resolve*[T](system: ConstraintSystem[T],
 
     # Compute reduced domain once and cache it
     if system.baseArray.reducedDomain.len == 0:
+        if verbose: logInitRss("pre-domain-reduction")
         let drStart = epochTime()
         system.baseArray.reducedDomain = reduceDomain(system.baseArray)
         system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
         if verbose:
             let drElapsed = epochTime() - drStart
             echo &"[Solve] Domain reduction took {drElapsed:.3f}s"
+            logInitRss("domain-reduction")
             var totalOriginal, totalReduced: int
             for pos in system.baseArray.allPositions():
                 totalOriginal += system.baseArray.domain[pos].len

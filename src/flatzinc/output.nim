@@ -161,6 +161,20 @@ proc formatSolution*(tr: FznTranslator): string =
 
   result = lines.join("\n")
 
+proc dumpAllVarValues*(tr: FznTranslator, path: string) =
+  ## Debug aid (CRUSHER_DUMP_ALL=<file>): write every scalar FZN variable's final
+  ## value as `name = value;` (unresolvable ones as comments) so an independent
+  ## FlatZinc checker can verify the solution against the ORIGINAL constraints —
+  ## catching translation-level unsoundness, not just search-state mistakes.
+  var lines: seq[string]
+  for decl in tr.model.variables:
+    if decl.isArray: continue
+    if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}: continue
+    let (ok, v) = tr.lookupVarValue(decl.name)
+    if ok: lines.add(decl.name & " = " & $v & ";")
+    else: lines.add("% " & decl.name & " unresolved")
+  writeFile(path, lines.join("\n") & "\n")
+
 proc printSolution*(tr: FznTranslator) =
   ## Prints one solution followed by the separator.
   echo tr.formatSolution()

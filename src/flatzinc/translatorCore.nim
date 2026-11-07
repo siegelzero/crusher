@@ -2386,15 +2386,20 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let nExpr = tr.resolveExprArg(con.args[0])
         let arrayExprs = tr.resolveExprArray(con.args[1])
         var arrayPos: seq[int]
+        var constVals: seq[int]
         for e in arrayExprs:
             if e.node.kind == RefNode:
                 arrayPos.add(e.node.position)
+            elif e.node.kind == LiteralNode:
+                constVals.add(e.node.value)
             else:
                 raise newException(ValueError, "fzn_nvalue requires simple variable references in array")
-        if nExpr.node.kind == RefNode:
+        if nExpr.node.kind == RefNode and constVals.len == 0:
             tr.sys.addConstraint(nvalue[int](arrayPos, nExpr.node.position))
+        elif nExpr.node.kind == LiteralNode:
+            tr.sys.addConstraint(nvalueFixed[int](arrayPos, constVals, nExpr.node.value))
         else:
-            raise newException(ValueError, "fzn_nvalue requires a variable for the count argument")
+            raise newException(ValueError, "fzn_nvalue requires a variable or constant count (literal array entries need a constant count)")
 
     of "fzn_at_least_int":
         # at_least(n, x, v) means at least n occurrences of v in x
@@ -2565,7 +2570,22 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             # is still a real constraint when A or B is a variable: for every
             # candidate element e, min(A[e], B[e]) must equal (e in C ? 1 : 0).
             # Only when BOTH A and B are constant is there nothing to enforce.
-            if not (aInfo.isConst and bInfo.isConst):
+            if not aInfo.isConst and not bInfo.isConst and cInfo.constVals.len == 0:
+                # Disjointness of two set variables (all_disjoint / disjoint
+                # decompose to set_intersect(A, B, {})): one native
+                # |A ∩ B| <= 0 constraint instead of one min() relational per
+                # element (warehouse: 1718 pairs x 100 elements = 171,800
+                # constraints, ~1.3GB per worker copy).
+                var leftPos, rightPos: seq[int]
+                for elem in setArgPossibleElements(aInfo) * setArgPossibleElements(bInfo):
+                    let ap = getSetBoolPosition(aInfo.varInfo, elem)
+                    let bp = getSetBoolPosition(bInfo.varInfo, elem)
+                    if ap >= 0 and bp >= 0:
+                        leftPos.add(ap)
+                        rightPos.add(bp)
+                if leftPos.len > 0:
+                    tr.sys.addConstraint(setIntersectCard[int](leftPos, rightPos, 0, 0))
+            elif not (aInfo.isConst and bInfo.isConst):
                 # min(A[e], B[e]) is only ever 1 when both could contain e, so the
                 # candidate universe is (possibleA ∩ possibleB), plus any element
                 # C requires (so an infeasible C surfaces as unsatisfiable rather
@@ -3147,8 +3167,14 @@ proc translateSolve(tr: var FznTranslator) =
                     # which would hide objective gradient from compound moves (ejection chains).
                     tr.objectiveDefExpr = tr.definedVarExprs[objName]
                     tr.objectivePos = ObjPosDefinedExpr
+                elif tr.model.parameters.anyIt(it.name == objName and not it.isArray):
+                    # MiniZinc fixed the objective at compile time (e.g. a
+                    # single-job instance): every solution is optimal.
+                    tr.objectivePos = ObjPosConstant
                 else:
                     raise newException(KeyError, &"Unknown objective variable '{objName}'")
+            of FznIntLit:
+                tr.objectivePos = ObjPosConstant
             else:
                 raise newException(ValueError, "Objective must be a variable identifier")
     of Satisfy:
@@ -3250,6 +3276,8 @@ proc detectOrphanSearchVariables(tr: var FznTranslator) =
 
     stderr.writeLine("[FZN] Warning: " & $orphanVarNames.len &
         " non-annotated search variables detected (not in solve :: int_search)")
+    if existsEnv("CRUSHER_DEBUG_ORPHANS"):
+        stderr.writeLine("[FZN]   orphans: " & orphanVarNames[0..<min(20, orphanVarNames.len)].join(", "))
 
     let orphanSet = toHashSet(orphanVarNames)
     let annotatedSet = tr.annotatedSearchVarNames

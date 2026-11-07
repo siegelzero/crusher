@@ -54,14 +54,15 @@ suite "SetIntersectCard Constraint":
     let allPositions = @[0, 1, 2, 3, 5, 7, 8]  # every position in the constraint
     for p in allPositions:
       for newVal in [0, 1]:
-        let oldVal = c.vals[p - c.posBase]
+        let oldVal = assignment[p]
         let delta = c.moveDelta(p, oldVal, newVal)
 
-        # Ground truth: flip the value in a copy, recompute cost, compare to c.cost + delta.
-        var trialVals = c.vals
-        trialVals[p - c.posBase] = newVal
+        # Ground truth: flip the value in a copy of the full assignment (position-
+        # indexed, posBase 0), recompute cost, compare to c.cost + delta.
+        var trialVals = assignment
+        trialVals[p] = newVal
         let expectedCost = groundTruthCost(
-          left, right, trialVals, c.posBase, c.maxCard, c.minCard)
+          left, right, trialVals, 0, c.maxCard, c.minCard)
         check c.cost + delta == expectedCost
 
   test "moveDelta is zero for same-value moves and for out-of-range positions":
@@ -146,3 +147,25 @@ suite "SetIntersectCard Constraint":
     # Original untouched by c2's reinitialization.
     check c.cost == 2
     check c.dotProduct == 2
+
+  test "far-apart sides use compact storage and stay exact":
+    # Two set-var bool blocks ~1e6 positions apart (typical of disjoint() between
+    # set variables declared far apart). Storage must not scale with the span.
+    let left = @[10, 11, 12, 13]
+    let right = @[1_000_010, 1_000_011, 1_000_012, 1_000_013]
+    let c = newSetIntersectCardConstraint[int](left, right, maxCard = 0, minCard = 0)
+    check c.vals.len <= 16
+    var assignment = newSeq[int](1_000_020)
+    assignment[11] = 1; assignment[1_000_011] = 1    # overlap at element 1
+    assignment[12] = 1                               # A only
+    c.initialize(assignment)
+    check c.dotProduct == 1
+    check c.cost == 1
+    check c.moveDelta(1_000_011, 1, 0) == -1         # removing the overlap
+    check c.moveDelta(1_000_012, 0, 1) == 1          # creating a second overlap
+    check c.moveDelta(500_000, 0, 1) == 0            # position between the runs
+    c.updatePosition(11, 0)
+    check c.cost == 0
+    let d = c.deepCopy()
+    d.initialize(assignment)
+    check d.cost == 1                                # copy re-reads the original assignment

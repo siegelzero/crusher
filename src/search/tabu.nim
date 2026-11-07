@@ -57,6 +57,7 @@ type
         ceArgmax     ## Argmax channel binding
         ceCrossingCountMax  ## Crossing count max channel binding
         ceConditionalCountEq  ## ConditionalCountEq channel binding
+        ceExpression  ## Expression channel binding (int_times/int_div/int_mod/int_plus)
 
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
@@ -197,6 +198,24 @@ type
         # Cached list of tableIn constraint indices for fast stagnation-time table moves
         tableInConstraintIndices*: seq[int]
 
+        deltaMismatches*: int   # CRUSHER_CHECK_DELTA diagnostics
+        tourFailStreak*: int    # consecutive fruitless tryTourMoves scans (backoff)
+        tourNextTry*: int       # iteration of the next tryTourMoves attempt
+
+        # Regular constraints over search positions, for line-rewrite moves (tabuRegularMoves)
+        regularConstraintIndices*: seq[int]
+
+        # Incremental count channels: for wide countEq / weightedCountEq bindings
+        # (>= IncCountMinInputs inputs), position -> multiplicity / summed weight.
+        # When a single source position changes old -> new, the count changes by
+        # w * ([new == target] - [old == target]) instead of an O(inputs) rescan
+        # (global-cardinality counts over thousands of variables).
+        ceqPosMult*: seq[Table[int, int]]       # [countEq binding] (empty = not wide)
+        wceqPosWeight*: seq[Table[int, T]]      # [weightedCountEq binding] (empty = not wide)
+        # Source change for the propagation in progress (-1 = unknown)
+        propSrcPos*: int
+        propSrcOld*: T
+
         # Cached circuit constraint states (direct-variable only) for circuit-repair moves
         circuitConstraints*: seq[CircuitConstraint[T]]
         # Circuit constraints over channel (derived) positions: their successors are
@@ -244,6 +263,14 @@ type
         cdCascadeConstraintL: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # [cascadeIdx][constraintLocalIdx][j] = (chanIdx in cascade, coeff)
         cdCascadeConstraintR: seq[seq[seq[tuple[cascadeIdx: int, coeff: T]]]]  # right side
         cdCascadeConstraintIds: seq[seq[int]]     # [cascadeIdx][constraintLocalIdx] -> index into channelDepConstraints
+        # Sparse dynamic-cascade evaluation (see computeChannelDepPenaltiesAt)
+        cdCascadeNSrcReaders: seq[int]            # [cascadeIdx] -> entries 0..<n read the source position directly
+        cdCascadeHasBackEdge: seq[bool]           # [cascadeIdx] -> some entry reads a later entry (sparse unsafe)
+        cdCascadeEntryCons: seq[seq[seq[int]]]    # [cascadeIdx][entry] -> constraint-local indices reading it
+        cdCascadeSingleIdx: seq[seq[int]]         # [cascadeIdx][cli] -> entry of a single-pos constraint's position, or -1
+        cdBatchChanged: seq[seq[int]]             # [domainIdx] -> entries changed for that value (scratch)
+        cdCliStamp: seq[int]                      # scratch dedupe stamps per constraint-local index
+        cdCliStampGen: int
         # DisjunctiveClause fast cascade path: precomputed term coefficient mappings
         # [cascadeIdx][constraintLocalIdx] -> per-disjunct, per-term list of (coeffIdx, cascadeIdx) pairs
         cdCascadeDCTermCoeffs: seq[seq[seq[seq[seq[tuple[coeffIdx: int, cascIdx: int]]]]]]
@@ -252,6 +279,11 @@ type
         cdBatchSaved: seq[T]                      # saved channel values during batch evaluation
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
+        # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
+        # expression of one channel): penalty is a pure function of that value, memoized
+        # (see singlePosPenalty) instead of re-evaluating the expression tree per candidate.
+        cdSinglePos: seq[int]                     # [constraintIdx] -> the position, or -1
+        cdSingleCache: seq[Table[T, int]]         # [constraintIdx] -> value -> penalty
 
         # Partition swap move structures
         partitionGroups*: seq[PartitionGroup[int]]
@@ -444,6 +476,7 @@ include tabuSwapMoves
 include tabuFlowMoves
 include tabuLinearRepair
 include tabuCircuitMoves
+include tabuRegularMoves
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -1211,6 +1244,20 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
         stderr.writeLine("[Init] Balanced " & $groupCount & " permutation groups")
         stderr.flushFile()
 
+let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
+# A/B switches for the cascade/count evaluation paths (debugging aids)
+let gNoExprCascade = existsEnv("CRUSHER_NO_EXPR_CASCADE")
+let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
+let gNoIncCount = existsEnv("CRUSHER_NO_INC_COUNT")
+
+proc logInitRss*(label: string) =
+    ## Verbose-only: resident set size after an init phase (Linux /proc/self/statm).
+    try:
+        let f = readFile("/proc/self/statm").splitWhitespace()
+        if f.len >= 2:
+            echo "[Mem] after " & label & ": rss=" & $(parseInt(f[1]) * 4096 div (1024*1024)) & "MiB"
+    except CatchableError: discard
+
 proc initStrategyForPopulation*(id, populationSize: int): InitStrategy =
     ## Assigns init strategies to population members.
     ## id 0: domain min, id 1: domain max (if population >= 3), rest: random.
@@ -1270,6 +1317,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if c.stateType == RelationalType and c.relationalState.relation == EqualTo:
                     c.relationalState.graduated = true
 
+    # Incremental count-channel tables (see ceqPosMult)
+    state.propSrcPos = -1
+    state.ceqPosMult = newSeq[Table[int, int]](carray.countEqChannelBindings.len)
+    for bi, b in carray.countEqChannelBindings:
+        if not gNoIncCount and b.inputPositions.len >= IncCountMinInputs:
+            for p in b.inputPositions:
+                state.ceqPosMult[bi].mgetOrPut(p, 0) += 1
+    state.wceqPosWeight = newSeq[Table[int, T]](carray.weightedCountEqChannelBindings.len)
+    for bi, b in carray.weightedCountEqChannelBindings:
+        if not gNoIncCount and b.inputPositions.len >= IncCountMinInputs:
+            for k, p in b.inputPositions:
+                state.wceqPosWeight[bi].mgetOrPut(p, T(0)) += b.weights[k]
+
     for ci, constraint in state.constraints:
         for pos in constraint.positions.items:
             state.constraintsAtPosition[pos].add(constraint)
@@ -1292,6 +1352,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Circuit over derived positions: repaired via index-selector flips
                 # (see tabuCircuitMoves / tryChannelCircuitMoves).
                 state.channelCircuitConstraints.add(constraint.circuitState)
+        # Regular constraints over distinct non-channel positions: line-rewrite moves
+        if constraint.stateType == RegularType:
+            let reg = constraint.regularState
+            var ok = reg.n > 0 and reg.positionToIndex.len == reg.n
+            if ok:
+                for pos in reg.sortedPositions:
+                    if pos in carray.channelPositions:
+                        ok = false
+                        break
+            if ok:
+                state.regularConstraintIndices.add(ci)
         # Cache tableIn constraint indices for fast stagnation-time table moves.
         # Skip constraints whose positions include any channel position: channel
         # values are derived from source vars, so directly assigning a tuple to
@@ -1325,6 +1396,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     if verbose and id == 0:
         echo "[Init] Built constraintsAtPosition in " & $(epochTime() - initStart) & "s"
+        logInitRss("Built constraintsAtPosition")
         var maxPositions = 0
         var totalPositions = 0
         for c in state.constraints:
@@ -1553,7 +1625,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if dups <= 3:
                     stderr.writeLine("[Init] WARNING: position " & $pos & " has " & $indices.len & " element channel bindings (indices: " & $indices & ")")
                     for bi in indices:
-                        let b = carray.channelBindings[bi]
+                        let b {.cursor.} = carray.channelBindings[bi]
                         let nConst = block:
                             var c = 0
                             for e in b.arrayElements:
@@ -1721,7 +1793,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 let bi = worklist.pop()
                 inWorklist[bi] = false
                 inc fpEvals
-                let fb = state.flatMinMaxBindings[bi]
+                let fb {.cursor.} = state.flatMinMaxBindings[bi]
                 let newVal = evaluateFlatMinMax(fb, state.assignment)
                 if newVal != state.assignment[fb.channelPosition]:
                     state.assignment[fb.channelPosition] = newVal
@@ -1962,6 +2034,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     if verbose and id == 0:
         echo "[Init] Initialized constraints in " & $(epochTime() - initStart) & "s"
+        logInitRss("Initialized constraints")
         initStart = epochTime()
 
     for cons in state.constraints:
@@ -2094,7 +2167,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Min/max channel bindings
                 if p in carray.minMaxChannelsAtPosition:
                     for bi in carray.minMaxChannelsAtPosition[p]:
-                        let binding = carray.minMaxChannelBindings[bi]
+                        let binding {.cursor.} = carray.minMaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2103,7 +2176,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Count-equals channel bindings
                 if p in carray.countEqChannelsAtPosition:
                     for bi in carray.countEqChannelsAtPosition[p]:
-                        let binding = carray.countEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.countEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2112,7 +2185,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Weighted count-equals channel bindings
                 if p in carray.weightedCountEqChannelsAtPosition:
                     for bi in carray.weightedCountEqChannelsAtPosition[p]:
-                        let binding = carray.weightedCountEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.weightedCountEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2121,7 +2194,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Conditional count-equals channel bindings
                 if p in carray.conditionalCountEqChannelsAtPosition:
                     for bi in carray.conditionalCountEqChannelsAtPosition[p]:
-                        let binding = carray.conditionalCountEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.conditionalCountEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2130,7 +2203,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Inverse channel bindings
                 if p in carray.inverseChannelsAtPosition:
                     for gi in carray.inverseChannelsAtPosition[p]:
-                        let group = carray.inverseChannelGroups[gi]
+                        let group {.cursor.} = carray.inverseChannelGroups[gi]
                         for ipos in group.inversePositions:
                             reachable.incl(ipos)
                             if ipos notin visited:
@@ -2139,7 +2212,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Argmax channel bindings
                 if p in carray.argmaxChannelsAtPosition:
                     for bi in carray.argmaxChannelsAtPosition[p]:
-                        let binding = carray.argmaxChannelBindings[bi]
+                        let binding {.cursor.} = carray.argmaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2156,7 +2229,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Crossing count max channel bindings
                 if p in carray.crossingCountMaxChannelsAtPosition:
                     for bi in carray.crossingCountMaxChannelsAtPosition[p]:
-                        let binding = carray.crossingCountMaxChannelBindings[bi]
+                        let binding {.cursor.} = carray.crossingCountMaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
@@ -2357,6 +2430,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdConstraintCoeffsR = newSeq[seq[tuple[pos: int, coeff: T]]](nCd)
         state.cdConstraintCanFast = newSeq[bool](nCd)
         state.cdSavedConstraintCosts = newSeq[int](nCd)
+        state.cdSinglePos = newSeqWith(nCd, -1)
+        state.cdSingleCache = newSeq[Table[T, int]](nCd)
         for ci in 0..<nCd:
             let c = state.channelDepConstraints[ci]
             if c.stateType == PseudoBoolLinLeType:
@@ -2395,6 +2470,26 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 else: canFast = false
 
             state.cdConstraintCanFast[ci] = canFast
+            if not canFast and c.positions.len == 1 and
+               rc.leftExpr.kind in {StatefulAlgebraicExpr, ConstantExpr} and
+               rc.rightExpr.kind in {StatefulAlgebraicExpr, ConstantExpr}:
+                for p in c.positions.items: state.cdSinglePos[ci] = p
+
+        if verbose and id == 0 and existsEnv("CRUSHER_DEBUG_CDFAST"):
+            var hist: CountTable[string]
+            for ci in 0..<nCd:
+                if state.cdConstraintCanFast[ci]: continue
+                let c = state.channelDepConstraints[ci]
+                var key = $c.stateType
+                if c.stateType == RelationalType:
+                    let rc = c.relationalState
+                    key &= " " & $rc.leftExpr.kind & (if rc.leftExpr.kind == SumExpr: "/" & $rc.leftExpr.sumExpr.evalMethod else: "") &
+                           " " & $rc.relation & " " & $rc.rightExpr.kind &
+                           (if rc.rightExpr.kind == SumExpr: "/" & $rc.rightExpr.sumExpr.evalMethod else: "") &
+                           " npos=" & $c.positions.len
+                hist.inc(key)
+            hist.sort()
+            for k, v in hist.pairs: echo "[Init]   cd-fallback ", v, "x ", k
 
         if verbose and id == 0:
             var fastCount, fallbackCount = 0
@@ -2416,7 +2511,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.depConstraintOneHotEntries = newSeq[seq[tuple[pos: int, domainIdx: int]]](state.channelDepConstraints.len)
         for pos in state.channelDepSearchPositions:
             if pos notin state.oneHotChanges: continue
-            let changes = state.oneHotChanges[pos]
+            let changes {.cursor.} = state.oneHotChanges[pos]
             let lo = state.oneHotLo[pos]
             for arrayIdx in 0..<changes.len:
                 let val = T(arrayIdx + lo)
@@ -2436,6 +2531,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             echo "[Init] Channel-dep reverse index: " & $state.chanPosToDepConstraintIdx.len &
                  " channel positions, " & $state.depConstraintOneHotEntries.len &
                  " constraints, " & $totalEntries & " one-hot entries"
+            logInitRss("Channel-dep reverse")
 
     if verbose and id == 0:
         stderr.writeLine("[Init] Starting cascade topology build...")
@@ -2461,6 +2557,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadeConstraintL = @[]
         state.cdCascadeConstraintR = @[]
         state.cdCascadeConstraintIds = @[]
+        state.cdCascadeNSrcReaders = @[]
+        state.cdCascadeHasBackEdge = @[]
+        state.cdCascadeEntryCons = @[]
+        state.cdCascadeSingleIdx = @[]
         let cascadeStart = epochTime()
         var staticCount = 0
         var dynamicCount = 0
@@ -2468,8 +2568,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var cascadeDepthFail = 0
         var noConstraintSkip = 0  # cascades skipped: zero channel-dep constraints read them
 
+        # Very many channel-dep search positions (e.g. tens of thousands of set-var
+        # bools): per-position cascade tables cost seconds and gigabytes to build,
+        # while a binary position's fallback evaluates a single alternative value.
+        # Keep cascades for the non-binary positions only.
+        const ManyCascadePositions = 4000
+        let skipBinaryCascades = state.channelDepSearchPositions.len > ManyCascadePositions
+        var binaryCascadesSkipped = 0
+        var cascadeProgress = 0
+        var cascadeEntriesTotal = 0
         for pos in state.channelDepSearchPositions:
+            inc cascadeProgress
+            if verbose and id == 0 and (cascadeProgress and 1023) == 0:
+                echo "[Init]   cascade build: " & $cascadeProgress & "/" & $state.channelDepSearchPositions.len &
+                     " positions, " & $cascadeEntriesTotal & " entries, " & $(epochTime() - cascadeStart) & "s"
+                logInitRss("cascade progress")
             if state.isLazy[pos]: continue
+            if skipBinaryCascades and state.sharedDomain[][pos].len <= 2:
+                inc binaryCascadesSkipped
+                continue
             # Skip positions with inverse groups (forced changes not captured by cascade)
             if state.inverseEnabled and state.posToInverseGroup[pos] >= 0: continue
 
@@ -2487,7 +2604,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var canBuild = true       # can build topology at all
             var canStatic = true      # can precompute values (constant arrays + local index deps)
             const MaxCascadeChans = 5000  # limit cascade depth to avoid initialization blowup
+            var nSrcReaders = -1
             while bfsHead < bfsQueue.len and canBuild:
+                if bfsHead == 1 and nSrcReaders < 0:
+                    nSrcReaders = topoOrder.len  # entries registered at the source position
                 let p = bfsQueue[bfsHead]
                 inc bfsHead
                 if topoOrder.len >= MaxCascadeChans:
@@ -2528,7 +2648,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # are not included in the penalty-map cascade to control build overhead.
                 if p in carray.minMaxChannelsAtPosition:
                     for bi in carray.minMaxChannelsAtPosition[p]:
-                        let fb = state.flatMinMaxBindings[bi]
+                        let fb {.cursor.} = state.flatMinMaxBindings[bi]
                         let chanPos = fb.channelPosition
                         if chanPos in carray.implicitMinMaxPositions:
                             continue  # Cascade-exempt: skip downstream propagation
@@ -2545,7 +2665,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # CountEq channel bindings: include in cascade as dynamic entries
                 if p in carray.countEqChannelsAtPosition:
                     for bi in carray.countEqChannelsAtPosition[p]:
-                        let binding = carray.countEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.countEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         if chanPos in topoSet:
                             continue  # Diamond — skip
@@ -2560,7 +2680,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # WeightedCountEq channel bindings: include in cascade as dynamic entries
                 if p in carray.weightedCountEqChannelsAtPosition:
                     for bi in carray.weightedCountEqChannelsAtPosition[p]:
-                        let binding = carray.weightedCountEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.weightedCountEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         if chanPos in topoSet:
                             continue
@@ -2575,7 +2695,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Argmax channel bindings: include in cascade as dynamic entries
                 if p in carray.argmaxChannelsAtPosition:
                     for bi in carray.argmaxChannelsAtPosition[p]:
-                        let binding = carray.argmaxChannelBindings[bi]
+                        let binding {.cursor.} = carray.argmaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         if chanPos in topoSet:
                             continue  # Diamond — skip
@@ -2590,7 +2710,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # CrossingCountMax channel bindings: include in cascade as dynamic entries
                 if p in carray.crossingCountMaxChannelsAtPosition:
                     for bi in carray.crossingCountMaxChannelsAtPosition[p]:
-                        let binding = carray.crossingCountMaxChannelBindings[bi]
+                        let binding {.cursor.} = carray.crossingCountMaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         if chanPos in topoSet:
                             continue  # Diamond — skip
@@ -2605,7 +2725,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # ConditionalCountEq channels: include in cascade as dynamic entries
                 if p in carray.conditionalCountEqChannelsAtPosition:
                     for bi in carray.conditionalCountEqChannelsAtPosition[p]:
-                        let binding = carray.conditionalCountEqChannelBindings[bi]
+                        let binding {.cursor.} = carray.conditionalCountEqChannelBindings[bi]
                         let chanPos = binding.channelPosition
                         if chanPos in topoSet:
                             continue  # Diamond — skip
@@ -2617,9 +2737,44 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
+                # Expression channels (e.g. squares of load channels feeding a sum
+                # objective): without them, constraints over these channels — often
+                # the objective bound — are invisible to cascade move scoring.
+                if not gNoExprCascade and p in carray.expressionChannelsAtPosition:
+                    for bi in carray.expressionChannelsAtPosition[p]:
+                        let chanPos = carray.expressionChannelBindings[bi].channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)  # index into expressionChannelBindings
+                        topoEntryKind.add(ceExpression)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
                 if p in carray.inverseChannelsAtPosition:
                     canBuild = false
 
+            # Wide-input guard: entries such as global-cardinality count channels
+            # read every assignment variable; the per-cascade dependency tables are
+            # O(entries x inputs) (warehouse: 100 counts x 3219 tokens = 322k refs,
+            # ~2.5MB per cascade, thousands of cascades). Past the cap, fall back
+            # to per-value channel-dep evaluation for this position.
+            const MaxCascadeInputRefs = 50_000
+            if canBuild:
+                var inputRefs = 0
+                for ci in 0..<topoOrder.len:
+                    case topoEntryKind[ci]
+                    of ceCountEq: inputRefs += carray.countEqChannelBindings[topoBindingIdx[ci]].inputPositions.len
+                    of ceWeightedCountEq: inputRefs += carray.weightedCountEqChannelBindings[topoBindingIdx[ci]].inputPositions.len
+                    of ceConditionalCountEq:
+                        let b {.cursor.} = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
+                        inputRefs += b.primaryPositions.len + b.filterPositions.len + b.primaryOnlyPositions.len
+                    of ceElement: inputRefs += carray.channelBindings[topoBindingIdx[ci]].arrayElements.len
+                    else: inputRefs += 4
+                if inputRefs > MaxCascadeInputRefs:
+                    canBuild = false
             if not canBuild or topoOrder.len == 0:
                 cascadeFail += 1
                 # Mark deep-cascade-failed positions as lazy to avoid per-iteration
@@ -2808,8 +2963,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             if elem.variablePosition != pos and elem.variablePosition notin topoSet:
                                 externalDeps.incl(elem.variablePosition)
                                 elemExtDeps.incl(elem.variablePosition)
+                of ceExpression:
+                    let binding {.cursor.} = carray.expressionChannelBindings[topoBindingIdx[ci]]
+                    for ep in binding.expression.positions.items:
+                        if ep != pos and ep notin topoSet:
+                            externalDeps.incl(ep)
+                            elemExtDeps.incl(ep)
 
             let cascadeIdx = state.cdCascadeChans.len
+            cascadeEntriesTotal += topoOrder.len
             state.cdCascadePos[pos] = cascadeIdx
             state.cdCascadeChans.add(topoOrder)
             state.cdCascadeBindings.add(topoBindingIdx)
@@ -2876,6 +3038,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for elem in bindingPtr.arrayElements:
                         if not elem.isConstant and elem.variablePosition != pos:
                             inputs.incl(elem.variablePosition)
+                of ceExpression:
+                    let binding {.cursor.} = carray.expressionChannelBindings[topoBindingIdx[ci]]
+                    for ep in binding.expression.positions.items:
+                        if ep != pos: inputs.incl(ep)
                 # Register in posToReaders (cascade-internal deps) and extPosToEntries
                 for p in inputs.items:
                     if p in topoSet:
@@ -2884,9 +3050,27 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         extPosToEntries.mgetOrPut(p, @[]).add(ci)
             # Build forward deps: from entry ci to entries that read chans[ci]
             var forwardDeps = newSeq[seq[int]](topoOrder.len)
+            var hasBackEdge = false
             for ci in 0..<topoOrder.len:
                 if topoOrder[ci] in posToReaders:
                     forwardDeps[ci] = posToReaders[topoOrder[ci]]
+                    for r in forwardDeps[ci]:
+                        if r <= ci: hasBackEdge = true
+            if nSrcReaders < 0: nSrcReaders = topoOrder.len
+            state.cdCascadeNSrcReaders.add(nSrcReaders)
+            state.cdCascadeHasBackEdge.add(hasBackEdge or gNoSparseCascade)
+            block:
+                var entryCons = newSeq[seq[int]](topoOrder.len)
+                for cli, dci in constraintLocalIds:
+                    for p in state.channelDepConstraints[dci].positions.items:
+                        if p in chanToIdx:
+                            entryCons[chanToIdx[p]].add(cli)
+                state.cdCascadeEntryCons.add(entryCons)
+                var singleIdx = newSeq[int](constraintLocalIds.len)
+                for cli, dci in constraintLocalIds:
+                    let sp = state.cdSinglePos[dci]
+                    singleIdx[cli] = if sp >= 0 and sp in chanToIdx: chanToIdx[sp] else: -1
+                state.cdCascadeSingleIdx.add(singleIdx)
             state.cdCascadeForwardDeps.add(forwardDeps)
             state.cdCascadeExtPosToEntries.add(extPosToEntries)
             # Allocate cache for this cascade
@@ -2932,11 +3116,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  " dynamic / " & $(staticCount + dynamicCount + cascadeFail + noConstraintSkip) &
                  " positions (fail=" & $cascadeFail & " depthFail=" & $cascadeDepthFail &
                  " noCons=" & $noConstraintSkip &
+                 (if binaryCascadesSkipped > 0: " binarySkipped=" & $binaryCascadesSkipped else: "") &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
                  " mem=" & $(totalMem div 1024) & "KB" &
                  " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &
                  " noExt=" & $noExtCount &
                  " built in " & $(epochTime() - cascadeStart) & "s)"
+            logInitRss("Cascade tables")
             # Distribution of cascade sizes and constraint counts
             var sizeHist: Table[int, int]
             var constraintHist: Table[int, int]
@@ -3017,6 +3203,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if verbose and id == 0:
             echo "[Init] Channel-dep penalties computed in " & $(epochTime() - cdStart) & "s" &
                  " (binary=" & $cdBinaryCount & " large=" & $cdLargeCount & " totalEvals=" & $cdTotalEvals & ")"
+            logInitRss("Channel-dep penalties computed")
 
         # Check if all channel-dep penalties are zero (tautological constraints).
         block tautologyCheck:
@@ -3147,6 +3334,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     if verbose and id == 0:
         echo "[Init] Built penalty map in " & $(epochTime() - initStart) & "s"
+        logInitRss("Built penalty map")
         state.logProfileStats()
         state.resetProfileStats()
 
@@ -3282,6 +3470,11 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
 
     while worklist.len > 0:
         let pos = worklist.pop()
+        # Source of this propagation (set by assignValue*): wide count channels
+        # update incrementally. Consumed on first use so it can't apply twice.
+        let srcInc = pos == state.propSrcPos
+        let srcOld = state.propSrcOld
+        if srcInc: state.propSrcPos = -1
         inWorklist.excl(pos)
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
@@ -3324,7 +3517,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
             for bi in state.carray.minMaxChannelsAtPosition[pos]:
-                let fb = state.flatMinMaxBindings[bi]
+                let fb {.cursor.} = state.flatMinMaxBindings[bi]
                 let newVal = evaluateFlatMinMax(fb, state.assignment)
                 if newVal != state.assignment[fb.channelPosition]:
                     result = true
@@ -3350,8 +3543,9 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Count-equals channel bindings
         if pos in state.carray.countEqChannelsAtPosition:
             for bi in state.carray.countEqChannelsAtPosition[pos]:
-                let binding = state.carray.countEqChannelBindings[bi]
-                let newVal = evaluateCountEq(binding, state.assignment)
+                let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
+                let newVal = if srcInc: state.countEqAfterSrc(bi, pos, srcOld)
+                             else: evaluateCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
                     changedChannels.add(binding.channelPosition)
@@ -3376,8 +3570,9 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Weighted count-equals channel bindings
         if pos in state.carray.weightedCountEqChannelsAtPosition:
             for bi in state.carray.weightedCountEqChannelsAtPosition[pos]:
-                let binding = state.carray.weightedCountEqChannelBindings[bi]
-                let newVal = evaluateWeightedCountEq(binding, state.assignment)
+                let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bi]
+                let newVal = if srcInc: state.wCountEqAfterSrc(bi, pos, srcOld)
+                             else: evaluateWeightedCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
                     changedChannels.add(binding.channelPosition)
@@ -3402,7 +3597,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Conditional count-equals channel bindings
         if pos in state.carray.conditionalCountEqChannelsAtPosition:
             for bi in state.carray.conditionalCountEqChannelsAtPosition[pos]:
-                let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bi]
                 let newVal = evaluateConditionalCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
@@ -3428,7 +3623,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Argmax channel bindings
         if pos in state.carray.argmaxChannelsAtPosition:
             for bi in state.carray.argmaxChannelsAtPosition[pos]:
-                let binding = state.carray.argmaxChannelBindings[bi]
+                let binding {.cursor.} = state.carray.argmaxChannelBindings[bi]
                 let newVal = evaluateArgmax(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
@@ -3454,7 +3649,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Crossing count max channel bindings
         if pos in state.carray.crossingCountMaxChannelsAtPosition:
             for bi in state.carray.crossingCountMaxChannelsAtPosition[pos]:
-                let binding = state.carray.crossingCountMaxChannelBindings[bi]
+                let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bi]
                 let newVal = evaluateCrossingCountMax(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
@@ -3480,7 +3675,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Inverse channel bindings: recompute inverse from forward assignments
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
-                let group = state.carray.inverseChannelGroups[gi]
+                let group {.cursor.} = state.carray.inverseChannelGroups[gi]
                 let newInverse = group.recomputeInverse(state.assignment)
                 for j, ipos in group.inversePositions:
                     if newInverse[j] != state.assignment[ipos]:
@@ -3507,7 +3702,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         # Expression channel bindings
         if pos in state.carray.expressionChannelsAtPosition:
             for bi in state.carray.expressionChannelsAtPosition[pos]:
-                let binding = state.carray.expressionChannelBindings[bi]
+                let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
                 let newVal = binding.expression.evaluate(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
@@ -3542,6 +3737,11 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
 
     while worklist.len > 0:
         let pos = worklist.pop()
+        # Source of this propagation (set by assignValue*): wide count channels
+        # update incrementally. Consumed on first use so it can't apply twice.
+        let srcInc = pos == state.propSrcPos
+        let srcOld = state.propSrcOld
+        if srcInc: state.propSrcPos = -1
         inWorklist.excl(pos)
         # Element channel bindings
         if pos in state.carray.channelsAtPosition:
@@ -3568,7 +3768,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Min/max channel bindings
         if pos in state.carray.minMaxChannelsAtPosition:
             for bi in state.carray.minMaxChannelsAtPosition[pos]:
-                let fb = state.flatMinMaxBindings[bi]
+                let fb {.cursor.} = state.flatMinMaxBindings[bi]
                 let newVal = evaluateFlatMinMax(fb, state.assignment)
                 if newVal != state.assignment[fb.channelPosition]:
                     state.assignment[fb.channelPosition] = newVal
@@ -3583,8 +3783,9 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Count-equals channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.countEqChannelsAtPosition:
             for bi in state.carray.countEqChannelsAtPosition[pos]:
-                let binding = state.carray.countEqChannelBindings[bi]
-                let newVal = evaluateCountEq(binding, state.assignment)
+                let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
+                let newVal = if srcInc: state.countEqAfterSrc(bi, pos, srcOld)
+                             else: evaluateCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     for c in state.constraintsAtPosition[binding.channelPosition]:
@@ -3598,8 +3799,9 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Weighted count-equals channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.weightedCountEqChannelsAtPosition:
             for bi in state.carray.weightedCountEqChannelsAtPosition[pos]:
-                let binding = state.carray.weightedCountEqChannelBindings[bi]
-                let newVal = evaluateWeightedCountEq(binding, state.assignment)
+                let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bi]
+                let newVal = if srcInc: state.wCountEqAfterSrc(bi, pos, srcOld)
+                             else: evaluateWeightedCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     for c in state.constraintsAtPosition[binding.channelPosition]:
@@ -3613,7 +3815,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Conditional count-equals channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.conditionalCountEqChannelsAtPosition:
             for bi in state.carray.conditionalCountEqChannelsAtPosition[pos]:
-                let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bi]
                 let newVal = evaluateConditionalCountEq(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
@@ -3628,7 +3830,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Argmax channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.argmaxChannelsAtPosition:
             for bi in state.carray.argmaxChannelsAtPosition[pos]:
-                let binding = state.carray.argmaxChannelBindings[bi]
+                let binding {.cursor.} = state.carray.argmaxChannelBindings[bi]
                 let newVal = evaluateArgmax(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
@@ -3643,7 +3845,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Crossing count max channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.crossingCountMaxChannelsAtPosition:
             for bi in state.carray.crossingCountMaxChannelsAtPosition[pos]:
-                let binding = state.carray.crossingCountMaxChannelBindings[bi]
+                let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bi]
                 let newVal = evaluateCrossingCountMax(binding, state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
@@ -3658,7 +3860,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Inverse channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
-                let group = state.carray.inverseChannelGroups[gi]
+                let group {.cursor.} = state.carray.inverseChannelGroups[gi]
                 let newInverse = group.recomputeInverse(state.assignment)
                 for j, ipos in group.inversePositions:
                     if newInverse[j] != state.assignment[ipos]:
@@ -3674,7 +3876,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         # Expression channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.expressionChannelsAtPosition:
             for bi in state.carray.expressionChannelsAtPosition[pos]:
-                let binding = state.carray.expressionChannelBindings[bi]
+                let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
                 let newVal = binding.expression.evaluate(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
@@ -3769,7 +3971,11 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
                         state.violationCount[pos] += 1
             state.propagateChannelsLean(fPos)
 
+    if not hasInverseMoveLean:
+        state.propSrcPos = position
+        state.propSrcOld = oldValueLean
     state.propagateChannelsLean(position)
+    state.propSrcPos = -1
 
     # Circuit-time-prop writeback (lean path): copy computed times to assignment
     # positions and propagate downstream channels (e.g. objective max channels).
@@ -3830,7 +4036,11 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     # Propagate channel variables affected by this position change
     when ProfileIteration:
         let tProp0 = epochTime()
+    if not hasInverseMove:
+        state.propSrcPos = position
+        state.propSrcOld = oldValueAssign
     discard state.propagateChannels(position, state.changedChannelsBuf)
+    state.propSrcPos = -1
 
     # Also propagate channels for forced positions (using pre-allocated buffer)
     if hasInverseMove:
@@ -4193,7 +4403,16 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
 
     if bestPos >= 0:
         let oldValue = state.assignment[bestPos]
+        let costBefore = state.cost
         state.assignValueLean(bestPos, bestVal)
+        if gCheckDelta and state.cost - costBefore != bestDelta:
+            # Debug (CRUSHER_CHECK_DELTA): predicted move delta disagrees with the
+            # actual cost change -> a move-evaluation path is inexact.
+            inc state.deltaMismatches
+            if state.deltaMismatches <= 20:
+                echo "[CheckDelta] S" & $state.id & " it=" & $state.iteration & " pos=" & $bestPos &
+                     " " & $oldValue & "->" & $bestVal & " predicted=" & $bestDelta &
+                     " actual=" & $(state.cost - costBefore)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
         let oldIdx = state.domIdx(bestPos, oldValue)
         if oldIdx >= 0 and not state.isLazy[bestPos]:
@@ -4657,6 +4876,57 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         state.lastImprovementIter = lastImprovement
                         return state
 
+        # Regular line rewrites during stagnation: optimal re-solve of one DFA
+        # line against the rest of the model (see tabuRegularMoves). Chain while
+        # improving; sideways rewrites only in deeper stagnation.
+        if state.regularConstraintIndices.len > 0 and
+           state.iteration - lastImprovement >= 10 and
+           (state.iteration - lastImprovement) mod 10 == 0 and
+           not outOfBudget():
+            let sideways = state.iteration - lastImprovement >= 100
+            var lineIters = 0
+            while lineIters < 50 and not outOfBudget() and
+                    state.tryRegularLineMoves(allowSideways = sideways and lineIters == 0):
+                inc lineIters
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via regular line move")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Tour-preserving relocation moves on valid circuits (see tryTourMoves):
+        # the main neighborhood for sequencing once the circuit is satisfied.
+        # Backoff: after a fruitless full scan, wait 10 * 2^k iterations (k = consecutive
+        # failures, reset on success) — scans re-walk every circuit-time chain per candidate.
+        if state.circuitConstraints.len > 0 and
+           state.iteration - lastImprovement >= 2 and
+           state.iteration >= state.tourNextTry and
+           not outOfBudget():
+            var tourIters = 0
+            while tourIters < 20 and not outOfBudget() and state.tryTourMoves(allowPerturb = false):
+                inc tourIters
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via tour move")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            if tourIters == 0:
+                state.tourFailStreak = min(state.tourFailStreak + 1, 8)
+                state.tourNextTry = state.iteration + 10 * (1 shl state.tourFailStreak)
+                if state.iteration - lastImprovement >= 200:
+                    discard state.tryTourMoves(allowPerturb = true)
+            else:
+                state.tourFailStreak = 0
+                state.tourNextTry = state.iteration + 2
+
         # Try circuit cross-cycle merge moves during stagnation: when a circuit
         # constraint has split into disjoint subtours, a 2-opt swap of successors
         # across two cycles merges them — an escape single-variable moves cannot
@@ -4784,6 +5054,25 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
     if state.verbose:
         state.logExitStats("Exhausted")
+        if existsEnv("CRUSHER_DEBUG_CIRCUIT"):
+            for cc in state.circuitConstraints:
+                var succ: seq[int]
+                for p in cc.positionArray: succ.add(int(state.assignment[p]))
+                echo "[DebugCircuit] circuit cost=", cc.cost, " succ=", succ
+                for i, p in cc.positionArray:
+                    var row = ""
+                    for v in state.sharedDomain[][p]:
+                        if v == state.assignment[p]: continue
+                        let before = state.cost
+                        let ov = state.assignment[p]
+                        state.assignValueLean(p, v)
+                        let act = state.cost - before
+                        state.assignValueLean(p, ov)
+                        row &= " " & $v & ":" & $act & "/" & $state.costDelta(p, v)
+                    echo "[DebugCircuit]   node ", i, " moves(actual/pred):", row
+            for ctc in state.circuitTimePropConstraints:
+                echo "[DebugCircuit] ctp circPen=", ctc.circuitPenalty, " w=", ctc.circuitWeight,
+                     " tw=", ctc.timeWindowPenalty, " cost=", ctc.cost, " links=", ctc.links
 
     state.lastImprovementIter = lastImprovement
     return state

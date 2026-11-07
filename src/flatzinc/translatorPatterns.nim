@@ -1707,7 +1707,7 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
             let binding = ChannelBinding[int](
                 channelPosition: channelPos,
                 indexExpression: indexExpr,
-                arrayElements: arrayElems
+                arrayElements: toSharedElems(arrayElems)
             )
             let bindingIdx = tr.sys.baseArray.channelBindings.len
             tr.sys.baseArray.channelBindings.add(binding)
@@ -1750,7 +1750,7 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
             let binding = ChannelBinding[int](
                 channelPosition: setInPos,
                 indexExpression: indexExpr,
-                arrayElements: setInElems
+                arrayElements: toSharedElems(setInElems)
             )
             let bindingIdx = tr.sys.baseArray.channelBindings.len
             tr.sys.baseArray.channelBindings.add(binding)
@@ -1785,7 +1785,7 @@ proc emitSkillAllocationConstraints(tr: var FznTranslator) =
             let binding = ChannelBinding[int](
                 channelPosition: eqPos,
                 indexExpression: indexExpr,
-                arrayElements: eqElems
+                arrayElements: toSharedElems(eqElems)
             )
             let bindingIdx = tr.sys.baseArray.channelBindings.len
             tr.sys.baseArray.channelBindings.add(binding)

@@ -2811,6 +2811,17 @@ func countEq*[T](arrayPositions: openArray[int], countValue: T, targetPosition: 
 # NValue wrapper functions
 ################################################################################
 
+func nvalueFixed*[T](arrayPositions: openArray[int], constantValues: openArray[T],
+                     fixedCount: T): StatefulConstraint[T] =
+    ## NValue with a constant required count; `constantValues` are literal array
+    ## entries (always present).
+    let constraint = newNValueConstraint[T](arrayPositions, -1, constantValues, fixedCount)
+    return StatefulConstraint[T](
+        positions: constraint.allPositions,
+        stateType: NValueType,
+        nvalueState: constraint
+    )
+
 func nvalue*[T](arrayPositions: openArray[int], targetPosition: int): StatefulConstraint[T] =
     ## Creates an NValue constraint: the number of distinct values in array positions
     ## must equal the value at `targetPosition`.

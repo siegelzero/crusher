@@ -77,6 +77,7 @@ type
         circuitPenalty*: int
         timeWindowPenalty*: int
         circuitWeight*: int                  # weight for circuit violations
+        closureFree*: bool                   # equality chain: arc back into the depot is unconstrained
 
         # Scratch space
         scratchInAffected*: seq[bool]
@@ -308,7 +309,7 @@ proc computePenaltiesEquality[T](c: CircuitTimePropConstraint[T],
         let lastSucc = c.scratchPath[current]
         if lastSucc != c.depotIndex:
             circPenalty = 1
-        elif c.outConstrained[current]:
+        elif c.outConstrained[current] and not c.closureFree:
             cum += c.distanceMatrix[c.depotIndex][current]
             c.scratchSegNodes.add(c.depotIndex)
             c.scratchSegCum.add(cum)
@@ -604,7 +605,7 @@ proc moveDeltaIncEquality[T](c: CircuitTimePropConstraint[T],
         let lastSucc = if current == nodeIdx: newLink else: c.links[current]
         if lastSucc != c.depotIndex:
             circPen = 1
-        elif c.outConstrained[current]:
+        elif c.outConstrained[current] and not c.closureFree:
             cum += c.distanceMatrix[c.depotIndex][current]
             c.scratchSegNodes.add(c.depotIndex)
             c.scratchSegCum.add(cum)
@@ -701,6 +702,7 @@ proc deepCopy*[T](c: CircuitTimePropConstraint[T]): CircuitTimePropConstraint[T]
     result.arrivalPositions = c.arrivalPositions
     result.departurePositions = c.departurePositions
     result.circuitWeight = c.circuitWeight
+    result.closureFree = c.closureFree
 
     # Deep copy mutable state
     result.links = newSeq[int](c.n)

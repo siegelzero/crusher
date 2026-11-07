@@ -14,7 +14,7 @@
 ##   --memory <MiB>  memory budget; caps workers so peak memory fits (also reads
 ##                   the MEMORY_LIMIT env var and the cgroup limit)
 
-import std/[os, strutils, strformat, times, posix]
+import std/[os, strutils, strformat, times, posix, tables, packedsets]
 
 import crusher
 import flatzinc/[parser, translator, output]
@@ -152,6 +152,7 @@ proc main() =
     model = parseFznFile(filename)
     if verbose:
       stderr.writeLine(&"[FZN] Parsed: {model.variables.len} variables, {model.parameters.len} parameters, {model.constraints.len} constraints")
+      stderr.writeLine(&"[Mem] after parse: rss={currentRssBytes() div MiB}MiB")
 
     # Translate to ConstraintSystem
     if verbose:
@@ -159,6 +160,21 @@ proc main() =
     tr = translate(model, timeBudgetSecs = timeLimitMs.float / 1000.0)
     if verbose:
       stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
+      stderr.writeLine(&"[Mem] after translate: rss={currentRssBytes() div MiB}MiB")
+    if existsEnv("CRUSHER_DEBUG_VARS"):
+      # Debug: where did these FZN variables end up, and which constraints read them?
+      for vn in getEnv("CRUSHER_DEBUG_VARS").split(','):
+        if vn in tr.varPositions:
+          let p = tr.varPositions[vn]
+          var cs: seq[string]
+          for ci, c in tr.sys.baseArray.constraints:
+            if p in c.positions: cs.add($ci & ":" & $c.stateType & "/" & $c.positions.len)
+          stderr.writeLine("[DebugVars] " & vn & " pos=" & $p & " channel=" &
+                           $(p in tr.sys.baseArray.channelPositions) & " constraints=" & cs.join(" "))
+        elif vn in tr.definedVarExprs:
+          stderr.writeLine("[DebugVars] " & vn & " defined expr over " & $tr.definedVarExprs[vn].positions.len & " positions")
+        else:
+          stderr.writeLine("[DebugVars] " & vn & " has no position")
   except CatchableError as e:
     stderr.writeLine(&"[FZN] Parse/translate failed: {e.msg}")
     printUnknown()
@@ -223,7 +239,10 @@ proc main() =
   let solveWallStart = epochTime()
   var solved = false
   var timedOut = false
-  case model.solve.kind
+  # A presolved (constant) objective turns optimization into satisfaction:
+  # any feasible solution is optimal.
+  let solveKind = if tr.objectivePos == ObjPosConstant: Satisfy else: model.solve.kind
+  case solveKind
   of Satisfy:
     try:
       tr.sys.resolve(
@@ -235,6 +254,8 @@ proc main() =
       )
       solved = true
       tr.sys.hasFeasibleSolution = true
+      if tr.objectivePos == ObjPosConstant:
+        tr.sys.optimalityProven = true
     except TimeLimitExceededError:
       timedOut = true
     except NoSolutionFoundError:
@@ -371,6 +392,8 @@ proc main() =
     # Print the final solution, unless `-i` already streamed this exact assignment
     # (avoid a redundant trailing duplicate block). Streaming never fires for geost
     # models, so those always print here.
+    if existsEnv("CRUSHER_DUMP_ALL"):
+      tr.dumpAllVarValues(getEnv("CRUSHER_DUMP_ALL"))
     if not (canStream and lastStreamedAssignment.len > 0 and
             tr.sys.assignment == lastStreamedAssignment):
       tr.printSolution()

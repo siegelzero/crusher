@@ -196,7 +196,7 @@ proc buildReifChannelBindings(tr: var FznTranslator) =
                 let binding = ChannelBinding[int](
                     channelPosition: bPos,
                     indexExpression: indexExpr,
-                    arrayElements: @[ArrayElement[int](isConstant: true, constantValue: 1)]
+                    arrayElements: toSharedElems(@[ArrayElement[int](isConstant: true, constantValue: 1)])
                 )
                 tr.sys.baseArray.channelBindings.add(binding)
                 tr.sys.baseArray.channelPositions.incl(bPos)

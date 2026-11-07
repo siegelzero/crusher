@@ -1,6 +1,7 @@
 ## FlatZinc translator - maps FznModel to ConstraintSystem[int].
 
 import std/[tables, sequtils, strutils, strformat, packedsets, sets, math, algorithm, hashes, times]
+from std/os import existsEnv, getEnv
 
 import parser
 import dfaExtract
@@ -14,6 +15,8 @@ const
     ObjPosDefinedExpr* = -1   ## Objective is a defined-variable expression
     ObjPosWeightedSV* = -3    ## Objective is a WeightedSameValueExpression
     ObjPosBinaryPairwiseSum* = -4  ## Objective is a BinaryPairwiseSumExpression
+    ObjPosConstant* = -5      ## Objective is a fixed parameter/literal (presolved away):
+                              ## solve as satisfy; any solution is optimal
 
 type
     CountEqPattern* = object
@@ -286,6 +289,12 @@ type
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int
+        # Reified-arc families (tryMatchReifArcFamilies): exact equality chains
+        hasValueOffset*: bool           # valueOffset set explicitly (else legacy auto-detect)
+        valueOffset*: int               # successor value denoting node 0
+        closureFree*: bool              # arcs back into the depot carry no constraint
+        keepCircuit*: bool              # the crusher_circuit stays; CTP circuit weight 0
+        exactChain*: bool               # equalities define every time: projection exempt
 
     FznTranslator* = object
         sys*: ConstraintSystem[int]
@@ -1146,6 +1155,23 @@ proc buildObjectiveStaging(tr: var FznTranslator) =
     stderr.writeLine(&"[FZN] Objective staging: var '{vname}' (weight={bestW}, dom {vLo}..{vHi}), " &
                      &"{vHi - vLo} stages, up to {maxFixes} positions fixed per stage")
 
+
+proc debugWatchClauses(tr: FznTranslator, label: string) =
+    ## CRUSHER_DEBUG_WATCH=<var>: report bool_clause constraints mentioning <var>
+    ## and whether a pass consumed them (definingConstraints) — bisects drops.
+    let w = getEnv("CRUSHER_DEBUG_WATCH")
+    if w.len == 0: return
+    for ci, con in tr.model.constraints:
+        var hit = false
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident == w: hit = true
+            elif arg.kind == FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent and e.ident == w: hit = true
+        if hit:
+            stderr.writeLine("[Watch] " & label & ": ci=" & $ci & " " & con.name &
+                             " consumed=" & $(ci in tr.definingConstraints))
+
 proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     ## Translates a complete FznModel to a ConstraintSystem.
     ## timeBudgetSecs is the caller's total solve budget (0 = unknown); optional
@@ -1401,6 +1427,9 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.detectSetUnionChannels()
     # Detect equality copy variables (vars only in defines_var constraints, aliased to original)
     result.detectEqualityCopyVars()
+    # Split remaining cond -> (c1 /\ ... /\ ck) implications into cond -> cj so case
+    # analysis can see cond -> (target == value) (appends; consumes the originals)
+    result.splitImplicationConjunctions()
     # Detect case-analysis channels (bool_clause exhaustive case patterns → lookup tables)
     # Run as fixpoint: first pass channels simple targets (e.g. job_time), subsequent passes
     # channel targets that depend on earlier results (e.g. job_end depending on job_time).
@@ -1411,6 +1440,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
             prevCount = result.caseAnalysisDefs.len
             result.detectCaseAnalysisChannels()
             inc iterations
+    result.debugWatchClauses("after case analysis")
     # Detect int_lin_eq_reif defines_var patterns → channel variables
     # MUST run after case-analysis fixpoint (which uses int_lin_eq_reif via linEqReifMap)
     result.detectLinEqReifChannels()
@@ -1426,6 +1456,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Detect reif-equation channel vars: int_lin_eq_reif where one var can be solved for
     # MUST run after detectLinEqReifChannels (which consumes defines_var bool channels first)
     result.detectReifEquationChannelVars()
+    result.debugWatchClauses("after detectReifEquationChannelVars")
     # Detect conditional expression channels (optional variable decomposition patterns)
     # target = if occurs then linear_expr else constant
     # MUST run after detectLinEqReifChannels and detectBoolGatedVariableChannels
@@ -1433,12 +1464,15 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Detect conditional variable-source channels (EVM step predicate patterns)
     # MUST run after case-analysis fixpoint (uses same eqReifMap) and before implication patterns
     result.detectConditionalSourceChannels()
+    result.debugWatchClauses("after detectConditionalSourceChannels")
     # Prune bool_clauses and disjunctive clauses already implied by the
     # ConditionalSourceDefs we just built. Otherwise the same conditional
     # logic ships to search twice — once as channels, once as constraints.
     result.pruneClausesImpliedByConditionalSource()
+    result.debugWatchClauses("after pruneClausesImpliedByConditionalSource")
     # Detect implication-to-table and one-hot channel patterns
     result.detectImplicationPatterns()
+    result.debugWatchClauses("after detectImplicationPatterns")
     # Detect conditional gain patterns (reified value assignment → element channel)
     result.detectConditionalGainChannels()
     # Detect NoOverlap patterns (6-literal bool_clause → 3D box non-overlap)
@@ -1463,6 +1497,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Detect redundant disjunctive pairs implied by max/min conditions.
     # MUST run after detectDisjunctivePairs (which populates disjunctivePairs).
     result.detectRedundantDisjunctions()
+    result.debugWatchClauses("after detectRedundantDisjunctions")
     # Eliminate disconnected all_different constraints whose variables appear nowhere else.
     # MUST run just before translateVariables so definedVarNames additions take effect.
     # DISABLED: removing disconnected variables can hurt search quality in some cases
@@ -1487,6 +1522,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # newly-promoted names.
     result.rescueDefinedVarsToChannels()
     result.translateVariables()
+    result.debugWatchClauses("after translateVariables")
     # Detect bivalent integer vars structurally pinned by another var via a
     # shared reif bool, and channel them so they stop being search positions.
     # MUST run after translateVariables (positions exist) and before any
@@ -1847,8 +1883,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
         #      formally in `definingConstraints`. Counting refs from these keeps
         #      element results that feed into reification/min/max channels alive.
         var varRefCount: Table[string, int]
-        for ci in 0 ..< model.constraints.len:
-            let con {.cursor.} = model.constraints[ci]
+        for ci in 0 ..< result.model.constraints.len:
+            let con {.cursor.} = result.model.constraints[ci]
             if ci in result.redundantOrderings: continue
             for arg in con.args:
                 case arg.kind
@@ -1869,8 +1905,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
                         varRefCount.mgetOrPut(annArg.ident, 0) += 1
 
         var nElementConsumed = 0
-        for ci in 0 ..< model.constraints.len:
-            let con {.cursor.} = model.constraints[ci]
+        for ci in 0 ..< result.model.constraints.len:
+            let con {.cursor.} = result.model.constraints[ci]
             if ci in result.definingConstraints: continue
             let name = stripSolverPrefix(con.name)
             if name notin ["array_int_element", "array_int_element_nonshifted",
@@ -1894,8 +1930,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
             stderr.writeLine(&"[FZN] Consumed {nElementConsumed} dead element constraints (result variable unreferenced)")
 
     var nSkippedDefining, nSkippedRedundant, nTranslated = 0
-    for ci in 0 ..< model.constraints.len:
-        let con {.cursor.} = model.constraints[ci]
+    for ci in 0 ..< result.model.constraints.len:
+        let con {.cursor.} = result.model.constraints[ci]
         if ci in result.definingConstraints:
             inc nSkippedDefining
             continue

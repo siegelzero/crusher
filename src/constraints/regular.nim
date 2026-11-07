@@ -8,6 +8,15 @@
 ## it counts 1 penalty and recovers to a pre-computed "background state" that
 ## preserves the DFA's column/row tracking. This gives penalties proportional to
 ## the number of distinct errors while maintaining correct positional context.
+##
+## **Hamming mode** (default when the DFA is small enough): the penalty is the
+## exact minimum number of variables that must change for the sequence to be
+## accepted, computed by forward/backward dynamic programming over the DFA
+## (fwd[i][s] = min changes to be in state s after i inputs, bwd[i][s] = min
+## changes to accept from state s at input i). This gives local search a smooth
+## gradient (e.g. nonogram lines), and moveDelta is O(states * inputs) by
+## combining fwd[idx] with bwd[idx+1]. The recovery penalty above is kept for
+## DFAs too large for the DP tables.
 
 import std/[packedsets, tables]
 
@@ -41,9 +50,21 @@ type
         lastChangeAffectedPositions*: PackedSet[int]
         lastChangeAffectedCost*: bool
 
+        # Hamming mode (see module doc). Tables are flat: [i * stride + s] with
+        # stride = nStates + 1 (state 0 = fail, always HInf).
+        useHamming*: bool
+        hVals*: seq[int]                 # current input value per index
+        hFwd*: seq[int]                  # (n+1) * stride
+        hBwd*: seq[int]                  # (n+1) * stride
+
 ################################################################################
 # Constructor
 ################################################################################
+
+const
+    RegularHammingMaxStateInputs* = 4096
+    RegularHammingMaxWork* = 1_000_000
+    HInf = high(int) div 4
 
 proc newRegularConstraint*[T](positions: openArray[int],
                                nStates: int,
@@ -75,6 +96,14 @@ proc newRegularConstraint*[T](positions: openArray[int],
     # Background states are computed properly in initialize() via initializeBackgroundStates()
     # once the actual assignment (with sentinel positions) is available.
     result.backgroundState = newSeq[int](result.n)
+
+    # Hamming mode when the DP tables are cheap: per-update work is
+    # n * nStates * nInputs, per-move work nStates * nInputs.
+    let nInputs = int(inputMax) - int(inputMin) + 1
+    result.useHamming = not defined(regularRecovery) and
+                        result.positionToIndex.len == result.n and
+                        nStates * nInputs <= RegularHammingMaxStateInputs and
+                        result.n * nStates * nInputs <= RegularHammingMaxWork
 
 ################################################################################
 # DFA simulation
@@ -133,9 +162,102 @@ proc initializeBackgroundStates*[T](state: RegularConstraint[T], assignment: seq
         state.backgroundState[i] = bgState
 
 
+
+################################################################################
+# Hamming mode
+################################################################################
+
+proc hRecomputeFwd[T](state: RegularConstraint[T], fromIdx: int) =
+    ## Recompute fwd rows fromIdx+1..n (row fromIdx must be valid).
+    let stride = state.nStates + 1
+    let nIn = int(state.inputMax) - int(state.inputMin) + 1
+    for i in fromIdx..<state.n:
+        let base = i * stride
+        let nb = base + stride
+        for s in 0..<stride: state.hFwd[nb + s] = HInf
+        let xi = state.hVals[i] - int(state.inputMin)
+        for s in 1..state.nStates:
+            let f = state.hFwd[base + s]
+            if f >= HInf: continue
+            let row = state.transition[s - 1]
+            for k in 0..<min(nIn, row.len):
+                let ns = row[k]
+                if ns <= 0: continue
+                let c = f + (if k == xi: 0 else: 1)
+                if c < state.hFwd[nb + ns]: state.hFwd[nb + ns] = c
+
+proc hRecomputeBwd[T](state: RegularConstraint[T], fromIdx: int) =
+    ## Recompute bwd rows fromIdx down to 0 (row fromIdx+1 must be valid).
+    let stride = state.nStates + 1
+    let nIn = int(state.inputMax) - int(state.inputMin) + 1
+    for i in countdown(fromIdx, 0):
+        let base = i * stride
+        let nb = base + stride
+        let xi = state.hVals[i] - int(state.inputMin)
+        state.hBwd[base] = HInf
+        for s in 1..state.nStates:
+            var best = HInf
+            let row = state.transition[s - 1]
+            for k in 0..<min(nIn, row.len):
+                let ns = row[k]
+                if ns <= 0: continue
+                let b = state.hBwd[nb + ns]
+                if b >= HInf: continue
+                let c = b + (if k == xi: 0 else: 1)
+                if c < best: best = c
+            state.hBwd[base + s] = best
+
+proc hCost[T](state: RegularConstraint[T]): int {.inline.} =
+    let c = state.hBwd[state.initialState]
+    # No accepted string of this length at all: constant maximal penalty.
+    if c >= HInf: state.n + 1 else: c
+
+proc hInitialize[T](state: RegularConstraint[T]) =
+    let stride = state.nStates + 1
+    state.hVals = newSeq[int](state.n)
+    for i in 0..<state.n:
+        state.hVals[i] = int(state.currentAssignment[state.sortedPositions[i]])
+    state.hFwd = newSeq[int]((state.n + 1) * stride)
+    state.hBwd = newSeq[int]((state.n + 1) * stride)
+    for s in 0..<stride: state.hFwd[s] = HInf
+    state.hFwd[state.initialState] = 0
+    state.hRecomputeFwd(0)
+    let last = state.n * stride
+    for s in 0..<stride:
+        state.hBwd[last + s] = if s > 0 and s in state.finalStates: 0 else: HInf
+    if state.n > 0: state.hRecomputeBwd(state.n - 1)
+    state.cost = state.hCost()
+
+proc hCostWith[T](state: RegularConstraint[T], idx: int, newValue: T): int =
+    ## Penalty if the input at idx were newValue (all else unchanged).
+    let stride = state.nStates + 1
+    let nIn = int(state.inputMax) - int(state.inputMin) + 1
+    let base = idx * stride
+    let nb = base + stride
+    let xi = int(newValue) - int(state.inputMin)
+    var best = HInf
+    for s in 1..state.nStates:
+        let f = state.hFwd[base + s]
+        if f >= HInf: continue
+        let row = state.transition[s - 1]
+        for k in 0..<min(nIn, row.len):
+            let ns = row[k]
+            if ns <= 0: continue
+            let b = state.hBwd[nb + ns]
+            if b >= HInf: continue
+            let c = f + b + (if k == xi: 0 else: 1)
+            if c < best: best = c
+    if best >= HInf: state.n + 1 else: best
+
 proc initialize*[T](state: RegularConstraint[T], assignment: seq[T]) =
     for pos in state.positions.items:
         state.currentAssignment[pos] = assignment[pos]
+
+    if state.useHamming:
+        state.hInitialize()
+        state.lastChangeAffectedPositions = state.positions
+        state.lastChangeAffectedCost = true
+        return
 
     # Compute background states with actual sentinel positions
     state.initializeBackgroundStates(assignment)
@@ -170,6 +292,17 @@ proc updatePosition*[T](state: RegularConstraint[T], position: int, newValue: T)
 
     state.currentAssignment[position] = newValue
     let idx = state.positionToIndex[position]
+
+    if state.useHamming:
+        state.hVals[idx] = int(newValue)
+        state.hRecomputeFwd(idx)
+        state.hRecomputeBwd(idx)
+        let newCost = state.hCost()
+        state.lastChangeAffectedCost = newCost != state.cost
+        state.cost = newCost
+        # Every position's move delta depends on the whole line's DP tables.
+        state.lastChangeAffectedPositions = state.positions
+        return
 
     # Re-run DFA with recovery from the changed position forward
     state.lastChangeAffectedPositions = initPackedSet[int]()
@@ -244,6 +377,10 @@ proc deepCopy*[T](state: RegularConstraint[T]): RegularConstraint[T] =
     result.backgroundState = @(state.backgroundState)
     result.lastChangeAffectedPositions = state.lastChangeAffectedPositions
     result.lastChangeAffectedCost = state.lastChangeAffectedCost
+    result.useHamming = state.useHamming
+    result.hVals = state.hVals
+    result.hFwd = state.hFwd
+    result.hBwd = state.hBwd
 
 
 proc moveDelta*[T](state: RegularConstraint[T], position: int, oldValue, newValue: T): int =
@@ -251,6 +388,9 @@ proc moveDelta*[T](state: RegularConstraint[T], position: int, oldValue, newValu
         return 0
 
     let idx = state.positionToIndex[position]
+
+    if state.useHamming:
+        return state.hCostWith(idx, newValue) - state.cost
 
     # Temporarily change
     state.currentAssignment[position] = newValue

@@ -21,23 +21,38 @@ type
         currentAssignment*: Table[int, T]
         allPositions*: PackedSet[int]
         lastChangeAffectedCost*: bool
+        # targetPosition = -1: the count is the constant fixedCount
+        fixedCount*: T
+        # Literal entries of the array: always present, counted at initialization
+        constantValues*: seq[T]
 
-func newNValueConstraint*[T](arrayPositions: openArray[int], targetPosition: int): NValueConstraint[T] =
+func newNValueConstraint*[T](arrayPositions: openArray[int], targetPosition: int,
+                             constantValues: openArray[T] = [], fixedCount: T = 0): NValueConstraint[T] =
+    ## targetPosition < 0 means the required number of distinct values is the
+    ## constant `fixedCount` (e.g. MiniZinc fixed the count at compile time).
     new(result)
     result.arrayPositions = toPackedSet[int](arrayPositions)
-    result.targetPosition = targetPosition
+    result.targetPosition = if targetPosition < 0: -1 else: targetPosition
     result.valueCounts = initTable[T, int]()
     result.distinctCount = 0
-    result.requiredCount = 0
+    result.requiredCount = fixedCount
+    result.fixedCount = fixedCount
+    result.constantValues = @constantValues
     result.cost = 0
     result.currentAssignment = initTable[int, T]()
     result.allPositions = toPackedSet[int](arrayPositions)
-    result.allPositions.incl(targetPosition)
+    if result.targetPosition >= 0:
+        result.allPositions.incl(targetPosition)
 
 {.push overflowChecks: off.}
 proc initialize*[T](state: NValueConstraint[T], assignment: seq[T]) =
     state.valueCounts.clear()
     state.distinctCount = 0
+    for v in state.constantValues:
+        let oldCount = state.valueCounts.getOrDefault(v, 0)
+        state.valueCounts[v] = oldCount + 1
+        if oldCount == 0:
+            state.distinctCount += 1
     for pos in state.arrayPositions.items:
         state.currentAssignment[pos] = assignment[pos]
         let v = assignment[pos]
@@ -45,8 +60,11 @@ proc initialize*[T](state: NValueConstraint[T], assignment: seq[T]) =
         state.valueCounts[v] = oldCount + 1
         if oldCount == 0:
             state.distinctCount += 1
-    state.currentAssignment[state.targetPosition] = assignment[state.targetPosition]
-    state.requiredCount = assignment[state.targetPosition]
+    if state.targetPosition >= 0:
+        state.currentAssignment[state.targetPosition] = assignment[state.targetPosition]
+        state.requiredCount = assignment[state.targetPosition]
+    else:
+        state.requiredCount = state.fixedCount
     state.cost = abs(state.distinctCount - state.requiredCount)
 
 proc updatePosition*[T](state: NValueConstraint[T], position: int, newValue: T) =
@@ -132,3 +150,5 @@ proc deepCopy*[T](state: NValueConstraint[T]): NValueConstraint[T] =
         result.currentAssignment[k] = v
     result.allPositions = state.allPositions
     result.lastChangeAffectedCost = state.lastChangeAffectedCost
+    result.fixedCount = state.fixedCount
+    result.constantValues = state.constantValues

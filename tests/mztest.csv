@@ -76,3 +76,10 @@ work_task_variation_s3_l10,2025/work-task-variation/work-task-variation.mzn,2025
 # (circuits + inverse channeling checked by hand, rest by mzn flattening)
 stochastic_vrp_s2_v2_c8,2019/stochastic-vrp/vrp-s2-v2-c8_vrp-v2-c8_det.mzn,-,minimize,20000,150,350
 cvrp_simple2,2015/cvrp/cvrp.mzn,2015/cvrp/simple2.dzn,minimize,10000,34,40
+
+# MiniZinc Challenge 2026 (bounds = proven optimum unless noted)
+filters_2026_ewf_1_3,2026/filters/filter.mzn,2026/filters/ewf_1_3.dzn,minimize,10000,28,28
+gbac_2026_csplib12,2026/gbac/gbac.mzn,2026/gbac/csplib12-gbac.dzn,minimize,15000,0,0
+workforce_alloc_2026_174,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_174.dzn,minimize,10000,45,45
+atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance6-stage2.dzn,minimize,5000,726404,726404
+nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,

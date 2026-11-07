@@ -488,10 +488,21 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # Create population: deepCopy sequentially (safe), init in parallel (fast)
     let populationStartTime = epochTime()
     var population = newSeq[TabuState[T]](populationSize)
+    if verbose: logInitRss("pre-population-copy")
+    if existsEnv("CRUSHER_DEBUG_CARRAYMEM"):
+        var totalElems, maxElems = 0
+        for b in system.baseArray.channelBindings:
+            totalElems += b.arrayElements.len
+            maxElems = max(maxElems, b.arrayElements.len)
+        echo "[Mem]   channelBindings: n=" & $system.baseArray.channelBindings.len &
+             " totalElems=" & $totalElems & " maxElems=" & $maxElems &
+             " (~" & $(totalElems * sizeof(ArrayElement[T]) div (1024*1024)) & "MiB elems)"
     var templateArray = system.baseArray.deepCopy()
+    if verbose: logInitRss("template carray copy")
     var carrays = newSeq[ConstrainedArray[T]](populationSize)
     for i in 0..<populationSize:
         carrays[i] = templateArray.deepCopy()
+    if verbose: logInitRss($populationSize & " carray copies")
 
     # Assign init strategies. When seed is provided (optimization rounds), state 0 is
     # seeded (warm start) and states 1/2 get min/max for diversity. Without seed (initial

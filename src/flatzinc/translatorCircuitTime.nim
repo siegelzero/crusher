@@ -1021,7 +1021,7 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
 
     for k in 0..<candidates.len:
         keep[k] = true
-        if not candidates[k].forward: continue   # equality form: exempt
+        if not candidates[k].forward or candidates[k].exactChain: continue   # equality form: exempt
 
         var timeSet: HashSet[string]
         for tn in candidates[k].timeVarNames:
@@ -1301,6 +1301,369 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
     candidates = kept
 
 
+proc tryMatchReifArcFamilies(tr: var FznTranslator, circuitCI: int,
+                              elems: seq[FznExpr], claimed: PackedSet[int],
+                              candidates: var seq[CircuitTimeCandidate]) =
+    ## Reified-arc chains on a successor circuit (e.g. single-machine scheduling
+    ## with sequence-dependent setups, atp-stage2):
+    ##   bool_clause([ne(succ_i, j), B], [])    -- succ_i = j  ->  B
+    ##   bool_clause([B], [eq(succ_i, j)])       -- (same, other polarity)
+    ## where B is int_lin_eq_reif / int_eq_reif / array_bool_and of those, each
+    ## an exact equation  T_F[j] = T_F[i] + c(i, j)  for some family F of
+    ## per-node variables (start times, per-product accumulators, ...), and
+    ## depot arcs give  T_F[j] = c(depot, j).  Defined variables are resolved
+    ## through their int_lin_eq definitions (end_i = start_i + d_i).
+    ##
+    ## Every complete family (an equation on every arc out of every node) becomes
+    ## an exact CircuitTimeProp equality chain: its variables turn into channels
+    ## computed by walking the tour, so the search only moves successors. The
+    ## circuit constraint itself is kept (circuit moves; CTP circuit weight 0).
+    let n = elems.len
+    var linkVarNames = newSeq[string](n)
+    var rawFixedLinks = newSeq[int](n)
+    var nodeOfLinkVar: Table[string, int]
+    for i, e in elems:
+        case e.kind
+        of FznIdent:
+            if e.ident in nodeOfLinkVar: return
+            linkVarNames[i] = e.ident
+            nodeOfLinkVar[e.ident] = i
+        of FznIntLit:
+            rawFixedLinks[i] = e.intVal
+        else: return
+    if nodeOfLinkVar.len == 0: return
+    # Successor value offset: 0-based iff some link can take 0 (and none n).
+    var offset = 1
+    block:
+        var hasZero, hasN = false
+        for vn in linkVarNames:
+            if vn == "": continue
+            let (lo, hi) = tr.circuitTimeDomainBounds(vn)
+            if lo <= 0: hasZero = true
+            if hi >= n: hasN = true
+        if hasZero and not hasN: offset = 0
+        elif hasZero and hasN: return
+
+    # --- Defined-variable resolution: v = sign*w + k from int_lin_eq definitions
+    type Lin = tuple[ok: bool, coeffs: Table[string, int], k: int]   # sum(coeffs*vars) + k
+    var defOf: Table[string, (string, int, int)]   # v -> (w, a, b) with v = a*w + b
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_lin_eq": continue
+        if not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        let dv = ann.args[0].ident
+        let cs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let vs = tr.resolveVarArrayElems(con.args[1])
+        if cs.len != 2 or vs.len != 2: continue
+        if vs[0].kind != FznIdent or vs[1].kind != FznIdent: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let (di, oi) = if vs[0].ident == dv: (0, 1) elif vs[1].ident == dv: (1, 0) else: (-1, -1)
+        if di < 0 or abs(cs[di]) != 1 or abs(cs[oi]) != 1: continue
+        # cd*dv + co*w = rhs  ->  dv = (rhs - co*w)/cd
+        defOf[dv] = (vs[oi].ident, -cs[oi] * cs[di], rhs * cs[di])
+
+    proc addTerm(t: var Table[string, int], k: var int, name: string, c: int,
+                 defOf: Table[string, (string, int, int)]) =
+        if name in defOf:
+            let (w, a, b) = defOf[name]
+            t.mgetOrPut(w, 0) += c * a
+            k += c * b
+        else:
+            t.mgetOrPut(name, 0) += c
+
+    # --- Equation bools: b <-> (sum(coeffs*vars) + k == 0)
+    var eqOf: Table[string, Lin]
+    var eqDefCI: Table[string, int]
+    var andOf: Table[string, seq[string]]
+    var andDefCI: Table[string, int]
+    var neOf, eqLinkOf: Table[string, (int, int)]   # bool -> (node i, node j)
+    var reifDefCI: Table[string, int]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if not con.hasAnnotation("defines_var"): continue
+        case name
+        of "int_lin_eq_reif":
+            if con.args.len < 4 or con.args[3].kind != FznIdent: continue
+            let cs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+            let vs = tr.resolveVarArrayElems(con.args[1])
+            let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+            var t: Table[string, int]
+            var k = -rhs
+            var ok = cs.len == vs.len
+            for q in 0..<min(cs.len, vs.len):
+                if vs[q].kind == FznIdent: addTerm(t, k, vs[q].ident, cs[q], defOf)
+                elif vs[q].kind == FznIntLit: k += cs[q] * vs[q].intVal
+                else: ok = false
+            if ok:
+                eqOf[con.args[3].ident] = (ok: true, coeffs: t, k: k)
+                eqDefCI[con.args[3].ident] = ci
+        of "int_eq_reif", "int_ne_reif":
+            if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+            let b = con.args[2].ident
+            if con.args[0].kind == FznIdent and con.args[0].ident in nodeOfLinkVar and
+               con.args[1].kind == FznIntLit:
+                let i = nodeOfLinkVar[con.args[0].ident]
+                let j = con.args[1].intVal - offset
+                if j >= 0 and j < n:
+                    if name == "int_ne_reif": neOf[b] = (i, j) else: eqLinkOf[b] = (i, j)
+                    reifDefCI[b] = ci
+            elif name == "int_eq_reif" and con.args[0].kind == FznIdent and
+                 con.args[1].kind == FznIntLit:
+                var t: Table[string, int]
+                var k = -con.args[1].intVal
+                addTerm(t, k, con.args[0].ident, 1, defOf)
+                eqOf[b] = (ok: true, coeffs: t, k: k)
+                eqDefCI[b] = ci
+            elif name == "int_eq_reif" and con.args[0].kind == FznIdent and
+                 con.args[1].kind == FznIdent and con.args[0].ident notin nodeOfLinkVar and
+                 con.args[1].ident notin nodeOfLinkVar:
+                # x == y (zero increment on this arc)
+                var t: Table[string, int]
+                var k = 0
+                addTerm(t, k, con.args[0].ident, 1, defOf)
+                addTerm(t, k, con.args[1].ident, -1, defOf)
+                eqOf[b] = (ok: true, coeffs: t, k: k)
+                eqDefCI[b] = ci
+        of "array_bool_and":
+            if con.args.len < 2 or con.args[1].kind != FznIdent: continue
+            let lits = tr.resolveVarArrayElems(con.args[0])
+            var names: seq[string]
+            var ok = true
+            for l in lits:
+                if l.kind == FznIdent: names.add(l.ident) else: ok = false
+            if ok:
+                andOf[con.args[1].ident] = names
+                andDefCI[con.args[1].ident] = ci
+        else: discard
+
+    # --- Arc implications
+    type ArcEq = tuple[i, j: int, coeffs: Table[string, int], k: int]
+    var arcEqs: seq[ArcEq]
+    var clauseOfEq: seq[int]           # arcEqs index -> clause CI
+    var clauseEqs: Table[int, seq[int]]  # clause CI -> arcEqs indices
+    var clauseBools: Table[int, seq[string]]  # clause CI -> bools it references
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in claimed or ci in tr.definingConstraints: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "bool_clause" or con.args.len < 2: continue
+        let pos = tr.resolveVarArrayElems(con.args[0])
+        let neg = tr.resolveVarArrayElems(con.args[1])
+        var arc = (-1, -1)
+        var body = ""
+        if pos.len == 2 and neg.len == 0 and pos[0].kind == FznIdent and pos[1].kind == FznIdent:
+            if pos[0].ident in neOf: (arc, body) = (neOf[pos[0].ident], pos[1].ident)
+            elif pos[1].ident in neOf: (arc, body) = (neOf[pos[1].ident], pos[0].ident)
+        elif pos.len == 1 and neg.len == 1 and pos[0].kind == FznIdent and neg[0].kind == FznIdent:
+            if neg[0].ident in eqLinkOf: (arc, body) = (eqLinkOf[neg[0].ident], pos[0].ident)
+        if arc[0] < 0: continue
+        var parts = if body in andOf: andOf[body] else: @[body]
+        var ok = true
+        for b in parts:
+            if b notin eqOf: ok = false
+        if not ok: continue
+        var bools = parts
+        if body in andOf: bools.add(body)
+        for pl in pos:
+            if pl.kind == FznIdent: bools.add(pl.ident)
+        for nl in neg:
+            if nl.kind == FznIdent: bools.add(nl.ident)
+        clauseBools[ci] = bools
+        for b in parts:
+            let e = eqOf[b]
+            var t: Table[string, int]
+            for v, c in e.coeffs.pairs:
+                if c != 0: t[v] = c
+            arcEqs.add((i: arc[0], j: arc[1], coeffs: t, k: e.k))
+            clauseOfEq.add(ci)
+            clauseEqs.mgetOrPut(ci, @[]).add(arcEqs.len - 1)
+    if arcEqs.len == 0: return
+
+    # --- Depot: the node whose outgoing equations are all single-variable
+    var depot = -1
+    for i in 0..<n:
+        var nOut, nSingle = 0
+        for e in arcEqs:
+            if e.i == i:
+                inc nOut
+                if e.coeffs.len == 1: inc nSingle
+        if nOut > 0 and nSingle == nOut:
+            if depot >= 0: return   # ambiguous
+            depot = i
+    if depot < 0: return
+
+    # --- Seeds: variable -> node from depot arcs (T[j] = const)
+    var nodeOfVar: Table[string, int]
+    for e in arcEqs:
+        if e.i != depot: continue
+        for v, c in e.coeffs.pairs:
+            if abs(c) != 1: return
+            if v in nodeOfVar and nodeOfVar[v] != e.j: return
+            nodeOfVar[v] = e.j
+    # --- Families: union-find over variables linked by arc equations
+    var parent: Table[string, string]
+    proc find(parent: var Table[string, string], x: string): string =
+        var r = x
+        while parent.getOrDefault(r, r) != r: r = parent[r]
+        r
+    for v in nodeOfVar.keys: parent[v] = v
+    var eqFamily = newSeq[string](arcEqs.len)   # root var per equation ("" = unusable)
+    for q, e in arcEqs:
+        if e.i == depot:
+            for v in e.coeffs.keys: eqFamily[q] = v
+            continue
+        if e.coeffs.len != 2: continue
+        var vs: seq[(string, int)]
+        for v, c in e.coeffs.pairs: vs.add((v, c))
+        if vs[0][1] + vs[1][1] != 0 or abs(vs[0][1]) != 1: continue
+        if vs[0][0] notin nodeOfVar or vs[1][0] notin nodeOfVar: continue
+        let ra = find(parent, vs[0][0])
+        let rb = find(parent, vs[1][0])
+        if ra != rb: parent[ra] = rb
+        eqFamily[q] = vs[0][0]
+    for q in 0..<arcEqs.len:
+        if eqFamily[q] != "": eqFamily[q] = find(parent, eqFamily[q])
+
+    # --- Build each family's chain and check completeness
+    var famIdx: Table[string, int]
+    var famT: seq[seq[string]]
+    var famDist: seq[seq[seq[int]]]
+    var famHas: seq[seq[seq[bool]]]
+    var famBad: seq[bool]
+    for v in nodeOfVar.keys:
+        let r = find(parent, v)
+        if r notin famIdx:
+            famIdx[r] = famT.len
+            famT.add(newSeq[string](n))
+            famDist.add(newSeqWith(n, newSeq[int](n)))
+            famHas.add(newSeqWith(n, newSeq[bool](n)))
+            famBad.add(false)
+        let f = famIdx[r]
+        let node = nodeOfVar[v]
+        if famT[f][node] != "" and famT[f][node] != v: famBad[f] = true
+        famT[f][node] = v
+    for q, e in arcEqs:
+        if eqFamily[q] == "" or eqFamily[q] notin famIdx: continue
+        let f = famIdx[eqFamily[q]]
+        var d: int
+        if e.i == depot:
+            # c*T[j] + k = 0  ->  T[j] = -k/c   (c = +-1)
+            var c = 0
+            var v = ""
+            for vv, cc in e.coeffs.pairs: (v, c) = (vv, cc)
+            if famT[f][e.j] != v: famBad[f] = true; continue
+            d = -e.k * c
+        else:
+            let tj = famT[f][e.j]
+            let ti = famT[f][e.i]
+            if tj == "" or ti == "" or e.coeffs.getOrDefault(tj, 0) == 0 or
+               e.coeffs.getOrDefault(ti, 0) == 0 or tj == ti:
+                famBad[f] = true; continue
+            # cj*Tj + ci*Ti + k = 0 with cj = -ci = +-1  ->  Tj = Ti - k/cj
+            let cj = e.coeffs[tj]
+            d = -e.k * cj
+        if famHas[f][e.j][e.i] and famDist[f][e.j][e.i] != d: famBad[f] = true
+        famHas[f][e.j][e.i] = true
+        famDist[f][e.j][e.i] = d
+    # Completeness: every arc (i -> j), j != depot, j in dom(succ_i)
+    var accepted: seq[int]
+    for f in 0..<famT.len:
+        if famBad[f]: continue
+        var complete = true
+        for i in 0..<n:
+            if linkVarNames[i] == "": continue
+            let dom = if linkVarNames[i] in tr.presolveDomains: tr.presolveDomains[linkVarNames[i]]
+                      else:
+                          let (lo, hi) = tr.circuitTimeDomainBounds(linkVarNames[i])
+                          toSeq(lo..hi)
+            for v in dom:
+                let j = v - offset
+                if j < 0 or j >= n or j == i or j == depot: continue
+                if not famHas[f][j][i] or famT[f][j] == "" or (i != depot and famT[f][i] == ""):
+                    complete = false
+                    break
+            if not complete: break
+        if complete: accepted.add(f)
+    if accepted.len == 0: return
+    var acceptedRoots: HashSet[string]
+    for f in accepted:
+        for v in famT[f]:
+            if v != "": acceptedRoots.incl(find(parent, v))
+
+    # --- Consumable clauses: every equation in the body belongs to an accepted family
+    var consumed: PackedSet[int]
+    for ci, eqs in clauseEqs.pairs:
+        var ok = true
+        for q in eqs:
+            if eqFamily[q] == "" or eqFamily[q] notin acceptedRoots: ok = false
+        if ok: consumed.incl(ci)
+    if consumed.len == 0: return
+    # Bools used only by consumed clauses (and their defining reifs) are dead too
+    var useCount: CountTable[string]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        for arg in con.args:
+            if arg.kind == FznIdent: useCount.inc(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent: useCount.inc(e.ident)
+    var consumedUse: CountTable[string]
+    for ci in consumed.items:
+        for b in clauseBools[ci]: consumedUse.inc(b)
+    # array_bool_and outputs' own args count as uses of their literals
+    var allConsumed = consumed
+    for b, cnt in consumedUse.pairs:
+        # uses outside consumed clauses: total - consumed - its own definition (1)
+        let defCI = if b in eqDefCI: eqDefCI[b] elif b in andDefCI: andDefCI[b]
+                    elif b in reifDefCI: reifDefCI[b] else: -1
+        if defCI < 0: continue
+        var extra = useCount.getOrDefault(b, 0) - cnt - 1
+        if b in andOf: discard
+        # literals of a consumed array_bool_and are used by that and
+        for a, lits in andOf.pairs:
+            if a in consumedUse and b in lits: extra -= 1
+        if extra <= 0: allConsumed.incl(defCI)
+
+    for f in accepted:
+        var cand = CircuitTimeCandidate(circuitCI: circuitCI)
+        cand.forward = true
+        cand.linkVarNames = linkVarNames
+        cand.rawFixedLinks = rawFixedLinks
+        cand.distMatrix = famDist[f]
+        cand.earlyTimes = newSeq[int](n)
+        cand.lateTimes = newSeq[int](n)
+        cand.arrivalVars = newSeq[string](n)
+        cand.departureVars = newSeq[string](n)
+        cand.timeVarNames = newSeq[string](n)
+        cand.outConstrained = newSeqWith(n, true)
+        for node in 0..<n:
+            let v = famT[f][node]
+            if node == depot or v == "":
+                cand.earlyTimes[node] = 0
+                cand.lateTimes[node] = 0
+            else:
+                let (lo, hi) = tr.circuitTimeDomainBounds(v)
+                cand.earlyTimes[node] = lo
+                cand.lateTimes[node] = hi
+                cand.arrivalVars[node] = v
+                cand.timeVarNames[node] = v
+                cand.channelVars.add(v)
+        cand.depotIdx = depot
+        cand.depotDep = 0
+        cand.equalityChain = true
+        cand.exactChain = true
+        cand.closureFree = true
+        cand.keepCircuit = true
+        cand.hasValueOffset = true
+        cand.valueOffset = offset
+        cand.consumedCIs = allConsumed   # shared; definingConstraints is a set
+        candidates.add(cand)
+    stderr.writeLine("[FZN] Reified-arc circuit chains: " & $accepted.len & "/" & $famT.len &
+                     " families exact (" & $consumed.len & " arc clauses consumed, depot node " &
+                     $depot & ")")
+
 proc detectCircuitTimePropagation(tr: var FznTranslator) =
     ## Detect circuit-time patterns (one time-chain candidate plus any number
     ## of accumulator-chain candidates per crusher_circuit), verify soundness,
@@ -1350,6 +1713,12 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
         for k in nBefore..<candidates.len:
             for cci in candidates[k].consumedCIs.items:
                 claimed.incl(cci)
+        if not matchedTimeChain and candidates.len == nBefore:
+            let nB2 = candidates.len
+            tr.tryMatchReifArcFamilies(ci, elems, claimed, candidates)
+            for k in nB2..<candidates.len:
+                for cci in candidates[k].consumedCIs.items:
+                    claimed.incl(cci)
 
     if candidates.len == 0: return
 
@@ -1375,6 +1744,7 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
 
 proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
     ## Emit the CircuitTimeProp constraints after variable positions are created.
+    var keepCircuitCharged: PackedSet[int]
     var nLinked = 0
     var linkedExact = false
     for cand in tr.circuitTimeCandidates:
@@ -1404,7 +1774,9 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
         # Detect value offset (same logic as circuit translation). Successor
         # form is verified 1-based at detection time.
         var valueOffset = 1
-        if not cand.forward:
+        if cand.hasValueOffset:
+            valueOffset = cand.valueOffset
+        elif not cand.forward:
             var hasZero = false
             var hasN = false
             for pos in linkPositions:
@@ -1430,7 +1802,7 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
             departurePositions[i] = if dv != "" and dv in tr.varPositions: tr.varPositions[dv]
                                     else: -1
 
-        tr.sys.addConstraint(circuitTimeProp[int](
+        var ctpCon = circuitTimeProp[int](
             linkPositions,
             cand.distMatrix,
             cand.earlyTimes,
@@ -1450,7 +1822,25 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
             cand.useSumMetric,
             cand.sumMetricWeights,
             cand.equalityChain
-        ))
+        )
+        if cand.closureFree:
+            ctpCon.circuitTimePropState.closureFree = true
+        if cand.keepCircuit:
+            # The crusher_circuit constraint stays and drives circuit moves. Off
+            # the depot's tour the chain values are meaningless defaults, so the
+            # first chain on this circuit charges each unvisited node more than
+            # any single arc can cost elsewhere; further chains don't re-charge.
+            if cand.circuitCI in keepCircuitCharged:
+                ctpCon.circuitTimePropState.circuitWeight = 0
+            else:
+                keepCircuitCharged.incl(cand.circuitCI)
+                var maxD = 1
+                for other in tr.circuitTimeCandidates:
+                    if other.circuitCI != cand.circuitCI: continue
+                    for row in other.distMatrix:
+                        for d in row: maxD = max(maxD, abs(d))
+                ctpCon.circuitTimePropState.circuitWeight = max(n, 2 * maxD)
+        tr.sys.addConstraint(ctpCon)
 
         # NOTE: No separate allDifferent — the CircuitTimeProp circuit penalty already
         # penalizes duplicate values (they create tail nodes). Adding allDifferent as a

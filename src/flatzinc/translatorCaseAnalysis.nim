@@ -29,6 +29,38 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     let caseAnalysisStartTime = epochTime()
     let caseAnalysisDeadline = caseAnalysisStartTime + timeBudgetMs / 1000.0
 
+    # Defined variables that are a positioned variable plus a constant, through
+    # two-term int_lin_eq definitions (v = w + b with unit coefficients):
+    # usable as variable case values (element entries with an offset).
+    var linAlias: Table[string, (string, int)]
+    if not existsEnv("CRUSHER_NO_LINALIAS"):
+        var direct: Table[string, (string, int)]
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+            let dv = ann.args[0].ident
+            if dv notin tr.definedVarNames: continue
+            let cs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+            let vs = tr.resolveVarArrayElems(con.args[1])
+            if cs.len != 2 or vs.len != 2 or vs[0].kind != FznIdent or vs[1].kind != FznIdent: continue
+            let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+            let (di, oi) = if vs[0].ident == dv: (0, 1) elif vs[1].ident == dv: (1, 0) else: (-1, -1)
+            if di < 0 or abs(cs[di]) != 1 or cs[oi] != -cs[di]: continue
+            # cd*dv - cd*w = rhs  ->  dv = w + rhs/cd
+            direct[dv] = (vs[oi].ident, rhs * cs[di])
+        for dv in direct.keys:
+            var (w, off) = direct[dv]
+            var depth = 0
+            while w in direct and depth < 3:
+                let (w2, o2) = direct[w]
+                w = w2
+                off += o2
+                inc depth
+            if w notin tr.definedVarNames:
+                linAlias[dv] = (w, off)
+
     # Step 1: Build reverse index from reifChannelDefs
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]
     var neReifMap: Table[string, tuple[condVar: string, condVal: int]]
@@ -254,6 +286,11 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
             linReifIdx: int  # constraint index of the int_lin_eq_reif
 
     var casesByTarget: Table[string, seq[CaseEntry]]
+    # Clauses matched by seeing through an array_bool_and: clause CI -> (AND output,
+    # inner literal used as the case). Consuming such a clause must keep the AND's
+    # other conjuncts (e.g. cond -> (produced >= total /\ end_d = end_j): the
+    # produced >= total part is a real constraint) — see Step 6.
+    var seeThrough: Table[int, (string, string)]
 
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
@@ -371,6 +408,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                     eqLitVar = innerVar
                     eqSourceVar = eqReifMap[innerVar].sourceVar
                     eqTestVal = eqReifMap[innerVar].testVal
+                seeThrough[ci] = (elem.ident, eqLitVar)
             elif eqLitVar == "" and elem.ident in andToLinReifs:
                 # See through array_bool_and: extract contained lin_eq_reif
                 let innerVar = andToLinReifs[elem.ident][0]
@@ -378,6 +416,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                 eqLinEntry = linEqReifMap[innerVar]
                 eqSourceVar = eqLinEntry.targetVar
                 eqIsLinear = true
+                seeThrough[ci] = (elem.ident, eqLitVar)
             elif elem.ident in neReifMap:
                 let info = neReifMap[elem.ident]
                 condLits.add((info.condVar, info.condVal))
@@ -538,6 +577,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     var nRejectedIncomplete = 0
     var nRejectedTableSize = 0
     var nRejectedUnresolved = 0
+    var nResidual = 0
     var nRejectedCondSource = 0
     var nRejectedOther = 0
 
@@ -1074,6 +1114,12 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                                 varEntries[flatIdx] = CaseAnalysisVarEntry(
                                     varName: testValExpr.ident, offset: 0)
                                 lookupTable[flatIdx] = 0
+                            elif testValExpr.ident in linAlias:
+                                # Defined var = base + offset (e.g. end = start + duration)
+                                let (baseVar, off) = linAlias[testValExpr.ident]
+                                varEntries[flatIdx] = CaseAnalysisVarEntry(
+                                    varName: baseVar, offset: off)
+                                lookupTable[flatIdx] = 0
                             else:
                                 allResolved = false
                                 break
@@ -1094,6 +1140,28 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                 tr.definingConstraints.incl(e.boolClauseIdx)
                 consumedBoolClauses.incl(e.boolClauseIdx)
                 inc nConsumed
+                if e.boolClauseIdx in seeThrough:
+                    # Keep the AND's other conjuncts: same clause with the AND
+                    # literal replaced by each remaining conjunct.
+                    let (andVar, usedLit) = seeThrough[e.boolClauseIdx]
+                    let orig = tr.model.constraints[e.boolClauseIdx]
+                    var andLits: seq[FznExpr]
+                    for andCI in tr.boolAndOrChannelDefs:
+                        let ac {.cursor.} = tr.model.constraints[andCI]
+                        if stripSolverPrefix(ac.name) == "array_bool_and" and ac.args.len >= 2 and
+                           ac.args[1].kind == FznIdent and ac.args[1].ident == andVar:
+                            andLits = tr.resolveVarArrayElems(ac.args[0])
+                            break
+                    for lit in andLits:
+                        if lit.kind == FznIdent and lit.ident == usedLit: continue
+                        var posElems: seq[FznExpr]
+                        for pe in orig.args[0].elems:
+                            if pe.kind == FznIdent and pe.ident == andVar: posElems.add(lit)
+                            else: posElems.add(pe)
+                        tr.model.constraints.add(FznConstraint(name: orig.name,
+                            args: @[FznExpr(kind: FznArrayLit, elems: posElems), orig.args[1]],
+                            annotations: orig.annotations))
+                        inc nResidual
             if e.kind == cekLinear and e.linReifIdx notin consumedLinReifs:
                 tr.definingConstraints.incl(e.linReifIdx)
                 consumedLinReifs.incl(e.linReifIdx)
@@ -1113,7 +1181,7 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     if nTargets > 0 or nRejected > 0:
         stderr.writeLine(&"[FZN] Case-analysis channels: {nTargets} detected, {nConsumed} bool_clause consumed" &
             &" (rejected: {nRejected} = condVars:{nRejectedCondVars} incomplete:{nRejectedIncomplete}" &
-            &" tableSize:{nRejectedTableSize} unresolved:{nRejectedUnresolved}" &
+            &" tableSize:{nRejectedTableSize} unresolved:{nRejectedUnresolved} residual:{nResidual}" &
             &" condSource:{nRejectedCondSource} other:{nRejectedOther})" &
             &" [candidates: {casesByTarget.len}]")
 

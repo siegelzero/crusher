@@ -144,3 +144,89 @@ proc canonicalizeLinearReifs(tr: var FznTranslator) =
         else: discard
     if nFolded > 0:
         stderr.writeLine(&"[FZN] Canonicalized {nFolded} single-term linear reifs → primitive reifs (eq={nEq} ne={nNe} le={nLe})")
+
+
+proc splitImplicationConjunctions(tr: var FznTranslator) =
+    ## Rewrite the implication  cond -> (c1 /\ ... /\ ck), i.e.
+    ##   bool_clause([cond', A], [])  or  bool_clause([A], [cond])
+    ## with A <-> array_bool_and(c1..ck) used only there, into k implications
+    ## cond -> cj (appended; the original clause is consumed). Sound, and exposes
+    ## cond -> (target == value) to the case-analysis detector, e.g.
+    ##   demand_end_job[d] = j  ->  (produced[j] >= total /\ demand_end[d] = end[j]).
+    ## Conservative: only two-literal clauses whose condition is an eq/ne
+    ## reification of a variable against a constant, and only clauses no earlier
+    ## detector consumed (AND structure matters to the disjunctive-clause and
+    ## conditional-source detectors). Runs late, so it appends instead of
+    ## re-indexing the constraint list.
+    if existsEnv("CRUSHER_NO_SPLIT"): return
+    var useCount: CountTable[string]
+    for con in tr.model.constraints:
+        for arg in con.args:
+            if arg.kind == FznIdent: useCount.inc(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent: useCount.inc(e.ident)
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            for e in decl.value.elems:
+                if e.kind == FznIdent: useCount.inc(e.ident)
+    var andDef: Table[string, int]
+    var condReif: HashSet[string]     # outputs of int_eq_reif / int_ne_reif(var, const)
+    for ci, con in tr.model.constraints:
+        let name = stripSolverPrefix(con.name)
+        if not con.hasAnnotation("defines_var"): continue
+        if name == "array_bool_and" and con.args.len >= 2 and con.args[1].kind == FznIdent:
+            andDef[con.args[1].ident] = ci
+        elif name in ["int_eq_reif", "int_ne_reif"] and con.args.len >= 3 and
+             con.args[0].kind == FznIdent and con.args[2].kind == FznIdent:
+            let isConst = con.args[1].kind == FznIntLit or
+                          (con.args[1].kind == FznIdent and con.args[1].ident in tr.paramValues)
+            if isConst: condReif.incl(con.args[2].ident)
+    if andDef.len == 0: return
+
+    var usedAnd: HashSet[string]
+    var added: seq[FznConstraint]
+    var nSplit = 0
+    let nOrig = tr.model.constraints.len
+    for ci in 0 ..< nOrig:
+        if ci in tr.definingConstraints: continue
+        let con = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "bool_clause" or con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+        let pos = con.args[0].elems
+        let neg = con.args[1].elems
+        if pos.len + neg.len != 2: continue
+        var a, cond = ""
+        var condIsNeg = false
+        for e in pos:
+            if e.kind != FznIdent: continue
+            if e.ident in andDef and a == "": a = e.ident
+            elif e.ident in condReif: cond = e.ident
+        for e in neg:
+            if e.kind == FznIdent and e.ident in condReif:
+                cond = e.ident
+                condIsNeg = true
+        if a == "" or cond == "" or a in usedAnd: continue
+        if useCount.getOrDefault(a) != 2: continue
+        let andCI = andDef[a]
+        if andCI in tr.definingConstraints: continue
+        let lits = tr.resolveVarArrayElems(tr.model.constraints[andCI].args[0])
+        var ok = lits.len >= 2
+        for l in lits:
+            if l.kind != FznIdent: ok = false
+        if not ok: continue
+        let condExpr = FznExpr(kind: FznIdent, ident: cond)
+        for l in lits:
+            let posElems = if condIsNeg: @[l] else: @[l, condExpr]
+            let negElems = if condIsNeg: @[condExpr] else: newSeq[FznExpr]()
+            added.add(FznConstraint(name: con.name,
+                args: @[FznExpr(kind: FznArrayLit, elems: posElems),
+                        FznExpr(kind: FznArrayLit, elems: negElems)],
+                annotations: con.annotations))
+        usedAnd.incl(a)
+        tr.definingConstraints.incl(ci)   # original clause replaced by the split ones
+        inc nSplit
+    if nSplit == 0: return
+    for c in added: tr.model.constraints.add(c)
+    stderr.writeLine("[FZN] Split " & $nSplit & " implication conjunctions into " &
+                     $added.len & " clauses")

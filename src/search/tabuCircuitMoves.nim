@@ -257,3 +257,81 @@ proc tryChannelCircuitMoves[T](state: TabuState[T], allowPerturb: bool = false):
     state.assignValue(ipB, ivB)
     state.circuitMergesApplied += 1
     return true
+
+
+proc tryTourMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
+    ## Tour-preserving node relocation (or-opt) on a VALID circuit over direct
+    ## successor variables: remove node x (p -> x -> s becomes p -> s) and
+    ## reinsert it after u (u -> x -> v). Three successor changes that keep the
+    ## permutation a single cycle — single-variable successor moves always break
+    ## it, so without this the search can only optimize a tour through circuit
+    ## violations (fatal when the circuit drives time/accumulator chains whose
+    ## values are meaningless off the tour). Each candidate is scored by its true
+    ## global delta (lean simulate-and-restore, including channels and CTP
+    ## writebacks); the best strictly improving one is applied (or, under
+    ## allowPerturb, the least-worsening one).
+    if state.circuitConstraints.len == 0: return false
+    const MAX_EVALS = 3000
+    var bestDelta = if allowPerturb: high(int) else: 0
+    var bestChanges: seq[(int, T)]
+    var evals = 0
+    for cc in state.circuitConstraints:
+        if cc.cost != 0: continue
+        let n = cc.n
+        if n < 4: continue
+        var succ = newSeq[int](n)
+        var pred = newSeq[int](n)
+        var ok = true
+        for i in 0..<n:
+            let p = cc.positionArray[i]
+            if p < 0: ok = false; break
+            let s = int(state.assignment[p]) - cc.valueOffset
+            if s < 0 or s >= n: ok = false; break
+            succ[i] = s
+            pred[s] = i
+        if not ok: continue
+        template valOf(node: int): T = T(node + cc.valueOffset)
+        var order = toSeq(0..<n)
+        shuffle(order)
+        for x in order:
+            if evals >= MAX_EVALS: break
+            let p = pred[x]
+            let s = succ[x]
+            for u in 0..<n:
+                if evals >= MAX_EVALS: break
+                if u == x or u == p: continue
+                let v = if u == s: succ[s] else: succ[u]
+                if v == x: continue
+                # Changes: succ[p] := s, succ[u] := x, succ[x] := v
+                let pp = cc.positionArray[p]
+                let pu = cc.positionArray[u]
+                let px = cc.positionArray[x]
+                if state.domIdx(pp, valOf(s)) < 0 or state.domIdx(pu, valOf(x)) < 0 or
+                   state.domIdx(px, valOf(v)) < 0:
+                    continue
+                inc evals
+                let before = state.cost
+                let ovp = state.assignment[pp]
+                let ovu = state.assignment[pu]
+                let ovx = state.assignment[px]
+                state.assignValueLean(pp, valOf(s))
+                state.assignValueLean(pu, valOf(x))
+                state.assignValueLean(px, valOf(v))
+                let delta = state.cost - before
+                state.assignValueLean(px, ovx)
+                state.assignValueLean(pu, ovu)
+                state.assignValueLean(pp, ovp)
+                if delta < bestDelta:
+                    bestDelta = delta
+                    bestChanges = @[(pp, valOf(s)), (pu, valOf(x)), (px, valOf(v))]
+                    if delta < 0 and not allowPerturb: break   # first improvement
+            if bestDelta < 0 and not allowPerturb: break
+    if bestChanges.len == 0: return false
+    if bestDelta >= 0 and not allowPerturb: return false
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    for (pos, val) in bestChanges:
+        let oldIdx = state.domIdx(pos, state.assignment[pos])
+        if oldIdx >= 0 and not state.isLazy[pos]:
+            state.tabu[pos][oldIdx] = tabuTenure
+        state.assignValue(pos, val)
+    return true

@@ -36,19 +36,33 @@ proc initSwapStructures[T](state: TabuState[T]) =
         neighborSets[i] = initPackedSet[int]()
 
     const maxBinaryPerConstraint = 350  # skip constraints with too many binary positions
-    for constraint in state.constraints:
-        # Collect binary positions in this constraint
+    # Global pair budget: the sharedConstraints table holds one entry per pair, so
+    # tens of thousands of binary positions in mid-sized constraints explode it
+    # (warehouse: 18M pairs, ~20s and gigabytes per state). Smallest constraints
+    # first until the budget is spent.
+    const maxTotalSwapPairs = 2_000_000
+    var candidates: seq[(int, int)]   # (binary count, constraint index)
+    var binaryLists = newSeq[seq[int]](state.constraints.len)
+    var pairBudget = 0
+    for ci, constraint in state.constraints:
         var binaryInConstraint: seq[int] = @[]
         for pos in constraint.positions.items:
             if pos in binaryPosSet:
                 binaryInConstraint.add(pos)
-
-        if binaryInConstraint.len < 2:
+        if binaryInConstraint.len < 2 or binaryInConstraint.len > maxBinaryPerConstraint:
             continue
-
-        # Skip constraints with too many binary positions (O(n^2) pair explosion)
-        if binaryInConstraint.len > maxBinaryPerConstraint:
-            continue
+        pairBudget += binaryInConstraint.len * (binaryInConstraint.len - 1) div 2
+        candidates.add((binaryInConstraint.len, ci))
+        binaryLists[ci] = binaryInConstraint
+    if pairBudget > maxTotalSwapPairs:
+        candidates.sort()
+    var pairsUsed = 0
+    for (k, ci) in candidates:
+        let constraint = state.constraints[ci]
+        let binaryInConstraint {.cursor.} = binaryLists[ci]
+        pairsUsed += k * (k - 1) div 2
+        if pairsUsed > maxTotalSwapPairs:
+            break
 
         # Add all pairs as swap neighbors and record shared constraints
         for i in 0..<binaryInConstraint.len:

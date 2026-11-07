@@ -11,6 +11,21 @@ func safeAbs(x: int): int {.inline.} =
 
 type LinearTerm[T] = tuple[pos: int, coeff: T]
 
+proc singlePosPenalty[T](state: TabuState[T], ci: int, value: T): int =
+    ## Penalty of single-position relational channel-dep constraint ci when its
+    ## position holds `value`. Pure function of the value: evaluated once on a
+    ## one-entry assignment table, then memoized.
+    if value in state.cdSingleCache[ci]:
+        return state.cdSingleCache[ci][value]
+    let rc = state.channelDepConstraints[ci].relationalState
+    var tbl = initTable[int, T]()
+    tbl[state.cdSinglePos[ci]] = value
+    template side(e: untyped): T =
+        (if e.kind == ConstantExpr: e.constantValue
+         else: e.algebraicExpr.algebraicExpr.evaluate(tbl))
+    result = rc.computeCost(side(rc.leftExpr), side(rc.rightExpr))
+    state.cdSingleCache[ci][value] = result
+
 proc tryExtractLinear[T](node: ExpressionNode[T]): tuple[ok: bool, terms: seq[LinearTerm[T]], offset: T] =
     ## Recursively decompose an expression tree into sum(coeff_i * assignment[pos_i]) + offset.
     ## Non-linear subtrees (min/max/abs) are only treated as constants when their
@@ -134,6 +149,30 @@ proc evaluateWeightedCountEq[T](binding: WeightedCountEqChannelBinding[T], assig
             total += binding.weights[i]
     total
 
+const IncCountMinInputs = 16
+
+proc countEqAfterSrc[T](state: TabuState[T], bi: int, p: int, oldV: T): T {.inline.} =
+    ## countEq channel bi after source position p changed from oldV to its current
+    ## value, given the channel still holds its pre-change value. O(1) for wide
+    ## bindings, full rescan otherwise.
+    let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
+    if state.ceqPosMult[bi].len > 0:
+        let m = state.ceqPosMult[bi].getOrDefault(p, 0)
+        let t = binding.targetValue
+        return state.assignment[binding.channelPosition] +
+               T(m) * (T(ord(state.assignment[p] == t)) - T(ord(oldV == t)))
+    evaluateCountEq(binding, state.assignment)
+
+proc wCountEqAfterSrc[T](state: TabuState[T], bi: int, p: int, oldV: T): T {.inline.} =
+    ## weightedCountEq analogue of countEqAfterSrc.
+    let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bi]
+    if state.wceqPosWeight[bi].len > 0:
+        let w = state.wceqPosWeight[bi].getOrDefault(p, T(0))
+        let t = binding.targetValue
+        return state.assignment[binding.channelPosition] +
+               w * (T(ord(state.assignment[p] == t)) - T(ord(oldV == t)))
+    evaluateWeightedCountEq(binding, state.assignment)
+
 proc evaluateConditionalCountEq[T](binding: ConditionalCountEqChannelBinding[T],
                                     assignment: seq[T]): T {.inline.} =
     ## Evaluate a conditional count-equals channel:
@@ -240,11 +279,11 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         if state.cdCascadeIsStatic[cascadeIdx]:
             let di = state.domIdx(pos, candidateValue)
             if di < 0: return 0
-            let chans = state.cdCascadeChans[cascadeIdx]
-            let chanVals = state.cdCascadeValues[cascadeIdx]
-            let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
-            let coeffsL = state.cdCascadeConstraintL[cascadeIdx]
-            let coeffsR = state.cdCascadeConstraintR[cascadeIdx]
+            let chans {.cursor.} = state.cdCascadeChans[cascadeIdx]
+            let chanVals {.cursor.} = state.cdCascadeValues[cascadeIdx]
+            let constraintIds {.cursor.} = state.cdCascadeConstraintIds[cascadeIdx]
+            let coeffsL {.cursor.} = state.cdCascadeConstraintL[cascadeIdx]
+            let coeffsR {.cursor.} = state.cdCascadeConstraintR[cascadeIdx]
             let nChans = chans.len
             for cli in 0..<constraintIds.len:
                 let ci = constraintIds[cli]
@@ -272,6 +311,15 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             if diff != 0:
                                 newRight += coeff * diff
                         delta = rc.computeCost(newLeft, newRight) - rc.cost
+                elif state.cdSinglePos[ci] >= 0:
+                    let sp = state.cdSinglePos[ci]
+                    var newVal = state.assignment[sp]
+                    for chanIdx in 0..<nChans:
+                        if chans[chanIdx] == sp:
+                            newVal = chanVals[chanIdx][di]
+                            break
+                    delta = state.singlePosPenalty(ci, newVal) -
+                            state.channelDepConstraints[ci].penalty()
                 else:
                     let c = state.channelDepConstraints[ci]
                     let oldPenalty = c.penalty()
@@ -319,7 +367,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
     # Fast path for one-hot source positions: directly compute the few changes
     # instead of evaluating all bindings through the worklist
     if pos in state.oneHotChanges:
-        let changes = state.oneHotChanges[pos]
+        let changes {.cursor.} = state.oneHotChanges[pos]
         let lo = state.oneHotLo[pos]
         let oldIdx = savedPos - lo
         let newIdx = candidateValue - lo
@@ -371,7 +419,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.minMaxChannelsAtPosition:
                 for bi in state.carray.minMaxChannelsAtPosition[p]:
-                    let fb = state.flatMinMaxBindings[bi]
+                    let fb {.cursor.} = state.flatMinMaxBindings[bi]
                     let newChanVal = evaluateFlatMinMax(fb, state.assignment)
                     let chanPos = fb.channelPosition
                     if newChanVal != state.assignment[chanPos]:
@@ -379,10 +427,12 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            let srcInc = p == pos and state.inverseSavedBuf.len == 0
             if p in state.carray.countEqChannelsAtPosition:
                 for bi in state.carray.countEqChannelsAtPosition[p]:
-                    let binding = state.carray.countEqChannelBindings[bi]
-                    let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
+                    let newChanVal = if srcInc: state.countEqAfterSrc(bi, p, savedPos)
+                                     else: evaluateCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -391,8 +441,9 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.weightedCountEqChannelsAtPosition:
                 for bi in state.carray.weightedCountEqChannelsAtPosition[p]:
-                    let binding = state.carray.weightedCountEqChannelBindings[bi]
-                    let newChanVal = evaluateWeightedCountEq(binding, state.assignment)
+                    let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bi]
+                    let newChanVal = if srcInc: state.wCountEqAfterSrc(bi, p, savedPos)
+                                     else: evaluateWeightedCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -401,7 +452,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.conditionalCountEqChannelsAtPosition:
                 for bi in state.carray.conditionalCountEqChannelsAtPosition[p]:
-                    let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                    let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bi]
                     let newChanVal = evaluateConditionalCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
@@ -411,7 +462,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
-                    let group = state.carray.inverseChannelGroups[gi]
+                    let group {.cursor.} = state.carray.inverseChannelGroups[gi]
                     let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
@@ -421,8 +472,20 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                                 state.cdWorklist.add(ipos)
             if p in state.carray.argmaxChannelsAtPosition:
                 for bi in state.carray.argmaxChannelsAtPosition[p]:
-                    let binding = state.carray.argmaxChannelBindings[bi]
+                    let binding {.cursor.} = state.carray.argmaxChannelBindings[bi]
                     let newChanVal = evaluateArgmax(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            # Expression channels (int_times/div/mod/plus): without this, effects
+            # through e.g. squared loads were invisible to per-value move scoring.
+            if p in state.carray.expressionChannelsAtPosition:
+                for bi in state.carray.expressionChannelsAtPosition[p]:
+                    let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
+                    let newChanVal = binding.expression.evaluate(state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -458,7 +521,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.minMaxChannelsAtPosition:
                 for bi in state.carray.minMaxChannelsAtPosition[p]:
-                    let fb = state.flatMinMaxBindings[bi]
+                    let fb {.cursor.} = state.flatMinMaxBindings[bi]
                     let newChanVal = evaluateFlatMinMax(fb, state.assignment)
                     let chanPos = fb.channelPosition
                     if newChanVal != state.assignment[chanPos]:
@@ -466,10 +529,12 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                         if chanPos notin state.cdVisited:
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
+            let srcInc = p == pos and state.inverseSavedBuf.len == 0
             if p in state.carray.countEqChannelsAtPosition:
                 for bi in state.carray.countEqChannelsAtPosition[p]:
-                    let binding = state.carray.countEqChannelBindings[bi]
-                    let newChanVal = evaluateCountEq(binding, state.assignment)
+                    let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
+                    let newChanVal = if srcInc: state.countEqAfterSrc(bi, p, savedPos)
+                                     else: evaluateCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -478,8 +543,9 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.weightedCountEqChannelsAtPosition:
                 for bi in state.carray.weightedCountEqChannelsAtPosition[p]:
-                    let binding = state.carray.weightedCountEqChannelBindings[bi]
-                    let newChanVal = evaluateWeightedCountEq(binding, state.assignment)
+                    let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bi]
+                    let newChanVal = if srcInc: state.wCountEqAfterSrc(bi, p, savedPos)
+                                     else: evaluateWeightedCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -488,7 +554,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.conditionalCountEqChannelsAtPosition:
                 for bi in state.carray.conditionalCountEqChannelsAtPosition[p]:
-                    let binding = state.carray.conditionalCountEqChannelBindings[bi]
+                    let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bi]
                     let newChanVal = evaluateConditionalCountEq(binding, state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
@@ -498,7 +564,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdWorklist.add(chanPos)
             if p in state.carray.inverseChannelsAtPosition:
                 for gi in state.carray.inverseChannelsAtPosition[p]:
-                    let group = state.carray.inverseChannelGroups[gi]
+                    let group {.cursor.} = state.carray.inverseChannelGroups[gi]
                     let newInverse = group.recomputeInverse(state.assignment)
                     for j, ipos in group.inversePositions:
                         if newInverse[j] != state.assignment[ipos]:
@@ -508,8 +574,20 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                                 state.cdWorklist.add(ipos)
             if p in state.carray.argmaxChannelsAtPosition:
                 for bi in state.carray.argmaxChannelsAtPosition[p]:
-                    let binding = state.carray.argmaxChannelBindings[bi]
+                    let binding {.cursor.} = state.carray.argmaxChannelBindings[bi]
                     let newChanVal = evaluateArgmax(binding, state.assignment)
+                    let chanPos = binding.channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
+            # Expression channels (int_times/div/mod/plus): without this, effects
+            # through e.g. squared loads were invisible to per-value move scoring.
+            if p in state.carray.expressionChannelsAtPosition:
+                for bi in state.carray.expressionChannelsAtPosition[p]:
+                    let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
+                    let newChanVal = binding.expression.evaluate(state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -563,6 +641,9 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                                 if state.cdIsChanged[cpos]:
                                     newRight += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
                             delta = rc.computeCost(newLeft, newRight) - rc.cost
+                    elif state.cdSinglePos[ci] >= 0:
+                        delta = state.singlePosPenalty(ci, state.assignment[state.cdSinglePos[ci]]) -
+                                state.channelDepConstraints[ci].penalty()
                     else:
                         # Fallback: simulate-restore on the constraint
                         let c = state.channelDepConstraints[ci]
@@ -615,18 +696,28 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
 
 proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
-    chanVals: openArray[seq[T]], domain: openArray[T], penalties: var seq[int]) =
+    chanVals: openArray[seq[T]], domain: openArray[T], penalties: var seq[int],
+    sparse: bool = false) =
     ## Compute penalty deltas for all domain values given cascade channel values.
     ## chanVals[chanIdx][domainIdx] = the channel value for that domain entry.
-    let chans = state.cdCascadeChans[cascadeIdx]
-    let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
-    let coeffsL = state.cdCascadeConstraintL[cascadeIdx]
-    let coeffsR = state.cdCascadeConstraintR[cascadeIdx]
+    ## sparse=true: state.cdBatchChanged[di] lists the cascade entries whose value
+    ## differs from the current assignment for domain value di (built by the
+    ## dynamic cascade evaluation); only constraints touching those entries are
+    ## scored. Exact: a constraint with no changed channel has zero delta.
+    let chans {.cursor.} = state.cdCascadeChans[cascadeIdx]
+    let constraintIds {.cursor.} = state.cdCascadeConstraintIds[cascadeIdx]
+    let coeffsL {.cursor.} = state.cdCascadeConstraintL[cascadeIdx]
+    let coeffsR {.cursor.} = state.cdCascadeConstraintR[cascadeIdx]
+    let entryCons {.cursor.} = state.cdCascadeEntryCons[cascadeIdx]
     let nChans = chans.len
 
-    for di in 0..<domain.len:
-        var totalDelta = 0
-        for cli in 0..<constraintIds.len:
+    let singleChanIdx {.cursor.} = state.cdCascadeSingleIdx[cascadeIdx]
+
+    template cliDelta(cliArg, diArg: int, changedArg: ptr seq[int]): int =
+        block:
+            let cli = cliArg
+            let di = diArg
+            let changed: ptr seq[int] = changedArg
             let ci = constraintIds[cli]
             var delta: int
             if state.cdConstraintCanFast[ci]:
@@ -655,7 +746,7 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
             elif state.channelDepConstraints[ci].stateType == DisjunctiveClauseType:
                 # Fast DC path: compute penalty directly from precomputed cascade-to-term mappings
                 let dc = state.channelDepConstraints[ci].disjunctiveClauseState
-                let termCoeffs = state.cdCascadeDCTermCoeffs[cascadeIdx][cli]
+                let termCoeffs {.cursor.} = state.cdCascadeDCTermCoeffs[cascadeIdx][cli]
                 var newPenalty = high(int)
                 for d in 0..<dc.disjuncts.len:
                     var conjPenalty = dc.disjunctPenalties[d]
@@ -672,11 +763,20 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                         newPenalty = conjPenalty
                         if newPenalty == 0: break
                 delta = newPenalty - dc.cost
+            elif state.cdSinglePos[ci] >= 0:
+                let sp = state.cdSinglePos[ci]
+                let k = singleChanIdx[cli]
+                let newVal = if k >= 0: chanVals[k][di] else: state.assignment[sp]
+                delta = state.singlePosPenalty(ci, newVal) -
+                        state.channelDepConstraints[ci].penalty()
             else:
                 let c = state.channelDepConstraints[ci]
                 let oldPenalty = c.penalty()
                 var anyChanged = false
-                for chanIdx in 0..<nChans:
+                let useList = changed != nil
+                let nIter = if useList: changed[].len else: nChans
+                for k in 0..<nIter:
+                    let chanIdx = if useList: changed[][k] else: k
                     let chanPos = chans[chanIdx]
                     let newVal = chanVals[chanIdx][di]
                     if newVal != state.assignment[chanPos] and chanPos in c.positions:
@@ -684,16 +784,40 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                         anyChanged = true
                 if anyChanged:
                     delta = c.penalty() - oldPenalty
-                    for chanIdx in 0..<nChans:
+                    for k in 0..<nIter:
+                        let chanIdx = if useList: changed[][k] else: k
                         let chanPos = chans[chanIdx]
                         if chanVals[chanIdx][di] != state.assignment[chanPos] and chanPos in c.positions:
                             c.updatePosition(chanPos, state.assignment[chanPos])
                 else:
                     delta = 0
-            totalDelta += delta
             if state.cdTrackPerConstraint and delta != 0:
                 state.cdPerConstraintMaxDelta[ci] = max(state.cdPerConstraintMaxDelta[ci], safeAbs(delta))
-        penalties[di] = totalDelta
+            delta
+
+    if not sparse:
+        for di in 0..<domain.len:
+            var totalDelta = 0
+            for cli in 0..<constraintIds.len:
+                totalDelta += cliDelta(cli, di, nil)
+            penalties[di] = totalDelta
+    else:
+        if state.cdCliStamp.len < constraintIds.len:
+            state.cdCliStamp.setLen(constraintIds.len)
+        for di in 0..<domain.len:
+            let changed = addr state.cdBatchChanged[di]
+            if changed[].len == 0:
+                penalties[di] = 0
+                continue
+            inc state.cdCliStampGen
+            let gen = state.cdCliStampGen
+            var totalDelta = 0
+            for e in changed[]:
+                for cli in entryCons[e]:
+                    if state.cdCliStamp[cli] == gen: continue
+                    state.cdCliStamp[cli] = gen
+                    totalDelta += cliDelta(cli, di, changed)
+            penalties[di] = totalDelta
 
 proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExternals: ptr PackedSet[int]) =
     ## Incremental cascade evaluation: only re-evaluate entries affected by changed
@@ -703,11 +827,11 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
     let cascadeIdx = state.cdCascadePos[pos]
     let nChans = state.cdCascadeChans[cascadeIdx].len
     let nDom = domain.len
-    let chans = state.cdCascadeChans[cascadeIdx]
-    let bindings = state.cdCascadeBindings[cascadeIdx]
-    let entryKinds = state.cdCascadeEntryKind[cascadeIdx]
-    let forwardDeps = state.cdCascadeForwardDeps[cascadeIdx]
-    let extPosToEntries = state.cdCascadeExtPosToEntries[cascadeIdx]
+    let chans {.cursor.} = state.cdCascadeChans[cascadeIdx]
+    let bindings {.cursor.} = state.cdCascadeBindings[cascadeIdx]
+    let entryKinds {.cursor.} = state.cdCascadeEntryKind[cascadeIdx]
+    let forwardDeps {.cursor.} = state.cdCascadeForwardDeps[cascadeIdx]
+    let extPosToEntries {.cursor.} = state.cdCascadeExtPosToEntries[cascadeIdx]
 
     when ProfileIteration:
         let tBind0 = epochTime()
@@ -772,22 +896,24 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 var newVal: T
                 case entryKinds[ci]
                 of ceMinMax:
-                    let fb = state.flatMinMaxBindings[bindings[ci]]
+                    let fb {.cursor.} = state.flatMinMaxBindings[bindings[ci]]
                     newVal = evaluateFlatMinMax(fb, state.assignment)
                 of ceCountEq:
-                    let binding = state.carray.countEqChannelBindings[bindings[ci]]
+                    let binding {.cursor.} = state.carray.countEqChannelBindings[bindings[ci]]
                     newVal = evaluateCountEq(binding, state.assignment)
                 of ceConditionalCountEq:
-                    let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
+                    let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                     newVal = evaluateConditionalCountEq(binding, state.assignment)
+                of ceExpression:
+                    newVal = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
                 of ceWeightedCountEq:
-                    let binding = state.carray.weightedCountEqChannelBindings[bindings[ci]]
+                    let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bindings[ci]]
                     newVal = evaluateWeightedCountEq(binding, state.assignment)
                 of ceArgmax:
-                    let binding = state.carray.argmaxChannelBindings[bindings[ci]]
+                    let binding {.cursor.} = state.carray.argmaxChannelBindings[bindings[ci]]
                     newVal = evaluateArgmax(binding, state.assignment)
                 of ceCrossingCountMax:
-                    let binding = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
+                    let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
                     newVal = evaluateCrossingCountMax(binding, state.assignment)
                 of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
@@ -844,55 +970,129 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             when ProfileIteration:
                 let tBind0CD = epochTime()
             # Dynamic cascade: evaluate bindings at runtime for all domain values
-            let chans = state.cdCascadeChans[cascadeIdx]
-            let bindings = state.cdCascadeBindings[cascadeIdx]
-            let entryKinds = state.cdCascadeEntryKind[cascadeIdx]
+            let chans {.cursor.} = state.cdCascadeChans[cascadeIdx]
+            let bindings {.cursor.} = state.cdCascadeBindings[cascadeIdx]
+            let entryKinds {.cursor.} = state.cdCascadeEntryKind[cascadeIdx]
 
             # Save original assignment values
             let savedPos = state.assignment[pos]
             for ci in 0..<nChans:
                 state.cdBatchSaved[ci] = state.assignment[chans[ci]]
 
-            # Evaluate cascade for all domain values using in-place modify-restore
-            for di in 0..<nDom:
-                state.assignment[pos] = domain[di]
-                for ci in 0..<nChans:
-                    case entryKinds[ci]
-                    of ceMinMax:
-                        # Min/max binding: evaluate using flat linear representation
-                        let fb = state.flatMinMaxBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
-                    of ceCountEq:
-                        # CountEq binding: count matching values over input positions
-                        let binding = state.carray.countEqChannelBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
-                    of ceConditionalCountEq:
-                        # ConditionalCountEq binding: count matching with filter condition
-                        let binding = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
-                    of ceWeightedCountEq:
-                        # WeightedCountEq binding: sum weights for matching values
-                        let binding = state.carray.weightedCountEqChannelBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateWeightedCountEq(binding, state.assignment)
-                    of ceArgmax:
-                        # Argmax binding: evaluate input expressions and find max index
-                        let binding = state.carray.argmaxChannelBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateArgmax(binding, state.assignment)
-                    of ceCrossingCountMax:
-                        # Crossing count max: sweep-line evaluation
-                        let binding = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
-                        state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
-                    of ceElement:
-                        # Element binding: evaluate index expression and look up array
-                        let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
-                        let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
-                        if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
-                            let elem = bindingPtr.arrayElements[idxVal]
-                            state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
-                                                           else: state.assignment[elem.variablePosition] + elem.offset
-                        else:
+            # Sparse evaluation: per domain value, only entries downstream of a
+            # changed input are re-evaluated (dirty propagation in topological
+            # order), and the entries whose value changed are recorded for the
+            # sparse penalty pass. Falls back to dense when the cascade has a
+            # backward dependency (reader ordered before the entry it reads).
+            let useSparse = not state.cdCascadeHasBackEdge[cascadeIdx]
+            if state.cdBatchChanged.len < nDom: state.cdBatchChanged.setLen(nDom)
+            if useSparse:
+                let nSrc = state.cdCascadeNSrcReaders[cascadeIdx]
+                let fwd {.cursor.} = state.cdCascadeForwardDeps[cascadeIdx]
+                for di in 0..<nDom:
+                    state.cdBatchChanged[di].setLen(0)
+                    if domain[di] == savedPos:
+                        for ci in 0..<nChans: state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
+                        continue
+                    state.assignment[pos] = domain[di]
+                    for ci in 0..<nSrc: state.cdCascadeDirtyDV[ci] = true
+                    for ci in 0..<nChans:
+                        if not state.cdCascadeDirtyDV[ci]:
                             state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
-                    state.assignment[chans[ci]] = state.cdBatchValues[ci][di]
+                            continue
+                        state.cdCascadeDirtyDV[ci] = false
+                        case entryKinds[ci]
+                        of ceMinMax:
+                            # Min/max binding: evaluate using flat linear representation
+                            let fb {.cursor.} = state.flatMinMaxBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
+                        of ceCountEq:
+                            # Source readers update incrementally (pos is the only change)
+                            if ci < nSrc:
+                                state.cdBatchValues[ci][di] = state.countEqAfterSrc(bindings[ci], pos, savedPos)
+                            else:
+                                let binding {.cursor.} = state.carray.countEqChannelBindings[bindings[ci]]
+                                state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
+                        of ceConditionalCountEq:
+                            # ConditionalCountEq binding: count matching with filter condition
+                            let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
+                        of ceExpression:
+                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
+                        of ceWeightedCountEq:
+                            if ci < nSrc:
+                                state.cdBatchValues[ci][di] = state.wCountEqAfterSrc(bindings[ci], pos, savedPos)
+                            else:
+                                let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bindings[ci]]
+                                state.cdBatchValues[ci][di] = evaluateWeightedCountEq(binding, state.assignment)
+                        of ceArgmax:
+                            # Argmax binding: evaluate input expressions and find max index
+                            let binding {.cursor.} = state.carray.argmaxChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateArgmax(binding, state.assignment)
+                        of ceCrossingCountMax:
+                            # Crossing count max: sweep-line evaluation
+                            let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
+                        of ceElement:
+                            # Element binding: evaluate index expression and look up array
+                            let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
+                            let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                            if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                                let elem = bindingPtr.arrayElements[idxVal]
+                                state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
+                                                               else: state.assignment[elem.variablePosition] + elem.offset
+                            else:
+                                state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
+                        if state.cdBatchValues[ci][di] != state.cdBatchSaved[ci]:
+                            state.assignment[chans[ci]] = state.cdBatchValues[ci][di]
+                            state.cdBatchChanged[di].add(ci)
+                            for r in fwd[ci]: state.cdCascadeDirtyDV[r] = true
+                    for ci in state.cdBatchChanged[di]:
+                        state.assignment[chans[ci]] = state.cdBatchSaved[ci]
+                    state.assignment[pos] = savedPos
+            else:
+                # Evaluate cascade for all domain values using in-place modify-restore
+                for di in 0..<nDom:
+                    state.assignment[pos] = domain[di]
+                    for ci in 0..<nChans:
+                        case entryKinds[ci]
+                        of ceMinMax:
+                            # Min/max binding: evaluate using flat linear representation
+                            let fb {.cursor.} = state.flatMinMaxBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateFlatMinMax(fb, state.assignment)
+                        of ceCountEq:
+                            # CountEq binding: count matching values over input positions
+                            let binding {.cursor.} = state.carray.countEqChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateCountEq(binding, state.assignment)
+                        of ceConditionalCountEq:
+                            # ConditionalCountEq binding: count matching with filter condition
+                            let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
+                        of ceExpression:
+                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
+                        of ceWeightedCountEq:
+                            # WeightedCountEq binding: sum weights for matching values
+                            let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateWeightedCountEq(binding, state.assignment)
+                        of ceArgmax:
+                            # Argmax binding: evaluate input expressions and find max index
+                            let binding {.cursor.} = state.carray.argmaxChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateArgmax(binding, state.assignment)
+                        of ceCrossingCountMax:
+                            # Crossing count max: sweep-line evaluation
+                            let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
+                            state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
+                        of ceElement:
+                            # Element binding: evaluate index expression and look up array
+                            let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
+                            let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                            if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
+                                let elem = bindingPtr.arrayElements[idxVal]
+                                state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
+                                                               else: state.assignment[elem.variablePosition] + elem.offset
+                            else:
+                                state.cdBatchValues[ci][di] = state.cdBatchSaved[ci]
+                        state.assignment[chans[ci]] = state.cdBatchValues[ci][di]
 
             # Restore assignment
             state.assignment[pos] = savedPos
@@ -910,7 +1110,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
 
             # Compute penalties from batch channel values
             state.computeCascadePenalties(cascadeIdx,
-                state.cdBatchValues, domain, state.channelDepPenalties[pos])
+                state.cdBatchValues, domain, state.channelDepPenalties[pos], sparse = useSparse)
             when ProfileIteration:
                 state.cdCascadePenaltyTime += epochTime() - tBind1CD
                 state.cdCascadeCalls += 1
@@ -923,7 +1123,8 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             state.cdCascadeFallbackTime += epochTime() - tFall0CD
 
 
-proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[int]) {.inline.} =
+proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[int],
+                          movedPosition: int = -1) {.inline.} =
     ## Apply uniform cost delta for channel-dep penalties at position.
     ## For cascade positions: checks if external dependencies changed. If not,
     ## applies uniform delta (exact). If only min/max external deps changed (not
@@ -944,9 +1145,18 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
     # Check which external deps changed: element deps vs min/max-only deps
     var elemDepChanged = false
     var anyDepChanged = false
-    let elemExtDeps = state.cdCascadeElemExtDeps[cascadeIdx]
-    let externalDeps = state.cdCascadeExternalDeps[cascadeIdx]
-    if externalDeps.len > 0:
+    let elemExtDeps {.cursor.} = state.cdCascadeElemExtDeps[cascadeIdx]
+    let externalDeps {.cursor.} = state.cdCascadeExternalDeps[cascadeIdx]
+    # The moved search position itself is an external input of other cascades
+    # whose entries read several search positions (count / weighted-count loads,
+    # element arrays). It is not in changedChannels, so it must be checked
+    # explicitly — otherwise the uniform shortcut below keeps stale per-value
+    # channel values (wrong move scores in non-lean search).
+    let movedIsExt = movedPosition >= 0 and movedPosition in externalDeps
+    if movedIsExt:
+        anyDepChanged = true
+        if movedPosition in elemExtDeps: elemDepChanged = true
+    if externalDeps.len > 0 and not elemDepChanged:
         for chanPos in changedChannels:
             if chanPos in externalDeps:
                 anyDepChanged = true
@@ -958,6 +1168,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         when ProfileIteration: state.cdIncCalls += 1
         # Collect changed external positions
         var changedExternals: PackedSet[int]
+        if movedIsExt: changedExternals.incl(movedPosition)
         for chanPos in changedChannels:
             if chanPos in externalDeps:
                 changedExternals.incl(chanPos)
@@ -979,9 +1190,9 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         # Pass cache directly to computeCascadePenalties (it only reads min/max entries).
         let domain {.cursor.} = state.sharedDomain[][pos]
         let nDom = domain.len
-        let bindings = state.cdCascadeBindings[cascadeIdx]
-        let mmIndices = state.cdCascadeMinMaxIdx[cascadeIdx]
-        let mmInputs = state.cdCascadeMinMaxInputs[cascadeIdx]
+        let bindings {.cursor.} = state.cdCascadeBindings[cascadeIdx]
+        let mmIndices {.cursor.} = state.cdCascadeMinMaxIdx[cascadeIdx]
+        let mmInputs {.cursor.} = state.cdCascadeMinMaxInputs[cascadeIdx]
         # Save assignment values at positions that will be temporarily modified
         var savedAssignment: seq[tuple[pos: int, val: T]]
         var savedSet: PackedSet[int]
@@ -1033,7 +1244,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
     if not anyDepChanged:
         # No external deps changed — uniform delta is exact
         when ProfileIteration: state.cdUniformCalls += 1
-        let constraintIds = state.cdCascadeConstraintIds[cascadeIdx]
+        let constraintIds {.cursor.} = state.cdCascadeConstraintIds[cascadeIdx]
         var uniformDelta = 0
         for ci in constraintIds:
             if not state.channelDepConstraintActive[ci]: continue
@@ -1082,7 +1293,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
             if currentIdx >= 0 and currentIdx in affectedIndices:
                 # Full recomputation — use uniform delta
                 when ProfileIteration: state.cdFullPos += 1
-                state.applyUniformDelta(pos, changedChannels)
+                state.applyUniformDelta(pos, changedChannels, movedPosition)
             else:
                 # Targeted recomputation — only affected domain values
                 when ProfileIteration: state.cdTargetedPos += 1
@@ -1105,7 +1316,7 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos in nonOneHotPositions.items:
             if state.isLazy[pos]: continue
             when ProfileIteration: state.cdNonOneHotPos += 1
-            state.applyUniformDelta(pos, changedChannels)
+            state.applyUniformDelta(pos, changedChannels, movedPosition)
     else:
         # No reverse index — use channelDepPosForChannel with uniform delta
         var affectedPositions: PackedSet[int]
@@ -1116,4 +1327,4 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for pos in affectedPositions.items:
             if pos == movedPosition: continue
             if state.isLazy[pos]: continue
-            state.applyUniformDelta(pos, changedChannels)
+            state.applyUniformDelta(pos, changedChannels, movedPosition)

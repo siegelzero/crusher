@@ -1,5 +1,6 @@
 import std/[packedsets, sequtils, strformat, tables, times]
-import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular]
+import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular, sharedElems]
+export sharedElems
 from constraints/globalCardinality import ExactCounts, BoundedCounts
 import constraints/constraintNode
 import constraints/relationalConstraint
@@ -20,7 +21,7 @@ type
     ChannelBinding*[T] = object
         channelPosition*: int                # Position of the channel variable
         indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
-        arrayElements*: seq[ArrayElement[T]] # The array (constants and/or variable positions)
+        arrayElements*: SharedElems[T]       # The array (constants and/or variable positions); shared, immutable
         hasOffset*: bool                     # true if any element has non-zero offset
 
     MinMaxChannelBinding*[T] = object
@@ -259,7 +260,7 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
     arr.channelBindings.add(ChannelBinding[T](
         channelPosition: channelPos,
         indexExpression: indexExpr,
-        arrayElements: arrayElems,
+        arrayElements: toSharedElems(arrayElems),
         hasOffset: hasOff
     ))
     arr.channelPositions.incl(channelPos)
@@ -1557,16 +1558,22 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         channelChanged = true
 
                     # Backward: index domain restricted to values mapping to valid channel values
-                    for v in toSeq(currentDomain[idxPos].items):
-                        if currentDomain[idxPos].len <= 1: break  # never empty a domain
+                    # PackedSet.len is O(n) for large sets, so track the size locally
+                    # (calling len per value made this loop O(n^2) on big index domains).
+                    let idxVals = toSeq(currentDomain[idxPos].items)
+                    var idxRemaining = idxVals.len
+                    for v in idxVals:
+                        if idxRemaining <= 1: break  # never empty a domain
                         tempAssign[idxPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= binding.arrayElements.len:
                             currentDomain[idxPos].excl(v)
+                            dec idxRemaining
                             channelTotalRemoved += 1
                             channelChanged = true
                         elif binding.arrayElements[idx].constantValue notin currentDomain[chanPos]:
                             currentDomain[idxPos].excl(v)
+                            dec idxRemaining
                             channelTotalRemoved += 1
                             channelChanged = true
                 else:
@@ -4500,32 +4507,40 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         outerChanged = true
 
                     # Backward: domain(keyPos) ∩= {v : eval(v) ∈ bounds AND lookup[eval(v)] ∈ domain(ch)}
-                    for v in toSeq(currentDomain[keyPos].items):
-                        if currentDomain[keyPos].len <= 1: break  # never empty a domain
+                    let keyVals = toSeq(currentDomain[keyPos].items)
+                    var keyRemaining = keyVals.len  # PackedSet.len is O(n); track locally
+                    for v in keyVals:
+                        if keyRemaining <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= arrLen:
                             currentDomain[keyPos].excl(v)
+                            dec keyRemaining
                             outerChanged = true
                         elif arrElems[idx].constantValue notin currentDomain[chPos]:
                             currentDomain[keyPos].excl(v)
+                            dec keyRemaining
                             outerChanged = true
 
                 elif chSkipped and not keySkipped:
                     # Channel position skipped: use domainMin/domainMax bounds for feasibility
                     if currentDomain[keyPos].len == 0:
                         continue
-                    for v in toSeq(currentDomain[keyPos].items):
-                        if currentDomain[keyPos].len <= 1: break  # never empty a domain
+                    let keyVals = toSeq(currentDomain[keyPos].items)
+                    var keyRemaining = keyVals.len  # PackedSet.len is O(n); track locally
+                    for v in keyVals:
+                        if keyRemaining <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
                         let idx = binding.indexExpression.evaluate(tempAssign)
                         if idx < 0 or idx >= arrLen:
                             currentDomain[keyPos].excl(v)
+                            dec keyRemaining
                             outerChanged = true
                         else:
                             let val = arrElems[idx].constantValue
                             if val < domainMin[chPos] or val > domainMax[chPos]:
                                 currentDomain[keyPos].excl(v)
+                                dec keyRemaining
                                 outerChanged = true
 
                 elif not chSkipped and keySkipped:
@@ -4732,7 +4747,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             otherDomains.add(posDomains[oi])
                             otherProduct *= posDomains[oi].len
                         var oIndices = newSeq[int](otherPositions.len)
-                        for v in toSeq(currentDomain[kPos].items):
+                        let kVals = toSeq(currentDomain[kPos].items)
+                        var kRemaining = kVals.len  # PackedSet.len is O(n); track locally
+                        for v in kVals:
                             tempAssign[kPos] = v
                             var hasSupport = false
                             # Reset odometer indices
@@ -4754,8 +4771,9 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                                     else:
                                         break
                             if not hasSupport:
-                                if currentDomain[kPos].len <= 1: break  # never empty a domain
+                                if kRemaining <= 1: break  # never empty a domain
                                 currentDomain[kPos].excl(v)
+                                dec kRemaining
                                 cbPruned += 1
                                 outerChanged = true
 
