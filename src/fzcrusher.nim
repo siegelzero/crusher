@@ -14,7 +14,7 @@
 ##   --memory <MiB>  memory budget; caps workers so peak memory fits (also reads
 ##                   the MEMORY_LIMIT env var and the cgroup limit)
 
-import std/[os, strutils, strformat, times, posix, tables, packedsets]
+import std/[os, strutils, strformat, times, posix, tables, packedsets, algorithm]
 
 import crusher
 import flatzinc/[parser, translator, output]
@@ -172,6 +172,22 @@ proc main() =
             stderr.writeLine("[BigDom] " & name & " pos=" & $p & " len=" & $dl &
                              " channel=" & $(p in tr.sys.baseArray.channelPositions))
       stderr.writeLine("[BigDom] total positions with >100k values: " & $n)
+    if existsEnv("CRUSHER_DEBUG_SEARCHVARS"):
+      # Debug: every non-channel, non-fixed position (name, domain size, constraint count)
+      var rows: seq[(int, string)]
+      for name, p in tr.varPositions.pairs:
+        if p in tr.sys.baseArray.channelPositions: continue
+        let dl = tr.sys.baseArray.domain[p].len
+        if dl <= 1: continue
+        var nc = 0
+        for c in tr.sys.baseArray.constraints:
+          if p in c.positions: inc nc
+        rows.add((p, "[SearchVar] pos=" & $p & " " & name & " dom=" & $dl &
+                     " [" & $min(tr.sys.baseArray.domain[p]) & ".." & $max(tr.sys.baseArray.domain[p]) &
+                     "] cons=" & $nc))
+      rows.sort(proc (a, b: (int, string)): int = cmp(a[0], b[0]))
+      for r in rows: stderr.writeLine(r[1])
+      stderr.writeLine("[SearchVar] total: " & $rows.len)
     if existsEnv("CRUSHER_DEBUG_POS"):
       # Debug: name and constraints of the given system positions
       var want: seq[int]
@@ -191,8 +207,11 @@ proc main() =
           var cs: seq[string]
           for ci, c in tr.sys.baseArray.constraints:
             if p in c.positions: cs.add($ci & ":" & $c.stateType & "/" & $c.positions.len)
+          let dom = tr.sys.baseArray.domain[p]
+          let domStr = if dom.len <= 8: $dom else: $dom.len & " values [" & $min(dom) & ".." & $max(dom) & "]"
           stderr.writeLine("[DebugVars] " & vn & " pos=" & $p & " channel=" &
-                           $(p in tr.sys.baseArray.channelPositions) & " constraints=" & cs.join(" "))
+                           $(p in tr.sys.baseArray.channelPositions) & " dom=" & domStr &
+                           " constraints=" & cs.join(" "))
         elif vn in tr.definedVarExprs:
           stderr.writeLine("[DebugVars] " & vn & " defined expr over " & $tr.definedVarExprs[vn].positions.len & " positions")
         else:

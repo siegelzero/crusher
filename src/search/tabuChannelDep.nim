@@ -513,10 +513,33 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                 # constraints downstream of the chain see successor moves.
                 for k in state.ctpAtLink[p]:
                     let ctc = state.circuitTimePropConstraints[k]
-                    let nodeIdx = ctc.positionToIndex[p]
-                    for q in 0..<ctc.n: ctc.scratchLinks[q] = ctc.links[q]
-                    ctc.scratchLinks[nodeIdx] = int(state.assignment[p]) - ctc.valueOffset
-                    discard ctc.computePenalties(ctc.scratchLinks, ctc.scratchArrival, ctc.scratchDeparture)
+                    if p in ctc.positionToIndex:
+                        for q in 0..<ctc.n: ctc.scratchLinks[q] = ctc.links[q]
+                        let nodeIdx = ctc.positionToIndex[p]
+                        ctc.scratchLinks[nodeIdx] = int(state.assignment[p]) - ctc.valueOffset
+                        discard ctc.computePenalties(ctc.scratchLinks, ctc.scratchArrival, ctc.scratchDeparture)
+                    elif ctc.releaseFastOk:
+                        # Release (waiting) position on a valid tour: bounded re-walk,
+                        # only the changed nodes' times can differ
+                        let ri = ctc.releaseToIndex[p]
+                        discard ctc.releaseRewalk(ri, state.assignment[p])
+                        for q in ctc.relChangedNodes:
+                            for (tp, v) in [(ctc.arrivalPositions[q], ctc.scratchArrival[q]),
+                                            (ctc.departurePositions[q], ctc.scratchDeparture[q])]:
+                                if tp >= 0 and v != state.assignment[tp]:
+                                    state.trackChannelChange(tp, v)
+                                    if tp notin state.cdVisited:
+                                        state.cdVisited.incl(tp)
+                                        state.cdWorklist.add(tp)
+                        continue
+                    else:
+                        # Release (waiting) position: re-walk with the candidate release
+                        for q in 0..<ctc.n: ctc.scratchLinks[q] = ctc.links[q]
+                        let ri = ctc.releaseToIndex[p]
+                        let saved = ctc.releaseVal[ri]
+                        ctc.releaseVal[ri] = state.assignment[p]
+                        discard ctc.computePenalties(ctc.scratchLinks, ctc.scratchArrival, ctc.scratchDeparture)
+                        ctc.releaseVal[ri] = saved
                     for q in 0..<ctc.n:
                         for (tp, v) in [(ctc.arrivalPositions[q], ctc.scratchArrival[q]),
                                         (ctc.departurePositions[q], ctc.scratchDeparture[q])]:

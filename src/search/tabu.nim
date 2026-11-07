@@ -202,6 +202,11 @@ type
         deltaMismatches*: int   # CRUSHER_CHECK_DELTA diagnostics
         tourFailStreak*: int    # consecutive fruitless tryTourMoves scans (backoff)
         tourNextTry*: int       # iteration of the next tryTourMoves attempt
+        tourPairs*: seq[(int, int, int)]   # (circuit idx, node a, node b): nodes tied by a binary
+                                           # relation over one accumulator chain (e.g. same vehicle)
+        tourPairsBuilt*: bool
+        pairNextTry*: int
+        pairFailStreak*: int
 
         # Regular constraints over search positions, for line-rewrite moves (tabuRegularMoves)
         regularConstraintIndices*: seq[int]
@@ -219,6 +224,14 @@ type
 
         # Cached circuit constraint states (direct-variable only) for circuit-repair moves
         circuitConstraints*: seq[CircuitConstraint[T]]
+        # Successor positions of circuits that drive circuit-time chains -> index
+        # into circuitConstraints (built lazily). On a VALID tour every single
+        # successor move breaks the circuit, so these are left to tour moves.
+        ctpCircuitOfPos*: Table[int, int]
+        ctpCircuitBuilt*: bool
+        # Lean first-improvement run: penalty maps are not read, so stagnation
+        # helpers commit moves with assignValueLean (no map maintenance).
+        leanSearch*: bool
         # Circuit constraints over channel (derived) positions: their successors are
         # selected by index variables, so a cross-cycle merge is realized by flipping
         # those selectors rather than assigning the channel directly.
@@ -471,6 +484,29 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 ################################################################################
 # Included subsystems
 ################################################################################
+
+let gNoCtpLinkSkip = existsEnv("CRUSHER_NO_CTP_LINK_SKIP")
+let gNoSegmentRelocate = not existsEnv("CRUSHER_SEGMENT_RELOCATE")   # opt-in: relocating fixed chains scrambled vrplc vehicle anchors
+
+proc onValidCtpCircuit[T](state: TabuState[T], pos: int): bool {.inline.} =
+    ## True when pos is a successor variable of a currently valid circuit whose
+    ## tour drives a circuit-time chain (single moves there only break the tour).
+    if gNoCtpLinkSkip or state.circuitTimePropConstraints.len == 0 or
+       state.circuitConstraints.len == 0:
+        return false
+    if not state.ctpCircuitBuilt:
+        state.ctpCircuitBuilt = true
+        for ci, cc in state.circuitConstraints:
+            for p in cc.positionArray:
+                if p >= 0 and p in state.ctpAtLink:
+                    state.ctpCircuitOfPos[p] = ci
+    let ci = state.ctpCircuitOfPos.getOrDefault(pos, -1)
+    ci >= 0 and state.circuitConstraints[ci].cost == 0
+
+template commitValue[T](state: TabuState[T], position: int, value: T) =
+    ## Commit a move from a stagnation helper: lean when the search is lean.
+    if state.leanSearch: state.assignValueLean(position, value)
+    else: state.assignValue(position, value)
 
 include tabuInverseMoves
 include tabuChannelDep
@@ -1165,6 +1201,232 @@ proc balanceBinarySums[T](state: TabuState[T]) =
         for pos in positions:
             fixed.incl(pos)
 
+proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
+    ## Start every circuit (over direct search variables) on a random VALID
+    ## Hamiltonian tour: chain the paths formed by fixed arcs and the free
+    ## nodes in random order, each link drawn from the tail's domain, with
+    ## randomized retries. Single-variable moves cannot merge subtours, so a
+    ## random permutation start leaves the search fighting the circuit (and
+    ## any chain constraint walking it) instead of the side constraints;
+    ## tour moves then keep the circuit valid.
+    var nInit = 0
+    if verbose: echo "[Init] circuit init: " & $state.circuitConstraints.len & " circuits"
+    for cc in state.circuitConstraints:
+        let n = cc.n
+        if n < 3: continue
+        let off = cc.valueOffset
+        var fixedSucc = newSeq[int](n)
+        var hasFixedPred = newSeq[bool](n)
+        var ok = true
+        for i in 0..<n:
+            let pos = cc.positionArray[i]
+            let dom {.cursor.} = state.sharedDomain[][pos]
+            fixedSucc[i] = -1
+            if dom.len == 1 or pos in state.carray.fixedPositions:
+                let v = (if dom.len == 1: int(dom[0]) else: int(state.assignment[pos])) - off
+                if v < 0 or v >= n or hasFixedPred[v]:
+                    if verbose: echo "[Init] circuit init: inconsistent fixed arc at node " & $i
+                    ok = false
+                    break
+                fixedSucc[i] = v
+                hasFixedPred[v] = true
+        if not ok: continue
+        # Segments: maximal fixed-arc paths, from heads (no fixed predecessor)
+        var segHead, segTail: seq[int]
+        var covered = 0
+        for h in 0..<n:
+            if hasFixedPred[h]: continue
+            var cur = h
+            inc covered
+            var guard = 0
+            while fixedSucc[cur] >= 0 and guard <= n:
+                cur = fixedSucc[cur]
+                inc covered
+                inc guard
+            segHead.add(h)
+            segTail.add(cur)
+        if covered != n or segHead.len < 2:   # fixed cycle or fully fixed
+            if verbose: echo "[Init] circuit init skipped: covered=" & $covered & "/" & $n & " segs=" & $segHead.len
+            continue
+        let m = segHead.len
+        var domSet = newSeq[PackedSet[int]](m)          # allowed heads (node idx) per tail
+        for k in 0..<m:
+            for v in state.sharedDomain[][cc.positionArray[segTail[k]]]:
+                domSet[k].incl(int(v) - off)
+        var headSeg: Table[int, int]
+        for k in 0..<m: headSeg[segHead[k]] = k
+        var order = newSeq[int](m)
+        var success = false
+        # Phase 1: random insertion. Close a small cycle from a random segment,
+        # then insert the remaining segments (random order) at random valid
+        # arcs a -> b (head_k in dom(tail_a), head_b in dom(tail_k)).
+        block insertion:
+            var nextSeg = newSeq[int](m)
+            var inCycle = newSeq[bool](m)
+            var cycleList: seq[int]
+            var pending: seq[int]
+            var arcs: seq[int]
+            for attempt in 0..<16:
+                for k in 0..<m:
+                    inCycle[k] = false
+                    nextSeg[k] = -1
+                cycleList.setLen(0)
+                var s0 = rand(m - 1)
+                var closed = false
+                # Fixed multi-node segments (e.g. giant-tour depot connectors
+                # end_v -> start_v+1) first, in head-index order: anchors that
+                # accumulate along the tour (vehicle ids, loads) then start
+                # consistent and only the free nodes are placed at random.
+                if attempt < 8:
+                    var multi: seq[int]
+                    for k in 0..<m:
+                        if segHead[k] != segTail[k]: multi.add(k)
+                    if multi.len >= 2:
+                        multi.sort(proc (a, b: int): int = cmp(segHead[a], segHead[b]))
+                        var okBase = true
+                        for t in 0..<multi.len:
+                            let a = multi[t]
+                            let b = multi[(t + 1) mod multi.len]
+                            if segHead[b] notin domSet[a]:
+                                okBase = false
+                                break
+                        if okBase:
+                            for t in 0..<multi.len:
+                                let a = multi[t]
+                                inCycle[a] = true
+                                cycleList.add(a)
+                                nextSeg[a] = multi[(t + 1) mod multi.len]
+                            s0 = multi[0]
+                            closed = true
+                if not closed:
+                    inCycle[s0] = true
+                    cycleList.add(s0)
+                    closed = segHead[s0] in domSet[s0] and m == 1
+                var cur = s0
+                var guard = 0
+                while not closed and guard < m:
+                    inc guard
+                    if segHead[s0] in domSet[cur] and cycleList.len >= 2:
+                        nextSeg[cur] = s0
+                        closed = true
+                        break
+                    # extend with a random unused segment whose tail can close or continue
+                    var best = -1
+                    var nSeen = 0
+                    for h in domSet[cur].items:
+                        if h notin headSeg: continue
+                        let k = headSeg[h]
+                        if inCycle[k]: continue
+                        let canClose = segHead[s0] in domSet[k]
+                        inc nSeen
+                        if canClose:
+                            if best < 0 or segHead[s0] notin domSet[best] or rand(nSeen - 1) == 0:
+                                best = k
+                        elif best < 0 or (segHead[s0] notin domSet[best] and rand(nSeen - 1) == 0):
+                            best = k
+                    if best < 0: break
+                    nextSeg[cur] = best
+                    inCycle[best] = true
+                    cycleList.add(best)
+                    cur = best
+                if not closed: continue
+                pending.setLen(0)
+                for k in 0..<m:
+                    if not inCycle[k]: pending.add(k)
+                shuffle(pending)
+                var allIn = true
+                for k in pending:
+                    arcs.setLen(0)
+                    for a in cycleList:
+                        let b = nextSeg[a]
+                        if segHead[k] in domSet[a] and segHead[b] in domSet[k]:
+                            arcs.add(a)
+                    if arcs.len == 0:
+                        allIn = false
+                        break
+                    let a = arcs[rand(arcs.len - 1)]
+                    nextSeg[k] = nextSeg[a]
+                    nextSeg[a] = k
+                    inCycle[k] = true
+                    cycleList.add(k)
+                if not allIn: continue
+                var c = s0
+                for step in 0..<m:
+                    order[step] = c
+                    c = nextSeg[c]
+                success = true
+                if verbose: echo "[Init] circuit init (insertion) succeeded at attempt " & $attempt
+                break insertion
+        for attempt in 0..<64:
+            if success: break
+            var used = newSeq[bool](m)
+            var first = rand(m - 1)
+            order[0] = first
+            used[first] = true
+            var cur = first
+            var fail = false
+            var cand: seq[int]
+            # Warnsdorff: prefer the segment with the fewest onward options
+            # only after 32 random attempts failed (random tours spread better)
+            let warnsdorff = m <= 300 and attempt >= 32
+            for step in 1..<m:
+                cand.setLen(0)
+                for h in domSet[cur].items:
+                    if h in headSeg:
+                        let k = headSeg[h]
+                        if not used[k]: cand.add(k)
+                if cand.len == 0:
+                    fail = true
+                    break
+                var nk = cand[rand(cand.len - 1)]
+                if warnsdorff and cand.len > 1:
+                    var bestDeg = high(int)
+                    var nBest = 0
+                    for k in cand:
+                        var deg = 0
+                        for h in domSet[k].items:
+                            if h in headSeg:
+                                let kk = headSeg[h]
+                                if not used[kk] and kk != k: inc deg
+                        # the last step must be able to close back to `first`
+                        if step == m - 1 and segHead[first] notin domSet[k]: deg = high(int) - 1
+                        if deg < bestDeg:
+                            bestDeg = deg
+                            nk = k
+                            nBest = 1
+                        elif deg == bestDeg:
+                            inc nBest
+                            if rand(nBest - 1) == 0: nk = k
+                order[step] = nk
+                used[nk] = true
+                cur = nk
+            if fail: continue
+            if segHead[first] notin domSet[cur]: continue
+            success = true
+            if verbose: echo "[Init] circuit init succeeded at attempt " & $attempt
+            break
+        if not success:
+            if verbose: echo "[Init] circuit init failed after retries (" & $m & " segments)"
+            continue
+        for step in 0..<m:
+            let k = order[step]
+            let nxt = order[(step + 1) mod m]
+            state.assignment[cc.positionArray[segTail[k]]] = T(segHead[nxt] + off)
+        if verbose:
+            # sanity: walk the tour
+            var seen = newSeq[bool](n)
+            var cur = 0
+            var cnt = 0
+            while not seen[cur]:
+                seen[cur] = true
+                inc cnt
+                cur = int(state.assignment[cc.positionArray[cur]]) - off
+                if cur < 0 or cur >= n: break
+            echo "[Init] circuit init tour length " & $cnt & "/" & $n & " segments=" & $m
+        inc nInit
+    if verbose and nInit > 0:
+        echo "[Init] Valid circuit tours: " & $nInit & "/" & $state.circuitConstraints.len
+
 proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
     ## For each alldifferent constraint that is a permutation (domain union size ==
     ## position count), initialize free positions with a valid random permutation of
@@ -1254,6 +1516,8 @@ let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
 let gNoIncCount = existsEnv("CRUSHER_NO_INC_COUNT")
 let gExactCascadeExt = existsEnv("CRUSHER_EXACT_CASCADE_EXT")
 let gNoExactCascadeExt = existsEnv("CRUSHER_NO_EXACT_CASCADE_EXT")
+let gDebugViolations = existsEnv("CRUSHER_DEBUG_VIOLATIONS")
+let gCtpLazy = existsEnv("CRUSHER_CTP_LAZY")
 
 proc logInitRss*(label: string) =
     ## Verbose-only: resident set size after an init phase (Linux /proc/self/statm).
@@ -1344,6 +1608,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             for lp in constraint.circuitTimePropState.positionArray:
                 if lp >= 0:
                     state.ctpAtLink.mgetOrPut(lp, @[]).add(state.circuitTimePropConstraints.len - 1)
+            # Release (waiting) positions also drive the time writeback
+            for rp in constraint.circuitTimePropState.releasePositions:
+                if rp >= 0:
+                    state.ctpAtLink.mgetOrPut(rp, @[]).add(state.circuitTimePropConstraints.len - 1)
         # Cache circuit constraints for stagnation-time cross-cycle merge moves.
         # Skip circuits over channel positions: their successor values are derived
         # from source variables and cannot be assigned directly (same reasoning as
@@ -1566,6 +1834,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     # Initialize permutation groups with valid random permutations
     if initialAssignment.len == 0:
         state.balancePermutations(verbose and id == 0)
+
+    # Circuits start on a random valid Hamiltonian tour
+    if initialAssignment.len == 0 and not existsEnv("CRUSHER_NO_CIRCUIT_INIT"):
+        state.initValidCircuits(verbose and id == 0)
 
     # Table-aware initialization: for each table constraint, try to satisfy it
     # by picking a valid tuple closest to the current assignment. This dramatically
@@ -2065,7 +2337,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for pos in carray.allSearchPositions():
         state.searchPositions.add(pos)
         let dsize = state.sharedDomain[][pos].len
-        if dsize > LazyThreshold:
+        if dsize > LazyThreshold or (gCtpLazy and pos in state.ctpAtLink):
             state.isLazy[pos] = true
         else:
             state.totalDomainSize += dsize
@@ -3948,10 +4220,10 @@ proc writebackCircuitTimes[T](state: TabuState[T], position: int,
     ## (e.g. an objective max over arrival times) stay consistent.
     changedBuf.setLen(0)
     for ctc in state.circuitTimePropConstraints:
-        var touched = position in ctc.positionToIndex
+        var touched = position in ctc.positions
         if not touched:
             for (fPos, fOld, fNew) in forced:
-                if fPos in ctc.positionToIndex:
+                if fPos in ctc.positions:
                     touched = true
                     break
         if not touched: continue
@@ -4381,6 +4653,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
     var posChecked = 0
 
     for position in state.searchPositions:
+        if state.onValidCtpCircuit(position): continue
         let oldValue = state.assignment[position]
         # Skip non-violated positions (use constraint state directly, no violationCount)
         var isViolated = false
@@ -4690,7 +4963,7 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
     echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s" &
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
-    if state.id == 0 and state.bestCost > 0 and label == "Exhausted":
+    if state.id == 0 and state.bestCost > 0 and (label == "Exhausted" or gDebugViolations):
         state.logViolatedBreakdown()
     when ProfileIteration:
         let iters = max(1, state.iteration).float
@@ -4870,6 +5143,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         state.channelDepSearchPositions.len > 0 and
         state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5
 
+    state.leanSearch = useLeanSearch and not existsEnv("CRUSHER_NO_LEAN_COMMIT")
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
             (if useLeanSearch: " (lean first-improvement)" else: "")
@@ -4997,6 +5271,27 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             else:
                 state.tourFailStreak = 0
                 state.tourNextTry = state.iteration + 2
+
+        # Linked-pair relocation (pickup/delivery on one vehicle) on valid tours
+        if state.circuitConstraints.len > 0 and state.circuitTimePropConstraints.len > 0 and
+           state.iteration - lastImprovement >= 5 and
+           state.iteration >= state.pairNextTry and
+           not outOfBudget() and not existsEnv("CRUSHER_NO_PAIR_MOVES"):
+            if state.tryPairTourMoves():
+                state.pairFailStreak = 0
+                state.pairNextTry = state.iteration + 2
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via pair tour move")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            else:
+                state.pairFailStreak = min(state.pairFailStreak + 1, 8)
+                state.pairNextTry = state.iteration + 10 * (1 shl state.pairFailStreak)
 
         # Try circuit cross-cycle merge moves during stagnation: when a circuit
         # constraint has split into disjoint subtours, a 2-opt swap of successors

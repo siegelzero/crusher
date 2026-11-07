@@ -44,6 +44,9 @@
 ## offset across instances), letting the optimizer distribute a global bound.
 
 import std/[tables, packedsets]
+from std/os import existsEnv
+
+let gNoReleaseFast = existsEnv("CRUSHER_NO_RELEASE_FAST")
 
 type
     CircuitTimePropConstraint*[T] = ref object
@@ -78,6 +81,22 @@ type
         timeWindowPenalty*: int
         circuitWeight*: int                  # weight for circuit violations
         closureFree*: bool                   # equality chain: arc back into the depot is unconstrained
+
+        # Release (waiting) variables, inequality form only. A node with a
+        # release position departs at max(arrival, early, release): searching
+        # the release lets the walk represent ANY feasible schedule (waiting
+        # for a resource, e.g. location congestion), not only earliest times.
+        # noWait nodes (arrival and departure are the same model variable)
+        # depart at their arrival after a constrained arc; both window sides
+        # are penalized there.
+        hasRelease*: bool
+        releasePositions*: seq[int]          # per node, -1 if none
+        releaseToIndex*: Table[int, int]     # release position -> node index
+        releaseVal*: seq[T]                  # current release per node (early if none)
+        noWait*: seq[bool]                   # per node (empty = all false)
+        # Committed walk for bounded release re-walks (valid on a full tour)
+        committedFullTour*: bool             # last committed walk visited all nodes and closed
+        relChangedNodes*: seq[int]           # nodes whose times differ in the last releaseRewalk
 
         # Scratch space
         scratchInAffected*: seq[bool]
@@ -349,14 +368,18 @@ proc computePenalties*[T](c: CircuitTimePropConstraint[T],
                 c.scratchPath[p] = l
 
     # Traverse from depot computing times
-    departure[c.depotIndex] = c.depotDeparture
-    arrival[c.depotIndex] = c.depotDeparture
+    let depotDep = if c.hasRelease: max(c.depotDeparture, c.releaseVal[c.depotIndex])
+                   else: c.depotDeparture
+    departure[c.depotIndex] = depotDep
+    arrival[c.depotIndex] = depotDep
     c.scratchInAffected[c.depotIndex] = true
 
     var visited = 1
     var current = c.depotIndex
     var twPenalty = 0
-    var maxTime = c.depotDeparture
+    var maxTime = depotDep
+    if c.hasRelease and depotDep > c.lateTimes[c.depotIndex]:
+        twPenalty += int(depotDep - c.lateTimes[c.depotIndex])
 
     for step in 1..<n:
         let next = c.scratchPath[current]
@@ -369,7 +392,16 @@ proc computePenalties*[T](c: CircuitTimePropConstraint[T],
             # No time constraint on this arc: the clock resets (e.g. giant-tour
             # wrap from one vehicle's end depot to the next vehicle's start).
             arrival[next] = c.earlyTimes[next]
-        departure[next] = max(arrival[next], c.earlyTimes[next])
+        if c.hasRelease:
+            if c.noWait.len > 0 and c.noWait[next] and c.outConstrained[current]:
+                departure[next] = arrival[next]
+                if arrival[next] < c.earlyTimes[next]:
+                    twPenalty += int(c.earlyTimes[next] - arrival[next])
+            else:
+                departure[next] = max(arrival[next],
+                                      max(c.earlyTimes[next], c.releaseVal[next]))
+        else:
+            departure[next] = max(arrival[next], c.earlyTimes[next])
         if departure[next] > c.lateTimes[next]:
             twPenalty += int(departure[next] - c.lateTimes[next])
         if departure[next] > maxTime:
@@ -422,7 +454,7 @@ proc rebuildIncCache[T](c: CircuitTimePropConstraint[T]) =
     ## c.departureTime for the committed links. Forward orientation only —
     ## a backward (predecessor) link change rewires two successor arcs, so the
     ## prefix argument doesn't hold there.
-    c.incValid = c.forward and
+    c.incValid = c.forward and not c.hasRelease and
                  (c.equalityChain or c.useMaxMetric or c.useSumMetric)
     if not c.incValid: return
     let n = c.n
@@ -615,10 +647,104 @@ proc moveDeltaIncEquality[T](c: CircuitTimePropConstraint[T],
     return newCost - c.cost
 
 
+proc setReleasePositions*[T](c: CircuitTimePropConstraint[T],
+                             releasePositions: seq[int], noWait: seq[bool]) =
+    ## Attach release (waiting) variables; see the hasRelease field.
+    c.hasRelease = true
+    c.releasePositions = releasePositions
+    c.noWait = noWait
+    c.releaseVal = newSeq[T](c.n)
+    c.releaseToIndex = initTable[int, int]()
+    for i in 0..<c.n:
+        c.releaseVal[i] = c.earlyTimes[i]
+        let p = if i < releasePositions.len: releasePositions[i] else: -1
+        if p >= 0:
+            c.releaseToIndex[p] = i
+            c.positions.incl(p)
+
+proc releaseFastOk*[T](c: CircuitTimePropConstraint[T]): bool {.inline.} =
+    c.hasRelease and c.forward and not c.equalityChain and c.committedFullTour and
+        not c.useMaxMetric and not c.useSumMetric and not c.objectiveBoundActive
+
+proc nodeTwPen[T](c: CircuitTimePropConstraint[T], v: int, arr, dep: T, constrainedIn: bool): int {.inline.} =
+    ## Window penalty of node v as charged by the inequality walk.
+    result = 0
+    if c.hasRelease and c.noWait.len > 0 and c.noWait[v] and constrainedIn:
+        if arr < c.earlyTimes[v]: result += int(c.earlyTimes[v] - arr)
+    if dep > c.lateTimes[v]: result += int(dep - c.lateTimes[v])
+
+proc releaseRewalk*[T](c: CircuitTimePropConstraint[T], nodeIdx: int, newRel: T): int =
+    ## Bounded re-walk for a release change at nodeIdx on a valid committed
+    ## tour: follows the tour from nodeIdx and stops at a clock reset, the
+    ## closure into the depot, or the first node whose times are unchanged.
+    ## Returns the time-window penalty delta; c.relChangedNodes lists the
+    ## changed nodes with their new times in c.scratchArrival/scratchDeparture.
+    ## Requires releaseFastOk.
+    c.relChangedNodes.setLen(0)
+    let n = c.n
+    var delta = 0
+    var cur = nodeIdx
+    var dep: T
+    if nodeIdx == c.depotIndex:
+        dep = max(c.depotDeparture, newRel)
+        let oldDep = c.departureTime[cur]
+        if dep == oldDep: return 0
+        delta += max(0, int(dep - c.lateTimes[cur])) - max(0, int(oldDep - c.lateTimes[cur]))
+        c.scratchArrival[cur] = c.arrivalTime[cur]   # depot arrival = closure arrival
+        c.scratchDeparture[cur] = dep
+    else:
+        let arr = c.arrivalTime[cur]
+        # in-arc constrained? (predecessor's out-arc); noWait nodes never carry releases
+        # after a constrained arc, so the release form applies here
+        dep = max(arr, max(c.earlyTimes[cur], newRel))
+        let oldDep = c.departureTime[cur]
+        if dep == oldDep: return 0
+        delta += max(0, int(dep - c.lateTimes[cur])) - max(0, int(oldDep - c.lateTimes[cur]))
+        c.scratchArrival[cur] = arr
+        c.scratchDeparture[cur] = dep
+    c.relChangedNodes.add(cur)
+    var steps = 0
+    while steps < n:
+        inc steps
+        if not c.outConstrained[cur]: break          # clock resets downstream
+        let nxt = c.links[cur]
+        if nxt < 0 or nxt >= n: break
+        let newArr = dep + c.distanceMatrix[nxt][cur]
+        if nxt == c.depotIndex:
+            # closure: only the depot's arrival is re-checked
+            let oldArr = c.arrivalTime[nxt]
+            if newArr != oldArr:
+                delta += max(0, int(newArr - c.lateTimes[nxt])) - max(0, int(oldArr - c.lateTimes[nxt]))
+                c.scratchArrival[nxt] = newArr
+                c.scratchDeparture[nxt] = c.departureTime[nxt]
+                c.relChangedNodes.add(nxt)
+            break
+        var newDep: T
+        if c.noWait.len > 0 and c.noWait[nxt]:
+            newDep = newArr
+        else:
+            newDep = max(newArr, max(c.earlyTimes[nxt], c.releaseVal[nxt]))
+        let oldArr = c.arrivalTime[nxt]
+        let oldDep = c.departureTime[nxt]
+        if newArr == oldArr and newDep == oldDep: break
+        delta += c.nodeTwPen(nxt, newArr, newDep, true) - c.nodeTwPen(nxt, oldArr, oldDep, true)
+        c.scratchArrival[nxt] = newArr
+        c.scratchDeparture[nxt] = newDep
+        c.relChangedNodes.add(nxt)
+        cur = nxt
+        dep = newDep
+    return delta
+
+proc commitWalk[T](c: CircuitTimePropConstraint[T]) {.inline.} =
+    c.committedFullTour = c.circuitPenalty == 0
+
 proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
     for i, pos in c.positionArray:
         if pos >= 0:
             c.links[i] = int(assignment[pos]) - c.valueOffset
+    if c.hasRelease:
+        for p, i in c.releaseToIndex.pairs:
+            c.releaseVal[i] = assignment[p]
 
     let pens = c.computePenalties(c.links, c.arrivalTime, c.departureTime)
     c.circuitPenalty = pens.circPen
@@ -626,6 +752,7 @@ proc initialize*[T](c: CircuitTimePropConstraint[T], assignment: seq[T]) =
     c.objectiveMetric = pens.metric
     c.cost = c.circuitPenalty * c.circuitWeight + c.timeWindowPenalty +
              c.objPenaltyFor(pens.metric)
+    c.commitWalk()
     c.rebuildIncCache()
 
 
@@ -645,6 +772,19 @@ proc clearObjectiveBound*[T](c: CircuitTimePropConstraint[T]) =
 
 proc moveDelta*[T](c: CircuitTimePropConstraint[T],
                     position: int, oldValue, newValue: T): int =
+    if c.hasRelease and position in c.releaseToIndex:
+        let ri = c.releaseToIndex[position]
+        var fastOff = false
+        {.cast(noSideEffect).}:
+            fastOff = gNoReleaseFast
+        if c.releaseFastOk and not fastOff:
+            return c.releaseRewalk(ri, newValue)
+        let saved = c.releaseVal[ri]
+        c.releaseVal[ri] = newValue
+        let pens = c.computePenalties(c.links, c.scratchArrival, c.scratchDeparture)
+        c.releaseVal[ri] = saved
+        return pens.circPen * c.circuitWeight + pens.twPen +
+               c.objPenaltyFor(pens.metric) - c.cost
     if position notin c.positionToIndex:
         return 0
     let nodeIdx = c.positionToIndex[position]
@@ -669,10 +809,13 @@ proc moveDelta*[T](c: CircuitTimePropConstraint[T],
 
 proc updatePosition*[T](c: CircuitTimePropConstraint[T],
                          position: int, newValue: T) =
-    if position notin c.positionToIndex:
+    if c.hasRelease and position in c.releaseToIndex:
+        c.releaseVal[c.releaseToIndex[position]] = newValue
+    elif position notin c.positionToIndex:
         return
-    let nodeIdx = c.positionToIndex[position]
-    c.links[nodeIdx] = int(newValue) - c.valueOffset
+    else:
+        let nodeIdx = c.positionToIndex[position]
+        c.links[nodeIdx] = int(newValue) - c.valueOffset
 
     let pens = c.computePenalties(c.links, c.arrivalTime, c.departureTime)
     c.circuitPenalty = pens.circPen
@@ -680,6 +823,7 @@ proc updatePosition*[T](c: CircuitTimePropConstraint[T],
     c.objectiveMetric = pens.metric
     c.cost = c.circuitPenalty * c.circuitWeight + c.timeWindowPenalty +
              c.objPenaltyFor(pens.metric)
+    c.commitWalk()
     c.rebuildIncCache()
 
 
@@ -703,6 +847,12 @@ proc deepCopy*[T](c: CircuitTimePropConstraint[T]): CircuitTimePropConstraint[T]
     result.departurePositions = c.departurePositions
     result.circuitWeight = c.circuitWeight
     result.closureFree = c.closureFree
+    result.hasRelease = c.hasRelease
+    result.releasePositions = c.releasePositions
+    result.releaseToIndex = c.releaseToIndex
+    result.releaseVal = c.releaseVal
+    result.noWait = c.noWait
+    result.committedFullTour = c.committedFullTour
 
     # Deep copy mutable state
     result.links = newSeq[int](c.n)

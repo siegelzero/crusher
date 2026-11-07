@@ -7,7 +7,7 @@ import parser
 import dfaExtract
 import ../constraintSystem
 import ../constrainedArray
-import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir]
+import ../constraints/[stateful, constraintNode, relationalConstraint, countEq, matrixElement, elementState, tableConstraint, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, multiMachineNoOverlap, conditionalLinear, reservoir, circuitTimeProp]
 import ../expressions/[expressions, algebraic, sumExpression, minExpression, maxExpression, weightedSameValue, binaryPairwiseSum]
 
 const
@@ -296,6 +296,13 @@ type
         closureFree*: bool              # arcs back into the depot carry no constraint
         keepCircuit*: bool              # the crusher_circuit stays; CTP circuit weight 0
         exactChain*: bool               # equalities define every time: projection exempt
+        # Split time chains (arr[succ] = dep + d, arr <= ser, ser + s <= dep):
+        # searched release variables make the walk complete (no projection),
+        # dep becomes the channel ser + s (WLOG minimal: observed monotonically).
+        useRelease*: bool
+        releaseNodes*: seq[bool]        # per node: gets a release (waiting) variable
+        noWait*: seq[bool]              # per node: arrival and departure are one variable
+        depChannels*: seq[tuple[dep, ser: string, s: int]]
 
     FznTranslator* = object
         sys*: ConstraintSystem[int]
@@ -1241,6 +1248,9 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.canonicalizeLinearReifs()
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
+    # Equalities whose reification presolve fixed true become FZN aliases.
+    if not existsEnv("CRUSHER_NO_FIXED_EQ_ALIAS"):
+        result.aliasFixedEqualities()
     # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection
     # or constraint collection. Substitutes alias names with canonical names everywhere
     # in the model and demotes redundant parallel defining constraints (which become

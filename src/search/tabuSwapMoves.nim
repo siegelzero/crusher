@@ -320,10 +320,13 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
         if state.violationCount[p1] == 0 and
            state.channelDepPenalties[p1].len == 0:
             continue
+        # Swapping two successors of one valid tour splits it: tour moves cover these
+        if state.onValidCtpCircuit(p1): continue
         let val1 = state.assignment[p1]
 
         for j in (i+1)..<state.searchPositions.len:
             let p2 = state.searchPositions[j]
+            if state.onValidCtpCircuit(p2): continue
             let val2 = state.assignment[p2]
             if val1 == val2:
                 continue
@@ -377,8 +380,8 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
     let (p1, p2) = sample(bestSwaps)
     let oldVal1 = state.assignment[p1]
     let oldVal2 = state.assignment[p2]
-    state.assignValue(p1, oldVal2)
-    state.assignValue(p2, oldVal1)
+    state.commitValue(p1, oldVal2)
+    state.commitValue(p2, oldVal1)
 
     # Set tabu on old values
     let tabuTenure = state.iteration + 1 + state.iteration mod 10

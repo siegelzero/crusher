@@ -1,6 +1,7 @@
-import std/[sequtils, unittest]
+import std/[sequtils, unittest, random]
 import crusher
 import constraints/circuitTimeProp
+import search/tabu
 
 ## Small TSPTW instance: 5 locations, depot at 0 (0-based)
 ## Tour: 0 → 1 → 2 → 3 → 4 → 0
@@ -254,3 +255,91 @@ suite "CircuitTimeProp Constraint":
         c.initialize(assignment)
         # Some nodes will be unreachable from depot
         check c.circuitPenalty > 0
+
+suite "CircuitTimeProp release (waiting) variables":
+    test "departure = max(arrival, early, release); moveDelta matches recompute":
+        # Forward (successor) form, 1-based links at positions 0..4, release
+        # variables at positions 5..9 (node 0 = depot).
+        var c = newCircuitTimePropConstraint[int](
+            linkPositions = @[0,1,2,3,4],
+            distanceMatrix = dist,
+            earlyTimes = early,
+            lateTimes = late,
+            depotIndex = 0,
+            depotDeparture = 0,
+            arrivalPositions = @[-1,-1,-1,-1,-1],
+            departurePositions = @[-1,-1,-1,-1,-1],
+            valueOffset = 1,
+            forward = true)
+        c.setReleasePositions(@[5, 6, 7, 8, 9], @[false, false, false, false, false])
+        check 7 in c.positions
+        # Tour 0->1->2->3->4->0 (succ, 1-based); releases: wait at node 2 until 40
+        var a = @[2, 3, 4, 5, 1, 0, 0, 40, 0, 0]
+        c.initialize(a)
+        # dep1 = max(10, 5) = 10; arr2 = 22, dep2 = max(22, 15, 40) = 40
+        check c.departureTime[1] == 10
+        check c.arrivalTime[2] == 22
+        check c.departureTime[2] == 40
+        check c.departureTime[3] == 50       # 40 + 10
+        let base = c.cost
+        # Every release / link change: moveDelta == fresh initialize difference
+        for pos in 0..9:
+            let vals = if pos < 5: toSeq(1..5) else: toSeq(0..90)
+            for v in vals:
+                let md = c.moveDelta(pos, a[pos], v)
+                var b = a
+                b[pos] = v
+                var c2 = c.deepCopy()
+                c2.initialize(b)
+                check md == c2.cost - base
+        # updatePosition on a release keeps the state consistent
+        c.updatePosition(7, 0)
+        a[7] = 0
+        check c.departureTime[2] == 22
+        var c3 = c.deepCopy()
+        c3.initialize(a)
+        check c3.cost == c.cost
+
+    test "noWait node departs at its arrival and is penalized below its window":
+        var c = newCircuitTimePropConstraint[int](
+            linkPositions = @[0,1,2,3,4],
+            distanceMatrix = dist,
+            earlyTimes = @[0, 5, 30, 25, 35],
+            lateTimes = late,
+            depotIndex = 0,
+            depotDeparture = 0,
+            arrivalPositions = @[-1,-1,-1,-1,-1],
+            departurePositions = @[-1,-1,-1,-1,-1],
+            valueOffset = 1,
+            forward = true)
+        c.setReleasePositions(@[-1, -1, -1, -1, -1], @[false, false, true, false, false])
+        c.initialize(@[2, 3, 4, 5, 1])
+        # arrival at 2 = 22 < early 30: no waiting allowed -> departs 22, penalty 8
+        check c.departureTime[2] == 22
+        check c.timeWindowPenalty >= 8
+
+suite "Valid circuit initialization":
+    test "random start is a single Hamiltonian cycle respecting fixed arcs and domains":
+        # 8 nodes, 1-based successors; fixed arcs 7->2 and 8->1 (giant-tour style),
+        # node 1 may not go to node 8. The fresh tabu state must start on a
+        # valid tour (circuit cost 0) for every seed.
+        for seed in 1..20:
+            randomize(seed)
+            var sys = initConstraintSystem[int]()
+            var x = sys.newConstrainedSequence(8)
+            x.setDomain(toSeq(1..8))
+            sys.baseArray.setDomain(6, @[2])
+            sys.baseArray.setDomain(7, @[1])
+            sys.baseArray.setDomain(0, @[2, 3, 4, 5, 6, 7])
+            sys.addConstraint(circuit[int](toSeq(0..7)))
+            # Materialize reducedDomain (normally done by domain reduction)
+            sys.baseArray.reducedDomain = newSeq[seq[int]](8)
+            for i in 0..<8:
+                sys.baseArray.reducedDomain[i] = sys.baseArray.domain[i]
+            sys.baseArray.sharedDomainPtr = addr sys.baseArray.reducedDomain
+            let st = newTabuState[int](sys.baseArray)
+            check st.cost == 0
+            let a = st.assignment
+            check a[6] == 2
+            check a[7] == 1
+            check a[0] != 8

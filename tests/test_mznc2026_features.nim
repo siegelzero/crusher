@@ -300,3 +300,115 @@ solve minimize objective;
         sys.baseArray.setDomain(0, @[1, 2, 3])       # explicit write wins
         check not sys.baseArray.isBoundsOnly(0)
         check sys.baseArray.domainBounds(0) == (1, 3)
+
+    test "value-cover pigeonhole restricts domains, alldiff makes the clauses implied":
+        # exists(a)(x[a] == c) for c in {3,5,7} over exactly three variables.
+        let src = """
+var 0..20: x1 :: output_var;
+var 0..20: x2 :: output_var;
+var 0..20: x3 :: output_var;
+var bool: b13 :: var_is_introduced :: is_defined_var;
+var bool: b23 :: var_is_introduced :: is_defined_var;
+var bool: b33 :: var_is_introduced :: is_defined_var;
+var bool: b15 :: var_is_introduced :: is_defined_var;
+var bool: b25 :: var_is_introduced :: is_defined_var;
+var bool: b35 :: var_is_introduced :: is_defined_var;
+var bool: b17 :: var_is_introduced :: is_defined_var;
+var bool: b27 :: var_is_introduced :: is_defined_var;
+var bool: b37 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(x1,3,b13) :: defines_var(b13);
+constraint int_eq_reif(x2,3,b23) :: defines_var(b23);
+constraint int_eq_reif(x3,3,b33) :: defines_var(b33);
+constraint int_eq_reif(x1,5,b15) :: defines_var(b15);
+constraint int_eq_reif(x2,5,b25) :: defines_var(b25);
+constraint int_eq_reif(x3,5,b35) :: defines_var(b35);
+constraint int_eq_reif(x1,7,b17) :: defines_var(b17);
+constraint int_eq_reif(x2,7,b27) :: defines_var(b27);
+constraint int_eq_reif(x3,7,b37) :: defines_var(b37);
+constraint bool_clause([b13,b23,b33],[]);
+constraint bool_clause([b15,b25,b35],[]);
+constraint bool_clause([b17,b27,b37],[]);
+constraint fzn_all_different_int([x1,x2,x3]);
+solve satisfy;
+"""
+        var tr = translate(parseFzn(src))
+        for v in ["x1", "x2", "x3"]:
+            check tr.presolveDomains[v] == @[3, 5, 7]
+        tr.sys.resolve(parallel = false, tabuThreshold = 2000)
+        check tr.sys.hasFeasibleSolution
+        let a = tr.sys.assignment
+        let vals = @[a[tr.varPositions["x1"]], a[tr.varPositions["x2"]], a[tr.varPositions["x3"]]]
+        check vals.toHashSet == [3, 5, 7].toHashSet
+
+    test "value-cover pigeonhole: slack variables give no restriction":
+        # Two required values over three variables: x3 is free.
+        let src = """
+var 0..20: x1 :: output_var;
+var 0..20: x2 :: output_var;
+var 0..20: x3 :: output_var;
+var bool: b13 :: var_is_introduced :: is_defined_var;
+var bool: b23 :: var_is_introduced :: is_defined_var;
+var bool: b15 :: var_is_introduced :: is_defined_var;
+var bool: b25 :: var_is_introduced :: is_defined_var;
+var bool: b35 :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(x1,3,b13) :: defines_var(b13);
+constraint int_eq_reif(x2,3,b23) :: defines_var(b23);
+constraint int_eq_reif(x1,5,b15) :: defines_var(b15);
+constraint int_eq_reif(x2,5,b25) :: defines_var(b25);
+constraint int_eq_reif(x3,5,b35) :: defines_var(b35);
+constraint bool_clause([b13,b23],[]);
+constraint bool_clause([b15,b25,b35],[]);
+solve satisfy;
+"""
+        var tr = translate(parseFzn(src))
+        for v in ["x1", "x2", "x3"]:
+            check v notin tr.presolveDomains or tr.presolveDomains[v].len == 21
+
+    test "int_mod presolve: remainder set and reverse pruning":
+        let src = """
+var {3,5,7,11}: x :: output_var;
+var 0..1: z :: output_var;
+var 0..20: w :: output_var;
+var 0..2: r :: output_var;
+constraint int_mod(x,2,z);
+constraint int_mod(w,3,r);
+constraint int_le(r,0);
+solve satisfy;
+"""
+        var tr = translate(parseFzn(src))
+        check tr.presolveDomains["z"] == @[1]
+        check tr.presolveDomains["w"] == @[0, 3, 6, 9, 12, 15, 18]
+
+    test "equality with presolve-fixed reification becomes an alias":
+        # bool_clause([u == 0, x == y]) with u fixed to 1: x is just y.
+        let src = """
+var 1..1: u :: output_var;
+var 0..20: x :: output_var;
+var 2..6: y :: output_var;
+var bool: bu :: var_is_introduced :: is_defined_var;
+var bool: be :: var_is_introduced :: is_defined_var;
+constraint int_eq_reif(u,0,bu) :: defines_var(bu);
+constraint int_eq_reif(x,y,be) :: defines_var(be);
+constraint bool_clause([bu,be],[]);
+constraint int_lin_le([1],[y],4);
+solve maximize x;
+"""
+        var tr = translate(parseFzn(src))
+        check tr.fznVarAliases.getOrDefault("x") == "y"
+        let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                      else: tr.objectiveDefExpr
+        tr.sys.maximize(objExpr, parallel = false, tabuThreshold = 2000)
+        check tr.sys.hasFeasibleSolution
+        check tr.sys.assignment[tr.varPositions["y"]] == 4
+
+    test "equality alias refused when it would drop a domain restriction":
+        # dom(x) = 0..3 and dom(y) = 2..6: neither contains the other.
+        let src = """
+var 0..3: x :: output_var;
+var 2..6: y :: output_var;
+constraint int_eq(x,y);
+solve satisfy;
+"""
+        var tr = translate(parseFzn(src))
+        check "x" notin tr.fznVarAliases
+        check "y" notin tr.fznVarAliases

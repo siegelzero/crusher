@@ -1585,6 +1585,55 @@ proc resolveReifications(tr: FznTranslator,
                         eliminated.incl(ci)
                         result = true
 
+        # --- int_mod(x, c, z): z = x mod c (truncated, sign of x), constant c != 0 ---
+        # Exact value-set propagation both ways when x's domain is enumerable.
+        elif name == "int_mod" and con.args.len >= 3 and con.args[1].kind == FznIntLit and
+             con.args[1].intVal != 0:
+            let cVal = con.args[1].intVal
+            let xName = presolveVarName(con.args[0])
+            let zName = presolveVarName(con.args[2])
+            {.cast(noSideEffect).}:
+                if existsEnv("CRUSHER_DEBUG_MOD"):
+                    stderr.writeLine("[mod] " & xName & " inDom=" & $(xName in domains) & " len=" & $(if xName in domains: domains[xName].len else: -1) & " z=" & zName & " zin=" & $(zName in domains))
+            if xName != "" and xName in domains and domains[xName].len <= 4096:
+                var zVals = initHashSet[int]()
+                for v in domains[xName]: zVals.incl(v mod cVal)
+                if zName != "" and zName in domains:
+                    let zDom = domains[zName]
+                    var newZ: seq[int]
+                    for v in zDom:
+                        if v in zVals: newZ.add(v)
+                    if newZ.len < zDom.len:
+                        if newZ.len == 0:
+                            infeasible = true
+                        else:
+                            domains[zName] = newZ
+                            result = true
+                    if not infeasible:
+                        let zSet = toHashSet(domains[zName])
+                        let xDom = domains[xName]
+                        var newX: seq[int]
+                        for v in xDom:
+                            if (v mod cVal) in zSet: newX.add(v)
+                        if newX.len < xDom.len:
+                            if newX.len == 0:
+                                infeasible = true
+                            else:
+                                domains[xName] = newX
+                                result = true
+                elif zName == "" and con.args[2].kind == FznIntLit:
+                    let zc = con.args[2].intVal
+                    let xDom = domains[xName]
+                    var newX: seq[int]
+                    for v in xDom:
+                        if v mod cVal == zc: newX.add(v)
+                    if newX.len < xDom.len:
+                        if newX.len == 0:
+                            infeasible = true
+                        else:
+                            domains[xName] = newX
+                            result = true
+
         # --- int_lin_le_reif(coeffs, vars, rhs, b): b <=> (sum(c_i * x_i) <= rhs) ---
         # --- int_lin_eq_reif(coeffs, vars, rhs, b): b <=> (sum(c_i * x_i) == rhs) ---
         elif (name == "int_lin_le_reif" or name == "int_lin_eq_reif" or
@@ -2203,6 +2252,216 @@ proc disjunctionEqualitiesPropagate(tr: FznTranslator,
         if applyMembership(tr, domains, fixedVars, m.x, m.vals,
                            con.args[2], false, infeasible):
             result = true
+
+proc valueCoverPigeonholePropagate(tr: FznTranslator,
+                                   domains: var Table[string, seq[int]],
+                                   fixedVars: Table[string, int],
+                                   eliminated: var PackedSet[int],
+                                   infeasible: var bool): bool =
+    ## Pigeonhole reasoning over "some variable takes value c" clauses:
+    ##   bool_clause([x_1 == c, x_2 == c, ...], [])   (int_eq_reif literals)
+    ## i.e. MiniZinc's flattened `exists(a)(x[a] == c)`. Each variable holds a
+    ## single value, so it can satisfy the clauses of at most one constant.
+    ## Group clauses with distinct constants into connected components of the
+    ## variable/value graph: a component needing k distinct values from k
+    ## variables uses every variable, so each variable must take one of the
+    ## constants of the clauses it appears in (more values than variables is
+    ## infeasible). Example: all targets must be produced by exactly as many
+    ## slots (MCM: ca[1..N] covers T with N = |T|) ⇒ dom(ca[a]) ⊆ T.
+    ##
+    ## When an all_different covers a tight component (and 0 is not a required
+    ## value for the except_0 form), the restricted variables form a bijection
+    ## onto the constants, so the clauses are implied and are eliminated: their
+    ## graduated penalties (distance |x - c|) only mislead the search.
+    result = false
+
+    var eqMap: Table[string, (string, int)]
+    var conflict: HashSet[string]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        if con.args.len < 3: continue
+        if con.args[1].kind != FznIntLit: continue
+        let xName = presolveVarName(con.args[0])
+        let bName = presolveVarName(con.args[2])
+        if xName == "" or bName == "": continue
+        if bName in conflict: continue
+        if bName in eqMap:
+            eqMap.del(bName)
+            conflict.incl(bName)
+        else:
+            eqMap[bName] = (xName, con.args[1].intVal)
+    if eqMap.len == 0: return
+
+    # One clause (smallest variable set) per constant.
+    var clauseVars: Table[int, seq[string]]
+    var clauseList: seq[(int, int, seq[string])]   # (ci, constant, live vars)
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2: continue
+        if con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+        if con.args[1].elems.len > 0: continue
+        let posElems {.cursor.} = con.args[0].elems
+        if posElems.len < 2: continue
+        var ok = true
+        var satisfied = false
+        var c = 0
+        var haveC = false
+        var vs: seq[string]
+        for e in posElems:
+            let bName = presolveVarName(e)
+            if bName == "":
+                # literal true/false constant
+                if e.kind == FznBoolLit and e.boolVal: satisfied = true
+                elif e.kind == FznBoolLit: continue
+                else: ok = false
+                break
+            if bName in fixedVars:
+                if fixedVars[bName] != 0:
+                    satisfied = true
+                    break
+                continue    # false literal: drop
+            if bName notin eqMap:
+                ok = false
+                break
+            let (xName, cv) = eqMap[bName]
+            if haveC and cv != c:
+                ok = false
+                break
+            c = cv
+            haveC = true
+            if xName notin vs: vs.add(xName)
+        if not ok or satisfied or not haveC: continue
+        # Literals on fixed variables: a fixed x == c satisfies the clause.
+        var sat2 = false
+        var live: seq[string]
+        for x in vs:
+            if x in fixedVars:
+                if fixedVars[x] == c:
+                    sat2 = true
+                    break
+            elif x in domains:
+                if c in domains[x]: live.add(x)
+            else:
+                ok = false
+                break
+        if not ok or sat2: continue
+        if live.len == 0:
+            infeasible = true
+            return
+        if c notin clauseVars or clauseVars[c].len > live.len:
+            clauseVars[c] = live
+        clauseList.add((ci, c, live))
+    if clauseVars.len < 2: return
+
+    # Connected components (union-find over variables; values link their vars).
+    var varId: Table[string, int]
+    var names: seq[string]
+    for c, vs in clauseVars:
+        for x in vs:
+            if x notin varId:
+                varId[x] = names.len
+                names.add(x)
+    var parent = newSeq[int](names.len)
+    for i in 0 ..< parent.len: parent[i] = i
+    proc find(parent: var seq[int], i: int): int =
+        var r = i
+        while parent[r] != r: r = parent[r]
+        var j = i
+        while parent[j] != r:
+            let nx = parent[j]
+            parent[j] = r
+            j = nx
+        r
+    for c, vs in clauseVars:
+        let r0 = find(parent, varId[vs[0]])
+        for k in 1 ..< vs.len:
+            let rk = find(parent, varId[vs[k]])
+            if rk != r0: parent[rk] = r0
+    var compVals: Table[int, int]       # root -> number of constants
+    var compVars: Table[int, int]       # root -> number of variables
+    for c, vs in clauseVars:
+        let r = find(parent, varId[vs[0]])
+        compVals.mgetOrPut(r, 0).inc
+    for i in 0 ..< names.len:
+        compVars.mgetOrPut(find(parent, i), 0).inc
+    var allowed: Table[string, seq[int]]
+    for c, vs in clauseVars:
+        for x in vs: allowed.mgetOrPut(x, @[]).add(c)
+    # all_different groups (variable name sets) for the implied-clause check.
+    var adGroups: seq[(HashSet[string], bool)]   # (vars, except0)
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in eliminated: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        let nm = stripSolverPrefix(con.name)
+        let ex0 = nm == "fzn_alldifferent_except_0"
+        if nm != "fzn_all_different_int" and not ex0: continue
+        if con.args.len < 1: continue
+        var vs: HashSet[string]
+        var elems: seq[FznExpr]
+        if con.args[0].kind == FznArrayLit:
+            elems = con.args[0].elems
+        elif con.args[0].kind == FznIdent:
+            for decl in tr.model.variables:
+                if decl.isArray and decl.name == con.args[0].ident:
+                    if decl.value != nil and decl.value.kind == FznArrayLit:
+                        elems = decl.value.elems
+                    break
+        for e in elems:
+            if e.kind == FznIdent: vs.incl(e.ident)
+        if vs.len >= 2: adGroups.add((vs, ex0))
+    var tightened = 0
+    var implied = 0
+    for r, nv in compVars:
+        let nc = compVals.getOrDefault(r, 0)
+        if nc > nv:
+            infeasible = true
+            return
+        if nc < nv or nc < 2: continue
+        var compNames: seq[string]
+        for i in 0 ..< names.len:
+            if find(parent, i) != r: continue
+            compNames.add(names[i])
+            if presolveTightenDomain(domains, names[i], allowed[names[i]], infeasible):
+                result = true
+                inc tightened
+            if infeasible: return
+        # Implied clauses: an all_different over the whole component.
+        var compHasZero = false
+        for c, vs in clauseVars:
+            if find(parent, varId[vs[0]]) == r and c == 0: compHasZero = true
+        var covered = false
+        for (g, ex0) in adGroups:
+            if ex0 and compHasZero: continue
+            var all = true
+            for x in compNames:
+                if x notin g:
+                    all = false
+                    break
+            if all:
+                covered = true
+                break
+        if not covered: continue
+        for (ci, c, live) in clauseList:
+            if ci in eliminated: continue
+            if c notin clauseVars: continue
+            let chosen = clauseVars[c]
+            if find(parent, varId[chosen[0]]) != r: continue
+            # The variable taking c lies in the chosen set; implied iff chosen ⊆ live.
+            var sup = true
+            for x in chosen:
+                if x notin live:
+                    sup = false
+                    break
+            if sup:
+                eliminated.incl(ci)
+                inc implied
+                result = true
+    if tightened > 0 or implied > 0:
+        stderr.writeLine(&"[FZN] Value-cover pigeonhole: restricted {tightened} domains to their required values, {implied} clauses implied by all_different")
 
 proc nonMembershipPropagate(tr: FznTranslator,
                             domains: var Table[string, seq[int]],
@@ -5321,6 +5580,12 @@ proc presolve*(tr: var FznTranslator) =
         # bool_clause([b_1,...,b_n],[]) where every b_i is int_eq_reif(x, c_i, b_i)
         # on a shared x ⇒ dom(x) ⊆ {c_i}. Recovers MZN's flattened "exists" pattern.
         if disjunctionEqualitiesPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 3c2: Pigeonhole over value-cover clauses (exists(a)(x[a] == c)
+        # for k constants over k variables ⇒ every x[a] takes a required value).
+        if valueCoverPigeonholePropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 

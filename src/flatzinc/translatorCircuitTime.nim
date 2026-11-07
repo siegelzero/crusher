@@ -62,6 +62,21 @@ proc circuitTimeDomainBounds(tr: FznTranslator, name: string): (int, int) =
     return (low(int) div 2, high(int) div 2)
 
 
+proc circuitTimeDeclaredBounds(tr: FznTranslator, name: string): (int, int) =
+    ## Declared (pre-presolve) bounds; presolve tightenings are implied by the
+    ## model and need not be enforced separately.
+    for decl in tr.model.variables:
+        if not decl.isArray and decl.name == name:
+            case decl.varType.kind
+            of FznIntRange:
+                return (decl.varType.lo, decl.varType.hi)
+            of FznIntSet:
+                return (decl.varType.values[0], decl.varType.values[^1])
+            else:
+                discard
+            break
+    return (low(int) div 2, high(int) div 2)
+
 proc circuitTimeFixedValue(tr: FznTranslator, e: FznExpr): (bool, int) =
     ## Resolve an expression to a fixed integer (literal, parameter, or
     ## singleton-domain variable).
@@ -698,6 +713,321 @@ proc circuitTimeParseLinEq(tr: FznTranslator, con: FznConstraint):
     return (true, coeffs, varNames, rhs)
 
 
+proc tryMatchSplitSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
+                                      elems: seq[FznExpr],
+                                      cand: var CircuitTimeCandidate): bool =
+    ## VRP time chain with separate arrival / service-start / departure
+    ## variables (e.g. VRP with location congestion):
+    ##   array_int_element(succ[i], row_i, d_i)        :: defines_var(d_i)
+    ##   array_var_int_element(succ[i], arr, at_i)     :: defines_var(at_i)
+    ##   int_lin_eq: at_i = dep_i + d_i (+ const)      i.e. arr[succ[i]] = dep_i + d_i
+    ##   int_lin_le: arr_j <= ser_j                    (absent when arr_j IS ser_j)
+    ##   int_lin_le: ser_j + s_j <= dep_j              (absent when dep_j IS ser_j)
+    ## The walk computes arr exactly and ser = max(arr, early, release_j) with
+    ## a searched release per node, so every feasible schedule stays reachable
+    ## (ser may be observed arbitrarily, e.g. by a congestion cumulative).
+    ## dep_j becomes the channel ser_j + s_j: WLOG minimal because every other
+    ## observer of dep_j is an int_lin_le where dep_j enters positively.
+    ## The distance elements d_i are left in place (often shared with the
+    ## objective); the chain uses its own copy of the rows.
+    let n = elems.len
+    template splitReject(k: int) =
+        if existsEnv("CRUSHER_DEBUG_CIRCUIT"):
+            stderr.writeLine("[CTP] split-chain rejected at check " & $k)
+    var linkVarNames = newSeq[string](n)
+    var rawFixedLinks = newSeq[int](n)
+    var nodeOfLinkVar: Table[string, int]
+    for i, e in elems:
+        case e.kind
+        of FznIdent:
+            if e.ident in nodeOfLinkVar: (splitReject(1); return false)
+            linkVarNames[i] = e.ident
+            nodeOfLinkVar[e.ident] = i
+        of FznIntLit:
+            rawFixedLinks[i] = e.intVal
+            if e.intVal < 1 or e.intVal > n: (splitReject(2); return false)
+        else:
+            (splitReject(3); return false)
+    if nodeOfLinkVar.len == 0: (splitReject(4); return false)
+    for vn in linkVarNames:
+        if vn == "": continue
+        let (lo, hi) = tr.circuitTimeDomainBounds(vn)
+        if lo < 1 or hi > n: (splitReject(5); return false)
+
+    # Reference counts of identifiers (scalar args and named-array members)
+    var arrayDeclElems: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var names: seq[string]
+            for e in decl.value.elems:
+                if e.kind == FznIdent: names.add(e.ident)
+            arrayDeclElems[decl.name] = names
+    var refsOf: Table[string, seq[int]]   # var -> constraint indices referencing it
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        var seen: HashSet[string]
+        for arg in con.args:
+            case arg.kind
+            of FznIdent:
+                seen.incl(arg.ident)
+                if arg.ident in arrayDeclElems:
+                    for en in arrayDeclElems[arg.ident]: seen.incl(en)
+            of FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent: seen.incl(e.ident)
+            else: discard
+        for vn in seen: refsOf.mgetOrPut(vn, @[]).add(ci)
+
+    # Constant-row and var-array elements indexed by link vars
+    type ConstEl = tuple[ci: int, row: seq[int], res: string]
+    type VarEl = tuple[ci: int, arrName: string, res: string]
+    var constEls = newSeq[seq[ConstEl]](n)
+    var varEls = newSeq[seq[VarEl]](n)
+    var arrElemsOf: Table[string, seq[FznExpr]]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let nodeIdx = nodeOfLinkVar.getOrDefault(con.args[0].ident, -1)
+        if nodeIdx < 0: continue
+        if name in ["array_int_element", "array_int_element_nonshifted"]:
+            let row = try: tr.resolveIntArray(con.args[1])
+                      except ValueError, KeyError: continue
+            if row.len != n: continue
+            constEls[nodeIdx].add((ci: ci, row: row, res: con.args[2].ident))
+        elif name in ["array_var_int_element", "array_var_int_element_nonshifted"]:
+            if con.args[1].kind != FznIdent: continue
+            let an = con.args[1].ident
+            if an notin arrElemsOf:
+                let ae = tr.presolveResolveVarElems(con.args[1])
+                if ae.len != n: continue
+                arrElemsOf[an] = ae
+            varEls[nodeIdx].add((ci: ci, arrName: an, res: con.args[2].ident))
+
+    # Chain equalities: at_i = dep_i + d_i + off_i, tried per value-array
+    # family; a family is a split chain only if some node's departure var is
+    # not its own arrival var (all-equal is a plain accumulator, e.g. load).
+    var familyNames: seq[string]
+    for i in 0..<n:
+        for ve in varEls[i]:
+            if ve.arrName notin familyNames: familyNames.add(ve.arrName)
+    var arrName = ""
+    var depOf = newSeq[string](n)
+    var rowOf = newSeq[seq[int]](n)
+    var offOf = newSeq[int](n)
+    var eqCI = newSeq[int](n)
+    var atCI = newSeq[int](n)
+    var atName = newSeq[string](n)
+    var chained = newSeq[bool](n)
+    var nChained = 0
+    for fam in familyNames:
+        for i in 0..<n:
+            eqCI[i] = -1
+            atCI[i] = -1
+            chained[i] = false
+            depOf[i] = ""
+        nChained = 0
+        var nSplit = 0
+        let ae = arrElemsOf[fam]
+        for i in 0..<n:
+            if linkVarNames[i] == "": continue
+            var found = false
+            for ve in varEls[i]:
+                if ve.arrName != fam: continue
+                for eci in refsOf.getOrDefault(ve.res, @[]):
+                    let con {.cursor.} = tr.model.constraints[eci]
+                    if stripSolverPrefix(con.name) != "int_lin_eq": continue
+                    let (ok, coeffs, vns, rhs) = tr.circuitTimeParseLinEq(con)
+                    if not ok or vns.len != 3: continue
+                    let ai = vns.find(ve.res)
+                    if ai < 0 or coeffs[ai] notin [-1, 1]: continue
+                    var di = -1
+                    var rowK = -1
+                    for k in 0..2:
+                        if k == ai: continue
+                        for ki, cel in constEls[i]:
+                            if cel.res == vns[k]:
+                                di = k
+                                rowK = ki
+                    if di < 0: continue
+                    let pi = 3 - ai - di
+                    if coeffs[di] != -coeffs[ai] or coeffs[pi] != -coeffs[ai]: continue
+                    if not (ae[i].kind == FznIdent and ae[i].ident == vns[pi]): inc nSplit
+                    depOf[i] = vns[pi]
+                    rowOf[i] = constEls[i][rowK].row
+                    offOf[i] = rhs * coeffs[ai]
+                    eqCI[i] = eci
+                    atCI[i] = ve.ci
+                    atName[i] = ve.res
+                    chained[i] = true
+                    inc nChained
+                    found = true
+                    break
+                if found: break
+        if nChained >= 2 and nSplit > 0:
+            arrName = fam
+            break
+    if arrName == "": (splitReject(6); return false)
+
+    let arrE = arrElemsOf[arrName]
+    var arrVar = newSeq[string](n)
+    for j in 0..<n:
+        if arrE[j].kind != FznIdent: (splitReject(8); return false)
+        arrVar[j] = arrE[j].ident
+
+    # Per node: ser_j (arr_j <= ser_j, or ser_j IS arr_j) and service s_j
+    var serVar = newSeq[string](n)
+    var aCI = newSeq[int](n)
+    var noWait = newSeq[bool](n)
+    for j in 0..<n:
+        aCI[j] = -1
+        for lci in refsOf.getOrDefault(arrVar[j], @[]):
+            let con {.cursor.} = tr.model.constraints[lci]
+            if stripSolverPrefix(con.name) != "int_lin_le": continue
+            let (ok, coeffs, vns, rhs) = tr.circuitTimeParseLinEq(con)
+            if not ok or vns.len != 2 or rhs != 0: continue
+            let ai = vns.find(arrVar[j])
+            if ai < 0 or coeffs[ai] != 1 or coeffs[1 - ai] != -1: continue
+            serVar[j] = vns[1 - ai]
+            aCI[j] = lci
+            break
+        if aCI[j] < 0:
+            serVar[j] = arrVar[j]
+            noWait[j] = true
+    var serNames: HashSet[string]
+    for j in 0..<n: serNames.incl(serVar[j])
+    if serNames.len != n: (splitReject(9); return false)
+
+    # Departure of chained nodes: dep_i IS ser_i (no service) or ser_i + s_i <= dep_i
+    var service = newSeq[int](n)
+    var sCI = newSeq[int](n)
+    var depChannels: seq[tuple[dep, ser: string, s: int]]
+    for i in 0..<n:
+        sCI[i] = -1
+        if not chained[i]: continue
+        if depOf[i] == serVar[i]: continue
+        if depOf[i] in serNames or depOf[i] in nodeOfLinkVar: (splitReject(10); return false)
+        var found = false
+        for lci in refsOf.getOrDefault(depOf[i], @[]):
+            let con {.cursor.} = tr.model.constraints[lci]
+            if stripSolverPrefix(con.name) != "int_lin_le": continue
+            let (ok, coeffs, vns, rhs) = tr.circuitTimeParseLinEq(con)
+            if not ok or vns.len != 2: continue
+            let di = vns.find(depOf[i])
+            if di < 0 or vns[1 - di] != serVar[i]: continue
+            if coeffs[di] != -1 or coeffs[1 - di] != 1: continue
+            service[i] = -rhs
+            sCI[i] = lci
+            found = true
+            break
+        if not found: (splitReject(11); return false)
+        depChannels.add((dep: depOf[i], ser: serVar[i], s: service[i]))
+    # dep observers: only int_lin_le with a positive coefficient (larger is never better)
+    for (dep, ser, s) in depChannels:
+        for oci in refsOf.getOrDefault(dep, @[]):
+            if oci in eqCI or oci in sCI: continue
+            let con {.cursor.} = tr.model.constraints[oci]
+            if stripSolverPrefix(con.name) != "int_lin_le": (splitReject(12); return false)
+            let (ok, coeffs, vns, _) = tr.circuitTimeParseLinEq(con)
+            if not ok: (splitReject(13); return false)
+            for k, vn in vns:
+                if vn == dep and coeffs[k] <= 0: (splitReject(14); return false)
+
+    # Nodes reached only over a reset arc (fixed link from an unchained node)
+    var resetInto = newSeq[bool](n)
+    for k in 0..<n:
+        if linkVarNames[k] == "" and not chained[k]:
+            resetInto[rawFixedLinks[k] - 1] = true
+    var depotIdx = -1
+    for j in 0..<n:
+        if resetInto[j]:
+            depotIdx = j
+            break
+    if depotIdx < 0: (splitReject(15); return false)
+    # Chained nodes with a FIXED link would need the chain on a literal arc; keep simple.
+    for i in 0..<n:
+        if chained[i] and linkVarNames[i] == "": (splitReject(16); return false)
+    # Unchained nodes with variable links: their successor's clock would reset — unsound.
+    for i in 0..<n:
+        if not chained[i] and linkVarNames[i] != "": (splitReject(17); return false)
+
+    var earlyTimes = newSeq[int](n)
+    var lateTimes = newSeq[int](n)
+    for j in 0..<n:
+        let (lo, hi) = tr.circuitTimeDomainBounds(serVar[j])
+        earlyTimes[j] = lo
+        lateTimes[j] = hi
+
+    var distMatrix = newSeq[seq[int]](n)
+    for toN in 0..<n: distMatrix[toN] = newSeq[int](n)
+    for fromN in 0..<n:
+        if chained[fromN]:
+            for toN in 0..<n:
+                distMatrix[toN][fromN] = rowOf[fromN][toN] + offOf[fromN] + service[fromN]
+
+    # arr is computed exactly (not searched), so its declared bounds are not
+    # enforced by the walk: require them implied. Lower: every computed
+    # arrival is >= early(pred) + dist. Upper: arr <= ser <= late.
+    var minArr = high(int)
+    for fromN in 0..<n:
+        if chained[fromN]:
+            for toN in 0..<n:
+                minArr = min(minArr, earlyTimes[fromN] + distMatrix[toN][fromN])
+    for j in 0..<n:
+        if not noWait[j]:
+            let (alo, ahi) = tr.circuitTimeDeclaredBounds(arrVar[j])
+            if alo > minArr or ahi < lateTimes[j]: (splitReject(18); return false)
+
+    var consumed = initPackedSet[int]()
+    consumed.incl(circuitCI)
+    var channelVars: seq[string]
+    for i in 0..<n:
+        if chained[i]:
+            consumed.incl(eqCI[i])
+            if sCI[i] >= 0: consumed.incl(sCI[i])
+            # at_i = arr[succ[i]] is internal when only the chain equality reads it
+            let refs = refsOf.getOrDefault(atName[i], @[])
+            if refs.len == 2 and atCI[i] in refs and eqCI[i] in refs:
+                consumed.incl(atCI[i])
+                channelVars.add(atName[i])
+            else:
+                (splitReject(19); return false)
+    for j in 0..<n:
+        if aCI[j] >= 0: consumed.incl(aCI[j])
+        channelVars.add(serVar[j])
+        if not noWait[j]: channelVars.add(arrVar[j])
+    for (dep, ser, s) in depChannels: channelVars.add(dep)
+
+    var arrivalVars = newSeq[string](n)
+    var releaseNodes = newSeq[bool](n)
+    for j in 0..<n:
+        if not noWait[j]: arrivalVars[j] = arrVar[j]
+        releaseNodes[j] = (not noWait[j]) or resetInto[j]
+
+    cand.forward = true
+    cand.linkVarNames = linkVarNames
+    cand.rawFixedLinks = rawFixedLinks
+    cand.distMatrix = distMatrix
+    cand.earlyTimes = earlyTimes
+    cand.lateTimes = lateTimes
+    cand.outConstrained = chained
+    cand.depotIdx = depotIdx
+    cand.depotDep = earlyTimes[depotIdx]
+    cand.arrivalVars = arrivalVars
+    cand.departureVars = serVar
+    cand.consumedCIs = consumed
+    cand.channelVars = channelVars
+    cand.timeVarNames = serVar
+    cand.useMaxMetric = false
+    cand.objectiveWeight = 0
+    cand.useRelease = true
+    cand.releaseNodes = releaseNodes
+    cand.noWait = noWait
+    cand.depChannels = depChannels
+    return true
+
+
 proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                                   elems: seq[FznExpr],
                                   claimed: PackedSet[int],
@@ -752,6 +1082,23 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         if not parsed: continue
         for vn in eqVars:
             linEqByVar.mgetOrPut(vn, @[]).add(ci)
+
+    # Constant-row elements on link vars: d = row[link[n]] (per-arc offsets,
+    # e.g. load[succ[i]] = load[i] + demand[succ[i]]).
+    var constElemByRes: Table[string, (int, seq[int])]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in claimed: continue
+        if stripSolverPrefix(con.name) notin ["array_int_element", "array_int_element_nonshifted"]:
+            continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        if not con.hasAnnotation("defines_var"): continue
+        let nodeIdx = nodeOfLinkVar.getOrDefault(con.args[0].ident, -1)
+        if nodeIdx < 0: continue
+        let row = try: tr.resolveIntArray(con.args[1])
+                  except ValueError, KeyError: continue
+        if row.len != n: continue
+        constElemByRes[con.args[2].ident] = (nodeIdx, row)
 
     # Group var-elements indexed by this circuit's link vars into families by
     # (named) value array.
@@ -833,6 +1180,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         # Per-node out-arc: constant offset + the constraints it consumes
         var outConstrained = newSeq[bool](n)
         var offsets = newSeq[int](n)
+        var offsetRows = newSeq[seq[int]](n)   # per-arc offsets (row[to]) or empty
         var elemCI = newSeq[int](n)
         var eqCI = newSeq[int](n)
         var nMatched = 0
@@ -852,6 +1200,17 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                 # Unified zero-offset chain: A[link[i]] = A_i (vehicle painting)
                 outConstrained[i] = true
                 offsets[i] = 0
+                elemCI[i] = info.ci
+                eqCI[i] = -1
+                inc nMatched
+                continue
+            if info.resultName in constElemByRes and constElemByRes[info.resultName][0] == i and
+               valueFixed[i]:
+                # A[link[i]] = row[link[i]] with A_i fixed (folded by the
+                # flattener): r = A_i + row[to] - A_i
+                outConstrained[i] = true
+                offsets[i] = -valueFixedVal[i]
+                offsetRows[i] = constElemByRes[info.resultName][1]
                 elemCI[i] = info.ci
                 eqCI[i] = -1
                 inc nMatched
@@ -882,6 +1241,35 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                     # A_i folded into the rhs as a constant: r = rhs*c_r
                     off = rhs * coeffs[0] - valueFixedVal[i]
                     matched = true
+                elif eqVars.len == 3:
+                    # c_A*A_i + c_d*d + c_r*r = rhs, d = row[link[i]],
+                    # c_A = c_d = -c_r, |c_r| = 1  =>  r = A_i + row[to] + rhs*c_r
+                    var aIdx = -1
+                    var rIdx = -1
+                    var dIdx = -1
+                    for vi, vn in eqVars:
+                        if vn == info.resultName: rIdx = vi
+                        elif vn == valueVarNames[i]: aIdx = vi
+                        elif vn in constElemByRes and constElemByRes[vn][0] == i: dIdx = vi
+                    if aIdx >= 0 and rIdx >= 0 and dIdx >= 0 and
+                       coeffs[rIdx] in [-1, 1] and coeffs[aIdx] == -coeffs[rIdx] and
+                       coeffs[dIdx] == -coeffs[rIdx]:
+                        off = rhs * coeffs[rIdx]
+                        offsetRows[i] = constElemByRes[eqVars[dIdx]][1]
+                        matched = true
+                elif eqVars.len == 2 and valueFixed[i]:
+                    # A_i fixed and folded: c_d*d + c_r*r = rhs, c_d = -c_r
+                    #   =>  r = A_i + row[to] + (rhs*c_r - A_i)
+                    var rIdx = -1
+                    var dIdx = -1
+                    for vi, vn in eqVars:
+                        if vn == info.resultName: rIdx = vi
+                        elif vn in constElemByRes and constElemByRes[vn][0] == i: dIdx = vi
+                    if rIdx >= 0 and dIdx >= 0 and coeffs[rIdx] in [-1, 1] and
+                       coeffs[dIdx] == -coeffs[rIdx]:
+                        off = rhs * coeffs[rIdx] - valueFixedVal[i]
+                        offsetRows[i] = constElemByRes[eqVars[dIdx]][1]
+                        matched = true
                 if matched:
                     outConstrained[i] = true
                     offsets[i] = off
@@ -942,7 +1330,8 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         for fromN in 0..<n:
             if outConstrained[fromN]:
                 for toN in 0..<n:
-                    distMatrix[toN][fromN] = offsets[fromN]
+                    distMatrix[toN][fromN] = offsets[fromN] +
+                        (if offsetRows[fromN].len == n: offsetRows[fromN][toN] else: 0)
 
         var consumed = initPackedSet[int]()
         consumed.incl(circuitCI)
@@ -953,7 +1342,9 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                 if eqCI[i] >= 0:
                     consumed.incl(eqCI[i])
                 if byNode[i].resultName != "" and
-                   byNode[i].resultName != valueVarNames[i]:
+                   byNode[i].resultName != valueVarNames[i] and
+                   byNode[i].resultName notin constElemByRes:
+                    # (a constant-row element result keeps its own definition)
                     channelVars.add(byNode[i].resultName)
         for vn in valueVarNames:
             if vn != "": channelVars.add(vn)
@@ -1021,7 +1412,8 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
 
     for k in 0..<candidates.len:
         keep[k] = true
-        if not candidates[k].forward or candidates[k].exactChain: continue   # equality form: exempt
+        if not candidates[k].forward or candidates[k].exactChain or
+           candidates[k].useRelease: continue   # equality / release form: exempt
 
         var timeSet: HashSet[string]
         for tn in candidates[k].timeVarNames:
@@ -1703,6 +2095,11 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
             if tr.tryMatchSuccFormCircuitTime(ci, elems, cand):
                 candidates.add(cand)
                 matchedTimeChain = true
+            elif not existsEnv("CRUSHER_NO_SPLIT_CTP"):
+                cand = CircuitTimeCandidate(circuitCI: ci)
+                if tr.tryMatchSplitSuccFormCircuitTime(ci, elems, cand):
+                    candidates.add(cand)
+                    matchedTimeChain = true
         if matchedTimeChain:
             for cci in candidates[^1].consumedCIs.items:
                 claimed.incl(cci)
@@ -1723,6 +2120,18 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
     if candidates.len == 0: return
 
     tr.verifyCircuitTimeCandidates(candidates)
+
+    # Circuits carrying a split (release) time chain keep their crusher_circuit:
+    # its dedicated moves build and repair the giant tour, and the chains on
+    # that circuit then charge circuit violations only once between them.
+    if not existsEnv("CRUSHER_NO_CTP_KEEP_CIRCUIT"):
+        var keepCis: PackedSet[int]
+        for cand in candidates:
+            if cand.useRelease: keepCis.incl(cand.circuitCI)
+        for k in 0..<candidates.len:
+            if candidates[k].circuitCI in keepCis:
+                candidates[k].keepCircuit = true
+                candidates[k].consumedCIs.excl(candidates[k].circuitCI)
 
     for cand in candidates:
         for ci in cand.consumedCIs.items:
@@ -1825,6 +2234,36 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
         )
         if cand.closureFree:
             ctpCon.circuitTimePropState.closureFree = true
+        if cand.useRelease:
+            # Searched release (waiting) variables, one per release node, ranging
+            # over the node's service window; dep channels = ser + service.
+            var relPos = newSeq[int](n)
+            var nRel = 0
+            for i in 0..<n:
+                relPos[i] = -1
+                if i < cand.releaseNodes.len and cand.releaseNodes[i] and
+                   cand.lateTimes[i] > cand.earlyTimes[i] and
+                   not existsEnv("CRUSHER_NO_CTP_RELEASE"):
+                    let pos = tr.sys.baseArray.len
+                    discard tr.sys.newConstrainedVariable()
+                    tr.sys.baseArray.setDomain(pos, toSeq(cand.earlyTimes[i]..cand.lateTimes[i]))
+                    relPos[i] = pos
+                    inc nRel
+            ctpCon.circuitTimePropState.setReleasePositions(relPos, cand.noWait)
+            ctpCon.positions = ctpCon.circuitTimePropState.positions
+            for (dep, ser, s) in cand.depChannels:
+                if dep notin tr.varPositions or ser notin tr.varPositions: continue
+                let dp = tr.varPositions[dep]
+                let sp = tr.varPositions[ser]
+                let expr = tr.getExpr(sp) + s
+                tr.sys.baseArray.addExpressionChannelBinding(dp, expr)
+                let dDom = tr.sys.baseArray.domain[dp]
+                let sDom = tr.sys.baseArray.domain[sp]
+                if dDom.len > 0 and sDom.len > 0:
+                    if min(sDom) + s < min(dDom): tr.sys.addConstraint(expr >= min(dDom))
+                    if max(sDom) + s > max(dDom): tr.sys.addConstraint(expr <= max(dDom))
+            stderr.writeLine("[FZN] CircuitTimeProp: " & $nRel & " release (waiting) variables, " &
+                             $cand.depChannels.len & " departure channels")
         if cand.keepCircuit:
             # The crusher_circuit constraint stays and drives circuit moves. Off
             # the depot's tour the chain values are meaningless defaults, so the

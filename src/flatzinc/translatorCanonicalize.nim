@@ -331,3 +331,107 @@ proc eliminateDeadDefinitions(tr: var FznTranslator) =
         if removed == 0: break
     if total > 0:
         stderr.writeLine("[FZN] Eliminated " & $total & " dead definitions")
+
+proc aliasFixedEqualities(tr: var FznTranslator) =
+    ## Presolve can fix the boolean of `int_eq_reif(x, y, b)` to true (e.g. the
+    ## other literal of `bool_clause([ua == 0, b])` became false), leaving a plain
+    ## equality between two variables that MiniZinc could not alias. Translated
+    ## as a constraint, x stays a search variable that the search must keep
+    ## "repairing" toward y; as an alias (`var x = y;`, resolved by
+    ## canonicalizeFznVarAliases) x simply IS y (e.g. y is an element channel).
+    ##
+    ## Sound only if the alias does not drop a restriction: the canonical side's
+    ## domain must be contained in the alias side's domain (the alias's own
+    ## domain is not enforced after substitution). Also handles plain
+    ## `int_eq(x, y)`. The equality constraint is consumed.
+    var declIdx: Table[string, int]
+    for i, decl in tr.model.variables:
+        if not decl.isArray: declIdx[decl.name] = i
+
+    proc boolFixedTrue(tr: FznTranslator, e: FznExpr): bool =
+        case e.kind
+        of FznBoolLit: e.boolVal
+        of FznIntLit: e.intVal == 1
+        of FznIdent:
+            if e.ident in tr.paramValues: tr.paramValues[e.ident] == 1
+            elif e.ident in tr.presolveDomains:
+                let d {.cursor.} = tr.presolveDomains[e.ident]
+                d.len == 1 and d[0] == 1
+            else: false
+        else: false
+
+    # Domain as (bounded, sorted values) — unbounded `var int` is (false, @[]).
+    proc domOf(tr: FznTranslator, declIdx: Table[string, int], name: string): (bool, seq[int]) =
+        if name in tr.presolveDomains: return (true, tr.presolveDomains[name])
+        if name notin declIdx: return (false, @[])
+        let decl {.cursor.} = tr.model.variables[declIdx[name]]
+        case decl.varType.kind
+        of FznIntRange:
+            if decl.varType.hi - decl.varType.lo > 1_000_000: return (false, @[])
+            return (true, toSeq(decl.varType.lo..decl.varType.hi))
+        of FznIntSet: return (true, decl.varType.values.sorted())
+        of FznBool: return (true, @[0, 1])
+        else: return (false, @[])
+
+    proc contains(outer, inner: (bool, seq[int])): bool =
+        ## inner ⊆ outer
+        if not outer[0]: return true
+        if not inner[0]: return false
+        let s = outer[1].toPackedSet()
+        for v in inner[1]:
+            if v notin s: return false
+        true
+
+    var definedByCon: HashSet[string]
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        for ann in tr.model.constraints[ci].annotations:
+            if ann.name == "defines_var" and ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                definedByCon.incl(ann.args[0].ident)
+    var touched: HashSet[string]   # one alias decision per variable per pass
+    var nAliased = 0
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        var isEq = false
+        if name == "int_eq" and con.args.len >= 2:
+            isEq = true
+        elif name == "int_eq_reif" and con.args.len >= 3 and tr.boolFixedTrue(con.args[2]):
+            isEq = true
+        if not isEq: continue
+        let a = con.args[0]
+        let b = con.args[1]
+        if a.kind != FznIdent or b.kind != FznIdent: continue
+        let x = a.ident
+        let y = b.ident
+        if x == y: continue
+        if x notin declIdx or y notin declIdx: continue
+        if x in touched or y in touched: continue
+        let dx = tr.model.variables[declIdx[x]]
+        let dy = tr.model.variables[declIdx[y]]
+        if not dx.isVar or not dy.isVar: continue
+        if dx.value != nil or dy.value != nil: continue
+        if dx.varType.kind notin {FznIntRange, FznIntSet, FznInt} or
+           dy.varType.kind notin {FznIntRange, FznIntSet, FznInt}: continue
+        let domX = tr.domOf(declIdx, x)
+        let domY = tr.domOf(declIdx, y)
+        # The alias side must be a free variable (no defining constraint):
+        # aliasing a defined variable would demote its definition and reshape
+        # the defined-variable structure later detectors rely on.
+        var aliasName, canonName: string
+        let yDefined = y in definedByCon
+        let xDefined = x in definedByCon
+        if not xDefined and contains(domX, domY):
+            aliasName = x; canonName = y
+        elif not yDefined and contains(domY, domX):
+            aliasName = y; canonName = x
+        else:
+            continue
+        tr.model.variables[declIdx[aliasName]].value = FznExpr(kind: FznIdent, ident: canonName)
+        tr.definingConstraints.incl(ci)
+        touched.incl(x)
+        touched.incl(y)
+        inc nAliased
+    if nAliased > 0:
+        stderr.writeLine(&"[FZN] Aliased {nAliased} presolve-fixed variable equalities")
