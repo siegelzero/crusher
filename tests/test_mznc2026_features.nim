@@ -245,3 +245,58 @@ solve minimize objective;
         check "t1" in mins
         check "t2" in mins
         check "s" notin mins
+
+    test "large channel domains are kept as bounds only":
+        # T = max(y1 + 3, y2 + 2, lb) is a minimized max-from-lin-le channel with
+        # a 200k-value declared range: stored as its two endpoints, still solved
+        # to the optimum. The big *search* variable z keeps an explicit domain.
+        let src = """
+var 0..10: y1 :: output_var;
+var 0..10: y2 :: output_var;
+var 0..200000: T :: output_var;
+var 0..200000: z :: output_var;
+var int: objective :: output_var :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,T],-3);
+constraint int_lin_le([1,-1],[y2,T],-2);
+constraint int_le(5, y1);
+constraint int_lin_le([1,-1],[z,y1],0);
+constraint int_lin_eq([1,-1,-1],[objective,T,z],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        var tr = translate(parseFzn(src))
+        let tPos = tr.varPositions["T"]
+        let zPos = tr.varPositions["z"]
+        check tPos in tr.sys.baseArray.channelPositions
+        check tr.sys.baseArray.isBoundsOnly(tPos)
+        check tr.sys.baseArray.domain[tPos].len == 2
+        check not tr.sys.baseArray.isBoundsOnly(zPos)
+        check tr.sys.baseArray.domain[zPos].len > 2
+        let (lo, hi) = tr.sys.baseArray.domainBounds(tPos)
+        check lo >= 0
+        check hi <= 200000
+        let objExpr = if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+                      else: tr.objectiveDefExpr
+        tr.sys.minimize(objExpr,
+                        parallel = true, tabuThreshold = 2000,
+                        lowerBound = tr.objectiveLoBound,
+                        upperBound = tr.objectiveHiBound)
+        check tr.sys.hasFeasibleSolution
+        let a = tr.sys.assignment
+        check a[tPos] == max(a[tr.varPositions["y1"]] + 3, a[tr.varPositions["y2"]] + 2)
+        check a[tPos] + a[zPos] == 8
+
+    test "setDomainBounds: compact interval, explicit write unmarks":
+        var sys = initConstraintSystem[int]()
+        var x = sys.newConstrainedSequence(2)
+        x.setDomain(toSeq(0..9))
+        sys.baseArray.setDomainBounds(0, 3, 500000)
+        check sys.baseArray.isBoundsOnly(0)
+        check sys.baseArray.domainBounds(0) == (3, 500000)
+        check sys.baseArray.domainBounds(1) == (0, 9)
+        sys.baseArray.setDomainBounds(0, 7, 7)       # degenerate -> explicit singleton
+        check not sys.baseArray.isBoundsOnly(0)
+        check sys.baseArray.domain[0] == @[7]
+        sys.baseArray.setDomainBounds(0, 1, 100)
+        sys.baseArray.setDomain(0, @[1, 2, 3])       # explicit write wins
+        check not sys.baseArray.isBoundsOnly(0)
+        check sys.baseArray.domainBounds(0) == (1, 3)

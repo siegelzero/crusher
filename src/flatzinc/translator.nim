@@ -3467,3 +3467,5 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Precompute staged-presolve fixings for an objective dominated by a small-domain
     # gating variable (applied by the optimizer when its objective bound implies them).
     result.buildObjectiveStaging()
+
+    result.finalizeBoundsOnlyDomains()

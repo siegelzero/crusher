@@ -9,8 +9,15 @@
 # **Performance**: O(min(|shift|, duration)) move evaluation via symmetric difference.
 # Only the time points entering/leaving the task's range are examined.
 # Uses array-based resource profile for O(1) access instead of hash tables.
+#
+# **Sweep mode** (long horizons, few tasks, constant durations/heights/limit):
+# the same cost -- the time integral of overload -- is computed from the 2n
+# sorted task endpoints in O(n log n) instead of walking O(duration) profile
+# cells, and no per-time profile is stored. Batch evaluation of one task over
+# its whole domain uses a prefix integral of the step function, O(log n) per
+# candidate value.
 
-import std/[packedsets, sequtils, tables]
+import std/[packedsets, sequtils, tables, algorithm]
 import ../expressions/expressions
 
 ################################################################################
@@ -33,6 +40,10 @@ type
         heightPositions*: seq[int]       # per-task: position of height var (-1 if constant)
         durPosToTask*: Table[int, int]   # dur position → task index
         heightPosToTask*: Table[int, int] # height position → task index
+        sweepMode*: bool                 # event-based evaluation, no resourceProfile
+        sweepOverride*: int              # 0 = auto, 1 = force sweep, -1 = force profile
+        taskStart*: seq[int]             # sweep mode: current (unclipped) origin per task
+        evBuf*: seq[(int, int)]          # sweep scratch: (time, +/- height)
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 originPositions*: seq[int]
@@ -171,6 +182,95 @@ proc updateResourceProfile[T](state: CumulativeConstraint[T], taskIdx: int, orig
             else:
                 state.resourceProfile[t] -= height
 
+proc nTasks[T](state: CumulativeConstraint[T]): int {.inline.} =
+    case state.evalMethod
+    of PositionBased: state.originPositions.len
+    of ExpressionBased: state.originExpressions.len
+
+proc chooseSweepMode[T](state: CumulativeConstraint[T]): bool =
+    if state.sweepOverride != 0: return state.sweepOverride > 0
+    if state.limitPosition >= 0: return false
+    for p in state.durationPositions:
+        if p >= 0: return false
+    for p in state.heightPositions:
+        if p >= 0: return false
+    let n = state.nTasks
+    if n == 0 or n > 512: return false
+    var totalDur = 0
+    for i in 0..<n: totalDur += max(0, int(state.getDuration(i)))
+    # profile work per move ~ duration, sweep ~ n log n
+    totalDur div n >= 16 * n and state.maxTime >= 4096
+
+proc sweepCost[T](state: CumulativeConstraint[T]): int =
+    ## Overload integral of the tasks at state.taskStart, clipped to [0, maxTime].
+    let tEnd = state.maxTime + 1
+    let limit = int(state.limit)
+    state.evBuf.setLen(0)
+    for i in 0..<state.taskStart.len:
+        let h = int(state.getHeight(i))
+        if h == 0: continue
+        let a = max(0, state.taskStart[i])
+        let b = min(tEnd, state.taskStart[i] + int(state.getDuration(i)))
+        if a >= b: continue
+        state.evBuf.add((a, h))
+        state.evBuf.add((b, -h))
+    state.evBuf.sort(proc (x, y: (int, int)): int = cmp(x[0], y[0]))
+    var usage = 0
+    var prevT = 0
+    for (t, dh) in state.evBuf:
+        if t > prevT and usage > limit: result += (usage - limit) * (t - prevT)
+        usage += dh
+        prevT = t
+
+proc sweepBatchSingle[T](state: CumulativeConstraint[T], taskIdx: int,
+                         newOrigins: openArray[int]): seq[int] =
+    ## Cost delta of moving one task to each of newOrigins: step function of the
+    ## other tasks' usage, prefix integral of the task's marginal overload.
+    result = newSeq[int](newOrigins.len)
+    let tEnd = state.maxTime + 1
+    let limit = int(state.limit)
+    let h = int(state.getHeight(taskIdx))
+    let d = int(state.getDuration(taskIdx))
+    state.evBuf.setLen(0)
+    for i in 0..<state.taskStart.len:
+        if i == taskIdx: continue
+        let hi = int(state.getHeight(i))
+        if hi == 0: continue
+        let a = max(0, state.taskStart[i])
+        let b = min(tEnd, state.taskStart[i] + int(state.getDuration(i)))
+        if a >= b: continue
+        state.evBuf.add((a, hi))
+        state.evBuf.add((b, -hi))
+    state.evBuf.sort(proc (x, y: (int, int)): int = cmp(x[0], y[0]))
+    # Segments [bp[k], bp[k+1]) with marginal g[k]; P[k] = integral of g on [0, bp[k])
+    var bp = @[0]
+    var g: seq[int]
+    var baseCost = 0
+    var usage = 0
+    var j = 0
+    while true:
+        while j < state.evBuf.len and state.evBuf[j][0] <= bp[^1]:
+            usage += state.evBuf[j][1]
+            inc j
+        let nextT = if j < state.evBuf.len: min(state.evBuf[j][0], tEnd) else: tEnd
+        if nextT <= bp[^1]: break
+        g.add(max(0, usage + h - limit) - max(0, usage - limit))
+        baseCost += max(0, usage - limit) * (nextT - bp[^1])
+        bp.add(nextT)
+        if nextT >= tEnd: break
+    var P = newSeq[int](bp.len)
+    for k in 0..<g.len: P[k + 1] = P[k] + g[k] * (bp[k + 1] - bp[k])
+    proc G(x: int): int =
+        if x <= 0 or g.len == 0: return 0
+        if x >= bp[^1]: return P[^1]
+        let k = upperBound(bp, x) - 1          # bp[k] <= x < bp[k+1]
+        P[k] + g[k] * (x - bp[k])
+    for vi, o in newOrigins:
+        let a = max(0, o)
+        let b = min(tEnd, o + d)
+        let added = if a < b and h != 0: G(b) - G(a) else: 0
+        result[vi] = baseCost + added - state.cost
+
 proc recalculateCost[T](state: CumulativeConstraint[T]) =
     # Recalculates the total cost from the resource profile
     state.cost = 0
@@ -227,11 +327,27 @@ proc initialize*[T](state: CumulativeConstraint[T], assignment: seq[T]) =
                 if endTime > requiredMaxTime:
                     requiredMaxTime = endTime
 
-    # Resize resource profile if needed
     if requiredMaxTime > state.maxTime:
         state.maxTime = requiredMaxTime
-        state.resourceProfile = newSeq[T](requiredMaxTime + 1)
-        state.prefixDeltaBuf = newSeq[int64](requiredMaxTime + 2)
+    state.sweepMode = state.chooseSweepMode()
+    if state.sweepMode:
+        let n = state.nTasks
+        state.taskStart.setLen(n)
+        case state.evalMethod:
+            of PositionBased:
+                for i, pos in state.originPositions: state.taskStart[i] = int(assignment[pos])
+            of ExpressionBased:
+                for i, exp in state.originExpressions:
+                    state.taskStart[i] = int(exp.evaluate(state.currentAssignment))
+        state.resourceProfile = @[]
+        state.prefixDeltaBuf = @[]
+        state.cost = state.sweepCost()
+        return
+
+    # Resize resource profile if needed
+    if state.resourceProfile.len != state.maxTime + 1:
+        state.resourceProfile = newSeq[T](state.maxTime + 1)
+        state.prefixDeltaBuf = newSeq[int64](state.maxTime + 2)
 
     # Reset resource profile
     for t in 0..state.maxTime:
@@ -264,6 +380,20 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
     # Track change for getAffectedPositions
     state.lastChangedPosition = position
     state.lastOldValue = oldValue
+
+    if state.sweepMode:
+        state.currentAssignment[position] = newValue
+        case state.evalMethod:
+            of PositionBased:
+                if position < state.positionToTask.len and state.positionToTask[position] >= 0:
+                    state.taskStart[state.positionToTask[position]] = int(newValue)
+                    state.cost = state.sweepCost()
+            of ExpressionBased:
+                if position in state.expressionsAtPosition:
+                    for i in state.expressionsAtPosition[position]:
+                        state.taskStart[i] = int(state.originExpressions[i].evaluate(state.currentAssignment))
+                    state.cost = state.sweepCost()
+        return
 
     # Handle variable limit change
     if position == state.limitPosition:
@@ -551,7 +681,7 @@ proc getGoodStartTimes*[T](state: CumulativeConstraint[T], position: int, maxCan
     result = @[]
 
     # Limit position is not a task — no start time candidates
-    if position == state.limitPosition:
+    if position == state.limitPosition or state.sweepMode:
         return result
 
     case state.evalMethod:
@@ -619,6 +749,30 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
     ## O(min(|shift|, duration)) complexity via symmetric difference of old/new time ranges.
     if oldValue == newValue:
         return 0
+
+    if state.sweepMode:
+        case state.evalMethod:
+            of PositionBased:
+                if position >= state.positionToTask.len or state.positionToTask[position] < 0:
+                    return 0
+                let i = state.positionToTask[position]
+                let saved = state.taskStart[i]
+                state.taskStart[i] = int(newValue)
+                result = state.sweepCost() - state.cost
+                state.taskStart[i] = saved
+            of ExpressionBased:
+                if position notin state.expressionsAtPosition: return 0
+                let tasks {.cursor.} = state.expressionsAtPosition[position]
+                var saved = newSeq[int](tasks.len)
+                let savedVal = state.currentAssignment[position]
+                state.currentAssignment[position] = newValue
+                for k, i in tasks:
+                    saved[k] = state.taskStart[i]
+                    state.taskStart[i] = int(state.originExpressions[i].evaluate(state.currentAssignment))
+                state.currentAssignment[position] = savedVal
+                result = state.sweepCost() - state.cost
+                for k, i in tasks: state.taskStart[i] = saved[k]
+        return
 
     # Handle variable limit change
     if position == state.limitPosition:
@@ -782,6 +936,35 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     ## Compute moveDelta for ALL domain values at a position using prefix sums.
     ## O(maxTime + domainSize) instead of O(domainSize * duration).
     result = newSeq[int](domain.len)
+
+    if state.sweepMode:
+        case state.evalMethod:
+            of PositionBased:
+                if position >= state.positionToTask.len or state.positionToTask[position] < 0:
+                    return
+                var origins = newSeq[int](domain.len)
+                for i, v in domain: origins[i] = int(v)
+                result = state.sweepBatchSingle(state.positionToTask[position], origins)
+                for i, v in domain:
+                    if v == currentValue: result[i] = 0
+            of ExpressionBased:
+                if position notin state.expressionsAtPosition: return
+                let tasks {.cursor.} = state.expressionsAtPosition[position]
+                if tasks.len == 1:
+                    let ti = tasks[0]
+                    var origins = newSeq[int](domain.len)
+                    for i, v in domain:
+                        state.currentAssignment[position] = v
+                        origins[i] = int(state.originExpressions[ti].evaluate(state.currentAssignment))
+                    state.currentAssignment[position] = currentValue
+                    result = state.sweepBatchSingle(ti, origins)
+                    for i, v in domain:
+                        if v == currentValue: result[i] = 0
+                else:
+                    for i, v in domain:
+                        if v != currentValue:
+                            result[i] = state.moveDelta(position, currentValue, v)
+        return
 
     # Handle variable limit position: iterate profile for each candidate limit value
     if position == state.limitPosition:

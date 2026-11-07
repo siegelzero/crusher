@@ -32,6 +32,7 @@ import test_const_element_composition_fzn
 import test_count_eq
 import test_count_eq_channels
 import test_cumulative
+import test_cumulative_sweep
 import test_debruijn
 import test_deepcopy
 import test_diffn

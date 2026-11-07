@@ -1253,6 +1253,7 @@ let gNoExprCascade = existsEnv("CRUSHER_NO_EXPR_CASCADE")
 let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
 let gNoIncCount = existsEnv("CRUSHER_NO_INC_COUNT")
 let gExactCascadeExt = existsEnv("CRUSHER_EXACT_CASCADE_EXT")
+let gNoExactCascadeExt = existsEnv("CRUSHER_NO_EXACT_CASCADE_EXT")
 
 proc logInitRss*(label: string) =
     ## Verbose-only: resident set size after an init phase (Linux /proc/self/statm).
@@ -3097,7 +3098,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # such inputs on every successor move; elsewhere the extra full
                 # recomputes cost ~3x throughput (sparse_mds) for little gain.
                 var consExt: PackedSet[int]
-                if state.circuitTimePropConstraints.len > 0 or gExactCascadeExt:
+                if (state.circuitTimePropConstraints.len > 0 and not gNoExactCascadeExt) or
+                   gExactCascadeExt:
                     for dci in constraintLocalIds:
                         for p in state.channelDepConstraints[dci].positions.items:
                             if p != pos and p notin topoSet: consExt.incl(p)

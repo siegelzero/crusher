@@ -52,6 +52,21 @@ proc translateParameters(tr: var FznTranslator) =
                 else:
                     discard
 
+const BoundsOnlyDomainMin = 100_000   # interval channels larger than this keep bounds only
+
+proc finalizeBoundsOnlyDomains(tr: var FznTranslator) =
+    ## Safety net after translation: a bounds-only position that did not end up
+    ## a channel is searched, so it needs its explicit domain back.
+    var expand: seq[int]
+    for pos in tr.sys.baseArray.boundsOnlyDomains.items:
+        if pos notin tr.sys.baseArray.channelPositions: expand.add(pos)
+    for pos in expand:
+        let (lo, hi) = tr.sys.baseArray.domainBounds(pos)
+        tr.sys.baseArray.setDomain(pos, toSeq(lo..hi))
+    let n = tr.sys.baseArray.boundsOnlyDomains.len
+    if n > 0 or expand.len > 0:
+        stderr.writeLine(&"[FZN] Bounds-only channel domains: {n} kept, {expand.len} expanded (not channels)")
+
 proc translateVariables(tr: var FznTranslator) =
     ## Creates ConstrainedVariables for all FZN variable declarations and sets domains.
 
@@ -174,14 +189,24 @@ proc translateVariables(tr: var FznTranslator) =
             tr.channelVarNames.incl(decl.name)
         elif decl.name in tr.presolveDomains:
             # Presolve tightened this domain
-            let pdom = tr.presolveDomains[decl.name]
-            v.setDomain(pdom)
+            let pdom {.cursor.} = tr.presolveDomains[decl.name]
+            if pdom.len > BoundsOnlyDomainMin and decl.name in tr.channelVarNames and
+               pdom[^1] - pdom[0] + 1 == pdom.len:
+                tr.sys.baseArray.setDomainBounds(pos, pdom[0], pdom[^1])
+            else:
+                v.setDomain(pdom)
             if pdom.len == 1:
                 tr.channelVarNames.incl(decl.name)
         else:
             case decl.varType.kind
             of FznIntRange:
-                v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
+                if decl.name in tr.channelVarNames and
+                   decl.varType.hi - decl.varType.lo + 1 > BoundsOnlyDomainMin:
+                    # Large computed variable: interval kept as bounds only (an
+                    # explicit list per variable is GBs on long-horizon models)
+                    tr.sys.baseArray.setDomainBounds(pos, decl.varType.lo, decl.varType.hi)
+                else:
+                    v.setDomain(toSeq(decl.varType.lo..decl.varType.hi))
             of FznIntSet:
                 v.setDomain(decl.varType.values)
             of FznBool:

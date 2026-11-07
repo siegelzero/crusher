@@ -1,4 +1,5 @@
 import std/[packedsets, sequtils, strformat, tables, times]
+from std/os import existsEnv
 import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular, sharedElems]
 export sharedElems
 from constraints/globalCardinality import ExactCounts, BoundedCounts
@@ -113,6 +114,7 @@ type
         sharedDomainPtr*: ptr seq[seq[T]]  # Points to shared (non-copied) reducedDomain for parallel states
         entries*: seq[AlgebraicExpression[T]]
         channelPositions*: PackedSet[int]
+        boundsOnlyDomains*: PackedSet[int]  # channel positions whose domain seq is @[lo, hi] standing for lo..hi
         channelBindings*: seq[ChannelBinding[T]]
         channelsAtPosition*: Table[int, seq[int]]  # search_pos → [binding indices]
         minMaxChannelBindings*: seq[MinMaxChannelBinding[T]]
@@ -231,8 +233,36 @@ func setDomain*[T](arr: var ConstrainedArray[T], domain: openArray[T]) =
         arr.domain[position] = toSeq(domain)
 
 func setDomain*[T](arr: var ConstrainedArray[T], position: int, domain: openArray[T]) =
-    # Sets domain of position to the given values.
+    # Sets domain of position to the given values. An explicit domain replaces a
+    # bounds-only one (use setDomainBounds to keep the compact form).
+    if position in arr.boundsOnlyDomains:
+        arr.boundsOnlyDomains.excl(position)
+        {.cast(noSideEffect).}:
+            if existsEnv("CRUSHER_DEBUG_BOUNDSONLY"):
+                stderr.writeLine("[BoundsOnly] explicit domain written at pos " & $position &
+                                 " (len " & $domain.len & ")")
     arr.domain[position] = toSeq(domain)
+
+func isBoundsOnly*[T](arr: ConstrainedArray[T], position: int): bool {.inline.} =
+    position in arr.boundsOnlyDomains
+
+func setDomainBounds*[T](arr: var ConstrainedArray[T], position: int, lo, hi: T) =
+    ## Interval domain lo..hi stored compactly as @[lo, hi]. Only for channel
+    ## positions: their values are computed, and every consumer of a large
+    ## channel domain reads just its endpoints (domain reduction skips them,
+    ## deepCopy compacts them the same way).
+    if hi <= lo:
+        arr.boundsOnlyDomains.excl(position)
+        arr.domain[position] = @[lo]
+    else:
+        arr.boundsOnlyDomains.incl(position)
+        arr.domain[position] = @[lo, hi]
+
+func domainBounds*[T](arr: ConstrainedArray[T], position: int): (T, T) =
+    ## (min, max) of a position's domain, for explicit and bounds-only alike.
+    let d {.cursor.} = arr.domain[position]
+    if position in arr.boundsOnlyDomains: return (d[0], d[1])
+    (min(d), max(d))
 
 func allDifferent*[T](arr: ConstrainedArray[T]): StatefulConstraint[T] {.inline.} =
     allDifferent(toSeq arr.allPositions())
@@ -1283,7 +1313,8 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     var skippedPositions: PackedSet[int]
     var nSkipped, nNormal, maxDomainSize: int
     for pos in carray.allPositions():
-        if pos in carray.channelPositions and carray.domain[pos].len > LargeDomainThreshold:
+        if pos in carray.channelPositions and (carray.domain[pos].len > LargeDomainThreshold or
+                                               pos in carray.boundsOnlyDomains):
             # Don't copy the million-element domain; channel propagation will set the
             # correct value anyway. Store a 1-element placeholder for random init.
             reduced[pos] = @[carray.domain[pos][0]]
@@ -5259,6 +5290,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
 
     # Deep copy channel data - channelBindings contains AlgebraicExpression refs
     result.channelPositions = arr.channelPositions
+    result.boundsOnlyDomains = arr.boundsOnlyDomains
     result.channelBindings = newSeq[ChannelBinding[T]](arr.channelBindings.len)
     for i, binding in arr.channelBindings:
         result.channelBindings[i] = ChannelBinding[T](

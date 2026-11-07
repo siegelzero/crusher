@@ -3416,26 +3416,33 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
         for def in tr.maxFromLinLeDefs:
             if def.ceilingVarName notin tr.varPositions: continue
             let ceilingPos = tr.varPositions[def.ceilingVarName]
-            let ceilingDom = tr.sys.baseArray.domain[ceilingPos]
-            if ceilingDom.len == 0: continue
-            let maxCeiling = max(ceilingDom)
+            if tr.sys.baseArray.domain[ceilingPos].len == 0: continue
+            let (minCeilingDom, maxCeiling) = tr.sys.baseArray.domainBounds(ceilingPos)
 
             # Phase 1: Tighten source upper bounds from ceiling max
             # y_i + offset_i <= D, so y_i <= max(dom(D)) - offset_i
             for i, srcName in def.sourceVarNames:
                 if srcName notin tr.varPositions: continue
                 let srcPos = tr.varPositions[srcName]
-                let srcDom = tr.sys.baseArray.domain[srcPos]
-                if srcDom.len == 0: continue
+                if tr.sys.baseArray.domain[srcPos].len == 0: continue
                 let upperBound = maxCeiling - def.offsets[i]
-                if max(srcDom) <= upperBound: continue
+                let (srcLo, srcHi) = tr.sys.baseArray.domainBounds(srcPos)
+                if srcHi <= upperBound: continue
+                if tr.sys.baseArray.isBoundsOnly(srcPos):
+                    if upperBound >= srcLo:
+                        tr.sys.baseArray.setDomainBounds(srcPos, srcLo, upperBound)
+                        stderr.writeLine(&"[FZN] Max channel: tightened '{srcName}' upper bound to <= {upperBound} (bounds-only)")
+                        anyTightened = true
+                    continue
+                let srcDom {.cursor.} = tr.sys.baseArray.domain[srcPos]
                 var newDom: seq[int]
                 for v in srcDom:
                     if v <= upperBound:
                         newDom.add(v)
-                if newDom.len > 0 and newDom.len < srcDom.len:
+                let oldLen = srcDom.len
+                if newDom.len > 0 and newDom.len < oldLen:
                     tr.sys.baseArray.setDomain(srcPos, newDom)
-                    stderr.writeLine(&"[FZN] Max channel: tightened '{srcName}' upper bound to <= {upperBound} ({srcDom.len} -> {newDom.len})")
+                    stderr.writeLine(&"[FZN] Max channel: tightened '{srcName}' upper bound to <= {upperBound} ({oldLen} -> {newDom.len})")
                     anyTightened = true
 
             # Phase 2: Tighten ceiling lower bound from source minimums
@@ -3445,19 +3452,25 @@ proc tightenMaxFromLinLeBounds*(tr: var FznTranslator) =
             for i, srcName in def.sourceVarNames:
                 if srcName notin tr.varPositions: continue
                 let srcPos = tr.varPositions[srcName]
-                let srcDom = tr.sys.baseArray.domain[srcPos]
-                if srcDom.len == 0: continue
-                let lb = min(srcDom) + def.offsets[i]
+                if tr.sys.baseArray.domain[srcPos].len == 0: continue
+                let lb = tr.sys.baseArray.domainBounds(srcPos)[0] + def.offsets[i]
                 if lb > minCeiling:
                     minCeiling = lb
-            if minCeiling > min(ceilingDom):
+            if minCeiling > minCeilingDom and tr.sys.baseArray.isBoundsOnly(ceilingPos):
+                if minCeiling <= maxCeiling:
+                    tr.sys.baseArray.setDomainBounds(ceilingPos, minCeiling, maxCeiling)
+                    stderr.writeLine(&"[FZN] Max channel: tightened '{def.ceilingVarName}' lower bound to >= {minCeiling} (bounds-only)")
+                    anyTightened = true
+            elif minCeiling > minCeilingDom:
+                let ceilingDom {.cursor.} = tr.sys.baseArray.domain[ceilingPos]
                 var newDom: seq[int]
                 for v in ceilingDom:
                     if v >= minCeiling:
                         newDom.add(v)
-                if newDom.len > 0 and newDom.len < ceilingDom.len:
+                let oldLen = ceilingDom.len
+                if newDom.len > 0 and newDom.len < oldLen:
                     tr.sys.baseArray.setDomain(ceilingPos, newDom)
-                    stderr.writeLine(&"[FZN] Max channel: tightened '{def.ceilingVarName}' lower bound to >= {minCeiling} ({ceilingDom.len} -> {newDom.len})")
+                    stderr.writeLine(&"[FZN] Max channel: tightened '{def.ceilingVarName}' lower bound to >= {minCeiling} ({oldLen} -> {newDom.len})")
                     anyTightened = true
 
     if iteration > 1:
