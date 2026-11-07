@@ -291,6 +291,16 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     # other conjuncts (e.g. cond -> (produced >= total /\ end_d = end_j): the
     # produced >= total part is a real constraint) — see Step 6.
     var seeThrough: Table[int, (string, string)]
+    var andUseCount: CountTable[string]   # uses of each AND output (definition + clauses)
+    for con in tr.model.constraints:
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident in andToEqReifs or
+               arg.kind == FznIdent and arg.ident in andToLinReifs:
+                andUseCount.inc(arg.ident)
+            elif arg.kind == FznArrayLit:
+                for el in arg.elems:
+                    if el.kind == FznIdent and (el.ident in andToEqReifs or el.ident in andToLinReifs):
+                        andUseCount.inc(el.ident)
 
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
@@ -1104,6 +1114,19 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                             else:
                                 break
                         if not resolved:
+                            # Cheap variable-valued cases first; the expensive
+                            # value mapping is size-guarded below.
+                            if testValExpr.ident in tr.channelVarNames:
+                                varEntries[flatIdx] = CaseAnalysisVarEntry(
+                                    varName: testValExpr.ident, offset: 0)
+                                lookupTable[flatIdx] = 0
+                                continue
+                            if testValExpr.ident in linAlias:
+                                let (baseVar, off) = linAlias[testValExpr.ident]
+                                varEntries[flatIdx] = CaseAnalysisVarEntry(
+                                    varName: baseVar, offset: off)
+                                lookupTable[flatIdx] = 0
+                                continue
                             if tr.reifChannelDefs.len > 500:
                                 allResolved = false
                                 break
@@ -1151,6 +1174,10 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                         if stripSolverPrefix(ac.name) == "array_bool_and" and ac.args.len >= 2 and
                            ac.args[1].kind == FznIdent and ac.args[1].ident == andVar:
                             andLits = tr.resolveVarArrayElems(ac.args[0])
+                            # The AND output is dead once its only clause is consumed
+                            # (the case channel + residual clauses replace it).
+                            if andUseCount.getOrDefault(andVar) <= 2:
+                                tr.definingConstraints.incl(andCI)
                             break
                     for lit in andLits:
                         if lit.kind == FznIdent and lit.ident == usedLit: continue

@@ -178,3 +178,70 @@ solve satisfy;
                 check predictedCd == actual
                 inc checked
         check checked == 18
+
+    test "dead total definitions are eliminated":
+        # b is defined by a reification and read by nothing else: dropping its
+        # definition cannot change the solution set.
+        let src = """
+var 1..10: x :: output_var;
+var bool: b ::var_is_introduced :: is_defined_var;
+constraint int_le_reif(x, 3, b) :: defines_var(b);
+constraint int_le(5, x);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        var reifCi = -1
+        for ci, con in model.constraints:
+            if con.name == "int_le_reif": reifCi = ci
+        check reifCi >= 0
+        check reifCi in tr.definingConstraints
+        tr.sys.resolve(parallel = false, tabuThreshold = 5000)
+        check tr.sys.hasFeasibleSolution
+        check tr.sys.assignment[tr.varPositions["x"]] >= 5
+
+    test "dead partial definitions are kept (they constrain their inputs)":
+        # Each unused defined var restricts its inputs: z's domain bounds x + y,
+        # the element restricts the index, 2*h = w forces w even. Eliminating
+        # these as "dead" would be unsound.
+        let src = """
+var 4..10: x :: output_var;
+var 0..10: y :: output_var;
+var 0..5: z ::var_is_introduced :: is_defined_var;
+var 1..10: idx :: output_var;
+var int: r ::var_is_introduced :: is_defined_var;
+var 1..9: w :: output_var;
+var int: h ::var_is_introduced :: is_defined_var;
+array [1..3] of int: arr = [7, 8, 9];
+constraint int_lin_eq([1,1,-1],[x,y,z],0) :: defines_var(z);
+constraint array_int_element(idx, arr, r) :: defines_var(r);
+constraint int_lin_eq([2,-1],[h,w],0) :: defines_var(h);
+solve satisfy;
+"""
+        for trial in 0..<3:
+            var tr = translate(parseFzn(src))
+            tr.sys.resolve(parallel = false, tabuThreshold = 5000)
+            check tr.sys.hasFeasibleSolution
+            let a = tr.sys.assignment
+            check a[tr.varPositions["x"]] + a[tr.varPositions["y"]] <= 5
+            check a[tr.varPositions["idx"]] in 1..3
+            check a[tr.varPositions["w"]] mod 2 == 0
+
+    test "minimized variables propagate through positive linear definitions":
+        # objective = T, T = t1 + t2 - s  ->  t1, t2 minimized; s is maximized.
+        let src = """
+var 0..10: t1 :: output_var;
+var 0..10: t2 :: output_var;
+var 0..10: s :: output_var;
+var int: T ::var_is_introduced :: is_defined_var;
+var int: objective :: output_var :: is_defined_var;
+constraint int_lin_eq([1,-1,-1,1],[T,t1,t2,s],0) :: defines_var(T);
+constraint int_lin_eq([1,-1],[objective,T],0) :: defines_var(objective);
+solve minimize objective;
+"""
+        let tr = translate(parseFzn(src))
+        let mins = tr.findMinimizedVarNames()
+        check "T" in mins
+        check "t1" in mins
+        check "t2" in mins
+        check "s" notin mins

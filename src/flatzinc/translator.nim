@@ -231,6 +231,7 @@ type
         sourceVarNames*: seq[string]    # source variable names
         offsets*: seq[int]              # per-source offsets
         consumedCIs*: seq[int]          # consumed constraint indices
+        withDomainLb*: bool             # also max with the ceiling's domain lower bound
 
     SpreadPatternDef* = object
         ## A detected spread pattern:
@@ -1521,6 +1522,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # rescueDefinedVarsToChannels is idempotent; the second call only acts on the
     # newly-promoted names.
     result.rescueDefinedVarsToChannels()
+    result.eliminateDeadDefinitions()
     result.translateVariables()
     result.debugWatchClauses("after translateVariables")
     # Detect bivalent integer vars structurally pinned by another var via a

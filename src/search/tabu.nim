@@ -193,6 +193,7 @@ type
 
         # Circuit-time-prop writeback: after updatePosition, write computed times to assignment
         circuitTimePropConstraints*: seq[CircuitTimePropConstraint[T]]
+        ctpAtLink*: Table[int, seq[int]]           # link (successor) position -> indices into circuitTimePropConstraints
         ctpChangedBuf*: seq[int]                   # reusable buffer for writeback-changed time positions
 
         # Cached list of tableIn constraint indices for fast stagnation-time table moves
@@ -268,6 +269,8 @@ type
         cdCascadeHasBackEdge: seq[bool]           # [cascadeIdx] -> some entry reads a later entry (sparse unsafe)
         cdCascadeEntryCons: seq[seq[seq[int]]]    # [cascadeIdx][entry] -> constraint-local indices reading it
         cdCascadeSingleIdx: seq[seq[int]]         # [cascadeIdx][cli] -> entry of a single-pos constraint's position, or -1
+        cdCascadeConsExt: seq[PackedSet[int]]     # [cascadeIdx] -> positions its constraints read outside the cascade
+        cdReadersOf: Table[int, seq[int]]         # position -> cascade source positions that READ it (ext deps / constraint inputs)
         cdBatchChanged: seq[seq[int]]             # [domainIdx] -> entries changed for that value (scratch)
         cdCliStamp: seq[int]                      # scratch dedupe stamps per constraint-local index
         cdCliStampGen: int
@@ -1249,6 +1252,7 @@ let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
 let gNoExprCascade = existsEnv("CRUSHER_NO_EXPR_CASCADE")
 let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
 let gNoIncCount = existsEnv("CRUSHER_NO_INC_COUNT")
+let gExactCascadeExt = existsEnv("CRUSHER_EXACT_CASCADE_EXT")
 
 proc logInitRss*(label: string) =
     ## Verbose-only: resident set size after an init phase (Linux /proc/self/statm).
@@ -1336,6 +1340,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # Collect CircuitTimeProp constraints for writeback
         if constraint.stateType == CircuitTimePropType:
             state.circuitTimePropConstraints.add(constraint.circuitTimePropState)
+            for lp in constraint.circuitTimePropState.positionArray:
+                if lp >= 0:
+                    state.ctpAtLink.mgetOrPut(lp, @[]).add(state.circuitTimePropConstraints.len - 1)
         # Cache circuit constraints for stagnation-time cross-cycle merge moves.
         # Skip circuits over channel positions: their successor values are derived
         # from source variables and cannot be assigned directly (same reasoning as
@@ -2132,7 +2139,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if pos in carray.channelsAtPosition or pos in carray.minMaxChannelsAtPosition or
                pos in carray.countEqChannelsAtPosition or pos in carray.weightedCountEqChannelsAtPosition or pos in carray.conditionalCountEqChannelsAtPosition or
                pos in carray.inverseChannelsAtPosition or pos in carray.argmaxChannelsAtPosition or
-               pos in carray.expressionChannelsAtPosition or pos in carray.crossingCountMaxChannelsAtPosition:
+               pos in carray.expressionChannelsAtPosition or pos in carray.crossingCountMaxChannelsAtPosition or
+               pos in state.ctpAtLink:
                 state.channelDepSearchPositions.add(pos)
 
         # Build inverse index: channel position -> channel-dep constraints at that position
@@ -2156,6 +2164,16 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             visited.incl(pos)
             while worklist.len > 0:
                 let p = worklist.pop()
+                # Circuit-time chains: a link reaches every written-back time position
+                if p in state.ctpAtLink:
+                    for k in state.ctpAtLink[p]:
+                        let ctc = state.circuitTimePropConstraints[k]
+                        for tp in ctc.arrivalPositions & ctc.departurePositions:
+                            if tp >= 0:
+                                reachable.incl(tp)
+                                if tp notin visited:
+                                    visited.incl(tp)
+                                    worklist.add(tp)
                 # Element channel bindings
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
@@ -2561,6 +2579,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadeHasBackEdge = @[]
         state.cdCascadeEntryCons = @[]
         state.cdCascadeSingleIdx = @[]
+        state.cdCascadeConsExt = @[]
         let cascadeStart = epochTime()
         var staticCount = 0
         var dynamicCount = 0
@@ -2753,8 +2772,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
-                if p in carray.inverseChannelsAtPosition:
-                    canBuild = false
+                if p in carray.inverseChannelsAtPosition or p in state.ctpAtLink:
+                    canBuild = false   # multi-output groups: per-value fallback handles them
 
             # Wide-input guard: entries such as global-cardinality count channels
             # read every assignment variable; the per-cascade dependency tables are
@@ -3071,6 +3090,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     let sp = state.cdSinglePos[dci]
                     singleIdx[cli] = if sp >= 0 and sp in chanToIdx: chanToIdx[sp] else: -1
                 state.cdCascadeSingleIdx.add(singleIdx)
+                # Constraint inputs outside the cascade (other than the source):
+                # when one changes, per-value deltas change non-uniformly, so the
+                # uniform-delta shortcut in applyUniformDelta is not exact.
+                # Only tracked with circuit-time chains, whose writebacks change
+                # such inputs on every successor move; elsewhere the extra full
+                # recomputes cost ~3x throughput (sparse_mds) for little gain.
+                var consExt: PackedSet[int]
+                if state.circuitTimePropConstraints.len > 0 or gExactCascadeExt:
+                    for dci in constraintLocalIds:
+                        for p in state.channelDepConstraints[dci].positions.items:
+                            if p != pos and p notin topoSet: consExt.incl(p)
+                    # Reverse index: a change at any read-but-not-reached position must
+                    # refresh this source's penalties (reachability alone misses it).
+                    for p in consExt.items:
+                        state.cdReadersOf.mgetOrPut(p, @[]).add(pos)
+                    for p in externalDeps.items:
+                        if p notin consExt:
+                            state.cdReadersOf.mgetOrPut(p, @[]).add(pos)
+                state.cdCascadeConsExt.add(consExt)
             state.cdCascadeForwardDeps.add(forwardDeps)
             state.cdCascadeExtPosToEntries.add(extPosToEntries)
             # Allocate cache for this cascade
@@ -3232,6 +3270,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if state.hasChannelDeps and state.cdCascadePos.len == 0:
             if verbose and id == 0:
                 echo "[Init] Skipping tautological filtering (no cascades — deep channel chains)"
+        elif state.hasChannelDeps and state.circuitTimePropConstraints.len > 0:
+            # CircuitTimeProp writes its time/accumulator positions back after a
+            # move, outside the channel graph the cascades see: constraints
+            # downstream of those positions show zero delta at init yet become
+            # violated once the tour changes. Disabling them hides real violations.
+            if verbose and id == 0:
+                echo "[Init] Skipping tautological filtering (circuit-time writeback channels)"
         elif state.hasChannelDeps:
             # Build set of aggregate channel positions for tautology exclusion
             var aggregateChannelPositions: PackedSet[int]
@@ -4055,6 +4100,9 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
     if state.circuitTimePropConstraints.len > 0:
         state.writebackCircuitTimes(position, localForced, state.ctpChangedBuf)
         for tp in state.ctpChangedBuf:
+            # Constraints reading the written-back position directly also hold
+            # search positions whose penalty maps must follow (as for channels).
+            state.updateNeighborPenalties(tp)
             state.changedChannelsBuf.add(tp)
             let tpChanged = state.propagateChannels(tp, state.forcedChannelsBuf2)
             if tpChanged:
@@ -4515,7 +4563,28 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
             state.computeInverseForcedChanges(position, newValue)
             for (fPos, fOld, fNew) in state.inverseForcedChanges:
                 forcedOldValues.add((fPos, T(fOld)))
+        let predicted = if gCheckDelta: state.penaltyAt(position, newValue) else: 0
+        let freshPred = if gCheckDelta: state.costDelta(position, newValue) else: 0
+        var penBefore: seq[int]
+        if gCheckDelta:
+            for c in state.constraints: penBefore.add(c.penalty())
+        let costBefore = state.cost
         state.assignValue(position, newValue)
+        if gCheckDelta and state.cost - costBefore != predicted:
+            inc state.deltaMismatches
+            if state.deltaMismatches <= 20:
+                echo "[CheckDelta] best-move S" & $state.id & " it=" & $state.iteration & " pos=" & $position &
+                     " " & $oldValue & "->" & $newValue & " predicted=" & $predicted &
+                     " actual=" & $(state.cost - costBefore) & " fresh=" & $freshPred
+                if position in state.ctpAtLink and freshPred != state.cost - costBefore:
+                    var parts: seq[string]
+                    for ci, c in state.constraints:
+                        let d = c.penalty() - penBefore[ci]
+                        if d != 0:
+                            let inCd = c in state.channelDepConstraints
+                            parts.add($ci & ":" & $c.stateType & "=" & $d & (if inCd: "(cd)" else: "") &
+                                      (if position in c.positions: "(direct)" else: ""))
+                    echo "[CheckDelta]   changed: ", parts.join(" ")
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
         let oldIdx = state.domIdx(position, oldValue)
         if oldIdx >= 0 and not state.isLazy[position]:

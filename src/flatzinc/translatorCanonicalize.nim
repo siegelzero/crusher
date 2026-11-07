@@ -230,3 +230,104 @@ proc splitImplicationConjunctions(tr: var FznTranslator) =
     for c in added: tr.model.constraints.add(c)
     stderr.writeLine("[FZN] Split " & $nSplit & " implication conjunctions into " &
                      $added.len & " clauses")
+
+
+proc eliminateDeadDefinitions(tr: var FznTranslator) =
+    ## Consume `defines_var(b)` constraints whose output is read by no other live
+    ## constraint and is not output / the objective (fixpoint: chains of dead
+    ## reifications die together). Earlier detectors that consume a constraint
+    ## often leave the reifications feeding it behind; translated, those become
+    ## junk search variables with constraints the search keeps "repairing".
+    var keep: HashSet[string]
+    for decl in tr.model.variables:
+        if decl.hasAnnotation("output_var"): keep.incl(decl.name)
+        if decl.isArray and decl.hasAnnotation("output_array") and decl.value != nil and
+           decl.value.kind == FznArrayLit:
+            for e in decl.value.elems:
+                if e.kind == FznIdent: keep.incl(e.ident)
+    if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        keep.incl(tr.model.solve.objective.ident)
+    for v in tr.annotatedSearchVarNames: keep.incl(v)
+    # Array declarations referenced by name count as uses of their elements
+    var arrElems: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var names: seq[string]
+            for e in decl.value.elems:
+                if e.kind == FznIdent: names.add(e.ident)
+            arrElems[decl.name] = names
+    # Dropping a definition is sound only when it is total: every assignment of
+    # its inputs has a matching value of b. Reifications are (b is a free bool);
+    # functional int definitions are only when b's declared domain is unbounded
+    # (`var 0..5: b = x + y` restricts x + y). Partial ones (int_div, element)
+    # are never dropped.
+    var declType: Table[string, FznTypeKind]
+    for decl in tr.model.variables:
+        if decl.isVar and not decl.isArray: declType[decl.name] = decl.varType.kind
+    var declIdx: Table[string, int]
+    for i, decl in tr.model.variables:
+        if decl.isVar and not decl.isArray: declIdx[decl.name] = i
+    proc isTotalDefinition(tr: FznTranslator, declType: Table[string, FznTypeKind],
+                           declIdx: Table[string, int], con: FznConstraint, b: string): bool =
+        let name = stripSolverPrefix(con.name)
+        let kind = declType.getOrDefault(b, FznIntSet)
+        let lastIsB = con.args.len > 0 and con.args[^1].kind == FznIdent and
+                      con.args[^1].ident == b
+        if name.endsWith("_reif") or name in ["array_bool_and", "array_bool_or", "bool_xor"]:
+            return kind == FznBool and lastIsB
+        if name == "bool_not":
+            return kind == FznBool
+        if name == "bool2int":
+            if not lastIsB: return false
+            if kind == FznInt: return true
+            if kind == FznIntRange:
+                let t = tr.model.variables[declIdx[b]].varType
+                return t.lo <= 0 and t.hi >= 1
+            return false
+        if name == "int_lin_eq":
+            # b's coefficient must be +-1 (2*b = x forces x even)
+            if kind != FznInt or con.args.len < 2: return false
+            let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: return false
+            let elems = tr.resolveVarArrayElems(con.args[1])
+            if coeffs.len != elems.len: return false
+            var nB = 0
+            for i, e in elems:
+                if e.kind == FznIdent and e.ident == b:
+                    inc nB
+                    if abs(coeffs[i]) != 1: return false
+            return nB == 1
+        if name in ["int_plus", "int_times", "int_max", "int_min",
+                    "int_abs", "array_int_maximum", "array_int_minimum"]:
+            return kind == FznInt
+        false
+
+    var total = 0
+    for round in 0..<10:
+        var uses: CountTable[string]
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            for arg in con.args:
+                if arg.kind == FznIdent:
+                    uses.inc(arg.ident)
+                    if arg.ident in arrElems:
+                        for n in arrElems[arg.ident]: uses.inc(n)
+                elif arg.kind == FznArrayLit:
+                    for e in arg.elems:
+                        if e.kind == FznIdent: uses.inc(e.ident)
+        var removed = 0
+        for ci, con in tr.model.constraints:
+            if ci in tr.definingConstraints: continue
+            if not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+            let b = ann.args[0].ident
+            if b in keep: continue
+            if not isTotalDefinition(tr, declType, declIdx, con, b): continue
+            # its own definition is its only use
+            if uses.getOrDefault(b, 0) <= 1:
+                tr.definingConstraints.incl(ci)
+                inc removed
+        total += removed
+        if removed == 0: break
+    if total > 0:
+        stderr.writeLine("[FZN] Eliminated " & $total & " dead definitions")

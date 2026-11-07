@@ -270,7 +270,9 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
        pos notin state.carray.conditionalCountEqChannelsAtPosition and
        pos notin state.carray.inverseChannelsAtPosition and
        pos notin state.carray.argmaxChannelsAtPosition and
-       pos notin state.carray.crossingCountMaxChannelsAtPosition:
+       pos notin state.carray.crossingCountMaxChannelsAtPosition and
+       pos notin state.carray.expressionChannelsAtPosition and
+       pos notin state.ctpAtLink:
         return 0
 
     # Fast path: use precomputed (static) cascade table for single-value lookup
@@ -366,7 +368,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
     # Fast path for one-hot source positions: directly compute the few changes
     # instead of evaluating all bindings through the worklist
-    if pos in state.oneHotChanges:
+    if pos in state.oneHotChanges and pos notin state.ctpAtLink:
         let changes {.cursor.} = state.oneHotChanges[pos]
         let lo = state.oneHotLo[pos]
         let oldIdx = savedPos - lo
@@ -505,6 +507,24 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
         while state.cdWorklist.len > 0:
             let p = state.cdWorklist.pop()
+            if p == pos and p in state.ctpAtLink:
+                # Re-walk each circuit-time chain with the candidate link and treat
+                # its changed time/accumulator positions as changed channels, so
+                # constraints downstream of the chain see successor moves.
+                for k in state.ctpAtLink[p]:
+                    let ctc = state.circuitTimePropConstraints[k]
+                    let nodeIdx = ctc.positionToIndex[p]
+                    for q in 0..<ctc.n: ctc.scratchLinks[q] = ctc.links[q]
+                    ctc.scratchLinks[nodeIdx] = int(state.assignment[p]) - ctc.valueOffset
+                    discard ctc.computePenalties(ctc.scratchLinks, ctc.scratchArrival, ctc.scratchDeparture)
+                    for q in 0..<ctc.n:
+                        for (tp, v) in [(ctc.arrivalPositions[q], ctc.scratchArrival[q]),
+                                        (ctc.departurePositions[q], ctc.scratchDeparture[q])]:
+                            if tp >= 0 and v != state.assignment[tp]:
+                                state.trackChannelChange(tp, v)
+                                if tp notin state.cdVisited:
+                                    state.cdVisited.incl(tp)
+                                    state.cdWorklist.add(tp)
             if p in state.carray.channelsAtPosition:
                 for bi in state.carray.channelsAtPosition[p]:
                     let bindingPtr = addr state.carray.channelBindings[bi]
@@ -1242,6 +1262,28 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
                 state.penaltyMap[pos][i] += delta
         return
     if not anyDepChanged:
+        # A constraint of this cascade also reads a changed position outside it
+        # (e.g. a clause over a cascade channel AND a CTP-written indicator):
+        # per-value deltas shift non-uniformly — recompute fully.
+        let consExt {.cursor.} = state.cdCascadeConsExt[cascadeIdx]
+        var consInputChanged = movedPosition >= 0 and movedPosition in consExt
+        if not consInputChanged and consExt.len > 0:
+            for chanPos in changedChannels:
+                if chanPos in consExt:
+                    consInputChanged = true
+                    break
+        if consInputChanged:
+            let domain {.cursor.} = state.sharedDomain[][pos]
+            var oldPenalties = newSeq[int](domain.len)
+            for i in 0..<domain.len:
+                oldPenalties[i] = state.channelDepPenalties[pos][i]
+            state.computeChannelDepPenaltiesAt(pos)
+            for i in 0..<domain.len:
+                let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
+                if delta != 0:
+                    state.penaltyMap[pos][i] += delta
+            return
+    if not anyDepChanged:
         # No external deps changed — uniform delta is exact
         when ProfileIteration: state.cdUniformCalls += 1
         let constraintIds {.cursor.} = state.cdCascadeConstraintIds[cascadeIdx]
@@ -1313,6 +1355,10 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
                 for pos in state.channelDepPosForChannel[chanPos]:
                     if pos != movedPosition and pos notin state.cdTargetedUpdates:
                         nonOneHotPositions.incl(pos)
+            if chanPos in state.cdReadersOf:
+                for pos in state.cdReadersOf[chanPos]:
+                    if pos != movedPosition and pos notin state.cdTargetedUpdates:
+                        nonOneHotPositions.incl(pos)
         for pos in nonOneHotPositions.items:
             if state.isLazy[pos]: continue
             when ProfileIteration: state.cdNonOneHotPos += 1
@@ -1323,6 +1369,9 @@ proc recomputeAffectedChannelDepPenalties[T](state: TabuState[T], changedChannel
         for chanPos in changedChannels:
             if chanPos in state.channelDepPosForChannel:
                 for pos in state.channelDepPosForChannel[chanPos]:
+                    affectedPositions.incl(pos)
+            if chanPos in state.cdReadersOf:
+                for pos in state.cdReadersOf[chanPos]:
                     affectedPositions.incl(pos)
         for pos in affectedPositions.items:
             if pos == movedPosition: continue

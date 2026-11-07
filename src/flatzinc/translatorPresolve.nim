@@ -15,6 +15,9 @@ func psCeilDiv(a, b: int): int {.inline.} =
     if a >= 0: (a + b - 1) div b
     else: -((-a) div b)
 
+
+var presolveEmptyDom: seq[int]   # shared empty domain for cursor lookups
+
 proc initPresolveDomains(tr: FznTranslator): Table[string, seq[int]] =
     ## Build domain table from model variable declarations + already-fixed params.
     result = initTable[string, seq[int]]()
@@ -1076,7 +1079,7 @@ proc tryResolveReifBoolFromDomains(tr: FznTranslator,
         let xName = presolveVarName(con.args[0])
         if tr.presolveIsFixed(con.args[1], fixedVars):
             let val = tr.presolveResolve(con.args[1], fixedVars)
-            let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+            let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
             if xDom.len > 0:
                 if val notin xDom: return 1   # always not-equal
                 if xDom.len == 1 and xDom[0] == val: return 0  # always equal
@@ -1084,7 +1087,7 @@ proc tryResolveReifBoolFromDomains(tr: FznTranslator,
         let xName = presolveVarName(con.args[0])
         if tr.presolveIsFixed(con.args[1], fixedVars):
             let val = tr.presolveResolve(con.args[1], fixedVars)
-            let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+            let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
             if xDom.len > 0:
                 if val notin xDom: return 0
                 if xDom.len == 1 and xDom[0] == val: return 1
@@ -1202,7 +1205,7 @@ proc resolveReifications(tr: FznTranslator,
 
             if yFixed:
                 let val = tr.presolveResolve(con.args[1], fixedVars)
-                let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+                let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
 
                 if xDom.len > 0:
                     let valInDom = val in xDom
@@ -1228,10 +1231,11 @@ proc resolveReifications(tr: FznTranslator,
             # Two-variable case: int_eq_reif(x, y, b) where neither is fixed
             elif not yFixed and not bFixed:
                 let yName = presolveVarName(con.args[1])
-                let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
-                let yDom = if yName != "" and yName in domains: domains[yName] else: @[]
-                if xDom.len > 0 and yDom.len > 0:
-                    # Check if domains are disjoint
+                let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
+                let yDom {.cursor.} = if yName != "" and yName in domains: domains[yName] else: presolveEmptyDom
+                if xDom.len > 0 and yDom.len > 0 and xDom.len <= 4096 and yDom.len <= 4096:
+                    # Check if domains are disjoint (skipped for huge domains: building
+                    # the set per reification dominated presolve on long time horizons)
                     let xSet = xDom.toPackedSet()
                     var disjoint = true
                     for v in yDom:
@@ -1255,7 +1259,7 @@ proc resolveReifications(tr: FznTranslator,
             if tr.presolveIsFixed(con.args[1], fixedVars):
                 let val = tr.presolveResolve(con.args[1], fixedVars)
                 let xName = presolveVarName(con.args[0])
-                let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+                let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
                 if xDom.len > 0:
                     if val notin xDom and bName != "":
                         # val not in domain => ne is always true => b = 1
@@ -1386,7 +1390,7 @@ proc resolveReifications(tr: FznTranslator,
             # Only handle constant set argument
             if con.args[1].kind in {FznSetLit, FznRange}:
                 let setVals = extractSetValues(con.args[1])
-                let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+                let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
                 if xDom.len > 0 and bName != "":
                     let setPS = setVals.toPackedSet()
                     # Check if domain(x) is a subset of S
@@ -1443,8 +1447,8 @@ proc resolveReifications(tr: FznTranslator,
             let bName = presolveVarName(con.args[0])
             let xName = presolveVarName(con.args[1])
             # Propagate domain intersection in both directions
-            let bDom = if bName != "" and bName in domains: domains[bName] else: @[]
-            let xDom = if xName != "" and xName in domains: domains[xName] else: @[]
+            let bDom {.cursor.} = if bName != "" and bName in domains: domains[bName] else: presolveEmptyDom
+            let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
             if bDom.len > 0 and xName != "":
                 if presolveTightenDomain(domains, xName, bDom, infeasible):
                     result = true

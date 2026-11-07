@@ -1459,7 +1459,7 @@ proc tryMatchReifArcFamilies(tr: var FznTranslator, circuitCI: int,
         elif pos.len == 1 and neg.len == 1 and pos[0].kind == FznIdent and neg[0].kind == FznIdent:
             if neg[0].ident in eqLinkOf: (arc, body) = (eqLinkOf[neg[0].ident], pos[0].ident)
         if arc[0] < 0: continue
-        var parts = if body in andOf: andOf[body] else: @[body]
+        let parts = if body in andOf: andOf[body] else: @[body]
         var ok = true
         for b in parts:
             if b notin eqOf: ok = false
@@ -1613,17 +1613,17 @@ proc tryMatchReifArcFamilies(tr: var FznTranslator, circuitCI: int,
     for ci in consumed.items:
         for b in clauseBools[ci]: consumedUse.inc(b)
     # array_bool_and outputs' own args count as uses of their literals
+    var litInConsumedAnd: CountTable[string]
+    for a, lits in andOf.pairs:
+        if a in consumedUse:
+            for l in lits: litInConsumedAnd.inc(l)
     var allConsumed = consumed
     for b, cnt in consumedUse.pairs:
         # uses outside consumed clauses: total - consumed - its own definition (1)
         let defCI = if b in eqDefCI: eqDefCI[b] elif b in andDefCI: andDefCI[b]
                     elif b in reifDefCI: reifDefCI[b] else: -1
         if defCI < 0: continue
-        var extra = useCount.getOrDefault(b, 0) - cnt - 1
-        if b in andOf: discard
-        # literals of a consumed array_bool_and are used by that and
-        for a, lits in andOf.pairs:
-            if a in consumedUse and b in lits: extra -= 1
+        let extra = useCount.getOrDefault(b, 0) - cnt - 1 - litInConsumedAnd.getOrDefault(b, 0)
         if extra <= 0: allConsumed.incl(defCI)
 
     for f in accepted:

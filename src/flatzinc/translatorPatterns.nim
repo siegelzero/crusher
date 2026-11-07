@@ -2640,6 +2640,35 @@ proc findMinimizedVarNames*(tr: FznTranslator): HashSet[string] =
             if (objCoeff > 0 and coeffs[i] < 0) or (objCoeff < 0 and coeffs[i] > 0):
                 result.incl(v.ident)
         break
+    # Transitive: a minimized var defined as a positive combination
+    # (int_lin_eq defines_var(v), v = sum c_i x_i with c_i > 0) minimizes its terms.
+    var linEqDef: Table[string, int]   # defined var -> its defining int_lin_eq
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_lin_eq": continue
+        if not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+            linEqDef[ann.args[0].ident] = ci
+    var frontier = toSeq(result.items)
+    while frontier.len > 0:
+        let v = frontier.pop()
+        if v notin linEqDef: continue
+        block:
+            let con {.cursor.} = tr.model.constraints[linEqDef[v]]
+            let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+            let varElems = tr.resolveVarArrayElems(con.args[1])
+            if coeffs.len != varElems.len: continue
+            var vIdx = -1
+            for i, e in varElems:
+                if e.kind == FznIdent and e.ident == v: vIdx = i
+            if vIdx < 0: continue
+            for i, e in varElems:
+                if i == vIdx or e.kind != FznIdent: continue
+                # v*cv + x*ci = rhs  ->  x moves with v iff ci has the opposite sign of cv
+                if (coeffs[vIdx] > 0) != (coeffs[i] > 0) and e.ident notin result:
+                    result.incl(e.ident)
+                    frontier.add(e.ident)
 
 proc findForcedLargeVarNames*(tr: FznTranslator): HashSet[string] =
     ## Finds objective variables that the solver prefers to be LARGE.
@@ -2754,7 +2783,7 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
     # referencing a channelized variable lose effective penalty gradients.
     var ceilingNonConsumedRefs: Table[string, int]
     for ceilingName, infos in groups:
-        if infos.len < 3: continue
+        if infos.len < 3 and ceilingName notin minimizedVarNames: continue
         let consumedCIs = block:
             var s: PackedSet[int]
             for info in infos: s.incl(info.ci)
@@ -2779,7 +2808,12 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
     var totalConsumed = 0
     var skippedHeavyRef = 0
     for ceilingName, infos in groups:
-        if infos.len < 3: continue
+        # Small groups (e.g. tardiness >= end - due) only for minimized ceilings
+        # referenced by nothing but their objective-chain definition: projecting
+        # them to max(lb, sources) is then exact.
+        if infos.len < 3:
+            if ceilingName notin minimizedVarNames: continue
+            if ceilingNonConsumedRefs.getOrDefault(ceilingName, 0) > 1: continue
         if ceilingName in forcedLargeVarNames: continue
         if ceilingName in tr.definedVarNames: continue
         if ceilingName in tr.channelVarNames: continue
@@ -2794,7 +2828,7 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
             inc skippedHeavyRef
             continue
 
-        var def = MaxFromLinLeDef(ceilingVarName: ceilingName)
+        var def = MaxFromLinLeDef(ceilingVarName: ceilingName, withDomainLb: infos.len < 3)
         for info in infos:
             def.sourceVarNames.add(info.sourceVar)
             def.offsets.add(info.offset)
@@ -2830,6 +2864,13 @@ proc emitMaxFromLinLeChannels*(tr: var FznTranslator) =
                 inputExprs.add(srcExpr + def.offsets[i])
             else:
                 inputExprs.add(srcExpr)
+        if def.withDomainLb and tr.sys.baseArray.domain[ceilingPos].len > 0:
+            # ceiling = max(lb, sources): its declared lower bound (e.g. tardiness >= 0)
+            let lb = min(tr.sys.baseArray.domain[ceilingPos])
+            inputExprs.add(newAlgebraicExpression[int](
+                positions = initPackedSet[int](),
+                node = ExpressionNode[int](kind: LiteralNode, value: lb),
+                linear = true))
 
         tr.sys.baseArray.addMinMaxChannelBinding(ceilingPos, isMin = false, inputExprs)
         inc nEmitted

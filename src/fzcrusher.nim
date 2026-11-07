@@ -161,6 +161,28 @@ proc main() =
     if verbose:
       stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
       stderr.writeLine(&"[Mem] after translate: rss={currentRssBytes() div MiB}MiB")
+    if existsEnv("CRUSHER_DEBUG_BIGDOM"):
+      # Debug: positions with huge explicit domains (memory/time hogs)
+      var n = 0
+      for name, p in tr.varPositions.pairs:
+        let dl = tr.sys.baseArray.domain[p].len
+        if dl > 100_000:
+          inc n
+          if n <= 15:
+            stderr.writeLine("[BigDom] " & name & " pos=" & $p & " len=" & $dl &
+                             " channel=" & $(p in tr.sys.baseArray.channelPositions))
+      stderr.writeLine("[BigDom] total positions with >100k values: " & $n)
+    if existsEnv("CRUSHER_DEBUG_POS"):
+      # Debug: name and constraints of the given system positions
+      var want: seq[int]
+      for x in getEnv("CRUSHER_DEBUG_POS").split(','): want.add(parseInt(x))
+      for name, p in tr.varPositions.pairs:
+        if p in want:
+          var cs: seq[string]
+          for ci, c in tr.sys.baseArray.constraints:
+            if p in c.positions: cs.add($ci & ":" & $c.stateType & "/" & $c.positions.len)
+          stderr.writeLine("[DebugPos] pos=" & $p & " name=" & name & " channel=" &
+                           $(p in tr.sys.baseArray.channelPositions) & " constraints=" & cs.join(" "))
     if existsEnv("CRUSHER_DEBUG_VARS"):
       # Debug: where did these FZN variables end up, and which constraints read them?
       for vn in getEnv("CRUSHER_DEBUG_VARS").split(','):

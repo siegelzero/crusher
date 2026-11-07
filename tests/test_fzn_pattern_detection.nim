@@ -1449,7 +1449,24 @@ solve minimize objective;
         check "D" in tr.channelVarNames
 
     test "detectMaxFromLinLe: group too small (2 constraints) is not detected":
-        ## Need at least 3 int_lin_le constraints to qualify.
+        ## Need at least 3 int_lin_le constraints to qualify when the ceiling
+        ## is not minimized.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..50: D :: output_var;
+constraint int_lin_le([1,-1],[y1,D],-3);
+constraint int_lin_le([1,-1],[y2,D],-2);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+
+        check tr.maxFromLinLeDefs.len == 0
+
+    test "detectMaxFromLinLe: small group detected for minimized ceiling":
+        ## A minimized ceiling referenced only by its bounds is exactly
+        ## max(lb(D), sources), even with fewer than 3 constraints.
         let src = """
 var 1..20: y1 :: output_var;
 var 1..20: y2 :: output_var;
@@ -1463,7 +1480,9 @@ solve minimize objective;
         let model = parseFzn(src)
         var tr = translate(model)
 
-        check tr.maxFromLinLeDefs.len == 0
+        check tr.maxFromLinLeDefs.len == 1
+        check tr.maxFromLinLeDefs[0].withDomainLb
+        check "D" in tr.channelVarNames
 
     test "detectMaxFromLinLe: multi-component objective":
         ## objective = D + S where both D and S are minimized.
