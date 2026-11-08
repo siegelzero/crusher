@@ -19,6 +19,7 @@
 
 proc tryRegularLineMoves[T](state: TabuState[T], allowSideways: bool): bool =
     if state.regularConstraintIndices.len == 0: return false
+    inc state.regLineCalls
 
     const MAX_LINES = 4
     const INF = high(int) div 4

@@ -163,6 +163,7 @@ type
         # clock and sets trialAborted once past it, turning the rest of a
         # pathologically expensive best-move iteration into no-ops.
         trialAbortAt*: float
+        regLineCalls*, regLineApplied*: int
         trialAborted*: bool
         trialNeighborCalls*: int
 
@@ -5055,6 +5056,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
     echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s" &
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
+    if state.regLineCalls > 0:
+        echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -5418,6 +5421,9 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Regular line rewrites during stagnation: optimal re-solve of one DFA
         # line against the rest of the model (see tabuRegularMoves). Chain while
         # improving; sideways rewrites only in deeper stagnation.
+        # (Nonogram note, 2026-11: attempting rewrites every non-improving
+        # iteration with sideways after 10 did not change medium_05's ~15%
+        # solve rate at 60 s, and hard_01 plateaus at cost ~30 either way.)
         if state.regularConstraintIndices.len > 0 and
            state.iteration - lastImprovement >= 10 and
            (state.iteration - lastImprovement) mod 10 == 0 and
@@ -5427,6 +5433,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             while lineIters < 50 and not outOfBudget() and
                     state.tryRegularLineMoves(allowSideways = sideways and lineIters == 0):
                 inc lineIters
+                inc state.regLineApplied
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
                     state.bestCost = state.cost
