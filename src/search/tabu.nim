@@ -1,7 +1,7 @@
 import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os]
 from std/times import epochTime, cpuTime
 
-import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe]
+import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe, groupValueDisjoint, guardedCount]
 import ../constrainedArray
 import ../expressions/expressions
 
@@ -90,6 +90,13 @@ type
 
         bestAssignment*: seq[T]
         bestCost*: int
+        # Near-feasible tracking during an optimizer bound probe: the best state
+        # in which the objective-bound constraint was the ONLY violated one. Such
+        # a state is a feasible solution of the original problem (objective =
+        # target + violation), worth keeping when the probe misses its target.
+        boundConstraint*: StatefulConstraint[T]
+        nearBestCost*: int
+        nearBestAssignment*: seq[T]
 
         iteration*: int
         lastImprovementIter*: int  # Iteration of last bestCost improvement
@@ -150,6 +157,14 @@ type
         # GCC-preserving swap structures
         gccGroupPositions*: seq[seq[int]]  # search positions per GCC constraint (for GCC-preserving swaps)
         maxPermSwapEvals*: int  # adaptive budget for permutation swap evaluations
+        permSwapSlowTime*: float  # wall time spent in simulated (channel-propagating) swap evaluation
+        permSwapCalls*, permSwapThrottled*, permSwapApplied*: int
+        # Lean trial (tabuImprove): while > 0, updateNeighborPenalties checks the
+        # clock and sets trialAborted once past it, turning the rest of a
+        # pathologically expensive best-move iteration into no-ops.
+        trialAbortAt*: float
+        trialAborted*: bool
+        trialNeighborCalls*: int
 
         # Swap move structures for binary variables
         swapEnabled*: bool
@@ -476,6 +491,10 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
             result = constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
         of PseudoBoolLinLeType:
             result = constraint.pseudoBoolLinLeState.moveDelta(position, oldValue, newValue)
+        of GroupValueDisjointType:
+            result = constraint.groupValueDisjointState.moveDelta(position, oldValue, newValue)
+        of GuardedCountType:
+            result = constraint.guardedCountState.moveDelta(position, oldValue, newValue)
     when ProfileMoveDelta:
         let elapsed = cpuTime() - startT
         state.profileByType[constraint.stateType].calls += 1
@@ -618,6 +637,10 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             let p = constraint.atMostState.batchMovePenalty(
                 position, oldValue, domain)
             for i in 0..<dLen: penalties[i] += p[i]
+        elif constraint.stateType == GroupValueDisjointType:
+            let p = constraint.groupValueDisjointState.batchMovePenalty(
+                position, oldValue, domain)
+            for i in 0..<dLen: penalties[i] += p[i]
         else:
             for i in 0..<dLen:
                 if domain[i] != oldValue:
@@ -754,6 +777,12 @@ proc updatePenaltiesForPosition[T](state: TabuState[T], position: int) =
                 state.penaltyMap[position][i] += penalties[i]
         elif constraint.stateType == AtMostType:
             let penalties = constraint.atMostState.batchMovePenalty(
+                position, state.assignment[position], domain)
+            for i in 0..<dLen:
+                state.constraintPenalties[position][ci][i] = penalties[i]
+                state.penaltyMap[position][i] += penalties[i]
+        elif constraint.stateType == GroupValueDisjointType:
+            let penalties = constraint.groupValueDisjointState.batchMovePenalty(
                 position, state.assignment[position], domain)
             for i in 0..<dLen:
                 state.constraintPenalties[position][ci][i] = penalties[i]
@@ -908,6 +937,14 @@ proc updateConstraintAtPosition[T](state: TabuState[T], position: int, localIdx:
             let oldP = state.constraintPenalties[position][localIdx][i]
             state.penaltyMap[position][i] += newP - oldP
             state.constraintPenalties[position][localIdx][i] = newP
+    elif constraint.stateType == GroupValueDisjointType:
+        let penalties = constraint.groupValueDisjointState.batchMovePenalty(
+            position, state.assignment[position], domain)
+        for i in 0..<domain.len:
+            let newP = penalties[i]
+            let oldP = state.constraintPenalties[position][localIdx][i]
+            state.penaltyMap[position][i] += newP - oldP
+            state.constraintPenalties[position][localIdx][i] = newP
     else:
         for i in 0..<domain.len:
             let value = domain[i]
@@ -942,6 +979,15 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
     ## Only recomputes the specific constraint(s) that changed at each neighbor,
     ## not all constraints at that position.
     ## Uses precomputed search-only positions to skip channels efficiently.
+
+    if state.trialAbortAt > 0.0:
+        if state.trialAborted: return
+        inc state.trialNeighborCalls
+        # Checked on every call: one call can itself run for a long time on a
+        # cascade-heavy model, so a sampled check would overrun by that factor.
+        if epochTime() > state.trialAbortAt:
+            state.trialAborted = true
+            return
 
     for constraint in state.constraintsAtPosition[position]:
         when ProfileIteration:
@@ -1076,7 +1122,13 @@ proc updateNeighborPenalties*[T](state: TabuState[T], position: int) =
                 state.neighborTimeByType[constraint.stateType] += epochTime() - tNeighC
             continue  # Done with this constraint via broadcast
 
-        # Standard path
+        # Standard path. An empty affected set means no neighbor's cached
+        # delta changed (every getAffectedPositions returns the full position
+        # set when it cannot narrow), so skip the O(|searchPos|) scan outright:
+        # with k value-indexed constraints spanning all n positions (GCC counts
+        # decomposed into k AtMost), the scan alone was k*n set probes per move.
+        if affectedPositions.len == 0:
+            continue
         for pos in searchPos.items:
             if pos == position:
                 continue
@@ -1568,6 +1620,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
 
     for constraint in carray.constraints:
         state.constraints.add(constraint)
+        if constraint.isObjectiveBound:
+            state.boundConstraint = constraint
+    state.nearBestCost = high(int)
 
     # Auto-detect graduated equality: if the system has inequality constraints
     # (which use graduated penalties), enable graduated penalty on EqualTo
@@ -2276,6 +2331,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if rc.relation notin {LessThanEq, GreaterThanEq, LessThan, GreaterThan}: continue
             # Compute max |leftDelta - rightDelta| for any single position flip
             var maxDelta: T = 0
+            var posDeltas: seq[T]   # per-position max deltas (bound-scale calibration)
             for pos in rc.positions.items:
                 let domain {.cursor.} = state.sharedDomain[][pos]
                 if domain.len < 2: continue
@@ -2306,9 +2362,32 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 let posMaxDelta = netCoeff * dRange
                 if posMaxDelta > maxDelta:
                     maxDelta = posMaxDelta
+                if constraint.isObjectiveBound and posMaxDelta > 0:
+                    posDeltas.add(posMaxDelta)
             if maxDelta > 0 and maxDelta < high(T) div 2:
                 rc.maxNetDelta = int(maxDelta)
                 inc nComputed
+            # Objective-bound probe constraint: its raw penalty is in objective
+            # units, so a search that counts hard violations as 1 each trades
+            # capacity/incompatibility violations for objective gains and never
+            # returns to feasibility. Scale it so one unit is a fraction of the
+            # typical single-move objective change (median per-position max delta).
+            if constraint.isObjectiveBound and posDeltas.len > 0:
+                # CRUSHER_BOUND_SCALE_PCT: percent of the median (0 disables, "max" = maxNetDelta).
+                let pctStr = getEnv("CRUSHER_BOUND_SCALE_PCT", "100")
+                posDeltas.sort()
+                let median = int(posDeltas[posDeltas.len div 2])
+                var scale = 1
+                if pctStr == "max":
+                    scale = int(maxDelta)
+                else:
+                    let pct = try: parseInt(pctStr) except ValueError: 100
+                    if pct > 0: scale = max(1, median * pct div 100)
+                if scale > 1:
+                    rc.costScale = scale
+                    rc.cost = rc.computeCost(rc.leftValue, rc.rightValue)
+                    if verbose and id == 0:
+                        echo &"[Init] Objective-bound penalty scale: {scale} (median single-move delta {median}, max {maxDelta}, setting {pctStr})"
         if nComputed > 0 and verbose and id == 0:
             echo "[Init] Computed maxNetDelta for " & $nComputed & " inequality constraints"
 
@@ -3686,8 +3765,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             if groupPositions.len >= 2 and domainUnion.len == groupPositions.len:
                 state.gccGroupPositions.add(groupPositions)
     # Build sharedConstraints for all position pairs within GCC/permutation groups
-    # so that swapDelta can compute accurate joint deltas.
-    if state.gccGroupPositions.len > 0:
+    # so that swapDelta can compute accurate joint deltas. The table holds one
+    # entry per pair: a single 5000-position group is 12.5M entries (gigabytes
+    # per worker), so cap it; swapDelta falls back to independent deltas for
+    # pairs it does not find, and the GCC swap path uses exactSwapDelta anyway.
+    const MaxGccSharedPairs = 300_000
+    var gccPairTotal = 0
+    for group in state.gccGroupPositions:
+        gccPairTotal += group.len * (group.len - 1) div 2
+    if state.gccGroupPositions.len > 0 and gccPairTotal > MaxGccSharedPairs:
+        if verbose and id == 0:
+            echo "[Init] GCC swap groups: " & $state.gccGroupPositions.len & " groups, " &
+                $gccPairTotal & " pairs exceed shared-constraint table cap; pair table skipped"
+    if state.gccGroupPositions.len > 0 and gccPairTotal <= MaxGccSharedPairs:
         var groupPosSet = initPackedSet[int]()
         for group in state.gccGroupPositions:
             for pos in group:
@@ -4710,6 +4800,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
         let (permMoves, permCost) = state.bestPermutationSwapMoves()
         if permMoves.len > 0 and permCost < state.cost + bestDelta:
             # Apply swap
+            inc state.permSwapApplied
             let (pp1, pp2, pnv1, pnv2) = sample(permMoves)
             let pov1 = state.assignment[pp1]
             let pov2 = state.assignment[pp2]
@@ -4778,6 +4869,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
 
     # Find overall best among single, swap, permutation swap, and partition moves
     if permMoves.len > 0 and permCost <= swapCost and permCost <= partCost and permCost < singleCost:
+        inc state.permSwapApplied
         # Apply permutation swap move
         let (pp1, pp2, pNewVal1, pNewVal2) = sample(permMoves)
         let pOldVal1 = state.assignment[pp1]
@@ -4963,6 +5055,11 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     let rate = if elapsed > 0: state.iteration.float / elapsed else: 0.0
     echo &"[Tabu S{state.id}] {label}: best={state.bestCost} iters={state.iteration} elapsed={elapsed:.1f}s rate={rate:.0f}/s" &
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
+    if state.permSwapCalls > 0:
+        let fastOk = fastSwapEvalOk(state)
+        echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
+             &"calls={state.permSwapCalls} throttled={state.permSwapThrottled} applied={state.permSwapApplied} " &
+             &"slowTime={state.permSwapSlowTime:.2f}s ({state.permSwapSlowTime/max(elapsed,0.001)*100:.0f}%)"
     if state.id == 0 and state.bestCost > 0 and (label == "Exhausted" or gDebugViolations):
         state.logViolatedBreakdown()
     when ProfileIteration:
@@ -5138,10 +5235,41 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             state.neighborTimeByType[ct] = 0
 
     # Use lean first-improvement when cascades are large (penalty map rebuild dominates)
-    let useLeanSearch = state.hasChannelDeps and
+    if state.verbose and state.boundConstraint != nil:
+        echo &"[Tabu S{state.id}] Tracking objective-bound constraint for near-feasible states"
+    var useLeanSearch = state.hasChannelDeps and
         state.searchPositions.len >= 30 and
         state.channelDepSearchPositions.len > 0 and
-        state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5
+        state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5 and
+        not existsEnv("CRUSHER_NO_LEAN")   # diagnostic: force the penalty-map path
+
+    # The static gate above only says that channel-dep positions dominate; it
+    # does not say which regime is faster. Lean first-improvement re-runs the
+    # channel cascade for every domain value of every position it visits,
+    # best-move maintains the penalty map incrementally through the affected
+    # sets. Measured: work-task-variation needs lean (best-move never finishes
+    # a probe), warehouse needs best-move (lean runs at 64 it/s vs 787 it/s and
+    # reaches a 40% worse objective). So when the gate fires, trial both for a
+    # short slice and keep the one with the higher cost decrease per second.
+    # Lean goes first: its iteration cost is bounded (one cascade pass per
+    # visited position). A best-move iteration on a cascade-heavy model can run
+    # for tens of seconds (work-task-variation: neighbour-penalty updates over
+    # every changed channel), so its trial slice is abortable from inside
+    # updateNeighborPenalties (trialAbortAt) and an abort counts as a loss.
+    var trialPhase = 0   # 0 none, 1 measuring lean, 2 measuring best-move, 3 decided
+    var trialStartT = 0.0
+    var trialStartIter = 0
+    var trialStartCost = 0
+    var trialProgress: array[2, float]   # cost units per second: [lean, best-move]
+    var trialRate: array[2, float]       # iterations per second
+    const TrialSeconds = 0.25
+    const TrialIters = 200
+    const TrialAbortFactor = 4.0         # best-move slice may take at most this times TrialSeconds
+    if useLeanSearch and not existsEnv("CRUSHER_NO_LEAN_TRIAL"):
+        trialPhase = 1
+        trialStartT = epochTime()
+        trialStartIter = state.iteration
+        trialStartCost = state.cost
 
     state.leanSearch = useLeanSearch and not existsEnv("CRUSHER_NO_LEAN_COMMIT")
     if state.verbose:
@@ -5149,6 +5277,24 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             (if useLeanSearch: " (lean first-improvement)" else: "")
 
     while state.iteration - lastImprovement < threshold:
+        # Near-feasible incumbent: only the optimizer's bound constraint violated.
+        # Tracked by the RAW (unscaled) bound violation, i.e. in objective units,
+        # so that objective progress too small to register in the scaled cost
+        # still counts as search progress (resets the stagnation counter).
+        if state.boundConstraint != nil and state.cost > 0 and
+           state.cost == state.boundConstraint.penalty():
+            var raw = state.cost
+            if state.boundConstraint.stateType == RelationalType:
+                let rc = state.boundConstraint.relationalState
+                raw = case rc.relation
+                    of LessThanEq, LessThan: int(rc.leftValue - rc.rightValue)
+                    of GreaterThanEq, GreaterThan: int(rc.rightValue - rc.leftValue)
+                    else: state.cost
+                raw = max(raw, 1)
+            if raw < state.nearBestCost:
+                state.nearBestCost = raw
+                state.nearBestAssignment = state.assignment
+                lastImprovement = state.iteration
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
             if state.verbose:
@@ -5173,6 +5319,54 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
             (shouldStop != nil and shouldStop[].load()) or
             (deadline > 0 and epochTime() > deadline)
 
+        if trialPhase == 1 or trialPhase == 2:
+            let elapsed = epochTime() - trialStartT
+            let iters = state.iteration - trialStartIter
+            if state.trialAborted or
+               (iters > 0 and (elapsed >= TrialSeconds or iters >= TrialIters)):
+                let k = trialPhase - 1
+                trialProgress[k] = float(trialStartCost - state.cost) / max(elapsed, 1e-6)
+                trialRate[k] = float(iters) / max(elapsed, 1e-6)
+                if trialPhase == 1:
+                    trialPhase = 2
+                    useLeanSearch = false
+                    state.leanSearch = false
+                    # Lean moves left the penalty structures stale.
+                    for pos in state.channelDepSearchPositions:
+                        if not state.isLazy[pos]:
+                            state.computeChannelDepPenaltiesAt(pos)
+                    state.rebuildPenaltyMap()
+                    trialStartT = epochTime()
+                    trialStartIter = state.iteration
+                    trialStartCost = state.cost
+                    state.trialAborted = false
+                    state.trialNeighborCalls = 0
+                    state.trialAbortAt = trialStartT + TrialAbortFactor * TrialSeconds
+                else:
+                    trialPhase = 3
+                    let aborted = state.trialAborted
+                    state.trialAbortAt = 0.0
+                    state.trialAborted = false
+                    # Progress decides when either mode made any; otherwise
+                    # (both stuck at a local minimum) the faster iterator.
+                    let leanWins = aborted or
+                        (if max(trialProgress[0], trialProgress[1]) > 0.0:
+                            trialProgress[0] >= trialProgress[1]
+                         else:
+                            trialRate[0] >= trialRate[1])
+                    if state.verbose:
+                        echo &"[Tabu S{state.id}] Lean trial: lean {trialProgress[0]:.0f} cost/s ({trialRate[0]:.0f} it/s), " &
+                             &"best-move {trialProgress[1]:.0f} cost/s ({trialRate[1]:.0f} it/s)" &
+                             (if aborted: &" [aborted after {state.trialNeighborCalls} neighbour updates in {elapsed:.1f}s]" else: "") &
+                             " -> " & (if leanWins: "lean first-improvement" else: "best-move")
+                    if leanWins:
+                        useLeanSearch = true
+                        state.leanSearch = not existsEnv("CRUSHER_NO_LEAN_COMMIT")
+                    else:
+                        # Aborted neighbour updates never happened here (no abort), so
+                        # the penalty structures are fresh; keep best-move.
+                        useLeanSearch = false
+                        state.leanSearch = false
         if useLeanSearch:
             state.applyFirstImprovingMove()
         else:

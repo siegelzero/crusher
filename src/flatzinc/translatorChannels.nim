@@ -3840,6 +3840,14 @@ proc detectGccCountChannels(tr: var FznTranslator) =
         for pos in inputPositions:
             inputExprs.add(tr.getExpr(pos))
 
+        # Bound constraints absorbed into the count domains (cnt <= limit). Channel
+        # positions don't enforce domains during search, so they need explicit
+        # constraints. Collected first: many bounded values become ONE bounded
+        # GCC rather than k AtMost/AtLeast constraints each spanning every input
+        # position (warehouse: 66 AtMost x 1936 positions put 66 constraints on
+        # every position, dominating neighbour evaluation).
+        var boundedVals: seq[int]
+        var boundedLo, boundedHi: seq[int]
         for i, cname in countNames:
             let countPos = tr.varPositions[cname]
             # Count how many constant elements match this cover value
@@ -3849,20 +3857,45 @@ proc detectGccCountChannels(tr: var FznTranslator) =
             tr.sys.baseArray.addCountEqChannelBinding(countPos, cover[i], inputPositions, constOffset)
             tr.channelVarNames.incl(cname)
 
-            # MiniZinc may have absorbed bound constraints (cnt <= limit) into the
-            # variable domain. Since channel positions don't enforce domains during
-            # search, we must add explicit atMost/atLeast constraints.
             let dom = tr.sys.baseArray.domain[countPos]
             if dom.len > 0:
                 let domMin = dom[0]
                 let domMax = dom[^1]
                 let effectiveMax = totalElements - constOffset  # max possible from variable positions
-                if domMax < effectiveMax:
-                    tr.sys.addConstraint(atMost[int](inputExprs, cover[i], domMax - constOffset))
-                if domMin > constOffset:
-                    tr.sys.addConstraint(atLeast[int](inputExprs, cover[i], domMin - constOffset))
+                if domMax < effectiveMax or domMin > constOffset:
+                    boundedVals.add(cover[i])
+                    boundedLo.add(max(0, domMin - constOffset))
+                    boundedHi.add(min(effectiveMax, domMax - constOffset))
 
             inc totalChannels
+
+        const MinBoundedGccValues = 4
+        if boundedVals.len >= MinBoundedGccValues:
+            # One bounded GCC over the variable positions. Values outside the
+            # FZN cover must stay free: GCC penalises any value it does not
+            # cover, so every domain value of the inputs is covered, unbounded
+            # ones with [0, n].
+            var boundOf: Table[int, (int, int)]
+            for k, v in boundedVals: boundOf[v] = (boundedLo[k], boundedHi[k])
+            var allVals = initPackedSet[int]()
+            for pos in inputPositions:
+                for v in tr.sys.baseArray.domain[pos]: allVals.incl(v)
+            for v in boundedVals: allVals.incl(v)
+            var gCover, gLo, gHi: seq[int]
+            for v in allVals.items:
+                gCover.add(v)
+                if v in boundOf:
+                    gLo.add(boundOf[v][0]); gHi.add(boundOf[v][1])
+                else:
+                    gLo.add(0); gHi.add(inputPositions.len)
+            tr.sys.addConstraint(globalCardinalityBounded[int](inputPositions, gCover, gLo, gHi))
+            stderr.writeLine(&"[FZN] GCC count channels: {boundedVals.len} bounded counts -> one bounded GCC over {inputPositions.len} positions ({gCover.len} values)")
+        else:
+            for k, v in boundedVals:
+                if boundedHi[k] < inputPositions.len:
+                    tr.sys.addConstraint(atMost[int](inputExprs, v, boundedHi[k]))
+                if boundedLo[k] > 0:
+                    tr.sys.addConstraint(atLeast[int](inputExprs, v, boundedLo[k]))
 
         tr.definingConstraints.incl(ci)  # GCC is consumed — counts are channels now
 

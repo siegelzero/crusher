@@ -1,7 +1,7 @@
 import std/[packedsets, tables]
 import constraintNode, algebraic
 # Import all constraint state types
-import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe
+import allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, pseudoBoolLinLe, groupValueDisjoint, guardedCount
 
 ################################################################################
 # Shared constraint type definitions
@@ -51,7 +51,9 @@ type
         ReservoirType,
         SetIntersectCardType,
         ConjunctSumAtMostType,
-        PseudoBoolLinLeType
+        PseudoBoolLinLeType,
+        GroupValueDisjointType,
+        GuardedCountType
 
     # StatefulAlgebraicConstraint definition
     StatefulAlgebraicConstraint*[T] = ref object
@@ -83,6 +85,7 @@ type
 
     StatefulConstraint*[T] = ref object
         positions*: PackedSet[int]
+        isObjectiveBound*: bool   # the optimizer's `objective <= target` probe constraint
         case stateType*: StatefulConstraintType
             of AllDifferentType:
                 allDifferentState*: AllDifferentConstraint[T]
@@ -170,3 +173,7 @@ type
                 conjunctSumAtMostState*: ConjunctSumAtMostConstraint[T]
             of PseudoBoolLinLeType:
                 pseudoBoolLinLeState*: PseudoBoolLinLeConstraint[T]
+            of GroupValueDisjointType:
+                groupValueDisjointState*: GroupValueDisjointConstraint[T]
+            of GuardedCountType:
+                guardedCountState*: GuardedCountConstraint[T]

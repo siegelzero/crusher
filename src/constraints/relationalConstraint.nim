@@ -8,6 +8,8 @@ import constraintNode
 # RelationalConstraint - Unified constraint for expression relations
 ################################################################################
 
+const BoundScaleWindow* = 8  ## objective-bound violations within this many median moves of the target stay exact
+
 type
     ExprTerm*[T] = object
         node*: ExpressionNode[T]
@@ -34,6 +36,11 @@ type
         # (true). Stored as a flag so the hot updatePosition path never
         # allocates or copies a PackedSet.
         lastAffectsAll*: bool
+        # Penalty divisor (0/1 = none). Set on the optimizer's objective-bound
+        # probe constraint so one unit of its violation is comparable to one
+        # unit of hard-constraint violation instead of one objective unit
+        # (ceil division keeps every violated state at cost >= 1).
+        costScale*: int
         lastOldLeftValue*: T
         lastOldRightValue*: T
         # Max |leftDelta - rightDelta| from any single position change.
@@ -61,10 +68,22 @@ func computeCost*[T](c: RelationalConstraint[T], left, right: T): int {.inline.}
     ## overflowChecks off: during intermediate search states (channel propagation
     ## after partial moves), expression values can overflow int64. The subtraction
     ## and abs must not crash — a wrapped result is acceptable for transient states.
+    var raw: int
     if c.graduated and c.relation == EqualTo:
-        return int(abs(left - right))
+        raw = int(abs(left - right))
     else:
-        return int(c.relation.penalty(left, right))
+        raw = int(c.relation.penalty(left, right))
+    if c.costScale > 1 and raw > BoundScaleWindow * c.costScale:
+        # Objective-bound constraints (optimizer probes): far from the target the
+        # violation is compressed to single-move units so that it cannot dwarf
+        # the constraint violations (warehouse: 30k objective units vs cost-1
+        # violations, the search traded feasibility for objective). Within a
+        # window of BoundScaleWindow median moves the raw violation is kept:
+        # compressing there flattens the last steps to the target (nfc: 792
+        # instead of 784, the exact optimum).
+        let knee = BoundScaleWindow * c.costScale
+        raw = knee + (raw - knee + c.costScale - 1) div c.costScale
+    return raw
 {.pop.}
 
 # Create a new RelationalConstraint with Expression wrappers

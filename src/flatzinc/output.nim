@@ -23,6 +23,23 @@ proc reconstructSet(tr: FznTranslator, info: SetVarInfo): seq[int] =
     if tr.sys.assignment[info.positions[idx]] != 0:
       result.add(info.lo + idx)
 
+proc derivedSetValues(tr: FznTranslator, def: DerivedSetDef): seq[int] =
+  ## Value of a set eliminated by monotone set elimination: the union of its
+  ## generator variables' values plus constant members.
+  var vals: HashSet[int]
+  for v in def.constVals: vals.incl(v)
+  for x in def.xVarNames:
+    if x in tr.varPositions:
+      vals.incl(tr.sys.assignment[tr.varPositions[x]])
+  result = toSeq(vals)
+  result.sort()
+
+proc setVarValues(tr: FznTranslator, name: string): seq[int] =
+  ## Current value of a set variable, derived or boolean-decomposed.
+  if name in tr.derivedSetDefs:
+    return tr.derivedSetValues(tr.derivedSetDefs[name])
+  tr.reconstructSet(tr.setVarBoolPositions[name])
+
 proc lookupVarValue(tr: FznTranslator, varName: string): tuple[ok: bool, val: int] =
   ## Finds the current value of a named variable: real position, defining
   ## expression, or singleton parameter. Returns ok=false if none of those
@@ -73,8 +90,7 @@ proc formatSolution*(tr: FznTranslator): string =
   # Output single set variables
   for name in tr.outputSetVars:
     if name in tr.setVarBoolPositions:
-      let info = tr.setVarBoolPositions[name]
-      let values = tr.reconstructSet(info)
+      let values = tr.setVarValues(name)
       lines.add(&"{name} = {formatSet(values)};")
 
   # Output single variables
@@ -108,8 +124,7 @@ proc formatSolution*(tr: FznTranslator): string =
         if elem.isConstant:
           vals[i] = formatSet(elem.constantValues)
         elif elem.varName in tr.setVarBoolPositions:
-          let info = tr.setVarBoolPositions[elem.varName]
-          vals[i] = formatSet(tr.reconstructSet(info))
+          vals[i] = formatSet(tr.setVarValues(elem.varName))
         else:
           vals[i] = "{}"
       # Find output_array annotation for index range

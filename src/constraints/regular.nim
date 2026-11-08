@@ -19,6 +19,7 @@
 ## DFAs too large for the DP tables.
 
 import std/[packedsets, tables]
+import packedSetAssign
 
 ################################################################################
 # Type definitions
@@ -255,7 +256,7 @@ proc initialize*[T](state: RegularConstraint[T], assignment: seq[T]) =
 
     if state.useHamming:
         state.hInitialize()
-        state.lastChangeAffectedPositions = state.positions
+        state.lastChangeAffectedPositions.assignSet(state.positions)
         state.lastChangeAffectedCost = true
         return
 
@@ -279,7 +280,7 @@ proc initialize*[T](state: RegularConstraint[T], assignment: seq[T]) =
         state.cost += 1
 
     # Mark all positions as affected on init
-    state.lastChangeAffectedPositions = state.positions
+    state.lastChangeAffectedPositions.assignSet(state.positions)
     state.lastChangeAffectedCost = true
 
 
@@ -301,7 +302,7 @@ proc updatePosition*[T](state: RegularConstraint[T], position: int, newValue: T)
         state.lastChangeAffectedCost = newCost != state.cost
         state.cost = newCost
         # Every position's move delta depends on the whole line's DP tables.
-        state.lastChangeAffectedPositions = state.positions
+        state.lastChangeAffectedPositions.assignSet(state.positions)
         return
 
     # Re-run DFA with recovery from the changed position forward

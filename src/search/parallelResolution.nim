@@ -15,6 +15,8 @@ type
         workerId*: int
         iterations*: int
         lastImprovement*: int  # Iteration of last bestCost improvement
+        nearCost*: int           # best bound-only violation seen (high(int) if none)
+        nearAssignment*: seq[T]
         startTime*: float
         endTime*: float
         taskIndex*: int  # Index into carrays for eager slot freeing
@@ -118,6 +120,8 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
                 workerId: data.workerId,
                 iterations: improved.iteration,
                 lastImprovement: improved.lastImprovementIter,
+                nearCost: improved.nearBestCost,
+                nearAssignment: improved.nearBestAssignment,
                 startTime: startTime,
                 endTime: endTime
             )
@@ -159,6 +163,8 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                     workerId: 0,
                     iterations: improved.iteration,
                     lastImprovement: improved.lastImprovementIter,
+                    nearCost: improved.nearBestCost,
+                    nearAssignment: improved.nearBestAssignment,
                     startTime: startTime,
                     endTime: endTime
                 )
@@ -306,6 +312,8 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
                 workerId: data.workerId,
                 iterations: improved.iteration,
                 lastImprovement: improved.lastImprovementIter,
+                nearCost: improved.nearBestCost,
+                nearAssignment: improved.nearBestAssignment,
                 startTime: startTime,
                 endTime: endTime,
                 taskIndex: idx
@@ -350,6 +358,8 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                     workerId: 0,
                     iterations: improved.iteration,
                     lastImprovement: improved.lastImprovementIter,
+                    nearCost: improved.nearBestCost,
+                    nearAssignment: improved.nearBestAssignment,
                     startTime: startTime,
                     endTime: endTime
                 )
@@ -581,6 +591,9 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
             assignment: result.assignment,
             cost: result.cost
         ))
+        if result.nearAssignment.len > 0 and result.nearCost < system.nearFeasibleCost:
+            system.nearFeasibleCost = result.nearCost
+            system.nearFeasibleAssignment = result.nearAssignment
 
     # Set adapted threshold based on observed search depth
     if maxLastImp > 0:
@@ -598,7 +611,8 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
 
     if verbose:
         let bestCost = if allResults.len > 0: allResults[0].cost else: -1
-        stderr.writeLine &"[Solve] Initial parallel search failed: best cost={bestCost}"
+        stderr.writeLine &"[Solve] Initial parallel search failed: best cost={bestCost}" &
+            (if system.nearFeasibleAssignment.len > 0: &" (near-feasible bound violation={system.nearFeasibleCost})" else: " (no near-feasible state)")
         stderr.flushFile()
 
     return false

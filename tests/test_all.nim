@@ -6,6 +6,7 @@ import test_binary_pairwise_sum
 import test_argmax_channels
 import test_atleast
 import test_atmost
+import test_group_value_disjoint
 import test_conjunct_sum_at_most
 import test_bool_equiv_gated_channels
 import test_bool_iff_or_channels

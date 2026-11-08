@@ -101,7 +101,10 @@ proc fastSwapEvalOk[T](state: TabuState[T]): bool {.inline.} =
     ## exactly by per-constraint decomposition: no channel bindings, inverse
     ## groups, or circuit-time writebacks through which the change could
     ## propagate beyond the constraints at the two positions.
-    not state.anyChannels and not state.inverseEnabled and
+    ## Channels that no constraint reads (hasChannelDeps false: no constraint
+    ## has a channel position, or all channel-dep deltas are tautological)
+    ## cannot carry cost, so their presence does not block the decomposition.
+    not state.hasChannelDeps and not state.inverseEnabled and
         state.circuitTimePropConstraints.len == 0
 
 proc exactSwapDelta[T](state: TabuState[T], p1, p2: int, newVal1, newVal2: T): int =
@@ -469,11 +472,31 @@ proc bestPermutationSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], i
     if state.gccGroupPositions.len == 0:
         return (@[], high(int))
 
-    let maxEvals = if state.maxPermSwapEvals > 0: state.maxPermSwapEvals else: 500
+    let fastEval = state.fastSwapEvalOk
+    var maxEvals = if state.maxPermSwapEvals > 0: state.maxPermSwapEvals else: 500
+    var tSlow = 0.0
+    inc state.permSwapCalls
+    if not fastEval:
+        # Simulated evaluation costs four assignValueLean calls per pair, each
+        # propagating channels. On large groups with deep cascades (warehouse:
+        # thousands of positions, 2000-pair budget) that was most of the
+        # iteration time; on small groups (work-task-variation: 32 groups of
+        # ~12) it is cheap and the swaps are what reach feasibility. Regulate
+        # by measured share: once simulated swap evaluation has consumed more
+        # than half of the search's wall time, sample sparsely until it falls
+        # back below that share.
+        let elapsed = epochTime() - state.startTime
+        if state.permSwapSlowTime > 0.5 * elapsed:
+            if state.iteration mod 4 != 0:
+                inc state.permSwapThrottled
+                return (@[], high(int))
+            maxEvals = min(maxEvals, 128)
+        tSlow = epochTime()
+    defer:
+        if tSlow > 0.0: state.permSwapSlowTime += epochTime() - tSlow
     var bestCost = high(int)
     var moves: seq[(int, int, T, T)] = @[]
     var evalsCount = 0
-    let fastEval = state.fastSwapEvalOk
 
     for group in state.gccGroupPositions:
         for i in 0..<group.len:

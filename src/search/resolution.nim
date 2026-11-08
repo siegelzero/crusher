@@ -114,6 +114,9 @@ proc resolve*[T](system: ConstraintSystem[T],
         raise newException(NoSolutionFoundError, "Can't find satisfying solution with parallel search")
     else:
         var improved = system.baseArray.tabuImprove(tabuThreshold, verbose, deadline = deadline)
+        if improved.nearBestAssignment.len > 0 and improved.nearBestCost < system.nearFeasibleCost:
+            system.nearFeasibleCost = improved.nearBestCost
+            system.nearFeasibleAssignment = improved.nearBestAssignment
         if improved.bestCost == 0:
             system.initialize(improved.bestAssignment)
             system.lastIterations = improved.iteration

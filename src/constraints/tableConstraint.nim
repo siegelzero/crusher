@@ -7,6 +7,7 @@
 ## **tableNotIn penalty**: 1 if exact match with any forbidden tuple, else 0
 
 import std/[packedsets, tables]
+import packedSetAssign
 
 const MinTransitionTableSize* = 50
   ## Tables with fewer tuples than this are considered partial (e.g., from
@@ -225,7 +226,7 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
 
         # Track affected positions for getAffectedPositions
         if state.cost != oldCost:
-            state.lastAffectedPositions = state.positions
+            state.lastAffectedPositions.assignSet(state.positions)
         else:
             state.lastAffectedPositions = initPackedSet[int]()
             for col in dirtyColumns:
@@ -246,7 +247,7 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
         let oldCost = state.cost
         state.cost = if state.zeroCount > 0: 1 else: 0
         if state.cost != oldCost:
-            state.lastAffectedPositions = state.positions
+            state.lastAffectedPositions.assignSet(state.positions)
         else:
             state.lastAffectedPositions = initPackedSet[int]()
 

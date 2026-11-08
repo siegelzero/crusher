@@ -276,6 +276,44 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var hiProven = false
             let domainHiBound = if upperBound != high(int): upperBound else: high(int)
 
+        # A probe state where only the objective-bound constraint is violated
+        # is a feasible solution of the original problem (TabuState tracks the
+        # best such state as nearBest*, collected into system.nearFeasible*).
+        # Adopt it when it beats the incumbent instead of throwing the probe
+        # away — whether the probe stagnated or ran out of time (warehouse: a
+        # 102k incumbent kept while the timed-out probe held an 88k state).
+        template adoptNearFeasible(): bool =
+            var adopted = false
+            if system.nearFeasibleAssignment.len > 0:
+                system.initialize(system.nearFeasibleAssignment)
+                objective.initialize(system.assignment)
+                let nearObj = objective.value
+                var feasible = true
+                for c in system.baseArray.constraints:
+                    if not c.isObjectiveBound and c.penalty() > 0:
+                        feasible = false
+                        break
+                when direction == Minimize:
+                    let better = nearObj < currentCost and
+                        (lowerBound == low(int) or nearObj >= domainLoBound)
+                else:
+                    let better = nearObj > currentCost and
+                        (upperBound == high(int) or nearObj <= domainHiBound)
+                if verbose:
+                    echo "[Opt] Near-feasible probe state: objective=", nearObj, " feasible=", feasible,
+                         " incumbent=", currentCost, " (raw bound violation ", system.nearFeasibleCost, ")"
+                    flushFile(stdout)
+                if feasible and better:
+                    currentCost = nearObj
+                    system.bestAssignmentValid = false
+                    system.bestFeasibleAssignment = system.assignment
+                    system.bestAssignmentValid = true
+                    if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+                    echo "[Opt] Improved (near-feasible probe state): ", nearObj
+                    flushFile(stdout)
+                    adopted = true
+            adopted
+
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:
             echo "[Opt] Binary search [", lo, "..", hi, "]"
@@ -306,10 +344,15 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 # only duplicates the pressure at much higher per-move cost.
                 if not system.circuitTimeObjectiveExact:
                     system.addConstraint(objective <= target)
+                    system.baseArray.constraints[^1].isObjectiveBound = true
                     hasBoundConstraint = true
             else:
                 system.addConstraint(objective >= target)
+                system.baseArray.constraints[^1].isObjectiveBound = true
                 hasBoundConstraint = true
+            # Reset near-feasible tracking for this probe (see TabuState.boundConstraint)
+            system.nearFeasibleCost = high(int)
+            system.nearFeasibleAssignment = @[]
             # Set objective bound on CircuitTimeProp constraints (if any)
             system.applyCircuitTimeObjectiveBounds(target, direction == Minimize)
             system.baseArray.reducedDomain = baseReducedDomain
@@ -385,8 +428,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 else:
                     lo = currentCost + 1
             except TimeLimitExceededError:
-                system.initialize(bestSolution)
-                objective.initialize(system.assignment)
+                if not adoptNearFeasible():
+                    system.initialize(bestSolution)
+                    objective.initialize(system.assignment)
                 system.searchCompleted = false
                 break
             except InfeasibleError:
@@ -400,6 +444,16 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     hi = target - 1
                     hiProven = true
             except NoSolutionFoundError:
+                # The probe missed its target, but a state where only the bound
+                # constraint was violated is a feasible solution of the original
+                # problem; keep it when it beats the incumbent instead of throwing
+                # the whole probe away (warehouse: 102k incumbent, probe reached 56k).
+                if adoptNearFeasible():
+                    when direction == Minimize:
+                        hi = currentCost - 1
+                    else:
+                        lo = currentCost + 1
+                    continue
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)
                 # If staging fixed gated blocks at this target (i.e. the target forced
@@ -471,10 +525,14 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     # linkage replaces the explicit objective bound.
                     if not system.circuitTimeObjectiveExact:
                         system.addConstraint(objective <= currentCost - 1)
+                        system.baseArray.constraints[^1].isObjectiveBound = true
                         hasBoundConstraint = true
                 else:
                     system.addConstraint(objective >= currentCost + 1)
+                    system.baseArray.constraints[^1].isObjectiveBound = true
                     hasBoundConstraint = true
+                system.nearFeasibleCost = high(int)
+                system.nearFeasibleAssignment = @[]
                 # Set objective bound on CircuitTimeProp constraints (retry loop)
                 system.applyCircuitTimeObjectiveBounds(currentCost - 1, direction == Minimize)
                 system.baseArray.reducedDomain = baseReducedDomain
@@ -641,8 +699,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     flushFile(stdout)
                     retryThreshold = tabuThreshold  # reset on success
                 except TimeLimitExceededError:
-                    system.initialize(bestSolution)
-                    objective.initialize(system.assignment)
+                    if not adoptNearFeasible():
+                        system.initialize(bestSolution)
+                        objective.initialize(system.assignment)
                     system.searchCompleted = false
                     break retryLoop
                 except InfeasibleError:
@@ -652,6 +711,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     objective.initialize(system.assignment)
                     break retryLoop
                 except NoSolutionFoundError:
+                    if adoptNearFeasible():
+                        # Progress was made: keep asking, as after a retry success
+                        # (with no deadline the loop is bounded by its own caps).
+                        retryThreshold = tabuThreshold
+                        continue
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
                     retryThreshold = retryThreshold * 2

@@ -115,7 +115,8 @@ proc tryRegularLineMoves[T](state: TabuState[T], allowSideways: bool): bool =
             newVals[i] = T(int(reg.inputMin) + p mod V)
             s = p div V
 
-        # Simulate (lean), measure the true delta, restore
+        # Simulate (lean), measure the true delta, restore. Budget: the caller
+        # checks between calls; one call is at most MAX_LINES simulations.
         let origCost = state.cost
         var changes: seq[(int, T)]
         for i in 0..<n:
@@ -134,6 +135,10 @@ proc tryRegularLineMoves[T](state: TabuState[T], allowSideways: bool): bool =
                 let oldIdx = state.domIdx(pos, oldVal)
                 if oldIdx >= 0 and not state.isLazy[pos]:
                     state.tabu[pos][oldIdx] = tabuTenure
-                state.assignValue(pos, newVals[reg.positionToIndex[pos]])
+                # commitValue: under lean search the penalty map is never read,
+                # and a full assignValue per line cell (n * neighbor-penalty
+                # cascades, each through the channel fixpoint) ran for seconds
+                # past the deadline on channel-heavy models (work-task-variation).
+                state.commitValue(pos, newVals[reg.positionToIndex[pos]])
             return true
     return false

@@ -33,6 +33,7 @@
 ## **Performance**: O(1) evaluation with cached array access, efficient bound checking
 
 import std/[packedsets, tables]
+import packedSetAssign
 
 import ../expressions/expressions
 
@@ -338,7 +339,7 @@ proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
         # Conservative: return all positions
         affected = state.positions
 
-    state.lastAffectedPositions = affected
+    state.lastAffectedPositions.assignSet(affected)
 
     # Update assignment
     state.currentAssignment[position] = newValue

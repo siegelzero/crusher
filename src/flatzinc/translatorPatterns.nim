@@ -8444,3 +8444,224 @@ proc detectRedundantDisjunctions*(tr: var FznTranslator) =
     if nRedundant > 0:
         stderr.writeLine(&"[FZN] Eliminated {nRedundant} redundant disjunctive pairs (implied by max/min conditions)")
 
+
+################################################################################
+# Monotone set variable elimination
+################################################################################
+
+proc collectIdents(e: FznExpr, acc: var seq[string]) =
+    if e == nil: return
+    case e.kind
+    of FznIdent: acc.add(e.ident)
+    of FznArrayLit:
+        for sub in e.elems: collectIdents(sub, acc)
+    else: discard
+
+proc isEmptyConstSet(tr: FznTranslator, e: FznExpr): bool =
+    case e.kind
+    of FznRange: e.lo > e.hi
+    of FznSetLit: e.setElems.len == 0
+    of FznIdent: e.ident in tr.setParamValues and tr.setParamValues[e.ident].len == 0
+    else: false
+
+proc detectMonotoneSetElimination(tr: var FznTranslator) =
+    ## A set variable S that is only constrained by
+    ##   set_in(x_i, S)              (S must contain each x_i: lower bound), and
+    ##   set_intersect(S, T, {})     (S must avoid T: upper bound, T likewise eliminable)
+    ## is monotone: any superset of {x_i} satisfies the set_in side and any subset
+    ## satisfies the disjointness side, so S = {x_i} is the canonical value. The
+    ## set's boolean decomposition is dropped entirely, and all disjointness
+    ## constraints between eliminated sets become one GroupValueDisjoint
+    ## constraint over the generator variables (warehouse: 10k search bools and
+    ## 3k set_intersect constraints collapse into a single O(1)-delta constraint
+    ## over token_facility).
+    ## MUST run before translateVariables.
+    type Cand = object
+        lo, hi: int
+        universe: seq[int]       # empty when contiguous lo..hi
+        xVarNames: seq[string]
+        constVals: seq[int]
+        cis: seq[int]            # consuming constraint indices
+        partners: seq[string]
+        local: bool              # passes the per-constraint check
+
+    var cands: Table[string, Cand]
+    for decl in tr.model.variables:
+        if decl.isArray or not decl.isVar: continue
+        if decl.name in tr.skipSetVarNames: continue
+        if decl.value != nil: continue
+        var c = Cand(local: true)
+        case decl.varType.kind
+        of FznSetOfIntRange:
+            c.lo = decl.varType.setLo
+            c.hi = decl.varType.setHi
+        of FznSetOfIntSet:
+            if decl.varType.setValues.len == 0: continue
+            c.lo = decl.varType.setValues.min
+            c.hi = decl.varType.setValues.max
+            if decl.varType.setValues.len != c.hi - c.lo + 1:
+                c.universe = decl.varType.setValues
+        else: continue
+        if c.lo > c.hi: continue
+        cands[decl.name] = c
+    if cands.len == 0: return
+
+    # Which constraints mention which identifiers (recursing into array literals).
+    # Constraints already consumed by an earlier pattern are included: a set
+    # whose bools some fused constraint (e.g. SetIntersectCard) will still read
+    # must keep its decomposition, so any such reference disqualifies the set.
+    var refs: Table[string, seq[int]]
+    for ci in 0 ..< tr.model.constraints.len:
+        var ids: seq[string]
+        for arg in tr.model.constraints[ci].args: collectIdents(arg, ids)
+        for id in ids:
+            refs.mgetOrPut(id, @[]).add(ci)
+    # A set var reachable through an array that some constraint uses is not
+    # eliminable (array_set_element etc. would read its bools).
+    for decl in tr.model.variables:
+        if not decl.isArray: continue
+        if decl.varType.kind notin {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}: continue
+        if decl.name notin refs: continue
+        if decl.value == nil or decl.value.kind != FznArrayLit: continue
+        for e in decl.value.elems:
+            if e.kind == FznIdent and e.ident in cands:
+                cands[e.ident].local = false
+
+    # Int variable declarations (for generator checks).
+    var intVarDecls: HashSet[string]
+    for decl in tr.model.variables:
+        if decl.isArray or not decl.isVar: continue
+        if decl.varType.kind in {FznInt, FznIntRange, FznIntSet}:
+            intVarDecls.incl(decl.name)
+
+    proc canonical(tr: FznTranslator, name: string): string =
+        if name in tr.fznVarAliases: tr.fznVarAliases[name] else: name
+
+    for sName, c in cands.mpairs:
+        if not c.local: continue
+        for ci in refs.getOrDefault(sName, @[]):
+            if ci in tr.definingConstraints:
+                c.local = false
+                break
+            let con {.cursor.} = tr.model.constraints[ci]
+            let name = stripSolverPrefix(con.name)
+            if name == "set_in" and con.args.len == 2 and
+               con.args[1].kind == FznIdent and con.args[1].ident == sName:
+                let xArg = con.args[0]
+                if xArg.kind == FznIntLit or (xArg.kind == FznIdent and xArg.ident in tr.paramValues):
+                    let v = if xArg.kind == FznIntLit: xArg.intVal else: tr.paramValues[xArg.ident]
+                    # A constant outside the set's universe makes the model
+                    # infeasible; leave that to the regular decomposition.
+                    if v < c.lo or v > c.hi or (c.universe.len > 0 and v notin c.universe):
+                        c.local = false
+                        break
+                    c.constVals.add(v)
+                elif xArg.kind == FznIdent:
+                    let canon = tr.canonical(xArg.ident)
+                    if canon notin intVarDecls or canon in tr.definedVarNames:
+                        c.local = false
+                        break
+                    c.xVarNames.add(canon)
+                else:
+                    c.local = false
+                    break
+                c.cis.add(ci)
+            elif name == "set_intersect" and con.args.len == 3 and
+                 con.args[0].kind == FznIdent and con.args[1].kind == FznIdent and
+                 tr.isEmptyConstSet(con.args[2]):
+                let a = con.args[0].ident
+                let b = con.args[1].ident
+                if a == b or (a != sName and b != sName):
+                    c.local = false
+                    break
+                let other = if a == sName: b else: a
+                if other notin cands:
+                    c.local = false
+                    break
+                c.partners.add(other)
+                c.cis.add(ci)
+            else:
+                c.local = false
+                break
+
+    # Fixpoint: a set whose disjointness partner is not eliminable stays as bools.
+    # A set with no generator at all (only disjointness) has nothing to derive
+    # from; its boolean decomposition is tiny, so leave it (and, through the
+    # fixpoint, its partners) on the regular path.
+    var eligible: HashSet[string]
+    for sName, c in cands:
+        if c.local and c.xVarNames.len + c.constVals.len > 0: eligible.incl(sName)
+    var changed = true
+    while changed:
+        changed = false
+        for sName in toSeq(eligible):
+            for p in cands[sName].partners:
+                if p notin eligible:
+                    eligible.excl(sName)
+                    changed = true
+                    break
+    if eligible.len == 0: return
+
+    var nGen = 0
+    var nPairs = 0
+    var seenPairCI = initHashSet[int]()
+    for sName in eligible:
+        let c = cands[sName]
+        tr.skipSetVarNames.incl(sName)
+        tr.derivedSetDefs[sName] = DerivedSetDef(
+            lo: c.lo, hi: c.hi, universe: c.universe,
+            xVarNames: c.xVarNames, constVals: c.constVals)
+        nGen += c.xVarNames.len
+        for ci in c.cis:
+            tr.definingConstraints.incl(ci)
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) == "set_intersect" and ci notin seenPairCI:
+                seenPairCI.incl(ci)
+                tr.derivedSetDisjointPairs.add((aSetName: con.args[0].ident, bSetName: con.args[1].ident))
+                inc nPairs
+    stderr.writeLine(&"[FZN] Monotone set elimination: {eligible.len} set vars derived from {nGen} generator vars, {nPairs} disjoint pairs -> GroupValueDisjoint")
+
+proc emitDerivedSetDisjointConstraint(tr: var FznTranslator) =
+    ## Posts the GroupValueDisjoint constraint for sets eliminated by
+    ## detectMonotoneSetElimination. MUST run after translateVariables.
+    if tr.derivedSetDefs.len == 0: return
+    var groupIdx: Table[string, int]
+    var groups: seq[seq[int]]
+    var consts: seq[seq[int]]
+    var lo = int.high
+    var hi = int.low
+    for sName, def in tr.derivedSetDefs:
+        var poss: seq[int]
+        for x in def.xVarNames:
+            if x notin tr.varPositions:
+                raise newException(ValueError,
+                    &"derived set '{sName}': generator '{x}' has no position")
+            let pos = tr.varPositions[x]
+            poss.add(pos)
+            # set_in(x, S) with S ⊆ universe restricts x to the universe.
+            let cur = tr.sys.baseArray.domain[pos]
+            var newDom: seq[int]
+            for v in cur:
+                if v < def.lo or v > def.hi: continue
+                if def.universe.len > 0 and v notin def.universe: continue
+                newDom.add(v)
+            if newDom.len == 0:
+                raise newException(ValueError,
+                    &"derived set '{sName}': generator '{x}' has no value in the set's universe")
+            if newDom.len < cur.len:
+                tr.sys.baseArray.setDomain(pos, newDom)
+        groupIdx[sName] = groups.len
+        groups.add(poss)
+        consts.add(def.constVals)
+        lo = min(lo, def.lo)
+        hi = max(hi, def.hi)
+    var pairs: seq[(int, int)]
+    for p in tr.derivedSetDisjointPairs:
+        if p.aSetName notin groupIdx or p.bSetName notin groupIdx: continue
+        let g = groupIdx[p.aSetName]
+        let h = groupIdx[p.bSetName]
+        if groups[g].len + consts[g].len == 0 or groups[h].len + consts[h].len == 0: continue
+        pairs.add((g, h))
+    if pairs.len == 0: return
+    tr.sys.addConstraint(groupValueDisjoint[int](groups, consts, pairs, lo, hi))
+    stderr.writeLine(&"[FZN] Emitted GroupValueDisjoint: {groups.len} groups, {pairs.len} pairs, values {lo}..{hi}")

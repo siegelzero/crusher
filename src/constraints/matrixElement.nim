@@ -11,6 +11,7 @@
 ## **Violation Cost**: Binary (0 = satisfied, 1 = violated)
 
 import std/[packedsets, tables]
+import packedSetAssign
 
 import ../expressions/expressions
 import elementState
@@ -255,7 +256,7 @@ proc updatePosition*[T](state: MatrixElementState[T], position: int, newValue: T
                     affected.incl(state.colPosition)
         # else: not at current index, no affected positions
 
-    state.lastAffectedPositions = affected
+    state.lastAffectedPositions.assignSet(affected)
 
 ################################################################################
 # moveDelta - O(1) incremental evaluation

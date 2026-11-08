@@ -115,6 +115,14 @@ type
         lo*: int              # min element of universe
         hi*: int              # max element of universe
 
+    DerivedSetDef* = object
+        ## A set variable eliminated by detectMonotoneSetElimination: its value
+        ## is the union of its generator variables' values plus constant members.
+        lo*, hi*: int
+        universe*: seq[int]      # sparse universe (empty when contiguous lo..hi)
+        xVarNames*: seq[string]
+        constVals*: seq[int]
+
     SetArrayElement* = object
         isConstant*: bool
         constantValues*: seq[int]  # for literal set elements
@@ -506,6 +514,11 @@ type
         singletonSetChannelDefs*: seq[tuple[setName: string, xVarName: string, cardCI: int, inCI: int]]
         # Set intersection cardinality defs: set_intersect(A,B,C) + set_card(C,n) → sum_i min(A[i],B[i]) in domain(n)
         setIntersectCardDefs*: seq[tuple[aSetName, bSetName, cSetName, cardVarName: string, intersectCI, cardCI: int]]
+        # Monotone set elimination: set vars bounded only below by set_in(x, S) and
+        # above by disjointness become the derived set {x}; disjoint pairs become one
+        # GroupValueDisjoint constraint over the generator variables.
+        derivedSetDefs*: Table[string, DerivedSetDef]
+        derivedSetDisjointPairs*: seq[tuple[aSetName, bSetName: string]]
         # Detected weighted same-value pattern for objective
         weightedSameValuePairs*: seq[tuple[varNameA, varNameB: string, coeff: int]]
         weightedSameValueConstant*: int
@@ -1500,6 +1513,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.detectConditionalDayCapacityPattern()
     # Detect set_intersect(A,B,C) + set_card(C,n) → dedicated SetIntersectCard constraint
     result.detectSetIntersectCardPattern()
+    # Eliminate set vars bounded only by set_in (below) and disjointness (above)
+    result.detectMonotoneSetElimination()
     # Detect redundant ordering constraints (transitive reduction)
     result.detectRedundantOrderings()
     # Detect conditional separation patterns: guard → (var ≤ lo ∨ var ≥ hi)
@@ -1556,6 +1571,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.buildOrphanEqualityConstraints()
     # Emit set-intersect-cardinality constraints (after translateVariables so positions exist)
     result.emitSetIntersectCardConstraints()
+    # Emit the GroupValueDisjoint constraint for eliminated monotone set vars
+    result.emitDerivedSetDisjointConstraint()
     # Detect singleton set channels: set_card(S,1) + set_in(x,S) → S.bools become channels
     result.detectSingletonSetChannels()
     for def in result.singletonSetChannelDefs:
@@ -2180,6 +2197,20 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
 
     # Add conditional linear constraints (guard → linear_le)
     var nCondLinEmitted = 0
+    var nCondLinSkipped = 0
+    # guard → c * count_v <= rhs, where count_v is a GCC count channel of some
+    # input array: grouped per input array into one GuardedCount constraint
+    # (facility location: count_j <= cap_j * is_open_j). Evaluated through the
+    # count channel these were cascade constraints; GuardedCount is O(1) for
+    # both the input move and the guard flip.
+    var countEqByChannel: Table[int, int]   # channel position -> countEq binding index
+    for bi, b in result.sys.baseArray.countEqChannelBindings:
+        countEqByChannel[b.channelPosition] = bi
+    type GuardedGroup = object
+        inputs: seq[int]
+        values, guards, actives, ubs: seq[int]
+        seenValues: HashSet[int]
+    var guardedGroups: Table[seq[int], GuardedGroup]
     for pat in result.conditionalLinearPatterns:
         var linPositions: seq[int]
         var skip = false
@@ -2193,11 +2224,39 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
             else:
                 skip = true
                 break
-        if skip: continue
+        if skip:
+            inc nCondLinSkipped
+            continue
 
-        # Resolve guard position
-        if pat.guardVarName notin result.varPositions: continue
-        let guardPos = result.varPositions[pat.guardVarName]
+        # Resolve guard position. The guard is often the bool2int image of a
+        # bool (`open <= cap * b2i(is_open)`); detectBool2intIdentityAliases
+        # turned that int into a defined var with no position of its own, so
+        # follow the alias to the bool's position.
+        var guardName = pat.guardVarName
+        if guardName notin result.varPositions and guardName in result.bool2intIdentityAliases:
+            guardName = result.bool2intIdentityAliases[guardName]
+        if guardName notin result.varPositions:
+            inc nCondLinSkipped
+            continue
+        let guardPos = result.varPositions[guardName]
+
+        if pat.coeffs.len == 1 and pat.coeffs[0] > 0 and
+           linPositions[0] in countEqByChannel and
+           guardPos notin result.sys.baseArray.channelPositions:
+            let b = result.sys.baseArray.countEqChannelBindings[countEqByChannel[linPositions[0]]]
+            if guardPos notin b.inputPositions:
+                # c * (count_vars + constOffset) <= rhs  →  count_vars <= floor(rhs / c) - constOffset
+                let ub = floorDiv(pat.rhs, pat.coeffs[0]) - b.constantOffset
+                var grp = guardedGroups.getOrDefault(b.inputPositions,
+                    GuardedGroup(inputs: b.inputPositions))
+                if b.targetValue notin grp.seenValues:
+                    grp.seenValues.incl(b.targetValue)
+                    grp.values.add(b.targetValue)
+                    grp.guards.add(guardPos)
+                    grp.actives.add(pat.guardActiveValue)
+                    grp.ubs.add(ub)
+                    guardedGroups[b.inputPositions] = grp
+                    continue
 
         # Create the ConditionalLinear constraint
         let clState = newConditionalLinearConstraint[int](
@@ -2218,8 +2277,14 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
         result.sys.addConstraint(constraint)
         inc nCondLinEmitted
 
-    if nCondLinEmitted > 0:
-        stderr.writeLine(&"[FZN] Emitted {nCondLinEmitted} conditional linear constraints")
+    var nGuardedCount = 0
+    for key, grp in guardedGroups:
+        result.sys.addConstraint(guardedCount[int](grp.inputs, grp.values, grp.guards, grp.actives, grp.ubs))
+        nGuardedCount += grp.values.len
+        stderr.writeLine(&"[FZN] GuardedCount: {grp.values.len} guarded counts over {grp.inputs.len} positions")
+    if nCondLinEmitted > 0 or nCondLinSkipped > 0:
+        stderr.writeLine(&"[FZN] Emitted {nCondLinEmitted} conditional linear constraints" &
+            (if nCondLinSkipped > 0: &", {nCondLinSkipped} skipped (unresolved variables)" else: ""))
 
     # Coalesce adjacency-shaped clause groups into AdjacencyEqual constraints.
     # Shape per clause: (labelEq ∨ lin ≤ r1 ∨ −lin ≤ r2) with r1 + r2 = −2,

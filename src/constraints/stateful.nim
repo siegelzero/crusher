@@ -1,6 +1,6 @@
 import std/[packedsets, sequtils, sets, tables]
 
-import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe
+import algebraic, allDifferent, allDifferentExcept0, atleast, atmost, conjunctSumAtMost, elementState, matrixElement, relationalConstraint, ordering, globalCardinality, multiknapsack, sequence, cumulative, geost, irdcs, circuit, subcircuit, unionCycle, involution, connected, lexOrder, tableConstraint, regular, countEq, nvalue, diffn, diffnK, noOverlapFixedBox, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, conditionalLinear, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, reservoir, setIntersectCard, pseudoBoolLinLe, groupValueDisjoint, guardedCount
 import constraintNode, types
 import ../expressions/[algebraic, maxExpression, minExpression, weightedSameValue, binaryPairwiseSum]
 
@@ -322,6 +322,10 @@ func `$`*[T](constraint: StatefulConstraint[T]): string =
             return "ConjunctSumAtMost Constraint"
         of PseudoBoolLinLeType:
             return "PseudoBoolLinLe Constraint"
+        of GroupValueDisjointType:
+            return "GroupValueDisjoint Constraint"
+        of GuardedCountType:
+            return "GuardedCount Constraint"
 
 ################################################################################
 # Evaluation
@@ -415,6 +419,10 @@ proc penalty*[T](constraint: StatefulConstraint[T]): T {.inline.} =
             return constraint.conjunctSumAtMostState.cost
         of PseudoBoolLinLeType:
             return constraint.pseudoBoolLinLeState.cost
+        of GroupValueDisjointType:
+            return constraint.groupValueDisjointState.cost
+        of GuardedCountType:
+            return constraint.guardedCountState.cost
 
 ################################################################################
 # Computed Constraints
@@ -1214,6 +1222,10 @@ func initialize*[T](constraint: StatefulConstraint[T], assignment: seq[T]) =
             constraint.conjunctSumAtMostState.initialize(assignment)
         of PseudoBoolLinLeType:
             constraint.pseudoBoolLinLeState.initialize(assignment)
+        of GroupValueDisjointType:
+            constraint.groupValueDisjointState.initialize(assignment)
+        of GuardedCountType:
+            constraint.guardedCountState.initialize(assignment)
 
 
 func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, newValue: T): int =
@@ -1304,6 +1316,10 @@ func moveDelta*[T](constraint: StatefulConstraint[T], position: int, oldValue, n
             constraint.conjunctSumAtMostState.moveDelta(position, oldValue, newValue)
         of PseudoBoolLinLeType:
             constraint.pseudoBoolLinLeState.moveDelta(position, oldValue, newValue)
+        of GroupValueDisjointType:
+            constraint.groupValueDisjointState.moveDelta(position, oldValue, newValue)
+        of GuardedCountType:
+            constraint.guardedCountState.moveDelta(position, oldValue, newValue)
 
 
 func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newValue: T) =
@@ -1394,6 +1410,10 @@ func updatePosition*[T](constraint: StatefulConstraint[T], position: int, newVal
             constraint.conjunctSumAtMostState.updatePosition(position, newValue)
         of PseudoBoolLinLeType:
             constraint.pseudoBoolLinLeState.updatePosition(position, newValue)
+        of GroupValueDisjointType:
+            constraint.groupValueDisjointState.updatePosition(position, newValue)
+        of GuardedCountType:
+            constraint.guardedCountState.updatePosition(position, newValue)
 
 
 func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int] =
@@ -1455,6 +1475,10 @@ func getAffectedPositions*[T](constraint: StatefulConstraint[T]): PackedSet[int]
             return constraint.conjunctSumAtMostState.getAffectedPositions()
         of PseudoBoolLinLeType:
             return constraint.pseudoBoolLinLeState.getAffectedPositions()
+        of GroupValueDisjointType:
+            return constraint.groupValueDisjointState.getAffectedPositions()
+        of GuardedCountType:
+            return constraint.guardedCountState.getAffectedPositions()
         else:
             return constraint.positions
 
@@ -1497,6 +1521,10 @@ func getAffectedDomainValues*[T](constraint: StatefulConstraint[T], position: in
             return constraint.conjunctSumAtMostState.getAffectedDomainValues(position)
         of PseudoBoolLinLeType:
             return constraint.pseudoBoolLinLeState.getAffectedDomainValues(position)
+        of GroupValueDisjointType:
+            return constraint.groupValueDisjointState.getAffectedDomainValues(position)
+        of GuardedCountType:
+            return constraint.guardedCountState.getAffectedDomainValues(position)
         else:
             return @[]
 
@@ -2154,6 +2182,19 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 stateType: PseudoBoolLinLeType,
                 pseudoBoolLinLeState: constraint.pseudoBoolLinLeState.deepCopy()
             )
+        of GroupValueDisjointType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: GroupValueDisjointType,
+                groupValueDisjointState: constraint.groupValueDisjointState.deepCopy()
+            )
+        of GuardedCountType:
+            result = StatefulConstraint[T](
+                positions: constraint.positions,
+                stateType: GuardedCountType,
+                guardedCountState: constraint.guardedCountState.deepCopy()
+            )
+    result.isObjectiveBound = constraint.isObjectiveBound
 
 
 
@@ -2439,6 +2480,43 @@ func setIntersectCard*[T](
     positions: constraint.positions,
     stateType: SetIntersectCardType,
     setIntersectCardState: constraint
+  )
+
+################################################################################
+# Group value disjointness wrapper functions
+################################################################################
+
+func groupValueDisjoint*[T](
+    groups: seq[seq[int]], constMembers: seq[seq[T]],
+    pairs: seq[(int, int)], lo, hi: T
+): StatefulConstraint[T] =
+  ## Creates a group value-disjointness constraint: for each pair (g, h) the
+  ## values taken by group g's members and group h's members must be disjoint.
+  ## cost = sum over pairs of |values(g) ∩ values(h)|; O(1) moveDelta.
+  let constraint = newGroupValueDisjointConstraint[T](
+      groups, constMembers, pairs, lo, hi)
+  return StatefulConstraint[T](
+    positions: constraint.positions,
+    stateType: GroupValueDisjointType,
+    groupValueDisjointState: constraint
+  )
+
+################################################################################
+# Guarded count wrapper functions
+################################################################################
+
+func guardedCount*[T](
+    inputPositions: seq[int], values: seq[T], guardPositions: seq[int],
+    guardActive: seq[T], ubs: seq[int]
+): StatefulConstraint[T] =
+  ## guard_v == active_v  →  count(inputs == v) <= ub_v, for every slot v.
+  ## cost = Σ_v [active] * max(0, count_v - ub_v); O(1) moveDelta.
+  let constraint = newGuardedCountConstraint[T](
+      inputPositions, values, guardPositions, guardActive, ubs)
+  return StatefulConstraint[T](
+    positions: constraint.positions,
+    stateType: GuardedCountType,
+    guardedCountState: constraint
   )
 
 ################################################################################
