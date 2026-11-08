@@ -587,6 +587,9 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
             system.initialize(result.assignment)
             system.lastIterations = result.iterations
             return true
+        if verbose:
+            let elapsed = result.endTime - result.startTime
+            echo &"[Solve] S{result.workerId} stopped: cost={result.cost} iters={result.iterations} {elapsed:.1f}s"
         allResults.add(PoolEntry[T](
             assignment: result.assignment,
             cost: result.cost

@@ -368,7 +368,8 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
 
     # Fast path for one-hot source positions: directly compute the few changes
     # instead of evaluating all bindings through the worklist
-    if pos in state.oneHotChanges and pos notin state.ctpAtLink:
+    let hasMixed = state.cdMixedAt.len > pos and state.cdMixedAt[pos].len > 0
+    if pos in state.oneHotChanges and pos notin state.ctpAtLink and not hasMixed:
         let changes {.cursor.} = state.oneHotChanges[pos]
         let lo = state.oneHotLo[pos]
         let oldIdx = savedPos - lo
@@ -408,7 +409,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.channelsAtPosition:
                 for bi in state.carray.channelsAtPosition[p]:
                     let bindingPtr = addr state.carray.channelBindings[bi]
-                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    let idxVal = bindingPtr[].evalIndex(state.assignment)
                     if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
                     let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
@@ -487,7 +488,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.expressionChannelsAtPosition:
                 for bi in state.carray.expressionChannelsAtPosition[p]:
                     let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
-                    let newChanVal = binding.expression.evaluate(state.assignment)
+                    let newChanVal = binding.evalExpr(state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -551,7 +552,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.channelsAtPosition:
                 for bi in state.carray.channelsAtPosition[p]:
                     let bindingPtr = addr state.carray.channelBindings[bi]
-                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    let idxVal = bindingPtr[].evalIndex(state.assignment)
                     if idxVal < 0 or idxVal >= bindingPtr.arrayElements.len: continue
                     let elem = bindingPtr.arrayElements[idxVal]
                     let newChanVal = if elem.isConstant: elem.constantValue
@@ -630,7 +631,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
             if p in state.carray.expressionChannelsAtPosition:
                 for bi in state.carray.expressionChannelsAtPosition[p]:
                     let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
-                    let newChanVal = binding.expression.evaluate(state.assignment)
+                    let newChanVal = binding.evalExpr(state.assignment)
                     let chanPos = binding.channelPosition
                     if newChanVal != state.assignment[chanPos]:
                         state.trackChannelChange(chanPos, newChanVal)
@@ -642,19 +643,50 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         let cdWorklistEnd = epochTime()
         state.cdDomainEvals += state.cdDirtyPositions.len
 
+    # Mixed constraints (see cdMixedAt): joint delta of the source change and
+    # the simulated channel changes; movePenalty contributes nothing for them.
+    var mixedDelta = 0
+    if hasMixed:
+        state.cdProcessed.clear()
+        let sd = candidateValue - savedPos
+        for m in state.cdMixedAt[pos]:
+            state.cdProcessed.incl(m.ci)
+            if not state.channelDepConstraintActive[m.ci]: continue
+            let cfast = state.channelDepConstraints[m.ci]
+            if cfast.stateType == PseudoBoolLinLeType:
+                let pb = cfast.pseudoBoolLinLeState
+                var newSum = pb.currentSum + m.l * sd
+                for (cpos, coeff) in state.cdConstraintCoeffs[m.ci]:
+                    if state.cdIsChanged[cpos]:
+                        newSum += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                mixedDelta += max(0, newSum - pb.rhs) - pb.cost
+            else:
+                let rc = cfast.relationalState
+                var newLeft = rc.leftValue + m.l * sd
+                var newRight = rc.rightValue + m.r * sd
+                for (cpos, coeff) in state.cdConstraintCoeffs[m.ci]:
+                    if state.cdIsChanged[cpos]:
+                        newLeft += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                for (cpos, coeff) in state.cdConstraintCoeffsR[m.ci]:
+                    if state.cdIsChanged[cpos]:
+                        newRight += coeff * (state.assignment[cpos] - state.cdSavedVal[cpos])
+                mixedDelta += rc.computeCost(newLeft, newRight) - rc.cost
+
     if state.cdDirtyPositions.len == 0:
         # No channel changes — just restore pos and inverse
         state.assignment[pos] = savedPos
         for (fPos, savedVal) in state.inverseSavedBuf:
             state.assignment[fPos] = savedVal
-        return 0
+        return mixedDelta
 
     # Compute penalty delta for affected channel-dep constraints.
     # Assignment still has simulated values so we can use position-indexed lookups.
     # Uses precomputed coefficient arrays (O(coefficients * array_access)) instead of
     # iterating cdChanges with hash table lookups (O(cdChanges * hash_lookup)).
+    result = mixedDelta
     if state.chanPosToDepConstraintIdx.len > 0:
-        state.cdProcessed.clear()
+        if not hasMixed:
+            state.cdProcessed.clear()
         for chanPos in state.cdDirtyPositions:
             if chanPos in state.chanPosToDepConstraintIdx:
                 for ci in state.chanPosToDepConstraintIdx[chanPos]:
@@ -707,6 +739,12 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
         # Fallback: iterate all relevant constraints (no reverse index)
         let relevantConstraints = state.channelDepConstraintsForPos.getOrDefault(pos, @[])
         for c in relevantConstraints:
+            if hasMixed:
+                var isMixed = false
+                for m in state.cdMixedAt[pos]:
+                    if cast[pointer](state.channelDepConstraints[m.ci]) == cast[pointer](c):
+                        isMixed = true; break
+                if isMixed: continue   # already scored jointly above
             var affected = false
             for dpos in state.cdDirtyPositions:
                 if dpos in c.positions:
@@ -755,6 +793,9 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
     let nChans = chans.len
 
     let singleChanIdx {.cursor.} = state.cdCascadeSingleIdx[cascadeIdx]
+    let srcCoeff {.cursor.} = state.cdCascadeSrcCoeff[cascadeIdx]
+    let mixedClis {.cursor.} = state.cdCascadeMixedClis[cascadeIdx]
+    let srcCur = state.assignment[state.cdCascadeSrcPos[cascadeIdx]]
 
     template cliDelta(cliArg, diArg: int, changedArg: ptr seq[int]): int =
         block:
@@ -765,6 +806,9 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
             var delta: int
             if state.cdConstraintCanFast[ci]:
                 let cfast = state.channelDepConstraints[ci]
+                # Mixed constraint: apply the source position's own coefficient
+                # together with the channel diffs (joint delta, see cdMixedAt).
+                let sd = domain[di] - srcCur
                 if cfast.stateType == PseudoBoolLinLeType:
                     let pb = cfast.pseudoBoolLinLeState
                     var newSum = pb.currentSum
@@ -772,6 +816,7 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                         let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
                         if diff != 0:
                             newSum += coeff * diff
+                    if srcCoeff[cli].l != 0: newSum += srcCoeff[cli].l * sd
                     delta = max(0, newSum - pb.rhs) - pb.cost
                 else:
                     let rc = cfast.relationalState
@@ -785,6 +830,8 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                         let diff = chanVals[cascIdx][di] - state.assignment[chans[cascIdx]]
                         if diff != 0:
                             newRight += coeff * diff
+                    if srcCoeff[cli].l != 0: newLeft += srcCoeff[cli].l * sd
+                    if srcCoeff[cli].r != 0: newRight += srcCoeff[cli].r * sd
                     delta = rc.computeCost(newLeft, newRight) - rc.cost
             elif state.channelDepConstraints[ci].stateType == DisjunctiveClauseType:
                 # Fast DC path: compute penalty directly from precomputed cascade-to-term mappings
@@ -849,7 +896,7 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
             state.cdCliStamp.setLen(constraintIds.len)
         for di in 0..<domain.len:
             let changed = addr state.cdBatchChanged[di]
-            if changed[].len == 0:
+            if changed[].len == 0 and mixedClis.len == 0:
                 penalties[di] = 0
                 continue
             inc state.cdCliStampGen
@@ -860,6 +907,12 @@ proc computeCascadePenalties[T](state: TabuState[T], cascadeIdx: int,
                     if state.cdCliStamp[cli] == gen: continue
                     state.cdCliStamp[cli] = gen
                     totalDelta += cliDelta(cli, di, changed)
+            # Mixed constraints change with the source value even when no
+            # channel does.
+            for cli in mixedClis:
+                if state.cdCliStamp[cli] == gen: continue
+                state.cdCliStamp[cli] = gen
+                totalDelta += cliDelta(cli, di, changed)
             penalties[di] = totalDelta
 
 proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExternals: ptr PackedSet[int]) =
@@ -948,7 +1001,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                     let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                     newVal = evaluateConditionalCountEq(binding, state.assignment)
                 of ceExpression:
-                    newVal = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
+                    newVal = state.carray.expressionChannelBindings[bindings[ci]].evalExpr(state.assignment)
                 of ceWeightedCountEq:
                     let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bindings[ci]]
                     newVal = evaluateWeightedCountEq(binding, state.assignment)
@@ -960,7 +1013,7 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                     newVal = evaluateCrossingCountMax(binding, state.assignment)
                 of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
-                    let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                    let idxVal = bindingPtr[].evalIndex(state.assignment)
                     if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                         let elem = bindingPtr.arrayElements[idxVal]
                         newVal = if elem.isConstant: elem.constantValue
@@ -991,6 +1044,34 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
     when ProfileIteration:
         state.cdCascadePenaltyTime += epochTime() - tPen0
         state.cdCascadeCalls += 1
+
+proc cdCascadeScoresConstraint[T](state: TabuState[T], pos: int, c: StatefulConstraint[T]): bool =
+    ## Debug: is constraint c scored by pos's cascade?
+    if pos notin state.cdCascadePos: return false
+    for dci in state.cdCascadeConstraintIds[state.cdCascadePos[pos]]:
+        if cast[pointer](state.channelDepConstraints[dci]) == cast[pointer](c): return true
+    false
+
+proc cdCascadeCacheValid[T](state: TabuState[T], pos: int): bool {.inline.} =
+    ## True when pos has a cascade whose cached per-value channel values (or
+    ## static table) reflect the current values of every external input.
+    if pos notin state.cdCascadePos: return false
+    let cascadeIdx = state.cdCascadePos[pos]
+    if state.cdCascadeIsStatic[cascadeIdx]: return true
+    state.cdCacheStamp[pos] >= 0 and state.cdCacheStamp[pos] >= state.cdCacheDirty[pos]
+
+proc rescoreCascadeFromCache[T](state: TabuState[T], pos: int) =
+    ## Recompute channelDepPenalties[pos] from the cascade's cached channel
+    ## values (valid per cdCascadeCacheValid): constraints x domain work
+    ## instead of entries x domain evaluations.
+    let cascadeIdx = state.cdCascadePos[pos]
+    let domain {.cursor.} = state.sharedDomain[][pos]
+    if state.cdCascadeIsStatic[cascadeIdx]:
+        state.computeCascadePenalties(cascadeIdx,
+            state.cdCascadeValues[cascadeIdx], domain, state.channelDepPenalties[pos])
+    else:
+        state.computeCascadePenalties(cascadeIdx,
+            state.cdCascadeCachedValues[cascadeIdx], domain, state.channelDepPenalties[pos])
 
 proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
     ## Compute channelDepPenalties[pos] for all domain values.
@@ -1032,6 +1113,28 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             if useSparse:
                 let nSrc = state.cdCascadeNSrcReaders[cascadeIdx]
                 let fwd {.cursor.} = state.cdCascadeForwardDeps[cascadeIdx]
+                # Source-reader element entries with a linear index: in the
+                # sparse path their other inputs are all external (a cascade
+                # channel input would be a back edge), so the index is an
+                # affine function of the probed value: one dot product per
+                # batch instead of one per domain value (kitchen widths: 71
+                # values x ~30 reified offset comparisons per batch).
+                if state.cdSrcLinOk.len < nSrc:
+                    state.cdSrcLinOk.setLen(nSrc)
+                    state.cdSrcLinBase.setLen(nSrc)
+                    state.cdSrcLinCoeff.setLen(nSrc)
+                for ci in 0..<nSrc:
+                    state.cdSrcLinOk[ci] = false
+                    if entryKinds[ci] == ceElement and not gNoSrcLin:
+                        let b = addr state.carray.channelBindings[bindings[ci]]
+                        if b.linearIndex:
+                            for k in 0..<b.linPositions.len:
+                                if b.linPositions[k] == pos:
+                                    let coeff = b.linCoeffs[k]
+                                    state.cdSrcLinBase[ci] = b[].evalIndex(state.assignment) - coeff * savedPos
+                                    state.cdSrcLinCoeff[ci] = coeff
+                                    state.cdSrcLinOk[ci] = true
+                                    break
                 for di in 0..<nDom:
                     state.cdBatchChanged[di].setLen(0)
                     if domain[di] == savedPos:
@@ -1061,7 +1164,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                             let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                             state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
                         of ceExpression:
-                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
+                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].evalExpr(state.assignment)
                         of ceWeightedCountEq:
                             if ci < nSrc:
                                 state.cdBatchValues[ci][di] = state.wCountEqAfterSrc(bindings[ci], pos, savedPos)
@@ -1079,7 +1182,10 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         of ceElement:
                             # Element binding: evaluate index expression and look up array
                             let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
-                            let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                            let idxVal = if ci < nSrc and state.cdSrcLinOk[ci]:
+                                             state.cdSrcLinBase[ci] + state.cdSrcLinCoeff[ci] * domain[di]
+                                         else:
+                                             bindingPtr[].evalIndex(state.assignment)
                             if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                                 let elem = bindingPtr.arrayElements[idxVal]
                                 state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
@@ -1112,7 +1218,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                             let binding {.cursor.} = state.carray.conditionalCountEqChannelBindings[bindings[ci]]
                             state.cdBatchValues[ci][di] = evaluateConditionalCountEq(binding, state.assignment)
                         of ceExpression:
-                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].expression.evaluate(state.assignment)
+                            state.cdBatchValues[ci][di] = state.carray.expressionChannelBindings[bindings[ci]].evalExpr(state.assignment)
                         of ceWeightedCountEq:
                             # WeightedCountEq binding: sum weights for matching values
                             let binding {.cursor.} = state.carray.weightedCountEqChannelBindings[bindings[ci]]
@@ -1128,7 +1234,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                         of ceElement:
                             # Element binding: evaluate index expression and look up array
                             let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
-                            let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                            let idxVal = bindingPtr[].evalIndex(state.assignment)
                             if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                                 let elem = bindingPtr.arrayElements[idxVal]
                                 state.cdBatchValues[ci][di] = if elem.isConstant: elem.constantValue
@@ -1146,6 +1252,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
             for ci in 0..<nChans:
                 for di in 0..<nDom:
                     state.cdCascadeCachedValues[cascadeIdx][ci][di] = state.cdBatchValues[ci][di]
+            state.cdCacheStamp[pos] = state.cdMoveSeq
 
             when ProfileIteration:
                 let tBind1CD = epochTime()
@@ -1220,6 +1327,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
         for i in 0..<domain.len:
             oldPenalties[i] = state.channelDepPenalties[pos][i]
         state.computeChannelDepPenaltiesInc(pos, addr changedExternals)
+        state.cdCacheStamp[pos] = state.cdMoveSeq
         for i in 0..<domain.len:
             let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
             if delta != 0:
@@ -1295,12 +1403,35 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
                 if chanPos in consExt:
                     consInputChanged = true
                     break
-        if consInputChanged:
+        # A hinged/scaled objective bound (costScale > 1) is not linear in its
+        # value: when its cost moved, the per-value deltas at this position
+        # shift non-uniformly (knee + rounding), so a uniform shift would leave
+        # stale scores (kitchen under scaling: 45 CHECK_DELTA mismatches/30 s).
+        var scaledChanged = false
+        if not consInputChanged:
+            for ci in state.cdCascadeConstraintIds[cascadeIdx]:
+                if not state.channelDepConstraintActive[ci]: continue
+                let c = state.channelDepConstraints[ci]
+                if c.stateType == RelationalType and c.relationalState.costScale > 1 and
+                        c.penalty() != state.cdSavedConstraintCosts[ci]:
+                    scaledChanged = true
+                    break
+        if consInputChanged or scaledChanged:
+            # No cascade input changed, so the per-value channel values cached
+            # by the last full evaluation are still exact: re-score the
+            # constraints from the cache instead of re-evaluating every entry
+            # for every domain value. An objective bound over hundreds of
+            # search variables otherwise forces that full pass on EVERY move
+            # (kitchen probes: 60 it/s vs 500 without the bound).
+            when ProfileIteration: state.cdConsRescoreCalls += 1
             let domain {.cursor.} = state.sharedDomain[][pos]
             var oldPenalties = newSeq[int](domain.len)
             for i in 0..<domain.len:
                 oldPenalties[i] = state.channelDepPenalties[pos][i]
-            state.computeChannelDepPenaltiesAt(pos)
+            if not gNoCacheRescore and state.cdCascadeCacheValid(pos):
+                state.rescoreCascadeFromCache(pos)
+            else:
+                state.computeChannelDepPenaltiesAt(pos)
             for i in 0..<domain.len:
                 let delta = state.channelDepPenalties[pos][i] - oldPenalties[i]
                 if delta != 0:

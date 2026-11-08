@@ -97,6 +97,8 @@ type
         boundConstraint*: StatefulConstraint[T]
         nearBestCost*: int
         nearBestAssignment*: seq[T]
+        nearStallSecs*: float      # see ConstrainedArray.nearStallSecs
+        nearStallRef*: float       # time of the run start / last near-feasible gain
 
         iteration*: int
         lastImprovementIter*: int  # Iteration of last bestCost improvement
@@ -299,7 +301,30 @@ type
         cdCascadeEntryCons: seq[seq[seq[int]]]    # [cascadeIdx][entry] -> constraint-local indices reading it
         cdCascadeSingleIdx: seq[seq[int]]         # [cascadeIdx][cli] -> entry of a single-pos constraint's position, or -1
         cdCascadeConsExt: seq[PackedSet[int]]     # [cascadeIdx] -> positions its constraints read outside the cascade
+        # Lean-mode cascade cache validity: cdExtReadersOf[p] lists the cascade
+        # source positions whose entries read p from outside the cascade. A move
+        # at p (or at a channel p) bumps cdCacheDirty of those sources; a scan
+        # whose cdCacheStamp is newer re-scores from the cached per-value channel
+        # values instead of re-evaluating the cascade (see applyFirstImprovingMove).
+        cdExtReadersOf: Table[int, seq[int]]
+        cdCacheStamp: seq[int]
+        cdCacheDirty: seq[int]
+        cdMoveSeq: int
+        # Per-batch affine index shortcut for source-reader element entries
+        cdSrcLinOk: seq[bool]
+        cdSrcLinBase: seq[T]
+        cdSrcLinCoeff: seq[T]
         cdReadersOf: Table[int, seq[int]]         # position -> cascade source positions that READ it (ext deps / constraint inputs)
+        # Mixed constraints: a fast-path linear constraint that reads the cascade
+        # source position DIRECTLY and channels the source feeds. Scoring it as
+        # direct delta + cascade delta is inexact across the max(0, .) hinge (an
+        # objective bound near its target gets every mixed move wrong), so the
+        # cascade scores it jointly (source coefficient applied with the channel
+        # diffs) and movePenalty returns 0 for the (constraint, source) pair.
+        cdCascadeSrcPos: seq[int]                          # [cascadeIdx] -> source position
+        cdCascadeSrcCoeff: seq[seq[tuple[l, r: T]]]         # [cascadeIdx][cli] -> source coefficients
+        cdCascadeMixedClis: seq[seq[int]]                   # [cascadeIdx] -> clis with a nonzero source coefficient
+        cdMixedAt: seq[seq[tuple[ci: int, l, r: T]]]         # [pos] -> mixed channel-dep constraints at pos
         cdBatchChanged: seq[seq[int]]             # [domainIdx] -> entries changed for that value (scratch)
         cdCliStamp: seq[int]                      # scratch dedupe stamps per constraint-local index
         cdCliStampGen: int
@@ -364,6 +389,9 @@ type
             cdCascadeCalls*: int64
             cdFastPathCalls*: int64
             cdIncCalls*: int64          # incremental cascade eval calls
+            cdConsRescoreCalls*: int64  # cascades re-scored from cache (constraint input changed)
+            cdLeanRescore*: int64       # lean scan: penalties re-scored from a valid cache
+            cdLeanFull*: int64          # lean scan: full cascade evaluation
             cdIncSkipped*: int64        # total entries×domvals skipped (used cached)
             cdIncEvaluated*: int64      # total entries×domvals actually evaluated
             cdUniformCalls*: int64
@@ -405,6 +433,11 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
     let oldValue = state.assignment[position]
     when ProfileMoveDelta:
         let startT = cpuTime()
+    if state.cdMixedAt.len > position and state.cdMixedAt[position].len > 0:
+        # Scored jointly by this position's cascade (see cdMixedAt).
+        for m in state.cdMixedAt[position]:
+            if cast[pointer](state.channelDepConstraints[m.ci]) == cast[pointer](constraint):
+                return 0
     case constraint.stateType:
         of AllDifferentType:
             result = constraint.allDifferentState.moveDelta(position, oldValue, newValue)
@@ -529,6 +562,18 @@ template commitValue[T](state: TabuState[T], position: int, value: T) =
     else: state.assignValue(position, value)
 
 include tabuInverseMoves
+# Debug A/B knobs for the cascade cache paths (see applyFirstImprovingMove /
+# computeChannelDepPenaltiesAt): disable the lean-scan re-score from cache,
+# and the affine index shortcut for source-reader element entries.
+let gNoCdStamp = existsEnv("CRUSHER_NO_CD_STAMP")
+let gTraceMoves = existsEnv("CRUSHER_TRACE_MOVES")   # debug: print S0's best-move assignments (first 400 iterations)
+let gNoSrcLin = existsEnv("CRUSHER_NO_SRC_LIN")
+let gNoPosSample = existsEnv("CRUSHER_NO_POS_SAMPLE")       # A/B: flat (position,value) tie sampling
+let gNoEmptyCascade = existsEnv("CRUSHER_NO_EMPTY_CASCADE") # A/B: worklist fallback for unread cascades
+let gOldWideGuard = existsEnv("CRUSHER_OLD_WIDE_GUARD")     # A/B: count constant element tables as cascade inputs
+let gNoCacheRescore = existsEnv("CRUSHER_NO_CACHE_RESCORE") # A/B: never re-score a cascade from cached channel values
+let gMixedAll = existsEnv("CRUSHER_MIXED_ALL")               # A/B: joint-score every mixed constraint, not only the objective bound
+
 include tabuChannelDep
 include tabuElementImplied
 include tabuSwapMoves
@@ -1624,6 +1669,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if constraint.isObjectiveBound:
             state.boundConstraint = constraint
     state.nearBestCost = high(int)
+    state.nearStallSecs = carray.nearStallSecs
 
     # Auto-detect graduated equality: if the system has inequality constraints
     # (which use graduated penalties), enable graduated penalty on EqualTo
@@ -1977,7 +2023,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         channelChanged = false
         fpIter += 1
         for binding in carray.channelBindings:
-            let idxVal = binding.indexExpression.evaluate(state.assignment)
+            let idxVal = binding.evalIndex(state.assignment)
             if idxVal >= 0 and idxVal < binding.arrayElements.len:
                 let elem = binding.arrayElements[idxVal]
                 let newVal = if elem.isConstant: elem.constantValue
@@ -1986,14 +2032,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     state.assignment[binding.channelPosition] = newVal
                     channelChanged = true
         for binding in carray.expressionChannelBindings:
-            let newVal = binding.expression.evaluate(state.assignment)
+            let newVal = binding.evalExpr(state.assignment)
             if newVal != state.assignment[binding.channelPosition]:
                 state.assignment[binding.channelPosition] = newVal
                 channelChanged = true
         if fpIter > 100:
             var changingPos: seq[int]
             for binding in carray.channelBindings:
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let idxVal = binding.evalIndex(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
@@ -2143,7 +2189,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # Re-evaluate element and argmax channels that may read from updated min/max channels
             var elemChanged = false
             for binding in carray.channelBindings:
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let idxVal = binding.evalIndex(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
@@ -2195,7 +2241,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             repairFpIter += 1
             if repairFpIter > 50: break
             for binding in carray.channelBindings:
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let idxVal = binding.evalIndex(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
@@ -2204,7 +2250,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         state.assignment[binding.channelPosition] = newVal
                         repairChannelChanged = true
             for binding in carray.expressionChannelBindings:
-                let newVal = binding.expression.evaluate(state.assignment)
+                let newVal = binding.evalExpr(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     repairChannelChanged = true
@@ -2250,7 +2296,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             ctpChanged = false
             inc ctpIter
             for binding in carray.channelBindings:
-                let idxVal = binding.indexExpression.evaluate(state.assignment)
+                let idxVal = binding.evalIndex(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
                     let elem = binding.arrayElements[idxVal]
                     let newVal = if elem.isConstant: elem.constantValue
@@ -2259,7 +2305,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         state.assignment[binding.channelPosition] = newVal
                         ctpChanged = true
             for binding in carray.expressionChannelBindings:
-                let newVal = binding.expression.evaluate(state.assignment)
+                let newVal = binding.evalExpr(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     ctpChanged = true
@@ -2384,11 +2430,23 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 else:
                     let pct = try: parseInt(pctStr) except ValueError: 100
                     if pct > 0: scale = max(1, median * pct div 100)
+                # A bound that reads a search variable directly AND channels fed
+                # by that same variable (kitchen: widths plus the discontinuity
+                # indicators they drive) is scored jointly inside the cascade
+                # (cdMixedAt / cdCascadeSrcCoeff), and a scaled bound's cost
+                # change is never applied as a uniform shift (see
+                # applyUniformDelta), so the hinged scale stays exact for mixed
+                # bounds too (CRUSHER_CHECK_DELTA: 0 mismatches on kitchen).
                 if scale > 1:
                     rc.costScale = scale
                     rc.cost = rc.computeCost(rc.leftValue, rc.rightValue)
-                    if verbose and id == 0:
-                        echo &"[Init] Objective-bound penalty scale: {scale} (median single-move delta {median}, max {maxDelta}, setting {pctStr})"
+                if verbose and id == 0:
+                    var nDirect = 0
+                    var nChannel = 0
+                    for p in constraint.positions.items:
+                        if p in carray.channelPositions: inc nChannel
+                        elif p notin carray.fixedPositions: inc nDirect
+                    echo &"[Init] Objective-bound penalty scale: {rc.costScale} (median single-move delta {median}, max {maxDelta}, setting {pctStr}, direct={nDirect} channel={nChannel})"
         if nComputed > 0 and verbose and id == 0:
             echo "[Init] Computed maxNetDelta for " & $nComputed & " inequality constraints"
 
@@ -2928,6 +2986,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.cdCascadeConstraintL = @[]
         state.cdCascadeConstraintR = @[]
         state.cdCascadeConstraintIds = @[]
+        state.cdCascadeSrcPos = @[]
+        state.cdCascadeSrcCoeff = @[]
+        state.cdCascadeMixedClis = @[]
+        state.cdMixedAt = @[]
         state.cdCascadeNSrcReaders = @[]
         state.cdCascadeHasBackEdge = @[]
         state.cdCascadeEntryCons = @[]
@@ -3134,8 +3196,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # ~2.5MB per cascade, thousands of cascades). Past the cap, fall back
             # to per-value channel-dep evaluation for this position.
             const MaxCascadeInputRefs = 50_000
+            const MaxTableHeavyCascadeChans = 2000
             if canBuild:
-                var inputRefs = 0
+                var inputRefs = 0        # variable inputs (dependency-table cost)
+                var tableRefs = 0        # the old count: whole element tables
                 for ci in 0..<topoOrder.len:
                     case topoEntryKind[ci]
                     of ceCountEq: inputRefs += carray.countEqChannelBindings[topoBindingIdx[ci]].inputPositions.len
@@ -3143,12 +3207,35 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     of ceConditionalCountEq:
                         let b {.cursor.} = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
                         inputRefs += b.primaryPositions.len + b.filterPositions.len + b.primaryOnlyPositions.len
-                    of ceElement: inputRefs += carray.channelBindings[topoBindingIdx[ci]].arrayElements.len
+                    of ceElement:
+                        # Only variable inputs cost dependency-table space: a
+                        # constant lookup table (reified linear comparison over a
+                        # wide value range) is read, never depended on.
+                        let b = addr carray.channelBindings[topoBindingIdx[ci]]
+                        tableRefs += b.arrayElements.len
+                        inputRefs += b.indexExpression.positions.len
+                        for elem in b.arrayElements:
+                            if not elem.isConstant: inc inputRefs
                     else: inputRefs += 4
+                if gOldWideGuard: inputRefs = max(inputRefs, tableRefs)
                 if inputRefs > MaxCascadeInputRefs:
+                    canBuild = false
+                # A cascade admitted only because its constant tables are no
+                # longer counted must still be of moderate size: counting
+                # variable inputs lets kitchen's 16 width positions (tables of
+                # ~1100 constants, cascades of <= 549 channels) get cascades,
+                # but it also admitted three 2300-channel cascades on sdn-chain
+                # that the table count had rejected, and evaluating those for
+                # every domain value on nearly every lean scan halved sdn's
+                # feasible-solution rate (3/6 vs 6/6 runs in 15 s). The
+                # per-value worklist fallback is the cheaper path for them.
+                if tableRefs > MaxCascadeInputRefs and topoOrder.len > MaxTableHeavyCascadeChans:
                     canBuild = false
             if not canBuild or topoOrder.len == 0:
                 cascadeFail += 1
+                if verbose and id == 0 and cascadeFail <= 8:
+                    echo "[Init]   cascade skipped at pos " & $pos & ": chans=" & $topoOrder.len &
+                         " canBuild=" & $canBuild & " domain=" & $state.sharedDomain[][pos].len
                 # Mark deep-cascade-failed positions as lazy to avoid per-iteration
                 # full recomputation in applyUniformDelta. These positions will use
                 # on-demand costDelta evaluation in bestMoves instead.
@@ -3170,9 +3257,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for ci in state.chanPosToDepConstraintIdx[chanPos]:
                         if state.channelDepConstraintActive[ci]:
                             break earlySkipCheck
-                # No active constraint reads any channel in this cascade — skip.
+                # No active constraint reads any channel in this cascade: register
+                # an EMPTY cascade (all-zero penalties, no external deps). Leaving
+                # the position without one sends it to the per-value worklist
+                # fallback, which simulates the full channel graph for every
+                # domain value on every recompute (kitchen: two 307-value
+                # paddings cost 9 s of a 19 s run).
                 inc noConstraintSkip
-                continue
+                if gNoEmptyCascade: continue
+                topoOrder.setLen(0)
+                topoBindingIdx.setLen(0)
+                topoEntryKind.setLen(0)
+                topoSet = initPackedSet[int]()
+                canStatic = true
 
             # Build channel values
             let domain {.cursor.} = state.sharedDomain[][pos]
@@ -3195,7 +3292,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     state.assignment[pos] = domain[di]
                     for ci in 0..<nChans:
                         let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
-                        let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                        let idxVal = bindingPtr[].evalIndex(state.assignment)
                         if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                             chanValues[ci][di] = bindingPtr.arrayElements[idxVal].constantValue
                         else:
@@ -3220,6 +3317,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var constraintLocalIds: seq[int] = @[]
             var constraintCoeffL: seq[seq[tuple[cascadeIdx: int, coeff: T]]] = @[]
             var constraintCoeffR: seq[seq[tuple[cascadeIdx: int, coeff: T]]] = @[]
+            var constraintSrcCoeff: seq[tuple[l, r: T]] = @[]
+            var mixedClis: seq[int] = @[]
 
             var seenCi: PackedSet[int]
             for chanPos in topoOrder:
@@ -3231,15 +3330,37 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             constraintLocalIds.add(ci)
                             var coeffsL: seq[tuple[cascadeIdx: int, coeff: T]] = @[]
                             var coeffsR: seq[tuple[cascadeIdx: int, coeff: T]] = @[]
+                            var srcL, srcR: T
                             if state.cdConstraintCanFast[ci]:
                                 for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
                                     if cpos in chanToIdx:
                                         coeffsL.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
+                                    elif cpos == pos:
+                                        srcL += coeff
                                 for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
                                     if cpos in chanToIdx:
                                         coeffsR.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
+                                    elif cpos == pos:
+                                        srcR += coeff
                             constraintCoeffL.add(coeffsL)
                             constraintCoeffR.add(coeffsR)
+                            # Joint (direct + cascade) scoring only for the
+                            # optimizer's objective bound: there the hinged
+                            # scale makes split scoring inexact (kitchen). For
+                            # ordinary model constraints the split scoring is
+                            # kept — scoring them jointly changed the lean
+                            # search's dynamics enough that sdn-chain found its
+                            # feasible solution in 3/12 runs instead of 11/12.
+                            let joint = (srcL != 0 or srcR != 0) and
+                                (gMixedAll or state.channelDepConstraints[ci].isObjectiveBound)
+                            if joint:
+                                constraintSrcCoeff.add((l: srcL, r: srcR))
+                                mixedClis.add(constraintLocalIds.len - 1)
+                                if state.cdMixedAt.len == 0:
+                                    state.cdMixedAt = newSeq[seq[tuple[ci: int, l, r: T]]](carray.len)
+                                state.cdMixedAt[pos].add((ci: ci, l: srcL, r: srcR))
+                            else:
+                                constraintSrcCoeff.add((l: T(0), r: T(0)))
 
             # Build DisjunctiveClause term coefficient mapping for DC fast cascade path
             var dcTermCoeffs: seq[seq[seq[seq[tuple[coeffIdx: int, cascIdx: int]]]]] = @[]
@@ -3463,6 +3584,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if p notin consExt:
                             state.cdReadersOf.mgetOrPut(p, @[]).add(pos)
                 state.cdCascadeConsExt.add(consExt)
+                for p in externalDeps.items:
+                    state.cdExtReadersOf.mgetOrPut(p, @[]).add(pos)
             state.cdCascadeForwardDeps.add(forwardDeps)
             state.cdCascadeExtPosToEntries.add(extPosToEntries)
             # Allocate cache for this cascade
@@ -3472,6 +3595,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.cdCascadeValues.add(chanValues)
             state.cdCascadeIsStatic.add(canStatic)
             state.cdCascadeConstraintIds.add(constraintLocalIds)
+            state.cdCascadeSrcPos.add(pos)
+            state.cdCascadeSrcCoeff.add(constraintSrcCoeff)
+            state.cdCascadeMixedClis.add(mixedClis)
             state.cdCascadeDCTermCoeffs.add(dcTermCoeffs)
             state.cdCascadeConstraintL.add(constraintCoeffL)
             state.cdCascadeConstraintR.add(constraintCoeffR)
@@ -3558,6 +3684,10 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.constraintPenalties = newSeq[seq[seq[int]]](carray.len)
     state.tabu = newSeq[seq[int]](carray.len)
     state.channelDepPenalties = newSeq[seq[int]](carray.len)
+    state.cdCacheStamp = newSeq[int](carray.len)
+    for i in 0..<carray.len: state.cdCacheStamp[i] = -1
+    state.cdCacheDirty = newSeq[int](carray.len)
+    state.cdMoveSeq = 0
     for pos in carray.allPositions():
         if pos in carray.channelPositions:
             continue
@@ -3890,7 +4020,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
                 let bindingPtr = addr state.carray.channelBindings[bi]
-                let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                let idxVal = bindingPtr[].evalIndex(state.assignment)
                 var newVal: T
                 if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                     let elem = bindingPtr.arrayElements[idxVal]
@@ -4113,7 +4243,7 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
         if pos in state.carray.expressionChannelsAtPosition:
             for bi in state.carray.expressionChannelsAtPosition[pos]:
                 let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
-                let newVal = binding.expression.evaluate(state.assignment)
+                let newVal = binding.evalExpr(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     result = true
                     changedChannels.add(binding.channelPosition)
@@ -4136,6 +4266,12 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
 
+proc cdMarkDirtyAt[T](state: TabuState[T], p: int) {.inline.} =
+    ## A value at p changed: cascades reading p from outside are stale.
+    if state.cdExtReadersOf.len == 0 or state.cdCacheDirty.len == 0: return
+    state.cdExtReadersOf.withValue(p, readers):
+        for q in readers[]: state.cdCacheDirty[q] = state.cdMoveSeq
+
 proc propagateChannelsLean[T](state: TabuState[T], position: int) =
     ## Lightweight channel propagation: updates constraint state and cost
     ## but skips penalty map updates entirely. For use during path relinking.
@@ -4147,6 +4283,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
 
     while worklist.len > 0:
         let pos = worklist.pop()
+        if pos != position: state.cdMarkDirtyAt(pos)
         # Source of this propagation (set by assignValue*): wide count channels
         # update incrementally. Consumed on first use so it can't apply twice.
         let srcInc = pos == state.propSrcPos
@@ -4157,7 +4294,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         if pos in state.carray.channelsAtPosition:
             for bi in state.carray.channelsAtPosition[pos]:
                 let bindingPtr = addr state.carray.channelBindings[bi]
-                let idxVal = bindingPtr.indexExpression.evaluate(state.assignment)
+                let idxVal = bindingPtr[].evalIndex(state.assignment)
                 var newVal: T
                 if idxVal >= 0 and idxVal < bindingPtr.arrayElements.len:
                     let elem = bindingPtr.arrayElements[idxVal]
@@ -4287,7 +4424,7 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
         if pos in state.carray.expressionChannelsAtPosition:
             for bi in state.carray.expressionChannelsAtPosition[pos]:
                 let binding {.cursor.} = state.carray.expressionChannelBindings[bi]
-                let newVal = binding.expression.evaluate(state.assignment)
+                let newVal = binding.evalExpr(state.assignment)
                 if newVal != state.assignment[binding.channelPosition]:
                     state.assignment[binding.channelPosition] = newVal
                     for c in state.constraintsAtPosition[binding.channelPosition]:
@@ -4347,6 +4484,8 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
     ## penalty map updates. Used during path relinking for fast traversal.
     let oldValueLean = state.assignment[position]
     state.assignment[position] = value
+    inc state.cdMoveSeq
+    state.cdMarkDirtyAt(position)
 
     for constraint in state.constraintsAtPosition[position]:
         let oldPenalty = constraint.penalty()
@@ -4368,6 +4507,7 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
         # Safe to iterate inverseForcedChanges directly: propagateChannelsLean doesn't modify it
         for (fPos, fOld, fNew) in state.inverseForcedChanges:
             state.assignment[fPos] = T(fNew)
+            state.cdMarkDirtyAt(fPos)
             for constraint in state.constraintsAtPosition[fPos]:
                 let oldPenalty = constraint.penalty()
                 constraint.updatePosition(fPos, T(fNew))
@@ -4394,6 +4534,7 @@ proc assignValueLean*[T](state: TabuState[T], position: int, value: T) =
             state.writebackCircuitTimes(position, state.inverseForcedChanges, state.ctpChangedBuf)
         else:
             state.writebackCircuitTimes(position, [], state.ctpChangedBuf)
+        for tp in state.ctpChangedBuf: state.cdMarkDirtyAt(tp)
         for tp in state.ctpChangedBuf:
             state.propagateChannelsLean(tp)
 
@@ -4403,6 +4544,10 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
 
     let oldValueAssign = state.assignment[position]
     state.assignment[position] = value
+    inc state.cdMoveSeq
+    state.cdMarkDirtyAt(position)
+    if gTraceMoves and state.id == 0 and state.iteration < 400:
+        echo "[Trace] S0 it=" & $state.iteration & " pos=" & $position & " " & $oldValueAssign & "->" & $value & " cost=" & $state.cost
 
     for constraint in state.constraintsAtPosition[position]:
         let oldPenalty = constraint.penalty()
@@ -4481,6 +4626,9 @@ proc assignValue*[T](state: TabuState[T], position: int, value: T) =
         state.channelChangesTotal += state.changedChannelsBuf.len
 
     let anyChannelsChanged = state.changedChannelsBuf.len > 0
+    for ch in state.changedChannelsBuf: state.cdMarkDirtyAt(ch)
+    if hasInverseMove:
+        for (fPos, fOld, fNew) in localForced: state.cdMarkDirtyAt(fPos)
 
     # Recompute channel-dep penalties only for affected search positions
     if state.hasChannelDeps and anyChannelsChanged:
@@ -4764,7 +4912,12 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             position < state.channelDepPenalties.len and
             state.channelDepPenalties[position].len > 0
         if hasChanDep:
-            state.computeChannelDepPenaltiesAt(position)
+            if not gNoCdStamp and not gNoCacheRescore and state.cdCascadeCacheValid(position):
+                when ProfileIteration: inc state.cdLeanRescore
+                state.rescoreCascadeFromCache(position)
+            else:
+                when ProfileIteration: inc state.cdLeanFull
+                state.computeChannelDepPenaltiesAt(position)
         for di in 0..<domain.len:
             let value = domain[di]
             if value == oldValue: continue
@@ -4828,11 +4981,62 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
                 echo "[CheckDelta] S" & $state.id & " it=" & $state.iteration & " pos=" & $bestPos &
                      " " & $oldValue & "->" & $bestVal & " predicted=" & $bestDelta &
                      " actual=" & $(state.cost - costBefore)
+            if state.deltaMismatches <= 5:
+                # Per-constraint attribution: revert, snapshot, re-apply, diff.
+                var before = newSeq[int](state.constraints.len)
+                state.assignValueLean(bestPos, oldValue)
+                for ci in 0..<state.constraints.len: before[ci] = state.constraints[ci].penalty()
+                var directPred = 0
+                for constraint in state.constraintsAtPosition[bestPos]:
+                    directPred += state.movePenalty(constraint, bestPos, bestVal)
+                var chanPred = 0
+                if state.hasChannelDeps and bestPos < state.channelDepPenalties.len and
+                   state.channelDepPenalties[bestPos].len > 0:
+                    state.computeChannelDepPenaltiesAt(bestPos)
+                    let dIdx = state.domIdx(bestPos, bestVal)
+                    if dIdx >= 0: chanPred = state.channelDepPenalties[bestPos][dIdx]
+                let wl = state.computeChannelDepDelta(bestPos, bestVal)
+                state.assignValueLean(bestPos, bestVal)
+                echo "[CheckDelta]   directPred=" & $directPred & " cascadePred=" & $chanPred & " worklistPred=" & $wl
+                for ci in 0..<state.constraints.len:
+                    let after = state.constraints[ci].penalty()
+                    if after != before[ci]:
+                        let c = state.constraints[ci]
+                        var isDirect = false
+                        for q in c.positions.items:
+                            if q == bestPos: isDirect = true
+                        var chanInputs = 0
+                        for q in c.positions.items:
+                            if q in state.carray.channelPositions: inc chanInputs
+                        echo "[CheckDelta]   ci=" & $ci & " type=" & $c.stateType & " pen " & $before[ci] & "->" & $after &
+                             " direct=" & $isDirect & " positions=" & $c.positions.len & " channelInputs=" & $chanInputs &
+                             " inCascade=" & $state.cdCascadeScoresConstraint(bestPos, c)
         let tabuTenure = state.iteration + 1 + state.iteration mod 10
         let oldIdx = state.domIdx(bestPos, oldValue)
         if oldIdx >= 0 and not state.isLazy[bestPos]:
             state.tabu[bestPos][oldIdx] = tabuTenure
 
+
+proc sampleByPosition[T](moves: seq[(int, T)]): (int, T) =
+    ## Tie-break among equal-cost moves by position first, then value. A flat
+    ## sample over (position, value) pairs lets a wide-domain variable hog the
+    ## plateau moves (kitchen: two 0..306 paddings held ~half of ~1200 zero-delta
+    ## ties, so the width/pair sequence that places a fixture was hardly ever
+    ## tried). bestMoves appends moves grouped by position.
+    if moves.len <= 1: return moves[0]
+    var nGroups = 0
+    var chosenStart = 0
+    var chosenEnd = 1
+    var i = 0
+    while i < moves.len:
+        var j = i + 1
+        while j < moves.len and moves[j][0] == moves[i][0]: inc j
+        inc nGroups
+        if rand(nGroups - 1) == 0:
+            chosenStart = i
+            chosenEnd = j
+        i = j
+    moves[chosenStart + rand(chosenEnd - chosenStart - 1)]
 
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
@@ -4923,7 +5127,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.applyElementImpliedMoves(p1)
         state.applyElementImpliedMoves(p2)
     elif moves.len > 0:
-        let (position, newValue) = sample(moves)
+        let (position, newValue) = if gNoPosSample: sample(moves) else: sampleByPosition(moves)
         let oldValue = state.assignment[position]
         # Compute forced changes BEFORE assignValue to capture old values for tabu
         var forcedOldValues: seq[(int, T)]
@@ -5088,6 +5292,7 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Profile S{state.id}] cdPaths: inc={state.cdIncCalls} fastPath={state.cdFastPathCalls} uniform={state.cdUniformCalls}"
         if state.cdIncCalls > 0:
             echo &"[Profile S{state.id}] cdInc: skipped={state.cdIncSkipped} evaluated={state.cdIncEvaluated} ({state.cdIncSkipped.float/(state.cdIncSkipped.float+state.cdIncEvaluated.float)*100:.1f}% cached)"
+        echo &"[Profile S{state.id}] cdConsRescore={state.cdConsRescoreCalls} leanRescore={state.cdLeanRescore} leanFull={state.cdLeanFull}"
         echo "[Profile S" & $state.id & "] Neighbor by type:"
         for ct in StatefulConstraintType:
             if state.neighborByType[ct] > 0:
@@ -5198,6 +5403,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
     # Reset timing and profiling counters for this run
     state.startTime = epochTime()
+    state.nearStallRef = state.startTime
     state.lastLogTime = state.startTime
     state.lastLogIteration = 0
     when ProfileIteration:
@@ -5231,6 +5437,9 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         state.cdFastPathCalls = 0
         state.cdIncCalls = 0
         state.cdIncSkipped = 0
+        state.cdConsRescoreCalls = 0
+        state.cdLeanRescore = 0
+        state.cdLeanFull = 0
         state.cdIncEvaluated = 0
         state.cdUniformCalls = 0
         for ct in StatefulConstraintType:
@@ -5239,7 +5448,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
     # Use lean first-improvement when cascades are large (penalty map rebuild dominates)
     if state.verbose and state.boundConstraint != nil:
-        echo &"[Tabu S{state.id}] Tracking objective-bound constraint for near-feasible states"
+        echo &"[Tabu S{state.id}] Tracking objective-bound constraint for near-feasible states (stall cap {state.nearStallSecs:.1f} s)"
     var useLeanSearch = state.hasChannelDeps and
         state.searchPositions.len >= 30 and
         state.channelDepSearchPositions.len > 0 and
@@ -5298,6 +5507,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                 state.nearBestCost = raw
                 state.nearBestAssignment = state.assignment
                 lastImprovement = state.iteration
+                state.nearStallRef = epochTime()
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
             if state.verbose:
@@ -5312,6 +5522,19 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         if deadline > 0 and (state.iteration and 0x3F) == 0 and epochTime() > deadline:
             if state.verbose:
                 state.logExitStats("Deadline")
+            state.lastImprovementIter = lastImprovement
+            return state
+        # Optimizer probe/ask stall cap: no improvement of any kind (best cost
+        # or near-feasible incumbent) for nearStallSecs. Local search cannot
+        # prove a bound infeasible, so a hopeless probe (kitchen: 560 of
+        # [1..1120], optimum 516) would otherwise run to the global deadline;
+        # a probe still descending (community detection, roster: exact optima
+        # reached only through such probes) or still finding better
+        # near-feasible states (warehouse wlp02) is left running.
+        if state.nearStallSecs > 0 and (state.iteration and 0x3F) == 0 and
+                epochTime() - state.nearStallRef > state.nearStallSecs:
+            if state.verbose:
+                state.logExitStats("Stalled")
             state.lastImprovementIter = lastImprovement
             return state
 
@@ -5377,9 +5600,9 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
         if state.cost < state.bestCost:
             lastImprovement = state.iteration
+            state.nearStallRef = epochTime()
             state.bestCost = state.cost
             state.bestAssignment = state.assignment
-            discard # diagnostic removed
             if state.cost == 0:
                 if state.verbose:
                     state.logExitStats("Solution found")

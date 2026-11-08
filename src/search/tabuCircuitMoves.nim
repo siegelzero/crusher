@@ -154,7 +154,7 @@ proc realizeChannelValue[T](state: TabuState[T], bi: int, target: T): (int, T) =
     let saved = state.assignment[idxPos]
     for v in state.sharedDomain[][idxPos]:
         state.assignment[idxPos] = v
-        let iv = b.indexExpression.evaluate(state.assignment)
+        let iv = b[].evalIndex(state.assignment)
         if iv >= 0 and iv < b.arrayElements.len:
             let elem = b.arrayElements[iv]
             let cv = if elem.isConstant: elem.constantValue

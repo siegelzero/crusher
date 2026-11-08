@@ -3,6 +3,8 @@ import resolution
 from std/times import epochTime
 import std/[algorithm, packedsets]
 import std/tables
+from std/os import getEnv
+from std/strutils import parseInt
 import ../constraints/[types, circuitTimeProp, stateful]
 import ../expressions/expressions
 
@@ -196,6 +198,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         echo "[Opt] Initial solution: ", currentCost
         flushFile(stdout)
+        # Objective of the first feasible solution: while nothing (bisection
+        # or ladder) has beaten it, the search may be stuck in a trivial
+        # attractor (kitchen: the empty layout) — see stuckAtStart below.
+        var firstCost = currentCost
         if lowIterRate and verbose:
             echo "[Opt] Low iter rate detected (", initIterRate.int, "/s) — skipping binary search bisection, going straight to retry-improvement"
             flushFile(stdout)
@@ -254,12 +260,34 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if onSolution != nil: onSolution(system.bestFeasibleAssignment)
             echo "[Opt] Resolved within domain bounds: ", currentCost
             flushFile(stdout)
+            firstCost = currentCost
 
         # Cache the base reduced domain and fixed positions (after any domain bound constraints).
         # Subsequent iterations only change the search bound — no need to recompute.
         # Use copyPackedSet for PackedSet to work around Nim 2.2.6 =copy bug under ARC.
         let baseReducedDomain = system.baseArray.reducedDomain
         let baseFixedPositions = copyPackedSet(system.baseArray.fixedPositions)
+
+        # Stall cap for probes and speculative asks (see nearStallSecs): stop a
+        # state after CRUSHER_PROBE_CAP_PCT percent of the remaining time
+        # without any improvement, at least 5 s (default 10; 100 disables it).
+        # Only for budgets of at least StallCapMinBudget seconds: on a 10 s
+        # budget community detection reaches its exact optimum only through
+        # the far bisection probe running the whole time (its near-feasible
+        # states ARE the search; cutting the probe after 2-5 quiet seconds
+        # left it at 701048 instead of 715070 in half the runs), and no cap
+        # can be both long enough for that and short enough to matter. On a
+        # 60 s kitchen run the hopeless probe at 560 of [1..1120] otherwise
+        # eats the budget (0 instead of 200-370).
+        const StallCapMinBudget = 30.0
+        var probeCapPct = 10
+        try: probeCapPct = parseInt(getEnv("CRUSHER_PROBE_CAP_PCT", "10"))
+        except ValueError: discard
+        let totalBudget = if deadline > 0: deadline - initSolveStart else: 0.0
+        proc stallCap(deadline: float): float =
+            if deadline <= 0 or probeCapPct >= 100 or totalBudget < StallCapMinBudget:
+                return 0.0
+            max(5.0, probeCapPct.float / 100.0 * (deadline - epochTime()))
 
         # Binary search bounds
         when direction == Minimize:
@@ -374,6 +402,17 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             let savedConstraints = system.baseArray.constraints
             let savedFixed = copyPackedSet(system.baseArray.fixedPositions)
 
+            # Local search cannot prove a midpoint infeasible, so a probe far
+            # above the true optimum (kitchen: midpoint 575 of [31..1120],
+            # optimum 516) otherwise runs until the global deadline and the
+            # whole budget is spent on one hopeless ask. Stall cap: a probe
+            # state stops once its near-feasible incumbent has not improved
+            # for a quarter of the remaining time (at least 2 s). A fixed
+            # wall-clock cap instead cut productive probes short (warehouse
+            # wlp02: 236650 capped vs 143590 uncapped — each restart costs 5 s
+            # of state creation and the search momentum).
+            system.baseArray.nearStallSecs = stallCap(deadline)
+
             try:
                 system.resolve(
                     parallel=parallel,
@@ -478,12 +517,30 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     # Tabu-only couldn't find — break to retry with scatter search
                     break
             finally:
+                system.baseArray.nearStallSecs = 0.0
                 system.baseArray.constraints = savedConstraints
                 system.baseArray.fixedPositions = copyPackedSet(savedFixed)
 
         # Retry: binary search used fast tabu-only probes until first failure.
         # Now try to beat the current best with full scatter search, deepening threshold on each failure.
         var retryThreshold = tabuThreshold
+        # Ask step. Two regimes (see the retry-ladder notes): in the
+        # target-limited regime every successful ask lands exactly on the
+        # asked bound and a ±1 ladder pays a full resolve per unit (kitchen:
+        # ~30 asks → 30 points in 40 s), so the step doubles on each exact
+        # hit; in the overshoot regime a ±1 ask already lands far past the
+        # target (community detection, wordpress), where speculative steps
+        # only add failures, so a success that overshoots by more than
+        # StepResetGain steps resets the step to 1. Failed or rejected asks
+        # quarter the step; speculative (step > 1) asks run tabu-only so they
+        # fail fast and never consume the scatter/LNS budget.
+        var retryStep = 1
+        const StepResetGain = 8
+        # When the incumbent is still the very first feasible solution, the
+        # seeded ask keeps restarting inside the same attractor: alternate
+        # seeded and fresh-population asks, and time-box them (a tall_complex
+        # ask for objective 1 otherwise ran 43 s of a 60 s budget).
+        var askUnseeded = false
         block retryLoop:
             while true:
                 # Check if current cost is already at the known bound.
@@ -520,26 +577,38 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.removeLastConstraint()
                     hasBoundConstraint = false
 
+                let askFrom = currentCost
+                when direction == Minimize:
+                    var askTarget = currentCost - retryStep
+                    if domainLoBound != low(int): askTarget = max(askTarget, domainLoBound)
+                    askTarget = min(askTarget, currentCost - 1)
+                else:
+                    var askTarget = currentCost + retryStep
+                    if domainHiBound != high(int): askTarget = min(askTarget, domainHiBound)
+                    askTarget = max(askTarget, currentCost + 1)
+                let effStep = abs(currentCost - askTarget)
+                let stuckAtStart = currentCost == firstCost
+
                 when direction == Minimize:
                     # See the binary-search phase: an exact circuit-time
                     # linkage replaces the explicit objective bound.
                     if not system.circuitTimeObjectiveExact:
-                        system.addConstraint(objective <= currentCost - 1)
+                        system.addConstraint(objective <= askTarget)
                         system.baseArray.constraints[^1].isObjectiveBound = true
                         hasBoundConstraint = true
                 else:
-                    system.addConstraint(objective >= currentCost + 1)
+                    system.addConstraint(objective >= askTarget)
                     system.baseArray.constraints[^1].isObjectiveBound = true
                     hasBoundConstraint = true
                 system.nearFeasibleCost = high(int)
                 system.nearFeasibleAssignment = @[]
                 # Set objective bound on CircuitTimeProp constraints (retry loop)
-                system.applyCircuitTimeObjectiveBounds(currentCost - 1, direction == Minimize)
+                system.applyCircuitTimeObjectiveBounds(askTarget, direction == Minimize)
                 system.baseArray.reducedDomain = baseReducedDomain
                 system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
                 system.baseArray.tightenReducedDomain()
                 when direction == Minimize:
-                    applyObjectiveStaging(system, currentCost - 1, verbose)
+                    applyObjectiveStaging(system, askTarget, verbose)
 
                 # Product-objective factor staging: try bounding the factors
                 # directly before the plain composite retry. `obj ≤ T` alone is
@@ -550,7 +619,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 when direction == Minimize:
                     if system.objectiveProduct.active and not system.circuitTimeObjectiveExact:
                         let op = system.objectiveProduct
-                        let target = currentCost - 1
+                        let target = askTarget
                         let curA = int(op.aExpr.evaluate(system.assignment))
                         let curB = int(op.bExpr.evaluate(system.assignment))
                         # Pareto-maximal splits (wa, hb): wa·hb ≤ target, no split
@@ -650,21 +719,36 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 let savedConstraints2 = system.baseArray.constraints
                 let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)
 
+                let thisUnseeded = askUnseeded
+                askUnseeded = false
+                # Speculative (step > 1) asks and asks that have not yet left
+                # the first solution get the probes' stall cap and run
+                # tabu-only, so they fail fast (a stalled ask surfaces as
+                # NoSolutionFoundError and is handled like a failed one).
+                let fastAsk = effStep > 1 or stuckAtStart
+                system.baseArray.nearStallSecs = if fastAsk: stallCap(deadline) else: 0.0
+
                 try:
                     if verbose:
-                        echo "[Opt] Retry targeting ", (when direction == Minimize: currentCost - 1 else: currentCost + 1)
+                        if effStep > 1:
+                            echo "[Opt] Retry targeting ", askTarget, " (step ", effStep, ")"
+                        else:
+                            echo "[Opt] Retry targeting ", askTarget
                         flushFile(stdout)
 
+                    if verbose and thisUnseeded:
+                        echo "[Opt] Retry from a fresh population"
+                        flushFile(stdout)
                     system.resolve(
                         parallel=parallel,
                         tabuThreshold=retryThreshold,
-                        scatterThreshold=scatterThreshold,
+                        scatterThreshold=(if fastAsk: 0 else: scatterThreshold),
                         populationSize=effectivePopSize,
                         numWorkers=numWorkers,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
                         deadline=deadline,
-                        seedAssignment=bestSolution,
+                        seedAssignment=(if thisUnseeded: newSeq[T]() else: bestSolution),
                     )
                     objective.initialize(system.assignment)
                     currentCost = objective.value
@@ -679,7 +763,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             system.initialize(bestSolution)
                             objective.initialize(system.assignment)
                             currentCost = objective.value
-                            retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
+                            retryStep = max(1, effStep div 4)
+                            if effStep == 1:
+                                retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
                             continue
                     else:
                         if domainHiBound != high(int) and currentCost > domainHiBound:
@@ -689,7 +775,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             system.initialize(bestSolution)
                             objective.initialize(system.assignment)
                             currentCost = objective.value
-                            retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
+                            retryStep = max(1, effStep div 4)
+                            if effStep == 1:
+                                retryThreshold = min(retryThreshold + retryThreshold div 2, 100_000)
                             continue
                     system.bestAssignmentValid = false
                     system.bestFeasibleAssignment = system.assignment
@@ -698,6 +786,11 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     echo "[Opt] Retry improved: ", currentCost
                     flushFile(stdout)
                     retryThreshold = tabuThreshold  # reset on success
+                    let gain = abs(currentCost - askFrom)
+                    if gain > StepResetGain * effStep:
+                        retryStep = 1          # overshoot regime: ±1 lands far anyway
+                    else:
+                        retryStep = effStep * 2 # exact hit: target-limited, grow
                 except TimeLimitExceededError:
                     if not adoptNearFeasible():
                         system.initialize(bestSolution)
@@ -715,11 +808,23 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         # Progress was made: keep asking, as after a retry success
                         # (with no deadline the loop is bounded by its own caps).
                         retryThreshold = tabuThreshold
+                        retryStep = max(1, effStep div 4)
                         continue
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
+                    if effStep > 1:
+                        # A speculative ask missed: shrink and re-ask at the same
+                        # threshold. Must continue even without a deadline, or the
+                        # first over-aggressive ask would abort the whole ladder.
+                        retryStep = max(1, effStep div 4)
+                        if verbose:
+                            echo "[Opt] Retry step shrinks to ", retryStep
+                            flushFile(stdout)
+                        continue
                     retryThreshold = retryThreshold * 2
                     system.adaptedTabuThreshold = 0  # force using bumped threshold
+                    if stuckAtStart:
+                        askUnseeded = not thisUnseeded
                     if verbose:
                         echo "[Opt] Retry deepening threshold to ", retryThreshold
                         flushFile(stdout)
@@ -727,6 +832,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         continue
                     break retryLoop
                 finally:
+                    system.baseArray.nearStallSecs = 0.0
                     system.baseArray.constraints = savedConstraints2
                     system.baseArray.fixedPositions = copyPackedSet(savedFixed2)
 

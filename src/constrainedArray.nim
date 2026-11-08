@@ -24,6 +24,13 @@ type
         indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
         arrayElements*: SharedElems[T]       # The array (constants and/or variable positions); shared, immutable
         hasOffset*: bool                     # true if any element has non-zero offset
+        # Flat form of a linear index expression (reified linear comparisons
+        # index a 0/1 table by a 10-term sum): evaluated as one dot product
+        # instead of walking the expression tree. See evalIndex.
+        linearIndex*: bool
+        linPositions*: seq[int]
+        linCoeffs*: seq[T]
+        linConst*: T
 
     MinMaxChannelBinding*[T] = object
         channelPosition*: int                # Position of the min/max channel variable
@@ -62,6 +69,10 @@ type
     ExpressionChannelBinding*[T] = object
         channelPosition*: int       # Position of the expression channel variable
         expression*: AlgebraicExpression[T]  # Expression to evaluate
+        linearExpr*: bool           # flat form below is valid (see evalExpr)
+        linPositions*: seq[int]
+        linCoeffs*: seq[T]
+        linConst*: T
 
     CrossingCountMaxChannelBinding*[T] = object
         ## Computes max crossing count: max_v |{j : min(a_j, b_j) < v < max(a_j, b_j)}|
@@ -109,6 +120,10 @@ type
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
+        # Optimizer probes/asks: a tabu run stops once its near-feasible
+        # incumbent (only the objective bound violated) has not improved for
+        # this many seconds (0 = off). Copied into every TabuState.
+        nearStallSecs*: float
         domain*: seq[seq[T]]
         reducedDomain*: seq[seq[T]]
         sharedDomainPtr*: ptr seq[seq[T]]  # Points to shared (non-copied) reducedDomain for parallel states
@@ -277,6 +292,16 @@ proc removeLastConstraint*[T](arr: var ConstrainedArray[T]) {.inline.} =
     arr.constraints.setLen(arr.constraints.len - 1)
     arr.reducedDomain = @[]
 
+func evalIndex*[T](b: ChannelBinding[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    ## Index value of an element channel: dot product for a linear index
+    ## expression, tree walk otherwise.
+    if b.linearIndex:
+        result = b.linConst
+        for i in 0..<b.linPositions.len:
+            result += b.linCoeffs[i] * assignment[b.linPositions[i]]
+    else:
+        result = b.indexExpression.evaluate(assignment)
+
 proc addChannelBinding*[T](arr: var ConstrainedArray[T],
                            channelPos: int,
                            indexExpr: AlgebraicExpression[T],
@@ -287,12 +312,21 @@ proc addChannelBinding*[T](arr: var ConstrainedArray[T],
             hasOff = true
             break
     let bindingIdx = arr.channelBindings.len
-    arr.channelBindings.add(ChannelBinding[T](
+    var binding = ChannelBinding[T](
         channelPosition: channelPos,
         indexExpression: indexExpr,
         arrayElements: toSharedElems(arrayElems),
         hasOffset: hasOff
-    ))
+    )
+    if indexExpr.linear and indexExpr.positions.len > 1:
+        let lin = linearize(indexExpr)
+        binding.linearIndex = true
+        binding.linConst = lin.constant
+        for pos in indexExpr.positions.items:
+            if pos in lin.coefficient and lin.coefficient[pos] != 0:
+                binding.linPositions.add(pos)
+                binding.linCoeffs.add(lin.coefficient[pos])
+    arr.channelBindings.add(binding)
     arr.channelPositions.incl(channelPos)
     # Register at index expression positions (index change → re-evaluate)
     for pos in indexExpr.positions.items:
@@ -452,6 +486,16 @@ proc addArgmaxChannelBinding*[T](arr: var ConstrainedArray[T],
         elif bindingIdx notin arr.argmaxChannelsAtPosition[pos]:
             arr.argmaxChannelsAtPosition[pos].add(bindingIdx)
 
+func evalExpr*[T](b: ExpressionChannelBinding[T], assignment: seq[T]|Table[int, T]): T {.inline.} =
+    ## Value of an expression channel: dot product for a linear expression
+    ## (a 300-term objective sum walks ~1000 tree nodes otherwise).
+    if b.linearExpr:
+        result = b.linConst
+        for i in 0..<b.linPositions.len:
+            result += b.linCoeffs[i] * assignment[b.linPositions[i]]
+    else:
+        result = b.expression.evaluate(assignment)
+
 proc addExpressionChannelBinding*[T](arr: var ConstrainedArray[T],
                                       channelPos: int,
                                       expr: AlgebraicExpression[T]) =
@@ -459,10 +503,19 @@ proc addExpressionChannelBinding*[T](arr: var ConstrainedArray[T],
     ## The channel position is added to channelPositions (not searched).
     ## Source positions are mapped in expressionChannelsAtPosition.
     let bindingIdx = arr.expressionChannelBindings.len
-    arr.expressionChannelBindings.add(ExpressionChannelBinding[T](
+    var binding = ExpressionChannelBinding[T](
         channelPosition: channelPos,
         expression: expr
-    ))
+    )
+    if expr.linear and expr.positions.len > 1:
+        let lin = linearize(expr)
+        binding.linearExpr = true
+        binding.linConst = lin.constant
+        for pos in expr.positions.items:
+            if pos in lin.coefficient and lin.coefficient[pos] != 0:
+                binding.linPositions.add(pos)
+                binding.linCoeffs.add(lin.coefficient[pos])
+    arr.expressionChannelBindings.add(binding)
     arr.channelPositions.incl(channelPos)
     for pos in expr.positions.items:
         if pos notin arr.expressionChannelsAtPosition:
@@ -1579,7 +1632,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var tempAssign = initTable[int, T]()
                     for v in currentDomain[idxPos].items:
                         tempAssign[idxPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < binding.arrayElements.len:
                             reachable.incl(binding.arrayElements[idx].constantValue)
                     let newChanDom = currentDomain[chanPos] * reachable
@@ -1596,7 +1649,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     for v in idxVals:
                         if idxRemaining <= 1: break  # never empty a domain
                         tempAssign[idxPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx < 0 or idx >= binding.arrayElements.len:
                             currentDomain[idxPos].excl(v)
                             dec idxRemaining
@@ -1613,7 +1666,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var tempAssign = initTable[int, T]()
                     for v in currentDomain[idxPos].items:
                         tempAssign[idxPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < binding.arrayElements.len:
                             let elem = binding.arrayElements[idx]
                             if elem.isConstant:
@@ -3780,7 +3833,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var tempAssign = initTable[int, T]()
                     for sv in currentDomain[srcPos].items:
                         tempAssign[srcPos] = sv
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx < 0 or idx >= binding.arrayElements.len: continue
                         if not binding.arrayElements[idx].isConstant: continue
                         let chanVal = binding.arrayElements[idx].constantValue
@@ -4529,7 +4582,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var reachableValues = initPackedSet[T]()
                     for v in currentDomain[keyPos].items:
                         tempAssign[keyPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < arrLen:
                             reachableValues.incl(arrElems[idx].constantValue)
                     let newChDom = currentDomain[chPos] * reachableValues
@@ -4543,7 +4596,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     for v in keyVals:
                         if keyRemaining <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx < 0 or idx >= arrLen:
                             currentDomain[keyPos].excl(v)
                             dec keyRemaining
@@ -4562,7 +4615,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     for v in keyVals:
                         if keyRemaining <= 1: break  # never empty a domain
                         tempAssign[keyPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx < 0 or idx >= arrLen:
                             currentDomain[keyPos].excl(v)
                             dec keyRemaining
@@ -4581,7 +4634,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         if v < domainMin[keyPos] or v > domainMax[keyPos]:
                             continue
                         tempAssign[keyPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < arrLen:
                             reachableValues.incl(arrElems[idx].constantValue)
                     if reachableValues.len > 0:
@@ -4626,7 +4679,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         tempAssign[p0] = v0
                         for v1 in currentDomain[p1].items:
                             tempAssign[p1] = v1
-                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
                                 reachableValues.incl(arrElems[idx].constantValue)
                     let newChDom = currentDomain[chPos] * reachableValues
@@ -4641,7 +4694,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         var hasSupport = false
                         for v1 in currentDomain[p1].items:
                             tempAssign[p1] = v1
-                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
                                 if arrElems[idx].constantValue in currentDomain[chPos]:
                                     hasSupport = true
@@ -4657,7 +4710,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         var hasSupport = false
                         for v0 in currentDomain[p0].items:
                             tempAssign[p0] = v0
-                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
                                 if arrElems[idx].constantValue in currentDomain[chPos]:
                                     hasSupport = true
@@ -4685,7 +4738,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         var hasSupport = false
                         for v1 in currentDomain[p1].items:
                             tempAssign[p1] = v1
-                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
                                 let val = arrElems[idx].constantValue
                                 if val >= domainMin[chPos] and val <= domainMax[chPos]:
@@ -4701,7 +4754,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         var hasSupport = false
                         for v0 in currentDomain[p0].items:
                             tempAssign[p0] = v0
-                            let idx = binding.indexExpression.evaluate(tempAssign)
+                            let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
                                 let val = arrElems[idx].constantValue
                                 if val >= domainMin[chPos] and val <= domainMax[chPos]:
@@ -4746,7 +4799,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     for combo in 0..<product:
                         for i in 0..<nPos:
                             tempAssign[idxPositions[i]] = posDomains[i][indices[i]]
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < arrLen:
                             reachableValues.incl(arrElems[idx].constantValue)
                         # Advance odometer
@@ -4788,7 +4841,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             for combo in 0..<otherProduct:
                                 for i in 0..<otherPositions.len:
                                     tempAssign[otherPositions[i]] = otherDomains[i][oIndices[i]]
-                                let idx = binding.indexExpression.evaluate(tempAssign)
+                                let idx = binding.evalIndex(tempAssign)
                                 if idx >= 0 and idx < arrLen:
                                     if arrElems[idx].constantValue in currentDomain[chPos]:
                                         hasSupport = true
@@ -4843,7 +4896,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var anyMapsToPos = false
                     for v in currentDomain[keyPos].items:
                         tempAssign[keyPos] = v
-                        let idx = binding.indexExpression.evaluate(tempAssign)
+                        let idx = binding.evalIndex(tempAssign)
                         if idx >= 0 and idx < arrLen:
                             let elem = arrElems[idx]
                             if not elem.isConstant and elem.variablePosition == pos:
@@ -4905,7 +4958,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                 # Check channel bindings (e.g., distance, pad_xy)
                 for bi in cbBindings:
                     let binding = carray.channelBindings[bi]
-                    let idx = binding.indexExpression.evaluate(tempAssign)
+                    let idx = binding.evalIndex(tempAssign)
                     let arrLen = binding.arrayElements.len
                     if idx < 0 or idx >= arrLen:
                         supported = false
@@ -5256,6 +5309,7 @@ proc removeFixedConstraints*[T](carray: var ConstrainedArray[T]) =
 proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     ## Creates a deep copy of a ConstrainedArray for thread-safe parallel processing
     result.len = arr.len
+    result.nearStallSecs = arr.nearStallSecs
 
     if arr.sharedDomainPtr != nil:
         # Parallel search state: domain not needed (reduceDomain already ran),
