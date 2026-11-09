@@ -221,6 +221,10 @@ type
         # realized by assigning that source. ci -> (source, channel columns).
         tableChanSrc*: Table[int, tuple[src: int, chanCols: seq[int]]]
         tableChanVals*: Table[int, seq[seq[T]]]   # ci -> [src domain idx] -> chanCols values (lazy)
+        # MultiMachineNoOverlap constraints with searchable machine positions,
+        # for stagnation-time machine-elimination moves
+        mmnoIndices*: seq[int]
+        machineElimApplied*: int
 
         deltaMismatches*: int   # CRUSHER_CHECK_DELTA diagnostics
         tourFailStreak*: int    # consecutive fruitless tryTourMoves scans (backoff)
@@ -1615,6 +1619,8 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
 let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
 let gNoTableChanMoves = existsEnv("CRUSHER_NO_TABLE_CHAN_MOVES")
 let gNoPermSwap = existsEnv("CRUSHER_NO_PERM_SWAP")
+let gNoMachineElim = existsEnv("CRUSHER_NO_MACHINE_ELIM")
+let gMachineElimEvery = (if existsEnv("CRUSHER_MACHINE_ELIM_EVERY"): parseInt(getEnv("CRUSHER_MACHINE_ELIM_EVERY")) else: 20)
 let gNoGeneralSwap = existsEnv("CRUSHER_NO_GENERAL_SWAP")
 let gTableMoveEvery = (if existsEnv("CRUSHER_TABLE_MOVE_EVERY"): parseInt(getEnv("CRUSHER_TABLE_MOVE_EVERY")) else: 100)
 
@@ -1819,6 +1825,17 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     state.tableChanSrc[ci] = (src: src, chanCols: chanCols)
                     state.tableInConstraintIndices.add(ci)
 
+    if not gNoMachineElim:
+        for ci, constraint in state.constraints:
+            if constraint.stateType != MultiMachineNoOverlapType: continue
+            let mc = constraint.multiMachineNoOverlapState
+            var ok = false
+            for mp in mc.machinePositions:
+                if mp >= 0:
+                    if mp in carray.channelPositions or mp in carray.fixedPositions:
+                        ok = false; break
+                    ok = true
+            if ok: state.mmnoIndices.add(ci)
     if verbose and id == 0 and state.tableChanSrc.len > 0:
         stderr.writeLine("[Init] Table moves via channel source: " & $state.tableChanSrc.len &
                          " tables (of " & $state.tableInConstraintIndices.len & " table moves)")
@@ -5326,6 +5343,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
     if state.regLineCalls > 0:
         echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
+    if state.mmnoIndices.len > 0:
+        echo &"[Tabu S{state.id}] machineElim: applied={state.machineElimApplied}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -5492,6 +5511,126 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
             if oldIdx >= 0 and not state.isLazy[pos]:
                 state.tabu[pos][oldIdx] = tabuTenure
             state.assignValue(pos, v)
+    return true
+
+
+proc tryMachineEliminationMoves[T](state: TabuState[T], allowPerturb: bool): bool =
+    ## Stagnation-time compound move for MultiMachineNoOverlap (e.g. teams):
+    ## empty one lightly loaded machine by moving every machine position on it
+    ## to another machine already in use, re-timing each moved task into its
+    ## cheapest slot. Single moves rarely empty a machine, yet objectives that
+    ## count used machines only improve when one is emptied. Applied when the
+    ## total cost drops, or as a perturbation when allowPerturb is set.
+    if state.mmnoIndices.len == 0: return false
+    let ci = state.mmnoIndices[rand(state.mmnoIndices.len - 1)]
+    let c = state.constraints[ci].multiMachineNoOverlapState
+    let nM = c.numMachineValues
+    var load = newSeq[int](nM)
+    var movable = newSeq[bool](nM)
+    var pinned = newSeq[bool](nM)     # has a fixed-machine task: cannot be emptied
+    for t in 0..<c.taskCount:
+        let m = int(c.currentMachines[t])
+        if m < 0 or m >= nM: continue
+        load[m] += c.durations[t]
+        if c.machinePositions[t] >= 0: movable[m] = true
+        else: pinned[m] = true
+    var cands: seq[int]
+    var nUsed = 0
+    for m in 0..<nM:
+        if m == c.ignoreMachine: continue
+        if movable[m] or pinned[m]: inc nUsed
+        if movable[m] and not pinned[m]: cands.add(m)
+    if cands.len == 0 or nUsed < 2: return false
+    cands.sort(proc (a, b: int): int = cmp(load[a], load[b]))
+    let m = cands[rand(min(2, cands.len - 1))]
+
+    # Machine positions currently on m, largest group first
+    var groupDur: Table[int, int]
+    for t in 0..<c.taskCount:
+        let mp = c.machinePositions[t]
+        if mp >= 0 and int(c.currentMachines[t]) == m:
+            groupDur.mgetOrPut(mp, 0) += c.durations[t]
+    var mps: seq[int]
+    for mp in groupDur.keys: mps.add(mp)
+    mps.sort(proc (a, b: int): int = cmp(groupDur[b], groupDur[a]))
+
+    let origCost = state.cost
+    var changes: seq[(int, T)]          # (position, old value), in application order
+    template leanSet(pos: int, v: T) =
+        changes.add((pos, state.assignment[pos]))
+        state.assignValueLean(pos, v)
+    template restoreAll() =
+        for i in countdown(changes.len - 1, 0):
+            state.assignValueLean(changes[i][0], changes[i][1])
+
+    var ok = true
+    for mp in mps:
+        var targets: seq[T]
+        for v in state.sharedDomain[][mp]:
+            let vi = int(v)
+            if vi != m and vi >= 0 and vi < nM and vi != c.ignoreMachine and
+               (movable[vi] or pinned[vi]):
+                targets.add(v)
+        if targets.len == 0:
+            ok = false; break
+        shuffle(targets)
+        if targets.len > 6: targets.setLen(6)
+        var bestCost = high(int)
+        var bestMoves: seq[(int, T)]
+        for v in targets:
+            let mark = changes.len
+            leanSet(mp, v)
+            for t in c.machinePosToTask[mp]:
+                # Cheapest no-overlap slot for the task on its new machine,
+                # then the best of a few such slots under the full cost
+                let sp = c.startPositions[t]
+                if sp in state.carray.fixedPositions or sp in state.carray.channelPositions: continue
+                let dom {.cursor.} = state.sharedDomain[][sp]
+                if dom.len <= 1: continue
+                let cur = state.assignment[sp]
+                let pen = c.batchMovePenalty(sp, cur, dom)
+                var minPen = high(int)
+                for x in pen: minPen = min(minPen, x)
+                var slots: seq[int]
+                for i, x in pen:
+                    if x == minPen: slots.add(i)
+                shuffle(slots)
+                if slots.len > 4: slots.setLen(4)
+                var bestS = cur
+                var bestSC = state.cost
+                for i in slots:
+                    let sv = dom[i]
+                    if sv == cur: continue
+                    state.assignValueLean(sp, sv)
+                    if state.cost < bestSC:
+                        bestSC = state.cost; bestS = sv
+                    state.assignValueLean(sp, cur)
+                if bestS != cur: leanSet(sp, bestS)
+            if state.cost < bestCost:
+                bestCost = state.cost
+                bestMoves = changes[mark..^1].mapIt((it[0], state.assignment[it[0]]))
+            # undo this target
+            for i in countdown(changes.len - 1, mark):
+                state.assignValueLean(changes[i][0], changes[i][1])
+            changes.setLen(mark)
+        for (pos, v) in bestMoves: leanSet(pos, v)
+
+    let delta = state.cost - origCost
+    var finalMoves: seq[(int, T)]
+    for (pos, _) in changes: finalMoves.add((pos, state.assignment[pos]))
+    restoreAll()
+    if not ok or finalMoves.len == 0: return false
+    if delta >= 0 and not allowPerturb: return false
+
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    for (pos, v) in finalMoves:
+        let oldVal = state.assignment[pos]
+        if v == oldVal: continue
+        let oldIdx = state.domIdx(pos, oldVal)
+        if oldIdx >= 0 and not state.isLazy[pos]:
+            state.tabu[pos][oldIdx] = tabuTenure
+        state.assignValue(pos, v)
+    inc state.machineElimApplied
     return true
 
 
@@ -5895,6 +6034,23 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via table move")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Machine elimination: empty a lightly loaded machine (team) in one move
+        if state.mmnoIndices.len > 0 and
+           state.iteration - lastImprovement >= gMachineElimEvery and
+           (state.iteration - lastImprovement) mod gMachineElimEvery == 0 and
+           not outOfBudget():
+            if state.tryMachineEliminationMoves(
+                    allowPerturb = state.iteration - lastImprovement >= 10 * gMachineElimEvery):
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via machine elimination")
                         state.lastImprovementIter = lastImprovement
                         return state
 
