@@ -2799,6 +2799,49 @@ solve minimize objective;
         check tr.maxFromLinLeDefs.len == 1
         check "D" in tr.channelVarNames
 
+    test "detectMaxFromLinLe: skipped when another constraint may need the ceiling higher":
+        ## D >= y_i + o_i (3 precedences) but D also reads into a counting
+        ## constraint (a period count): D == max(...) would lose solutions,
+        ## e.g. when the count needs D = 20. D must stay a search variable.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..20: D :: output_var;
+var bool: b :: var_is_introduced :: is_defined_var;
+constraint int_lin_le([1,-1],[y1,D],-1);
+constraint int_lin_le([1,-1],[y2,D],-1);
+constraint int_lin_le([1,-1],[y3,D],-1);
+constraint int_eq_reif(D,20,b) :: defines_var(b);
+constraint bool_clause([b],[]);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.maxFromLinLeDefs.len == 0
+        tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
+        check tr.sys.hasFeasibleSolution
+        check tr.sys.assignment[tr.varPositions["D"]] == 20
+
+    test "detectMaxFromLinLe: still detected when other references are upper bounds":
+        ## D + z <= 30 is satisfied at a lower D too, so the projection is exact.
+        let src = """
+var 1..20: y1 :: output_var;
+var 1..20: y2 :: output_var;
+var 1..20: y3 :: output_var;
+var 1..50: D :: output_var;
+var 0..30: z :: output_var;
+constraint int_lin_le([1,-1],[y1,D],-1);
+constraint int_lin_le([1,-1],[y2,D],-1);
+constraint int_lin_le([1,-1],[y3,D],-1);
+constraint int_lin_le([1,1],[D,z],30);
+solve satisfy;
+"""
+        let model = parseFzn(src)
+        var tr = translate(model)
+        check tr.maxFromLinLeDefs.len == 1
+        check "D" in tr.channelVarNames
+
 suite "Product Chain Bound Tightening":
 
     test "productChainBoundPropagate: tightens factor lower bound":

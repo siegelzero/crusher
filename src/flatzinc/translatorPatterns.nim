@@ -2715,6 +2715,61 @@ proc findForcedLargeVarNames*(tr: FznTranslator): HashSet[string] =
                 result.incl(v.ident)
         break
 
+proc ceilingLoweringUnsafe(tr: FznTranslator, groups: Table[string, seq[tuple[sourceVar: string, offset: int, ci: int]]],
+                           minimized: HashSet[string]): HashSet[string] =
+    ## Ceilings whose projection to max(sources + offset) could lose
+    ## solutions: some other constraint (channel definitions included) might
+    ## need the ceiling above that max. A reference is safe only when lowering
+    ## the ceiling cannot violate it: a positive coefficient in an int_lin_le,
+    ## the left side of int_le/int_lt, or (for a minimized ceiling) an
+    ## int_lin_eq / max defining a minimized variable or the objective.
+    var objName = ""
+    if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        objName = tr.model.solve.objective.ident
+    var own: PackedSet[int]
+    for _, infos in groups:
+        for info in infos: own.incl(info.ci)
+    proc elemsOf(arg: FznExpr): seq[FznExpr] =
+        if arg.kind == FznArrayLit: return arg.elems
+        if arg.kind == FznIdent and arg.ident in tr.arrayLitByName and
+           tr.arrayLitByName[arg.ident].kind == FznArrayLit:
+            return tr.arrayLitByName[arg.ident].elems
+        @[]
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in own: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        # Which candidate ceilings does this constraint mention?
+        var hits: seq[string]
+        for arg in con.args:
+            if arg.kind == FznIdent and arg.ident in groups: hits.add(arg.ident)
+            for e in elemsOf(arg):
+                if e.kind == FznIdent and e.ident in groups: hits.add(e.ident)
+        if hits.len == 0: continue
+        let name = stripSolverPrefix(con.name)
+        var definedVar = ""
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent: definedVar = ann.args[0].ident
+        let definesMinimized = definedVar != "" and (definedVar == objName or definedVar in minimized)
+        for c in hits:
+            var safe = false
+            case name
+            of "int_lin_le":
+                let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: @[]
+                let vs = elemsOf(con.args[1])
+                if coeffs.len == vs.len:
+                    var total = 0
+                    for i, v in vs:
+                        if v.kind == FznIdent and v.ident == c: total += coeffs[i]
+                    safe = total > 0
+            of "int_le", "int_lt":
+                safe = con.args[0].kind == FznIdent and con.args[0].ident == c and
+                       not (con.args[1].kind == FznIdent and con.args[1].ident == c)
+            of "int_lin_eq", "array_int_maximum", "int_max":
+                safe = definesMinimized and c in minimized and definedVar != c
+            else: discard
+            if not safe: result.incl(c)
+
 proc detectMaxFromLinLe*(tr: var FznTranslator) =
     ## Detects max-from-lin-le patterns:
     ## Multiple int_lin_le([1,-1], [source, ceiling], -offset) encode ceiling >= source + offset.
@@ -2807,6 +2862,8 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
     # for those — they provide per-source penalty feedback.
     var totalConsumed = 0
     var skippedHeavyRef = 0
+    var skippedUnsafe = 0
+    let unsafeCeilings = tr.ceilingLoweringUnsafe(groups, minimizedVarNames)
     for ceilingName, infos in groups:
         # Small groups (e.g. tardiness >= end - due) only for minimized ceilings
         # referenced by nothing but their objective-chain definition: projecting
@@ -2815,6 +2872,10 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
             if ceilingName notin minimizedVarNames: continue
             if ceilingNonConsumedRefs.getOrDefault(ceilingName, 0) > 1: continue
         if ceilingName in forcedLargeVarNames: continue
+        if ceilingName in unsafeCeilings:
+            # ceiling == max(...) would lose solutions that need it higher
+            if infos.len >= 3: inc skippedUnsafe
+            continue
         if ceilingName in tr.definedVarNames: continue
         if ceilingName in tr.channelVarNames: continue
         if ceilingName notin minimizedVarNames and infos.len > MaxNonObjectiveCeilingInputs:
@@ -2849,6 +2910,8 @@ proc detectMaxFromLinLe*(tr: var FznTranslator) =
         stderr.writeLine(&"[FZN] Detected {tr.maxFromLinLeDefs.len} max-from-lin-le channels, consumed {totalConsumed} int_lin_le constraints")
     if skippedHeavyRef > 0:
         stderr.writeLine(&"[FZN] Skipped {skippedHeavyRef} max-from-lin-le channels (heavily referenced by other constraints)")
+    if skippedUnsafe > 0:
+        stderr.writeLine(&"[FZN] Skipped {skippedUnsafe} max-from-lin-le channels (a constraint may need the ceiling above the max)")
 
 proc emitMaxFromLinLeChannels*(tr: var FznTranslator) =
     ## Emits max channel bindings for detected max-from-lin-le patterns.
