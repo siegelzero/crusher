@@ -860,10 +860,11 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
             let resolved = tr.resolveIntArray(coeffsArg)
             coeffs = resolved
         var varNames: seq[string]
-        if varsArg.kind == FznArrayLit:
-            for e in varsArg.elems:
-                if e.kind == FznIdent: varNames.add(e.ident)
-                else: break
+        let varElems = if varsArg.kind == FznArrayLit: varsArg.elems
+                       else: tr.resolveVarArrayElems(varsArg)   # named array
+        for e in varElems:
+            if e.kind == FznIdent: varNames.add(e.ident)
+            else: break
         if coeffs.len != varNames.len or coeffs.len < 2: continue
 
         # Find a variable with coefficient ±1 that is NOT a channel and NOT a defined var
@@ -967,6 +968,32 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
             andByInputPair[(inputs[0], inputs[1])] = resultVar
             andByInputPair[(inputs[1], inputs[0])] = resultVar
 
+    # Single-literal implications a -> b from bool_clause([b], [a]), including
+    # clauses consumed by earlier passes (the implication still holds).
+    var impliesLit: Table[string, HashSet[string]]
+    if not existsEnv("CRUSHER_OLD_COND_EXPR_LINK"):
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "bool_clause" or con.args.len < 2: continue
+            let posArg = con.args[0]
+            let negArg = con.args[1]
+            if posArg.kind != FznArrayLit or negArg.kind != FznArrayLit: continue
+            if posArg.elems.len != 1 or negArg.elems.len != 1: continue
+            if posArg.elems[0].kind != FznIdent or negArg.elems[0].kind != FznIdent: continue
+            impliesLit.mgetOrPut(negArg.elems[0].ident, initHashSet[string]()).incl(
+                posArg.elems[0].ident)
+        for def in tr.boolEquivAliasDefs:
+            impliesLit.mgetOrPut(def.canonicalVar, initHashSet[string]()).incl(def.aliasVar)
+            impliesLit.mgetOrPut(def.aliasVar, initHashSet[string]()).incl(def.canonicalVar)
+
+    proc occursImplies(occ, b: string): bool =
+        ## occ -> b directly or through one intermediate literal
+        if occ notin impliesLit: return false
+        if b in impliesLit[occ]: return true
+        for mid in impliesLit[occ]:
+            if mid in impliesLit and b in impliesLit[mid]: return true
+        false
+
     var detected = 0
     for eqBool, exprEntry in linEqReifExprMap:
         let targetVar = exprEntry.targetVar
@@ -975,9 +1002,11 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
 
         let defEntry = defaultsByTarget[targetVar]
 
-        # Verify: occurs and eqBool must be linked via array_bool_and
+        # Verify: occurs and eqBool must be linked, via array_bool_and or an
+        # implication occurs -> eqBool (together with the default clause
+        # ¬occurs -> target == const this determines target completely).
         let pair = (defEntry.occursVar, eqBool)
-        if pair notin andByInputPair: continue
+        if pair notin andByInputPair and not occursImplies(defEntry.occursVar, eqBool): continue
 
         # All checks passed. Verify expression variables are resolvable
         # (must be params, defined vars, channels, or regular vars that will get positions)

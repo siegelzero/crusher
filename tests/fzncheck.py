@@ -140,6 +140,13 @@ def main():
             while cur not in seen:
                 seen.add(cur); cur = s[cur] - off
             return cur == moved[0] and seen == set(moved)
+        if name == 'crusher_disjunctive_opt':
+            s, o, d = g[0], g[1], g[2]
+            iv = [(s[i], s[i] + d[i]) for i in range(len(s)) if o[i] and d[i] > 0]
+            for a in range(len(iv)):
+                for b in range(a + 1, len(iv)):
+                    if iv[a][0] < iv[b][1] and iv[b][0] < iv[a][1]: return False
+            return True
         if name == 'fzn_disjunctive_strict':
             s, d = g[0], g[1]
             for i in range(len(s)):

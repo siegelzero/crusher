@@ -84,6 +84,9 @@ cvrp_simple2,2015/cvrp/cvrp.mzn,2015/cvrp/simple2.dzn,minimize,10000,34,40
 filters_2026_ewf_1_3,2026/filters/filter.mzn,2026/filters/ewf_1_3.dzn,minimize,10000,28,28
 gbac_2026_csplib12,2026/gbac/gbac.mzn,2026/gbac/csplib12-gbac.dzn,minimize,15000,0,0
 workforce_alloc_2026_174,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_174.dzn,minimize,10000,45,45
+workforce_alloc_2026_202,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_202.dzn,minimize,15000,1125,3600
+workforce_alloc_2026_24_56,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_24_56.dzn,minimize,15000,1425,3600
+workforce_alloc_2026_19,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_19.dzn,minimize,15000,9000,40000
 atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance6-stage2.dzn,minimize,5000,726404,726404
 nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,
 # warehouse: regression bounds above the worst 15 s result on 5749d8b (wlp02 242508, olil4 102105 over 11 runs), not optima

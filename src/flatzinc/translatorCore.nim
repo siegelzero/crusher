@@ -1974,6 +1974,53 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         let heightPositions = newSeqWith(durations.len, -1)  # all -1 (constant height=1)
         tr.sys.addConstraint(cumulative[int](startExprs, durations, heights, 1, -1, durPositions, heightPositions))
 
+    of "crusher_disjunctive_opt":
+        # Single optional-task disjunctive: a MultiMachineNoOverlap whose
+        # "machine" is the presence bool (1 = constrained, 0 = ignored).
+        # Groups sharing an allocation variable are merged earlier by
+        # detectDisjunctiveOptMachines.
+        let sExprs = tr.resolveExprArray(con.args[0])
+        let oExprs = tr.resolveExprArray(con.args[1])
+        let durs = tr.resolveIntArray(con.args[2])
+        var startPositions, machinePositions, fixedMachines, durations: seq[int]
+        var blocks: seq[(int, int)]
+        var maxTime = 0
+        for i in 0..<durs.len:
+            if durs[i] <= 0: continue
+            let o = oExprs[i].node
+            if o.kind == LiteralNode and o.value == 0: continue
+            let sn = sExprs[i].node
+            if sn.kind == LiteralNode:
+                if o.kind != LiteralNode:
+                    raise newException(ValueError, "crusher_disjunctive_opt: optional task with constant start")
+                blocks.add((sn.value, durs[i]))
+                maxTime = max(maxTime, sn.value + durs[i])
+                continue
+            if sn.kind != RefNode:
+                raise newException(ValueError, "crusher_disjunctive_opt: unsupported start expression")
+            startPositions.add(sn.position)
+            durations.add(durs[i])
+            let dom = tr.sys.baseArray.domain[sn.position]
+            if dom.len > 0: maxTime = max(maxTime, max(dom) + durs[i])
+            if o.kind == LiteralNode:
+                machinePositions.add(-1); fixedMachines.add(1)
+            elif o.kind == RefNode:
+                machinePositions.add(o.position); fixedMachines.add(-1)
+            else:
+                raise newException(ValueError, "crusher_disjunctive_opt: unsupported presence expression")
+        if startPositions.len + (if blocks.len > 0: 1 else: 0) >= 2:
+            let c = newMultiMachineNoOverlapConstraint[int](
+                startPositions, machinePositions, fixedMachines, durations, 2, maxTime,
+                fixedBlocks = @[newSeq[(int, int)](), blocks], ignoreMachine = 0)
+            var positions = initPackedSet[int]()
+            for p in startPositions: positions.incl(p)
+            for p in machinePositions:
+                if p >= 0: positions.incl(p)
+            tr.sys.addConstraint(StatefulConstraint[int](
+                positions: positions,
+                stateType: MultiMachineNoOverlapType,
+                multiMachineNoOverlapState: c))
+
     of "fzn_diffn":
         # diffn(x, y, dx, dy) - non-overlapping rectangles
         let xExprs = tr.resolveExprArray(con.args[0])

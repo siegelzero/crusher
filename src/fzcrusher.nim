@@ -14,7 +14,7 @@
 ##   --memory <MiB>  memory budget; caps workers so peak memory fits (also reads
 ##                   the MEMORY_LIMIT env var and the cgroup limit)
 
-import std/[os, strutils, strformat, times, posix, tables, packedsets, algorithm]
+import std/[os, strutils, strformat, times, posix, tables, packedsets, algorithm, sets]
 
 import crusher
 import flatzinc/[parser, translator, output]
@@ -161,6 +161,25 @@ proc main() =
     if verbose:
       stderr.writeLine(&"[FZN] System has {tr.sys.baseArray.len} positions, {tr.sys.baseArray.constraints.len} constraints")
       stderr.writeLine(&"[Mem] after translate: rss={currentRssBytes() div MiB}MiB")
+    if existsEnv("CRUSHER_DEBUG_VAR"):
+      # Debug: how the translator classified named FZN variables (comma list)
+      for nm in getEnv("CRUSHER_DEBUG_VAR").split(','):
+        let pos = tr.varPositions.getOrDefault(nm, -1)
+        var info = &"[DebugVar] {nm}: pos={pos} channelName={nm in tr.channelVarNames} " &
+                   &"defined={nm in tr.definedVarNames} definedExpr={nm in tr.definedVarExprs}"
+        if pos >= 0:
+          let dom = tr.sys.baseArray.domain[pos]
+          info &= &" channelPos={pos in tr.sys.baseArray.channelPositions} domLen={dom.len}"
+          if dom.len > 0: info &= &" dom=[{min(dom)}..{max(dom)}]"
+          for b in tr.sys.baseArray.channelBindings:
+            if b.channelPosition == pos: info &= " elemBinding"
+          for b in tr.sys.baseArray.expressionChannelBindings:
+            if b.channelPosition == pos: info &= " exprBinding"
+          for b in tr.sys.baseArray.minMaxChannelBindings:
+            if b.channelPosition == pos: info &= " minMaxBinding"
+        elif nm in tr.definedVarExprs:
+          info &= " expr=" & $tr.definedVarExprs[nm].positions.len & "pos"
+        stderr.writeLine(info)
     if existsEnv("CRUSHER_DEBUG_BIGDOM"):
       # Debug: positions with huge explicit domains (memory/time hogs)
       var n = 0

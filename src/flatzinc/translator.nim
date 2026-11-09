@@ -726,7 +726,8 @@ type
             consumedCumulativeCIs: seq[int],
             consumedReifCIs: seq[int],
             consumedBool2intCIs: seq[int],
-            consumedVarNames: seq[string]]]  # intermediate vars to suppress
+            consumedVarNames: seq[string],  # intermediate vars to suppress
+            fixedBlocks: seq[seq[(int, int)]]]]  # per machine value: fixed busy (start, dur)
         # Unsupported constraints encountered during translation that were
         # silently dropped (no native handler). If non-empty, Crusher cannot
         # guarantee the solution satisfies the full model, so the FZN driver
@@ -1399,6 +1400,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Detect multi-machine no-overlap pattern (cumulative limit=1 with reified machine heights)
     # MUST run before detectReifChannels to prevent bool2int/int_eq_reif channelization
     result.detectMultiMachineNoOverlap()
+    result.detectDisjunctiveOptMachines()
     # Detect orphan search variables (non-annotated) — records mapping for later channel creation.
     # Runs before detectReifChannels so reification channels on orphan positions are still created.
     result.detectOrphanSearchVariables()
@@ -2771,9 +2773,12 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
 
         if not allResolved: continue
 
+        for blocks in mminfo.fixedBlocks:
+            for (bs, bd) in blocks: maxTime = max(maxTime, bs + bd)
         let c = newMultiMachineNoOverlapConstraint[int](
             startPositions, machinePositions, fixedMachines,
-            mminfo.durations, mminfo.numMachineValues, maxTime)
+            mminfo.durations, mminfo.numMachineValues, maxTime,
+            fixedBlocks = mminfo.fixedBlocks)
 
         var positions = initPackedSet[int]()
         for t in 0..<startPositions.len:

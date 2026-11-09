@@ -4306,10 +4306,164 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
             consumedCumulativeCIs: consumedCumulativeCIs,
             consumedReifCIs: allReifCIs,
             consumedBool2intCIs: allBool2intCIs,
-            consumedVarNames: allIntermediateVars))
+            consumedVarNames: allIntermediateVars,
+            fixedBlocks: newSeq[seq[(int, int)]]()))
 
         stderr.writeLine(&"[FZN] Detected multi-machine no-overlap: " &
             &"{nTasks} tasks × {indices.len} machines " &
             &"(consuming {consumedCumulativeCIs.len} cumulatives, " &
             &"{allReifCIs.len} int_eq_reif, {allBool2intCIs.len} bool2int)")
 
+
+proc detectDisjunctiveOptMachines(tr: var FznTranslator) =
+    ## Groups crusher_disjunctive_opt(s, o, d) constraints (one per machine
+    ## value, from `disjunctive([s[t] | t where A[t] == m] ++ blocks, d)`)
+    ## into a single MultiMachineNoOverlap over the allocation variables.
+    ##
+    ## Per element, the presence literal o must be (equivalent to)
+    ## int_eq_reif(A, m, _), and its start an opt-deopt alias x that equals
+    ## the real start S whenever o holds (int_eq_reif(x, S, b) with o -> b),
+    ## or S itself. Elements with presence `true` and a constant start are
+    ## fixed busy blocks of machine m. Sound only if every value m in the
+    ## domain of each allocation variable has a constraint that contains the
+    ## task, so that is checked; otherwise the constraints are left to the
+    ## per-constraint translation.
+    if existsEnv("CRUSHER_NO_DISJ_OPT_MACHINES"): return
+    var cons: seq[int]
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(tr.model.constraints[ci].name) == "crusher_disjunctive_opt":
+            cons.add(ci)
+    if cons.len < 2: return
+
+    # Indexes over the model
+    var eqReifConst: Table[string, (string, int)]       # bool -> (var, value)
+    var eqReifVarVar: Table[string, seq[(string, string)]]  # x -> [(S, bool)]
+    var implies: Table[string, HashSet[string]]          # a -> {b : a -> b}
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name == "int_eq_reif" and con.args.len == 3 and con.args[2].kind == FznIdent and
+           con.args[0].kind == FznIdent:
+            if con.args[1].kind == FznIntLit:
+                eqReifConst[con.args[2].ident] = (con.args[0].ident, con.args[1].intVal)
+            elif con.args[1].kind == FznIdent:
+                eqReifVarVar.mgetOrPut(con.args[0].ident, @[]).add(
+                    (con.args[1].ident, con.args[2].ident))
+        elif name == "bool_clause" and con.args.len == 2 and
+             con.args[0].kind == FznArrayLit and con.args[1].kind == FznArrayLit and
+             con.args[0].elems.len == 1 and con.args[1].elems.len == 1 and
+             con.args[0].elems[0].kind == FznIdent and con.args[1].elems[0].kind == FznIdent:
+            # bool_clause([b], [a]) : a -> b
+            implies.mgetOrPut(con.args[1].elems[0].ident, initHashSet[string]()).incl(
+                con.args[0].elems[0].ident)
+
+    proc impl(a, b: string): bool =
+        a in implies and b in implies[a]
+
+    type Elem = object
+        start: string
+        machineVar: string
+        dur: int
+    var perCon: seq[tuple[ci, m: int, elems: seq[Elem], blocks: seq[(int, int)]]]
+    for ci in cons:
+        let con {.cursor.} = tr.model.constraints[ci]
+        let sElems = tr.resolveVarArrayElems(con.args[0])
+        let oElems = tr.resolveVarArrayElems(con.args[1])
+        var durs: seq[int]
+        try: durs = tr.resolveIntArray(con.args[2])
+        except CatchableError: return
+        if sElems.len != oElems.len or sElems.len != durs.len: return
+        var m = int.low
+        var elems: seq[Elem]
+        var blocks: seq[(int, int)]
+        for i in 0..<sElems.len:
+            if durs[i] <= 0: continue
+            let o = oElems[i]
+            if o.kind == FznBoolLit:
+                if not o.boolVal: continue
+                if sElems[i].kind != FznIntLit: return
+                blocks.add((sElems[i].intVal, durs[i]))
+                continue
+            if o.kind != FznIdent: return
+            # Presence literal -> (A, value), directly or through an equivalence
+            var conds = @[o.ident]
+            var av = ("", 0)
+            if o.ident in eqReifConst:
+                av = eqReifConst[o.ident]
+            elif o.ident in implies:
+                for b in implies[o.ident]:
+                    if b in eqReifConst and impl(b, o.ident):
+                        av = eqReifConst[b]; conds.add(b); break
+            if av[0] == "": return
+            if m == int.low: m = av[1]
+            elif m != av[1]: return
+            # Start: the deopt alias resolves to S when present
+            if sElems[i].kind != FznIdent: return
+            var start = sElems[i].ident
+            if start in eqReifVarVar:
+                for (S, b) in eqReifVarVar[start]:
+                    var ok = false
+                    for c in conds:
+                        if impl(c, b): ok = true
+                    if ok:
+                        start = S; break
+            elems.add(Elem(start: start, machineVar: av[0], dur: durs[i]))
+        if m == int.low: return
+        perCon.add((ci: ci, m: m, elems: elems, blocks: blocks))
+
+    # Global task list keyed by (start, machine var)
+    var taskIdx: Table[(string, string), int]
+    var tasks: seq[Elem]
+    var byMachine: Table[int, HashSet[int]]   # machine value -> task indices present
+    for pc in perCon:
+        if pc.m in byMachine: return             # two constraints for one machine value
+        var present = initHashSet[int]()
+        for e in pc.elems:
+            let key = (e.start, e.machineVar)
+            if key notin taskIdx:
+                taskIdx[key] = tasks.len
+                tasks.add(e)
+            elif tasks[taskIdx[key]].dur != e.dur: return
+            present.incl(taskIdx[key])
+        byMachine[pc.m] = present
+    var startSeen: HashSet[string]
+    for t in tasks:
+        if t.start in startSeen: return
+        startSeen.incl(t.start)
+    # Coverage: each task must be constrained on every machine value it can take
+    var maxM = 0
+    for t, e in tasks:
+        let dom = tr.lookupVarDomain(e.machineVar)
+        if dom.len == 0: return
+        for v in dom:
+            if v < 0 or v notin byMachine or t notin byMachine[v]: return
+            maxM = max(maxM, v)
+    for pc in perCon:
+        if pc.m < 0: return
+        maxM = max(maxM, pc.m)
+
+    var fixedBlocks = newSeq[seq[(int, int)]](maxM + 1)
+    for pc in perCon:
+        fixedBlocks[pc.m] = pc.blocks
+        tr.definingConstraints.incl(pc.ci)
+    var startNames, machineNames: seq[string]
+    var durations, fixedMachineValues: seq[int]
+    for e in tasks:
+        startNames.add(e.start)
+        machineNames.add(e.machineVar)
+        durations.add(e.dur)
+        fixedMachineValues.add(-1)
+    tr.multiMachineNoOverlapInfos.add((
+        startVarNames: startNames,
+        durations: durations,
+        machineVarNames: machineNames,
+        fixedMachineValues: fixedMachineValues,
+        numMachineValues: maxM + 1,
+        consumedCumulativeCIs: perCon.mapIt(it.ci),
+        consumedReifCIs: newSeq[int](),
+        consumedBool2intCIs: newSeq[int](),
+        consumedVarNames: newSeq[string](),
+        fixedBlocks: fixedBlocks))
+    stderr.writeLine(&"[FZN] Detected optional-task disjunctive machines: {tasks.len} tasks × " &
+        &"{perCon.len} machines (consuming {perCon.len} crusher_disjunctive_opt)")
