@@ -83,6 +83,7 @@ cvrp_simple2,2015/cvrp/cvrp.mzn,2015/cvrp/simple2.dzn,minimize,10000,34,40
 # MiniZinc Challenge 2026 (bounds = proven optimum unless noted)
 filters_2026_ewf_1_3,2026/filters/filter.mzn,2026/filters/ewf_1_3.dzn,minimize,10000,28,28
 gbac_2026_csplib12,2026/gbac/gbac.mzn,2026/gbac/csplib12-gbac.dzn,minimize,15000,0,0
+gbac_2026_UD1,2026/gbac/gbac.mzn,2026/gbac/UD1-gbac.dzn,minimize,15000,232,4000
 workforce_alloc_2026_174,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_174.dzn,minimize,10000,45,45
 workforce_alloc_2026_202,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_202.dzn,minimize,15000,1125,3600
 workforce_alloc_2026_24_56,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_24_56.dzn,minimize,15000,1425,3600
