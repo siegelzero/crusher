@@ -46,6 +46,16 @@ type
         # k -> list of (position, value) to fix when the objective bound implies v <= k
         fixingsByBound*: Table[int, seq[(int, int)]]
 
+    ObjectiveDominant*[T] = object
+        ## Linear objective whose term `weight*v` outweighs every other term
+        ## (lexicographic weighting such as `big*teams + dispersion`). The
+        ## optimizer's retry ladder sometimes adds `v <= v_cur - 1` (minimize,
+        ## weight > 0) next to the objective bound, so search aims at the next
+        ## level of the dominant term instead of collecting small gains.
+        active*: bool
+        expr*: AlgebraicExpression[T]   # the dominant variable v
+        weight*: int
+
     ObjectiveProduct*[T] = object
         ## Detected `objective = a × b` structure (e.g. board area = w × h).
         ## When minimizing with a target bound T, the optimizer can bound the
@@ -83,6 +93,7 @@ type
         adaptedTabuThreshold*: int  # Persists adaptive threshold across resolve() calls
         objectiveStaging*: ObjectiveStaging  # Staged-presolve fixings (inactive by default)
         objectiveProduct*: ObjectiveProduct[T]  # objective = a×b factor staging (inactive by default)
+        objectiveDominant*: ObjectiveDominant[T]  # lexicographic dominant term (inactive by default)
         circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
                                           # minimized objective exactly: its metric bound
                                           # replaces the explicit objective<=target constraint

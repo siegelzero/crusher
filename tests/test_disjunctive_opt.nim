@@ -138,3 +138,41 @@ solve satisfy;
       check not overlaps(st[i], 3, 2, 2)
       for j in i+1..<3:
         check not overlaps(st[i], 3, st[j], 3)
+
+proc objExprOf(tr: FznTranslator): AlgebraicExpression[int] =
+  if tr.objectivePos >= 0: tr.getExpr(tr.objectivePos)
+  else: tr.objectiveDefExpr
+
+suite "Objective dominant term":
+
+  test "lexicographic weight is detected and optimized":
+    # obj = 100*v + r with v + r >= 4: optimum v = 1, r = 3 (obj 103)
+    let src = """
+var 1..5: v :: output_var;
+var 0..9: r :: output_var;
+var 0..1000: obj :: output_var :: is_defined_var;
+constraint int_lin_le([-1, -1], [v, r], -4);
+constraint int_lin_eq([100, 1, -1], [v, r, obj], 0) :: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check tr.sys.objectiveDominant.active
+    check tr.sys.objectiveDominant.weight == 100
+    let objExpr = tr.objExprOf()
+    minimize(tr.sys, objExpr, parallel = false, tabuThreshold = 2000,
+             lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+    check tr.sys.assignment[tr.varPositions["v"]] == 1
+    check objExpr.evaluate(tr.sys.assignment) == 103
+
+  test "comparable weights are not treated as dominant":
+    let src = """
+var 1..5: v :: output_var;
+var 0..9: r :: output_var;
+var 0..1000: obj :: output_var :: is_defined_var;
+constraint int_lin_eq([3, 1, -1], [v, r, obj], 0) :: defines_var(obj);
+solve minimize obj;
+"""
+    let model = parseFzn(src)
+    var tr = translate(model)
+    check not tr.sys.objectiveDominant.active

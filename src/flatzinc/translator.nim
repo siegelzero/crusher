@@ -1046,6 +1046,35 @@ include translatorCircuitTime
 include translatorInverseRewrite
 include translatorUnionCircuit
 
+proc buildObjectiveDominant(tr: var FznTranslator) =
+    ## Detects `minimize weight*v + rest` where weight > 0 is at least 10x every
+    ## other coefficient and v has a small domain (a count of used resources,
+    ## a level, ...). Records v for the optimizer's dominant-term asks.
+    if existsEnv("CRUSHER_NO_OBJ_DOMINANT"): return
+    if tr.model.solve.kind != Minimize: return
+    if tr.objectivePos != ObjPosDefinedExpr: return
+    if tr.objectiveDefExpr.isNil or not tr.objectiveDefExpr.linear: return
+    let lin = linearize(tr.objectiveDefExpr)
+    if lin.coefficient.len < 2: return
+    var bestPos = -1
+    var bestW = 0
+    var otherMax = 0
+    for pos, w in lin.coefficient:
+        if abs(w) > abs(bestW):
+            if bestPos >= 0: otherMax = max(otherMax, abs(bestW))
+            bestW = w; bestPos = pos
+        else:
+            otherMax = max(otherMax, abs(w))
+    if bestPos < 0 or bestW <= 0 or otherMax == 0: return
+    if bestW < 10 * otherMax: return
+    if bestPos >= tr.sys.baseArray.len: return
+    let dom = tr.sys.baseArray.domain[bestPos]
+    if dom.len < 2 or dom.len > 1000: return
+    tr.sys.objectiveDominant = ObjectiveDominant[int](
+        active: true, expr: tr.getExpr(bestPos), weight: bestW)
+    stderr.writeLine(&"[FZN] Objective dominant term: weight {bestW} (others <= {otherMax}), " &
+                     &"domain {dom.min}..{dom.max}")
+
 proc buildObjectiveStaging(tr: var FznTranslator) =
     ## Detect a linear objective dominated by a small-domain decision variable that
     ## gates structural blocks via reified implications, and precompute — for each
@@ -3550,5 +3579,6 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Precompute staged-presolve fixings for an objective dominated by a small-domain
     # gating variable (applied by the optimizer when its objective bound implies them).
     result.buildObjectiveStaging()
+    result.buildObjectiveDominant()
 
     result.finalizeBoundsOnlyDomains()

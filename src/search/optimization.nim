@@ -524,6 +524,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Retry: binary search used fast tabu-only probes until first failure.
         # Now try to beat the current best with full scatter search, deepening threshold on each failure.
         var retryThreshold = tabuThreshold
+        # Dominant-term asks (see ObjectiveDominant): ask for level v-1 of the
+        # dominant term. A miss at level k blocks dominant asks until plain
+        # asks reach k by themselves; then k-1 is tried.
+        var domBlockedLevel = high(int)
         # Ask step. Two regimes (see the retry-ladder notes): in the
         # target-limited regime every successful ask lands exactly on the
         # asked bound and a ±1 ladder pays a full resolve per unit (kitchen:
@@ -719,13 +723,30 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 let savedConstraints2 = system.baseArray.constraints
                 let savedFixed2 = copyPackedSet(system.baseArray.fixedPositions)
 
+                var domAsk = false
+                when direction == Minimize:
+                    if system.objectiveDominant.active:
+                        let od = system.objectiveDominant
+                        let curV = int(od.expr.evaluate(system.assignment))
+                        var vMin = low(int)
+                        if od.expr.positions.len == 1:
+                            for p in od.expr.positions.items:
+                                let d = system.baseArray.reducedDomain[p]
+                                if d.len > 0: vMin = int(min(d))
+                        if curV - 1 >= vMin and curV - 1 < domBlockedLevel:
+                            system.addConstraint(od.expr <= T(curV - 1))
+                            domAsk = true
+                            if verbose:
+                                echo "[Opt] Dominant ask: v <= ", curV - 1
+                                flushFile(stdout)
+
                 let thisUnseeded = askUnseeded
                 askUnseeded = false
                 # Speculative (step > 1) asks and asks that have not yet left
                 # the first solution get the probes' stall cap and run
                 # tabu-only, so they fail fast (a stalled ask surfaces as
                 # NoSolutionFoundError and is handled like a failed one).
-                let fastAsk = effStep > 1 or stuckAtStart
+                let fastAsk = effStep > 1 or stuckAtStart or domAsk
                 system.baseArray.nearStallSecs = if fastAsk: stallCap(deadline) else: 0.0
 
                 try:
@@ -812,6 +833,16 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         continue
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
+                    if domAsk:
+                        # Level v-1 not reached: plain asks until they get there
+                        let curV = int(system.objectiveDominant.expr.evaluate(system.assignment))
+                        domBlockedLevel = curV - 1
+                        if verbose:
+                            echo "[Opt] Dominant ask missed; blocked until plain asks reach v <= ", curV - 1
+                            flushFile(stdout)
+                        if deadline > 0 and epochTime() < deadline:
+                            continue
+                        break retryLoop
                     if effStep > 1:
                         # A speculative ask missed: shrink and re-ask at the same
                         # threshold. Must continue even without a deadline, or the
