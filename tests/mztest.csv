@@ -86,3 +86,8 @@ gbac_2026_csplib12,2026/gbac/gbac.mzn,2026/gbac/csplib12-gbac.dzn,minimize,15000
 workforce_alloc_2026_174,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_174.dzn,minimize,10000,45,45
 atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance6-stage2.dzn,minimize,5000,726404,726404
 nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,
+# warehouse: regression bounds above the worst 15 s result on 5749d8b (wlp02 242508, olil4 102105 over 11 runs), not optima
+warehouse_2026_wlp02,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/wlp02.dzn,minimize,15000,,260000
+warehouse_2026_olil4,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/olil4.dzn,minimize,15000,,120000
+# kitchen: regression floor; larger left the empty layout in 10/10 runs at 45-60 s (worst 178, optimum 470)
+kitchen_2026_larger,2026/kitchen/kitchen.mzn,2026/kitchen/larger.instance.json,maximize,45000,100,
