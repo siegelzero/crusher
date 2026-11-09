@@ -1,3 +1,4 @@
+import os
 #!/usr/bin/env python3
 """Independent FlatZinc solution checker (soundness debugging aid).
 
@@ -128,6 +129,18 @@ def main():
                 seen.add(cur); cur = s[cur] - off
                 if not (0 <= cur < n): return False
             return cur == 0 and len(seen) == n
+        if name == 'fzn_table_int':
+            x, t = g[0], g[1]; n = len(x)
+            return any(t[i:i+n] == x for i in range(0, len(t), n))
+        if name == 'crusher_subcircuit':
+            s = g[0]; n = len(s); off = 1 if 0 not in s else 0
+            if not all(0 <= v - off < n for v in s): return False
+            moved = [i for i in range(n) if s[i] - off != i]
+            if not moved: return True
+            seen = set(); cur = moved[0]
+            while cur not in seen:
+                seen.add(cur); cur = s[cur] - off
+            return cur == moved[0] and seen == set(moved)
         if name == 'fzn_disjunctive_strict':
             s, d = g[0], g[1]
             for i in range(len(s)):
@@ -195,6 +208,8 @@ def main():
         elif not r:
             bad[name] += 1
             if name not in examples: examples[name] = (name, a)
+            if os.environ.get('FZNCHECK_ALL'):
+                print('VIOLATED', name, [ev(x) if not (x[0] == 'id' and x[1] in A and len(A[x[1]][1]) > 40) else x[1] for x in a])
     print('violated:', dict(bad))
     for n, (name, a) in examples.items():
         print('  e.g.', name, str(a)[:300])

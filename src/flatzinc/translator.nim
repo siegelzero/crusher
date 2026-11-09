@@ -1264,6 +1264,9 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Equalities whose reification presolve fixed true become FZN aliases.
     if not existsEnv("CRUSHER_NO_FIXED_EQ_ALIAS"):
         result.aliasFixedEqualities()
+    # Set variables that only mirror derived booleans (set_in_reif + bool_eq).
+    if not existsEnv("CRUSHER_NO_SET_BIT_ALIAS"):
+        result.aliasSetMembershipBits()
     # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection
     # or constraint collection. Substitutes alias names with canonical names everywhere
     # in the model and demotes redundant parallel defining constraints (which become

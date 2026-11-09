@@ -611,6 +611,10 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         let keepCount = min(poolSize, allResults.len)
         failedPool.entries = allResults[0..<keepCount]
         failedPool.updateBounds()
+        # Debug aid (CRUSHER_DUMP_ALL): expose the best infeasible state so the
+        # CLI can dump it for tests/fzncheck.py.
+        if existsEnv("CRUSHER_DUMP_ALL"):
+            system.assignment = allResults[0].assignment
 
     if verbose:
         let bestCost = if allResults.len > 0: allResults[0].cost else: -1

@@ -2,6 +2,8 @@ import std/[packedsets, sequtils, strformat, tables, times]
 from std/os import existsEnv
 import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular, sharedElems]
 export sharedElems
+let gNoTableJointAC = existsEnv("CRUSHER_NO_TABLE_JOINT_AC")
+let gOldElementInverse = existsEnv("CRUSHER_OLD_ELEMENT_INVERSE")
 from constraints/globalCardinality import ExactCounts, BoundedCounts
 import constraints/constraintNode
 import constraints/relationalConstraint
@@ -704,6 +706,52 @@ proc detectElementInverseChannels*[T](arr: var ConstrainedArray[T]) =
                 valid = false
                 break
         if not valid: continue
+
+        # The channel sets every array cell no forward index points at to the
+        # default value. That is sound only when the forwards cover the whole
+        # array (Langford: n position vars, n cells), or when the uncovered
+        # cells are read by nothing else. Orthorio's agent array has one
+        # constant-valued element per agent (sba[next[start_a]] = a) but 55
+        # cells whose labels other constraints require: forcing them to 0 made
+        # the translated model unsatisfiable.
+        if memberIdxs.len < inversePositions.len:
+            var memberCIs: PackedSet[int]
+            for mi in memberIdxs: memberCIs.incl(candidates[mi].constraintIdx)
+            var readElsewhere = false
+            for ci in 0..<arr.constraints.len:
+                if ci in memberCIs: continue
+                for p in inversePositions:
+                    if p in arr.constraints[ci].positions:
+                        readElsewhere = true
+                        break
+                if readElsewhere: break
+            if not readElsewhere:
+                for p in inversePositions:
+                    if arr.channelPositions.len > 0 and p in arr.channelPositions:
+                        readElsewhere = true
+                        break
+            if not readElsewhere:
+                for b in arr.channelBindings:
+                    for p in inversePositions:
+                        if p in b.indexExpression.positions:
+                            readElsewhere = true
+                            break
+                    if readElsewhere: break
+                    for i in 0 ..< b.arrayElements.len:
+                        let e = b.arrayElements[i]
+                        if not e.isConstant and e.variablePosition in inverseSet:
+                            readElsewhere = true
+                            break
+                    if readElsewhere: break
+            if not readElsewhere:
+                for b in arr.expressionChannelBindings:
+                    for p in inversePositions:
+                        if p in b.expression.positions:
+                            readElsewhere = true
+                            break
+                    if readElsewhere: break
+            if readElsewhere and not gOldElementInverse:
+                continue
 
         for mi in memberIdxs:
             let info = candidates[mi]
@@ -3126,6 +3174,62 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     if gcdEqForms.len > 0:
         stderr.writeLine(&"[DomRed] GCD equality forms: {gcdEqForms.len} with non-trivial per-position GCD")
 
+    # Phase 7b inputs: channels that are a function of ONE search position
+    # through a chain of constant-array element channels (int div/mod lookups)
+    # and single-input expression channels (`+ 1`).
+    var unaryElem: Table[int, int]   # channel position -> element binding index
+    var unaryExpr: Table[int, int]   # channel position -> expression binding index
+    var unarySrcMemo: Table[int, int]
+    var tableJointPruned = 0
+    if not gNoTableJointAC:
+        for bi, b in carray.channelBindings:
+            if b.indexExpression.positions.len != 1: continue
+            var allConst = b.arrayElements.len > 0
+            for i in 0 ..< b.arrayElements.len:
+                if not b.arrayElements[i].isConstant:
+                    allConst = false
+                    break
+            if allConst: unaryElem[b.channelPosition] = bi
+        for bi, b in carray.expressionChannelBindings:
+            if b.expression.positions.len == 1: unaryExpr[b.channelPosition] = bi
+
+    proc unaryInput(pos: int): int =
+        ## The single position a unary channel reads, or -1.
+        if pos in unaryElem:
+            for p in carray.channelBindings[unaryElem[pos]].indexExpression.positions.items: return p
+        if pos in unaryExpr:
+            for p in carray.expressionChannelBindings[unaryExpr[pos]].expression.positions.items: return p
+        -1
+
+    proc unarySource(pos: int): int =
+        ## Search position that `pos` is a unary function of (itself if a
+        ## search position), or -1.
+        if pos in unarySrcMemo: return unarySrcMemo[pos]
+        var cur = pos
+        var depth = 0
+        while cur >= 0 and cur in carray.channelPositions and depth < 8:
+            cur = unaryInput(cur)
+            inc depth
+        let r = if cur >= 0 and cur notin carray.channelPositions: cur else: -1
+        unarySrcMemo[pos] = r
+        r
+
+    proc unaryEval(pos, src: int, v: T, ok: var bool): T =
+        if pos == src: return v
+        let inp = unaryInput(pos)
+        let inner = unaryEval(inp, src, v, ok)
+        if not ok: return T(0)
+        var tmp = initTable[int, T]()
+        tmp[inp] = inner
+        if pos in unaryElem:
+            let b {.cursor.} = carray.channelBindings[unaryElem[pos]]
+            let idx = b.evalIndex(tmp)
+            if idx < 0 or idx >= b.arrayElements.len:
+                ok = false
+                return T(0)
+            return b.arrayElements[idx].constantValue
+        carray.expressionChannelBindings[unaryExpr[pos]].evalExpr(tmp)
+
     let domRedStartTime = epochTime()
     const DomRedTimeBudget = 5.0  # seconds
 
@@ -5177,7 +5281,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         continue
                     for v in toSeq(currentDomain[pos].items):
                         if v notin tbl.tuplesByColumnValue[col]:
-                            continue  # Not mentioned in table — unconstrained
+                            if tbl.complete and not gNoTableJointAC:
+                                # Full-semantics table: a value in no tuple is forbidden.
+                                currentDomain[pos].excl(v)
+                                outerChanged = true
+                            continue  # Partial table: not mentioned — unconstrained
                         # Check if any tuple with this value has support in all other columns
                         var hasSupport = false
                         for t in tbl.tuplesByColumnValue[col][v]:
@@ -5255,8 +5363,84 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                             currentDomain[pos].excl(v)
                             outerChanged = true
 
+        # Phase 7b: joint table support through unary constant-array channels.
+        # Several table columns may be functions of ONE source variable (a grid
+        # successor `next` read through `nexty = (next-1) div W + 1` and
+        # `nextx = (next-1) mod W + 1`): per-column support (Phase 7) keeps every
+        # row and every column separately, so no successor is ever pruned. Here
+        # each source value is kept only if some tuple matches ALL its derived
+        # column values (other columns within their domains).
+        if not gNoTableJointAC:
+            for cons in carray.constraints:
+                if cons.stateType != TableConstraintType: continue
+                let tbl = cons.tableConstraintState
+                if tbl.mode != TableIn: continue
+                if tbl.tuples.len < MinTransitionTableSize and not tbl.gacSafe: continue
+                let nCols = tbl.sortedPositions.len
+                # source position -> columns derived from it (column itself counts)
+                var groups: Table[int, seq[int]]
+                for col in 0..<nCols:
+                    let pos = tbl.sortedPositions[col]
+                    if pos in skippedPositions: continue
+                    let src = unarySource(pos)
+                    if src < 0: continue
+                    groups.mgetOrPut(src, @[]).add(col)
+                for src, cols in tables.pairs(groups):
+                    if cols.len < 2: continue
+                    if src in skippedPositions or src in carray.channelPositions: continue
+                    if currentDomain[src].len <= 1: continue
+                    var colSet: set[0..63]
+                    var tooWide = false
+                    for c in cols:
+                        if c > 63: tooWide = true
+                        else: colSet.incl(c)
+                    if tooWide: continue
+                    var vals = newSeq[T](nCols)
+                    var remaining = currentDomain[src].len
+                    for v in toSeq(currentDomain[src].items):
+                        if remaining <= 1: break  # never empty a domain
+                        var defined = true
+                        for c in cols:
+                            vals[c] = unaryEval(tbl.sortedPositions[c], src, v, defined)
+                            if not defined: break
+                        if not defined: continue
+                        # Partial tables leave unmentioned values unconstrained.
+                        # (Full-semantics tables forbid them instead.)
+                        var mentioned = true
+                        for c in cols:
+                            if vals[c] notin tbl.tuplesByColumnValue[c]:
+                                mentioned = false
+                                break
+                        if not mentioned and not tbl.complete: continue
+                        var hasSupport = false
+                        if mentioned:
+                          for t in tbl.tuplesByColumnValue[cols[0]][vals[cols[0]]]:
+                            var ok = true
+                            for oc in 0..<nCols:
+                                if oc in colSet:
+                                    if tbl.tuples[t][oc] != vals[oc]:
+                                        ok = false
+                                        break
+                                else:
+                                    let op = tbl.sortedPositions[oc]
+                                    if op in skippedPositions: continue
+                                    if tbl.tuples[t][oc] notin currentDomain[op]:
+                                        ok = false
+                                        break
+                            if ok:
+                                hasSupport = true
+                                break
+                        if not hasSupport:
+                            currentDomain[src].excl(v)
+                            dec remaining
+                            inc tableJointPruned
+                            outerChanged = true
+
         if not outerChanged:
             break
+
+    if tableJointPruned > 0:
+        stderr.writeLine(&"[DomRed] Table joint support: {tableJointPruned} source values pruned")
 
     # Convert PackedSets to output sequences
     for pos in carray.allPositions():

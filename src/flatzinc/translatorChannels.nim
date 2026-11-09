@@ -2576,6 +2576,52 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
             else:
                 discard
 
+        # Soundness: with fewer element constraints than array cells and no
+        # at-most-once constraint, cells not hit by any index are NOT forced
+        # to the default value by the model -- they may legitimately hold any
+        # value. Channelizing them to the default is only harmless when no
+        # other constraint reads them.
+        # Constant cells count as covered when no element result can land on
+        # them (their value is not one of the results).
+        var nConstCells = 0
+        if arrName in tr.arrayLitByName and tr.arrayLitByName[arrName].kind == FznArrayLit:
+            for e in tr.arrayLitByName[arrName].elems:
+                if e.kind == FznIntLit and e.intVal notin resultSet:
+                    inc nConstCells
+        if ciList.len + nConstCells < arraySize and gccCIs.len == 0 and
+                not existsEnv("CRUSHER_OLD_INVERSE_CHANNEL"):
+            var watched = arrayElemNames
+            watched.incl(arrName)
+            for an, names in tr.arrayElementNames:
+                if an == arrName: continue
+                for n in names:
+                    if n in arrayElemNames:
+                        watched.incl(an)
+                        break
+            let ciSet = ciList.toHashSet()
+            proc refsWatched(e: FznExpr, w: HashSet[string]): bool =
+                if e.isNil: return false
+                case e.kind
+                of FznIdent: return e.ident in w
+                of FznArrayLit:
+                    for x in e.elems:
+                        if refsWatched(x, w): return true
+                else: discard
+                false
+            var readElsewhere = false
+            for ci2 in 0 ..< tr.model.constraints.len:
+                if ci2 in ciSet: continue
+                for arg in tr.model.constraints[ci2].args:
+                    if refsWatched(arg, watched):
+                        readElsewhere = true
+                        break
+                if readElsewhere: break
+            if readElsewhere:
+                stderr.writeLine(&"[FZN] Skipped inverse channel on array '{arrName}': " &
+                                 &"{ciList.len} element constraints cover only part of " &
+                                 &"{arraySize} cells, which other constraints read")
+                continue
+
         # Mark element constraints as consumed
         for ci in ciList:
             tr.definingConstraints.incl(ci)

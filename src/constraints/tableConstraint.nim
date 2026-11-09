@@ -45,6 +45,25 @@ type
         lastAffectedPositions*: PackedSet[int]
         # When true, GAC domain reduction applies even for small tables
         gacSafe*: bool
+        # Full table semantics (FlatZinc table_int): a value that appears in no
+        # tuple is forbidden. Internally generated implication tables are partial.
+        complete*: bool
+        # Dense TableIn mode (every column's value range is small): the group
+        # index, minima and counts are arrays indexed by value - colLo instead
+        # of hash tables, and updates reuse scratch buffers (no allocation).
+        dense*: bool
+        colLo: seq[T]
+        denseTuples: seq[seq[seq[int]]]   # [col][v - colLo] -> tuple indices
+        denseMin: seq[seq[int]]           # high(int) when no tuple has that value
+        denseCnt: seq[seq[int]]
+        dirtyStamp: seq[seq[int]]
+        stamp: int
+        scratchT: seq[int]
+        scratchOld: seq[int]
+        dirtyList: seq[(int, int)]
+
+const DenseColumnMaxWidth = 4096
+const DenseTotalMaxWidth = 1 shl 16
 
 ################################################################################
 # Constructor
@@ -79,6 +98,41 @@ proc newTableConstraint*[T](positions: openArray[int], tuples: seq[seq[T]],
             else:
                 result.tuplesByColumnValue[col][val].add(t)
 
+    if mode == TableIn and tuples.len > 0 and nCols > 0 and nCols <= 64:
+        var lo = newSeq[T](nCols)
+        var hi = newSeq[T](nCols)
+        for col in 0..<nCols:
+            lo[col] = tuples[0][col]
+            hi[col] = tuples[0][col]
+        for t in tuples:
+            for col in 0..<nCols:
+                if t[col] < lo[col]: lo[col] = t[col]
+                if t[col] > hi[col]: hi[col] = t[col]
+        var total = 0
+        var ok = true
+        for col in 0..<nCols:
+            let w = int(hi[col] - lo[col]) + 1
+            if w > DenseColumnMaxWidth:
+                ok = false
+                break
+            total += w
+        if ok and total <= DenseTotalMaxWidth:
+            result.dense = true
+            result.colLo = lo
+            result.denseTuples = newSeq[seq[seq[int]]](nCols)
+            result.denseMin = newSeq[seq[int]](nCols)
+            result.denseCnt = newSeq[seq[int]](nCols)
+            result.dirtyStamp = newSeq[seq[int]](nCols)
+            for col in 0..<nCols:
+                let w = int(hi[col] - lo[col]) + 1
+                result.denseTuples[col] = newSeq[seq[int]](w)
+                result.denseMin[col] = newSeq[int](w)
+                result.denseCnt[col] = newSeq[int](w)
+                result.dirtyStamp[col] = newSeq[int](w)
+            for t in 0..<tuples.len:
+                for col in 0..<nCols:
+                    result.denseTuples[col][int(tuples[t][col] - lo[col])].add(t)
+
 ################################################################################
 # Penalty computation
 ################################################################################
@@ -98,6 +152,21 @@ proc computeHammingDistances[T](state: TableConstraint[T]) =
 proc buildGroupMinCache[T](state: TableConstraint[T]) =
     ## Build cachedGroupMin and cachedGroupMinCount from current Hamming distances.
     let nCols = state.sortedPositions.len
+    if state.dense:
+        for col in 0..<nCols:
+            for k in 0..<state.denseTuples[col].len:
+                var minDist = high(int)
+                var count = 0
+                for t in state.denseTuples[col][k]:
+                    let d = state.hammingDistances[t]
+                    if d < minDist:
+                        minDist = d
+                        count = 1
+                    elif d == minDist:
+                        count += 1
+                state.denseMin[col][k] = minDist
+                state.denseCnt[col][k] = count
+        return
     state.cachedGroupMin = newSeq[Table[T, int]](nCols)
     state.cachedGroupMinCount = newSeq[Table[T, int]](nCols)
     for col in 0..<nCols:
@@ -119,6 +188,11 @@ proc buildGroupMinCache[T](state: TableConstraint[T]) =
 proc computeCostFromGroupMin[T](state: TableConstraint[T]): int =
     ## Compute cost as min over cachedGroupMin[0] values.
     result = state.sortedPositions.len + 1
+    if state.dense:
+        for minDist in state.denseMin[0]:
+            if minDist < result:
+                result = minDist
+        return
     for val, minDist in state.cachedGroupMin[0].pairs:
         if minDist < result:
             result = minDist
@@ -138,6 +212,80 @@ proc initialize*[T](state: TableConstraint[T], assignment: seq[T]) =
         state.cost = if state.zeroCount > 0: 1 else: 0
 
 
+proc updatePositionDense[T](state: TableConstraint[T], idx: int, oldValue, newValue: T) =
+    ## TableIn update on the dense index; same algorithm as the hash-table path.
+    let nCols = state.sortedPositions.len
+    let width = state.denseTuples[idx].len
+    state.scratchT.setLen(0)
+    state.scratchOld.setLen(0)
+    let ko = int(oldValue - state.colLo[idx])
+    if ko >= 0 and ko < width:
+        for t in state.denseTuples[idx][ko]:
+            state.scratchOld.add(state.hammingDistances[t])
+            state.hammingDistances[t] += 1
+            state.scratchT.add(t)
+    let kn = int(newValue - state.colLo[idx])
+    if kn >= 0 and kn < width:
+        for t in state.denseTuples[idx][kn]:
+            state.scratchOld.add(state.hammingDistances[t])
+            state.hammingDistances[t] -= 1
+            state.scratchT.add(t)
+
+    inc state.stamp
+    let stamp = state.stamp
+    state.dirtyList.setLen(0)
+    var dirtyCols = 0'u64
+    for i in 0..<state.scratchT.len:
+        let t = state.scratchT[i]
+        let oldDist = state.scratchOld[i]
+        # A tuple listed in both groups (old == new is excluded upstream) is
+        # impossible; each tuple appears once with its final distance.
+        let newDist = state.hammingDistances[t]
+        for col in 0..<nCols:
+            let k = int(state.tuples[t][col] - state.colLo[col])
+            if state.dirtyStamp[col][k] == stamp:
+                continue
+            if newDist > oldDist:
+                if oldDist == state.denseMin[col][k]:
+                    let newCount = state.denseCnt[col][k] - 1
+                    if newCount <= 0:
+                        state.dirtyStamp[col][k] = stamp
+                        state.dirtyList.add((col, k))
+                        dirtyCols = dirtyCols or (1'u64 shl col)
+                    else:
+                        state.denseCnt[col][k] = newCount
+            elif newDist < oldDist:
+                let curMin = state.denseMin[col][k]
+                if newDist < curMin:
+                    state.denseMin[col][k] = newDist
+                    state.denseCnt[col][k] = 1
+                    dirtyCols = dirtyCols or (1'u64 shl col)
+                elif newDist == curMin:
+                    state.denseCnt[col][k] += 1
+
+    for (col, k) in state.dirtyList:
+        var minDist = high(int)
+        var count = 0
+        for t in state.denseTuples[col][k]:
+            let d = state.hammingDistances[t]
+            if d < minDist:
+                minDist = d
+                count = 1
+            elif d == minDist:
+                count += 1
+        state.denseMin[col][k] = minDist
+        state.denseCnt[col][k] = count
+
+    let oldCost = state.cost
+    state.cost = state.computeCostFromGroupMin()
+    if state.cost != oldCost:
+        state.lastAffectedPositions.assignSet(state.positions)
+    else:
+        state.lastAffectedPositions = initPackedSet[int]()
+        for col in 0..<nCols:
+            if (dirtyCols and (1'u64 shl col)) != 0:
+                state.lastAffectedPositions.incl(state.sortedPositions[col])
+
 proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
     let oldValue = state.currentAssignment[position]
     if oldValue == newValue:
@@ -148,6 +296,9 @@ proc updatePosition*[T](state: TableConstraint[T], position: int, newValue: T) =
     case state.mode:
     of TableIn:
         let nCols = state.sortedPositions.len
+        if state.dense:
+            state.updatePositionDense(idx, oldValue, newValue)
+            return
 
         # Phase 1: Update only affected Hamming distances via tuplesByColumnValue[idx]
         # Collect (tupleIdx, oldDist, newDist) for Phase 2
@@ -264,8 +415,21 @@ proc moveDelta*[T](state: TableConstraint[T], position: int, oldValue, newValue:
 
     case state.mode:
     of TableIn:
+        if state.dense:
+            let gm {.cursor.} = state.denseMin[idx]
+            let lo = state.colLo[idx]
+            let maxPossible = state.sortedPositions.len + 1
+            let ko = int(oldValue - lo)
+            let kn = int(newValue - lo)
+            let term1 = if ko >= 0 and ko < gm.len and gm[ko] != high(int): gm[ko] + 1 else: high(int)
+            let term2 = if kn >= 0 and kn < gm.len and gm[kn] != high(int): gm[kn] - 1 else: maxPossible
+            var term3 = maxPossible
+            for k in 0..<gm.len:
+                if k != ko and k != kn and gm[k] < term3:
+                    term3 = gm[k]
+            return min(term1, min(term2, term3)) - state.cost
         # Use cachedGroupMin for O(1) evaluation (same logic as batchMovePenalty)
-        let groupMin = state.cachedGroupMin[idx]
+        let groupMin {.cursor.} = state.cachedGroupMin[idx]
         let maxPossible = state.sortedPositions.len + 1
 
         # term1: tuples matching oldValue at idx now have dist+1
@@ -318,8 +482,47 @@ proc batchMovePenalty*[T](state: TableConstraint[T], position: int,
 
     case state.mode:
     of TableIn:
+        if state.dense:
+            let gm {.cursor.} = state.denseMin[idx]
+            let lo = state.colLo[idx]
+            let maxPossible = state.sortedPositions.len + 1
+            # Three smallest present groups as (key, minDist).
+            var top3: array[3, (int, int)]
+            var top3Len = 0
+            for k in 0..<gm.len:
+                let d = gm[k]
+                if d == high(int): continue
+                if top3Len < 3:
+                    top3[top3Len] = (k, d)
+                    inc top3Len
+                    var j = top3Len - 1
+                    while j > 0 and top3[j][1] < top3[j-1][1]:
+                        swap(top3[j], top3[j-1])
+                        dec j
+                elif d < top3[2][1]:
+                    top3[2] = (k, d)
+                    if top3[2][1] < top3[1][1]:
+                        swap(top3[2], top3[1])
+                        if top3[1][1] < top3[0][1]:
+                            swap(top3[1], top3[0])
+            let kc = int(currentValue - lo)
+            let term1 = if kc >= 0 and kc < gm.len and gm[kc] != high(int): gm[kc] + 1 else: high(int)
+            for i in 0..<domain.len:
+                let v = domain[i]
+                if v == currentValue:
+                    result[i] = 0
+                    continue
+                let kv = int(v - lo)
+                let term2 = if kv >= 0 and kv < gm.len and gm[kv] != high(int): gm[kv] - 1 else: maxPossible
+                var term3 = maxPossible
+                for q in 0..<top3Len:
+                    if top3[q][0] != kc and top3[q][0] != kv:
+                        term3 = top3[q][1]
+                        break
+                result[i] = min(term1, min(term2, term3)) - state.cost
+            return
         # Use cached groupMin instead of scanning all tuples
-        let groupMin = state.cachedGroupMin[idx]
+        let groupMin {.cursor.} = state.cachedGroupMin[idx]
 
         # Track top-3 smallest groupMin values (value, minDist) for fast "min excluding keys"
         # We need: min of groupMin[val] for val not in {currentValue, candidateValue}

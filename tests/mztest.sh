@@ -42,6 +42,12 @@ while IFS=, read -r name model data type time_limit min_obj max_obj; do
         # Some output was produced before failure — process it
     fi
 
+    # Solver crash: report and continue with the rest of the suite
+    if echo "$output" | grep -q "=====ERROR====="; then
+        printf "${RED}ERROR${NC} (solver error)\n"
+        failed=$((failed + 1)); errors+=("$name: =====ERROR====="); continue
+    fi
+
     # Check for no-solution statuses
     if echo "$output" | grep -q "=====UNKNOWN====="; then
         printf "${RED}FAIL${NC} (no solution found)\n"
@@ -65,7 +71,7 @@ while IFS=, read -r name model data type time_limit min_obj max_obj; do
 
     # Optimization: extract _objective from last JSON solution
     obj=$(echo "$output" | grep '"_objective"' | tail -1 |
-          sed -E 's/.*"_objective"[[:space:]]*:[[:space:]]*(-?[0-9]+).*/\1/')
+          sed -E 's/.*"_objective"[[:space:]]*:[[:space:]]*(-?[0-9]+).*/\1/' || true)
 
     if [ -z "$obj" ]; then
         printf "${RED}FAIL${NC} (no objective in output)\n"

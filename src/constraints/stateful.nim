@@ -2045,6 +2045,7 @@ proc deepCopy*[T](constraint: StatefulConstraint[T]): StatefulConstraint[T] =
                 constraint.tableConstraintState.mode
             )
             tblCopy.gacSafe = constraint.tableConstraintState.gacSafe
+            tblCopy.complete = constraint.tableConstraintState.complete
             result = StatefulConstraint[T](
                 positions: constraint.positions,
                 stateType: TableConstraintType,
@@ -2801,6 +2802,18 @@ func lexLe*[T](leftExprs, rightExprs: seq[AlgebraicExpression[T]]): StatefulCons
 func tableIn*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
     ## Creates a table-in constraint: variable tuple must match one of the allowed tuples.
     let constraint = newTableConstraint[T](positions, tuples, TableIn)
+    return StatefulConstraint[T](
+        positions: constraint.positions,
+        stateType: TableConstraintType,
+        tableConstraintState: constraint
+    )
+
+func tableInComplete*[T](positions: openArray[int], tuples: seq[seq[T]]): StatefulConstraint[T] =
+    ## Creates a table-in constraint with full semantics (every allowed tuple is
+    ## listed, so values in no tuple are forbidden); GAC-safe at any size.
+    let constraint = newTableConstraint[T](positions, tuples, TableIn)
+    constraint.gacSafe = true
+    constraint.complete = true
     return StatefulConstraint[T](
         positions: constraint.positions,
         stateType: TableConstraintType,

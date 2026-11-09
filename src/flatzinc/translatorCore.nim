@@ -367,6 +367,60 @@ proc setChannelDomainFromLookup(tr: var FznTranslator, depPos: int, lookup: seq[
     dom.sort()
     tr.sys.baseArray.domain[depPos] = dom
 
+let gOldTableFD = existsEnv("CRUSHER_OLD_TABLE_FD")
+
+proc channelReaches(tr: FznTranslator, pos: int, targets: PackedSet[int],
+                    depth: int = 0): bool =
+    ## True when channel `pos` is (transitively) computed from a position in
+    ## `targets`. A channel whose binding is not built yet (marked while its
+    ## defining constraint is pending) is not inspected -- the same treatment
+    ## those keys always had.
+    if pos in targets: return true
+    if pos notin tr.sys.baseArray.channelPositions: return false
+    if depth > 16: return true
+    for b in tr.sys.baseArray.channelBindings:
+        if b.channelPosition != pos: continue
+        for p in b.indexExpression.positions.items:
+            if tr.channelReaches(p, targets, depth + 1): return true
+        for e in b.arrayElements.items:
+            if not e.isConstant and tr.channelReaches(e.variablePosition, targets, depth + 1):
+                return true
+    for b in tr.sys.baseArray.expressionChannelBindings:
+        if b.channelPosition != pos: continue
+        for p in b.expression.positions.items:
+            if tr.channelReaches(p, targets, depth + 1): return true
+    false
+
+proc keyChannelsReachDeps(tr: FznTranslator, positions: seq[int],
+                          keyCols, depCols: openArray[int]): bool =
+    ## A key column that is a channel over a dependent column would make the
+    ## dependent a function of itself (cyclic channels).
+    if gOldTableFD: return false
+    var deps: PackedSet[int]
+    for c in depCols: deps.incl(positions[c])
+    for c in keyCols:
+        if positions[c] in tr.sys.baseArray.channelPositions and
+                tr.channelReaches(positions[c], deps):
+            return true
+    false
+
+proc exprValueSet(tr: FznTranslator, expr: AlgebraicExpression[int]): seq[int] =
+    ## Values a single-position expression can take over that position's domain
+    ## (empty when the expression has several positions or a large domain).
+    let ps = toSeq(expr.positions.items)
+    if ps.len != 1: return @[]
+    let dom = tr.sys.baseArray.domain[ps[0]]
+    if dom.len == 0 or dom.len > 4096: return @[]
+    var asg = initTable[int, int]()
+    var seen: HashSet[int]
+    for v in dom:
+        asg[ps[0]] = v
+        let r = expr.evaluate(asg)
+        if r notin seen:
+            seen.incl(r)
+            result.add(r)
+    result.sort()
+
 proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
                         tuples: seq[seq[int]], keyCol: int): bool =
     ## Try column keyCol as a unique functional key.
@@ -408,6 +462,13 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
     for c in 0..<nCols:
         if c != keyCol:
             depCols.add(c)
+    # A column that is already a channel (expression/element channel) has its
+    # own definition; a second binding would silently drop one of the two.
+    for c in depCols:
+        if positions[c] in tr.sys.baseArray.channelPositions and not gOldTableFD:
+            return false
+    if tr.keyChannelsReachDeps(positions, [keyCol], depCols):
+        return false
 
     # Use first in-domain tuple's value as default for gap indices — keyRange may
     # exceed the number of keys when keys are sparse, and a low(int) sentinel
@@ -511,7 +572,24 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
             return false
         compositeKeys.incl(lk)
 
-    # Filter key columns' domains to values present in the table
+    # Dependent columns: all columns not in keyCols
+    var keyColSet: PackedSet[int]
+    for c in keyCols: keyColSet.incl(c)
+    var depCols: seq[int]
+    for c in 0..<nCols:
+        if c notin keyColSet:
+            depCols.add(c)
+
+    if depCols.len == 0:
+        return false
+    for c in depCols:
+        if positions[c] in tr.sys.baseArray.channelPositions and not gOldTableFD:
+            return false
+    if tr.keyChannelsReachDeps(positions, keyCols, depCols):
+        return false
+
+    # Filter key columns' domains to values present in the table (only once the
+    # conversion is committed: a bail-out must leave the domains untouched)
     var keyValueSets = newSeq[PackedSet[int]](nKeys)
     for t in tuples:
         if not keyInDom(t): continue
@@ -526,17 +604,6 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
                 filtered.add(v)
         if filtered.len < kDomain.len:
             tr.sys.baseArray.domain[kPos] = filtered
-
-    # Dependent columns: all columns not in keyCols
-    var keyColSet: PackedSet[int]
-    for c in keyCols: keyColSet.incl(c)
-    var depCols: seq[int]
-    for c in 0..<nCols:
-        if c notin keyColSet:
-            depCols.add(c)
-
-    if depCols.len == 0:
-        return false
 
     # Build linearized lookup arrays, using first in-domain tuple's values as
     # default for gaps (avoids sentinel low(int) causing overflow in evaluation)
@@ -645,11 +712,33 @@ proc tryTableComplementConversion(tr: var FznTranslator, positions: seq[int],
             return false
         productSize *= domSize
 
-    let forbiddenCount = productSize - tuples.len
+    # Count only DISTINCT tuples inside the domains: rows outside a column's
+    # domain allow nothing, so `productSize - tuples.len` could call a
+    # restrictive table a tautology and drop it.
+    var allowedInDomain: int
+    if existsEnv("CRUSHER_OLD_TABLE_COMPLEMENT"):
+        allowedInDomain = tuples.len
+    else:
+        var domSets = newSeq[HashSet[int]](arity)
+        for col in 0..<arity:
+            domSets[col] = toHashSet(domains[col])
+        var seenT = initHashSet[seq[int]]()
+        for t in tuples:
+            var inDom = true
+            for col in 0..<arity:
+                if t[col] notin domSets[col]:
+                    inDom = false
+                    break
+            if inDom: seenT.incl(t)
+        allowedInDomain = seenT.len
+    let forbiddenCount = productSize - allowedInDomain
 
     # Tautology: all combinations allowed, constraint is vacuous
     if forbiddenCount <= 0:
         return true
+    # Few allowed tuples: the positive table is the smaller, stronger encoding.
+    if allowedInDomain < forbiddenCount and not existsEnv("CRUSHER_OLD_TABLE_COMPLEMENT"):
+        return false
 
     # Only convert when forbidden set is small (much cheaper to enumerate and store)
     const maxForbiddenTuples = 100
@@ -2128,7 +2217,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         domainFiltered.add(t)
                 if domainFiltered.len > 0:
                     if not tr.tryTableComplementConversion(reducedPositions, domainFiltered):
-                        tr.sys.addConstraint(tableIn[int](reducedPositions, domainFiltered))
+                        tr.sys.addConstraint(tableInComplete[int](reducedPositions, domainFiltered))
                 else:
                     stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
         elif allRefs:
@@ -2153,7 +2242,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         domainFiltered.add(t)
                 if domainFiltered.len > 0:
                     if not tr.tryTableComplementConversion(positions, domainFiltered):
-                        tr.sys.addConstraint(tableIn[int](positions, domainFiltered))
+                        tr.sys.addConstraint(tableInComplete[int](positions, domainFiltered))
                 else:
                     stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
         else:
@@ -2205,11 +2294,39 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                                 seen.incl(t[col])
                                 colVals.add(t[col])
                         colVals.sort()
-                        auxVar.setDomain(colVals)
-                        tr.sys.baseArray.channelPositions.incl(auxPos)
-                        # Constrain: auxPos == expression
-                        let auxExpr = tr.getExpr(auxPos)
-                        tr.sys.addConstraint(auxExpr == expr)
+                        # The aux column is an expression channel: its domain
+                        # must be what the expression can take, not the table's
+                        # column values -- complement conversion reads the
+                        # domain, and a 1-tuple table over {v} x {w} would be
+                        # judged a tautology and dropped.
+                        var auxDom: seq[int]
+                        if not existsEnv("CRUSHER_OLD_TABLE_AUX"):
+                            var xElems: seq[FznExpr]
+                            if con.args[0].kind == FznArrayLit:
+                                xElems = con.args[0].elems
+                            elif con.args[0].kind == FznIdent and
+                                    con.args[0].ident in tr.arrayLitByName and
+                                    tr.arrayLitByName[con.args[0].ident].kind == FznArrayLit:
+                                xElems = tr.arrayLitByName[con.args[0].ident].elems
+                            if col < xElems.len and xElems[col].kind == FznIdent:
+                                auxDom = tr.lookupVarDomain(xElems[col].ident)
+                            if auxDom.len == 0:
+                                auxDom = tr.exprValueSet(expr)
+                        if auxDom.len == 0:
+                            auxDom = colVals
+                        auxVar.setDomain(auxDom)
+                        if existsEnv("CRUSHER_OLD_TABLE_AUX"):
+                            tr.sys.baseArray.channelPositions.incl(auxPos)
+                            # Constrain: auxPos == expression
+                            let auxExpr = tr.getExpr(auxPos)
+                            tr.sys.addConstraint(auxExpr == expr)
+                        else:
+                            # auxPos IS the expression: an expression channel.
+                            # (A channel position with only an equality
+                            # constraint is never written by propagation, so
+                            # the column froze at its initial value.) The table
+                            # itself restricts the column to its values.
+                            tr.sys.baseArray.addExpressionChannelBinding(auxPos, expr)
                         tablePositions.add(auxPos)
 
                 # Project out constant columns from tuples
@@ -2231,7 +2348,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                 if tablePositions.len > 0 and projectedTuples.len > 0:
                     if not tr.tryTableFunctionalDep(tablePositions, projectedTuples, projectedDefinesVarCol):
                         if not tr.tryTableComplementConversion(tablePositions, projectedTuples):
-                            tr.sys.addConstraint(tableIn[int](tablePositions, projectedTuples))
+                            tr.sys.addConstraint(tableInComplete[int](tablePositions, projectedTuples))
 
     of "fzn_global_cardinality":
         # global_cardinality(x, cover, counts)

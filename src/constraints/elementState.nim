@@ -55,6 +55,7 @@ type
         cost*: int
         positions*: PackedSet[int]
         lastAffectedPositions*: PackedSet[int]
+        lastAffectedAll: bool   # lastAffectedPositions currently == positions
         case evalMethod*: StateEvalMethod
             of PositionBased:
                 indexPosition*: int
@@ -285,18 +286,23 @@ proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
     # Update state when a variable assignment changes
     if position notin state.positions:
         state.lastAffectedPositions = initPackedSet[int]()
+        state.lastAffectedAll = false
         return
 
     let oldValue = state.currentAssignment[position]
     if oldValue == newValue:
         state.lastAffectedPositions = initPackedSet[int]()
+        state.lastAffectedAll = false
         return
 
-    # Compute affected positions before updating assignment
-    var affected = initPackedSet[int]()
+    # Affected positions are written in place: a temporary set plus a copy
+    # allocated on every call (hot in channel cascades).
+    template affected: untyped = state.lastAffectedPositions
 
     case state.evalMethod:
     of PositionBased:
+        state.lastAffectedPositions = initPackedSet[int]()
+        state.lastAffectedAll = false
         if position == state.indexPosition:
             # Index changed: value position always affected
             affected.incl(state.valuePosition)
@@ -336,10 +342,10 @@ proc updatePosition*[T](state: ElementState[T], position: int, newValue: T) =
             # else: not at current index, no affected positions
 
     of ExpressionBased:
-        # Conservative: return all positions
-        affected = state.positions
-
-    state.lastAffectedPositions.assignSet(affected)
+        # Conservative: return all positions (copied once, then kept)
+        if not state.lastAffectedAll:
+            state.lastAffectedPositions.assignSet(state.positions)
+            state.lastAffectedAll = true
 
     # Update assignment
     state.currentAssignment[position] = newValue

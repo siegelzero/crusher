@@ -435,3 +435,137 @@ proc aliasFixedEqualities(tr: var FznTranslator) =
         inc nAliased
     if nAliased > 0:
         stderr.writeLine(&"[FZN] Aliased {nAliased} presolve-fixed variable equalities")
+
+proc aliasSetMembershipBits(tr: var FznTranslator) =
+    ## MiniZinc flattens a variable-range set such as `nexty(n)+1 .. y-1` into a
+    ## free `var set of lo..hi: S` whose only role is to equal derived booleans:
+    ##   set_in_reif(k, S, b_k) :: defines_var(b_k)
+    ##   bool_eq(b_k, d_k)                 (d_k from e.g. int_le_reif)
+    ## Decomposed, S becomes hi-lo+1 free search booleans that the search must
+    ## keep repairing toward d_k (orthorio: 490 of 584 search positions). When
+    ## S is used ONLY by such set_in_reif constraints (distinct constants inside
+    ## its universe) and every b_k has a bool_eq partner, S carries no
+    ## information beyond the d_k: alias b_k to d_k, consume the set_in_reif and
+    ## the bool_eq, and drop S's decomposition. MUST run before
+    ## canonicalizeFznVarAliases and translateVariables.
+    var declIdx: Table[string, int]
+    for i, decl in tr.model.variables:
+        if not decl.isArray: declIdx[decl.name] = i
+
+    proc walk(e: FznExpr, acc: var seq[string]) =
+        if e.isNil: return
+        case e.kind
+        of FznIdent: acc.add(e.ident)
+        of FznArrayLit:
+            for x in e.elems: walk(x, acc)
+        of FznAnnotationExpr:
+            for x in e.annArgs: walk(x, acc)
+        else: discard
+
+    # Identifier -> constraint indices; identifiers used outside constraints
+    # (array literals, solve item) are never eliminated.
+    var refs: Table[string, seq[int]]
+    for ci in 0 ..< tr.model.constraints.len:
+        var ids: seq[string]
+        for arg in tr.model.constraints[ci].args: walk(arg, ids)
+        for id in ids: refs.mgetOrPut(id, @[]).add(ci)
+    var pinned: HashSet[string]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil:
+            var ids: seq[string]
+            walk(decl.value, ids)
+            for id in ids: pinned.incl(id)
+    block:
+        var ids: seq[string]
+        if tr.model.solve.objective != nil: walk(tr.model.solve.objective, ids)
+        for ann in tr.model.solve.annotations:
+            for a in ann.args: walk(a, ids)
+        for id in ids: pinned.incl(id)
+
+    proc boolDom(tr: FznTranslator, name: string): seq[int] =
+        if name in tr.presolveDomains: tr.presolveDomains[name] else: @[0, 1]
+
+    # Set-membership booleans of every candidate set: their bool_eq partners
+    # must lie outside this set so aliases never chain into a cycle.
+    var bitNames: HashSet[string]
+    type Plan = tuple[setName: string, reifCIs, eqCIs: seq[int], bits, partners: seq[string]]
+    var plans: seq[Plan]
+    for decl in tr.model.variables:
+        if decl.isArray or not decl.isVar or decl.value != nil: continue
+        if decl.varType.kind notin {FznSetOfIntRange, FznSetOfIntSet}: continue
+        if decl.name in tr.skipSetVarNames or decl.name in pinned: continue
+        if decl.hasAnnotation("output_var"): continue
+        let universe =
+            if decl.varType.kind == FznSetOfIntRange: toSeq(decl.varType.setLo .. decl.varType.setHi)
+            else: decl.varType.setValues
+        var plan: Plan
+        plan.setName = decl.name
+        var ok = decl.name in refs
+        var seenK: HashSet[int]
+        for ci in refs.getOrDefault(decl.name, @[]):
+            if not ok: break
+            let con {.cursor.} = tr.model.constraints[ci]
+            if ci in tr.definingConstraints or stripSolverPrefix(con.name) != "set_in_reif" or
+                    con.args.len != 3 or con.args[0].kind != FznIntLit or
+                    con.args[1].kind != FznIdent or con.args[1].ident != decl.name or
+                    con.args[2].kind != FznIdent:
+                ok = false
+                break
+            let k = con.args[0].intVal
+            let b = con.args[2].ident
+            if k in seenK or k notin universe or b notin declIdx or b in pinned or
+                    tr.model.variables[declIdx[b]].hasAnnotation("output_var") or
+                    tr.model.variables[declIdx[b]].value != nil:
+                ok = false
+                break
+            seenK.incl(k)
+            plan.reifCIs.add(ci)
+            plan.bits.add(b)
+        if ok and plan.bits.len > 0:
+            for b in plan.bits: bitNames.incl(b)
+            plans.add(plan)
+    if plans.len == 0: return
+
+    var nSets = 0
+    var nBits = 0
+    for plan in plans.mitems:
+        var ok = true
+        for b in plan.bits:
+            var found = -1
+            var partner = ""
+            for ci in refs.getOrDefault(b, @[]):
+                if ci in tr.definingConstraints: continue
+                let con {.cursor.} = tr.model.constraints[ci]
+                if stripSolverPrefix(con.name) != "bool_eq" or con.args.len != 2: continue
+                if con.args[0].kind != FznIdent or con.args[1].kind != FznIdent: continue
+                let other =
+                    if con.args[0].ident == b: con.args[1].ident
+                    elif con.args[1].ident == b: con.args[0].ident
+                    else: ""
+                if other == "" or other == b or other in bitNames or other notin declIdx: continue
+                # The alias drops b's own domain: d's must be contained in it.
+                let db = tr.boolDom(b)
+                var contained = true
+                for v in tr.boolDom(other):
+                    if v notin db: contained = false
+                if not contained: continue
+                found = ci
+                partner = other
+                break
+            if found < 0:
+                ok = false
+                break
+            plan.eqCIs.add(found)
+            plan.partners.add(partner)
+        if not ok: continue
+        for i, b in plan.bits:
+            tr.model.variables[declIdx[b]].value = FznExpr(kind: FznIdent, ident: plan.partners[i])
+            tr.definingConstraints.incl(plan.eqCIs[i])
+            let rci = plan.reifCIs[i]
+            tr.definingConstraints.incl(rci)
+            tr.model.constraints[rci].annotations.keepItIf(it.name != "defines_var")
+        tr.skipSetVarNames.incl(plan.setName)
+        inc nSets
+        nBits += plan.bits.len
+    if nSets > 0:
+        stderr.writeLine(&"[FZN] Set-membership aliasing: {nSets} set vars eliminated, {nBits} membership bools aliased to their bool_eq partners")

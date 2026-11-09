@@ -235,7 +235,10 @@ proc main() =
   # MiniZinc's --time-limit includes its own compilation time (before we start).
   # Anchor to process start and subtract a small margin. If our deadline doesn't
   # fire in time, the SIGTERM handler will output the best solution.
-  let deadline = if timeLimitMs > 0: wallStart + timeLimitMs.float / 1000.0 - 2.0 else: 0.0
+  # The margin shrinks for short limits: a flat 2 s put the deadline at process
+  # start for -t 2000, so parallel search never ran (UNKNOWN on trivial models).
+  let deadlineMargin = min(2.0, max(0.1, timeLimitMs.float / 1000.0 * 0.1))
+  let deadline = if timeLimitMs > 0: wallStart + timeLimitMs.float / 1000.0 - deadlineMargin else: 0.0
 
   # Redirect stdout to stderr during solving (solver echo goes to stderr)
   let savedFd = dup(stdout.getFileHandle())
@@ -441,6 +444,10 @@ proc main() =
     if tr.sys.optimalityProven:
       printComplete()  # Domain reduction proved no better solution exists
   else:
+    # Debug aid: dump the final (infeasible) assignment so tests/fzncheck.py
+    # can name the original constraints the search left violated.
+    if existsEnv("CRUSHER_DUMP_ALL") and tr.sys.assignment.len > 0:
+      tr.dumpAllVarValues(getEnv("CRUSHER_DUMP_ALL"))
     # Crusher cannot prove unsatisfiability either, so always report UNKNOWN.
     printUnknown()
 
