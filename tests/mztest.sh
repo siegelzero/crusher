@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 SOLVER_MSC="$PROJECT_ROOT/minizinc/crusher.msc"
 FZCRUSHER="$PROJECT_ROOT/fzcrusher"
-TEST_DEFS="$SCRIPT_DIR/mztest.csv"
+TEST_DEFS="${MZTEST_DEFS:-$SCRIPT_DIR/mztest.csv}"  # override to run a subset
 MZN_DIR="$PROJECT_ROOT/minizinc_challenge"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'

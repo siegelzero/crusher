@@ -216,6 +216,11 @@ type
 
         # Cached list of tableIn constraint indices for fast stagnation-time table moves
         tableInConstraintIndices*: seq[int]
+        # Table constraints whose channel columns are all functions of ONE search
+        # position (e.g. [sb, nexty, nextx] with nexty/nextx = f(next)): a tuple is
+        # realized by assigning that source. ci -> (source, channel columns).
+        tableChanSrc*: Table[int, tuple[src: int, chanCols: seq[int]]]
+        tableChanVals*: Table[int, seq[seq[T]]]   # ci -> [src domain idx] -> chanCols values (lazy)
 
         deltaMismatches*: int   # CRUSHER_CHECK_DELTA diagnostics
         tourFailStreak*: int    # consecutive fruitless tryTourMoves scans (backoff)
@@ -1608,6 +1613,44 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
         stderr.flushFile()
 
 let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
+let gNoTableChanMoves = existsEnv("CRUSHER_NO_TABLE_CHAN_MOVES")
+let gNoPermSwap = existsEnv("CRUSHER_NO_PERM_SWAP")
+let gNoGeneralSwap = existsEnv("CRUSHER_NO_GENERAL_SWAP")
+let gTableMoveEvery = (if existsEnv("CRUSHER_TABLE_MOVE_EVERY"): parseInt(getEnv("CRUSHER_TABLE_MOVE_EVERY")) else: 100)
+
+iterator channelBindingIdxOf[T](carray: ConstrainedArray[T], pos: int): int =
+    for bi in 0..<carray.channelBindings.len:
+        if carray.channelBindings[bi].channelPosition == pos: yield bi
+
+iterator exprChannelBindingIdxOf[T](carray: ConstrainedArray[T], pos: int): int =
+    for bi in 0..<carray.expressionChannelBindings.len:
+        if carray.expressionChannelBindings[bi].channelPosition == pos: yield bi
+
+proc channelSearchSources[T](carray: ConstrainedArray[T], pos: int,
+                             srcs: var PackedSet[int], depth: int): bool =
+    ## Collects the non-fixed search positions a channel position is computed
+    ## from (through element and expression channel bindings). Returns false
+    ## for any other binding kind or a chain deeper than 8.
+    if pos in carray.fixedPositions: return true
+    if pos notin carray.channelPositions:
+        srcs.incl(pos)
+        return true
+    if depth > 8: return false
+    var found = false
+    for bi in carray.channelBindingIdxOf(pos):
+        found = true
+        let b {.cursor.} = carray.channelBindings[bi]
+        for p in b.indexExpression.positions.items:
+            if not carray.channelSearchSources(p, srcs, depth + 1): return false
+        for k in 0..<b.arrayElements.len:
+            let e = b.arrayElements[k]
+            if not e.isConstant:
+                if not carray.channelSearchSources(e.variablePosition, srcs, depth + 1): return false
+    for bi in carray.exprChannelBindingIdxOf(pos):
+        found = true
+        for p in carray.expressionChannelBindings[bi].expression.positions.items:
+            if not carray.channelSearchSources(p, srcs, depth + 1): return false
+    return found
 # A/B switches for the cascade/count evaluation paths (debugging aids)
 let gNoExprCascade = existsEnv("CRUSHER_NO_EXPR_CASCADE")
 let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
@@ -1757,7 +1800,28 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     break
             if not hasChannelPos:
                 state.tableInConstraintIndices.add(ci)
+            elif not gNoTableChanMoves:
+                let tc = constraint.tableConstraintState
+                var src = -1
+                var chanCols: seq[int]
+                var ok = true
+                for col, pos in tc.sortedPositions:
+                    if pos notin carray.channelPositions: continue
+                    var srcs: PackedSet[int]
+                    if not carray.channelSearchSources(pos, srcs, 0) or srcs.len != 1:
+                        ok = false; break
+                    let s0 = toSeq(srcs.items)[0]
+                    if (src >= 0 and s0 != src) or s0 in tc.positions:
+                        ok = false; break
+                    src = s0
+                    chanCols.add(col)
+                if ok and src >= 0:
+                    state.tableChanSrc[ci] = (src: src, chanCols: chanCols)
+                    state.tableInConstraintIndices.add(ci)
 
+    if verbose and id == 0 and state.tableChanSrc.len > 0:
+        stderr.writeLine("[Init] Table moves via channel source: " & $state.tableChanSrc.len &
+                         " tables (of " & $state.tableInConstraintIndices.len & " table moves)")
     # Map each channel position to its element channel binding, so circuit-merge
     # moves can realize a successor change by flipping the selecting index variable.
     if state.channelCircuitConstraints.len > 0:
@@ -4949,7 +5013,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             break  # cap positions checked
 
     # Also evaluate permutation swaps
-    if state.gccGroupPositions.len > 0 and
+    if state.gccGroupPositions.len > 0 and not gNoPermSwap and
        (state.cost <= state.gccGroupPositions.len div 5 or state.iteration mod 3 == 0):
         let (permMoves, permCost) = state.bestPermutationSwapMoves()
         if permMoves.len > 0 and permCost < state.cost + bestDelta:
@@ -5300,12 +5364,65 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     state.logProfileStats()
 
 
+proc tableChanValues[T](state: TabuState[T], ci: int): ptr seq[seq[T]] =
+    ## [source domain idx] -> values the table's channel columns take when the
+    ## channel source holds that value (computed once by lean simulation).
+    if ci notin state.tableChanVals:
+        let info = state.tableChanSrc[ci]
+        let tc = state.constraints[ci].tableConstraintState
+        let dom = state.sharedDomain[][info.src]
+        let orig = state.assignment[info.src]
+        var vals = newSeq[seq[T]](dom.len)
+        for di, v in dom:
+            if v != state.assignment[info.src]: state.assignValueLean(info.src, v)
+            var row = newSeq[T](info.chanCols.len)
+            for k, col in info.chanCols: row[k] = state.assignment[tc.sortedPositions[col]]
+            vals[di] = row
+        if state.assignment[info.src] != orig: state.assignValueLean(info.src, orig)
+        state.tableChanVals[ci] = vals
+    addr state.tableChanVals[ci]
+
+proc tableMoveChanges[T](state: TabuState[T], ci: int, tup: seq[T],
+                         moves: var seq[(int, T)]): bool =
+    ## Search-position assignments realizing tuple `tup` of table ci (channel
+    ## columns realized through their single source). False if unrealizable.
+    moves.setLen(0)
+    let tc = state.constraints[ci].tableConstraintState
+    let hasChan = ci in state.tableChanSrc
+    var same = true
+    for col, pos in tc.sortedPositions:
+        if hasChan and pos in state.carray.channelPositions: continue
+        if tup[col] != state.assignment[pos]:
+            same = false
+            if tup[col] notin state.sharedDomain[][pos]: return false
+            moves.add((pos, tup[col]))
+    if hasChan:
+        let info = state.tableChanSrc[ci]
+        let vals = state.tableChanValues(ci)
+        let dom {.cursor.} = state.sharedDomain[][info.src]
+        var cands: seq[int]
+        for di in 0..<dom.len:
+            var match = true
+            for k, col in info.chanCols:
+                if vals[][di][k] != tup[col]:
+                    match = false; break
+            if match: cands.add(di)
+        if cands.len == 0: return false
+        var curOk = false
+        for di in cands:
+            if dom[di] == state.assignment[info.src]: curOk = true
+        if not curOk:
+            same = false
+            moves.add((info.src, dom[cands[rand(cands.len - 1)]]))
+    return not same
+
 proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
     ## Stagnation-triggered table move: pick a random table constraint and
     ## try switching to a different valid tuple. Uses cheap simulation via
     ## assignValueLean to find a strictly improving move, then applies it.
     ## When allowPerturb is true, also applies neutral/slightly-worse moves
     ## as a perturbation to escape deep local optima.
+    ## Violated tables are tried first.
     if state.tableInConstraintIndices.len == 0: return false
 
     # Try a few random table constraints
@@ -5313,21 +5430,25 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
     const MAX_TUPLES_PER_TABLE = 8
 
     var bestDelta = 0  # only accept strictly improving moves
-    var bestCI = -1
-    var bestTupleIdx = -1
+    var bestMoves: seq[(int, T)]
     # Track best perturbation candidate (smallest non-improving delta)
     var perturbDelta = high(int)
-    var perturbCI = -1
-    var perturbTupleIdx = -1
+    var perturbMoves: seq[(int, T)]
 
     var tableCandidates = state.tableInConstraintIndices
     shuffle(tableCandidates)
+    if state.tableChanSrc.len > 0:
+        var violated, rest: seq[int]
+        for ci in tableCandidates:
+            if state.constraints[ci].tableConstraintState.cost > 0: violated.add(ci)
+            else: rest.add(ci)
+        tableCandidates = violated & rest
     let nTables = min(tableCandidates.len, MAX_TABLES)
+    var moves: seq[(int, T)]
 
     for ti in 0..<nTables:
         let ci = tableCandidates[ti]
         let tc = state.constraints[ci].tableConstraintState
-        let nPos = tc.sortedPositions.len
 
         var tried: PackedSet[int]
         let nTries = min(tc.tuples.len, MAX_TUPLES_PER_TABLE)
@@ -5338,30 +5459,14 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
                 idx = rand(tc.tuples.len - 1)
             tried.incl(idx)
 
-            let tup = tc.tuples[idx]
-
-            # Quick check: different from current and domain-compatible?
-            var same = true
-            var domainOk = true
-            for col in 0..<nPos:
-                let pos = tc.sortedPositions[col]
-                let curVal = state.assignment[pos]
-                if tup[col] != curVal:
-                    same = false
-                    let dom {.cursor.} = state.sharedDomain[][pos]
-                    if tup[col] notin dom:
-                        domainOk = false
-                        break
-            if same or not domainOk: continue
+            if not state.tableMoveChanges(ci, tc.tuples[idx], moves): continue
 
             # Simulate: apply via assignValueLean, measure delta, restore
             let origCost = state.cost
             var changes: seq[(int, T)] = @[]
-            for col in 0..<nPos:
-                let pos = tc.sortedPositions[col]
-                if tup[col] != state.assignment[pos]:
-                    changes.add((pos, state.assignment[pos]))
-                    state.assignValueLean(pos, tup[col])
+            for (pos, v) in moves:
+                changes.add((pos, state.assignment[pos]))
+                state.assignValueLean(pos, v)
             let delta = state.cost - origCost
             # Restore
             for i in countdown(changes.len - 1, 0):
@@ -5370,29 +5475,23 @@ proc tryTableMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
 
             if delta < bestDelta:
                 bestDelta = delta
-                bestCI = ci
-                bestTupleIdx = idx
+                bestMoves = moves
             elif allowPerturb and delta >= bestDelta and delta < perturbDelta:
                 perturbDelta = delta
-                perturbCI = ci
-                perturbTupleIdx = idx
+                perturbMoves = moves
 
     # Prefer improving move; fall back to perturbation if allowed
-    let applyCI = if bestCI >= 0: bestCI else: perturbCI
-    let applyIdx = if bestCI >= 0: bestTupleIdx else: perturbTupleIdx
-    if applyCI < 0: return false
+    let apply = if bestMoves.len > 0: bestMoves else: perturbMoves
+    if apply.len == 0: return false
 
-    let tc = state.constraints[applyCI].tableConstraintState
-    let tup = tc.tuples[applyIdx]
     let tabuTenure = state.iteration + 1 + state.iteration mod 10
-    for col in 0..<tc.sortedPositions.len:
-        let pos = tc.sortedPositions[col]
+    for (pos, v) in apply:
         let oldVal = state.assignment[pos]
-        if tup[col] != oldVal:
+        if v != oldVal:
             let oldIdx = state.domIdx(pos, oldVal)
             if oldIdx >= 0 and not state.isLazy[pos]:
                 state.tabu[pos][oldIdx] = tabuTenure
-            state.assignValue(pos, tup[col])
+            state.assignValue(pos, v)
     return true
 
 
@@ -5626,7 +5725,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         return state
 
         # Try general swap moves periodically during stagnation
-        if state.searchPositions.len <= 200 and
+        if state.searchPositions.len <= 200 and not gNoGeneralSwap and
            state.iteration - lastImprovement >= 20 and
            (state.iteration - lastImprovement) mod 20 == 0 and
            not outOfBudget():
@@ -5783,8 +5882,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Short stagnation: only improving moves (safe). Deep stagnation (table-
         # heavy problems): allow perturbation to escape local optima.
         if state.tableInConstraintIndices.len > 0 and
-           state.iteration - lastImprovement >= 100 and
-           (state.iteration - lastImprovement) mod 100 == 0 and
+           state.iteration - lastImprovement >= gTableMoveEvery and
+           (state.iteration - lastImprovement) mod gTableMoveEvery == 0 and
            not outOfBudget():
             let deepStag = state.tableInConstraintIndices.len >= 10 and
                            state.iteration - lastImprovement >= 500

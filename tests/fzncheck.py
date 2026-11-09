@@ -1,4 +1,3 @@
-import os
 #!/usr/bin/env python3
 """Independent FlatZinc solution checker (soundness debugging aid).
 
@@ -10,7 +9,7 @@ recomputed from their defining constraints, then every ORIGINAL constraint is
 evaluated, so translation-level unsoundness (dropped or mistranslated
 constraints) shows up as violations. Unsupported constraints are listed as
 unchecked."""
-import re, sys
+import os, re, sys
 from collections import Counter
 
 def tokenize(s):
