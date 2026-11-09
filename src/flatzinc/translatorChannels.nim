@@ -2588,8 +2588,7 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
             for e in tr.arrayLitByName[arrName].elems:
                 if e.kind == FznIntLit and e.intVal notin resultSet:
                     inc nConstCells
-        if ciList.len + nConstCells < arraySize and gccCIs.len == 0 and
-                not existsEnv("CRUSHER_OLD_INVERSE_CHANNEL"):
+        if ciList.len + nConstCells < arraySize and gccCIs.len == 0:
             var watched = arrayElemNames
             watched.incl(arrName)
             for an, names in tr.arrayElementNames:

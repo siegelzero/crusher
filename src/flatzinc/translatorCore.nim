@@ -367,7 +367,6 @@ proc setChannelDomainFromLookup(tr: var FznTranslator, depPos: int, lookup: seq[
     dom.sort()
     tr.sys.baseArray.domain[depPos] = dom
 
-let gOldTableFD = existsEnv("CRUSHER_OLD_TABLE_FD")
 
 proc channelReaches(tr: FznTranslator, pos: int, targets: PackedSet[int],
                     depth: int = 0): bool =
@@ -395,7 +394,6 @@ proc keyChannelsReachDeps(tr: FznTranslator, positions: seq[int],
                           keyCols, depCols: openArray[int]): bool =
     ## A key column that is a channel over a dependent column would make the
     ## dependent a function of itself (cyclic channels).
-    if gOldTableFD: return false
     var deps: PackedSet[int]
     for c in depCols: deps.incl(positions[c])
     for c in keyCols:
@@ -465,7 +463,7 @@ proc trySingleColumnKey(tr: var FznTranslator, positions: seq[int],
     # A column that is already a channel (expression/element channel) has its
     # own definition; a second binding would silently drop one of the two.
     for c in depCols:
-        if positions[c] in tr.sys.baseArray.channelPositions and not gOldTableFD:
+        if positions[c] in tr.sys.baseArray.channelPositions:
             return false
     if tr.keyChannelsReachDeps(positions, [keyCol], depCols):
         return false
@@ -583,7 +581,7 @@ proc tryMultiColumnKey(tr: var FznTranslator, positions: seq[int],
     if depCols.len == 0:
         return false
     for c in depCols:
-        if positions[c] in tr.sys.baseArray.channelPositions and not gOldTableFD:
+        if positions[c] in tr.sys.baseArray.channelPositions:
             return false
     if tr.keyChannelsReachDeps(positions, keyCols, depCols):
         return false
@@ -715,29 +713,25 @@ proc tryTableComplementConversion(tr: var FznTranslator, positions: seq[int],
     # Count only DISTINCT tuples inside the domains: rows outside a column's
     # domain allow nothing, so `productSize - tuples.len` could call a
     # restrictive table a tautology and drop it.
-    var allowedInDomain: int
-    if existsEnv("CRUSHER_OLD_TABLE_COMPLEMENT"):
-        allowedInDomain = tuples.len
-    else:
-        var domSets = newSeq[HashSet[int]](arity)
+    var domSets = newSeq[HashSet[int]](arity)
+    for col in 0..<arity:
+        domSets[col] = toHashSet(domains[col])
+    var seenT = initHashSet[seq[int]]()
+    for t in tuples:
+        var inDom = true
         for col in 0..<arity:
-            domSets[col] = toHashSet(domains[col])
-        var seenT = initHashSet[seq[int]]()
-        for t in tuples:
-            var inDom = true
-            for col in 0..<arity:
-                if t[col] notin domSets[col]:
-                    inDom = false
-                    break
-            if inDom: seenT.incl(t)
-        allowedInDomain = seenT.len
+            if t[col] notin domSets[col]:
+                inDom = false
+                break
+        if inDom: seenT.incl(t)
+    let allowedInDomain = seenT.len
     let forbiddenCount = productSize - allowedInDomain
 
     # Tautology: all combinations allowed, constraint is vacuous
     if forbiddenCount <= 0:
         return true
     # Few allowed tuples: the positive table is the smaller, stronger encoding.
-    if allowedInDomain < forbiddenCount and not existsEnv("CRUSHER_OLD_TABLE_COMPLEMENT"):
+    if allowedInDomain < forbiddenCount:
         return false
 
     # Only convert when forbidden set is small (much cheaper to enumerate and store)
@@ -2347,33 +2341,26 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         # domain, and a 1-tuple table over {v} x {w} would be
                         # judged a tautology and dropped.
                         var auxDom: seq[int]
-                        if not existsEnv("CRUSHER_OLD_TABLE_AUX"):
-                            var xElems: seq[FznExpr]
-                            if con.args[0].kind == FznArrayLit:
-                                xElems = con.args[0].elems
-                            elif con.args[0].kind == FznIdent and
-                                    con.args[0].ident in tr.arrayLitByName and
-                                    tr.arrayLitByName[con.args[0].ident].kind == FznArrayLit:
-                                xElems = tr.arrayLitByName[con.args[0].ident].elems
-                            if col < xElems.len and xElems[col].kind == FznIdent:
-                                auxDom = tr.lookupVarDomain(xElems[col].ident)
-                            if auxDom.len == 0:
-                                auxDom = tr.exprValueSet(expr)
+                        var xElems: seq[FznExpr]
+                        if con.args[0].kind == FznArrayLit:
+                            xElems = con.args[0].elems
+                        elif con.args[0].kind == FznIdent and
+                                con.args[0].ident in tr.arrayLitByName and
+                                tr.arrayLitByName[con.args[0].ident].kind == FznArrayLit:
+                            xElems = tr.arrayLitByName[con.args[0].ident].elems
+                        if col < xElems.len and xElems[col].kind == FznIdent:
+                            auxDom = tr.lookupVarDomain(xElems[col].ident)
+                        if auxDom.len == 0:
+                            auxDom = tr.exprValueSet(expr)
                         if auxDom.len == 0:
                             auxDom = colVals
                         auxVar.setDomain(auxDom)
-                        if existsEnv("CRUSHER_OLD_TABLE_AUX"):
-                            tr.sys.baseArray.channelPositions.incl(auxPos)
-                            # Constrain: auxPos == expression
-                            let auxExpr = tr.getExpr(auxPos)
-                            tr.sys.addConstraint(auxExpr == expr)
-                        else:
-                            # auxPos IS the expression: an expression channel.
-                            # (A channel position with only an equality
-                            # constraint is never written by propagation, so
-                            # the column froze at its initial value.) The table
-                            # itself restricts the column to its values.
-                            tr.sys.baseArray.addExpressionChannelBinding(auxPos, expr)
+                        # auxPos IS the expression: an expression channel.
+                        # (A channel position with only an equality
+                        # constraint is never written by propagation, so
+                        # the column froze at its initial value.) The table
+                        # itself restricts the column to its values.
+                        tr.sys.baseArray.addExpressionChannelBinding(auxPos, expr)
                         tablePositions.add(auxPos)
 
                 # Project out constant columns from tuples

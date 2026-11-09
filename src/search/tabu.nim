@@ -1617,12 +1617,8 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
         stderr.flushFile()
 
 let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
-let gNoTableChanMoves = existsEnv("CRUSHER_NO_TABLE_CHAN_MOVES")
-let gNoPermSwap = existsEnv("CRUSHER_NO_PERM_SWAP")
-let gNoMachineElim = existsEnv("CRUSHER_NO_MACHINE_ELIM")
-let gMachineElimEvery = (if existsEnv("CRUSHER_MACHINE_ELIM_EVERY"): parseInt(getEnv("CRUSHER_MACHINE_ELIM_EVERY")) else: 20)
-let gNoGeneralSwap = existsEnv("CRUSHER_NO_GENERAL_SWAP")
-let gTableMoveEvery = (if existsEnv("CRUSHER_TABLE_MOVE_EVERY"): parseInt(getEnv("CRUSHER_TABLE_MOVE_EVERY")) else: 100)
+const TableMoveEvery = 100    # stagnant iterations between table moves
+const MachineElimEvery = 20   # stagnant iterations between machine-elimination moves
 
 iterator channelBindingIdxOf[T](carray: ConstrainedArray[T], pos: int): int =
     for bi in 0..<carray.channelBindings.len:
@@ -1806,7 +1802,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     break
             if not hasChannelPos:
                 state.tableInConstraintIndices.add(ci)
-            elif not gNoTableChanMoves:
+            else:
                 let tc = constraint.tableConstraintState
                 var src = -1
                 var chanCols: seq[int]
@@ -1825,7 +1821,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     state.tableChanSrc[ci] = (src: src, chanCols: chanCols)
                     state.tableInConstraintIndices.add(ci)
 
-    if not gNoMachineElim:
+    block:
         for ci, constraint in state.constraints:
             if constraint.stateType != MultiMachineNoOverlapType: continue
             let mc = constraint.multiMachineNoOverlapState
@@ -5030,7 +5026,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             break  # cap positions checked
 
     # Also evaluate permutation swaps
-    if state.gccGroupPositions.len > 0 and not gNoPermSwap and
+    if state.gccGroupPositions.len > 0 and
        (state.cost <= state.gccGroupPositions.len div 5 or state.iteration mod 3 == 0):
         let (permMoves, permCost) = state.bestPermutationSwapMoves()
         if permMoves.len > 0 and permCost < state.cost + bestDelta:
@@ -5864,7 +5860,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         return state
 
         # Try general swap moves periodically during stagnation
-        if state.searchPositions.len <= 200 and not gNoGeneralSwap and
+        if state.searchPositions.len <= 200 and
            state.iteration - lastImprovement >= 20 and
            (state.iteration - lastImprovement) mod 20 == 0 and
            not outOfBudget():
@@ -6021,8 +6017,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # Short stagnation: only improving moves (safe). Deep stagnation (table-
         # heavy problems): allow perturbation to escape local optima.
         if state.tableInConstraintIndices.len > 0 and
-           state.iteration - lastImprovement >= gTableMoveEvery and
-           (state.iteration - lastImprovement) mod gTableMoveEvery == 0 and
+           state.iteration - lastImprovement >= TableMoveEvery and
+           (state.iteration - lastImprovement) mod TableMoveEvery == 0 and
            not outOfBudget():
             let deepStag = state.tableInConstraintIndices.len >= 10 and
                            state.iteration - lastImprovement >= 500
@@ -6039,11 +6035,11 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
         # Machine elimination: empty a lightly loaded machine (team) in one move
         if state.mmnoIndices.len > 0 and
-           state.iteration - lastImprovement >= gMachineElimEvery and
-           (state.iteration - lastImprovement) mod gMachineElimEvery == 0 and
+           state.iteration - lastImprovement >= MachineElimEvery and
+           (state.iteration - lastImprovement) mod MachineElimEvery == 0 and
            not outOfBudget():
             if state.tryMachineEliminationMoves(
-                    allowPerturb = state.iteration - lastImprovement >= 10 * gMachineElimEvery):
+                    allowPerturb = state.iteration - lastImprovement >= 10 * MachineElimEvery):
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
                     state.bestCost = state.cost

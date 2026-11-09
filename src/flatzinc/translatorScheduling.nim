@@ -4328,7 +4328,6 @@ proc detectDisjunctiveOptMachines(tr: var FznTranslator) =
     ## domain of each allocation variable has a constraint that contains the
     ## task, so that is checked; otherwise the constraints are left to the
     ## per-constraint translation.
-    if existsEnv("CRUSHER_NO_DISJ_OPT_MACHINES"): return
     var cons: seq[int]
     for ci in 0 ..< tr.model.constraints.len:
         if ci in tr.definingConstraints: continue

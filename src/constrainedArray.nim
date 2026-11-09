@@ -2,8 +2,6 @@ import std/[packedsets, sequtils, strformat, tables, times]
 from std/os import existsEnv
 import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular, sharedElems]
 export sharedElems
-let gNoTableJointAC = existsEnv("CRUSHER_NO_TABLE_JOINT_AC")
-let gOldElementInverse = existsEnv("CRUSHER_OLD_ELEMENT_INVERSE")
 from constraints/globalCardinality import ExactCounts, BoundedCounts
 import constraints/constraintNode
 import constraints/relationalConstraint
@@ -750,7 +748,7 @@ proc detectElementInverseChannels*[T](arr: var ConstrainedArray[T]) =
                             readElsewhere = true
                             break
                     if readElsewhere: break
-            if readElsewhere and not gOldElementInverse:
+            if readElsewhere:
                 continue
 
         for mi in memberIdxs:
@@ -3181,7 +3179,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
     var unaryExpr: Table[int, int]   # channel position -> expression binding index
     var unarySrcMemo: Table[int, int]
     var tableJointPruned = 0
-    if not gNoTableJointAC:
+    block:
         for bi, b in carray.channelBindings:
             if b.indexExpression.positions.len != 1: continue
             var allConst = b.arrayElements.len > 0
@@ -5281,7 +5279,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                         continue
                     for v in toSeq(currentDomain[pos].items):
                         if v notin tbl.tuplesByColumnValue[col]:
-                            if tbl.complete and not gNoTableJointAC:
+                            if tbl.complete:
                                 # Full-semantics table: a value in no tuple is forbidden.
                                 currentDomain[pos].excl(v)
                                 outerChanged = true
@@ -5370,7 +5368,7 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
         # row and every column separately, so no successor is ever pruned. Here
         # each source value is kept only if some tuple matches ALL its derived
         # column values (other columns within their domains).
-        if not gNoTableJointAC:
+        block:
             for cons in carray.constraints:
                 if cons.stateType != TableConstraintType: continue
                 let tbl = cons.tableConstraintState

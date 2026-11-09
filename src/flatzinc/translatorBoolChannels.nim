@@ -971,7 +971,7 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
     # Single-literal implications a -> b from bool_clause([b], [a]), including
     # clauses consumed by earlier passes (the implication still holds).
     var impliesLit: Table[string, HashSet[string]]
-    if not existsEnv("CRUSHER_OLD_COND_EXPR_LINK"):
+    block:
         for ci in 0 ..< tr.model.constraints.len:
             let con {.cursor.} = tr.model.constraints[ci]
             if stripSolverPrefix(con.name) != "bool_clause" or con.args.len < 2: continue

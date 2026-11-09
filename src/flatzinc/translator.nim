@@ -1050,7 +1050,6 @@ proc buildObjectiveDominant(tr: var FznTranslator) =
     ## Detects `minimize weight*v + rest` where weight > 0 is at least 10x every
     ## other coefficient and v has a small domain (a count of used resources,
     ## a level, ...). Records v for the optimizer's dominant-term asks.
-    if existsEnv("CRUSHER_NO_OBJ_DOMINANT"): return
     if tr.model.solve.kind != Minimize: return
     if tr.objectivePos != ObjPosDefinedExpr: return
     if tr.objectiveDefExpr.isNil or not tr.objectiveDefExpr.linear: return
@@ -1295,8 +1294,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     if not existsEnv("CRUSHER_NO_FIXED_EQ_ALIAS"):
         result.aliasFixedEqualities()
     # Set variables that only mirror derived booleans (set_in_reif + bool_eq).
-    if not existsEnv("CRUSHER_NO_SET_BIT_ALIAS"):
-        result.aliasSetMembershipBits()
+    result.aliasSetMembershipBits()
     # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection
     # or constraint collection. Substitutes alias names with canonical names everywhere
     # in the model and demotes redundant parallel defining constraints (which become
