@@ -232,6 +232,86 @@ proc splitImplicationConjunctions(tr: var FznTranslator) =
                      $added.len & " clauses")
 
 
+## Dropping a definition is sound only when it is total: every assignment of
+## its inputs has a matching value of b. Reifications are (b is a free bool);
+## functional int definitions are when b's declared domain contains every value
+## the inputs can produce. Partial ones (int_div, element) are never dropped.
+proc isTotalDefinition*(tr: FznTranslator, declType: Table[string, FznTypeKind],
+                       declIdx: Table[string, int], con: FznConstraint, b: string): bool =
+    let name = stripSolverPrefix(con.name)
+    let kind = declType.getOrDefault(b, FznIntSet)
+    let lastIsB = con.args.len > 0 and con.args[^1].kind == FznIdent and
+                  con.args[^1].ident == b
+    if name.endsWith("_reif") or name in ["array_bool_and", "array_bool_or", "bool_xor"]:
+        return kind == FznBool and lastIsB
+    if name == "bool_not":
+        return kind == FznBool
+    if name == "bool2int":
+        if not lastIsB: return false
+        if kind == FznInt: return true
+        if kind == FznIntRange:
+            let t = tr.model.variables[declIdx[b]].varType
+            return t.lo <= 0 and t.hi >= 1
+        return false
+    if name == "int_lin_eq":
+        # b's coefficient must be +-1 (2*b = x forces x even)
+        if kind notin {FznInt, FznIntRange} or con.args.len < 3: return false
+        let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: return false
+        let elems = tr.resolveVarArrayElems(con.args[1])
+        if coeffs.len != elems.len: return false
+        var nB = 0
+        var bCoeff = 0
+        for i, e in elems:
+            if e.kind == FznIdent and e.ident == b:
+                inc nB
+                bCoeff = coeffs[i]
+                if abs(coeffs[i]) != 1: return false
+        if nB != 1: return false
+        if kind == FznInt: return true
+        # Bounded b: total when b's declared range contains the range of
+        # (rhs - sum of the other terms) over the inputs' declared domains.
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: return false
+        var lo, hi = 0
+        for i, e in elems:
+            if e.kind == FznIdent and e.ident == b: continue
+            var vlo, vhi: int
+            if e.kind == FznIntLit: vlo = e.intVal; vhi = e.intVal
+            elif e.kind == FznIdent:
+                if e.ident in tr.paramValues:
+                    vlo = tr.paramValues[e.ident]; vhi = vlo
+                else:
+                    let (ok, a, z) = tr.declaredBounds(e.ident)
+                    if not ok or abs(a) > 1_000_000_000 or abs(z) > 1_000_000_000: return false
+                    vlo = a; vhi = z
+            else: return false
+            let c = -bCoeff * coeffs[i]   # b = bCoeff*rhs - bCoeff*sum(others)
+            if c >= 0: lo += c * vlo; hi += c * vhi
+            else: lo += c * vhi; hi += c * vlo
+        lo += bCoeff * rhs; hi += bCoeff * rhs
+        let t = tr.model.variables[declIdx[b]].varType
+        return t.lo <= lo and t.hi >= hi
+    if name == "int_times" and kind == FznIntRange and con.args.len == 3 and lastIsB:
+        # Bounded product: total when its declared range contains the
+        # product range of the inputs' declared domains.
+        var r: array[2, (int, int)]
+        for k in 0..1:
+            let e = con.args[k]
+            if e.kind == FznIntLit: r[k] = (e.intVal, e.intVal)
+            elif e.kind == FznIdent and e.ident in tr.paramValues:
+                r[k] = (tr.paramValues[e.ident], tr.paramValues[e.ident])
+            elif e.kind == FznIdent:
+                let (ok, a, z) = tr.declaredBounds(e.ident)
+                if not ok or abs(a) > 1_000_000 or abs(z) > 1_000_000: return false
+                r[k] = (a, z)
+            else: return false
+        let ps = [r[0][0] * r[1][0], r[0][0] * r[1][1], r[0][1] * r[1][0], r[0][1] * r[1][1]]
+        let t = tr.model.variables[declIdx[b]].varType
+        return t.lo <= min(ps) and t.hi >= max(ps)
+    if name in ["int_plus", "int_times", "int_max", "int_min",
+                "int_abs", "array_int_maximum", "array_int_minimum"]:
+        return kind == FznInt
+    false
+
 proc eliminateDeadDefinitions(tr: var FznTranslator) =
     ## Consume `defines_var(b)` constraints whose output is read by no other live
     ## constraint and is not output / the objective (fixpoint: chains of dead
@@ -256,51 +336,13 @@ proc eliminateDeadDefinitions(tr: var FznTranslator) =
             for e in decl.value.elems:
                 if e.kind == FznIdent: names.add(e.ident)
             arrElems[decl.name] = names
-    # Dropping a definition is sound only when it is total: every assignment of
-    # its inputs has a matching value of b. Reifications are (b is a free bool);
-    # functional int definitions are only when b's declared domain is unbounded
-    # (`var 0..5: b = x + y` restricts x + y). Partial ones (int_div, element)
-    # are never dropped.
+    tr.buildVarDomainIndex()
     var declType: Table[string, FznTypeKind]
     for decl in tr.model.variables:
         if decl.isVar and not decl.isArray: declType[decl.name] = decl.varType.kind
     var declIdx: Table[string, int]
     for i, decl in tr.model.variables:
         if decl.isVar and not decl.isArray: declIdx[decl.name] = i
-    proc isTotalDefinition(tr: FznTranslator, declType: Table[string, FznTypeKind],
-                           declIdx: Table[string, int], con: FznConstraint, b: string): bool =
-        let name = stripSolverPrefix(con.name)
-        let kind = declType.getOrDefault(b, FznIntSet)
-        let lastIsB = con.args.len > 0 and con.args[^1].kind == FznIdent and
-                      con.args[^1].ident == b
-        if name.endsWith("_reif") or name in ["array_bool_and", "array_bool_or", "bool_xor"]:
-            return kind == FznBool and lastIsB
-        if name == "bool_not":
-            return kind == FznBool
-        if name == "bool2int":
-            if not lastIsB: return false
-            if kind == FznInt: return true
-            if kind == FznIntRange:
-                let t = tr.model.variables[declIdx[b]].varType
-                return t.lo <= 0 and t.hi >= 1
-            return false
-        if name == "int_lin_eq":
-            # b's coefficient must be +-1 (2*b = x forces x even)
-            if kind != FznInt or con.args.len < 2: return false
-            let coeffs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: return false
-            let elems = tr.resolveVarArrayElems(con.args[1])
-            if coeffs.len != elems.len: return false
-            var nB = 0
-            for i, e in elems:
-                if e.kind == FznIdent and e.ident == b:
-                    inc nB
-                    if abs(coeffs[i]) != 1: return false
-            return nB == 1
-        if name in ["int_plus", "int_times", "int_max", "int_min",
-                    "int_abs", "array_int_maximum", "array_int_minimum"]:
-            return kind == FznInt
-        false
-
     var total = 0
     for round in 0..<10:
         var uses: CountTable[string]

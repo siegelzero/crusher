@@ -1,4 +1,4 @@
-import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os]
+import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os, heapqueue]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe, groupValueDisjoint, guardedCount]
@@ -1678,6 +1678,56 @@ proc initStrategyForPopulation*(id, populationSize: int): InitStrategy =
         if id == 1: return isDomainMax
     isRandom
 
+proc cascadeEntryInputs[T](state: TabuState[T], carray: ConstrainedArray[T],
+                           kind: CascadeEntryKind, bidx: int, pos: int): PackedSet[int] =
+    ## Positions a cascade entry reads (excluding the cascade source `pos`).
+    case kind
+    of ceMinMax:
+        let fb {.cursor.} = state.flatMinMaxBindings[bidx]
+        for lp in fb.linearPositions:
+            if lp != pos: result.incl(lp)
+        for expr in fb.complexExprs:
+            for ep in expr.positions.items:
+                if ep != pos: result.incl(ep)
+    of ceCountEq:
+        let binding {.cursor.} = carray.countEqChannelBindings[bidx]
+        for srcPos in binding.inputPositions:
+            if srcPos != pos: result.incl(srcPos)
+    of ceConditionalCountEq:
+        let binding {.cursor.} = carray.conditionalCountEqChannelBindings[bidx]
+        for srcPos in binding.primaryPositions:
+            if srcPos != pos: result.incl(srcPos)
+        for srcPos in binding.filterPositions:
+            if srcPos != pos: result.incl(srcPos)
+        for srcPos in binding.primaryOnlyPositions:
+            if srcPos != pos: result.incl(srcPos)
+    of ceWeightedCountEq:
+        let binding {.cursor.} = carray.weightedCountEqChannelBindings[bidx]
+        for srcPos in binding.inputPositions:
+            if srcPos != pos: result.incl(srcPos)
+    of ceArgmax:
+        let binding {.cursor.} = carray.argmaxChannelBindings[bidx]
+        for srcPos in binding.inputPositions.items:
+            if srcPos != pos: result.incl(srcPos)
+    of ceCrossingCountMax:
+        let binding {.cursor.} = carray.crossingCountMaxChannelBindings[bidx]
+        for cable in binding.cables:
+            for srcPos in [cable.startPos, cable.endPos]:
+                if srcPos != pos: result.incl(srcPos)
+        for srcPos in binding.permPositions:
+            if srcPos != pos: result.incl(srcPos)
+    of ceElement:
+        let bindingPtr = addr carray.channelBindings[bidx]
+        for ipos in bindingPtr.indexExpression.positions.items:
+            if ipos != pos: result.incl(ipos)
+        for elem in bindingPtr.arrayElements:
+            if not elem.isConstant and elem.variablePosition != pos:
+                result.incl(elem.variablePosition)
+    of ceExpression:
+        let binding {.cursor.} = carray.expressionChannelBindings[bidx]
+        for ep in binding.expression.positions.items:
+            if ep != pos: result.incl(ep)
+
 proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false, deadline: float = 0.0) =
     state.id = id
     state.carray = carray
@@ -3267,6 +3317,55 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 if p in carray.inverseChannelsAtPosition or p in state.ctpAtLink:
                     canBuild = false   # multi-output groups: per-value fallback handles them
 
+            # BFS discovery order is not always topological: an entry reached
+            # early through one input can also read an entry discovered later
+            # (nside: a day-load sum reads indicators at two BFS depths). Such a
+            # back edge forces dense cascade evaluation (every entry for every
+            # value) and misorders static precomputation, so reorder into a
+            # stable topological order (BFS order as tie-break). The source
+            # readers must stay the leading block; otherwise keep BFS order.
+            if canBuild and topoOrder.len > 1:
+                let n = topoOrder.len
+                var idxOf = initTable[int, int]()
+                for ci, cp in topoOrder: idxOf[cp] = ci
+                var deps = newSeq[seq[int]](n)
+                var needSort = false
+                for ci in 0..<n:
+                    for p in state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).items:
+                        if p in idxOf:
+                            let d = idxOf[p]
+                            if d != ci:
+                                deps[ci].add d
+                                if d > ci: needSort = true
+                if needSort:
+                    var readers = newSeq[seq[int]](n)
+                    var indeg = newSeq[int](n)
+                    for ci in 0..<n:
+                        indeg[ci] = deps[ci].len
+                        for d in deps[ci]: readers[d].add ci
+                    # Min-heap on original index keeps BFS order among ready entries
+                    var ready = initHeapQueue[int]()
+                    for ci in 0..<n:
+                        if indeg[ci] == 0: ready.push ci
+                    var order: seq[int]
+                    while ready.len > 0:
+                        let ci = ready.pop()
+                        order.add ci
+                        for r in readers[ci]:
+                            dec indeg[r]
+                            if indeg[r] == 0: ready.push r
+                    var ok = order.len == n   # cycle -> keep BFS order
+                    let nSrc = if nSrcReaders < 0: n else: nSrcReaders
+                    if ok:
+                        for k in 0..<min(nSrc, n):
+                            if order[k] >= nSrc: ok = false; break
+                    if ok:
+                        var o2, b2: seq[int]
+                        var k2: seq[CascadeEntryKind]
+                        for ci in order:
+                            o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
+                        topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
+
             # Wide-input guard: entries such as global-cardinality count channels
             # read every assignment variable; the per-cascade dependency tables are
             # O(entries x inputs) (warehouse: 100 counts x 3219 tokens = 322k refs,
@@ -3565,53 +3664,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var posToReaders = initTable[int, seq[int]]()  # cascade pos -> entry indices that read it
             var extPosToEntries = initTable[int, seq[int]]()  # external pos -> entry indices
             for ci in 0..<topoOrder.len:
-                var inputs: PackedSet[int]
-                case topoEntryKind[ci]
-                of ceMinMax:
-                    let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
-                    for lp in fb.linearPositions:
-                        if lp != pos: inputs.incl(lp)
-                    for expr in fb.complexExprs:
-                        for ep in expr.positions.items:
-                            if ep != pos: inputs.incl(ep)
-                of ceCountEq:
-                    let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
-                    for srcPos in binding.inputPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                of ceConditionalCountEq:
-                    let binding = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
-                    for srcPos in binding.primaryPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                    for srcPos in binding.filterPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                    for srcPos in binding.primaryOnlyPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                of ceWeightedCountEq:
-                    let binding = carray.weightedCountEqChannelBindings[topoBindingIdx[ci]]
-                    for srcPos in binding.inputPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                of ceArgmax:
-                    let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]
-                    for srcPos in binding.inputPositions.items:
-                        if srcPos != pos: inputs.incl(srcPos)
-                of ceCrossingCountMax:
-                    let binding = carray.crossingCountMaxChannelBindings[topoBindingIdx[ci]]
-                    for cable in binding.cables:
-                        for srcPos in [cable.startPos, cable.endPos]:
-                            if srcPos != pos: inputs.incl(srcPos)
-                    for srcPos in binding.permPositions:
-                        if srcPos != pos: inputs.incl(srcPos)
-                of ceElement:
-                    let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
-                    for ipos in bindingPtr.indexExpression.positions.items:
-                        if ipos != pos: inputs.incl(ipos)
-                    for elem in bindingPtr.arrayElements:
-                        if not elem.isConstant and elem.variablePosition != pos:
-                            inputs.incl(elem.variablePosition)
-                of ceExpression:
-                    let binding {.cursor.} = carray.expressionChannelBindings[topoBindingIdx[ci]]
-                    for ep in binding.expression.positions.items:
-                        if ep != pos: inputs.incl(ep)
+                let inputs = state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos)
                 # Register in posToReaders (cascade-internal deps) and extPosToEntries
                 for p in inputs.items:
                     if p in topoSet:

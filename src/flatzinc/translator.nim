@@ -1034,6 +1034,7 @@ include translatorCore
 include translatorPresolve
 include translatorDefinedVars
 include translatorCanonicalize
+include translatorIndicatorSums
 include translatorChannels
 include translatorCountPatterns
 include translatorReifChannels
@@ -1302,6 +1303,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # flattened by MZN's CSE create independent positions for the same logical variable,
     # breaking the model's implicit equalities.
     result.canonicalizeFznVarAliases()
+    # Group `c * bool2int(x == v)` sum terms over the same x into table channels
+    result.groupIndicatorSums()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
     # Drop fzn_all_different_int constraints whose argument list is fully fixed

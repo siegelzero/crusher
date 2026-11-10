@@ -215,6 +215,25 @@ proc lookupTightenedDomain*(tr: var FznTranslator, varName: string): seq[int] =
         return tr.presolveDomains[varName]
     return tr.lookupVarDomain(varName)
 
+proc declaredBounds(tr: FznTranslator, name: string): (bool, int, int) =
+    ## (known, lo, hi) of a variable's declared FZN domain (bounded domains only).
+    ## Call buildVarDomainIndex first; without the index this scans.
+    var idx = -1
+    if tr.varDomainIndex.len > 0:
+        idx = tr.varDomainIndex.getOrDefault(name, -1)
+    else:
+        for i, d in tr.model.variables:
+            if not d.isArray and d.name == name: idx = i; break
+    if idx < 0: return (false, 0, 0)
+    let decl {.cursor.} = tr.model.variables[idx]
+    case decl.varType.kind
+    of FznIntRange: (true, decl.varType.lo, decl.varType.hi)
+    of FznIntSet:
+        if decl.varType.values.len == 0: (false, 0, 0)
+        else: (true, min(decl.varType.values), max(decl.varType.values))
+    of FznBool: (true, 0, 1)
+    else: (false, 0, 0)
+
 proc getDomainBounds*(tr: var FznTranslator, varName: string):
     tuple[domain: seq[int], lo: int, hi: int] =
     ## Looks up a variable's domain and returns (domain, lo, hi).

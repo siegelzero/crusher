@@ -120,6 +120,44 @@ proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
                 tr.channelVarNames.incl(name)
             stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (from cumulative/disjunctive durations)")
 
+    # Phase 3: inputs of a large array min/max. A min/max over inlined linear
+    # inputs is evaluated as one flat dot product over every input, so each
+    # probed move costs the total term count (nside: 242 per-day load sums,
+    # 113k terms, re-evaluated per candidate start day). As channels, each
+    # input is re-evaluated only when one of its own terms changes (cascade
+    # dirty propagation), and the min/max reads one value per input.
+    block:
+        const MinTotalTerms = 4096
+        var rescueNames = initHashSet[string]()
+        var linEqOf: Table[string, int]   # defined var -> its int_lin_eq
+        for ci in tr.definingConstraints.items:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "int_lin_eq": continue
+            if not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                linEqOf[ann.args[0].ident] = ci
+        for def in tr.minMaxChannelDefs:
+            let con {.cursor.} = tr.model.constraints[def.ci]
+            let cname = stripSolverPrefix(con.name)
+            if cname notin ["array_int_minimum", "array_int_maximum"]: continue
+            var cands: seq[string]
+            var total = 0
+            for elem in tr.resolveVarArrayElems(con.args[1]):
+                if elem.kind != FznIdent or elem.ident notin tr.definedVarNames: continue
+                if elem.ident notin linEqOf: continue
+                let lcon {.cursor.} = tr.model.constraints[linEqOf[elem.ident]]
+                total += tr.resolveVarArrayElems(lcon.args[1]).len
+                cands.add elem.ident
+            if total >= MinTotalTerms:
+                for n in cands: rescueNames.incl(n)
+        if rescueNames.len > 0:
+            for n in rescueNames:
+                tr.rescuedChannelDefs.add((ci: linEqOf[n], varName: n))
+                tr.definedVarNames.excl(n)
+                tr.channelVarNames.incl(n)
+            stderr.writeLine(&"[FZN] Rescued {rescueNames.len} defined vars as channels (inputs of large array min/max)")
+
 
 proc collectDefinedVars(tr: var FznTranslator) =
     ## First pass: identify variables defined by int_lin_eq constraints with defines_var annotations.
@@ -284,6 +322,16 @@ proc collectDefinedVars(tr: var FznTranslator) =
                     if sourceFanOut[arg.ident] > MaxTimesChannelFanOut:
                         fanOutOk = false
                         break
+            # A constant factor makes the product a linear term: inlining it
+            # costs nothing and avoids one channel position per product (nside
+            # has 113k `c * bool2int(d == v)` terms feeding per-day sums).
+            var constFactor = false
+            for idx in 0..1:
+                let arg = con.args[idx]
+                if arg.kind == FznIntLit or (arg.kind == FznIdent and arg.ident in tr.paramValues):
+                    constFactor = true
+            if constFactor:
+                fanOutOk = false
             if fanOutOk:
                 # Low fan-out: channel the product to avoid DAG duplication in constraints
                 tr.channelVarNames.incl(cand.definedName)
@@ -373,8 +421,9 @@ proc collectDefinedVars(tr: var FznTranslator) =
 
         # First: build per-constraint reference sets for defining constraints
         var definingRefs: Table[int, HashSet[string]]
+        var defRefCount: CountTable[string]
         for ci in tr.definingConstraints:
-            let con = tr.model.constraints[ci]
+            let con {.cursor.} = tr.model.constraints[ci]
             var refs = initHashSet[string]()
             for arg in con.args:
                 if arg.kind == FznIdent:
@@ -383,6 +432,7 @@ proc collectDefinedVars(tr: var FznTranslator) =
                     for elem in arg.elems:
                         if elem.kind == FznIdent:
                             refs.incl(elem.ident)
+            for r in refs: defRefCount.inc(r)
             definingRefs[ci] = refs
 
         # Collect all variable references from non-defining constraints
@@ -441,19 +491,18 @@ proc collectDefinedVars(tr: var FznTranslator) =
                             break
             if not isReferenced:
                 # Check if any OTHER defining constraint references this channel
-                for defCi, refs in definingRefs:
-                    if defCi == ci:
-                        continue  # skip own defining constraint
-                    if chanName in refs:
-                        isReferenced = true
-                        break
-                    if chanName in aliasesOf:
-                        for aliasName in aliasesOf[chanName]:
-                            if aliasName in refs:
-                                isReferenced = true
-                                break
-                    if isReferenced:
-                        break
+                # (count of defining constraints minus its own; was a scan of
+                # every defining constraint per channel, quadratic)
+                template refsByOthers(name: string): bool =
+                    let own = if ci in definingRefs and name in definingRefs[ci]: 1 else: 0
+                    defRefCount.getOrDefault(name, 0) - own > 0
+                if refsByOthers(chanName):
+                    isReferenced = true
+                elif chanName in aliasesOf:
+                    for aliasName in aliasesOf[chanName]:
+                        if refsByOthers(aliasName):
+                            isReferenced = true
+                            break
             if not isReferenced:
                 # Dead channel: convert to defined var (no position needed)
                 tr.channelVarNames.excl(chanName)

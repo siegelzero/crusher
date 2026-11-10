@@ -586,6 +586,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
                 echo &"[Solve] Solution found by S{result.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)"
             system.initialize(result.assignment)
             system.lastIterations = result.iterations
+            system.lastSearchSeconds = result.endTime - result.startTime
             return true
         if verbose:
             let elapsed = result.endTime - result.startTime

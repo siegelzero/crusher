@@ -1461,6 +1461,16 @@ proc buildChannelBindings(tr: var FznTranslator) =
     if tr.sys.baseArray.channelBindings.len > 0:
         stderr.writeLine(&"[FZN] Detected {tr.sys.baseArray.channelBindings.len} channel variables (element defines_var)")
 
+proc argBounds(tr: FznTranslator, a: AlgebraicExpression[int]): (bool, int, int) =
+    ## (known, min, max) of a bare variable or literal expression argument.
+    if a.node.kind == LiteralNode:
+        return (true, a.node.value, a.node.value)
+    if a.node.kind == RefNode:
+        let d {.cursor.} = tr.sys.baseArray.domain[a.node.position]
+        if d.len > 0:
+            return (true, min(d), max(d))
+    (false, 0, 0)
+
 proc buildExpressionChannelBindings(tr: var FznTranslator) =
     ## Builds expression channel bindings for int_times/int_div/int_mod/int_plus with defines_var.
     var nBuilt = 0
@@ -1502,18 +1512,14 @@ proc buildExpressionChannelBindings(tr: var FznTranslator) =
             var exLo, exHi: int
             var known = false
             const lim = 1_000_000_000  # keep plus/times interval arithmetic in range
-            if arg0.node.kind == RefNode and arg1.node.kind == RefNode:
-                let d0 = tr.sys.baseArray.domain[arg0.node.position]
-                let d1 = tr.sys.baseArray.domain[arg1.node.position]
-                if d0.len > 0 and d1.len > 0:
-                    let a0 = min(d0); let b0 = max(d0)
-                    let a1 = min(d1); let b1 = max(d1)
-                    if a0 >= -lim and b0 <= lim and a1 >= -lim and b1 <= lim:
-                        if name == "int_plus":
-                            exLo = a0 + a1; exHi = b0 + b1; known = true
-                        elif name == "int_times":
-                            let p = [a0 * a1, a0 * b1, b0 * a1, b0 * b1]
-                            exLo = min(p); exHi = max(p); known = true
+            let (ok0, a0, b0) = tr.argBounds(arg0)
+            let (ok1, a1, b1) = tr.argBounds(arg1)
+            if ok0 and ok1 and a0 >= -lim and b0 <= lim and a1 >= -lim and b1 <= lim:
+                if name == "int_plus":
+                    exLo = a0 + a1; exHi = b0 + b1; known = true
+                elif name == "int_times":
+                    let p = [a0 * a1, a0 * b1, b0 * a1, b0 * b1]
+                    exLo = min(p); exHi = max(p); known = true
             if not (known and exLo >= lo):
                 tr.sys.addConstraint(expr >= lo)
             if not (known and exHi <= hi):
@@ -1761,6 +1767,7 @@ proc buildRescuedChannelBindings(tr: var FznTranslator) =
     ## These are defined vars that appear in var-indexed arrays and need positions.
     ## Each gets a channel binding: min(expr) = expr (identity for single input).
     if tr.rescuedChannelDefs.len == 0: return
+    tr.buildVarDomainIndex()
 
     var nBuilt = 0
     for def in tr.rescuedChannelDefs:
@@ -1814,6 +1821,37 @@ proc buildRescuedChannelBindings(tr: var FznTranslator) =
                     expr = expr + constTerm
 
             if expr.isNil: continue
+
+            # The int_lin_eq pinned the rescued var into its declared domain;
+            # as a channel nothing does, so enforce the bound on the channel
+            # unless the inputs' declared domains already imply it.
+            var natLo, natHi = 0
+            var natKnown = true
+            let sgn = if defCoeff == 1: -1 else: 1
+            for vi, v in varElems:
+                if vi == definedIdx: continue
+                let c = sgn * coeffs[vi]
+                var vlo, vhi: int
+                if v.kind == FznIntLit:
+                    vlo = v.intVal; vhi = v.intVal
+                elif v.kind == FznIdent and v.ident in tr.paramValues:
+                    natKnown = false; break
+                elif v.kind == FznIdent:
+                    let (ok, lo, hi) = tr.declaredBounds(v.ident)
+                    if not ok: natKnown = false; break
+                    vlo = lo; vhi = hi
+                else:
+                    natKnown = false; break
+                if c >= 0: natLo += c * vlo; natHi += c * vhi
+                else: natLo += c * vhi; natHi += c * vlo
+            let constTerm2 = if defCoeff == 1: rhs else: -rhs
+            natLo += constTerm2; natHi += constTerm2
+            let (dOk, dLo, dHi) = tr.declaredBounds(def.varName)
+            if dOk:
+                if not natKnown or natLo < dLo:
+                    tr.sys.addConstraint(tr.getExpr(channelPos) >= dLo)
+                if not natKnown or natHi > dHi:
+                    tr.sys.addConstraint(tr.getExpr(channelPos) <= dHi)
 
         elif name == "int_abs":
             # int_abs(a, b) :: defines_var(b) → b = abs(a)

@@ -146,11 +146,15 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # Tabu probe runs first; if it fails, scatter search continues from the tabu pool
         # without re-initialization.
         let initSolveStart = epochTime()
+        system.lastSearchSeconds = 0.0
         system.resolve(parallel=parallel, tabuThreshold=min(tabuThreshold, 1000),
                       scatterThreshold=max(scatterThreshold, 3),
                       populationSize=effectivePopSize, numWorkers=numWorkers,
                       scatterStrategy=scatterStrategy, verbose=verbose,
                       deadline=deadline)
+        # Rate over search time only: state construction can take seconds on
+        # big models while the search itself is fast (nside: 25 iterations
+        # after 4-10 s of setup read as "2 iters/s").
         let initSolveElapsed = max(0.001, epochTime() - initSolveStart)
         let initIters = system.lastIterations
         objective.initialize(system.assignment)
@@ -192,7 +196,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # significant chunk of the deadline.
         const LowIterRateThreshold = 100.0  # iters/sec
         let initIterRate =
-            if initIters > 0: initIters.float / initSolveElapsed
+            if initIters > 0:
+                initIters.float / (if system.lastSearchSeconds > 0: max(0.001, system.lastSearchSeconds)
+                                   else: initSolveElapsed)
             else: 0.0
         let lowIterRate = initIters > 0 and initIterRate < LowIterRateThreshold
 

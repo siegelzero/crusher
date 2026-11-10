@@ -81,6 +81,7 @@ type
         baseArray*: ConstrainedArray[T]
         assignment*: seq[T]
         lastIterations*: int
+        lastSearchSeconds*: float  # search time of the solving state (0 = unknown)
         searchCompleted*: bool
         hasFeasibleSolution*: bool
         bestFeasibleAssignment*: seq[T]  # Best solution found during optimization (for signal handler)

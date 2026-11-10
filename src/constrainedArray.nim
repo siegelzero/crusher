@@ -1428,18 +1428,24 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
     # First examine any single-variable constraints to reduce domains
     var totalRemoved: int
+    # One shared scratch assignment (first domain value everywhere). A
+    # single-position constraint reads only `pos`, which is restored after
+    # each test; rebuilding it per constraint was O(#constraints * #positions).
+    var tempAssignment = newSeq[T](carray.len)
+    var tempReady = false
     for cons in carray.constraints:
         if cons.positions.len != 1:
             continue
         let pos = toSeq(cons.positions)[0]
         if pos in skippedPositions:
             continue
-        # Create a temporary assignment for testing this constraint
-        var tempAssignment = newSeq[T](carray.len)
-        # Initialize with first values from domains (doesn't matter, we only care about position pos)
-        for i in 0..<carray.len:
-            if carray.domain[i].len > 0:
-                tempAssignment[i] = carray.domain[i][0]
+        if not tempReady:
+            for i in 0..<carray.len:
+                if carray.domain[i].len > 0:
+                    tempAssignment[i] = carray.domain[i][0]
+            tempReady = true
+        let savedVal = tempAssignment[pos]
+        defer: tempAssignment[pos] = savedVal
 
         var removed = 0
         for d in carray.domain[pos]:
@@ -3267,26 +3273,39 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     var changed = false
 
                     for form in normalizedForms:
-                        for pos_j in form.coefficients.keys:
-                            let a_j = form.coefficients[pos_j]
-                            if a_j == 0: continue
-
-                            var restMax: T = 0
-                            var overflow = false
-                            for pos_i in form.coefficients.keys:
-                                if pos_i == pos_j: continue
-                                let a_i = form.coefficients[pos_i]
-                                let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
-                                let absA = abs(a_i)
-                                let absD = abs(dVal)
-                                if absA > 0 and absD > high(T) div absA:
-                                    overflow = true; break
-                                let product = a_i * dVal
-                                if abs(restMax) > HalfMax2:
-                                    overflow = true; break
-                                restMax += product
-                            if overflow: continue
-                            if abs(form.constant) > HalfMax2 or abs(restMax) > HalfMax2:
+                        # restMax for pos_j = (sum of every term) - (pos_j's term).
+                        # A position's own update below never changes its own
+                        # term (a_j > 0 raises its min but its term uses its max,
+                        # and vice versa), so the total stays exact within the form.
+                        # O(n) per form instead of O(n^2).
+                        var terms: seq[(int, T, T, bool)]  # (pos, coeff, term, overflow)
+                        var total: T = 0
+                        var nOverflow = 0
+                        var totalOverflow = false
+                        for pos_i, a_i in form.coefficients.pairs:
+                            if a_i == 0: continue
+                            let dVal = if a_i > 0: domainMax[pos_i] else: domainMin[pos_i]
+                            let absA = abs(a_i)
+                            let absD = abs(dVal)
+                            if absA > 0 and absD > high(T) div absA:
+                                terms.add((pos_i, a_i, T(0), true))
+                                inc nOverflow
+                                continue
+                            let product = a_i * dVal
+                            terms.add((pos_i, a_i, product, false))
+                            if abs(total) > HalfMax2 or abs(product) > HalfMax2:
+                                totalOverflow = true
+                            else:
+                                total += product
+                        if totalOverflow or abs(total) > HalfMax2:
+                            continue
+                        if abs(form.constant) > HalfMax2:
+                            continue
+                        for (pos_j, a_j, term_j, ovf_j) in terms:
+                            if nOverflow - (if ovf_j: 1 else: 0) > 0:
+                                continue
+                            let restMax = total - term_j
+                            if abs(restMax) > HalfMax2:
                                 continue
 
                             let bound = -form.constant - restMax
