@@ -687,6 +687,11 @@ type
         boolGatedVarVarChannelDefs*: seq[tuple[targetVar, condVar, val1Var, val0Var: string]]
         # Bool-gated expression channel defs: x = if cond then expression else constant
         # Created when int_lin_eq_reif defines a conditional relationship with a linear expression
+        # Default clause `x == c ∨ cond` of each conditional expression channel
+        # (target -> (bool of x == c, cond)); once the channel is built the
+        # clause holds by construction and its disjunctive-clause copy is dropped.
+        condExprDefaultClause*: Table[string, (string, string)]
+        absorbedClausePairs*: HashSet[(string, string)]
         boolGatedExprChannelDefs*: seq[tuple[
             targetVar, condVar: string,
             exprVars: seq[string],  # variable names in the expression
@@ -2518,6 +2523,9 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
                              &"({adjItems.len} items, {adjPairs.len} pairs, {adjPositions.len} positions)")
 
     # Add generalized disjunctive clause constraints using dedicated DisjunctiveClauseType
+    # Two-literal clauses by source bools: a conditional expression channel
+    # built later may make one hold by construction (dropped then).
+    var clauseByPair: Table[(string, string), StatefulConstraint[int]]
     for clause in result.disjunctiveClauses:
         var disjuncts: seq[seq[tuple[coeffs: seq[int], positions: seq[int], rhs: int]]]
         var allPositions = initPackedSet[int]()
@@ -2574,6 +2582,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
                 stateType: DisjunctiveClauseType,
                 disjunctiveClauseState: dcState)
             result.sys.addConstraint(constraint)
+            if clause.sourceBools.len == 2:
+                clauseByPair[(clause.sourceBools[0], clause.sourceBools[1])] = constraint
 
     if result.disjunctiveClauses.len > 0:
         stderr.writeLine(&"[FZN] Emitted {result.disjunctiveClauses.len} generalized disjunctive clause constraints")
@@ -3182,6 +3192,17 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.buildBoolGatedVarChannelBindings()
     # Build channel bindings for conditional expression channels (x = if cond then expr else const)
     result.buildConditionalExpressionChannelBindings()
+    # Default clauses `x == c ∨ cond` of the conditional expression channels
+    # just built hold by construction: drop their disjunctive-clause copies.
+    block:
+        var absorbed: HashSet[pointer]
+        for (a, b) in result.absorbedClausePairs:
+            for key in [(a, b), (b, a)]:
+                if key in clauseByPair: absorbed.incl(cast[pointer](clauseByPair[key]))
+        if absorbed.len > 0:
+            result.sys.baseArray.constraints.keepItIf(cast[pointer](it) notin absorbed)
+            result.sys.baseArray.reducedDomain = @[]
+            stderr.writeLine(&"[FZN] Dropped {absorbed.len} disjunctive clauses satisfied by conditional expression channels")
     # Build channel bindings for array_bool_and/or with defines_var
     result.buildBoolLogicChannelBindings()
     # Build channel bindings for implication-OR patterns (V = OR(W_i) detected

@@ -909,6 +909,7 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
     # Build a map: targetVar → (occurs, constVal, clauseCI)
     type DefaultEntry = object
         occursVar: string
+        constBool: string
         constVal: int
         clauseCI: int
         eqReifCI: int
@@ -944,6 +945,7 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
             if targetVar in defaultsByTarget: continue  # already found
             defaultsByTarget[targetVar] = DefaultEntry(
                 occursVar: candidateOccurs,
+                constBool: candidateConst,
                 constVal: eqEntry.constVal,
                 clauseCI: ci,
                 eqReifCI: eqEntry.ci)
@@ -1027,6 +1029,7 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
         if not allResolvable: continue
 
         # Record the detection
+        tr.condExprDefaultClause[targetVar] = (defEntry.constBool, defEntry.occursVar)
         tr.boolGatedExprChannelDefs.add((
             targetVar: targetVar,
             condVar: defEntry.occursVar,

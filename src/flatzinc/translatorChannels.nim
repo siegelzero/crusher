@@ -4451,6 +4451,8 @@ proc buildConditionalExpressionChannelBindings*(tr: var FznTranslator) =
 
         tr.sys.baseArray.addChannelBinding(targetPos, condExpr, gatedArray)
         inc built
+        if def.targetVar in tr.condExprDefaultClause:
+            tr.absorbedClausePairs.incl(tr.condExprDefaultClause[def.targetVar])
 
     if built > 0:
         let totalChannels = tr.sys.baseArray.channelPositions.len

@@ -353,6 +353,11 @@ type
         pmHintOk: seq[bool]        # all inputs are search positions
         pmUndo: seq[(int, T)]
         leanBatchBuf: seq[int]          # lean-move batch deltas of the position being scanned
+        # Keep-end moves: no-overlap tasks with a movable start and duration
+        keepEndBuilt: bool
+        keepEndTasks: seq[tuple[sp, dp: int]]
+        keepEndStartOf: Table[int, seq[(int, int)]]   # start pos -> (MMNO ci, task)
+        keepEndApplied: int
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -1649,6 +1654,7 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
 let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
 const TableMoveEvery = 100    # stagnant iterations between table moves
 const MachineElimEvery = 20   # stagnant iterations between machine-elimination moves
+const KeepEndEvery = 5        # stagnant iterations between keep-end moves
 
 iterator channelBindingIdxOf[T](carray: ConstrainedArray[T], pos: int): int =
     for bi in 0..<carray.channelBindings.len:
@@ -3200,6 +3206,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var cascadeInputEdges = 0
         var edgeBudgetSkipped = 0
         var noConstraintSkip = 0  # cascades skipped: zero channel-dep constraints read them
+        var deadCascadeEntries = 0  # cascade entries dropped: no constraint reads them
 
         # Very many channel-dep search positions (e.g. tens of thousands of set-var
         # bools): per-position cascade tables cost seconds and gigabytes to build,
@@ -3470,6 +3477,57 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         for ci in order:
                             o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
                         topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
+
+            # Dead entries: channels that no active channel-dep constraint reads,
+            # directly or through later cascade entries (e.g. deopt aliases of
+            # disjunctives consumed into a no-overlap constraint, output-only
+            # sums), cost an evaluation per domain value and change no penalty.
+            # Drop them; the worklist still propagates them after each move.
+            if canBuild and topoOrder.len > 0:
+                let n = topoOrder.len
+                var idxOf = initTable[int, int]()
+                for ci, cp in topoOrder: idxOf[cp] = ci
+                var readers = newSeq[seq[int]](n)
+                for ci in 0..<n:
+                    for p in state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).items:
+                        if p in idxOf and idxOf[p] != ci: readers[idxOf[p]].add ci
+                var useful = newSeq[bool](n)
+                for ci in countdown(n - 1, 0):
+                    let cp = topoOrder[ci]
+                    if cp in state.chanPosToDepConstraintIdx:
+                        for k in state.chanPosToDepConstraintIdx[cp]:
+                            if state.channelDepConstraintActive[k]:
+                                useful[ci] = true; break
+                    if not useful[ci]:
+                        for r in readers[ci]:
+                            if useful[r]: useful[ci] = true; break
+                # Readers come later in topological order, except across a
+                # cycle (BFS order kept): settle those by iterating.
+                var changed = true
+                while changed:
+                    changed = false
+                    for ci in 0..<n:
+                        if useful[ci]: continue
+                        for r in readers[ci]:
+                            if useful[r]:
+                                useful[ci] = true; changed = true; break
+                var nUseful = 0
+                for u in useful:
+                    if u: inc nUseful
+                if nUseful > 0 and nUseful < n:
+                    let nSrc = if nSrcReaders < 0: n else: nSrcReaders
+                    var o2, b2: seq[int]
+                    var k2: seq[CascadeEntryKind]
+                    var newSrc = 0
+                    for ci in 0..<n:
+                        if not useful[ci]: continue
+                        if ci < nSrc: inc newSrc
+                        o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
+                    topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
+                    topoSet = initPackedSet[int]()
+                    for cp in topoOrder: topoSet.incl(cp)
+                    if nSrcReaders >= 0: nSrcReaders = newSrc
+                    deadCascadeEntries += n - nUseful
 
             # Wide-input guard: entries such as global-cardinality count channels
             # read every assignment variable; the per-cascade dependency tables are
@@ -3875,7 +3933,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             echo "[Init] Cascade tables: " & $staticCount & " static + " & $dynamicCount &
                  " dynamic / " & $(staticCount + dynamicCount + cascadeFail + noConstraintSkip) &
                  " positions (fail=" & $cascadeFail & " depthFail=" & $cascadeDepthFail &
-                 " noCons=" & $noConstraintSkip &
+                 " noCons=" & $noConstraintSkip & " deadEntries=" & $deadCascadeEntries &
                  (if binaryCascadesSkipped > 0: " binarySkipped=" & $binaryCascadesSkipped else: "") &
                  (if edgeBudgetSkipped > 0: " edgeBudgetSkipped=" & $edgeBudgetSkipped else: "") &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
@@ -5555,6 +5613,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
     if state.mmnoIndices.len > 0:
         echo &"[Tabu S{state.id}] machineElim: applied={state.machineElimApplied}"
+    if state.keepEndTasks.len > 0:
+        echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -5843,6 +5903,80 @@ proc tryMachineEliminationMoves[T](state: TabuState[T], allowPerturb: bool): boo
     inc state.machineElimApplied
     return true
 
+
+proc tryKeepEndMoves[T](state: TabuState[T]): bool =
+    ## Compound move for no-overlap tasks whose start and duration are both
+    ## search variables: start -> v with duration -> end - v, so the task's
+    ## end (and an unload or other operation anchored to it) stays put while
+    ## its beginning moves into a free slot. Single moves always shift one of
+    ## the two ends. Candidates: the ends of the tasks sharing a machine with
+    ## it, the range extremes and a few random values. Applies the best one
+    ## when it lowers the cost, or keeps it at equal cost now and then.
+    if not state.keepEndBuilt:
+        state.keepEndBuilt = true
+        var seen: PackedSet[int]
+        template movable(p: int): bool =
+            p >= 0 and p notin state.carray.channelPositions and p notin state.carray.fixedPositions
+        for ci, c in state.constraints:
+            if c.stateType != MultiMachineNoOverlapType: continue
+            let mc = c.multiMachineNoOverlapState
+            for t in 0..<mc.taskCount:
+                let sp = mc.startPositions[t]
+                if not sp.movable: continue
+                state.keepEndStartOf.mgetOrPut(sp, @[]).add((ci, t))
+                let dp = mc.durPositions[t]
+                if dp.movable and sp notin seen:
+                    seen.incl(sp)
+                    state.keepEndTasks.add((sp: sp, dp: dp))
+    if state.keepEndTasks.len == 0: return false
+    let (sp, dp) = state.keepEndTasks[rand(state.keepEndTasks.len - 1)]
+    let s0 = state.assignment[sp]
+    let d0 = state.assignment[dp]
+    let e = s0 + d0
+    let sDom {.cursor.} = state.sharedDomain[][sp]
+    let dDom {.cursor.} = state.sharedDomain[][dp]
+    if sDom.len <= 1 or dDom.len <= 1: return false
+    let dLo = min(dDom)
+    let dHi = max(dDom)
+    let vLo = max(min(sDom), e - dHi)
+    let vHi = min(max(sDom), e - dLo)
+    if vHi <= vLo: return false
+    var cands: seq[T]
+    template addCand(v: T) =
+        if v >= vLo and v <= vHi and v != s0 and v notin cands: cands.add(v)
+    addCand(vLo); addCand(vHi)
+    for (ci, t) in state.keepEndStartOf.getOrDefault(sp, @[]):
+        let mc = state.constraints[ci].multiMachineNoOverlapState
+        let m = int(mc.currentMachines[t])
+        if m < 0 or m >= mc.order.len: continue
+        for u in mc.order[m]:
+            if u == t: continue
+            addCand(T(int(mc.currentStarts[u]) + mc.currentDurs[u]))
+    if cands.len > 10:
+        shuffle(cands); cands.setLen(10)
+    for _ in 0..<3: addCand(T(rand(int(vLo)..int(vHi))))
+    let origCost = state.cost
+    var bestCost = high(int)
+    var bestV = s0
+    for v in cands:
+        let d = e - v
+        if state.domIdx(dp, d) < 0 and d notin dDom: continue
+        if v notin sDom: continue
+        state.assignValueLean(sp, v)
+        state.assignValueLean(dp, d)
+        if state.cost < bestCost:
+            bestCost = state.cost; bestV = v
+        state.assignValueLean(dp, d0)
+        state.assignValueLean(sp, s0)
+    if bestV == s0: return false
+    if bestCost > origCost or (bestCost == origCost and rand(1.0) > 0.3): return false
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    for (p, oldV, newV) in [(sp, s0, bestV), (dp, d0, e - bestV)]:
+        let oi = state.domIdx(p, oldV)
+        if oi >= 0 and not state.isLazy[p]: state.tabu[p][oi] = tabuTenure
+        if state.leanSearch: state.assignValueLean(p, newV) else: state.assignValue(p, newV)
+    inc state.keepEndApplied
+    true
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     state.searchDeadline = deadline
@@ -6261,6 +6395,21 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                     if state.cost == 0:
                         if state.verbose:
                             state.logExitStats("Solution found via machine elimination")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+
+        # Keep-end moves: shift a task's start while its end stays put
+        if state.iteration - lastImprovement >= KeepEndEvery and
+           (state.iteration - lastImprovement) mod KeepEndEvery == 0 and
+           not outOfBudget():
+            if state.tryKeepEndMoves():
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via keep-end move")
                         state.lastImprovementIter = lastImprovement
                         return state
 
