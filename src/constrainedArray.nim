@@ -89,6 +89,26 @@ type
         permPositions*: seq[int]    # Permutation variable positions (for inverse lookup)
         sweepCosts*: seq[T]         # sweepCosts[nodeIdx] = per-position offset via inverse permutation
 
+    ProfileMaxChannelBinding*[T] = object
+        ## Peak of a load profile: channel = max_s L_s with
+        ##     L_s = slotBase[s] + Σ_g [x_g == v] * (A * y_g + B)
+        ## summed over the (slot, A, B) contributions listed for group g at
+        ## value v (y_g = 0 when the group has no multiplier). Search state
+        ## keeps the loads cached (see tabu pm* fields), so a move of one source
+        ## costs O(#contributions it touches), not a rescan of every slot.
+        channelPosition*: int
+        slotBase*: seq[T]
+        groupX*: seq[int]            # x position per group
+        groupY*: seq[int]            # y position per group (-1: none)
+        groupLo*: seq[T]             # lowest x value with contributions
+        groupStart*: seq[int]        # [g] -> index into valStart of value groupLo[g]
+        groupN*: seq[int]            # number of x values covered from groupLo[g]
+        valStart*: seq[int]          # [groupStart[g] + k ..< +k+1] -> contribution range
+        contribSlot*: seq[int32]
+        contribA*: seq[T]
+        contribB*: seq[T]
+        groupsAtPos*: Table[int, seq[int]]  # source position -> groups reading it
+
     InverseGroup*[T] = object
         ## A group of positions forming an involution (self-inverse permutation).
         ## position[i] holds the opponent for team (i + valueOffset).
@@ -147,6 +167,8 @@ type
         expressionChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [expr binding indices]
         crossingCountMaxChannelBindings*: seq[CrossingCountMaxChannelBinding[T]]
         crossingCountMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [binding indices]
+        profileMaxChannelBindings*: seq[ProfileMaxChannelBinding[T]]
+        profileMaxChannelsAtPosition*: Table[int, seq[int]]  # source_pos → [binding indices]
         disjunctivePairs*: seq[tuple[
             coeffs1: seq[T], positions1: seq[int], rhs1: T,
             coeffs2: seq[T], positions2: seq[int], rhs2: T]]
@@ -560,6 +582,21 @@ proc addCrossingCountMaxChannelBinding*[T](arr: var ConstrainedArray[T],
                 arr.crossingCountMaxChannelsAtPosition[pos] = @[bindingIdx]
             elif bindingIdx notin arr.crossingCountMaxChannelsAtPosition[pos]:
                 arr.crossingCountMaxChannelsAtPosition[pos].add(bindingIdx)
+
+proc addProfileMaxChannelBinding*[T](arr: var ConstrainedArray[T],
+                                     binding: sink ProfileMaxChannelBinding[T]) =
+    ## Register a profile max channel (see ProfileMaxChannelBinding).
+    let bindingIdx = arr.profileMaxChannelBindings.len
+    var b = binding
+    b.groupsAtPos = initTable[int, seq[int]]()
+    for g in 0..<b.groupX.len:
+        b.groupsAtPos.mgetOrPut(b.groupX[g], @[]).add(g)
+        if b.groupY[g] >= 0 and b.groupY[g] != b.groupX[g]:
+            b.groupsAtPos.mgetOrPut(b.groupY[g], @[]).add(g)
+    for p in b.groupsAtPos.keys:
+        arr.profileMaxChannelsAtPosition.mgetOrPut(p, @[]).add(bindingIdx)
+    arr.channelPositions.incl(b.channelPosition)
+    arr.profileMaxChannelBindings.add(b)
 
 proc addInverseGroup*[T](arr: var ConstrainedArray[T],
                           positions: seq[int],
@@ -4681,11 +4718,11 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
 
         if cbHasChanges:
          for cbInfo in cbConstBindings:
-            let binding = carray.channelBindings[cbInfo.bi]
+            let binding {.cursor.} = carray.channelBindings[cbInfo.bi]
             let chPos = cbInfo.chPos
-            let arrElems = binding.arrayElements
+            let arrElems {.cursor.} = binding.arrayElements
             let arrLen = arrElems.len
-            let idxPositions = cbInfo.idxPositions
+            let idxPositions {.cursor.} = cbInfo.idxPositions
 
             let chSkipped = chPos in skippedPositions
             inc cbProcessed
@@ -4794,50 +4831,47 @@ proc reduceDomain*[T](carray: ConstrainedArray[T]): seq[seq[T]] =
                     let oldP1 = currentDomain[p1].len
                     let oldCh = currentDomain[chPos].len
 
-                    # Forward: domain(ch) ∩= {lookup[eval(v0,v1)] : (v0,v1) ∈ dom(p0)×dom(p1)}
+                    # Forward: domain(ch) ∩= {lookup[eval(v0,v1)] : (v0,v1) ∈ dom(p0)×dom(p1)}.
+                    # The same enumeration records the supports for the backward
+                    # pass: v0 (v1) is supported iff some pair gives a value in
+                    # domain(ch), and a reachable value is in the pruned domain iff
+                    # it was in the old one. (One pass instead of three: 120k
+                    # bindings over 1000-pair index domains on nside 2000_500.)
                     var reachableValues = initPackedSet[T]()
+                    var sup0, sup1: PackedSet[T]
                     for v0 in currentDomain[p0].items:
                         tempAssign[p0] = v0
                         for v1 in currentDomain[p1].items:
                             tempAssign[p1] = v1
                             let idx = binding.evalIndex(tempAssign)
                             if idx >= 0 and idx < arrLen:
-                                reachableValues.incl(arrElems[idx].constantValue)
+                                let val = arrElems[idx].constantValue
+                                reachableValues.incl(val)
+                                if val in currentDomain[chPos]:
+                                    sup0.incl(v0)
+                                    sup1.incl(v1)
                     let newChDom = currentDomain[chPos] * reachableValues
                     if newChDom.len > 0 and newChDom.len < currentDomain[chPos].len:
                         currentDomain[chPos] = newChDom
                         outerChanged = true
 
                     # Backward for p0: keep v0 if ∃ v1 s.t. lookup[eval(v0,v1)] ∈ domain(ch)
+                    var rem0 = oldP0  # PackedSet.len is O(n); track locally
                     for v0 in toSeq(currentDomain[p0].items):
-                        if currentDomain[p0].len <= 1: break  # never empty a domain
-                        tempAssign[p0] = v0
-                        var hasSupport = false
-                        for v1 in currentDomain[p1].items:
-                            tempAssign[p1] = v1
-                            let idx = binding.evalIndex(tempAssign)
-                            if idx >= 0 and idx < arrLen:
-                                if arrElems[idx].constantValue in currentDomain[chPos]:
-                                    hasSupport = true
-                                    break
-                        if not hasSupport:
+                        if rem0 <= 1: break  # never empty a domain
+                        if v0 notin sup0:
                             currentDomain[p0].excl(v0)
+                            dec rem0
                             outerChanged = true
 
-                    # Backward for p1: symmetric
+                    # Backward for p1: symmetric (removed v0 had no support, so
+                    # they supported no v1 either)
+                    var rem1 = oldP1
                     for v1 in toSeq(currentDomain[p1].items):
-                        if currentDomain[p1].len <= 1: break  # never empty a domain
-                        tempAssign[p1] = v1
-                        var hasSupport = false
-                        for v0 in currentDomain[p0].items:
-                            tempAssign[p0] = v0
-                            let idx = binding.evalIndex(tempAssign)
-                            if idx >= 0 and idx < arrLen:
-                                if arrElems[idx].constantValue in currentDomain[chPos]:
-                                    hasSupport = true
-                                    break
-                        if not hasSupport:
+                        if rem1 <= 1: break  # never empty a domain
+                        if v1 notin sup1:
                             currentDomain[p1].excl(v1)
+                            dec rem1
                             outerChanged = true
 
                     let prunedP0 = oldP0 - currentDomain[p0].len
@@ -5608,6 +5642,9 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     # Crossing count max channel bindings are all value types — shallow copy is fine
     result.crossingCountMaxChannelBindings = arr.crossingCountMaxChannelBindings
     result.crossingCountMaxChannelsAtPosition = arr.crossingCountMaxChannelsAtPosition
+    # Profile max bindings are value types (the load cache lives in TabuState)
+    result.profileMaxChannelBindings = arr.profileMaxChannelBindings
+    result.profileMaxChannelsAtPosition = arr.profileMaxChannelsAtPosition
 
     # Inverse groups are all value types — shallow copy is fine
     result.inverseGroups = arr.inverseGroups

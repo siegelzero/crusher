@@ -210,6 +210,20 @@ type
         ## dispatch overhead across thousands of independent clauses.
         varNames*: seq[string]         # k binary var names; "all 1s forbidden"
 
+    ProfileMaxDef* = object
+        ## A detected peak-load profile (see ProfileMaxChannelBinding):
+        ## maxVarName = max_s (slotBase[s] + Σ_g [x_g == v] * (A*y_g + B)).
+        maxVarName*: string
+        natLo*, natHi*: int            # natural range of the max
+        slotBase*: seq[int]
+        groupX*, groupY*: seq[string]  # groupY "" = no multiplier
+        groupLo*: seq[int]
+        groupN*: seq[int]
+        groupStart*: seq[int]
+        valStart*: seq[int]
+        contribSlot*: seq[int32]
+        contribA*, contribB*: seq[int]
+
     CrossingCountMaxDef* = object
         ## A detected crossing count max pattern:
         ## array_int_maximum(M, sums of betweenness indicators)
@@ -609,6 +623,7 @@ type
         argmaxPatterns*: Table[int, ArgmaxPattern]
         # Detected crossing count max patterns (betweenness indicators → sum → array_int_maximum)
         crossingCountMaxDefs*: seq[CrossingCountMaxDef]
+        profileMaxDefs*: seq[ProfileMaxDef]
         # Rescued defined vars: originally defined-var-only, but appear in var-indexed arrays
         # so need positions. Converted to channel variables with single-input MinMaxChannelBindings.
         rescuedChannelDefs*: seq[tuple[ci: int, varName: string]]
@@ -2246,22 +2261,66 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
         values, guards, actives, ubs: seq[int]
         seenValues: HashSet[int]
     var guardedGroups: Table[seq[int], GuardedGroup]
+    var condLinSynthPos: Table[string, int]
     for pat in result.conditionalLinearPatterns:
+        # Resolve the linear term over positions: parameters and literals fold
+        # into the rhs, defined variables with a linear definition (an end time
+        # e = d + dur) are substituted. Skipping one would drop the constraint.
+        var coefOf: Table[int, int]
         var linPositions: seq[int]
+        var rhs = pat.rhs
         var skip = false
-        for vn in pat.varNames:
+        for i, vn in pat.varNames:
+            let c = pat.coeffs[i]
             if vn in result.varPositions:
-                linPositions.add(result.varPositions[vn])
+                let p = result.varPositions[vn]
+                if p notin coefOf: linPositions.add p
+                coefOf[p] = coefOf.getOrDefault(p, 0) + c
             elif vn in result.paramValues:
-                # Fixed parameter — fold into rhs
-                skip = true
-                break
+                rhs -= c * result.paramValues[vn]
             else:
-                skip = true
-                break
+                var e: AlgebraicExpression[int]
+                var resolved = true
+                try: e = result.resolveExprArg(FznExpr(kind: FznIdent, ident: vn))
+                except CatchableError: resolved = false
+                if not resolved or e.isNil:
+                    skip = true
+                    break
+                if e.node.kind == LiteralNode:
+                    rhs -= c * e.node.value
+                elif e.linear:
+                    let lin = linearize(e)
+                    rhs -= c * lin.constant
+                    for p in e.positions.items:
+                        let k = lin.coefficient.getOrDefault(p, 0)
+                        if k == 0: continue
+                        if p notin coefOf: linPositions.add p
+                        coefOf[p] = coefOf.getOrDefault(p, 0) + c * k
+                else:
+                    # Non-linear definition (a product g * e): give it an
+                    # expression channel position of its own
+                    var sp = condLinSynthPos.getOrDefault(vn, -1)
+                    if sp < 0:
+                        let dom = result.lookupVarDomain(vn)
+                        if dom.len == 0:
+                            skip = true
+                            break
+                        sp = result.sys.baseArray.len
+                        let v = result.sys.newConstrainedVariable()
+                        v.setDomain(dom)
+                        result.sys.baseArray.addExpressionChannelBinding(sp, e)
+                        condLinSynthPos[vn] = sp
+                    if sp notin coefOf: linPositions.add sp
+                    coefOf[sp] = coefOf.getOrDefault(sp, 0) + c
         if skip:
+            if nCondLinSkipped == 0:
+                stderr.writeLine(&"[FZN] WARNING: conditional linear over {pat.varNames} " &
+                                 "cannot be resolved; constraint dropped")
             inc nCondLinSkipped
             continue
+        linPositions.keepItIf(coefOf[it] != 0)
+        var linCoeffs: seq[int]
+        for p in linPositions: linCoeffs.add coefOf[p]
 
         # Resolve guard position. The guard is often the bool2int image of a
         # bool (`open <= cap * b2i(is_open)`); detectBool2intIdentityAliases
@@ -2271,17 +2330,26 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
         if guardName notin result.varPositions and guardName in result.bool2intIdentityAliases:
             guardName = result.bool2intIdentityAliases[guardName]
         if guardName notin result.varPositions:
+            if nCondLinSkipped == 0:
+                stderr.writeLine(&"[FZN] WARNING: conditional linear guard {guardName} has no position; constraint dropped")
             inc nCondLinSkipped
             continue
         let guardPos = result.varPositions[guardName]
+        if linPositions.len == 0:
+            # guard active -> 0 <= rhs: either a tautology or the guard can
+            # never take its active value
+            if rhs < 0:
+                result.sys.baseArray.domain[guardPos].keepItIf(it != pat.guardActiveValue)
+            inc nCondLinEmitted
+            continue
 
-        if pat.coeffs.len == 1 and pat.coeffs[0] > 0 and
+        if linCoeffs.len == 1 and linCoeffs[0] > 0 and
            linPositions[0] in countEqByChannel and
            guardPos notin result.sys.baseArray.channelPositions:
             let b = result.sys.baseArray.countEqChannelBindings[countEqByChannel[linPositions[0]]]
             if guardPos notin b.inputPositions:
                 # c * (count_vars + constOffset) <= rhs  →  count_vars <= floor(rhs / c) - constOffset
-                let ub = floorDiv(pat.rhs, pat.coeffs[0]) - b.constantOffset
+                let ub = floorDiv(rhs, linCoeffs[0]) - b.constantOffset
                 var grp = guardedGroups.getOrDefault(b.inputPositions,
                     GuardedGroup(inputs: b.inputPositions))
                 if b.targetValue notin grp.seenValues:
@@ -2295,9 +2363,9 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
 
         # Create the ConditionalLinear constraint
         let clState = newConditionalLinearConstraint[int](
-            coeffs = pat.coeffs,
+            coeffs = linCoeffs,
             linPositions = linPositions,
-            rhs = pat.rhs,
+            rhs = rhs,
             guardPosition = guardPos,
             guardActiveValue = pat.guardActiveValue)
 
@@ -3086,6 +3154,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.detectImplicitMaxChannels()
     # Build channel bindings for crossing count max patterns
     result.buildCrossingCountMaxChannelBindings()
+    result.buildProfileMaxChannelBindings()
     # Build channel bindings for array_int_minimum/maximum defines_var
     result.buildMinMaxChannelBindings()
     # Build channel bindings for rescued defined vars (from var-indexed arrays)

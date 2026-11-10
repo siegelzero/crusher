@@ -56,6 +56,7 @@ type
         ceWeightedCountEq  ## WeightedCountEq channel binding
         ceArgmax     ## Argmax channel binding
         ceCrossingCountMax  ## Crossing count max channel binding
+        ceProfileMax        ## Profile max channel binding (cached loads)
         ceConditionalCountEq  ## ConditionalCountEq channel binding
         ceExpression  ## Expression channel binding (int_times/int_div/int_mod/int_plus)
 
@@ -343,6 +344,13 @@ type
         # Reusable buffers for dynamic batch evaluation (avoid per-call allocation)
         cdBatchValues: seq[seq[T]]                # [chanIdx][domainIdx] -> channel value (resized as needed)
         cdBatchSaved: seq[T]                      # saved channel values during batch evaluation
+        # Profile max channel caches, per binding (see tabuChannelDep pm* procs)
+        pmLoads: seq[seq[T]]
+        pmTree: seq[seq[T]]
+        pmTreeSize: seq[int]
+        pmCacheX, pmCacheY: seq[seq[T]]
+        pmHintOk: seq[bool]        # all inputs are search positions
+        pmUndo: seq[(int, T)]
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -1716,6 +1724,9 @@ proc cascadeEntryInputs[T](state: TabuState[T], carray: ConstrainedArray[T],
                 if srcPos != pos: result.incl(srcPos)
         for srcPos in binding.permPositions:
             if srcPos != pos: result.incl(srcPos)
+    of ceProfileMax:
+        for srcPos in carray.profileMaxChannelBindings[bidx].groupsAtPos.keys:
+            if srcPos != pos: result.incl(srcPos)
     of ceElement:
         let bindingPtr = addr carray.channelBindings[bidx]
         for ipos in bindingPtr.indexExpression.positions.items:
@@ -1744,6 +1755,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         carray.argmaxChannelsAtPosition.len > 0 or
         carray.expressionChannelsAtPosition.len > 0 or
         carray.crossingCountMaxChannelsAtPosition.len > 0 or
+        carray.profileMaxChannelsAtPosition.len > 0 or
         carray.inverseChannelsAtPosition.len > 0
     state.constraintsAtPosition = newSeq[seq[StatefulConstraint[T]]](carray.len)
     state.neighbors = newSeq[seq[int]](carray.len)
@@ -2146,9 +2158,29 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         if dups > 3:
             stderr.writeLine("[Init] WARNING: ... and " & $(dups - 3) & " more duplicate positions")
         stderr.flushFile()
+    # Profile max caches: built here from the source values, kept in the
+    # fixed point below (cheap sync) in case channels read the profile max.
+    let nPm = carray.profileMaxChannelBindings.len
+    state.pmLoads = newSeq[seq[T]](nPm)
+    state.pmTree = newSeq[seq[T]](nPm)
+    state.pmTreeSize = newSeq[int](nPm)
+    state.pmCacheX = newSeq[seq[T]](nPm)
+    state.pmCacheY = newSeq[seq[T]](nPm)
+    state.pmHintOk = newSeq[bool](nPm)
+    for bi in 0..<nPm:
+        state.pmHintOk[bi] = true
+        for p in carray.profileMaxChannelBindings[bi].groupsAtPos.keys:
+            if p in carray.channelPositions: state.pmHintOk[bi] = false
+        state.assignment[carray.profileMaxChannelBindings[bi].channelPosition] = state.pmRebuild(bi)
     while channelChanged:
         channelChanged = false
         fpIter += 1
+        for bi in 0..<nPm:
+            let newVal = state.pmSync(bi)
+            let cp = carray.profileMaxChannelBindings[bi].channelPosition
+            if newVal != state.assignment[cp]:
+                state.assignment[cp] = newVal
+                channelChanged = true
         for binding in carray.channelBindings:
             let idxVal = binding.evalIndex(state.assignment)
             if idxVal >= 0 and idxVal < binding.arrayElements.len:
@@ -2367,6 +2399,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             repairChannelChanged = false
             repairFpIter += 1
             if repairFpIter > 50: break
+            for bi in 0..<carray.profileMaxChannelBindings.len:
+                let newVal = state.pmSync(bi)
+                let cp = carray.profileMaxChannelBindings[bi].channelPosition
+                if newVal != state.assignment[cp]:
+                    state.assignment[cp] = newVal
+                    repairChannelChanged = true
             for binding in carray.channelBindings:
                 let idxVal = binding.evalIndex(state.assignment)
                 if idxVal >= 0 and idxVal < binding.arrayElements.len:
@@ -2678,6 +2716,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                pos in carray.countEqChannelsAtPosition or pos in carray.weightedCountEqChannelsAtPosition or pos in carray.conditionalCountEqChannelsAtPosition or
                pos in carray.inverseChannelsAtPosition or pos in carray.argmaxChannelsAtPosition or
                pos in carray.expressionChannelsAtPosition or pos in carray.crossingCountMaxChannelsAtPosition or
+               pos in carray.profileMaxChannelsAtPosition or
                pos in state.ctpAtLink:
                 state.channelDepSearchPositions.add(pos)
 
@@ -2787,6 +2826,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for bi in carray.crossingCountMaxChannelsAtPosition[p]:
                         let binding {.cursor.} = carray.crossingCountMaxChannelBindings[bi]
                         let chanPos = binding.channelPosition
+                        reachable.incl(chanPos)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            worklist.add(chanPos)
+                # Profile max channel bindings
+                if p in carray.profileMaxChannelsAtPosition:
+                    for bi in carray.profileMaxChannelsAtPosition[p]:
+                        let chanPos = carray.profileMaxChannelBindings[bi].channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
                             visited.incl(chanPos)
@@ -3127,6 +3174,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         var dynamicCount = 0
         var cascadeFail = 0
         var cascadeDepthFail = 0
+        const MaxCascadeInputEdges = 8_000_000
+        var cascadeInputEdges = 0
+        var edgeBudgetSkipped = 0
         var noConstraintSkip = 0  # cascades skipped: zero channel-dep constraints read them
 
         # Very many channel-dep search positions (e.g. tens of thousands of set-var
@@ -3283,6 +3333,20 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             bfsQueue.add(chanPos)
+                # Profile max channel bindings: dynamic entries (cached loads)
+                if p in carray.profileMaxChannelsAtPosition:
+                    for bi in carray.profileMaxChannelsAtPosition[p]:
+                        let chanPos = carray.profileMaxChannelBindings[bi].channelPosition
+                        if chanPos in topoSet:
+                            continue  # Diamond — skip
+                        canStatic = false  # depends on non-local positions
+                        topoSet.incl(chanPos)
+                        topoOrder.add(chanPos)
+                        topoBindingIdx.add(bi)
+                        topoEntryKind.add(ceProfileMax)
+                        if chanPos notin visited:
+                            visited.incl(chanPos)
+                            bfsQueue.add(chanPos)
                 # ConditionalCountEq channels: include in cascade as dynamic entries
                 if p in carray.conditionalCountEqChannelsAtPosition:
                     for bi in carray.conditionalCountEqChannelsAtPosition[p]:
@@ -3316,6 +3380,25 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             bfsQueue.add(chanPos)
                 if p in carray.inverseChannelsAtPosition or p in state.ctpAtLink:
                     canBuild = false   # multi-output groups: per-value fallback handles them
+
+            # Input-edge budget: every cascade indexes the inputs its entries
+            # read (internal readers, external-dep reverse index). Cascades
+            # through wide sums that every source shares (nside 2000_500: 4000
+            # sources x 242 day sums x ~500 terms = 480M edges, >16 GB per
+            # state) make that quadratic. Binary sources stop first, at half
+            # the budget: their fallback evaluates a single alternative value.
+            # Checked before the topological reorder, which reads the same inputs.
+            var cascadeEdges = 0
+            if canBuild and topoOrder.len > 0:
+                let budget =
+                    if state.sharedDomain[][pos].len <= 2: MaxCascadeInputEdges div 2
+                    else: MaxCascadeInputEdges
+                for ci in 0..<topoOrder.len:
+                    cascadeEdges += state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).len
+                    if cascadeInputEdges + cascadeEdges > budget: break
+                if cascadeInputEdges + cascadeEdges > budget:
+                    canBuild = false
+                    inc edgeBudgetSkipped
 
             # BFS discovery order is not always topological: an entry reached
             # early through one input can also read an entry discovered later
@@ -3407,6 +3490,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # per-value worklist fallback is the cheaper path for them.
                 if tableRefs > MaxCascadeInputRefs and topoOrder.len > MaxTableHeavyCascadeChans:
                     canBuild = false
+            if canBuild and topoOrder.len > 0:
+                cascadeInputEdges += cascadeEdges
             if not canBuild or topoOrder.len == 0:
                 cascadeFail += 1
                 if verbose and id == 0 and cascadeFail <= 8:
@@ -3621,6 +3706,11 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)
+                of ceProfileMax:
+                    for srcPos in carray.profileMaxChannelBindings[topoBindingIdx[ci]].groupsAtPos.keys:
+                        if srcPos != pos and srcPos notin topoSet:
+                            externalDeps.incl(srcPos)
+                            elemExtDeps.incl(srcPos)
                 of ceElement:
                     let bindingPtr = addr carray.channelBindings[topoBindingIdx[ci]]
                     for ipos in bindingPtr.indexExpression.positions.items:
@@ -3765,6 +3855,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                  " positions (fail=" & $cascadeFail & " depthFail=" & $cascadeDepthFail &
                  " noCons=" & $noConstraintSkip &
                  (if binaryCascadesSkipped > 0: " binarySkipped=" & $binaryCascadesSkipped else: "") &
+                 (if edgeBudgetSkipped > 0: " edgeBudgetSkipped=" & $edgeBudgetSkipped else: "") &
                  " avg_chans=" & $(totalChans div max(1, staticCount + dynamicCount)) &
                  " mem=" & $(totalMem div 1024) & "KB" &
                  " extDeps: elemExt=" & $elemExtCount & " mmOnlyExt=" & $mmExtCount &
@@ -4342,6 +4433,32 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
+        # Profile max channel bindings: commit the source change to the load cache
+        if pos in state.carray.profileMaxChannelsAtPosition:
+            for bi in state.carray.profileMaxChannelsAtPosition[pos]:
+                let chanPos = state.carray.profileMaxChannelBindings[bi].channelPosition
+                let newVal = state.pmSync(bi)
+                if newVal != state.assignment[chanPos]:
+                    result = true
+                    changedChannels.add(chanPos)
+                    state.assignment[chanPos] = newVal
+                    for c in state.constraintsAtPosition[chanPos]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(chanPos, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                        if oldPenalty > 0 and newPenalty == 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] -= 1
+                        elif oldPenalty == 0 and newPenalty > 0:
+                            for pos in c.positions.items:
+                                state.violationCount[pos] += 1
+                    when ProfileIteration:
+                        state.propagateNeighborCalls += 1
+                    state.updateNeighborPenalties(chanPos)
+                    if chanPos notin inWorklist:
+                        inWorklist.incl(chanPos)
+                        worklist.add(chanPos)
         # Inverse channel bindings: recompute inverse from forward assignments
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:
@@ -4534,6 +4651,21 @@ proc propagateChannelsLean[T](state: TabuState[T], position: int) =
                     if binding.channelPosition notin inWorklist:
                         inWorklist.incl(binding.channelPosition)
                         worklist.add(binding.channelPosition)
+        # Profile max channel bindings (lean: no penalty maps or violationCount)
+        if pos in state.carray.profileMaxChannelsAtPosition:
+            for bi in state.carray.profileMaxChannelsAtPosition[pos]:
+                let chanPos = state.carray.profileMaxChannelBindings[bi].channelPosition
+                let newVal = state.pmSync(bi)
+                if newVal != state.assignment[chanPos]:
+                    state.assignment[chanPos] = newVal
+                    for c in state.constraintsAtPosition[chanPos]:
+                        let oldPenalty = c.penalty()
+                        c.updatePosition(chanPos, newVal)
+                        let newPenalty = c.penalty()
+                        state.cost += newPenalty - oldPenalty
+                    if chanPos notin inWorklist:
+                        inWorklist.incl(chanPos)
+                        worklist.add(chanPos)
         # Inverse channel bindings (lean: no penalty maps or violationCount)
         if pos in state.carray.inverseChannelsAtPosition:
             for gi in state.carray.inverseChannelsAtPosition[pos]:

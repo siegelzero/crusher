@@ -10,6 +10,7 @@ import test_group_value_disjoint
 import test_conjunct_sum_at_most
 import test_bool_equiv_gated_channels
 import test_bool_iff_or_channels
+import test_profile_max_and_condlin
 import test_implication_or_channels
 import test_implication_and_channels
 import test_boolean_constraints

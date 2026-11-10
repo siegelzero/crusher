@@ -249,6 +249,114 @@ proc evaluateCrossingCountMax[T](binding: CrossingCountMaxChannelBinding[T],
             current += events[v]
             if current > result: result = current
 
+# ---------------------------------------------------------------------------
+# Profile max channels: max over slots of cached loads (max-tree per binding).
+# The cache mirrors the committed assignment: rebuilt at init, synced on every
+# propagated move (O(#groups) compare). Candidate evaluations apply the moved
+# source's groups to the tree temporarily and revert.
+
+proc pmTreeSet[T](tree: var seq[T], sz: int, s: int, v: T) {.inline.} =
+    var i = sz + s
+    tree[i] = v
+    i = i shr 1
+    while i >= 1:
+        tree[i] = max(tree[2 * i], tree[2 * i + 1])
+        i = i shr 1
+
+proc pmShift[T](state: TabuState[T], bi, g: int, x, y: T, sign: T, record: bool) =
+    ## Add (sign = 1) or remove (sign = -1) group g's contributions at (x, y).
+    ## With `record`, the old load of every touched slot goes to pmUndo.
+    let b {.cursor.} = state.carray.profileMaxChannelBindings[bi]
+    let k = int(x - b.groupLo[g])
+    if k < 0 or k >= b.groupN[g]: return
+    let vi = b.groupStart[g] + k
+    let sz = state.pmTreeSize[bi]
+    for c in b.valStart[vi] ..< b.valStart[vi + 1]:
+        let s = int(b.contribSlot[c])
+        let d = sign * (b.contribA[c] * y + b.contribB[c])
+        if d == 0: continue
+        if record: state.pmUndo.add((s, state.pmLoads[bi][s]))
+        state.pmLoads[bi][s] += d
+        pmTreeSet(state.pmTree[bi], sz, s, state.pmLoads[bi][s])
+
+proc pmGroupY[T](state: TabuState[T], b: ProfileMaxChannelBinding[T], g: int): T {.inline.} =
+    if b.groupY[g] >= 0: state.assignment[b.groupY[g]] else: T(0)
+
+proc pmRebuild[T](state: TabuState[T], bi: int): T =
+    ## Rebuild binding bi's cache from the current assignment; returns the max.
+    let b {.cursor.} = state.carray.profileMaxChannelBindings[bi]
+    let nSlots = b.slotBase.len
+    var sz = 1
+    while sz < max(1, nSlots): sz = sz * 2
+    state.pmTreeSize[bi] = sz
+    state.pmLoads[bi] = b.slotBase
+    state.pmTree[bi] = newSeq[T](2 * sz)
+    for i in 0..<2 * sz: state.pmTree[bi][i] = low(T)
+    let nG = b.groupX.len
+    state.pmCacheX[bi].setLen(nG)
+    state.pmCacheY[bi].setLen(nG)
+    for g in 0..<nG:
+        let x = state.assignment[b.groupX[g]]
+        let y = state.pmGroupY(b, g)
+        state.pmCacheX[bi][g] = x
+        state.pmCacheY[bi][g] = y
+        let k = int(x - b.groupLo[g])
+        if k < 0 or k >= b.groupN[g]: continue
+        let vi = b.groupStart[g] + k
+        for c in b.valStart[vi] ..< b.valStart[vi + 1]:
+            state.pmLoads[bi][int(b.contribSlot[c])] += b.contribA[c] * y + b.contribB[c]
+    for s in 0..<nSlots: state.pmTree[bi][sz + s] = state.pmLoads[bi][s]
+    for i in countdown(sz - 1, 1):
+        state.pmTree[bi][i] = max(state.pmTree[bi][2 * i], state.pmTree[bi][2 * i + 1])
+    state.pmTree[bi][1]
+
+proc pmSyncGroup[T](state: TabuState[T], bi, g: int, record: bool) {.inline.} =
+    let b {.cursor.} = state.carray.profileMaxChannelBindings[bi]
+    let x = state.assignment[b.groupX[g]]
+    let y = state.pmGroupY(b, g)
+    let cx = state.pmCacheX[bi][g]
+    let cy = state.pmCacheY[bi][g]
+    if x == cx and y == cy: return
+    state.pmShift(bi, g, cx, cy, T(-1), record)
+    state.pmShift(bi, g, x, y, T(1), record)
+    if not record:
+        state.pmCacheX[bi][g] = x
+        state.pmCacheY[bi][g] = y
+
+proc pmSync[T](state: TabuState[T], bi: int): T =
+    ## Commit: bring the cache to the current assignment; returns the max.
+    for g in 0..<state.carray.profileMaxChannelBindings[bi].groupX.len:
+        state.pmSyncGroup(bi, g, record = false)
+    state.pmTree[bi][1]
+
+proc pmRevert[T](state: TabuState[T], bi: int) {.inline.} =
+    let sz = state.pmTreeSize[bi]
+    for i in countdown(state.pmUndo.len - 1, 0):
+        let (s, old) = state.pmUndo[i]
+        state.pmLoads[bi][s] = old
+        pmTreeSet(state.pmTree[bi], sz, s, old)
+    state.pmUndo.setLen(0)
+
+proc pmEvalFull[T](state: TabuState[T], bi: int): T =
+    ## Max for the current (possibly tentative) assignment; cache unchanged.
+    state.pmUndo.setLen(0)
+    for g in 0..<state.carray.profileMaxChannelBindings[bi].groupX.len:
+        state.pmSyncGroup(bi, g, record = true)
+    result = state.pmTree[bi][1]
+    state.pmRevert(bi)
+
+proc pmEvalAt[T](state: TabuState[T], bi: int, pos: int): T =
+    ## Max for the current assignment when only `pos` (a search position)
+    ## differs from the committed one; cache unchanged.
+    if not state.pmHintOk[bi]: return state.pmEvalFull(bi)
+    let b {.cursor.} = state.carray.profileMaxChannelBindings[bi]
+    state.pmUndo.setLen(0)
+    b.groupsAtPos.withValue(pos, gs):
+        for g in gs:
+            state.pmSyncGroup(bi, g, record = true)
+    result = state.pmTree[bi][1]
+    state.pmRevert(bi)
+
 proc trackChannelChange[T](state: TabuState[T], chanPos: int, newChanVal: T) {.inline.} =
     ## Record a channel position change using position-indexed tracking.
     ## Saves original value on first change; cdDirtyPositions stays deduplicated.
@@ -271,6 +379,7 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
        pos notin state.carray.inverseChannelsAtPosition and
        pos notin state.carray.argmaxChannelsAtPosition and
        pos notin state.carray.crossingCountMaxChannelsAtPosition and
+       pos notin state.carray.profileMaxChannelsAtPosition and
        pos notin state.carray.expressionChannelsAtPosition and
        pos notin state.ctpAtLink:
         return 0
@@ -431,6 +540,15 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
             let srcInc = p == pos and state.inverseSavedBuf.len == 0
+            if p in state.carray.profileMaxChannelsAtPosition:
+                for bi in state.carray.profileMaxChannelsAtPosition[p]:
+                    let newChanVal = if srcInc: state.pmEvalAt(bi, pos) else: state.pmEvalFull(bi)
+                    let chanPos = state.carray.profileMaxChannelBindings[bi].channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
             if p in state.carray.countEqChannelsAtPosition:
                 for bi in state.carray.countEqChannelsAtPosition[p]:
                     let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
@@ -574,6 +692,15 @@ proc computeChannelDepDelta[T](state: TabuState[T], pos: int, candidateValue: T)
                             state.cdVisited.incl(chanPos)
                             state.cdWorklist.add(chanPos)
             let srcInc = p == pos and state.inverseSavedBuf.len == 0
+            if p in state.carray.profileMaxChannelsAtPosition:
+                for bi in state.carray.profileMaxChannelsAtPosition[p]:
+                    let newChanVal = if srcInc: state.pmEvalAt(bi, pos) else: state.pmEvalFull(bi)
+                    let chanPos = state.carray.profileMaxChannelBindings[bi].channelPosition
+                    if newChanVal != state.assignment[chanPos]:
+                        state.trackChannelChange(chanPos, newChanVal)
+                        if chanPos notin state.cdVisited:
+                            state.cdVisited.incl(chanPos)
+                            state.cdWorklist.add(chanPos)
             if p in state.carray.countEqChannelsAtPosition:
                 for bi in state.carray.countEqChannelsAtPosition[p]:
                     let binding {.cursor.} = state.carray.countEqChannelBindings[bi]
@@ -1011,6 +1138,8 @@ proc computeChannelDepPenaltiesInc[T](state: TabuState[T], pos: int, changedExte
                 of ceCrossingCountMax:
                     let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
                     newVal = evaluateCrossingCountMax(binding, state.assignment)
+                of ceProfileMax:
+                    newVal = state.pmEvalAt(bindings[ci], pos)
                 of ceElement:
                     let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
                     let idxVal = bindingPtr[].evalIndex(state.assignment)
@@ -1179,6 +1308,8 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                             # Crossing count max: sweep-line evaluation
                             let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
                             state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
+                        of ceProfileMax:
+                            state.cdBatchValues[ci][di] = state.pmEvalAt(bindings[ci], pos)
                         of ceElement:
                             # Element binding: evaluate index expression and look up array
                             let bindingPtr = addr state.carray.channelBindings[bindings[ci]]
@@ -1231,6 +1362,8 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                             # Crossing count max: sweep-line evaluation
                             let binding {.cursor.} = state.carray.crossingCountMaxChannelBindings[bindings[ci]]
                             state.cdBatchValues[ci][di] = evaluateCrossingCountMax(binding, state.assignment)
+                        of ceProfileMax:
+                            state.cdBatchValues[ci][di] = state.pmEvalAt(bindings[ci], pos)
                         of ceElement:
                             # Element binding: evaluate index expression and look up array
                             let bindingPtr = addr state.carray.channelBindings[bindings[ci]]

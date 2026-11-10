@@ -1657,6 +1657,85 @@ proc buildCrossingCountMaxChannelBindings(tr: var FznTranslator) =
     if nBuilt > 0:
         stderr.writeLine(&"[FZN] Built {nBuilt} crossing count max channel bindings")
 
+proc buildProfileMaxChannelBindings(tr: var FznTranslator) =
+    ## Builds ProfileMaxChannelBinding from detected peak-load profiles
+    ## (groupIndicatorSums). Sources resolve to positions; a source fixed to a
+    ## literal by later passes is folded (x literal: the group is keyed by y).
+    var nBuilt = 0
+    for def in tr.profileMaxDefs:
+        if def.maxVarName notin tr.varPositions:
+            raise newException(ValueError, &"profile max var {def.maxVarName} has no position")
+        var b = ProfileMaxChannelBinding[int](channelPosition: tr.varPositions[def.maxVarName],
+                                              slotBase: def.slotBase)
+        b.valStart.add 0
+        proc resolveSrc(tr: var FznTranslator, name: string): (bool, int, int) =
+            ## (isPosition, position, literal value)
+            let e = tr.resolveExprArg(FznExpr(kind: FznIdent, ident: name))
+            if e.node.kind == RefNode: return (true, e.node.position, 0)
+            if e.node.kind == LiteralNode: return (false, -1, e.node.value)
+            raise newException(ValueError, &"profile max source {name} is not a variable or literal")
+        for g in 0..<def.groupX.len:
+            let (xIsPos, xPos, xVal) = tr.resolveSrc(def.groupX[g])
+            var yIsPos = false
+            var yPos = -1
+            var yVal = 0
+            if def.groupY[g] != "":
+                (yIsPos, yPos, yVal) = tr.resolveSrc(def.groupY[g])
+            template contribs(k: int, body: untyped) =
+                let vi {.inject.} = def.groupStart[g] + k
+                for c {.inject.} in def.valStart[vi] ..< def.valStart[vi + 1]:
+                    body
+            if xIsPos:
+                b.groupX.add xPos
+                b.groupY.add (if yIsPos: yPos else: -1)
+                b.groupLo.add def.groupLo[g]
+                b.groupN.add def.groupN[g]
+                b.groupStart.add b.valStart.len - 1
+                for k in 0..<def.groupN[g]:
+                    contribs(k):
+                        b.contribSlot.add def.contribSlot[c]
+                        if yIsPos or def.groupY[g] == "":
+                            b.contribA.add def.contribA[c]
+                            b.contribB.add def.contribB[c]
+                        else:
+                            b.contribA.add 0
+                            b.contribB.add def.contribA[c] * yVal + def.contribB[c]
+                    b.valStart.add b.contribSlot.len
+            else:
+                let k = xVal - def.groupLo[g]
+                if k < 0 or k >= def.groupN[g]: continue   # indicator never fires
+                if not yIsPos:
+                    contribs(k):
+                        b.slotBase[int(def.contribSlot[c])] +=
+                            (if def.groupY[g] == "": def.contribB[c]
+                             else: def.contribA[c] * yVal + def.contribB[c])
+                    continue
+                # x fixed: contributions are a function of y alone
+                let yDom {.cursor.} = tr.sys.baseArray.domain[yPos]
+                let ylo = min(yDom)
+                let yhi = max(yDom)
+                b.groupX.add yPos
+                b.groupY.add -1
+                b.groupLo.add ylo
+                b.groupN.add yhi - ylo + 1
+                b.groupStart.add b.valStart.len - 1
+                for yv in ylo..yhi:
+                    contribs(k):
+                        b.contribSlot.add def.contribSlot[c]
+                        b.contribA.add 0
+                        b.contribB.add def.contribA[c] * yv + def.contribB[c]
+                    b.valStart.add b.contribSlot.len
+        let channelPos = b.channelPosition
+        tr.sys.baseArray.addProfileMaxChannelBinding(b)
+        # Declared bounds narrower than the natural range are constraints
+        let (dOk, dLo, dHi) = tr.declaredBounds(def.maxVarName)
+        if dOk:
+            if def.natLo < dLo: tr.sys.addConstraint(tr.getExpr(channelPos) >= dLo)
+            if def.natHi > dHi: tr.sys.addConstraint(tr.getExpr(channelPos) <= dHi)
+        nBuilt += 1
+    if nBuilt > 0:
+        stderr.writeLine(&"[FZN] Built {nBuilt} profile max channel bindings")
+
 proc buildMinMaxChannelBindings(tr: var FznTranslator) =
     ## Builds min/max channel bindings from array_int_minimum/maximum and int_min/int_max
     ## constraints with defines_var annotations. Must be called after buildDefinedExpressions

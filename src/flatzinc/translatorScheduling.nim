@@ -1366,16 +1366,6 @@ proc detectBigMImplicationLinLe(tr: var FznTranslator) =
                           &"{nGuardFixed} guards fixed by infeasibility, " &
                           &"{nRedundant} redundant constraints dropped")
 
-proc referencesIdent(expr: FznExpr, name: string): bool =
-    ## Check if a FznExpr tree references a given identifier name.
-    case expr.kind
-    of FznIdent: return expr.ident == name
-    of FznArrayLit:
-        for e in expr.elems:
-            if referencesIdent(e, name): return true
-    else: discard
-    return false
-
 proc detectSmallDomainProducts(tr: var FznTranslator) =
     ## Detects int_times(a, b, prod) :: defines_var(prod) where one operand has
     ## a small domain (≤8 values), and ALL non-defining references to prod are in
@@ -1408,22 +1398,36 @@ proc detectSmallDomainProducts(tr: var FznTranslator) =
 
     if products.len == 0: return
 
-    # Step 2: For each product, find ALL non-defining constraints referencing it
+    # Step 2: For each product, find ALL non-defining constraints referencing it.
+    # One pass indexes the references of every product variable (a scan per
+    # product was O(#products * #constraints): 15 s on nside 2000_500).
+    var prodSlot = initTable[string, int]()
+    for product in products:
+        if product.prodVar notin prodSlot: prodSlot[product.prodVar] = prodSlot.len
+    var refsOf = newSeq[seq[int]](prodSlot.len)
+    proc collectRefs(expr: FznExpr, ci: int, prodSlot: Table[string, int],
+                     refsOf: var seq[seq[int]]) =
+        case expr.kind
+        of FznIdent:
+            let slot = prodSlot.getOrDefault(expr.ident, -1)
+            if slot >= 0 and (refsOf[slot].len == 0 or refsOf[slot][^1] != ci):
+                refsOf[slot].add(ci)
+        of FznArrayLit:
+            for e in expr.elems: collectRefs(e, ci, prodSlot, refsOf)
+        else: discard
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        for arg in tr.model.constraints[ci].args:
+            collectRefs(arg, ci, prodSlot, refsOf)
     var consumedLinLe = initPackedSet[int]()
     var nDecomposed = 0
     var nLinLeConsumed = 0
     for product in products:
         var linLeCIs: seq[int]
         var allLinLe = true
-        for ci in 0 ..< tr.model.constraints.len:
-            let con {.cursor.} = tr.model.constraints[ci]
-            if ci in tr.definingConstraints: continue
+        for ci in refsOf[prodSlot[product.prodVar]]:
             if ci in consumedLinLe: continue
-            var refsProd = false
-            for arg in con.args:
-                if referencesIdent(arg, product.prodVar):
-                    refsProd = true; break
-            if not refsProd: continue
+            let con {.cursor.} = tr.model.constraints[ci]
             let cname = stripSolverPrefix(con.name)
             if cname != "int_lin_le":
                 allLinLe = false; break
