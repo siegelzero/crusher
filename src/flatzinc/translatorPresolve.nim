@@ -2627,7 +2627,6 @@ proc cpmBoundsPropagate(tr: FznTranslator,
         fromVar, toVar, durVar: string  # durVar="" for constant-weight edges
         constWeight: int                # used when durVar=""
     var candidates: seq[CpmCandidate]
-    var destVars: HashSet[string]  # vars appearing with coeff=-1
 
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
@@ -2657,7 +2656,6 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
         if coeffs.len == 3 and coeffs == @[1, 1, -1] and rhs == 0:
             # Pattern A: v0 + v1 - v2 <= 0 → v2 >= v0 + v1
-            destVars.incl(varNames[2])
             candidates.add(CpmCandidate(
                 fromVar: varNames[0], toVar: varNames[2],
                 durVar: varNames[1], constWeight: 0))
@@ -2666,14 +2664,12 @@ proc cpmBoundsPropagate(tr: FznTranslator,
             if coeffs[0] > 0 and coeffs[1] < 0 and coeffs[0] == -coeffs[1]:
                 let c = coeffs[0]
                 if c > 1 and rhs mod c != 0: continue
-                destVars.incl(varNames[1])
                 candidates.add(CpmCandidate(
                     fromVar: varNames[0], toVar: varNames[1],
                     durVar: "", constWeight: -(rhs div c)))
             elif coeffs[0] < 0 and coeffs[1] > 0 and -coeffs[0] == coeffs[1]:
                 let c = coeffs[1]
                 if c > 1 and rhs mod c != 0: continue
-                destVars.incl(varNames[0])
                 candidates.add(CpmCandidate(
                     fromVar: varNames[1], toVar: varNames[0],
                     durVar: "", constWeight: -(rhs div c)))
@@ -2740,8 +2736,6 @@ proc cpmBoundsPropagate(tr: FznTranslator,
                             nImplied += 2
             if nImplied > 0:
                 candidates.add(extraCandidates)
-                for c in extraCandidates:
-                    destVars.incl(c.toVar)
 
     if candidates.len == 0: return false
 
@@ -2787,12 +2781,14 @@ proc cpmBoundsPropagate(tr: FznTranslator,
                 dropAsEquality.incl(k)
 
     # Phase 2: Resolve 3-var candidates into edges.
-    # For pattern A, determine which +1 var is start (source) vs duration (weight).
-    # destVars contains all vars that appear with coeff=-1 somewhere — these are start vars.
-    # Among the two +1 vars, if one is in destVars it's the source; otherwise use domain range.
+    # `a + b <= c` is symmetric in a and b, so it yields both a -> c with the
+    # weight min(b) and b -> c with the weight min(a). Both are sound for the
+    # forward pass (c >= es(a) + min(b)) and the backward pass
+    # (a <= ls(c) - min(b)), whichever operand is the start and whichever the
+    # duration. A variable duration must never be subtracted at its maximum.
     type CpmEdge = object
         toId: int
-        minW, maxW: int
+        w: int
     var nameToId: Table[string, int]
     var idToName: seq[string]
     var nextId = 0
@@ -2808,7 +2804,7 @@ proc cpmBoundsPropagate(tr: FznTranslator,
     var adjFwd: seq[seq[CpmEdge]]  # forward adjacency: succ edges
     var nEdges = 0
 
-    proc addEdge(fromId, toId, minW, maxW: int) =
+    proc addEdge(fromId, toId, w: int) =
         # Skip self-loops introduced by equality-class merging.
         if fromId == toId: return
         while adjFwd.len <= max(fromId, toId):
@@ -2816,11 +2812,15 @@ proc cpmBoundsPropagate(tr: FznTranslator,
         # Merge parallel edges: keep tightest (max weight)
         for e in adjFwd[fromId].mitems:
             if e.toId == toId:
-                e.minW = max(e.minW, minW)
-                e.maxW = max(e.maxW, maxW)
+                e.w = max(e.w, w)
                 return
-        adjFwd[fromId].add(CpmEdge(toId: toId, minW: minW, maxW: maxW))
+        adjFwd[fromId].add(CpmEdge(toId: toId, w: w))
         inc nEdges
+
+    template minOf(name: string): (bool, int) =
+        if name in fixedVars: (true, fixedVars[name])
+        elif domains.getOrDefault(name).len > 0: (true, domains[name][0])
+        else: (false, 0)
 
     for cand in candidates:
         if cand.durVar == "":
@@ -2828,50 +2828,14 @@ proc cpmBoundsPropagate(tr: FznTranslator,
             # 2-cycle equality (handled outside CPM).
             if (cand.fromVar, cand.toVar) in dropAsEquality:
                 continue
-            let fId = getId(cand.fromVar)
-            let tId = getId(cand.toVar)
-            addEdge(fId, tId, cand.constWeight, cand.constWeight)
+            addEdge(getId(cand.fromVar), getId(cand.toVar), cand.constWeight)
         else:
-            # 3-var: determine source vs duration
-            var sourceVar, durVar: string
-            let fromIsDest = cand.fromVar in destVars
-            let durIsDest = cand.durVar in destVars
-            if fromIsDest and not durIsDest:
-                sourceVar = cand.fromVar
-                durVar = cand.durVar
-            elif durIsDest and not fromIsDest:
-                sourceVar = cand.durVar
-                durVar = cand.fromVar
-            else:
-                # Both or neither in destVars — use domain range as tiebreaker.
-                # Start vars have large ranges (0..UB), duration vars have small ranges.
-                let fromDom = domains.getOrDefault(cand.fromVar)
-                let durDom = domains.getOrDefault(cand.durVar)
-                let fromRange = if fromDom.len > 0: fromDom[^1] - fromDom[0] else: 0
-                let durRange = if durDom.len > 0: durDom[^1] - durDom[0] else: 0
-                if fromRange >= durRange:
-                    sourceVar = cand.fromVar
-                    durVar = cand.durVar
-                else:
-                    sourceVar = cand.durVar
-                    durVar = cand.fromVar
-
-            # Get duration domain bounds
-            var minDur, maxDur: int
-            if durVar in fixedVars:
-                minDur = fixedVars[durVar]
-                maxDur = fixedVars[durVar]
-            elif durVar in domains:
-                let dom = domains[durVar]
-                if dom.len == 0: continue
-                minDur = dom[0]
-                maxDur = dom[^1]
-            else:
-                continue
-
-            let fId = getId(sourceVar)
+            let (okA, minA) = minOf(cand.fromVar)
+            let (okB, minB) = minOf(cand.durVar)
+            if not (okA and okB): continue
             let tId = getId(cand.toVar)
-            addEdge(fId, tId, minDur, maxDur)
+            addEdge(getId(cand.fromVar), tId, minB)
+            addEdge(getId(cand.durVar), tId, minA)
 
     let n = nextId
     if n == 0 or nEdges == 0: return false
@@ -2918,7 +2882,7 @@ proc cpmBoundsPropagate(tr: FznTranslator,
 
     for u in topoOrder:
         for e in adjFwd[u]:
-            let newES = es[u] + e.minW
+            let newES = es[u] + e.w
             if newES > es[e.toId]:
                 es[e.toId] = newES
 
@@ -2936,7 +2900,7 @@ proc cpmBoundsPropagate(tr: FznTranslator,
     for i in countdown(topoOrder.len - 1, 0):
         let u = topoOrder[i]
         for e in adjFwd[u]:
-            let newLS = ls[e.toId] - e.maxW
+            let newLS = ls[e.toId] - e.w
             if newLS < ls[u]:
                 ls[u] = newLS
 

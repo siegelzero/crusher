@@ -742,7 +742,10 @@ type
             consumedReifCIs: seq[int],
             consumedBool2intCIs: seq[int],
             consumedVarNames: seq[string],  # intermediate vars to suppress
-            fixedBlocks: seq[seq[(int, int)]]]]  # per machine value: fixed busy (start, dur)
+            fixedBlocks: seq[seq[(int, int)]],  # per machine value: fixed busy (start, dur)
+            durVarNames: seq[string],        # per-task variable duration ("" = constant); empty = all constant
+            # per-task linear start c + Σ k*v for "lin:" start names; empty = none
+            startLins: seq[(seq[(int, string)], int)]]]
         # Unsupported constraints encountered during translation that were
         # silently dropped (no native handler). If non-empty, Crusher cannot
         # guarantee the solution satisfies the full model, so the FZN driver
@@ -2835,54 +2838,97 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     if result.conditionalCumulativeInfos.len > 0:
         stderr.writeLine(&"[FZN] Built {result.conditionalCumulativeInfos.len} ConditionalCumulative constraints")
 
-    # Build MultiMachineNoOverlap constraints from detected patterns
+    # Build MultiMachineNoOverlap constraints from detected patterns. Starts
+    # and durations that are defined expressions get expression channel
+    # positions; the consumed constraints are already marked as defining, so
+    # anything left unresolved must be reported, never silently dropped.
     for mminfo in result.multiMachineNoOverlapInfos:
-        var startPositions: seq[int]
-        var machinePositions: seq[int]
-        var fixedMachines: seq[int]
-        var allResolved = true
+        var startPositions, machinePositions, fixedMachines, durations, durPositions: seq[int]
+        var unresolved = ""
         var maxTime = 0
+        proc namePosition(tr: var FznTranslator, name: string): int =
+            if name == "": return -1
+            if name in tr.varPositions: return tr.varPositions[name]
+            try:
+                tr.exprPosition(tr.resolveExprArg(FznExpr(kind: FznIdent, ident: name)),
+                                tr.lookupVarDomain(name))
+            except CatchableError: -1
+        proc linPosition(tr: var FznTranslator, lin: (seq[(int, string)], int)): int =
+            try:
+                var e = newAlgebraicExpression[int](
+                    positions = initPackedSet[int](),
+                    node = ExpressionNode[int](kind: LiteralNode, value: lin[1]),
+                    linear = true)
+                for (k, v) in lin[0]:
+                    e = e + k * tr.resolveExprArg(FznExpr(kind: FznIdent, ident: v))
+                tr.exprPosition(e)
+            except CatchableError: -1
         for t in 0..<mminfo.startVarNames.len:
-            let startPos = if mminfo.startVarNames[t] != "":
-                result.varPositions.getOrDefault(mminfo.startVarNames[t], -1) else: -1
+            let startPos =
+                if mminfo.startVarNames[t].startsWith("lin:"): result.linPosition(mminfo.startLins[t])
+                else: result.namePosition(mminfo.startVarNames[t])
             if startPos < 0:
-                allResolved = false
+                unresolved = "start " & mminfo.startVarNames[t]
                 break
             startPositions.add(startPos)
+            var dur = mminfo.durations[t]
+            var durPos = -1
+            var durMax = dur
+            let dName = if mminfo.durVarNames.len > 0: mminfo.durVarNames[t] else: ""
+            if dName != "":
+                durPos = result.namePosition(dName)
+                if durPos < 0:
+                    # A defined duration that folded to a constant
+                    try:
+                        let e = result.resolveExprArg(FznExpr(kind: FznIdent, ident: dName))
+                        if e.node.kind == LiteralNode:
+                            dur = e.node.value; durMax = dur
+                        else:
+                            unresolved = "duration " & dName
+                            break
+                    except CatchableError:
+                        unresolved = "duration " & dName
+                        break
+                else:
+                    let dd = result.sys.baseArray.domain[durPos]
+                    dur = max(0, min(dd)); durMax = max(0, max(dd))
+            durations.add(dur)
+            durPositions.add(durPos)
             # Machine position
             if mminfo.machineVarNames[t] != "":
                 let machPos = result.varPositions.getOrDefault(mminfo.machineVarNames[t], -1)
                 if machPos < 0:
-                    allResolved = false
+                    unresolved = "machine " & mminfo.machineVarNames[t]
                     break
                 machinePositions.add(machPos)
                 fixedMachines.add(-1)
-                # Estimate maxTime from start domain
-                let dom = result.sys.baseArray.domain[startPos]
-                if dom.len > 0:
-                    maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
             else:
                 # Fixed machine — use value determined during pattern detection
                 machinePositions.add(-1)
                 fixedMachines.add(mminfo.fixedMachineValues[t])
-                let dom = result.sys.baseArray.domain[startPos]
-                if dom.len > 0:
-                    maxTime = max(maxTime, dom[dom.len - 1] + mminfo.durations[t])
+            let dom = result.sys.baseArray.domain[startPos]
+            if dom.len > 0:
+                maxTime = max(maxTime, max(dom) + durMax)
 
-        if not allResolved: continue
+        if unresolved != "":
+            stderr.writeLine(&"[FZN] WARNING: multi-machine no-overlap with unresolved {unresolved}; constraint dropped")
+            result.unsupportedConstraints.add("multi-machine no-overlap (" & unresolved & ")")
+            continue
 
         for blocks in mminfo.fixedBlocks:
             for (bs, bd) in blocks: maxTime = max(maxTime, bs + bd)
         let c = newMultiMachineNoOverlapConstraint[int](
             startPositions, machinePositions, fixedMachines,
-            mminfo.durations, mminfo.numMachineValues, maxTime,
-            fixedBlocks = mminfo.fixedBlocks)
+            durations, mminfo.numMachineValues, maxTime,
+            fixedBlocks = mminfo.fixedBlocks, durPositions = durPositions)
 
         var positions = initPackedSet[int]()
         for t in 0..<startPositions.len:
             positions.incl(startPositions[t])
             if machinePositions[t] >= 0:
                 positions.incl(machinePositions[t])
+            if durPositions[t] >= 0:
+                positions.incl(durPositions[t])
 
         result.sys.addConstraint(StatefulConstraint[int](
             positions: positions,

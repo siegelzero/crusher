@@ -38,6 +38,46 @@ proc resolveActualDomain(tr: var FznTranslator, expr: AlgebraicExpression[int],
     else:
         return tr.lookupVarDomain(identName)
 
+proc resolveVarArrayElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
+    ## Resolves a variable array argument to its elements, from inline literal or named declaration.
+    if arg.kind == FznArrayLit:
+        return arg.elems
+    elif arg.kind == FznIdent:
+        for decl in tr.model.variables:
+            if decl.isArray and decl.name == arg.ident and decl.value != nil and decl.value.kind == FznArrayLit:
+                return decl.value.elems
+    return @[]
+
+proc exprPosition(tr: var FznTranslator, e: AlgebraicExpression[int],
+                  declDom: seq[int] = @[]): int =
+    ## A position whose value is always `e`: its own position for a plain
+    ## reference, otherwise a new expression channel. Its domain covers every
+    ## value `e` can take (interval bounds for a linear `e`, else `declDom`);
+    ## -1 when neither is available. Literals have no position (-1).
+    if e.node.kind == RefNode: return e.node.position
+    if e.node.kind == LiteralNode: return -1
+    var dom: seq[int]
+    if e.linear:
+        let lin = linearize(e)
+        var lo = lin.constant
+        var hi = lin.constant
+        for p, k in lin.coefficient:
+            let d = tr.sys.baseArray.domain[p]
+            if d.len == 0: return -1
+            if k >= 0:
+                lo += k * min(d); hi += k * max(d)
+            else:
+                lo += k * max(d); hi += k * min(d)
+        if hi - lo > 1_000_000: return -1
+        dom = toSeq(lo..hi)
+    else:
+        dom = declDom
+    if dom.len == 0: return -1
+    result = tr.sys.baseArray.len
+    let v = tr.sys.newConstrainedVariable()
+    v.setDomain(dom)
+    tr.sys.baseArray.addExpressionChannelBinding(result, e)
+
 # --- FZN-level alias canonicalization ---
 
 proc canonicalizeFznVarAliases*(tr: var FznTranslator) =

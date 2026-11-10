@@ -15,12 +15,16 @@
 #   max(0, end[i] + setup[i][j] - start[j])
 # where consecutive is by sorted start time (with task index as tie-breaker).
 #
+# Variable durations: a task's duration may be a position (durPositions[t]
+# >= 0, e.g. a processing time chosen through a mode, or a load time that
+# includes transport); its current value is cached in currentDurs.
+#
 # Performance:
 #   - No setup: O(k log k) moveDelta, O(maxTime) batch via prefix sums.
 #   - With setup: O(k log k) moveDelta (sort + linear scan); batch falls back
 #     to per-value evaluation.
 
-import std/[packedsets, algorithm, tables]
+import std/[packedsets, algorithm, tables, sequtils]
 
 type
   MultiMachineNoOverlapConstraint*[T] = ref object
@@ -28,7 +32,8 @@ type
     startPositions*: seq[int]     # position of start time for each task
     machinePositions*: seq[int]   # position of machine assignment for each task (-1 if fixed)
     fixedMachines*: seq[int]      # fixed machine value for tasks with machinePositions=-1
-    durations*: seq[int]          # constant duration for each task
+    durations*: seq[int]          # constant duration for each task (initial value if variable)
+    durPositions*: seq[int]       # position of a variable duration (-1: constant)
 
     # Optional sequence-dependent setup. setupMatrix[i][j] = setup time after
     # task i finishes before task j can start on the same machine. Empty when
@@ -47,6 +52,7 @@ type
     cost*: int
     currentStarts*: seq[T]        # cached start values per task
     currentMachines*: seq[T]      # cached machine values per task
+    currentDurs*: seq[int]        # current duration per task
     machineCosts*: seq[int]       # per-machine penalty contribution
 
     lastChangedPosition*: int
@@ -55,6 +61,7 @@ type
     # Lookups
     startPosToTask*: Table[int, int]    # start position → task index
     machinePosToTask*: Table[int, seq[int]]  # machine position → task indices (shared by same-allocation tasks)
+    durPosToTasks*: Table[int, seq[int]]     # duration position → task indices
     maxTime*: int                        # max possible end time
     numMachineValues*: int               # number of distinct machine values
 
@@ -78,11 +85,15 @@ proc sweepPenalty(events: var seq[(int, int)]): int =
     count += delta
 
 
+template durOf[T](c: MultiMachineNoOverlapConstraint[T], t, ovDurPos, ovDur: int): int =
+  if ovDurPos >= 0 and c.durPositions[t] == ovDurPos: ovDur else: c.currentDurs[t]
+
 proc setupPenaltyForMachine[T](c: MultiMachineNoOverlapConstraint[T], machine: int,
                                 excludeTask: int = -1,
                                 includeTaskIdx: int = -1, includeStart: int = 0,
                                 altTaskIdx: int = -1, altStart: int = 0,
-                                ovPos: int = -1, ovMachine: int = 0): int =
+                                ovPos: int = -1, ovMachine: int = 0,
+                                ovDurPos: int = -1, ovDur: int = 0): int =
   ## Setup-aware penalty: gather tasks on the machine, sort by start time,
   ## sum max(0, end_prev + setup[prev][curr] - start_curr) over consecutive pairs.
   ## Tie-break ties by task index for determinism.
@@ -105,7 +116,7 @@ proc setupPenaltyForMachine[T](c: MultiMachineNoOverlapConstraint[T], machine: i
   for k in 1..<tasks.len:
     let prev = tasks[k - 1]
     let curr = tasks[k]
-    let endPrev = prev.start + c.durations[prev.idx]
+    let endPrev = prev.start + c.durOf(prev.idx, ovDurPos, ovDur)
     let setup = c.setupMatrix[prev.idx][curr.idx]
     let required = endPrev + setup
     if required > curr.start:
@@ -115,7 +126,8 @@ proc computeMachinePenalty*[T](c: MultiMachineNoOverlapConstraint[T], machine: i
                                 excludeTask: int = -1,
                                 includeTaskIdx: int = -1, includeStart: int = 0,
                                 altTaskIdx: int = -1, altStart: int = 0,
-                                ovPos: int = -1, ovMachine: int = 0): int =
+                                ovPos: int = -1, ovMachine: int = 0,
+                                ovDurPos: int = -1, ovDur: int = 0): int =
   ## Compute penalty for a single machine.
   ## excludeTask: task to exclude (being removed from this machine)
   ## includeTaskIdx: extra task to include (being added to this machine)
@@ -123,7 +135,8 @@ proc computeMachinePenalty*[T](c: MultiMachineNoOverlapConstraint[T], machine: i
   if machine == c.ignoreMachine: return 0
   if c.setupMatrix.len > 0:
     return setupPenaltyForMachine(c, machine, excludeTask, includeTaskIdx,
-                                   includeStart, altTaskIdx, altStart, ovPos, ovMachine)
+                                   includeStart, altTaskIdx, altStart, ovPos, ovMachine,
+                                   ovDurPos, ovDur)
 
   var events = newSeqOfCap[(int, int)](c.taskCount)
   if machine < c.fixedBlocks.len:
@@ -138,14 +151,14 @@ proc computeMachinePenalty*[T](c: MultiMachineNoOverlapConstraint[T], machine: i
             else: c.fixedMachines[t]
     if m != machine: continue
     let s = if t == altTaskIdx: altStart else: int(c.currentStarts[t])
-    let e = s + c.durations[t]
+    let e = s + c.durOf(t, ovDurPos, ovDur)
     events.add((s, 1))
     events.add((e, -1))
 
   # Include extra task if specified
   if includeTaskIdx >= 0:
     events.add((includeStart, 1))
-    events.add((includeStart + c.durations[includeTaskIdx], -1))
+    events.add((includeStart + c.durOf(includeTaskIdx, ovDurPos, ovDur), -1))
 
   return sweepPenalty(events)
 
@@ -171,7 +184,8 @@ func newMultiMachineNoOverlapConstraint*[T](
     maxTime: int,
     setupMatrix: seq[seq[int]] = @[],
     fixedBlocks: seq[seq[(int, int)]] = @[],
-    ignoreMachine: int = -1): MultiMachineNoOverlapConstraint[T] =
+    ignoreMachine: int = -1,
+    durPositions: seq[int] = @[]): MultiMachineNoOverlapConstraint[T] =
   let n = startPositions.len
   doAssert machinePositions.len == n
   doAssert fixedMachines.len == n
@@ -187,6 +201,9 @@ func newMultiMachineNoOverlapConstraint*[T](
   result.machinePositions = machinePositions
   result.fixedMachines = fixedMachines
   result.durations = durations
+  result.currentDurs = durations
+  result.durPositions = if durPositions.len > 0: durPositions else: newSeqWith(n, -1)
+  doAssert result.durPositions.len == n
   result.setupMatrix = setupMatrix
   doAssert fixedBlocks.len == 0 or setupMatrix.len == 0
   result.fixedBlocks = fixedBlocks
@@ -208,6 +225,13 @@ func newMultiMachineNoOverlapConstraint*[T](
     result.startPosToTask[startPositions[t]] = t
     if machinePositions[t] >= 0:
       result.machinePosToTask.mgetOrPut(machinePositions[t], @[]).add(t)
+    if result.durPositions[t] >= 0:
+      result.durPosToTasks.mgetOrPut(result.durPositions[t], @[]).add(t)
+  # Each position plays a single role (start, machine or duration)
+  for p in result.durPosToTasks.keys:
+    doAssert p notin result.startPosToTask and p notin result.machinePosToTask
+  for p in result.machinePosToTask.keys:
+    doAssert p notin result.startPosToTask
 
 
 ################################################################################
@@ -221,18 +245,80 @@ proc initialize*[T](c: MultiMachineNoOverlapConstraint[T], assignment: seq[T]) =
       c.currentMachines[t] = assignment[c.machinePositions[t]]
     else:
       c.currentMachines[t] = T(c.fixedMachines[t])
+    if c.durPositions[t] >= 0:
+      c.currentDurs[t] = int(assignment[c.durPositions[t]])
   c.computeTotalCost()
 
+
+func coveredWithin[T](c: MultiMachineNoOverlapConstraint[T], machine: int,
+                       lo, hi, skipTask: int): int =
+  ## Length of [lo, hi) covered by the other tasks on `machine` and its
+  ## fixed blocks. With limit 1, placing a task on [lo, hi) raises the
+  ## machine's penalty by exactly this amount.
+  if hi <= lo or machine == c.ignoreMachine: return 0
+  var segs: seq[(int, int)]
+  for t in 0..<c.taskCount:
+    if t == skipTask or int(c.currentMachines[t]) != machine: continue
+    let s = int(c.currentStarts[t])
+    let a = max(s, lo)
+    let b = min(s + c.currentDurs[t], hi)
+    if b > a: segs.add((a, b))
+  if machine < c.fixedBlocks.len:
+    for (bs, bd) in c.fixedBlocks[machine]:
+      let a = max(bs, lo)
+      let b = min(bs + bd, hi)
+      if b > a: segs.add((a, b))
+  if segs.len == 0: return 0
+  if segs.len == 1: return segs[0][1] - segs[0][0]
+  segs.sort()
+  var curA = segs[0][0]
+  var curB = segs[0][1]
+  for k in 1..<segs.len:
+    if segs[k][0] > curB:
+      result += curB - curA
+      curA = segs[k][0]; curB = segs[k][1]
+    elif segs[k][1] > curB:
+      curB = segs[k][1]
+  result += curB - curA
+
+func taskMoveDeltas[T](c: MultiMachineNoOverlapConstraint[T], t: int,
+                       newStart, newDur, newMachine: int): (int, int) =
+  ## (delta on t's current machine, delta on newMachine) when task t alone
+  ## moves to [newStart, newStart + newDur) on newMachine. Only valid
+  ## without a setup matrix.
+  let m0 = int(c.currentMachines[t])
+  let s0 = int(c.currentStarts[t])
+  let removed = c.coveredWithin(m0, s0, s0 + c.currentDurs[t], t)
+  let added = c.coveredWithin(newMachine, newStart, newStart + newDur, t)
+  if newMachine == m0: (added - removed, 0)
+  else: (-removed, added)
+
+template incremental[T](c: MultiMachineNoOverlapConstraint[T]): bool =
+  c.setupMatrix.len == 0
+
+proc applyTaskMove[T](c: MultiMachineNoOverlapConstraint[T], t: int,
+                      newStart, newDur, newMachine: int) =
+  let m0 = int(c.currentMachines[t])
+  let (d0, d1) = c.taskMoveDeltas(t, newStart, newDur, newMachine)
+  c.machineCosts[m0] += d0
+  if newMachine != m0: c.machineCosts[newMachine] += d1
+  c.cost += d0 + d1
+  c.currentStarts[t] = T(newStart)
+  c.currentDurs[t] = newDur
+  c.currentMachines[t] = T(newMachine)
 
 proc updatePosition*[T](c: MultiMachineNoOverlapConstraint[T], position: int, newValue: T) =
   c.lastChangedPosition = position
   if position in c.startPosToTask:
     let taskIdx = c.startPosToTask[position]
     c.lastOldValue = c.currentStarts[taskIdx]
+    if c.incremental:
+      c.applyTaskMove(taskIdx, int(newValue), c.currentDurs[taskIdx],
+                      int(c.currentMachines[taskIdx]))
+      return
     c.currentStarts[taskIdx] = newValue
     # Recompute penalty for affected machine
-    let m = if c.machinePositions[taskIdx] >= 0: int(c.currentMachines[taskIdx])
-            else: c.fixedMachines[taskIdx]
+    let m = int(c.currentMachines[taskIdx])
     let oldMC = c.machineCosts[m]
     c.machineCosts[m] = c.computeMachinePenalty(m)
     c.cost += c.machineCosts[m] - oldMC
@@ -241,6 +327,10 @@ proc updatePosition*[T](c: MultiMachineNoOverlapConstraint[T], position: int, ne
     c.lastOldValue = c.currentMachines[tasks[0]]
     let oldM = int(c.currentMachines[tasks[0]])
     let newM = int(newValue)
+    if tasks.len == 1 and c.incremental:
+      let t = tasks[0]
+      c.applyTaskMove(t, int(c.currentStarts[t]), c.currentDurs[t], newM)
+      return
     for taskIdx in tasks: c.currentMachines[taskIdx] = newValue
     # Recompute penalties for old and new machines
     let oldCostOldM = c.machineCosts[oldM]
@@ -250,6 +340,22 @@ proc updatePosition*[T](c: MultiMachineNoOverlapConstraint[T], position: int, ne
       let oldCostNewM = c.machineCosts[newM]
       c.machineCosts[newM] = c.computeMachinePenalty(newM)
       c.cost += c.machineCosts[newM] - oldCostNewM
+  elif position in c.durPosToTasks:
+    let tasks {.cursor.} = c.durPosToTasks[position]
+    c.lastOldValue = T(c.currentDurs[tasks[0]])
+    if tasks.len == 1 and c.incremental:
+      let t = tasks[0]
+      c.applyTaskMove(t, int(c.currentStarts[t]), int(newValue), int(c.currentMachines[t]))
+      return
+    for taskIdx in tasks: c.currentDurs[taskIdx] = int(newValue)
+    var done: seq[int]
+    for taskIdx in tasks:
+      let m = int(c.currentMachines[taskIdx])
+      if m in done: continue
+      done.add(m)
+      let oldMC = c.machineCosts[m]
+      c.machineCosts[m] = c.computeMachinePenalty(m)
+      c.cost += c.machineCosts[m] - oldMC
 
 
 func moveDelta*[T](c: MultiMachineNoOverlapConstraint[T], position: int, oldValue, newValue: T): int =
@@ -258,18 +364,25 @@ func moveDelta*[T](c: MultiMachineNoOverlapConstraint[T], position: int, oldValu
   if position in c.startPosToTask:
     # Start time change — only affects one machine
     let taskIdx = c.startPosToTask[position]
-    let m = if c.machinePositions[taskIdx] >= 0: int(c.currentMachines[taskIdx])
-            else: c.fixedMachines[taskIdx]
+    let m = int(c.currentMachines[taskIdx])
+    if c.incremental:
+      let (d0, d1) = c.taskMoveDeltas(taskIdx, int(newValue), c.currentDurs[taskIdx], m)
+      return d0 + d1
     let oldCost = c.machineCosts[m]
     let newCost = c.computeMachinePenalty(m, altTaskIdx=taskIdx, altStart=int(newValue))
     return newCost - oldCost
 
   elif position in c.machinePosToTask:
     # Machine change — affects old and new machines
-    let taskIdx = c.machinePosToTask[position][0]
+    let tasks {.cursor.} = c.machinePosToTask[position]
+    let taskIdx = tasks[0]
     let oldM = int(c.currentMachines[taskIdx])
     let newM = int(newValue)
     if oldM == newM: return 0
+    if tasks.len == 1 and c.incremental:
+      let (d0, d1) = c.taskMoveDeltas(taskIdx, int(c.currentStarts[taskIdx]),
+                                      c.currentDurs[taskIdx], newM)
+      return d0 + d1
 
     # Every task reading this machine position moves from oldM to newM
     let oldCostOldM = c.machineCosts[oldM]
@@ -277,6 +390,23 @@ func moveDelta*[T](c: MultiMachineNoOverlapConstraint[T], position: int, oldValu
     let oldCostNewM = c.machineCosts[newM]
     let newCostNewM = c.computeMachinePenalty(newM, ovPos=position, ovMachine=newM)
     return (newCostOldM - oldCostOldM) + (newCostNewM - oldCostNewM)
+
+  elif position in c.durPosToTasks:
+    # Duration change — affects the machines of the tasks reading it
+    let tasks {.cursor.} = c.durPosToTasks[position]
+    if tasks.len == 1 and c.incremental:
+      let t = tasks[0]
+      let m = int(c.currentMachines[t])
+      let (d0, d1) = c.taskMoveDeltas(t, int(c.currentStarts[t]), int(newValue), m)
+      return d0 + d1
+    var done: seq[int]
+    for taskIdx in tasks:
+      let m = int(c.currentMachines[taskIdx])
+      if m in done: continue
+      done.add(m)
+      result += c.computeMachinePenalty(m, ovDurPos=position, ovDur=int(newValue)) -
+                c.machineCosts[m]
+    return
 
   return 0
 
@@ -289,6 +419,8 @@ proc getAffectedPositions*[T](c: MultiMachineNoOverlapConstraint[T]): PackedSet[
       result.incl(c.startPositions[t])
       if c.machinePositions[t] >= 0:
         result.incl(c.machinePositions[t])
+      if c.durPositions[t] >= 0:
+        result.incl(c.durPositions[t])
     return
 
   if c.lastChangedPosition in c.startPosToTask:
@@ -303,6 +435,8 @@ proc getAffectedPositions*[T](c: MultiMachineNoOverlapConstraint[T]): PackedSet[
         result.incl(c.startPositions[t])
         if c.machinePositions[t] >= 0:
           result.incl(c.machinePositions[t])
+        if c.durPositions[t] >= 0:
+          result.incl(c.durPositions[t])
 
   elif c.lastChangedPosition in c.machinePosToTask:
     # Machine changed — tasks on old and new machines affected
@@ -317,6 +451,22 @@ proc getAffectedPositions*[T](c: MultiMachineNoOverlapConstraint[T]): PackedSet[
         result.incl(c.startPositions[t])
         if c.machinePositions[t] >= 0:
           result.incl(c.machinePositions[t])
+        if c.durPositions[t] >= 0:
+          result.incl(c.durPositions[t])
+
+  elif c.lastChangedPosition in c.durPosToTasks:
+    # Duration changed — tasks on the machines of the tasks reading it
+    var ms: seq[int]
+    for taskIdx in c.durPosToTasks[c.lastChangedPosition]:
+      let m = int(c.currentMachines[taskIdx])
+      if m notin ms: ms.add(m)
+    for t in 0..<c.taskCount:
+      if int(c.currentMachines[t]) in ms:
+        result.incl(c.startPositions[t])
+        if c.machinePositions[t] >= 0:
+          result.incl(c.machinePositions[t])
+        if c.durPositions[t] >= 0:
+          result.incl(c.durPositions[t])
 
 
 proc getAffectedDomainValues*[T](c: MultiMachineNoOverlapConstraint[T]): seq[T] =
@@ -349,7 +499,7 @@ proc batchMovePenalty*[T](c: MultiMachineNoOverlapConstraint[T], position: int,
   let taskIdx = c.startPosToTask[position]
   let m = if c.machinePositions[taskIdx] >= 0: int(c.currentMachines[taskIdx])
           else: c.fixedMachines[taskIdx]
-  let dur = c.durations[taskIdx]
+  let dur = c.currentDurs[taskIdx]
   let baseCost = c.machineCosts[m]
   if m == c.ignoreMachine:
     return  # all zeros: start moves of an ignored task change nothing
@@ -364,7 +514,7 @@ proc batchMovePenalty*[T](c: MultiMachineNoOverlapConstraint[T], position: int,
              else: c.fixedMachines[t]
     if tm != m: continue
     let s = max(0, int(c.currentStarts[t]))
-    let e = min(s + c.durations[t], profileLen)
+    let e = min(s + c.currentDurs[t], profileLen)
     # Use delta encoding: +1 at start, -1 at end
     profile[s] += 1
     if e < profileLen:
@@ -422,6 +572,9 @@ proc deepCopy*[T](c: MultiMachineNoOverlapConstraint[T]): MultiMachineNoOverlapC
   result.machinePositions = c.machinePositions
   result.fixedMachines = c.fixedMachines
   result.durations = c.durations
+  result.durPositions = c.durPositions
+  result.currentDurs = c.durations
+  result.durPosToTasks = c.durPosToTasks
   result.setupMatrix = c.setupMatrix
   result.fixedBlocks = c.fixedBlocks
   result.ignoreMachine = c.ignoreMachine

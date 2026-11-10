@@ -1,15 +1,5 @@
 ## Included from translator.nim -- not a standalone module.
 
-proc resolveVarArrayElems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
-    ## Resolves a variable array argument to its elements, from inline literal or named declaration.
-    if arg.kind == FznArrayLit:
-        return arg.elems
-    elif arg.kind == FznIdent:
-        for decl in tr.model.variables:
-            if decl.isArray and decl.name == arg.ident and decl.value != nil and decl.value.kind == FznArrayLit:
-                return decl.value.elems
-    return @[]
-
 proc rescueDefinedVarsToChannels*(tr: var FznTranslator) =
     ## Promote defined vars (expression-only) to channel vars (with positions) when they
     ## appear as elements of a var-indexed array OR as durations/heights of a cumulative/

@@ -4311,7 +4311,9 @@ proc detectMultiMachineNoOverlap(tr: var FznTranslator) =
             consumedReifCIs: allReifCIs,
             consumedBool2intCIs: allBool2intCIs,
             consumedVarNames: allIntermediateVars,
-            fixedBlocks: newSeq[seq[(int, int)]]()))
+            fixedBlocks: newSeq[seq[(int, int)]](),
+            durVarNames: newSeq[string](),
+            startLins: newSeq[(seq[(int, string)], int)]()))
 
         stderr.writeLine(&"[FZN] Detected multi-machine no-overlap: " &
             &"{nTasks} tasks × {indices.len} machines " &
@@ -4343,9 +4345,33 @@ proc detectDisjunctiveOptMachines(tr: var FznTranslator) =
     var eqReifConst: Table[string, (string, int)]       # bool -> (var, value)
     var eqReifVarVar: Table[string, seq[(string, string)]]  # x -> [(S, bool)]
     var implies: Table[string, HashSet[string]]          # a -> {b : a -> b}
+    # x -> [(x = c + Σ k*v, bool)] from int_lin_eq_reif with x at coefficient ±1
+    var linEqReifOf: Table[string, seq[(seq[(int, string)], int, string)]]
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
+        if name == "int_lin_eq_reif" and con.args.len == 4 and con.args[3].kind == FznIdent:
+            block linEq:
+                var coeffs: seq[int]
+                try: coeffs = tr.resolveIntArray(con.args[0])
+                except CatchableError: break linEq
+                let vs = tr.resolveVarArrayElems(con.args[1])
+                if vs.len != coeffs.len or con.args[2].kind != FznIntLit: break linEq
+                for e in vs:
+                    if e.kind != FznIdent: break linEq
+                for xi in 0..<vs.len:
+                    let cx = coeffs[xi]
+                    if cx != 1 and cx != -1: continue
+                    var terms: seq[(int, string)]
+                    var dup = false
+                    for j in 0..<vs.len:
+                        if j == xi: continue
+                        if vs[j].ident == vs[xi].ident: dup = true
+                        terms.add((-cx * coeffs[j], vs[j].ident))
+                    if dup: continue
+                    terms.sort(proc (a, b: (int, string)): int = cmp(a[1], b[1]))
+                    linEqReifOf.mgetOrPut(vs[xi].ident, @[]).add(
+                        (terms, cx * con.args[2].intVal, con.args[3].ident))
         if name == "int_eq_reif" and con.args.len == 3 and con.args[2].kind == FznIdent and
            con.args[0].kind == FznIdent:
             if con.args[1].kind == FznIntLit:
@@ -4365,30 +4391,49 @@ proc detectDisjunctiveOptMachines(tr: var FznTranslator) =
         a in implies and b in implies[a]
 
     type Elem = object
-        start: string
+        start: string         # var name, or "lin:..." key of a linear start
+        startLin: (seq[(int, string)], int)  # start = c + Σ k*v when a "lin:" key
         machineVar: string
         dur: int
-    var perCon: seq[tuple[ci, m: int, elems: seq[Elem], blocks: seq[(int, int)]]]
+        durVar: string        # "" for a constant duration
+    type PerCon = tuple[ci, m: int, elems: seq[Elem], blocks: seq[(int, int)]]
+    # Constraints that don't fit the pattern are left to the per-constraint
+    # translation; they don't prevent grouping the others.
+    var perCon: seq[PerCon]
     for ci in cons:
         let con {.cursor.} = tr.model.constraints[ci]
         let sElems = tr.resolveVarArrayElems(con.args[0])
         let oElems = tr.resolveVarArrayElems(con.args[1])
-        var durs: seq[int]
-        try: durs = tr.resolveIntArray(con.args[2])
-        except CatchableError: return
-        if sElems.len != oElems.len or sElems.len != durs.len: return
+        var dElems = tr.resolveVarArrayElems(con.args[2])
+        if dElems.len == 0:
+            try:
+                for d in tr.resolveIntArray(con.args[2]):
+                    dElems.add(FznExpr(kind: FznIntLit, intVal: d))
+            except CatchableError: continue
+        if sElems.len != oElems.len or sElems.len != dElems.len: continue
         var m = int.low
         var elems: seq[Elem]
         var blocks: seq[(int, int)]
+        var ok = true
         for i in 0..<sElems.len:
-            if durs[i] <= 0: continue
+            var dur = 0
+            var durVar = ""
+            let de = dElems[i]
+            if de.kind == FznIntLit: dur = de.intVal
+            elif de.kind == FznIdent and de.ident in tr.paramValues: dur = tr.paramValues[de.ident]
+            elif de.kind == FznIdent: durVar = de.ident
+            else:
+                ok = false; break
+            if durVar == "" and dur <= 0: continue
             let o = oElems[i]
             if o.kind == FznBoolLit:
                 if not o.boolVal: continue
-                if sElems[i].kind != FznIntLit: return
-                blocks.add((sElems[i].intVal, durs[i]))
+                if sElems[i].kind != FznIntLit or durVar != "":
+                    ok = false; break
+                blocks.add((sElems[i].intVal, dur))
                 continue
-            if o.kind != FznIdent: return
+            if o.kind != FznIdent:
+                ok = false; break
             # Presence literal -> (A, value), directly or through an equivalence
             var conds = @[o.ident]
             var av = ("", 0)
@@ -4398,75 +4443,123 @@ proc detectDisjunctiveOptMachines(tr: var FznTranslator) =
                 for b in implies[o.ident]:
                     if b in eqReifConst and impl(b, o.ident):
                         av = eqReifConst[b]; conds.add(b); break
-            if av[0] == "": return
-            if m == int.low: m = av[1]
-            elif m != av[1]: return
+            if av[0] == "" or (m != int.low and m != av[1]):
+                ok = false; break
+            m = av[1]
             # Start: the deopt alias resolves to S when present
-            if sElems[i].kind != FznIdent: return
+            if sElems[i].kind != FznIdent:
+                ok = false; break
             var start = sElems[i].ident
+            var startLin: (seq[(int, string)], int)
+            proc condImplies(conds: seq[string], b: string): bool =
+                for c in conds:
+                    if impl(c, b): return true
+                false
             if start in eqReifVarVar:
                 for (S, b) in eqReifVarVar[start]:
-                    var ok = false
-                    for c in conds:
-                        if impl(c, b): ok = true
-                    if ok:
+                    if conds.condImplies(b):
                         start = S; break
-            elems.add(Elem(start: start, machineVar: av[0], dur: durs[i]))
-        if m == int.low: return
+            elif start in linEqReifOf:
+                # x = c + Σ k*v when present: keyed by the expression, so
+                # different aliases of one task (one per worker) coincide
+                for (terms, c, b) in linEqReifOf[start]:
+                    if conds.condImplies(b):
+                        var key = "lin:" & $c
+                        for (k, v) in terms: key.add(" " & $k & "*" & v)
+                        start = key
+                        startLin = (terms, c)
+                        break
+            elems.add(Elem(start: start, startLin: startLin, machineVar: av[0],
+                           dur: dur, durVar: durVar))
+        if not ok or m == int.low or m < 0: continue
         perCon.add((ci: ci, m: m, elems: elems, blocks: blocks))
 
-    # Global task list keyed by (start, machine var)
-    var taskIdx: Table[(string, string), int]
-    var tasks: seq[Elem]
-    var byMachine: Table[int, HashSet[int]]   # machine value -> task indices present
-    for pc in perCon:
-        if pc.m in byMachine: return             # two constraints for one machine value
-        var present = initHashSet[int]()
+    # Families: constraints linked through shared allocation variables (e.g.
+    # the machine disjunctives over AllocLCUToMachine, the worker ones over
+    # the loading/unloading allocations) each become one constraint.
+    var parent = newSeq[int](perCon.len)
+    for k in 0..<parent.len: parent[k] = k
+    proc find(parent: var seq[int], k: int): int =
+        var r = k
+        while parent[r] != r: r = parent[r]
+        var x = k
+        while parent[x] != r:
+            let nx = parent[x]; parent[x] = r; x = nx
+        r
+    var conOfVar: Table[string, int]
+    for k, pc in perCon:
         for e in pc.elems:
-            let key = (e.start, e.machineVar)
-            if key notin taskIdx:
-                taskIdx[key] = tasks.len
-                tasks.add(e)
-            elif tasks[taskIdx[key]].dur != e.dur: return
-            present.incl(taskIdx[key])
-        byMachine[pc.m] = present
-    var startSeen: HashSet[string]
-    for t in tasks:
-        if t.start in startSeen: return
-        startSeen.incl(t.start)
-    # Coverage: each task must be constrained on every machine value it can take
-    var maxM = 0
-    for t, e in tasks:
-        let dom = tr.lookupVarDomain(e.machineVar)
-        if dom.len == 0: return
-        for v in dom:
-            if v < 0 or v notin byMachine or t notin byMachine[v]: return
-            maxM = max(maxM, v)
-    for pc in perCon:
-        if pc.m < 0: return
-        maxM = max(maxM, pc.m)
+            if e.machineVar in conOfVar:
+                let a = parent.find(k)
+                let b = parent.find(conOfVar[e.machineVar])
+                if a != b: parent[a] = b
+            else:
+                conOfVar[e.machineVar] = k
+    var families: Table[int, seq[int]]
+    for k in 0..<perCon.len:
+        families.mgetOrPut(parent.find(k), @[]).add(k)
 
-    var fixedBlocks = newSeq[seq[(int, int)]](maxM + 1)
-    for pc in perCon:
-        fixedBlocks[pc.m] = pc.blocks
-        tr.definingConstraints.incl(pc.ci)
-    var startNames, machineNames: seq[string]
-    var durations, fixedMachineValues: seq[int]
-    for e in tasks:
-        startNames.add(e.start)
-        machineNames.add(e.machineVar)
-        durations.add(e.dur)
-        fixedMachineValues.add(-1)
-    tr.multiMachineNoOverlapInfos.add((
-        startVarNames: startNames,
-        durations: durations,
-        machineVarNames: machineNames,
-        fixedMachineValues: fixedMachineValues,
-        numMachineValues: maxM + 1,
-        consumedCumulativeCIs: perCon.mapIt(it.ci),
-        consumedReifCIs: newSeq[int](),
-        consumedBool2intCIs: newSeq[int](),
-        consumedVarNames: newSeq[string](),
-        fixedBlocks: fixedBlocks))
-    stderr.writeLine(&"[FZN] Detected optional-task disjunctive machines: {tasks.len} tasks × " &
-        &"{perCon.len} machines (consuming {perCon.len} crusher_disjunctive_opt)")
+    for _, members in families:
+        if members.len < 2: continue
+        block family:
+            # Global task list keyed by (start, machine var)
+            var taskIdx: Table[(string, string), int]
+            var tasks: seq[Elem]
+            var byMachine: Table[int, HashSet[int]]   # machine value -> task indices present
+            for k in members:
+                let pc {.cursor.} = perCon[k]
+                if pc.m in byMachine: break family    # two constraints for one machine value
+                var present = initHashSet[int]()
+                for e in pc.elems:
+                    let key = (e.start, e.machineVar)
+                    if key notin taskIdx:
+                        taskIdx[key] = tasks.len
+                        tasks.add(e)
+                    elif tasks[taskIdx[key]].dur != e.dur or
+                         tasks[taskIdx[key]].durVar != e.durVar: break family
+                    present.incl(taskIdx[key])
+                byMachine[pc.m] = present
+            var startSeen: HashSet[string]
+            for t in tasks:
+                if t.start in startSeen: break family
+                startSeen.incl(t.start)
+            # Coverage: each task must be constrained on every machine value it
+            # can take (after presolve: MiniZinc drops tasks provably absent)
+            var maxM = 0
+            for t, e in tasks:
+                let dom = tr.lookupTightenedDomain(e.machineVar)
+                if dom.len == 0: break family
+                for v in dom:
+                    if v < 0 or v notin byMachine or t notin byMachine[v]: break family
+                    maxM = max(maxM, v)
+            for k in members: maxM = max(maxM, perCon[k].m)
+
+            var fixedBlocks = newSeq[seq[(int, int)]](maxM + 1)
+            for k in members:
+                fixedBlocks[perCon[k].m] = perCon[k].blocks
+                tr.definingConstraints.incl(perCon[k].ci)
+            var startNames, machineNames, durVarNames: seq[string]
+            var durations, fixedMachineValues: seq[int]
+            var startLins: seq[(seq[(int, string)], int)]
+            for e in tasks:
+                startNames.add(e.start)
+                startLins.add(e.startLin)
+                machineNames.add(e.machineVar)
+                durations.add(e.dur)
+                durVarNames.add(e.durVar)
+                fixedMachineValues.add(-1)
+            tr.multiMachineNoOverlapInfos.add((
+                startVarNames: startNames,
+                durations: durations,
+                machineVarNames: machineNames,
+                fixedMachineValues: fixedMachineValues,
+                numMachineValues: maxM + 1,
+                consumedCumulativeCIs: members.mapIt(perCon[it].ci),
+                consumedReifCIs: newSeq[int](),
+                consumedBool2intCIs: newSeq[int](),
+                consumedVarNames: newSeq[string](),
+                fixedBlocks: fixedBlocks,
+                durVarNames: durVarNames,
+                startLins: startLins))
+            stderr.writeLine(&"[FZN] Detected optional-task disjunctive machines: {tasks.len} tasks × " &
+                &"{members.len} machines (consuming {members.len} crusher_disjunctive_opt)")

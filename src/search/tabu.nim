@@ -5712,7 +5712,7 @@ proc tryMachineEliminationMoves[T](state: TabuState[T], allowPerturb: bool): boo
     for t in 0..<c.taskCount:
         let m = int(c.currentMachines[t])
         if m < 0 or m >= nM: continue
-        load[m] += c.durations[t]
+        load[m] += c.currentDurs[t]
         if c.machinePositions[t] >= 0: movable[m] = true
         else: pinned[m] = true
     var cands: seq[int]
@@ -5730,7 +5730,7 @@ proc tryMachineEliminationMoves[T](state: TabuState[T], allowPerturb: bool): boo
     for t in 0..<c.taskCount:
         let mp = c.machinePositions[t]
         if mp >= 0 and int(c.currentMachines[t]) == m:
-            groupDur.mgetOrPut(mp, 0) += c.durations[t]
+            groupDur.mgetOrPut(mp, 0) += c.currentDurs[t]
     var mps: seq[int]
     for mp in groupDur.keys: mps.add(mp)
     mps.sort(proc (a, b: int): int = cmp(groupDur[b], groupDur[a]))

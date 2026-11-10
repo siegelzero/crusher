@@ -1972,30 +1972,49 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         # Single optional-task disjunctive: a MultiMachineNoOverlap whose
         # "machine" is the presence bool (1 = constrained, 0 = ignored).
         # Groups sharing an allocation variable are merged earlier by
-        # detectDisjunctiveOptMachines.
+        # detectDisjunctiveOptMachines. Starts and durations that are
+        # expressions get expression channel positions.
         let sExprs = tr.resolveExprArray(con.args[0])
         let oExprs = tr.resolveExprArray(con.args[1])
-        let durs = tr.resolveIntArray(con.args[2])
-        var startPositions, machinePositions, fixedMachines, durations: seq[int]
+        let dExprs = tr.resolveExprArray(con.args[2])
+        let sNames = tr.resolveVarArrayElems(con.args[0])
+        let dNames = tr.resolveVarArrayElems(con.args[2])
+        proc declDomOf(tr: var FznTranslator, names: seq[FznExpr], i: int): seq[int] =
+            if i < names.len and names[i].kind == FznIdent: tr.lookupVarDomain(names[i].ident)
+            else: @[]
+        var startPositions, machinePositions, fixedMachines, durations, durPositions: seq[int]
         var blocks: seq[(int, int)]
         var maxTime = 0
-        for i in 0..<durs.len:
-            if durs[i] <= 0: continue
+        for i in 0..<dExprs.len:
             let o = oExprs[i].node
             if o.kind == LiteralNode and o.value == 0: continue
+            let dn = dExprs[i].node
+            var dur, durPos, durMax: int
+            if dn.kind == LiteralNode:
+                if dn.value <= 0: continue
+                dur = dn.value; durPos = -1; durMax = dur
+            else:
+                durPos = tr.exprPosition(dExprs[i], tr.declDomOf(dNames, i))
+                if durPos < 0:
+                    raise newException(ValueError, "crusher_disjunctive_opt: unsupported duration expression")
+                let dd = tr.sys.baseArray.domain[durPos]
+                if max(dd) <= 0: continue
+                dur = max(0, min(dd)); durMax = max(dd)
             let sn = sExprs[i].node
             if sn.kind == LiteralNode:
-                if o.kind != LiteralNode:
-                    raise newException(ValueError, "crusher_disjunctive_opt: optional task with constant start")
-                blocks.add((sn.value, durs[i]))
-                maxTime = max(maxTime, sn.value + durs[i])
+                if o.kind != LiteralNode or durPos >= 0:
+                    raise newException(ValueError, "crusher_disjunctive_opt: optional or variable-length task with constant start")
+                blocks.add((sn.value, dur))
+                maxTime = max(maxTime, sn.value + dur)
                 continue
-            if sn.kind != RefNode:
+            let sp = tr.exprPosition(sExprs[i], tr.declDomOf(sNames, i))
+            if sp < 0:
                 raise newException(ValueError, "crusher_disjunctive_opt: unsupported start expression")
-            startPositions.add(sn.position)
-            durations.add(durs[i])
-            let dom = tr.sys.baseArray.domain[sn.position]
-            if dom.len > 0: maxTime = max(maxTime, max(dom) + durs[i])
+            startPositions.add(sp)
+            durations.add(dur)
+            durPositions.add(durPos)
+            let dom = tr.sys.baseArray.domain[sp]
+            if dom.len > 0: maxTime = max(maxTime, max(dom) + durMax)
             if o.kind == LiteralNode:
                 machinePositions.add(-1); fixedMachines.add(1)
             elif o.kind == RefNode:
@@ -2005,10 +2024,13 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
         if startPositions.len + (if blocks.len > 0: 1 else: 0) >= 2:
             let c = newMultiMachineNoOverlapConstraint[int](
                 startPositions, machinePositions, fixedMachines, durations, 2, maxTime,
-                fixedBlocks = @[newSeq[(int, int)](), blocks], ignoreMachine = 0)
+                fixedBlocks = @[newSeq[(int, int)](), blocks], ignoreMachine = 0,
+                durPositions = durPositions)
             var positions = initPackedSet[int]()
             for p in startPositions: positions.incl(p)
             for p in machinePositions:
+                if p >= 0: positions.incl(p)
+            for p in durPositions:
                 if p >= 0: positions.incl(p)
             tr.sys.addConstraint(StatefulConstraint[int](
                 positions: positions,
