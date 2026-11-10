@@ -811,11 +811,15 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
         constVal: int
         ci: int
 
+    # All int_eq_reif(target, const, b) :: defines_var(b), not only those that
+    # became reif channels: the relation holds whichever pass translates it
+    # (e.g. the disjunctive-clause detector consumes `x == 0 ∨ alloc == m`).
     var eqReifConstMap: Table[string, EqReifConstEntry]
-    for ci in tr.reifChannelDefs:
-        let con = tr.model.constraints[ci]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
         if name != "int_eq_reif": continue
+        if not con.hasAnnotation("defines_var"): continue
         if con.args.len < 3: continue
         if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
         if con.args[1].kind != FznIntLit: continue  # must be constant testVal
@@ -909,10 +913,11 @@ proc detectConditionalExpressionChannels*(tr: var FznTranslator) =
         clauseCI: int
         eqReifCI: int
 
+    # Clauses already consumed by other passes still hold in the model, so
+    # they are read too (the channel then satisfies them by construction).
     var defaultsByTarget: Table[string, DefaultEntry]
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
-        if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
         if con.args.len < 2: continue
         let posArg = con.args[0]

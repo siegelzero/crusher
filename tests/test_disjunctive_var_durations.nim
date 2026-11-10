@@ -59,6 +59,12 @@ suite "MultiMachineNoOverlap variable durations":
       check c.cost - before == predicted
       check c.cost == fullCost()
       if c.cost != fullCost(): break
+      # Batch evaluation of starts and durations agrees with moveDelta
+      let q = [rng.rand(0..5), 12 + rng.rand(0..2)][rng.rand(0..1)]
+      let dom = if q < 6: @[0, 3, 7, 12, 20] else: @[0, 1, 2, 4, 6]
+      let batch = c.batchMovePenalty(q, a[q], dom)
+      for i, v in dom:
+        check batch[i] == c.moveDelta(q, a[q], v)
 
   test "batch start evaluation uses the current duration":
     let c = newMultiMachineNoOverlapConstraint[int](
@@ -207,3 +213,38 @@ solve satisfy;
     let cv = asg[tr.varPositions["c"]]
     check cv + 8 <= d
     check s1 + d <= s2
+
+suite "Conditional end-time channels":
+
+  test "x = if alloc == 1 then s + d else 0 becomes a channel":
+    ## saeling's per-machine makespan terms. The default clause
+    ## `x == 0 ∨ alloc == 1` is also claimed by the disjunctive-clause
+    ## detector, which used to hide it from the conditional-expression
+    ## detector and leave x as a free search variable.
+    let src = """
+var 1..2: a :: output_var;
+var 0..10: s :: output_var;
+var 1..3: d :: output_var;
+var 0..13: x :: output_var;
+var bool: b1 :: is_defined_var;
+var bool: e :: is_defined_var;
+var bool: z :: is_defined_var;
+constraint int_eq_reif(a,1,b1) :: defines_var(b1);
+constraint int_lin_eq_reif([1,-1,-1],[x,s,d],0,e) :: defines_var(e);
+constraint int_eq_reif(x,0,z) :: defines_var(z);
+constraint bool_clause([e],[b1]);
+constraint bool_clause([z,b1],[]);
+constraint int_lin_le([-1],[x],-6);
+solve satisfy;
+"""
+    var tr = translate(parseFzn(src))
+    check tr.varPositions["x"] in tr.sys.baseArray.channelPositions
+    tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
+    check tr.sys.hasFeasibleSolution
+    let asg = tr.sys.assignment
+    let a = asg[tr.varPositions["a"]]
+    let s = asg[tr.varPositions["s"]]
+    let d = asg[tr.varPositions["d"]]
+    let x = asg[tr.varPositions["x"]]
+    check x == (if a == 1: s + d else: 0)
+    check x >= 6

@@ -18,6 +18,7 @@ const ProfileMoveDelta* = defined(profileMoveDelta) or defined(profileIteration)
 const ProfileIteration* = defined(profileIteration)
 const LazyThreshold* = 1000  # Positions with domain > this use on-demand costDelta instead of penalty maps
 const BatchLazyMax* = 10000  # Lazy positions with domain <= this use batch evaluation in bestMoves
+const LeanBatchMinDomain* = 64  # Lean moves score domains at least this wide with batch kernels
 
 ################################################################################
 # Type definitions
@@ -351,6 +352,7 @@ type
         pmCacheX, pmCacheY: seq[seq[T]]
         pmHintOk: seq[bool]        # all inputs are search positions
         pmUndo: seq[(int, T)]
+        leanBatchBuf: seq[int]          # lean-move batch deltas of the position being scanned
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -622,17 +624,25 @@ proc costDelta*[T](state: TabuState[T], position: int, newValue: T): int =
     if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
         result += state.computeInverseDeltaAt(position, newValue)
 
-proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
-    ## Batch-compute cost delta for all domain values at a lazy position.
-    ## Returns (bestCostDelta, bestValue, movesEvaluated).
-    ## Uses batchMovePenalty for constraint types that support it.
+proc batchDirectDeltas[T](state: TabuState[T], position: int, penalties: var seq[int]) =
+    ## Direct (non-cascade) move deltas of every domain value at position,
+    ## as movePenalty would sum them, using batchMovePenalty for constraint
+    ## types that support it. Constraints scored by the position's cascade
+    ## (cdMixedAt) contribute 0, as in movePenalty.
     let domain {.cursor.} = state.sharedDomain[][position]
     let dLen = domain.len
     let oldValue = state.assignment[position]
-
-    var penalties = newSeq[int](dLen)
+    penalties.setLen(dLen)
+    for i in 0..<dLen: penalties[i] = 0
+    let hasMixed = state.cdMixedAt.len > position and state.cdMixedAt[position].len > 0
 
     for constraint in state.constraintsAtPosition[position]:
+        if hasMixed:
+            var mixed = false
+            for m in state.cdMixedAt[position]:
+                if cast[pointer](state.channelDepConstraints[m.ci]) == cast[pointer](constraint):
+                    mixed = true; break
+            if mixed: continue
         if constraint.stateType == CumulativeType and
            (constraint.cumulativeState.evalMethod == PositionBased or
             (constraint.cumulativeState.evalMethod == ExpressionBased and
@@ -708,6 +718,18 @@ proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
             for i in 0..<dLen:
                 if domain[i] != oldValue:
                     penalties[i] += state.movePenalty(constraint, position, domain[i])
+    # Unchanged value: no move
+    for i in 0..<dLen:
+        if domain[i] == oldValue: penalties[i] = 0
+
+proc batchCostDelta[T](state: TabuState[T], position: int): (int, T, int) =
+    ## Batch-compute cost delta for all domain values at a lazy position.
+    ## Returns (bestCostDelta, bestValue, movesEvaluated).
+    let domain {.cursor.} = state.sharedDomain[][position]
+    let dLen = domain.len
+    let oldValue = state.assignment[position]
+    var penalties: seq[int]
+    state.batchDirectDeltas(position, penalties)
 
     # Find minimum (excluding current value)
     var bestDelta = high(int)
@@ -5180,6 +5202,10 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             else:
                 when ProfileIteration: inc state.cdLeanFull
                 state.computeChannelDepPenaltiesAt(position)
+        # Wide domains: score all values with the batch kernels once instead
+        # of a moveDelta per value and constraint
+        let useBatch = domain.len >= LeanBatchMinDomain
+        if useBatch: state.batchDirectDeltas(position, state.leanBatchBuf)
         for di in 0..<domain.len:
             let value = domain[di]
             if value == oldValue: continue
@@ -5192,8 +5218,11 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
                 continue  # tabu and no aspiration
 
             var delta = 0
-            for constraint in state.constraintsAtPosition[position]:
-                delta += state.movePenalty(constraint, position, value)
+            if useBatch:
+                delta = state.leanBatchBuf[di]
+            else:
+                for constraint in state.constraintsAtPosition[position]:
+                    delta += state.movePenalty(constraint, position, value)
             if hasChanDep:
                 delta += state.channelDepPenalties[position][di]
             if state.inverseEnabled and state.posToInverseGroup[position] >= 0:
