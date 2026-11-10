@@ -418,6 +418,9 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             # wlp02: 236650 capped vs 143590 uncapped — each restart costs 5 s
             # of state creation and the search momentum).
             system.baseArray.nearStallSecs = stallCap(deadline)
+            system.baseArray.nearGapCap =
+                when direction == Minimize: max(0, currentCost - target)
+                else: max(0, target - currentCost)
 
             try:
                 system.resolve(
@@ -754,6 +757,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 # NoSolutionFoundError and is handled like a failed one).
                 let fastAsk = effStep > 1 or stuckAtStart or domAsk
                 system.baseArray.nearStallSecs = if fastAsk: stallCap(deadline) else: 0.0
+                system.baseArray.nearGapCap = 0
 
                 try:
                     if verbose:

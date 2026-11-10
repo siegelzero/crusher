@@ -100,6 +100,8 @@ type
         nearBestCost*: int
         nearBestAssignment*: seq[T]
         nearStallSecs*: float      # see ConstrainedArray.nearStallSecs
+        nearGapCap*: int           # see ConstrainedArray.nearGapCap
+        nearFeasRef: float         # time of the run start / last near-feasible gain
         nearStallRef*: float       # time of the run start / last near-feasible gain
 
         iteration*: int
@@ -1805,6 +1807,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.boundConstraint = constraint
     state.nearBestCost = high(int)
     state.nearStallSecs = carray.nearStallSecs
+    state.nearGapCap = carray.nearGapCap
 
     # Auto-detect graduated equality: if the system has inequality constraints
     # (which use graduated penalties), enable graduated penalty on EqualTo
@@ -5986,6 +5989,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     # Reset timing and profiling counters for this run
     state.startTime = epochTime()
     state.nearStallRef = state.startTime
+    state.nearFeasRef = state.startTime
     state.lastLogTime = state.startTime
     state.lastLogIteration = 0
     when ProfileIteration:
@@ -6090,6 +6094,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                 state.nearBestAssignment = state.assignment
                 lastImprovement = state.iteration
                 state.nearStallRef = epochTime()
+                state.nearFeasRef = state.nearStallRef
         # Check for early termination signal
         if shouldStop != nil and shouldStop[].load():
             if state.verbose:
@@ -6117,6 +6122,24 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                 epochTime() - state.nearStallRef > state.nearStallSecs:
             if state.verbose:
                 state.logExitStats("Stalled")
+            state.lastImprovementIter = lastImprovement
+            return state
+        # Bisection probe that only re-finds the incumbent: hard violations
+        # keep falling (so the stall cap above never fires) while its
+        # near-feasible states stay within 1% of the incumbent's objective and
+        # have stopped improving (rect-euler harrypotter: a 60 s budget spent
+        # on one probe at 4300 of [929..7700], ending back at 7660). States
+        # that have no near-feasible state yet are left alone: warehouse
+        # wlp02's probe states need longer to reach one, and restarting them
+        # every 10 s cost it 15-25% of its objective.
+        if state.nearGapCap > 0 and state.nearStallSecs > 0 and
+                (state.iteration and 0x3F) == 0 and
+                state.nearBestCost != high(int) and
+                state.nearBestCost * 100 >= state.nearGapCap * 99 and
+                epochTime() - state.startTime > 2.0 * state.nearStallSecs and
+                epochTime() - state.nearFeasRef > state.nearStallSecs:
+            if state.verbose:
+                state.logExitStats("Unproductive probe")
             state.lastImprovementIter = lastImprovement
             return state
 

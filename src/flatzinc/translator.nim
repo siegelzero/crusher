@@ -1802,6 +1802,50 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
         nObjBoundsSkipped += 2
     if nBoundsSkipped > 0 or nChannelBoundsSkipped > 0 or nObjBoundsSkipped > 0:
         stderr.writeLine(&"[FZN] Skipped {nBoundsSkipped + nChannelBoundsSkipped + nObjBoundsSkipped} defined-var bounds (range={nBoundsSkipped} channel={nChannelBoundsSkipped} objective={nObjBoundsSkipped})")
+    # Interval bounds of the objective from its defining linear equation over
+    # the presolve-tightened domains of its terms. The inlined expression
+    # loses those (c_width = cx_max - cx_min ranges below 0 although
+    # c_width >= its minimum), and a trivial bound makes the first bisection
+    # probe far too aggressive.
+    if nObjBoundsSkipped > 0 and objectiveVarName != "":
+        for ci in 0 ..< result.model.constraints.len:
+            let con {.cursor.} = result.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident != objectiveVarName: continue
+            var coeffs: seq[int]
+            try: coeffs = result.resolveIntArray(con.args[0])
+            except CatchableError: break
+            let vs = result.resolveVarArrayElems(con.args[1])
+            if vs.len != coeffs.len or con.args[2].kind != FznIntLit: break
+            var cObj = 0
+            var lo = 0
+            var hi = 0
+            var ok = true
+            for i, e in vs:
+                if e.kind == FznIntLit:
+                    lo += coeffs[i] * e.intVal; hi += coeffs[i] * e.intVal
+                    continue
+                if e.kind != FznIdent: ok = false; break
+                if e.ident == objectiveVarName:
+                    cObj += coeffs[i]; continue
+                let dom = if e.ident in result.paramValues: @[result.paramValues[e.ident]]
+                          else: result.lookupTightenedDomain(e.ident)
+                if dom.len == 0: ok = false; break
+                let (dmin, dmax) = (min(dom), max(dom))
+                if coeffs[i] >= 0:
+                    lo += coeffs[i] * dmin; hi += coeffs[i] * dmax
+                else:
+                    lo += coeffs[i] * dmax; hi += coeffs[i] * dmin
+            # cObj * obj + (sum in [lo, hi]) = rhs
+            let rhs = con.args[2].intVal
+            if ok and (cObj == 1 or cObj == -1):
+                let (oLo, oHi) = if cObj == 1: (rhs - hi, rhs - lo) else: (lo - rhs, hi - rhs)
+                if oLo > result.objectiveLoBound or oHi < result.objectiveHiBound:
+                    stderr.writeLine(&"[FZN] Objective bounds from its definition: [{max(oLo, result.objectiveLoBound)}..{min(oHi, result.objectiveHiBound)}]")
+                result.objectiveLoBound = max(result.objectiveLoBound, oLo)
+                result.objectiveHiBound = min(result.objectiveHiBound, oHi)
+            break
     if nObjBoundsSkipped > 0:
         stderr.writeLine(&"[FZN] Objective domain bounds [{result.objectiveLoBound}..{result.objectiveHiBound}] deferred to optimizer")
     # Emit range bounds for implicit-lin-eq promoted vars. The original int_lin_eq

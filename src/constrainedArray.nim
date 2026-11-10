@@ -144,6 +144,10 @@ type
         # incumbent (only the objective bound violated) has not improved for
         # this many seconds (0 = off). Copied into every TabuState.
         nearStallSecs*: float
+        # Optimizer bisection probes: the incumbent's raw bound violation.
+        # A probe state with no near-feasible state below it (nothing better
+        # than the incumbent) for twice nearStallSecs stops (0 = off).
+        nearGapCap*: int
         domain*: seq[seq[T]]
         reducedDomain*: seq[seq[T]]
         sharedDomainPtr*: ptr seq[seq[T]]  # Points to shared (non-copied) reducedDomain for parallel states
@@ -5545,6 +5549,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     ## Creates a deep copy of a ConstrainedArray for thread-safe parallel processing
     result.len = arr.len
     result.nearStallSecs = arr.nearStallSecs
+    result.nearGapCap = arr.nearGapCap
 
     if arr.sharedDomainPtr != nil:
         # Parallel search state: domain not needed (reduceDomain already ran),
