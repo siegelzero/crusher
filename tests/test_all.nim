@@ -27,6 +27,7 @@ import test_conditional_count_eq_channels
 import test_conditional_counter_element_channels
 import test_disjunctive_opt
 import test_disjunctive_var_durations
+import test_lp_simplex
 import test_conditional_expr_channels
 import test_conditional_source_pruning
 import test_connected

@@ -95,6 +95,10 @@ type
         objectiveStaging*: ObjectiveStaging  # Staged-presolve fixings (inactive by default)
         objectiveProduct*: ObjectiveProduct[T]  # objective = a×b factor staging (inactive by default)
         objectiveDominant*: ObjectiveDominant[T]  # lexicographic dominant term (inactive by default)
+        # One-shot seed source for the first resolve: when its search finds
+        # nothing by part of the budget, this is called with a time budget and
+        # the search restarts with state 0 seeded from the result (the LP dive).
+        seedFallback*: proc(budget: float): seq[T] {.closure.}
         circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
                                           # minimized objective exactly: its metric bound
                                           # replaces the explicit objective<=target constraint

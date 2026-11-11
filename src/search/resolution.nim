@@ -13,6 +13,12 @@ type
         PathRelinking,  ## Current approach: pairwise path relinking between pool members
         LNS             ## Constraint-group LNS: targeted perturbation guided by constraint topology
 
+const
+    SeedFallbackMinBudget = 10.0  # seconds left: below this no fallback
+    SeedFallbackAfter = 0.3       # fraction of the budget searched before it
+    SeedFallbackBudget = 0.15     # fraction of the rest the fallback may use
+    SeedFallbackMaxSecs = 30.0
+
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
                 scatterThreshold: int = 5,
@@ -80,34 +86,49 @@ proc resolve*[T](system: ConstraintSystem[T],
                                  else: tabuThreshold
         if verbose and effectiveThreshold != tabuThreshold:
             echo &"[Solve] Using adapted threshold: {effectiveThreshold} (original: {tabuThreshold})"
-        var pool: CandidatePool[T]
         var adaptedThreshold = effectiveThreshold
-        if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, deadline, adaptedThreshold, seedAssignment):
-            system.adaptedTabuThreshold = adaptedThreshold
+        # Parallel tabu, then scatter search from its pool, until `dl`.
+        proc attempt(dl: float, seed: seq[T]): bool =
+            var pool: CandidatePool[T]
+            if parallelResolve(system, populationSize, numWorkers, effectiveThreshold, verbose, pool, dl, adaptedThreshold, seed):
+                system.adaptedTabuThreshold = adaptedThreshold
+                return true
+            if dl > 0 and epochTime() > dl:
+                system.adaptedTabuThreshold = adaptedThreshold
+                return false
+            # Parallel tabu failed — continue with scatter search using collected results
+            if pool.entries.len > 0 and scatterThreshold > 0:
+                let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
+                if verbose:
+                    echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy}, adaptedThreshold={adaptedThreshold})"
+                    flushFile(stdout)
+                    pool.poolStatistics()
+                # scatter/lns write final adaptedThreshold to system.adaptedTabuThreshold directly
+                return case scatterStrategy:
+                    of PathRelinking:
+                        scatterImprove(system, pool, scatterThreshold, adaptedThreshold, adaptedThreshold, actualWorkers, verbose, dl)
+                    of LNS:
+                        lnsImprove(system, pool, scatterThreshold, adaptedThreshold, actualWorkers, verbose, dl)
+            false
+
+        # Seed fallback (one shot): search for part of the budget first; only
+        # if that finds nothing is the fallback seed computed and the search
+        # restarted from it.
+        let fallback = system.seedFallback
+        system.seedFallback = nil
+        let useFallback = fallback != nil and seedAssignment.len == 0 and
+                          not system.hasFeasibleSolution and deadline > 0 and
+                          deadline - epochTime() >= SeedFallbackMinBudget
+        let firstDeadline = if useFallback: epochTime() + SeedFallbackAfter * (deadline - epochTime())
+                            else: deadline
+        var found = attempt(firstDeadline, seedAssignment)
+        if not found and useFallback and epochTime() < deadline:
+            let seed = fallback(min(SeedFallbackMaxSecs, SeedFallbackBudget * (deadline - epochTime())))
+            if epochTime() < deadline:
+                found = attempt(deadline, if seed.len == system.baseArray.len: seed else: @[])
+        if found:
             system.hasFeasibleSolution = true
             return
-
-        # Check deadline before continuing with scatter search
-        if deadline > 0 and epochTime() > deadline:
-            system.adaptedTabuThreshold = adaptedThreshold
-            raise newException(TimeLimitExceededError, "Time limit exceeded")
-
-        # Parallel tabu failed — continue with scatter search using collected results
-        if pool.entries.len > 0 and scatterThreshold > 0:
-            let actualWorkers = if numWorkers == 0: getOptimalWorkerCount() else: numWorkers
-            if verbose:
-                echo &"[Solve] Continuing with scatter search (pool size={pool.entries.len}, best cost={pool.minCost}, strategy={scatterStrategy}, adaptedThreshold={adaptedThreshold})"
-                flushFile(stdout)
-                pool.poolStatistics()
-            let improved = case scatterStrategy:
-                of PathRelinking:
-                    scatterImprove(system, pool, scatterThreshold, adaptedThreshold, adaptedThreshold, actualWorkers, verbose, deadline)
-                of LNS:
-                    lnsImprove(system, pool, scatterThreshold, adaptedThreshold, actualWorkers, verbose, deadline)
-            # scatter/lns write final adaptedThreshold to system.adaptedTabuThreshold directly
-            if improved:
-                system.hasFeasibleSolution = true
-                return
 
         if deadline > 0 and epochTime() > deadline:
             raise newException(TimeLimitExceededError, "Time limit exceeded")

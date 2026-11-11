@@ -298,6 +298,11 @@ proc main() =
   let onSol: proc(assignment: seq[int]) {.closure.} =
     if canStream: streamSolution else: nil
 
+  # LP-guided construction as a fallback: if the initial search finds nothing,
+  # an integral point of the LP relaxation (models linear apart from
+  # reifications/clauses) seeds a restarted search.
+  tr.sys.seedFallback = tr.lpDiveFallback(verbose)
+
   # Solve
   let solveWallStart = epochTime()
   var solved = false

@@ -1069,6 +1069,7 @@ include translatorScheduling
 include translatorCircuitTime
 include translatorInverseRewrite
 include translatorUnionCircuit
+include translatorLpDive
 
 proc buildObjectiveDominant(tr: var FznTranslator) =
     ## Detects `minimize weight*v + rest` where weight > 0 is at least 10x every
