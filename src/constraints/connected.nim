@@ -5,7 +5,10 @@
 #
 # Input: A graph defined by edges (from[], to[]) plus boolean variables for
 # node activity (ns[]) and edge activity (es[]).
-# Edge activity is computed internally: edge e is active iff both endpoints are active.
+# With edgesInduced (the edge variables are known to equal the AND of their
+# endpoints), edge activity is derived from node activity and edge variables are
+# ignored. Otherwise edge e is active iff its variable is non-0 and both endpoints
+# are active, and edge positions are tracked too.
 #
 # Penalty formula: max(0, numComponents - 1)
 # where numComponents counts connected components among active nodes.
@@ -23,6 +26,8 @@ type
         numNodes*: int
         numEdges*: int
         adjacency*: seq[seq[int]]        # adjacency[node] = list of neighbor nodes
+        adjEdge*: seq[seq[int]]          # adjEdge[node][k] = edge index of adjacency[node][k]
+        edgesInduced*: bool
         edgeFrom*: seq[int]              # 0-based source node per edge
         edgeTo*: seq[int]                # 0-based target node per edge
 
@@ -30,11 +35,13 @@ type
         nodePositions*: seq[int]         # variable position for each node
         edgePositions*: seq[int]         # variable position for each edge
         nodePositionToIndex*: Table[int, int]  # position -> node index
-        positions*: PackedSet[int]       # node variable positions only
+        edgePositionToIndices*: Table[int, seq[int]]  # position -> edge indices (edge-aware mode)
+        positions*: PackedSet[int]       # node positions, plus edge positions in edge-aware mode
 
         # Mutable state
         cost*: int
         nodeActive*: seq[bool]
+        edgeActive*: seq[bool]           # edge variable values (edge-aware mode only)
         numComponents*: int
 
         # Scratch space for BFS (avoids allocation)
@@ -72,7 +79,10 @@ proc computeComponents*[T](constraint: ConnectedConstraint[T]): int =
         while qIdx < constraint.scratchQueue.len:
             let current = constraint.scratchQueue[qIdx]
             qIdx += 1
-            for neighbor in constraint.adjacency[current]:
+            for k, neighbor in constraint.adjacency[current]:
+                if not constraint.edgesInduced and
+                        not constraint.edgeActive[constraint.adjEdge[current][k]]:
+                    continue
                 if constraint.nodeActive[neighbor] and not constraint.scratchVisited[neighbor]:
                     constraint.scratchVisited[neighbor] = true
                     constraint.scratchQueue.add(neighbor)
@@ -84,8 +94,10 @@ proc computeComponents*[T](constraint: ConnectedConstraint[T]): int =
 ################################################################################
 
 proc newConnectedConstraint*[T](nodePositions, edgePositions: openArray[int],
-                                edgeFrom, edgeTo: openArray[int]): ConnectedConstraint[T] =
+                                edgeFrom, edgeTo: openArray[int],
+                                edgesInduced = true): ConnectedConstraint[T] =
     new(result)
+    result.edgesInduced = edgesInduced
     result.numNodes = nodePositions.len
     result.numEdges = edgePositions.len
     result.nodePositions = @nodePositions
@@ -95,27 +107,34 @@ proc newConnectedConstraint*[T](nodePositions, edgePositions: openArray[int],
 
     # Build adjacency list
     result.adjacency = newSeq[seq[int]](result.numNodes)
-    for i in 0..<result.numNodes:
-        result.adjacency[i] = @[]
+    result.adjEdge = newSeq[seq[int]](result.numNodes)
     for e in 0..<result.numEdges:
         let u = edgeFrom[e]
         let v = edgeTo[e]
         result.adjacency[u].add(v)
-        result.adjacency[v].add(u)
+        result.adjEdge[u].add(e)
+        if v != u:
+            result.adjacency[v].add(u)
+            result.adjEdge[v].add(e)
 
     # Position mappings
     result.nodePositionToIndex = initTable[int, int]()
     for i, pos in nodePositions:
         result.nodePositionToIndex[pos] = i
 
-    # Only node positions — edge activity is derived, so edges don't affect penalty
     result.positions = initPackedSet[int]()
     for pos in nodePositions:
         result.positions.incl(pos)
+    result.edgePositionToIndices = initTable[int, seq[int]]()
+    if not edgesInduced:
+        for e, pos in edgePositions:
+            result.edgePositionToIndices.mgetOrPut(pos, @[]).add e
+            result.positions.incl(pos)
 
     # Mutable state
     result.cost = 0
     result.nodeActive = newSeq[bool](result.numNodes)
+    result.edgeActive = newSeq[bool](result.numEdges)
     result.numComponents = 0
 
     # Scratch space
@@ -131,6 +150,9 @@ proc initialize*[T](constraint: ConnectedConstraint[T], assignment: seq[T]) =
     for i in 0..<constraint.numNodes:
         let pos = constraint.nodePositions[i]
         constraint.nodeActive[i] = (assignment[pos] != T(0))
+    if not constraint.edgesInduced:
+        for e in 0..<constraint.numEdges:
+            constraint.edgeActive[e] = (assignment[constraint.edgePositions[e]] != T(0))
 
     constraint.numComponents = constraint.computeComponents()
     constraint.cost = max(0, constraint.numComponents - 1)
@@ -147,23 +169,30 @@ proc penalty*[T](constraint: ConnectedConstraint[T]): int {.inline.} =
 ################################################################################
 
 proc moveDelta*[T](constraint: ConnectedConstraint[T], position: int, oldValue, newValue: T): int =
-    ## Compute cost change for toggling a node.
-    ## Edge positions are ignored (edge activity is derived from node activity).
-    if position notin constraint.nodePositionToIndex:
+    ## Compute cost change for toggling a node (or, in edge-aware mode, an edge).
+    ## Temporarily apply, recompute, revert. Safe: each thread gets its own
+    ## deep copy, so no concurrent access.
+    if (oldValue != T(0)) == (newValue != T(0)):
+        return 0
+    let active = newValue != T(0)
+    var changed = false
+    let nodeIdx = constraint.nodePositionToIndex.getOrDefault(position, -1)
+    if nodeIdx >= 0 and constraint.nodeActive[nodeIdx] != active:
+        constraint.nodeActive[nodeIdx] = active
+        changed = true
+    var edgeFlipped: seq[int]
+    if not constraint.edgesInduced:
+        constraint.edgePositionToIndices.withValue(position, edges):
+            for e in edges[]:
+                if constraint.edgeActive[e] != active:
+                    constraint.edgeActive[e] = active
+                    edgeFlipped.add e
+    if not changed and edgeFlipped.len == 0:
         return 0
 
-    let nodeIdx = constraint.nodePositionToIndex[position]
-    let wasActive = constraint.nodeActive[nodeIdx]
-    let willBeActive = (newValue != T(0))
-
-    if wasActive == willBeActive:
-        return 0
-
-    # Temporarily toggle, recompute, untoggle.
-    # Safe: each thread gets its own deep copy, so no concurrent access.
-    constraint.nodeActive[nodeIdx] = willBeActive
     let newComponents = constraint.computeComponents()
-    constraint.nodeActive[nodeIdx] = wasActive
+    if changed: constraint.nodeActive[nodeIdx] = not active
+    for e in edgeFlipped: constraint.edgeActive[e] = not active
 
     let newCost = max(0, newComponents - 1)
     return newCost - constraint.cost
@@ -174,9 +203,17 @@ proc moveDelta*[T](constraint: ConnectedConstraint[T], position: int, oldValue, 
 
 proc updatePosition*[T](constraint: ConnectedConstraint[T], position: int, newValue: T) =
     ## Apply a change and recompute components.
-    if position in constraint.nodePositionToIndex:
-        let nodeIdx = constraint.nodePositionToIndex[position]
+    var changed = false
+    let nodeIdx = constraint.nodePositionToIndex.getOrDefault(position, -1)
+    if nodeIdx >= 0:
         constraint.nodeActive[nodeIdx] = (newValue != T(0))
+        changed = true
+    if not constraint.edgesInduced:
+        constraint.edgePositionToIndices.withValue(position, edges):
+            for e in edges[]:
+                constraint.edgeActive[e] = (newValue != T(0))
+            changed = true
+    if changed:
         constraint.numComponents = constraint.computeComponents()
         constraint.cost = max(0, constraint.numComponents - 1)
 
@@ -191,6 +228,9 @@ proc deepCopy*[T](constraint: ConnectedConstraint[T]): ConnectedConstraint[T] =
     result.numNodes = constraint.numNodes
     result.numEdges = constraint.numEdges
     result.adjacency = constraint.adjacency  # seq of seqs, but read-only
+    result.adjEdge = constraint.adjEdge
+    result.edgesInduced = constraint.edgesInduced
+    result.edgePositionToIndices = constraint.edgePositionToIndices
     result.edgeFrom = constraint.edgeFrom
     result.edgeTo = constraint.edgeTo
     result.nodePositions = constraint.nodePositions
@@ -203,6 +243,7 @@ proc deepCopy*[T](constraint: ConnectedConstraint[T]): ConnectedConstraint[T] =
     result.nodeActive = newSeq[bool](constraint.numNodes)
     for i in 0..<constraint.numNodes:
         result.nodeActive[i] = constraint.nodeActive[i]
+    result.edgeActive = constraint.edgeActive
     result.numComponents = constraint.numComponents
 
     # Fresh scratch space

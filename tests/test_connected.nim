@@ -375,3 +375,81 @@ suite "Connected Constraint":
 
         # All-fixed constraint SHOULD be removed
         check after == before - 1
+
+    test "Edge-aware mode: inactive edge variables disconnect":
+        # Path 0-1-2 with all nodes active; edge 1-2 off -> two components.
+        var sys = initConstraintSystem[int]()
+        var ns = sys.newConstrainedSequence(3)
+        ns.setDomain(@[0, 1])
+        var es = sys.newConstrainedSequence(2)
+        es.setDomain(@[0, 1])
+
+        sys.addConstraint(connected[int](@[0, 1, 2], @[3, 4], @[0, 1], @[1, 2],
+                                         edgesInduced = false))
+        sys.initialize(@[1, 1, 1, 1, 0])
+        let constraint = sys.baseArray.constraints[0]
+        check constraint.penalty() == 1
+
+        # Turning the edge on reconnects; the edge position is tracked
+        check 4 in constraint.positions
+        let d = constraint.moveDelta(4, 0, 1)
+        check d == -1
+        constraint.updatePosition(4, 1)
+        check constraint.penalty() == 0
+
+        # An active edge to an inactive node does not connect through it
+        let d2 = constraint.moveDelta(1, 1, 0)
+        constraint.updatePosition(1, 0)
+        check constraint.penalty() == 1
+        check d2 == 1
+
+    test "Edge-aware mode: random moves match full recomputation":
+        # 2x3 grid, nodes and edges toggled at random
+        var sys = initConstraintSystem[int]()
+        var ns = sys.newConstrainedSequence(6)
+        ns.setDomain(@[0, 1])
+        var es = sys.newConstrainedSequence(7)
+        es.setDomain(@[0, 1])
+
+        let edgeFrom = @[0, 1, 3, 4, 0, 1, 2]
+        let edgeTo   = @[1, 2, 4, 5, 3, 4, 5]
+        sys.addConstraint(connected[int](toSeq(0..5), toSeq(6..12), edgeFrom, edgeTo,
+                                         edgesInduced = false))
+        var current = newSeq[int](13)
+        for i in 0..<13: current[i] = 1
+        sys.initialize(current)
+        let constraint = sys.baseArray.constraints[0]
+        let connRef = constraint.connectedState
+
+        var seed = 12345
+        for step in 0..<200:
+            seed = (seed * 1103515245 + 12345) mod 2147483648
+            let pos = seed mod 13
+            let newVal = 1 - current[pos]
+            let before = constraint.penalty()
+            let delta = constraint.moveDelta(pos, current[pos], newVal)
+            constraint.updatePosition(pos, newVal)
+            current[pos] = newVal
+            check constraint.penalty() == before + delta
+            check constraint.penalty() == max(0, connRef.computeComponents() - 1)
+
+            # Independent check: BFS over active nodes and active edges only
+            var comp = newSeq[int](6)
+            for i in 0..<6: comp[i] = -1
+            var nComp = 0
+            for s in 0..<6:
+                if current[s] == 0 or comp[s] >= 0: continue
+                comp[s] = nComp
+                var stack = @[s]
+                while stack.len > 0:
+                    let u = stack.pop()
+                    for e in 0..<7:
+                        if current[6 + e] == 0: continue
+                        var w = -1
+                        if edgeFrom[e] == u: w = edgeTo[e]
+                        elif edgeTo[e] == u: w = edgeFrom[e]
+                        if w >= 0 and current[w] != 0 and comp[w] < 0:
+                            comp[w] = nComp
+                            stack.add w
+                inc nComp
+            check constraint.penalty() == max(0, nComp - 1)

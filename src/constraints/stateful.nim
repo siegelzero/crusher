@@ -2710,13 +2710,18 @@ func subcircuit*[T](positions: openArray[int], valueOffset: int = 1): StatefulCo
 ################################################################################
 
 func connected*[T](nodePositions, edgePositions: openArray[int],
-                   edgeFrom, edgeTo: openArray[int]): StatefulConstraint[T] =
+                   edgeFrom, edgeTo: openArray[int],
+                   edgesInduced = true): StatefulConstraint[T] =
     ## Creates a Connected constraint ensuring active nodes form a single connected component.
     ## Node/edge activity is determined by boolean variables (0 = inactive, non-0 = active).
-    ## Edge activity is derived from node activity (active iff both endpoints active).
+    ## With edgesInduced, edge activity is derived from node activity (active iff
+    ## both endpoints active) and edge variables are ignored: only valid when each
+    ## edge variable equals the AND of its endpoints. Otherwise an edge is active
+    ## iff its variable is non-0 and both endpoints are active.
     ##
     ## **Violation Cost**: max(0, numComponents - 1)
-    let connectedConstraint = newConnectedConstraint[T](nodePositions, edgePositions, edgeFrom, edgeTo)
+    let connectedConstraint = newConnectedConstraint[T](nodePositions, edgePositions, edgeFrom, edgeTo,
+                                                        edgesInduced)
     return StatefulConstraint[T](
         positions: connectedConstraint.positions,
         stateType: ConnectedType,

@@ -1162,6 +1162,83 @@ proc detectCircuitValueOffset(tr: FznTranslator, positions: seq[int], n: int): i
             if v == n: hasN = true
     return if hasZero and not hasN: 0 else: 1
 
+proc connectedEdgesInduced(tr: FznTranslator, con: FznConstraint): bool =
+    ## fzn_connected(from, to, ns, es): true when every es[e] equals
+    ## ns[from[e]] /\ ns[to[e]] (hitori, surface-based-tsp define it through
+    ## array_bool_and), so edge activity follows from node activity and the
+    ## edge variables can be ignored. Both sides are compared as a conjunction
+    ## of literals over resolved positions, with fixed values folded: MiniZinc
+    ## drops fixed-true inputs from the AND, aliases edges, or leaves a constant
+    ## behind bool_not(false, b) while the node array holds the literal.
+    proc elems(tr: FznTranslator, arg: FznExpr): seq[FznExpr] =
+        if arg.kind == FznArrayLit: return arg.elems
+        if arg.kind == FznIdent and arg.ident in tr.arrayLitByName and
+                tr.arrayLitByName[arg.ident].kind == FznArrayLit:
+            return tr.arrayLitByName[arg.ident].elems
+    let fromArr = tr.resolveIntArray(con.args[0])
+    let toArr = tr.resolveIntArray(con.args[1])
+    let ns = tr.elems(con.args[2])
+    let es = tr.elems(con.args[3])
+    if es.len != fromArr.len or es.len != toArr.len: return false
+    var needed = initHashSet[string]()
+    for x in ns:
+        if x.kind == FznIdent: needed.incl x.ident
+    for x in es:
+        if x.kind == FznIdent: needed.incl x.ident
+    var andDef = initTable[string, seq[FznExpr]]()
+    var constDef = initTable[string, bool]()   # b defined as a constant
+    for c in tr.model.constraints:
+        let name = stripSolverPrefix(c.name)
+        if name == "array_bool_and" and c.args.len >= 2 and c.args[1].kind == FznIdent and
+                c.args[1].ident in needed:
+            let ins = tr.elems(c.args[0])
+            andDef[c.args[1].ident] = ins
+            for x in ins:
+                if x.kind == FznIdent: needed.incl x.ident
+    for c in tr.model.constraints:
+        let name = stripSolverPrefix(c.name)
+        if name in ["bool_not", "bool_eq"] and c.args.len >= 2 and
+                c.args[0].kind == FznBoolLit and c.args[1].kind == FznIdent and
+                c.args[1].ident in needed:
+            constDef[c.args[1].ident] =
+                if name == "bool_not": not c.args[0].boolVal else: c.args[0].boolVal
+    type Conj = tuple[isFalse: bool, ids: HashSet[int]]
+    proc addLit(tr: FznTranslator, c: var Conj, x: FznExpr): bool =
+        if x.kind == FznIdent and x.ident in constDef:
+            if not constDef[x.ident]: c.isFalse = true
+            return true
+        var ex: AlgebraicExpression[int]
+        try:
+            ex = tr.resolveExprArg(x)
+        except CatchableError:
+            return false
+        case ex.node.kind
+        of LiteralNode:
+            if ex.node.value == 0: c.isFalse = true
+        of RefNode:
+            let pos = ex.node.position
+            let dom {.cursor.} = tr.sys.baseArray.domain[pos]
+            if dom.len == 1:
+                if dom[0] == 0: c.isFalse = true
+            else:
+                c.ids.incl pos
+        else:
+            return false
+        true
+    for i, e in es:
+        let a = fromArr[i] - 1
+        let b = toArr[i] - 1
+        if a notin 0..<ns.len or b notin 0..<ns.len: return false
+        var want, got: Conj
+        if not tr.addLit(want, ns[a]) or not tr.addLit(want, ns[b]): return false
+        if e.kind == FznIdent and e.ident in andDef:
+            for x in andDef[e.ident]:
+                if not tr.addLit(got, x): return false
+        elif not tr.addLit(got, e): return false
+        if want.isFalse != got.isFalse: return false
+        if not want.isFalse and want.ids != got.ids: return false
+    true
+
 proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
     ## Translates a single FlatZinc constraint to a Crusher constraint.
     let name = stripSolverPrefix(con.name)
@@ -2155,7 +2232,11 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             from0[i] = fromArr[i] - 1
             to0[i] = toArr[i] - 1
 
-        tr.sys.addConstraint(connected[int](nodePositions, edgePositions, from0, to0))
+        let induced = tr.connectedEdgesInduced(con)
+        stderr.writeLine(&"[FZN] connected: {nodePositions.len} nodes, {edgePositions.len} edges, " &
+                         (if induced: "edges induced by nodes" else: "edge variables tracked"))
+        tr.sys.addConstraint(connected[int](nodePositions, edgePositions, from0, to0,
+                                            edgesInduced = induced))
 
     of "fzn_regular":
         # regular(x, Q, S, d, q0, F)
