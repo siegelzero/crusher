@@ -3419,14 +3419,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # sources x 242 day sums x ~500 terms = 480M edges, >16 GB per
             # state) make that quadratic. Binary sources stop first, at half
             # the budget: their fallback evaluates a single alternative value.
-            # Checked before the topological reorder, which reads the same inputs.
+            # Checked before the topological reorder. The inputs computed here
+            # (topoInputs, aligned with topoOrder through the reorders below)
+            # serve the reorder, the dead-entry pass and the dependency tables.
             var cascadeEdges = 0
+            var topoInputs: seq[PackedSet[int]]
             if canBuild and topoOrder.len > 0:
                 let budget =
                     if state.sharedDomain[][pos].len <= 2: MaxCascadeInputEdges div 2
                     else: MaxCascadeInputEdges
                 for ci in 0..<topoOrder.len:
-                    cascadeEdges += state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).len
+                    topoInputs.add state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos)
+                    cascadeEdges += topoInputs[^1].len
                     if cascadeInputEdges + cascadeEdges > budget: break
                 if cascadeInputEdges + cascadeEdges > budget:
                     canBuild = false
@@ -3446,7 +3450,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 var deps = newSeq[seq[int]](n)
                 var needSort = false
                 for ci in 0..<n:
-                    for p in state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).items:
+                    for p in topoInputs[ci].items:
                         if p in idxOf:
                             let d = idxOf[p]
                             if d != ci:
@@ -3477,9 +3481,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     if ok:
                         var o2, b2: seq[int]
                         var k2: seq[CascadeEntryKind]
+                        var i2: seq[PackedSet[int]]
                         for ci in order:
                             o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
+                            i2.add move(topoInputs[ci])
                         topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
+                        topoInputs = move(i2)
 
             # Dead entries: channels that no active channel-dep constraint reads,
             # directly or through later cascade entries (e.g. deopt aliases of
@@ -3492,7 +3499,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 for ci, cp in topoOrder: idxOf[cp] = ci
                 var readers = newSeq[seq[int]](n)
                 for ci in 0..<n:
-                    for p in state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos).items:
+                    for p in topoInputs[ci].items:
                         if p in idxOf and idxOf[p] != ci: readers[idxOf[p]].add ci
                 var useful = newSeq[bool](n)
                 for ci in countdown(n - 1, 0):
@@ -3521,12 +3528,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     let nSrc = if nSrcReaders < 0: n else: nSrcReaders
                     var o2, b2: seq[int]
                     var k2: seq[CascadeEntryKind]
+                    var i2: seq[PackedSet[int]]
                     var newSrc = 0
                     for ci in 0..<n:
                         if not useful[ci]: continue
                         if ci < nSrc: inc newSrc
                         o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
+                        i2.add move(topoInputs[ci])
                     topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
+                    topoInputs = move(i2)
                     topoSet = initPackedSet[int]()
                     for cp in topoOrder: topoSet.incl(cp)
                     if nSrcReaders >= 0: nSrcReaders = newSrc
@@ -3612,6 +3622,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 topoOrder.setLen(0)
                 topoBindingIdx.setLen(0)
                 topoEntryKind.setLen(0)
+                topoInputs.setLen(0)
                 topoSet = initPackedSet[int]()
                 canStatic = true
 
@@ -3737,7 +3748,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 case topoEntryKind[ci]
                 of ceMinMax:
                     minMaxIndices.add(ci)
-                    let fb = state.flatMinMaxBindings[topoBindingIdx[ci]]
+                    let fb {.cursor.} = state.flatMinMaxBindings[topoBindingIdx[ci]]
                     for j in 0..<fb.linearPositions.len:
                         let lp = fb.linearPositions[j]
                         if lp != pos and lp notin topoSet:
@@ -3747,13 +3758,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             if ep != pos and ep notin topoSet:
                                 externalDeps.incl(ep)
                 of ceCountEq:
-                    let binding = carray.countEqChannelBindings[topoBindingIdx[ci]]
+                    let binding {.cursor.} = carray.countEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)  # treat like element deps for dirty tracking
                 of ceConditionalCountEq:
-                    let binding = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
+                    let binding {.cursor.} = carray.conditionalCountEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.primaryPositions:
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
@@ -3767,19 +3778,19 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)
                 of ceWeightedCountEq:
-                    let binding = carray.weightedCountEqChannelBindings[topoBindingIdx[ci]]
+                    let binding {.cursor.} = carray.weightedCountEqChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions:
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)
                 of ceArgmax:
-                    let binding = carray.argmaxChannelBindings[topoBindingIdx[ci]]
+                    let binding {.cursor.} = carray.argmaxChannelBindings[topoBindingIdx[ci]]
                     for srcPos in binding.inputPositions.items:
                         if srcPos != pos and srcPos notin topoSet:
                             externalDeps.incl(srcPos)
                             elemExtDeps.incl(srcPos)
                 of ceCrossingCountMax:
-                    let binding = carray.crossingCountMaxChannelBindings[topoBindingIdx[ci]]
+                    let binding {.cursor.} = carray.crossingCountMaxChannelBindings[topoBindingIdx[ci]]
                     for cable in binding.cables:
                         for srcPos in [cable.startPos, cable.endPos]:
                             if srcPos != pos and srcPos notin topoSet:
@@ -3837,7 +3848,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             var posToReaders = initTable[int, seq[int]]()  # cascade pos -> entry indices that read it
             var extPosToEntries = initTable[int, seq[int]]()  # external pos -> entry indices
             for ci in 0..<topoOrder.len:
-                let inputs = state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos)
+                let inputs {.cursor.} = topoInputs[ci]
                 # Register in posToReaders (cascade-internal deps) and extPosToEntries
                 for p in inputs.items:
                     if p in topoSet:
