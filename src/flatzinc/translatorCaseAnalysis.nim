@@ -33,33 +33,32 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
     # two-term int_lin_eq definitions (v = w + b with unit coefficients):
     # usable as variable case values (element entries with an offset).
     var linAlias: Table[string, (string, int)]
-    if not existsEnv("CRUSHER_NO_LINALIAS"):
-        var direct: Table[string, (string, int)]
-        for ci in 0 ..< tr.model.constraints.len:
-            let con {.cursor.} = tr.model.constraints[ci]
-            if stripSolverPrefix(con.name) != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
-            let ann = con.getAnnotation("defines_var")
-            if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
-            let dv = ann.args[0].ident
-            if dv notin tr.definedVarNames: continue
-            let cs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
-            let vs = tr.resolveVarArrayElems(con.args[1])
-            if cs.len != 2 or vs.len != 2 or vs[0].kind != FznIdent or vs[1].kind != FznIdent: continue
-            let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
-            let (di, oi) = if vs[0].ident == dv: (0, 1) elif vs[1].ident == dv: (1, 0) else: (-1, -1)
-            if di < 0 or abs(cs[di]) != 1 or cs[oi] != -cs[di]: continue
-            # cd*dv - cd*w = rhs  ->  dv = w + rhs/cd
-            direct[dv] = (vs[oi].ident, rhs * cs[di])
-        for dv in direct.keys:
-            var (w, off) = direct[dv]
-            var depth = 0
-            while w in direct and depth < 3:
-                let (w2, o2) = direct[w]
-                w = w2
-                off += o2
-                inc depth
-            if w notin tr.definedVarNames:
-                linAlias[dv] = (w, off)
+    var direct: Table[string, (string, int)]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        let dv = ann.args[0].ident
+        if dv notin tr.definedVarNames: continue
+        let cs = try: tr.resolveIntArray(con.args[0]) except ValueError, KeyError: continue
+        let vs = tr.resolveVarArrayElems(con.args[1])
+        if cs.len != 2 or vs.len != 2 or vs[0].kind != FznIdent or vs[1].kind != FznIdent: continue
+        let rhs = try: tr.resolveIntArg(con.args[2]) except ValueError, KeyError: continue
+        let (di, oi) = if vs[0].ident == dv: (0, 1) elif vs[1].ident == dv: (1, 0) else: (-1, -1)
+        if di < 0 or abs(cs[di]) != 1 or cs[oi] != -cs[di]: continue
+        # cd*dv - cd*w = rhs  ->  dv = w + rhs/cd
+        direct[dv] = (vs[oi].ident, rhs * cs[di])
+    for dv in direct.keys:
+        var (w, off) = direct[dv]
+        var depth = 0
+        while w in direct and depth < 3:
+            let (w2, o2) = direct[w]
+            w = w2
+            off += o2
+            inc depth
+        if w notin tr.definedVarNames:
+            linAlias[dv] = (w, off)
 
     # Step 1: Build reverse index from reifChannelDefs
     var eqReifMap: Table[string, tuple[sourceVar: string, testVal: FznExpr]]

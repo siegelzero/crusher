@@ -1254,7 +1254,7 @@ proc computeChannelDepPenaltiesAt[T](state: TabuState[T], pos: int) =
                     state.cdSrcLinCoeff.setLen(nSrc)
                 for ci in 0..<nSrc:
                     state.cdSrcLinOk[ci] = false
-                    if entryKinds[ci] == ceElement and not gNoSrcLin:
+                    if entryKinds[ci] == ceElement:
                         let b = addr state.carray.channelBindings[bindings[ci]]
                         if b.linearIndex:
                             for k in 0..<b.linPositions.len:
@@ -1561,7 +1561,7 @@ proc applyUniformDelta[T](state: TabuState[T], pos: int, changedChannels: seq[in
             var oldPenalties = newSeq[int](domain.len)
             for i in 0..<domain.len:
                 oldPenalties[i] = state.channelDepPenalties[pos][i]
-            if not gNoCacheRescore and state.cdCascadeCacheValid(pos):
+            if state.cdCascadeCacheValid(pos):
                 state.rescoreCascadeFromCache(pos)
             else:
                 state.computeChannelDepPenaltiesAt(pos)

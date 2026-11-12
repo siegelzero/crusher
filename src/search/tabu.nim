@@ -564,13 +564,11 @@ proc movePenalty*[T](state: TabuState[T], constraint: StatefulConstraint[T], pos
 # Included subsystems
 ################################################################################
 
-let gNoCtpLinkSkip = existsEnv("CRUSHER_NO_CTP_LINK_SKIP")
-let gNoSegmentRelocate = not existsEnv("CRUSHER_SEGMENT_RELOCATE")   # opt-in: relocating fixed chains scrambled vrplc vehicle anchors
 
 proc onValidCtpCircuit[T](state: TabuState[T], pos: int): bool {.inline.} =
     ## True when pos is a successor variable of a currently valid circuit whose
     ## tour drives a circuit-time chain (single moves there only break the tour).
-    if gNoCtpLinkSkip or state.circuitTimePropConstraints.len == 0 or
+    if state.circuitTimePropConstraints.len == 0 or
        state.circuitConstraints.len == 0:
         return false
     if not state.ctpCircuitBuilt:
@@ -591,14 +589,7 @@ include tabuInverseMoves
 # Debug A/B knobs for the cascade cache paths (see applyFirstImprovingMove /
 # computeChannelDepPenaltiesAt): disable the lean-scan re-score from cache,
 # and the affine index shortcut for source-reader element entries.
-let gNoCdStamp = existsEnv("CRUSHER_NO_CD_STAMP")
 let gTraceMoves = existsEnv("CRUSHER_TRACE_MOVES")   # debug: print S0's best-move assignments (first 400 iterations)
-let gNoSrcLin = existsEnv("CRUSHER_NO_SRC_LIN")
-let gNoPosSample = existsEnv("CRUSHER_NO_POS_SAMPLE")       # A/B: flat (position,value) tie sampling
-let gNoEmptyCascade = existsEnv("CRUSHER_NO_EMPTY_CASCADE") # A/B: worklist fallback for unread cascades
-let gOldWideGuard = existsEnv("CRUSHER_OLD_WIDE_GUARD")     # A/B: count constant element tables as cascade inputs
-let gNoCacheRescore = existsEnv("CRUSHER_NO_CACHE_RESCORE") # A/B: never re-score a cascade from cached channel values
-let gMixedAll = existsEnv("CRUSHER_MIXED_ALL")               # A/B: joint-score every mixed constraint, not only the objective bound
 
 include tabuChannelDep
 include tabuElementImplied
@@ -1692,13 +1683,7 @@ proc channelSearchSources[T](carray: ConstrainedArray[T], pos: int,
             if not carray.channelSearchSources(p, srcs, depth + 1): return false
     return found
 # A/B switches for the cascade/count evaluation paths (debugging aids)
-let gNoExprCascade = existsEnv("CRUSHER_NO_EXPR_CASCADE")
-let gNoSparseCascade = existsEnv("CRUSHER_NO_SPARSE_CASCADE")
-let gNoIncCount = existsEnv("CRUSHER_NO_INC_COUNT")
-let gExactCascadeExt = existsEnv("CRUSHER_EXACT_CASCADE_EXT")
-let gNoExactCascadeExt = existsEnv("CRUSHER_NO_EXACT_CASCADE_EXT")
 let gDebugViolations = existsEnv("CRUSHER_DEBUG_VIOLATIONS")
-let gCtpLazy = existsEnv("CRUSHER_CTP_LAZY")
 
 proc logInitRss*(label: string) =
     ## Verbose-only: resident set size after an init phase (Linux /proc/self/statm).
@@ -1830,12 +1815,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     state.propSrcPos = -1
     state.ceqPosMult = newSeq[Table[int, int]](carray.countEqChannelBindings.len)
     for bi, b in carray.countEqChannelBindings:
-        if not gNoIncCount and b.inputPositions.len >= IncCountMinInputs:
+        if b.inputPositions.len >= IncCountMinInputs:
             for p in b.inputPositions:
                 state.ceqPosMult[bi].mgetOrPut(p, 0) += 1
     state.wceqPosWeight = newSeq[Table[int, T]](carray.weightedCountEqChannelBindings.len)
     for bi, b in carray.weightedCountEqChannelBindings:
-        if not gNoIncCount and b.inputPositions.len >= IncCountMinInputs:
+        if b.inputPositions.len >= IncCountMinInputs:
             for k, p in b.inputPositions:
                 state.wceqPosWeight[bi].mgetOrPut(p, T(0)) += b.weights[k]
 
@@ -1856,7 +1841,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         # Skip circuits over channel positions: their successor values are derived
         # from source variables and cannot be assigned directly (same reasoning as
         # the table-move guard below), so the swap move does not apply to them.
-        if constraint.stateType == CircuitType and not existsEnv("CRUSHER_NO_CIRCUIT_MOVES"):
+        if constraint.stateType == CircuitType:
             var hasChannelPos = false
             for pos in constraint.circuitState.positions.items:
                 if pos in carray.channelPositions:
@@ -2108,7 +2093,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         state.balancePermutations(verbose and id == 0)
 
     # Circuits start on a random valid Hamiltonian tour
-    if initialAssignment.len == 0 and not existsEnv("CRUSHER_NO_CIRCUIT_INIT"):
+    if initialAssignment.len == 0:
         state.initValidCircuits(verbose and id == 0)
 
     # Table-aware initialization: for each table constraint, try to satisfy it
@@ -2616,16 +2601,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # returns to feasibility. Scale it so one unit is a fraction of the
             # typical single-move objective change (median per-position max delta).
             if constraint.isObjectiveBound and posDeltas.len > 0:
-                # CRUSHER_BOUND_SCALE_PCT: percent of the median (0 disables, "max" = maxNetDelta).
-                let pctStr = getEnv("CRUSHER_BOUND_SCALE_PCT", "100")
                 posDeltas.sort()
                 let median = int(posDeltas[posDeltas.len div 2])
-                var scale = 1
-                if pctStr == "max":
-                    scale = int(maxDelta)
-                else:
-                    let pct = try: parseInt(pctStr) except ValueError: 100
-                    if pct > 0: scale = max(1, median * pct div 100)
+                var scale = max(1, median)
                 # A bound that reads a search variable directly AND channels fed
                 # by that same variable (kitchen: widths plus the discontinuity
                 # indicators they drive) is scored jointly inside the cascade
@@ -2642,7 +2620,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     for p in constraint.positions.items:
                         if p in carray.channelPositions: inc nChannel
                         elif p notin carray.fixedPositions: inc nDirect
-                    echo &"[Init] Objective-bound penalty scale: {rc.costScale} (median single-move delta {median}, max {maxDelta}, setting {pctStr}, direct={nDirect} channel={nChannel})"
+                    echo &"[Init] Objective-bound penalty scale: {rc.costScale} (median single-move delta {median}, max {maxDelta}, direct={nDirect} channel={nChannel})"
         if nComputed > 0 and verbose and id == 0:
             echo "[Init] Computed maxNetDelta for " & $nComputed & " inequality constraints"
 
@@ -2671,7 +2649,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for pos in carray.allSearchPositions():
         state.searchPositions.add(pos)
         let dsize = state.sharedDomain[][pos].len
-        if dsize > LazyThreshold or (gCtpLazy and pos in state.ctpAtLink):
+        if dsize > LazyThreshold:
             state.isLazy[pos] = true
         else:
             state.totalDomainSize += dsize
@@ -3397,7 +3375,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # Expression channels (e.g. squares of load channels feeding a sum
                 # objective): without them, constraints over these channels — often
                 # the objective bound — are invisible to cascade move scoring.
-                if not gNoExprCascade and p in carray.expressionChannelsAtPosition:
+                if p in carray.expressionChannelsAtPosition:
                     for bi in carray.expressionChannelsAtPosition[p]:
                         let chanPos = carray.expressionChannelBindings[bi].channelPosition
                         if chanPos in topoSet:
@@ -3569,7 +3547,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         for elem in b.arrayElements:
                             if not elem.isConstant: inc inputRefs
                     else: inputRefs += 4
-                if gOldWideGuard: inputRefs = max(inputRefs, tableRefs)
                 if inputRefs > MaxCascadeInputRefs:
                     canBuild = false
                 # A cascade admitted only because its constant tables are no
@@ -3618,7 +3595,6 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # domain value on every recompute (kitchen: two 307-value
                 # paddings cost 9 s of a 19 s run).
                 inc noConstraintSkip
-                if gNoEmptyCascade: continue
                 topoOrder.setLen(0)
                 topoBindingIdx.setLen(0)
                 topoEntryKind.setLen(0)
@@ -3707,7 +3683,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             # search's dynamics enough that sdn-chain found its
                             # feasible solution in 3/12 runs instead of 11/12.
                             let joint = (srcL != 0 or srcR != 0) and
-                                (gMixedAll or state.channelDepConstraints[ci].isObjectiveBound)
+                                state.channelDepConstraints[ci].isObjectiveBound
                             if joint:
                                 constraintSrcCoeff.add((l: srcL, r: srcR))
                                 mixedClis.add(constraintLocalIds.len - 1)
@@ -3865,7 +3841,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if r <= ci: hasBackEdge = true
             if nSrcReaders < 0: nSrcReaders = topoOrder.len
             state.cdCascadeNSrcReaders.add(nSrcReaders)
-            state.cdCascadeHasBackEdge.add(hasBackEdge or gNoSparseCascade)
+            state.cdCascadeHasBackEdge.add(hasBackEdge)
             block:
                 var entryCons = newSeq[seq[int]](topoOrder.len)
                 for cli, dci in constraintLocalIds:
@@ -3885,8 +3861,7 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 # such inputs on every successor move; elsewhere the extra full
                 # recomputes cost ~3x throughput (sparse_mds) for little gain.
                 var consExt: PackedSet[int]
-                if (state.circuitTimePropConstraints.len > 0 and not gNoExactCascadeExt) or
-                   gExactCascadeExt:
+                if state.circuitTimePropConstraints.len > 0:
                     for dci in constraintLocalIds:
                         for p in state.channelDepConstraints[dci].positions.items:
                             if p != pos and p notin topoSet: consExt.incl(p)
@@ -5268,7 +5243,7 @@ proc applyFirstImprovingMove[T](state: TabuState[T]) {.inline.} =
             position < state.channelDepPenalties.len and
             state.channelDepPenalties[position].len > 0
         if hasChanDep:
-            if not gNoCdStamp and not gNoCacheRescore and state.cdCascadeCacheValid(position):
+            if state.cdCascadeCacheValid(position):
                 when ProfileIteration: inc state.cdLeanRescore
                 state.rescoreCascadeFromCache(position)
             else:
@@ -5490,7 +5465,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.applyElementImpliedMoves(p1)
         state.applyElementImpliedMoves(p2)
     elif moves.len > 0:
-        let (position, newValue) = if gNoPosSample: sample(moves) else: sampleByPosition(moves)
+        let (position, newValue) = sampleByPosition(moves)
         let oldValue = state.assignment[position]
         # Compute forced changes BEFORE assignValue to capture old values for tabu
         var forcedOldValues: seq[(int, T)]
@@ -6049,8 +6024,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     var useLeanSearch = state.hasChannelDeps and
         state.searchPositions.len >= 30 and
         state.channelDepSearchPositions.len > 0 and
-        state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5 and
-        not existsEnv("CRUSHER_NO_LEAN")   # diagnostic: force the penalty-map path
+        state.channelDepSearchPositions.len.float / state.searchPositions.len.float > 0.5
 
     # The static gate above only says that channel-dep positions dominate; it
     # does not say which regime is faster. Lean first-improvement re-runs the
@@ -6074,13 +6048,13 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     const TrialSeconds = 0.25
     const TrialIters = 200
     const TrialAbortFactor = 4.0         # best-move slice may take at most this times TrialSeconds
-    if useLeanSearch and not existsEnv("CRUSHER_NO_LEAN_TRIAL"):
+    if useLeanSearch:
         trialPhase = 1
         trialStartT = epochTime()
         trialStartIter = state.iteration
         trialStartCost = state.cost
 
-    state.leanSearch = useLeanSearch and not existsEnv("CRUSHER_NO_LEAN_COMMIT")
+    state.leanSearch = useLeanSearch
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
             (if useLeanSearch: " (lean first-improvement)" else: "")
@@ -6203,7 +6177,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                              " -> " & (if leanWins: "lean first-improvement" else: "best-move")
                     if leanWins:
                         useLeanSearch = true
-                        state.leanSearch = not existsEnv("CRUSHER_NO_LEAN_COMMIT")
+                        state.leanSearch = true
                     else:
                         # Aborted neighbour updates never happened here (no abort), so
                         # the penalty structures are fresh; keep best-move.
@@ -6316,7 +6290,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         if state.circuitConstraints.len > 0 and state.circuitTimePropConstraints.len > 0 and
            state.iteration - lastImprovement >= 5 and
            state.iteration >= state.pairNextTry and
-           not outOfBudget() and not existsEnv("CRUSHER_NO_PAIR_MOVES"):
+           not outOfBudget():
             if state.tryPairTourMoves():
                 state.pairFailStreak = 0
                 state.pairNextTry = state.iteration + 2

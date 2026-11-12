@@ -46,7 +46,6 @@
 import std/[tables, packedsets]
 from std/os import existsEnv
 
-let gNoReleaseFast = existsEnv("CRUSHER_NO_RELEASE_FAST")
 
 type
     CircuitTimePropConstraint*[T] = ref object
@@ -774,10 +773,7 @@ proc moveDelta*[T](c: CircuitTimePropConstraint[T],
                     position: int, oldValue, newValue: T): int =
     if c.hasRelease and position in c.releaseToIndex:
         let ri = c.releaseToIndex[position]
-        var fastOff = false
-        {.cast(noSideEffect).}:
-            fastOff = gNoReleaseFast
-        if c.releaseFastOk and not fastOff:
+        if c.releaseFastOk:
             return c.releaseRewalk(ri, newValue)
         let saved = c.releaseVal[ri]
         c.releaseVal[ri] = newValue

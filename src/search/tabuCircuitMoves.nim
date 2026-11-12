@@ -295,30 +295,16 @@ proc tryTourMoves[T](state: TabuState[T], allowPerturb: bool = false): bool =
         shuffle(order)
         for x in order:
             if evals >= MAX_EVALS: break
-            # Segment x..b: follow fixed arcs (single-value successor domains),
-            # so fixed chains (e.g. giant-tour depot connectors end_v -> start_v+1)
-            # relocate as a unit; a single node is the segment x..x.
-            var b = x
-            var segLen = 1
-            while state.sharedDomain[][cc.positionArray[b]].len == 1 and segLen < n - 2 and
-                  not gNoSegmentRelocate:
-                let nb = succ[b]
-                if nb == x: break
-                b = nb
-                inc segLen
+            # Single-node relocation. Moving fixed chains (follow single-value
+            # successor arcs, e.g. giant-tour depot connectors) as a unit was
+            # tried and scrambled vrplc vehicle anchors.
+            let b = x
             if state.sharedDomain[][cc.positionArray[b]].len == 1: continue   # tail arc fixed
             let p = pred[x]
             let s = succ[b]
-            var inSeg = initPackedSet[int]()
-            if segLen > 1:
-                var y = x
-                while true:
-                    inSeg.incl(y)
-                    if y == b: break
-                    y = succ[y]
             for u in 0..<n:
                 if evals >= MAX_EVALS: break
-                if u == x or u == p or u == b or (segLen > 1 and u in inSeg): continue
+                if u == x or u == p or u == b: continue
                 let v = if u == s: succ[s] else: succ[u]
                 if v == x: continue
                 # Changes: succ[p] := s, succ[u] := x, succ[b] := v

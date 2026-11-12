@@ -158,7 +158,6 @@ proc splitImplicationConjunctions(tr: var FznTranslator) =
     ## detector consumed (AND structure matters to the disjunctive-clause and
     ## conditional-source detectors). Runs late, so it appends instead of
     ## re-indexing the constraint list.
-    if existsEnv("CRUSHER_NO_SPLIT"): return
     var useCount: CountTable[string]
     for con in tr.model.constraints:
         for arg in con.args:

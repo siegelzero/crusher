@@ -275,8 +275,8 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         let baseFixedPositions = copyPackedSet(system.baseArray.fixedPositions)
 
         # Stall cap for probes and speculative asks (see nearStallSecs): stop a
-        # state after CRUSHER_PROBE_CAP_PCT percent of the remaining time
-        # without any improvement, at least 5 s (default 10; 100 disables it).
+        # state after probeCapPct percent of the remaining time without any
+        # improvement, at least 5 s.
         # Only for budgets of at least StallCapMinBudget seconds: on a 10 s
         # budget community detection reaches its exact optimum only through
         # the far bisection probe running the whole time (its near-feasible
@@ -286,12 +286,10 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
         # 60 s kitchen run the hopeless probe at 560 of [1..1120] otherwise
         # eats the budget (0 instead of 200-370).
         const StallCapMinBudget = 30.0
-        var probeCapPct = 10
-        try: probeCapPct = parseInt(getEnv("CRUSHER_PROBE_CAP_PCT", "10"))
-        except ValueError: discard
+        const probeCapPct = 10
         let totalBudget = if deadline > 0: deadline - initSolveStart else: 0.0
         proc stallCap(deadline: float): float =
-            if deadline <= 0 or probeCapPct >= 100 or totalBudget < StallCapMinBudget:
+            if deadline <= 0 or totalBudget < StallCapMinBudget:
                 return 0.0
             max(5.0, probeCapPct.float / 100.0 * (deadline - epochTime()))
 

@@ -2095,7 +2095,7 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
             if tr.tryMatchSuccFormCircuitTime(ci, elems, cand):
                 candidates.add(cand)
                 matchedTimeChain = true
-            elif not existsEnv("CRUSHER_NO_SPLIT_CTP"):
+            else:
                 cand = CircuitTimeCandidate(circuitCI: ci)
                 if tr.tryMatchSplitSuccFormCircuitTime(ci, elems, cand):
                     candidates.add(cand)
@@ -2124,14 +2124,13 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
     # Circuits carrying a split (release) time chain keep their crusher_circuit:
     # its dedicated moves build and repair the giant tour, and the chains on
     # that circuit then charge circuit violations only once between them.
-    if not existsEnv("CRUSHER_NO_CTP_KEEP_CIRCUIT"):
-        var keepCis: PackedSet[int]
-        for cand in candidates:
-            if cand.useRelease: keepCis.incl(cand.circuitCI)
-        for k in 0..<candidates.len:
-            if candidates[k].circuitCI in keepCis:
-                candidates[k].keepCircuit = true
-                candidates[k].consumedCIs.excl(candidates[k].circuitCI)
+    var keepCis: PackedSet[int]
+    for cand in candidates:
+        if cand.useRelease: keepCis.incl(cand.circuitCI)
+    for k in 0..<candidates.len:
+        if candidates[k].circuitCI in keepCis:
+            candidates[k].keepCircuit = true
+            candidates[k].consumedCIs.excl(candidates[k].circuitCI)
 
     for cand in candidates:
         for ci in cand.consumedCIs.items:
@@ -2242,8 +2241,7 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
             for i in 0..<n:
                 relPos[i] = -1
                 if i < cand.releaseNodes.len and cand.releaseNodes[i] and
-                   cand.lateTimes[i] > cand.earlyTimes[i] and
-                   not existsEnv("CRUSHER_NO_CTP_RELEASE"):
+                   cand.lateTimes[i] > cand.earlyTimes[i]:
                     let pos = tr.sys.baseArray.len
                     discard tr.sys.newConstrainedVariable()
                     tr.sys.baseArray.setDomain(pos, toSeq(cand.earlyTimes[i]..cand.lateTimes[i]))

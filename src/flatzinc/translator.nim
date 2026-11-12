@@ -1316,8 +1316,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
     # Equalities whose reification presolve fixed true become FZN aliases.
-    if not existsEnv("CRUSHER_NO_FIXED_EQ_ALIAS"):
-        result.aliasFixedEqualities()
+    result.aliasFixedEqualities()
     # Set variables that only mirror derived booleans (set_in_reif + bool_eq).
     result.aliasSetMembershipBits()
     # Canonicalize FZN-level variable aliases (`var X = Y;`) BEFORE any pattern detection
