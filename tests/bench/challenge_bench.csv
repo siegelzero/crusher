@@ -1,0 +1,21 @@
+# name,model,data   (paths relative to minizinc_challenge/)
+# Rows that looked worse in the 2026-11-11 sweep
+gbac_UD1,2026/gbac/gbac.mzn,2026/gbac/UD1-gbac.dzn
+gbac_UD6,2026/gbac/gbac.mzn,2026/gbac/UD6-gbac.dzn
+warehouse_olal41,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/olal41.dzn
+warehouse_oly20,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/oly20.dzn
+warehouse_wlp02,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/wlp02.dzn
+workforce_19,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_19.dzn
+workforce_71,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_71.dzn
+atp_instance9,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance9-stage2.dzn
+sdn_d26n600_5,2026/sdn-chain/model.mzn,2026/sdn-chain/d26n600-5.dzn
+sbtsp_burma14,2026/surface-based-tsp/dual_surface_tsp_cp_combined.mzn,2026/surface-based-tsp/burma14.dzn
+recteuler_3venn,2026/rect-euler/RectEuler_max_clique.mzn,2026/rect-euler/3venn_combined_model_input.json
+# Representative far-from-best rows
+gbac_reduced_UD9,2026/gbac/gbac.mzn,2026/gbac/reduced_UD9-gbac.dzn
+nside_HARD_1000_100,2026/nside/full.mzn,2026/nside/HARD_1000_100.dzn
+saeling_j0010_m008,2026/saeling/encoding_challenge_v2_0.mzn,2026/saeling/instance__j0010_m008_w02_g2x2_s021.dzn
+kitchen_linear,2026/kitchen/kitchen.mzn,2026/kitchen/linear.instance.json
+spot5_1407,2026/spot5/spot5.mzn,2026/spot5/1407.dzn
+recteuler_harrypotter,2026/rect-euler/RectEuler_max_clique.mzn,2026/rect-euler/harrypotter_combined_model_input.json
+community_e50_s10,2026/community-detection-2021/community-detection.mzn,2026/community-detection-2021/rnd_n100_e50_s10_d5_c9_p70.json
