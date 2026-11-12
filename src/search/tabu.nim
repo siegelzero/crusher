@@ -1,4 +1,4 @@
-import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os, heapqueue]
+import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe, groupValueDisjoint, guardedCount]
@@ -3397,9 +3397,9 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             # sources x 242 day sums x ~500 terms = 480M edges, >16 GB per
             # state) make that quadratic. Binary sources stop first, at half
             # the budget: their fallback evaluates a single alternative value.
-            # Checked before the topological reorder. The inputs computed here
-            # (topoInputs, aligned with topoOrder through the reorders below)
-            # serve the reorder, the dead-entry pass and the dependency tables.
+            # The inputs computed here (topoInputs, aligned with topoOrder through
+            # the dead-entry filter below) also serve that filter and the
+            # dependency tables.
             var cascadeEdges = 0
             var topoInputs: seq[PackedSet[int]]
             if canBuild and topoOrder.len > 0:
@@ -3414,57 +3414,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     canBuild = false
                     inc edgeBudgetSkipped
 
-            # BFS discovery order is not always topological: an entry reached
-            # early through one input can also read an entry discovered later
-            # (nside: a day-load sum reads indicators at two BFS depths). Such a
-            # back edge forces dense cascade evaluation (every entry for every
-            # value) and misorders static precomputation, so reorder into a
-            # stable topological order (BFS order as tie-break). The source
-            # readers must stay the leading block; otherwise keep BFS order.
-            if canBuild and topoOrder.len > 1:
-                let n = topoOrder.len
-                var idxOf = initTable[int, int]()
-                for ci, cp in topoOrder: idxOf[cp] = ci
-                var deps = newSeq[seq[int]](n)
-                var needSort = false
-                for ci in 0..<n:
-                    for p in topoInputs[ci].items:
-                        if p in idxOf:
-                            let d = idxOf[p]
-                            if d != ci:
-                                deps[ci].add d
-                                if d > ci: needSort = true
-                if needSort:
-                    var readers = newSeq[seq[int]](n)
-                    var indeg = newSeq[int](n)
-                    for ci in 0..<n:
-                        indeg[ci] = deps[ci].len
-                        for d in deps[ci]: readers[d].add ci
-                    # Min-heap on original index keeps BFS order among ready entries
-                    var ready = initHeapQueue[int]()
-                    for ci in 0..<n:
-                        if indeg[ci] == 0: ready.push ci
-                    var order: seq[int]
-                    while ready.len > 0:
-                        let ci = ready.pop()
-                        order.add ci
-                        for r in readers[ci]:
-                            dec indeg[r]
-                            if indeg[r] == 0: ready.push r
-                    var ok = order.len == n   # cycle -> keep BFS order
-                    let nSrc = if nSrcReaders < 0: n else: nSrcReaders
-                    if ok:
-                        for k in 0..<min(nSrc, n):
-                            if order[k] >= nSrc: ok = false; break
-                    if ok:
-                        var o2, b2: seq[int]
-                        var k2: seq[CascadeEntryKind]
-                        var i2: seq[PackedSet[int]]
-                        for ci in order:
-                            o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
-                            i2.add move(topoInputs[ci])
-                        topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
-                        topoInputs = move(i2)
+            # BFS order is kept even where it is not topological (an entry reached
+            # early through one input can also read an entry discovered later;
+            # such cascades are evaluated densely). A stable topological reorder
+            # (9eec56f, for nside) made those evaluations exact but cost
+            # workforce-alloc a dominant level in most runs (19: 4/8 runs reach
+            # < 13500 without it, 0/9 with it; 71: 12285-14445 vs 14190-14340)
+            # and no longer changes nside (state creation and objectives equal).
 
             # Dead entries: channels that no active channel-dep constraint reads,
             # directly or through later cascade entries (e.g. deopt aliases of
@@ -3489,8 +3445,8 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     if not useful[ci]:
                         for r in readers[ci]:
                             if useful[r]: useful[ci] = true; break
-                # Readers come later in topological order, except across a
-                # cycle (BFS order kept): settle those by iterating.
+                # Readers mostly come later in BFS order, but not always (back
+                # edges, cycles): settle the rest by iterating.
                 var changed = true
                 while changed:
                     changed = false
