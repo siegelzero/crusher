@@ -237,14 +237,19 @@ constraint bool_clause([z,b1],[]);
 constraint int_lin_le([-1],[x],-6);
 solve satisfy;
 """
-    var tr = translate(parseFzn(src))
-    check tr.varPositions["x"] in tr.sys.baseArray.channelPositions
-    tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
-    check tr.sys.hasFeasibleSolution
-    let asg = tr.sys.assignment
-    let a = asg[tr.varPositions["a"]]
-    let s = asg[tr.varPositions["s"]]
-    let d = asg[tr.varPositions["d"]]
-    let x = asg[tr.varPositions["x"]]
-    check x == (if a == 1: s + d else: 0)
-    check x >= 6
+    # x >= 6 is folded into x's domain by presolve, then x becomes a channel:
+    # the constraint must not be dropped as tautological on that domain (it
+    # used to be, and ~10% of seeds returned s + d = 4 or 5).
+    for seed in 0..<20:
+        randomize(seed)
+        var tr = translate(parseFzn(src))
+        check tr.varPositions["x"] in tr.sys.baseArray.channelPositions
+        tr.sys.resolve(parallel = false, tabuThreshold = 2000, verbose = false)
+        check tr.sys.hasFeasibleSolution
+        let asg = tr.sys.assignment
+        let a = asg[tr.varPositions["a"]]
+        let s = asg[tr.varPositions["s"]]
+        let d = asg[tr.varPositions["d"]]
+        let x = asg[tr.varPositions["x"]]
+        check x == (if a == 1: s + d else: 0)
+        check x >= 6

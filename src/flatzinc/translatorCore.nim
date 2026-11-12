@@ -873,6 +873,15 @@ proc getExprBounds(tr: var FznTranslator, arg: FznExpr): tuple[lo: int, hi: int,
             return (val, val, true)
         elif arg.ident in tr.varPositions:
             let pos = tr.varPositions[arg.ident]
+            if pos in tr.sys.baseArray.channelPositions:
+                # A channel's value is computed, not drawn from its domain, and
+                # presolve may have tightened that domain from the very
+                # constraint being tested (x >= 6 folded into x's domain, then x
+                # channelled as `if b then s + d else 0`): only the declared
+                # domain, which channel builders enforce, bounds it.
+                tr.buildVarDomainIndex()
+                let (ok, lo, hi) = tr.declaredBounds(arg.ident)
+                return (lo, hi, ok)
             let dom = tr.sys.baseArray.domain[pos]
             if dom.len > 0:
                 return (dom[0], dom[^1], true)
