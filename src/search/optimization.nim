@@ -355,9 +355,15 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
 
         # Product objectives skip bisection: a midpoint product bound has no
         # gradient and no factor decomposition — the retry loop's factor
-        # staging ratchets the shape down directly instead.
+        # staging ratchets the shape down directly instead. Lexicographic
+        # objectives (dominant term) skip it too: a midpoint asks for half the
+        # dominant level at once, which local search cannot reach, and the
+        # probe stalls out the budget, while the ladder's dominant asks step
+        # the level down one at a time (workforce-alloc 71: 16320-16395 with
+        # bisection, 14385-14490 without).
         let skipBisection = lowIterRate or
-            (direction == Minimize and system.objectiveProduct.active)
+            (direction == Minimize and system.objectiveProduct.active) or
+            system.objectiveDominant.active
         while lo <= hi and not skipBisection:
             if deadline > 0 and epochTime() > deadline:
                 system.searchCompleted = false
