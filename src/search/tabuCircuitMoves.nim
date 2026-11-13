@@ -400,20 +400,29 @@ proc buildTourPairs[T](state: TabuState[T]) =
 proc tryPairTourMoves[T](state: TabuState[T]): bool =
     ## Relocate a linked node pair together on a valid circuit: move a after u,
     ## then b within the next few nodes after a (same route), both orders.
-    ## Six successor changes scored by lean simulate-and-restore; the best
-    ## strictly improving one is committed.
+    ## Six successor changes scored by lean simulate-and-restore (the pair is
+    ## detached once per pair, each candidate only inserts and undoes); the
+    ## first strictly improving one is committed.
     if not state.tourPairsBuilt: state.buildTourPairs()
     if state.tourPairs.len == 0: return false
-    const MAX_EVALS = 2500
+    const MAX_EVALS = 2500         # no new pair is started past this (pairs finish)
     const AHEAD = 6
     var evals = 0
     var bestDelta = 0
     var bestChanges: seq[(int, T)]
-    var order = toSeq(0..<state.tourPairs.len)
-    shuffle(order)
+    # Resume a random pair order across calls: a call scans only a few pairs,
+    # and the caller backs off only once every pair failed since the last
+    # improvement (state.pairsSinceImprove), not after a few unlucky ones.
+    if state.pairOrder.len != state.tourPairs.len or state.pairCursor >= state.pairOrder.len:
+        state.pairOrder = toSeq(0..<state.tourPairs.len)
+        shuffle(state.pairOrder)
+        state.pairCursor = 0
     var changes: seq[(int, T)]     # (position, old value) for restore
-    for pi in order:
+    while state.pairCursor < state.pairOrder.len:
         if evals >= MAX_EVALS: break
+        let pi = state.pairOrder[state.pairCursor]
+        inc state.pairCursor
+        inc state.pairsSinceImprove
         let (circ, na, nb) = state.tourPairs[pi]
         let cc = state.circuitConstraints[circ]
         if cc.cost != 0: continue
@@ -428,33 +437,33 @@ proc tryPairTourMoves[T](state: TabuState[T]): bool =
             for k in 0..<cc.n:
                 if int(state.assignment[cc.positionArray[k]]) - cc.valueOffset == v: return k
             -1
-        for (x, y) in [(na, nb), (nb, na)]:
-            if evals >= MAX_EVALS: break
-            var us = toSeq(0..<n)
-            shuffle(us)
-            for u in us:
-                if evals >= MAX_EVALS: break
-                if u == x or u == y: continue
-                for k in 0..<AHEAD:
-                    if evals >= MAX_EVALS: break
-                    changes.setLen(0)
-                    let before = state.cost
-                    var ok = true
-                    # 1) remove x and y from the tour (y first if adjacent handled by preds)
-                    for z in [x, y]:
-                        let pz = state.predOf(cc, z)
-                        let sz = succOf(z)
-                        if pz < 0 or state.domIdx(cc.positionArray[pz], T(sz + off)) < 0:
-                            ok = false
-                            break
-                        setSucc(pz, sz)
-                        setSucc(z, z)            # detached (self loop placeholder)
-                    # 2) insert x after u, then y after the k-th node following x
-                    if ok:
+        # 1) detach both nodes once (self loops); every candidate below
+        #    reinserts them from this state and undoes only its insertion
+        changes.setLen(0)
+        let before = state.cost
+        var detached = true
+        for z in [na, nb]:
+            let pz = state.predOf(cc, z)
+            let sz = succOf(z)
+            if pz < 0 or state.domIdx(cc.positionArray[pz], T(sz + off)) < 0:
+                detached = false
+                break
+            setSucc(pz, sz)
+            setSucc(z, z)
+        let nDetach = changes.len
+        if detached:
+            for (x, y) in [(na, nb), (nb, na)]:
+                var us = toSeq(0..<n)
+                shuffle(us)
+                for u in us:
+                    if u == x or u == y: continue
+                    for k in 0..<AHEAD:
+                        # 2) insert x after u, then y after the k-th node following x
+                        var ok = true
                         let su = succOf(u)
                         if state.domIdx(cc.positionArray[u], T(x + off)) < 0 or
                            state.domIdx(cc.positionArray[x], T(su + off)) < 0:
-                            ok = false
+                            break                  # no k can place x after u
                         else:
                             setSucc(u, x)
                             setSucc(x, su)
@@ -469,21 +478,22 @@ proc tryPairTourMoves[T](state: TabuState[T]): bool =
                             else:
                                 setSucc(w, y)
                                 setSucc(y, sw)
-                    inc evals
-                    let delta = state.cost - before
-                    let valid = ok and cc.cost == 0
-                    var finalVals: seq[(int, T)]
-                    if valid and delta < bestDelta:
-                        for (pp, _) in changes: finalVals.add((pp, state.assignment[pp]))
-                    for ci in countdown(changes.len - 1, 0):
-                        state.assignValueLean(changes[ci][0], changes[ci][1])
-                    if valid and delta < bestDelta:
-                        bestDelta = delta
-                        bestChanges = finalVals
+                        inc evals
+                        let delta = state.cost - before
+                        if ok and cc.cost == 0 and delta < bestDelta:
+                            bestDelta = delta
+                            bestChanges.setLen(0)
+                            for (pp, _) in changes: bestChanges.add((pp, state.assignment[pp]))
+                        for ci in countdown(changes.len - 1, nDetach):
+                            state.assignValueLean(changes[ci][0], changes[ci][1])
+                        changes.setLen(nDetach)
+                    if bestDelta < 0: break
                 if bestDelta < 0: break
-            if bestDelta < 0: break
+        for ci in countdown(changes.len - 1, 0):
+            state.assignValueLean(changes[ci][0], changes[ci][1])
         if bestDelta < 0: break
     if bestChanges.len == 0: return false
+    state.pairsSinceImprove = 0
     let tabuTenure = state.iteration + 1 + state.iteration mod 10
     # commit the final successor values (dedup: last write per position wins)
     var finalOf: Table[int, T]

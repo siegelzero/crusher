@@ -500,11 +500,23 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 # constraint was violated is a feasible solution of the original
                 # problem; keep it when it beats the incumbent instead of throwing
                 # the whole probe away (warehouse: 102k incumbent, probe reached 56k).
+                let probeFrom = currentCost
                 if adoptNearFeasible():
                     when direction == Minimize:
                         hi = currentCost - 1
                     else:
                         lo = currentCost + 1
+                    # A probe that closed under a quarter of its gap asked for far
+                    # too much: the next midpoint would be just as hopeless and eat
+                    # another stall cap (vrplc: three ~17 s probes at half the
+                    # incumbent gained 7%; the ladder then took 14% in 3 s).
+                    if totalBudget >= StallCapMinBudget and
+                       4 * abs(probeFrom - currentCost) < abs(probeFrom - target):
+                        if verbose:
+                            echo "[Opt] Probe gained ", abs(probeFrom - currentCost), " of ",
+                                 abs(probeFrom - target), ": switching to the retry ladder"
+                            flushFile(stdout)
+                        break
                     continue
                 system.initialize(bestSolution)
                 objective.initialize(system.assignment)

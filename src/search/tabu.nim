@@ -238,6 +238,9 @@ type
         tourPairsBuilt*: bool
         pairNextTry*: int
         pairFailStreak*: int
+        pairOrder*: seq[int]        # tryPairTourMoves: random pair order resumed across calls
+        pairCursor*: int
+        pairsSinceImprove*: int     # pairs scanned since the last applied pair move
 
         # Regular constraints over search positions, for line-rewrite moves (tabuRegularMoves)
         regularConstraintIndices*: seq[int]
@@ -6318,7 +6321,10 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                             state.logExitStats("Solution found via pair tour move")
                         state.lastImprovementIter = lastImprovement
                         return state
+            elif state.pairsSinceImprove < state.tourPairs.len:
+                state.pairNextTry = state.iteration + 2     # round not finished yet
             else:
+                state.pairsSinceImprove = 0
                 state.pairFailStreak = min(state.pairFailStreak + 1, 8)
                 state.pairNextTry = state.iteration + 10 * (1 shl state.pairFailStreak)
 
