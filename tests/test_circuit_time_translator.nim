@@ -17,10 +17,10 @@
 ##     consumed witnesses) and tautology elimination
 
 import unittest
-import std/[strutils, tables, sets, packedsets]
+import std/[strutils, tables, sets, packedsets, random]
 import crusher
 import flatzinc/[parser, translator]
-import constraints/types
+import constraints/[types, circuitTimeProp]
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -702,6 +702,51 @@ suite "Circuit accumulator chains (equality form)":
         tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
         check tr.val("v1") == 1
         check tr.val("v2") == 1
+
+    test "shared value variable: alias group penalizes split routes":
+        # Two vehicles; customers 1 and 2 share ONE vehicle variable (the
+        # flattener unifies veh[i] and veh[P+i] for same-vehicle pickup and
+        # delivery). Start depots 3 (veh 1) and 4 (veh 2), end depots 5 and 6
+        # wrap to the next start. Splitting the customers across vehicles
+        # must cost: the walk paints them differently but writes one variable.
+        let src = """
+var 1..6: s1;
+var 1..6: s2;
+var 1..6: s3;
+var 1..6: s4;
+var 1..2: v;
+array [1..6] of var int: V = [v, v, 1, 2, 1, 2];
+constraint crusher_circuit([s1, s2, s3, s4, 4, 3]);
+constraint array_var_int_element(s1, V, v);
+constraint array_var_int_element(s2, V, v);
+constraint array_var_int_element(s3, V, 1);
+constraint array_var_int_element(s4, V, 2);
+solve satisfy;
+"""
+        var tr = translate(parseFzn(src))
+        check tr.circuitTimeCandidates.len == 1
+        check tr.circuitTimeCandidates[0].aliasGroups == @[@[0, 1]]
+        var ctp: CircuitTimePropConstraint[int]
+        for c in tr.sys.baseArray.constraints:
+            if c.stateType == CircuitTimePropType: ctp = c.circuitTimePropState
+        check ctp != nil
+        var a = newSeq[int](tr.sys.baseArray.len)
+        # 3 -> 1 -> 5 -> 4 -> 2 -> 6 -> 3: customers on different vehicles
+        a[tr.pos("s3")] = 1; a[tr.pos("s1")] = 5; a[tr.pos("s4")] = 2; a[tr.pos("s2")] = 6
+        ctp.initialize(a)
+        check ctp.cost == 1
+        # Customer 2 on vehicle 1 too (3 -> 1 -> 2 -> 5, 4 -> 6): consistent
+        a[tr.pos("s1")] = 2; a[tr.pos("s2")] = 5; a[tr.pos("s4")] = 6
+        ctp.initialize(a)
+        check ctp.cost == 0
+        for seed in 0..<10:
+            randomize(seed)
+            var tr2 = translate(parseFzn(src))
+            tr2.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+            let s = @[tr2.val("s1"), tr2.val("s2"), tr2.val("s3"), tr2.val("s4"), 4, 3]
+            let vv = @[tr2.val("v"), tr2.val("v"), 1, 2, 1, 2]
+            for n in 0..<4:
+                check vv[s[n] - 1] == vv[n]
 
     test "no anchored end (both guards fail): family rejected":
         # End depot value free AND segment starts free -> neither forward nor

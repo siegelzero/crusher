@@ -309,6 +309,7 @@ type
         useSumMetric*: bool             # metric = weighted sum of observed departures
         sumMetricWeights*: seq[int]     # per node; objective weight of the node's time (with useSumMetric)
         equalityChain*: bool            # exact accumulator chain (no clamp, two-sided windows)
+        aliasGroups*: seq[seq[int]]     # equality chain: nodes sharing one value variable
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int

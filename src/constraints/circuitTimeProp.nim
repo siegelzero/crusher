@@ -80,6 +80,11 @@ type
         timeWindowPenalty*: int
         circuitWeight*: int                  # weight for circuit violations
         closureFree*: bool                   # equality chain: arc back into the depot is unconstrained
+        # Equality chain: groups of nodes whose value is ONE model variable
+        # (e.g. veh[i] and veh[P+i] unified by the flattener). Each visited
+        # member disagreeing with the group's first visited member costs 1.
+        # Disables the incremental walk (its prefix caches don't cover them).
+        aliasGroups*: seq[seq[int]]
 
         # Release (waiting) variables, inequality form only. A node with a
         # release position departs at max(arrival, early, release): searching
@@ -334,6 +339,13 @@ proc computePenaltiesEquality[T](c: CircuitTimePropConstraint[T],
             closeSegment(true)
     closeSegment(false)
 
+    for g in c.aliasGroups:
+        var first = -1
+        for v in g:
+            if not c.scratchInAffected[v]: continue
+            if first < 0: first = v
+            elif departure[v] != departure[first]: inc twPenalty
+
     return (circPen: circPenalty, twPen: twPenalty, metric: T(0))
 
 
@@ -453,7 +465,7 @@ proc rebuildIncCache[T](c: CircuitTimePropConstraint[T]) =
     ## c.departureTime for the committed links. Forward orientation only —
     ## a backward (predecessor) link change rewires two successor arcs, so the
     ## prefix argument doesn't hold there.
-    c.incValid = c.forward and not c.hasRelease and
+    c.incValid = c.forward and not c.hasRelease and c.aliasGroups.len == 0 and
                  (c.equalityChain or c.useMaxMetric or c.useSumMetric)
     if not c.incValid: return
     let n = c.n
@@ -843,6 +855,7 @@ proc deepCopy*[T](c: CircuitTimePropConstraint[T]): CircuitTimePropConstraint[T]
     result.departurePositions = c.departurePositions
     result.circuitWeight = c.circuitWeight
     result.closureFree = c.closureFree
+    result.aliasGroups = c.aliasGroups
     result.hasRelease = c.hasRelease
     result.releasePositions = c.releasePositions
     result.releaseToIndex = c.releaseToIndex

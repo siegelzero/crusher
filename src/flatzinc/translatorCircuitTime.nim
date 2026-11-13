@@ -1412,6 +1412,42 @@ proc verifyCircuitTimeCandidates(tr: var FznTranslator,
 
     for k in 0..<candidates.len:
         keep[k] = true
+        # Nodes sharing one value variable (the flattener unifies e.g. veh[i]
+        # and veh[P+i] for same-vehicle pickup/delivery): the walk writes each
+        # node's value into it, the last write wins, and the equality between
+        # the nodes would go unchecked. Exact (equality) chains penalize
+        # disagreement per alias group; an earliest-time walk can't satisfy a
+        # time equality across nodes, so other forms are skipped.
+        block:
+            var nodesOf: Table[string, seq[int]]
+            for i in 0..<candidates[k].linkVarNames.len:
+                for vars in [candidates[k].arrivalVars, candidates[k].departureVars]:
+                    if i < vars.len and vars[i] != "":
+                        let ns = nodesOf.mgetOrPut(vars[i], @[]).addr
+                        if ns[].len == 0 or ns[][^1] != i: ns[].add(i)
+            var parent = newSeq[int](candidates[k].linkVarNames.len)
+            for i in 0..<parent.len: parent[i] = i
+            proc root(parent: var seq[int], x: int): int =
+                var x = x
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                x
+            var shared = false
+            for ns in nodesOf.values:
+                if ns.len < 2: continue
+                shared = true
+                for j in 1..<ns.len:
+                    parent[root(parent, ns[j])] = root(parent, ns[0])
+            if shared:
+                if not candidates[k].equalityChain:
+                    keep[k] = false
+                    continue
+                var groupOf: Table[int, seq[int]]
+                for i in 0..<parent.len:
+                    groupOf.mgetOrPut(root(parent, i), @[]).add(i)
+                for g in groupOf.values:
+                    if g.len >= 2: candidates[k].aliasGroups.add(g)
         if not candidates[k].forward or candidates[k].exactChain or
            candidates[k].useRelease: continue   # equality / release form: exempt
 
@@ -2233,6 +2269,10 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
         )
         if cand.closureFree:
             ctpCon.circuitTimePropState.closureFree = true
+        if cand.aliasGroups.len > 0:
+            ctpCon.circuitTimePropState.aliasGroups = cand.aliasGroups
+            stderr.writeLine("[FZN] CircuitTimeProp: " & $cand.aliasGroups.len &
+                             " groups of nodes share one value variable")
         if cand.useRelease:
             # Searched release (waiting) variables, one per release node, ranging
             # over the node's service window; dep channels = ser + service.
