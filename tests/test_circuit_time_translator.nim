@@ -895,6 +895,7 @@ suite "Position-chain circuits and time-dependent travel (tdtsp)":
         check nTd == 1
         check nAcc == 1                      # the position chain
         check tr.countType(CircuitTimePropType) == 2
+        check tr.countType(CircuitType) == 1  # the inferred circuit stays: tour moves
         # Every arc (both statements) and both redundant sums are consumed
         var nLe = 0
         for ci, con in tr.model.constraints:
@@ -912,6 +913,66 @@ suite "Position-chain circuits and time-dependent travel (tdtsp)":
         let tv = @[0, tr.val("X_INTRODUCED_13_"), tr.val("X_INTRODUCED_14_"), tr.val("objective")]
         check tv[3] == 24
         check tv[1] == 10
+
+    test "implied tour relations consumed, premises kept":
+        # next = [X17, X5, X6, 1], prev = R = [4, X9, X10, X18],
+        # atposition = A = [1, X17, X18, 4] with X18 = next[X17].
+        let tr = translate(parseFzn(src))
+        proc idx(tr: FznTranslator, text: string): int =
+            ## constraint index whose args print as `text` (a, b, c)
+            result = -1
+            for ci, con in tr.model.constraints:
+                var parts: seq[string]
+                for a in con.args:
+                    parts.add(if a.kind == FznIdent: a.ident.replace("X_INTRODUCED_", "X").replace("_", "")
+                              elif a.kind == FznIntLit: $a.intVal else: "?")
+                if con.name & "(" & parts.join(",") & ")" == text:
+                    return ci
+        # position[i] = position[prev[i]] + 1, its intermediates, and the walk
+        # relations position[A[k]] = k, A[position[i]] = i, prev[A[k]] = A[k-1]
+        for t in ["array_var_int_element(X9,position,X37)", "array_var_int_element(X10,position,X39)",
+                  "array_var_int_element(X1,atposition,2)", "array_var_int_element(X2,atposition,3)",
+                  "array_var_int_element(X18,prev,X17)"]:
+            let ci = tr.idx(t)
+            check ci >= 0
+            check ci in tr.definingConstraints
+        var nLinEqLeft = 0
+        for ci, con in tr.model.constraints:
+            if con.name == "int_lin_eq" and ci notin tr.definingConstraints: inc nLinEqLeft
+        check nLinEqLeft == 0
+        # Nothing over the walk or the predecessor positions is left to evaluate
+        check tr.countType(ElementType) <= 1        # at most a duplicate premise
+        check tr.countType(RelationalType) == 0     # no bucket bounds either
+
+    test "no walk relations without the walk chain":
+        # Without X18 = next[X17], atposition[3] is not provably the node at
+        # position 3: the walk relations stay (the prev-side chain still goes).
+        let broken = src.replace("constraint array_var_int_element(X_INTRODUCED_17_,next,X_INTRODUCED_18_):: defines_var(X_INTRODUCED_18_);\n", "")
+        check broken.len < src.len
+        let tr = translate(parseFzn(broken))
+        var walkLeft = 0
+        for ci, con in tr.model.constraints:
+            if con.name == "array_var_int_element" and con.args[1].kind == FznIdent and
+               con.args[1].ident == "atposition" and ci notin tr.definingConstraints:
+                inc walkLeft
+        check walkLeft == 2
+
+    test "travel intermediates keep their bindings when something reads them":
+        let tr = translate(parseFzn(src))
+        # mirror t[p_2] and its bucket: consumed, read by nobody
+        check "X_INTRODUCED_45_" in tr.deadChannelVars
+        check "X_INTRODUCED_46_" in tr.deadChannelVars
+        # An output bucket keeps its binding and (through its consumed
+        # definition) the time it divides. (A live constraint reading it fails
+        # projection-soundness verification before this point.)
+        let withOut = src.replace("var 0..2: X_INTRODUCED_46_ ::var_is_introduced",
+                                  "var 0..2: X_INTRODUCED_46_ :: output_var ::var_is_introduced")
+        check withOut != src
+        let tr2 = translate(parseFzn(withOut))
+        check tr2.circuitTimeCandidates.len == 2
+        check "X_INTRODUCED_46_" notin tr2.deadChannelVars
+        check "X_INTRODUCED_45_" notin tr2.deadChannelVars
+        check "X_INTRODUCED_57_" in tr2.deadChannelVars
 
     test "no implied circuit unless the closing node's position is N":
         # With P[4] free, S = [2, 4, 2, 1], P = [1, 2, 1, 3] satisfies every

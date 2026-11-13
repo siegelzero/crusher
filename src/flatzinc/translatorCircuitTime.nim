@@ -77,6 +77,26 @@ proc circuitTimeDeclaredBounds(tr: FznTranslator, name: string): (int, int) =
             break
     return (low(int) div 2, high(int) div 2)
 
+proc circuitTimeDeclaredCovers(tr: FznTranslator, name: string, lo, hi: int): bool =
+    ## Every value in lo..hi lies in the variable's declared domain.
+    if lo > hi: return true
+    for decl in tr.model.variables:
+        if not decl.isArray and decl.name == name:
+            case decl.varType.kind
+            of FznInt:
+                return true
+            of FznIntRange:
+                return lo >= decl.varType.lo and hi <= decl.varType.hi
+            of FznIntSet:
+                if hi - lo > 100_000: return false
+                let vs = decl.varType.values.toHashSet()
+                for v in lo..hi:
+                    if v notin vs: return false
+                return true
+            else:
+                return false
+    false
+
 proc circuitTimeFixedValue(tr: FznTranslator, e: FznExpr): (bool, int) =
     ## Resolve an expression to a fixed integer (literal, parameter, or
     ## singleton-domain variable).
@@ -319,6 +339,13 @@ proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
                     same = false
                 if not same: break
             if not same: break
+            # A = t[p] and Dv = D[p] must lie in their declared domains
+            if not tr.circuitTimeDeclaredCovers(aVar, cand.earlyTimes[f], cand.lateTimes[f]):
+                same = false
+                break
+            if dVar != "" and not tr.circuitTimeDeclaredCovers(dVar, dv, dv):
+                same = false
+                break
         if not same: continue
         cand.consumedCIs.incl(ci)
         cand.consumedCIs.incl(aCI)
@@ -327,12 +354,15 @@ proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
         cand.channelVars.add(aVar)
         cand.channelVars.add(tVar)
         cand.channelVars.add(term.idxVar)
+        cand.tdIntermediates.add([aVar, tVar, term.idxVar])
         if term.bVar != "":
             cand.consumedCIs.incl(term.divCI)
             cand.channelVars.add(term.bVar)
+            cand.tdIntermediates.add(term.bVar)
         if dCI >= 0:
             cand.consumedCIs.incl(dCI)
             cand.channelVars.add(dVar)
+            cand.tdIntermediates.add(dVar)
         termOfIdx[term.idxVar] = (tVar, term.table)
         if mirrorTv[toN] == "":
             mirrorTv[toN] = tVar
@@ -417,6 +447,7 @@ proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
             for (v, eci) in aliasUsed:
                 cand.consumedCIs.incl(eci)
                 cand.channelVars.add(v)
+                cand.tdIntermediates.add(v)
     if nMirror > 0:
         stderr.writeLine("[FZN] Circuit-time: " & $nMirror &
                          " predecessor-side mirror arcs implied by the chain")
@@ -1075,6 +1106,12 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var consumed = initPackedSet[int]()
     consumed.incl(circuitCI)
     var channelVars: seq[string]
+    var tdInter: seq[string]
+    var minEarly = high(int)
+    var maxLate = low(int)
+    for i in 0..<n:
+        minEarly = min(minEarly, earlyTimes[i])
+        maxLate = max(maxLate, lateTimes[i])
     for i in 0..<n:
         if outConstrained[i]:
             consumed.incl(constElemCI[i])
@@ -1085,9 +1122,15 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
             if hasTd[i]:
                 consumed.incl(tdTerm[i].idxCI)
                 channelVars.add(tdTerm[i].idxVar)
+                # index, value and bucket domains are verified (Step 1b / 7b)
+                tdInter.add([tdTerm[i].idxVar, durVars[i]])
                 if tdTerm[i].bVar != "":
                     consumed.incl(tdTerm[i].divCI)
                     channelVars.add(tdTerm[i].bVar)
+                    tdInter.add(tdTerm[i].bVar)
+                # t[S_i] within its declared domain for every successor
+                if tr.circuitTimeDeclaredCovers(atVars[i], minEarly, maxLate):
+                    tdInter.add(atVars[i])
     for tn in timeVarNames:
         if tn != "": channelVars.add(tn)
 
@@ -1116,6 +1159,7 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     if anyTd:
         cand.tdBucket = tdL
         cand.tdTravel = tdTravel
+        cand.tdIntermediates = tdInter
         var tdServices = newSeq[int](n)
         for i in 0..<n:
             if outConstrained[i]: tdServices[i] = serviceTimes[i]
@@ -2611,10 +2655,14 @@ proc detectCircuitTimePropagation(tr: var FznTranslator) =
 
     # Circuits carrying a split (release) time chain keep their crusher_circuit:
     # its dedicated moves build and repair the giant tour, and the chains on
-    # that circuit then charge circuit violations only once between them.
+    # that circuit then charge circuit violations only once between them. So do
+    # circuits inferred from a position chain (tdtsp): the model has no other
+    # tour structure, and without circuit init and tour-preserving moves the
+    # search only reaches tours through circuit violations.
     var keepCis: PackedSet[int]
     for cand in candidates:
-        if cand.useRelease: keepCis.incl(cand.circuitCI)
+        if cand.useRelease or cand.circuitCI in tr.inferredCircuitCIs:
+            keepCis.incl(cand.circuitCI)
     for k in 0..<candidates.len:
         if candidates[k].circuitCI in keepCis:
             candidates[k].keepCircuit = true
@@ -2791,6 +2839,218 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
         stderr.writeLine("[FZN] Objective bound delegated to CircuitTimeProp metric (exact single-instance linkage)")
 
 
+proc consumeImpliedTourRelations(tr: var FznTranslator, sName: string,
+                                 sElems: seq[FznExpr], pName: string,
+                                 pFixed: seq[bool], pVal: seq[int], pVar: seq[string],
+                                 aNode, bNode: int): int =
+    ## With circuit(S) and positions P proven by inferPositionChainCircuits
+    ## (walk[1] = a, walk[k+1] = S[walk[k]], P[walk[k]] = k), these relations
+    ## are implied and only cost evaluations on every move:
+    ##   R with element(S[i], R, i) for every i (R = S^-1):
+    ##     P[i] = P[R[i]] + 1 for i != a              (prev-side position chain)
+    ##   A with A[1] = a, A[2] = S[a], A[k] = S[A[k-1]] (element-defined), so
+    ##   A[k] = walk[k]:
+    ##     P[A[k]] = k,  A[P[i]] = i,  R[A[k]] = A[k-1]
+    ## Every premise (the forward chain, the inverse elements, the A chain
+    ## definitions) stays in the model; only the implied relations are consumed.
+    ## Returns the number of constraints consumed.
+    let n = sElems.len
+    var sNodeOf: Table[string, int]        # S var -> node i (S[i])
+    for i, e in sElems:
+        if e.kind == FznIdent: sNodeOf[e.ident] = i
+    var pNodeOf: Table[string, int]        # P var -> node i (P[i])
+    for i in 0..<n:
+        if not pFixed[i] and pVar[i].len > 0: pNodeOf[pVar[i]] = i
+    var elemsByArray: Table[string, seq[int]]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) notin ["array_var_int_element",
+                                              "array_var_int_element_nonshifted"]: continue
+        if con.args.len != 3 or con.args[1].kind != FznIdent: continue
+        elemsByArray.mgetOrPut(con.args[1].ident, @[]).add(ci)
+
+    # R: element(S[i], R, i + 1) for every variable S[i]; R[S[b]] = b + 1 fixed.
+    var rName = ""
+    var rElems: seq[FznExpr]
+    block findR:
+        var cands: HashSet[string]
+        for arr, cis in elemsByArray.pairs:
+            if arr == sName or arr == pName: continue
+            for ci in cis:
+                if tr.model.constraints[ci].args[0].kind == FznIdent and
+                   tr.model.constraints[ci].args[0].ident in sNodeOf:
+                    cands.incl(arr)
+                    break
+        for arr in cands:
+            let re = tr.presolveResolveVarElems(FznExpr(kind: FznIdent, ident: arr))
+            if re.len != n: continue
+            var covered = newSeq[bool](n)
+            for ci in elemsByArray[arr]:
+                let con {.cursor.} = tr.model.constraints[ci]
+                if con.args[0].kind != FznIdent or con.args[0].ident notin sNodeOf: continue
+                let (f, v) = tr.circuitTimeFixedValue(con.args[2])
+                let i = sNodeOf[con.args[0].ident]
+                if f and v == i + 1: covered[i] = true
+            let (bf, bv) = tr.circuitTimeFixedValue(re[aNode])
+            if bf and bv == bNode + 1: covered[bNode] = true
+            if covered.allIt(it):
+                rName = arr
+                rElems = re
+                break
+    if rName.len == 0: return 0
+    var rNodeOf: Table[string, int]        # R var -> node i (R[i])
+    for i, e in rElems:
+        if e.kind == FznIdent: rNodeOf[e.ident] = i
+
+    # A: walk positions. walkPos[var] = k (1-based position on the tour).
+    var aName = ""
+    var walkPos: Table[string, int]
+    block findA:
+        var cands: HashSet[string]
+        for decl in tr.model.variables:
+            if not decl.isArray or decl.value == nil or decl.value.kind != FznArrayLit: continue
+            if decl.value.elems.len != n or decl.name == sName or decl.name == pName or
+               decl.name == rName: continue
+            let e1 = decl.value.elems[1]
+            if e1.kind == FznIdent and sElems[aNode].kind == FznIdent and
+               e1.ident == sElems[aNode].ident:
+                cands.incl(decl.name)
+        for arr in cands:
+            let ae = tr.presolveResolveVarElems(FznExpr(kind: FznIdent, ident: arr))
+            if ae.len != n: continue
+            let (f0, v0) = tr.circuitTimeFixedValue(ae[0])
+            if not (f0 and v0 == aNode + 1): continue
+            # A[k] = S[A[k-1]] definitions by (index var, result var)
+            var defined: HashSet[(string, string)]
+            for ci in elemsByArray.getOrDefault(sName, @[]):
+                let con {.cursor.} = tr.model.constraints[ci]
+                if con.args[0].kind == FznIdent and con.args[2].kind == FznIdent:
+                    defined.incl((con.args[0].ident, con.args[2].ident))
+            var wp: Table[string, int]
+            var ok = true
+            for k in 1..<n:
+                let e = ae[k]
+                let (f, v) = tr.circuitTimeFixedValue(e)
+                if f:
+                    # a fixed node must sit at this position: P[v] = k + 1
+                    if v < 1 or v > n or not (pFixed[v - 1] and pVal[v - 1] == k + 1):
+                        ok = false
+                elif e.kind != FznIdent or e.ident in wp:
+                    ok = false
+                elif k == 1:
+                    wp[e.ident] = 2          # A[2] is S[a] itself
+                else:
+                    let prevE = ae[k - 1]
+                    if prevE.kind == FznIdent and (prevE.ident, e.ident) in defined:
+                        wp[e.ident] = k + 1
+                    else:
+                        ok = false
+                if not ok: break
+            if ok:
+                aName = arr
+                walkPos = wp
+                break
+
+    # Variables that must keep their values (objective, output)
+    var protected: HashSet[string]
+    if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        protected.incl(tr.model.solve.objective.ident)
+    for decl in tr.model.variables:
+        let isOut = decl.annotations.anyIt(it.name in ["output_var", "output_array"])
+        if not isOut: continue
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            for e in decl.value.elems:
+                if e.kind == FznIdent: protected.incl(e.ident)
+        else:
+            protected.incl(decl.name)
+    # Reference counts over constraint arguments and array declarations
+    var refs: CountTable[string]
+    for con in tr.model.constraints:
+        for a in con.args:
+            if a.kind == FznIdent: refs.inc(a.ident)
+            elif a.kind == FznArrayLit:
+                for e in a.elems:
+                    if e.kind == FznIdent: refs.inc(e.ident)
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            for e in decl.value.elems:
+                if e.kind == FznIdent: refs.inc(e.ident)
+
+    var linEqOf: Table[string, seq[int]]
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(tr.model.constraints[ci].name) != "int_lin_eq": continue
+        let (ok, _, vars, _) = tr.circuitTimeParseLinEq(tr.model.constraints[ci])
+        if ok and vars.len == 2:
+            for v in vars: linEqOf.mgetOrPut(v, @[]).add(ci)
+
+    var consumed = 0
+    template consume(ci: int) =
+        tr.definingConstraints.incl(ci)
+        inc consumed
+    template walkOf(e: FznExpr): int =
+        ## Tour position of an A entry given as a variable, else 0
+        (if e.kind == FznIdent: walkPos.getOrDefault(e.ident, 0) else: 0)
+
+    # Elements indexed by an S variable are premises (the forward chain
+    # P[S[i]] = P[i] + 1, the inverse elements R[S[i]] = i) even where they
+    # coincide with an implied form (A[2] = S[a]: P[A[2]] = 2, R[A[2]] = a,
+    # often stated twice), so they always stay.
+    # P[R[i]] + 1 = P[i] (i != a), and P[A[k]] = k
+    for ci in elemsByArray.getOrDefault(pName, @[]):
+        if ci in tr.definingConstraints: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        let idx = con.args[0]
+        let val = con.args[2]
+        if idx.kind != FznIdent or idx.ident in sNodeOf: continue
+        let (vf, vv) = tr.circuitTimeFixedValue(val)
+        let k = walkOf(idx)
+        if k > 0 and vf and vv == k:
+            consume(ci)
+            continue
+        let i = rNodeOf.getOrDefault(idx.ident, -1)
+        if i < 0 or i == aNode: continue
+        if vf:
+            if pFixed[i] and pVal[i] == vv + 1: consume(ci)
+            continue
+        if val.kind != FznIdent or pFixed[i] or val.ident in protected: continue
+        # Y = P[R[i]] referenced only here and by one lin_eq P[i] - Y = 1
+        if refs.getOrDefault(val.ident, 0) != 2: continue
+        for lci in linEqOf.getOrDefault(val.ident, @[]):
+            let (lok, coeffs, vars, rhs) = tr.circuitTimeParseLinEq(tr.model.constraints[lci])
+            if not lok: continue
+            let yi = vars.find(val.ident)
+            let pi = vars.find(pVar[i])
+            if yi >= 0 and pi >= 0 and coeffs[pi] in [-1, 1] and
+               coeffs[yi] == -coeffs[pi] and rhs * coeffs[pi] == 1:
+                consume(ci)
+                consume(lci)
+                tr.channelVarNames.incl(val.ident)
+                tr.definedVarNames.excl(val.ident)
+                break
+    if aName.len > 0:
+        # A[P[i]] = i
+        for ci in elemsByArray.getOrDefault(aName, @[]):
+            if ci in tr.definingConstraints: continue
+            let con {.cursor.} = tr.model.constraints[ci]
+            if con.args[0].kind != FznIdent or con.args[0].ident in sNodeOf: continue
+            let i = pNodeOf.getOrDefault(con.args[0].ident, -1)
+            let (vf, vv) = tr.circuitTimeFixedValue(con.args[2])
+            if i >= 0 and vf and vv == i + 1: consume(ci)
+        # R[A[k]] = A[k-1]
+        for ci in elemsByArray.getOrDefault(rName, @[]):
+            if ci in tr.definingConstraints: continue
+            let con {.cursor.} = tr.model.constraints[ci]
+            if con.args[0].kind == FznIdent and con.args[0].ident in sNodeOf: continue
+            let k = walkOf(con.args[0])
+            if k < 2: continue
+            let (vf, vv) = tr.circuitTimeFixedValue(con.args[2])
+            let km1 = walkOf(con.args[2])
+            if (km1 > 0 and km1 == k - 1) or (k == 2 and vf and vv == aNode + 1):
+                consume(ci)
+    consumed
+
+
 proc inferPositionChainCircuits(tr: var FznTranslator) =
     ## A Hamiltonian tour encoded by positions instead of a circuit (tdtsp):
     ##   P[S[i]] = P[i] + 1 for every node i but one, b, with S[b] = a fixed,
@@ -2908,8 +3168,91 @@ proc inferPositionChainCircuits(tr: var FznTranslator) =
             if chained != n - 1: continue
             tr.model.constraints.add(FznConstraint(name: "crusher_circuit",
                 args: @[FznExpr(kind: FznIdent, ident: decl.name)]))
+            tr.inferredCircuitCIs.incl(tr.model.constraints.len - 1)
             circuitArgs.incl(decl.name)
-            added.add(decl.name & " (positions " & pName & ")")
+            let nImplied = tr.consumeImpliedTourRelations(decl.name, sElems, pName,
+                                                          pFixed, pVal, pVar, aNode, bNode)
+            added.add(decl.name & " (positions " & pName & "; " & $nImplied &
+                      " implied tour relations consumed)")
             break
     for a in added:
         stderr.writeLine("[FZN] Implied circuit from a position chain: " & a)
+
+
+proc computeDeadCircuitTimeIntermediates(tr: var FznTranslator) =
+    ## Time-dependent and mirror travel terms are evaluated inside
+    ## CircuitTimeProp from tables; their consumed intermediates (t[S_i],
+    ## t[p_i], buckets, indices, lookups) keep element / div bindings and
+    ## domain bounds that every move recomputes for nobody. The matcher verified
+    ## their declared domains, so an intermediate no live reader needs gets no
+    ## binding (it stays an inert channel position). Readers: every constraint
+    ## the circuit-time instances did not consume, output, the objective,
+    ## annotated search variables, the instances' own link and time variables,
+    ## and (fixpoint) consumed definitions whose output is read.
+    var inter: HashSet[string]
+    var ctpConsumed = initPackedSet[int]()
+    var used: HashSet[string]
+    for cand in tr.circuitTimeCandidates:
+        for v in cand.tdIntermediates: inter.incl(v)
+        for ci in cand.consumedCIs.items: ctpConsumed.incl(ci)
+        for v in cand.linkVarNames: used.incl(v)
+        for v in cand.timeVarNames: used.incl(v)
+        for v in cand.arrivalVars: used.incl(v)
+        for v in cand.departureVars: used.incl(v)
+        for v in cand.maxOutputs: used.incl(v)
+        for (dep, ser, _) in cand.depChannels:
+            used.incl(dep)
+            used.incl(ser)
+    if inter.len == 0: return
+    for decl in tr.model.variables:
+        if decl.hasAnnotation("output_var"): used.incl(decl.name)
+        if decl.isArray and decl.hasAnnotation("output_array") and decl.value != nil and
+           decl.value.kind == FznArrayLit:
+            for e in decl.value.elems:
+                if e.kind == FznIdent: used.incl(e.ident)
+    if tr.model.solve.objective != nil and tr.model.solve.objective.kind == FznIdent:
+        used.incl(tr.model.solve.objective.ident)
+    for v in tr.annotatedSearchVarNames: used.incl(v)
+    var arrElems: Table[string, seq[string]]
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            var names: seq[string]
+            for e in decl.value.elems:
+                if e.kind == FznIdent: names.add(e.ident)
+            arrElems[decl.name] = names
+    proc readArgs(con: FznConstraint, skip: string, used: var HashSet[string],
+                  arrElems: Table[string, seq[string]]): bool =
+        ## Mark every variable con reads (all arguments but `skip`); true if new
+        for arg in con.args:
+            case arg.kind
+            of FznIdent:
+                if arg.ident != skip and not used.containsOrIncl(arg.ident): result = true
+                if arg.ident in arrElems:
+                    for n in arrElems[arg.ident]:
+                        if n != skip and not used.containsOrIncl(n): result = true
+            of FznArrayLit:
+                for e in arg.elems:
+                    if e.kind == FznIdent and e.ident != skip and
+                       not used.containsOrIncl(e.ident): result = true
+            else: discard
+    for ci, con in tr.model.constraints:
+        if ci notin ctpConsumed: discard readArgs(con, "", used, arrElems)
+    var changed = true
+    while changed:
+        changed = false
+        for ci in ctpConsumed.items:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if not con.hasAnnotation("defines_var"): continue
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+            let b = ann.args[0].ident
+            if b in used and readArgs(con, b, used, arrElems): changed = true
+    var nDead = 0
+    for v in inter:
+        if v notin used and v notin tr.deadChannelVars:
+            tr.deadChannelVars.incl(v)
+            tr.channelVarNames.incl(v)
+            inc nDead
+    if nDead > 0:
+        stderr.writeLine("[FZN] Circuit-time: " & $nDead &
+                         " consumed travel intermediates need no channel binding")

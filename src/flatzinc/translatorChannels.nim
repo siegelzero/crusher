@@ -1409,7 +1409,7 @@ proc buildChannelBindings(tr: var FznTranslator) =
         let name = stripSolverPrefix(con.name)
 
         # The defined variable must have a position (it was NOT added to definedVarNames)
-        if definedName notin tr.varPositions:
+        if definedName notin tr.varPositions or definedName in tr.deadChannelVars:
             continue
 
         let channelPos = tr.varPositions[definedName]
@@ -1475,7 +1475,7 @@ proc buildExpressionChannelBindings(tr: var FznTranslator) =
     ## Builds expression channel bindings for int_times/int_div/int_mod/int_plus with defines_var.
     var nBuilt = 0
     for def in tr.expressionChannelDefs:
-        if def.varName notin tr.varPositions:
+        if def.varName notin tr.varPositions or def.varName in tr.deadChannelVars:
             continue
         let channelPos = tr.varPositions[def.varName]
         let con = tr.model.constraints[def.ci]
@@ -1591,7 +1591,7 @@ proc buildIntModChannelBindings(tr: var FznTranslator) =
     ## Uses precomputed lookup tables from detectIntModChannels.
     var nBuilt = 0
     for def in tr.intModChannelDefs:
-        if def.varName notin tr.varPositions: continue
+        if def.varName notin tr.varPositions or def.varName in tr.deadChannelVars: continue
         let channelPos = tr.varPositions[def.varName]
         let originExpr = try: tr.resolveVarOrExpr(def.originVar)
                          except KeyError: continue
@@ -1609,7 +1609,7 @@ proc buildIntDivChannelBindings(tr: var FznTranslator) =
     ## Uses precomputed lookup tables from detectIntDivChannels.
     var nBuilt = 0
     for def in tr.intDivChannelDefs:
-        if def.varName notin tr.varPositions: continue
+        if def.varName notin tr.varPositions or def.varName in tr.deadChannelVars: continue
         let channelPos = tr.varPositions[def.varName]
         let originExpr = try: tr.resolveVarOrExpr(def.originVar)
                          except KeyError: continue

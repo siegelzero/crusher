@@ -312,6 +312,9 @@ type
         aliasGroups*: seq[seq[int]]     # equality chain: nodes sharing one value variable
         tdBucket*: int                  # >0: time-dependent travel, bucket = t div tdBucket
         tdTravel*: seq[seq[seq[int]]]   # [from][to][bucket], service folded in
+        tdIntermediates*: seq[string]   # consumed TD/mirror intermediates whose declared
+                                        # domains the matcher verified (no binding needed
+                                        # unless something live reads them)
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int
@@ -349,6 +352,8 @@ type
         timeBudgetSecs*: float
         # Tracks which variables have output_var annotation
         outputVars*: seq[string]
+        deadChannelVars*: HashSet[string]   # channel vars no live reader needs: no binding
+        inferredCircuitCIs*: PackedSet[int] # crusher_circuit constraints added by inference
         # Tracks which arrays have output_array annotation, with their index ranges
         outputArrays*: seq[tuple[name: string, lo, hi: int]]
         # The model
@@ -3211,6 +3216,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Record binding count from constraint loop (table_int functional deps, array_set_element, etc.)
     let constraintLoopBindingCount = result.sys.baseArray.channelBindings.len
 
+    # Consumed circuit-time intermediates nothing live reads get no binding
+    result.computeDeadCircuitTimeIntermediates()
     # Build channel bindings for element defines_var
     result.buildChannelBindings()
     # Build expression channel bindings for int_div/int_mod/int_plus defines_var
