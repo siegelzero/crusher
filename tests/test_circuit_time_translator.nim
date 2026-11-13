@@ -15,12 +15,15 @@
 ##   - rewriteInverseChannelIndexedElements: channel-index elements rewritten
 ##     to forward-side elements, with subsumption (including circuit-time-
 ##     consumed witnesses) and tautology elimination
+##   - split time chains (VRP with location congestion): chain intermediates
+##     without bindings, linked pickup/delivery pairs started on one vehicle
 
 import unittest
 import std/[strutils, tables, sets, packedsets, random]
 import crusher
 import flatzinc/[parser, translator]
 import constraints/[types, circuitTimeProp]
+import search/tabu
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1002,3 +1005,173 @@ solve satisfy;
                 if con.name == "crusher_circuit": inc result
         check nCircuits(mk("var 4..4: P4;\n")) == 1
         check nCircuits(mk("var 1..4: P4;\n")) == 0
+
+
+## vrplc_service.mzn flattened with crusher's mznlib on a tiny instance: one
+## request (pickup 1, delivery 2), two vehicles (start depots 3, 4; end depots
+## 5, 6; succ[5] = 4 and succ[6] = 3 close the giant tour). The pickup and
+## delivery share one vehicle variable (X39); X73 / X76 are the start depots'
+## demand lookups qq[succ[3]] / qq[succ[4]], whose row (2, -2, 0, ...) leaves
+## their declared 0..5: they forbid driving from a start depot to the delivery.
+const TinyVrplc = """
+predicate crusher_circuit(array [int] of var int: x);
+array [1..2] of int: X_INTRODUCED_42_ = [1,-1];
+array [1..6] of int: X_INTRODUCED_48_ = [0,4,3,3,3,3];
+array [1..3] of int: X_INTRODUCED_52_ = [1,1,-1];
+array [1..6] of int: X_INTRODUCED_53_ = [4,0,5,5,5,5];
+array [1..6] of int: X_INTRODUCED_57_ = [3,5,0,0,0,0];
+array [1..6] of int: X_INTRODUCED_65_ = [2,-2,0,0,0,0];
+array [1..5] of int: X_INTRODUCED_83_ = [1,-1,-1,-1,-1];
+var 0..19: objective:: output_var:: is_defined_var;
+var 1..6: X_INTRODUCED_6_;
+var 1..6: X_INTRODUCED_7_;
+var 1..6: X_INTRODUCED_8_;
+var 1..6: X_INTRODUCED_9_;
+var 0..5: X_INTRODUCED_12_;
+var 0..5: X_INTRODUCED_13_;
+var 0..40: X_INTRODUCED_18_;
+var 0..40: X_INTRODUCED_19_;
+var 2..20: X_INTRODUCED_24_;
+var 6..30: X_INTRODUCED_25_;
+var 0..40: X_INTRODUCED_30_;
+var 0..40: X_INTRODUCED_31_;
+var 0..40: X_INTRODUCED_32_;
+var 0..40: X_INTRODUCED_33_;
+var 0..40: X_INTRODUCED_34_;
+var 0..40: X_INTRODUCED_35_;
+var 1..2: X_INTRODUCED_39_ ::var_is_introduced ;
+var 1..1: X_INTRODUCED_40_ ::var_is_introduced ;
+var 2..2: X_INTRODUCED_41_ ::var_is_introduced ;
+var 0..4: X_INTRODUCED_49_ ::var_is_introduced :: is_defined_var;
+var 0..40: X_INTRODUCED_51_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_54_ ::var_is_introduced :: is_defined_var;
+var 0..40: X_INTRODUCED_56_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_58_ ::var_is_introduced :: is_defined_var;
+var 0..40: X_INTRODUCED_60_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_61_ ::var_is_introduced :: is_defined_var;
+var 0..40: X_INTRODUCED_63_ ::var_is_introduced :: is_defined_var;
+var -5..5: X_INTRODUCED_64_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_67_ ::var_is_introduced :: is_defined_var;
+var -5..5: X_INTRODUCED_68_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_70_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_73_ ::var_is_introduced :: is_defined_var;
+var 0..5: X_INTRODUCED_76_ ::var_is_introduced :: is_defined_var;
+array [1..6] of var int: veh:: output_array([1..6]) = [X_INTRODUCED_39_,X_INTRODUCED_39_,1,2,1,2];
+array [1..6] of var int: succ:: output_array([1..6]) = [X_INTRODUCED_6_,X_INTRODUCED_7_,X_INTRODUCED_8_,X_INTRODUCED_9_,4,3];
+array [1..6] of var int: load:: output_array([1..6]) = [X_INTRODUCED_12_,X_INTRODUCED_13_,0,0,0,0];
+array [1..6] of var int: arr:: output_array([1..6]) = [X_INTRODUCED_18_,X_INTRODUCED_19_,X_INTRODUCED_32_,X_INTRODUCED_33_,X_INTRODUCED_34_,X_INTRODUCED_35_];
+array [1..6] of var int: ser:: output_array([1..6]) = [X_INTRODUCED_24_,X_INTRODUCED_25_,X_INTRODUCED_32_,X_INTRODUCED_33_,X_INTRODUCED_34_,X_INTRODUCED_35_];
+array [1..6] of var int: dep:: output_array([1..6]) = [X_INTRODUCED_30_,X_INTRODUCED_31_,X_INTRODUCED_32_,X_INTRODUCED_33_,X_INTRODUCED_34_,X_INTRODUCED_35_];
+constraint crusher_circuit(succ);
+constraint array_var_int_element(X_INTRODUCED_6_,veh,X_INTRODUCED_39_);
+constraint array_var_int_element(X_INTRODUCED_7_,veh,X_INTRODUCED_39_);
+constraint array_var_int_element(X_INTRODUCED_8_,veh,1);
+constraint array_var_int_element(X_INTRODUCED_9_,veh,2);
+constraint int_lin_le(X_INTRODUCED_42_,[X_INTRODUCED_18_,X_INTRODUCED_24_],0);
+constraint int_lin_le(X_INTRODUCED_42_,[X_INTRODUCED_19_,X_INTRODUCED_25_],0);
+constraint int_lin_le(X_INTRODUCED_42_,[X_INTRODUCED_24_,X_INTRODUCED_30_],-2);
+constraint int_lin_le(X_INTRODUCED_42_,[X_INTRODUCED_25_,X_INTRODUCED_31_],-3);
+constraint array_int_element(X_INTRODUCED_6_,X_INTRODUCED_48_,X_INTRODUCED_49_):: defines_var(X_INTRODUCED_49_);
+constraint array_var_int_element(X_INTRODUCED_6_,arr,X_INTRODUCED_51_):: defines_var(X_INTRODUCED_51_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_30_,X_INTRODUCED_49_,X_INTRODUCED_51_],0);
+constraint array_int_element(X_INTRODUCED_7_,X_INTRODUCED_53_,X_INTRODUCED_54_):: defines_var(X_INTRODUCED_54_);
+constraint array_var_int_element(X_INTRODUCED_7_,arr,X_INTRODUCED_56_):: defines_var(X_INTRODUCED_56_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_31_,X_INTRODUCED_54_,X_INTRODUCED_56_],0);
+constraint array_int_element(X_INTRODUCED_8_,X_INTRODUCED_57_,X_INTRODUCED_58_):: defines_var(X_INTRODUCED_58_);
+constraint array_var_int_element(X_INTRODUCED_8_,arr,X_INTRODUCED_60_):: defines_var(X_INTRODUCED_60_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_32_,X_INTRODUCED_58_,X_INTRODUCED_60_],0);
+constraint array_int_element(X_INTRODUCED_9_,X_INTRODUCED_57_,X_INTRODUCED_61_):: defines_var(X_INTRODUCED_61_);
+constraint array_var_int_element(X_INTRODUCED_9_,arr,X_INTRODUCED_63_):: defines_var(X_INTRODUCED_63_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_33_,X_INTRODUCED_61_,X_INTRODUCED_63_],0);
+constraint array_int_element(X_INTRODUCED_6_,X_INTRODUCED_65_,X_INTRODUCED_64_):: defines_var(X_INTRODUCED_64_);
+constraint array_var_int_element(X_INTRODUCED_6_,load,X_INTRODUCED_67_):: defines_var(X_INTRODUCED_67_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_12_,X_INTRODUCED_64_,X_INTRODUCED_67_],0);
+constraint array_int_element(X_INTRODUCED_7_,X_INTRODUCED_65_,X_INTRODUCED_68_):: defines_var(X_INTRODUCED_68_);
+constraint array_var_int_element(X_INTRODUCED_7_,load,X_INTRODUCED_70_):: defines_var(X_INTRODUCED_70_);
+constraint int_lin_eq(X_INTRODUCED_52_,[X_INTRODUCED_13_,X_INTRODUCED_68_,X_INTRODUCED_70_],0);
+constraint array_int_element(X_INTRODUCED_8_,X_INTRODUCED_65_,X_INTRODUCED_73_):: defines_var(X_INTRODUCED_73_);
+constraint array_var_int_element(X_INTRODUCED_8_,load,X_INTRODUCED_73_);
+constraint array_int_element(X_INTRODUCED_9_,X_INTRODUCED_65_,X_INTRODUCED_76_):: defines_var(X_INTRODUCED_76_);
+constraint array_var_int_element(X_INTRODUCED_9_,load,X_INTRODUCED_76_);
+constraint int_lin_le(X_INTRODUCED_42_,[X_INTRODUCED_30_,X_INTRODUCED_19_],-4);
+constraint int_lin_eq(X_INTRODUCED_83_,[objective,X_INTRODUCED_49_,X_INTRODUCED_54_,X_INTRODUCED_58_,X_INTRODUCED_61_],0):: defines_var(objective);
+solve :: seq_search([int_search(succ,first_fail,indomain_min,complete),int_search(ser,smallest,indomain_min,complete),int_search(arr,smallest,indomain_min,complete),int_search(dep,smallest,indomain_min,complete),int_search(load,smallest,indomain_min,complete),int_search(veh,first_fail,indomain_min,complete)]) minimize objective;
+"""
+
+suite "Split time chains (VRP with location congestion)":
+
+    test "chain intermediates need no binding; objective lookups and narrowing rows keep theirs":
+        let tr = translate(parseFzn(TinyVrplc))
+        check tr.circuitTimeCandidates.len == 3
+        check tr.countType(CircuitTimePropType) == 3
+        # arr[succ[i]] (time chain), load[succ[i]] and the customers' demand lookups
+        for name in ["X_INTRODUCED_51_", "X_INTRODUCED_56_", "X_INTRODUCED_60_",
+                     "X_INTRODUCED_63_", "X_INTRODUCED_67_", "X_INTRODUCED_70_",
+                     "X_INTRODUCED_64_", "X_INTRODUCED_68_"]:
+            check name in tr.deadChannelVars
+        # travel lookups read by the objective
+        for name in ["X_INTRODUCED_49_", "X_INTRODUCED_54_", "X_INTRODUCED_58_", "X_INTRODUCED_61_"]:
+            check name notin tr.deadChannelVars
+        # declared domain narrower than the row: the binding still restricts succ
+        check "X_INTRODUCED_73_" notin tr.deadChannelVars
+        check "X_INTRODUCED_76_" notin tr.deadChannelVars
+
+    test "an output intermediate keeps its binding":
+        let src = TinyVrplc.replace("var 0..5: X_INTRODUCED_67_ ::var_is_introduced",
+                                    "var 0..5: X_INTRODUCED_67_ :: output_var ::var_is_introduced")
+        check src != TinyVrplc
+        let tr = translate(parseFzn(src))
+        check "X_INTRODUCED_67_" notin tr.deadChannelVars
+        check "X_INTRODUCED_70_" in tr.deadChannelVars
+
+    test "initial tours keep each linked pair on one empty vehicle":
+        var tr = translate(parseFzn(TinyVrplc))
+        tr.sys.baseArray.reducedDomain = reduceDomain(tr.sys.baseArray)
+        tr.sys.baseArray.sharedDomainPtr = addr tr.sys.baseArray.reducedDomain
+        for seed in 0..<10:
+            randomize(seed)
+            let st = newTabuState[int](tr.sys.baseArray)
+            template succOf(name: string): int = st.assignment[tr.pos(name)]
+            # pickup (earlier window) directly before its delivery
+            check succOf("X_INTRODUCED_6_") == 2
+            # start depot -> pickup, delivery -> that vehicle's end depot
+            if succOf("X_INTRODUCED_8_") == 1:
+                check succOf("X_INTRODUCED_7_") == 5
+            else:
+                check succOf("X_INTRODUCED_9_") == 1
+                check succOf("X_INTRODUCED_7_") == 6
+
+    test "round-trip: solutions satisfy the original model":
+        let time = @[@[0, 4, 3, 3, 3, 3], @[4, 0, 5, 5, 5, 5], @[3, 5, 0, 0, 0, 0],
+                     @[3, 5, 0, 0, 0, 0], @[3, 5, 0, 0, 0, 0], @[3, 5, 0, 0, 0, 0]]
+        let qq = @[2, -2, 0, 0, 0, 0]
+        for seed in 0..<5:
+            randomize(seed)
+            var tr = translate(parseFzn(TinyVrplc))
+            tr.sys.resolve(parallel = false, tabuThreshold = 10000, verbose = false)
+            check tr.sys.hasFeasibleSolution
+            let succ = @[tr.val("X_INTRODUCED_6_"), tr.val("X_INTRODUCED_7_"),
+                         tr.val("X_INTRODUCED_8_"), tr.val("X_INTRODUCED_9_"), 4, 3]
+            let veh = @[tr.val("X_INTRODUCED_39_"), tr.val("X_INTRODUCED_39_"), 1, 2, 1, 2]
+            let load = @[tr.val("X_INTRODUCED_12_"), tr.val("X_INTRODUCED_13_"), 0, 0, 0, 0]
+            let starts = @[tr.val("X_INTRODUCED_32_"), tr.val("X_INTRODUCED_33_"),
+                           tr.val("X_INTRODUCED_34_"), tr.val("X_INTRODUCED_35_")]
+            let arr = @[tr.val("X_INTRODUCED_18_"), tr.val("X_INTRODUCED_19_")] & starts
+            let ser = @[tr.val("X_INTRODUCED_24_"), tr.val("X_INTRODUCED_25_")] & starts
+            let dep = @[tr.val("X_INTRODUCED_30_"), tr.val("X_INTRODUCED_31_")] & starts
+            var seen: set[0..5]
+            var c = 0
+            for _ in 0..<6:
+                seen.incl(c)
+                c = succ[c] - 1
+            check card(seen) == 6
+            for i in 0..<4:                    # requests and start depots
+                let j = succ[i] - 1
+                check veh[j] == veh[i]
+                check dep[i] + time[i][j] == arr[j]
+                check load[i] + qq[j] == load[j]
+                check load[j] in 0..5
+            check arr[0] <= ser[0] and ser[0] + 2 <= dep[0] and ser[0] in 2..20
+            check arr[1] <= ser[1] and ser[1] + 3 <= dep[1] and ser[1] in 6..30
+            check dep[0] + 4 <= arr[1]
+            for t in arr & ser & dep: check t in 0..40

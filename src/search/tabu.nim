@@ -1346,7 +1346,9 @@ proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
     ## tour moves then keep the circuit valid.
     var nInit = 0
     if verbose: echo "[Init] circuit init: " & $state.circuitConstraints.len & " circuits"
-    for cc in state.circuitConstraints:
+    if not state.tourPairsBuilt and state.circuitTimePropConstraints.len > 0:
+        state.buildTourPairs()
+    for circIdx, cc in state.circuitConstraints:
         let n = cc.n
         if n < 3: continue
         let off = cc.valueOffset
@@ -1390,6 +1392,29 @@ proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
                 domSet[k].incl(int(v) - off)
         var headSeg: Table[int, int]
         for k in 0..<m: headSeg[segHead[k]] = k
+        # Linked node pairs of this circuit as single-node segments, the node
+        # with the earlier time window first (pickup before delivery)
+        var pairSegs: seq[(int, int)]
+        for (pc, na, nb) in state.tourPairs:
+            if pc != circIdx: continue
+            if na notin headSeg or nb notin headSeg: continue
+            let ka = headSeg[na]
+            let kb = headSeg[nb]
+            if segTail[ka] != na or segTail[kb] != nb: continue
+            var first = min(na, nb)
+            for ctc in state.circuitTimePropConstraints:
+                if ctc.equalityChain or ctc.n != n: continue
+                var sameCircuit = false
+                for i in 0..<n:
+                    let lp = ctc.positionArray[i]
+                    if lp >= 0:
+                        sameCircuit = lp == cc.positionArray[i]
+                        if not sameCircuit: break
+                if not sameCircuit: continue
+                if ctc.earlyTimes[na] != ctc.earlyTimes[nb]:
+                    first = if ctc.earlyTimes[na] < ctc.earlyTimes[nb]: na else: nb
+                break
+            pairSegs.add(if first == na: (ka, kb) else: (kb, ka))
         var order = newSeq[int](m)
         var success = false
         # Phase 1: random insertion. Close a small cycle from a random segment,
@@ -1408,6 +1433,7 @@ proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
                 cycleList.setLen(0)
                 var s0 = rand(m - 1)
                 var closed = false
+                var baseFromFixed = false
                 # Fixed multi-node segments (e.g. giant-tour depot connectors
                 # end_v -> start_v+1) first, in head-index order: anchors that
                 # accumulate along the tour (vehicle ids, loads) then start
@@ -1433,6 +1459,7 @@ proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
                                 nextSeg[a] = multi[(t + 1) mod multi.len]
                             s0 = multi[0]
                             closed = true
+                            baseFromFixed = true
                 if not closed:
                     inCycle[s0] = true
                     cycleList.add(s0)
@@ -1465,6 +1492,38 @@ proc initValidCircuits[T](state: TabuState[T], verbose: bool = false) =
                     cycleList.add(best)
                     cur = best
                 if not closed: continue
+                # Linked pairs (pickup and delivery on one vehicle) start together,
+                # each in its own empty route (an arc joining two fixed segments,
+                # e.g. start depot -> end depot of a giant tour) while those last:
+                # a random placement splits nearly every pair across vehicles,
+                # and repairing a split pair costs far more than it gains.
+                if baseFromFixed and pairSegs.len > 0:
+                    var emptyArcs: seq[int]
+                    for a in cycleList:
+                        if segHead[a] != segTail[a] and segHead[nextSeg[a]] != segTail[nextSeg[a]]:
+                            emptyArcs.add(a)
+                    shuffle(emptyArcs)
+                    var pairOrder = toSeq(0..<pairSegs.len)
+                    shuffle(pairOrder)
+                    var ei = 0
+                    for pk in pairOrder:
+                        if ei >= emptyArcs.len: break
+                        let (sx, sy) = pairSegs[pk]
+                        if inCycle[sx] or inCycle[sy]: continue
+                        let a = emptyArcs[ei]
+                        let b = nextSeg[a]
+                        for (f, t) in [(sx, sy), (sy, sx)]:
+                            if segHead[f] in domSet[a] and segHead[t] in domSet[f] and
+                               segHead[b] in domSet[t]:
+                                nextSeg[a] = f
+                                nextSeg[f] = t
+                                nextSeg[t] = b
+                                inCycle[f] = true
+                                inCycle[t] = true
+                                cycleList.add(f)
+                                cycleList.add(t)
+                                inc ei
+                                break
                 pending.setLen(0)
                 for k in 0..<m:
                     if not inCycle[k]: pending.add(k)

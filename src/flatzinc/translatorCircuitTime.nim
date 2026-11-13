@@ -97,6 +97,25 @@ proc circuitTimeDeclaredCovers(tr: FznTranslator, name: string, lo, hi: int): bo
                 return false
     false
 
+proc circuitTimeRowCovered(tr: FznTranslator, name: string, row: seq[int],
+                           linkVar: string): bool =
+    ## Every value row[s - 1], s in linkVar's domain bounds, lies in the
+    ## declared domain of name (the element result d = row[linkVar]).
+    if linkVar == "": return false
+    let (lo, hi) = tr.circuitTimeDomainBounds(linkVar)
+    var vlo = high(int)
+    var vhi = low(int)
+    var vals: seq[int]
+    for s in max(lo, 1)..min(hi, row.len):
+        vals.add(row[s - 1])
+        vlo = min(vlo, row[s - 1])
+        vhi = max(vhi, row[s - 1])
+    if vals.len == 0: return false
+    if tr.circuitTimeDeclaredCovers(name, vlo, vhi): return true
+    for v in vals:
+        if not tr.circuitTimeDeclaredCovers(name, v, v): return false
+    true
+
 proc circuitTimeFixedValue(tr: FznTranslator, e: FznExpr): (bool, int) =
     ## Resolve an expression to a fixed integer (literal, parameter, or
     ## singleton-domain variable).
@@ -354,15 +373,15 @@ proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
         cand.channelVars.add(aVar)
         cand.channelVars.add(tVar)
         cand.channelVars.add(term.idxVar)
-        cand.tdIntermediates.add([aVar, tVar, term.idxVar])
+        cand.verifiedIntermediates.add([aVar, tVar, term.idxVar])
         if term.bVar != "":
             cand.consumedCIs.incl(term.divCI)
             cand.channelVars.add(term.bVar)
-            cand.tdIntermediates.add(term.bVar)
+            cand.verifiedIntermediates.add(term.bVar)
         if dCI >= 0:
             cand.consumedCIs.incl(dCI)
             cand.channelVars.add(dVar)
-            cand.tdIntermediates.add(dVar)
+            cand.verifiedIntermediates.add(dVar)
         termOfIdx[term.idxVar] = (tVar, term.table)
         if mirrorTv[toN] == "":
             mirrorTv[toN] = tVar
@@ -447,7 +466,7 @@ proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
             for (v, eci) in aliasUsed:
                 cand.consumedCIs.incl(eci)
                 cand.channelVars.add(v)
-                cand.tdIntermediates.add(v)
+                cand.verifiedIntermediates.add(v)
     if nMirror > 0:
         stderr.writeLine("[FZN] Circuit-time: " & $nMirror &
                          " predecessor-side mirror arcs implied by the chain")
@@ -1128,9 +1147,11 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
                     consumed.incl(tdTerm[i].divCI)
                     channelVars.add(tdTerm[i].bVar)
                     tdInter.add(tdTerm[i].bVar)
-                # t[S_i] within its declared domain for every successor
-                if tr.circuitTimeDeclaredCovers(atVars[i], minEarly, maxLate):
-                    tdInter.add(atVars[i])
+            elif tr.circuitTimeRowCovered(durVars[i], distRows[i], linkVarNames[i]):
+                tdInter.add(durVars[i])
+            # t[S_i] within its declared domain for every successor
+            if tr.circuitTimeDeclaredCovers(atVars[i], minEarly, maxLate):
+                tdInter.add(atVars[i])
     for tn in timeVarNames:
         if tn != "": channelVars.add(tn)
 
@@ -1156,10 +1177,10 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     cand.objectiveWeight = 0               # set by verification when linked
     cand.objectiveMetricLo = metricLo
     cand.objectiveConstOffset = 0
+    cand.verifiedIntermediates = tdInter
     if anyTd:
         cand.tdBucket = tdL
         cand.tdTravel = tdTravel
-        cand.tdIntermediates = tdInter
         var tdServices = newSeq[int](n)
         for i in 0..<n:
             if outConstrained[i]: tdServices[i] = serviceTimes[i]
@@ -1478,6 +1499,9 @@ proc tryMatchSplitSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     var consumed = initPackedSet[int]()
     consumed.incl(circuitCI)
     var channelVars: seq[string]
+    var verified: seq[string]
+    var maxLateAll = low(int)
+    for j in 0..<n: maxLateAll = max(maxLateAll, lateTimes[j])
     for i in 0..<n:
         if chained[i]:
             consumed.incl(eqCI[i])
@@ -1487,6 +1511,9 @@ proc tryMatchSplitSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
             if refs.len == 2 and atCI[i] in refs and eqCI[i] in refs:
                 consumed.incl(atCI[i])
                 channelVars.add(atName[i])
+                # on a solution arr[succ[i]] lies in minArr..max late (arr <= ser <= late)
+                if tr.circuitTimeDeclaredCovers(atName[i], minArr, maxLateAll):
+                    verified.add(atName[i])
             else:
                 (splitReject(19); return false)
     for j in 0..<n:
@@ -1518,6 +1545,7 @@ proc tryMatchSplitSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     cand.useMaxMetric = false
     cand.objectiveWeight = 0
     cand.useRelease = true
+    cand.verifiedIntermediates = verified
     cand.releaseNodes = releaseNodes
     cand.noWait = noWait
     cand.depChannels = depChannels
@@ -1677,6 +1705,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         var outConstrained = newSeq[bool](n)
         var offsets = newSeq[int](n)
         var offsetRows = newSeq[seq[int]](n)   # per-arc offsets (row[to]) or empty
+        var dRowNames = newSeq[seq[string]](n) # their element results
         var elemCI = newSeq[int](n)
         var eqCI = newSeq[int](n)
         var nMatched = 0
@@ -1707,6 +1736,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                 outConstrained[i] = true
                 offsets[i] = -valueFixedVal[i]
                 offsetRows[i] = constElemByRes[info.resultName][1]
+                dRowNames[i] = @[info.resultName]
                 elemCI[i] = info.ci
                 eqCI[i] = -1
                 inc nMatched
@@ -1752,6 +1782,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                        coeffs[dIdx] == -coeffs[rIdx]:
                         off = rhs * coeffs[rIdx]
                         offsetRows[i] = constElemByRes[eqVars[dIdx]][1]
+                        dRowNames[i] = @[eqVars[dIdx]]
                         matched = true
                 elif eqVars.len == 2 and valueFixed[i]:
                     # A_i fixed and folded: c_d*d + c_r*r = rhs, c_d = -c_r
@@ -1765,6 +1796,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                        coeffs[dIdx] == -coeffs[rIdx]:
                         off = rhs * coeffs[rIdx] - valueFixedVal[i]
                         offsetRows[i] = constElemByRes[eqVars[dIdx]][1]
+                        dRowNames[i] = @[eqVars[dIdx]]
                         matched = true
                 if matched:
                     outConstrained[i] = true
@@ -1832,6 +1864,12 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         var consumed = initPackedSet[int]()
         consumed.incl(circuitCI)
         var channelVars: seq[string]
+        var verified: seq[string]
+        var minEarlyAll = high(int)
+        var maxLateAll = low(int)
+        for i in 0..<n:
+            minEarlyAll = min(minEarlyAll, earlyTimes[i])
+            maxLateAll = max(maxLateAll, lateTimes[i])
         for i in 0..<n:
             if outConstrained[i]:
                 consumed.incl(elemCI[i])
@@ -1842,6 +1880,14 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
                    byNode[i].resultName notin constElemByRes:
                     # (a constant-row element result keeps its own definition)
                     channelVars.add(byNode[i].resultName)
+                    # A[link[i]]: on a solution some node's value, within its window
+                    if tr.circuitTimeDeclaredCovers(byNode[i].resultName, minEarlyAll, maxLateAll):
+                        verified.add(byNode[i].resultName)
+                # per-arc offset rows d = row[link[i]] (their definitions stay
+                # in place; dead unless something besides this chain reads them)
+                for dn in dRowNames[i]:
+                    if tr.circuitTimeRowCovered(dn, constElemByRes[dn][1], linkVarNames[i]):
+                        verified.add(dn)
         for vn in valueVarNames:
             if vn != "": channelVars.add(vn)
 
@@ -1862,6 +1908,7 @@ proc tryMatchSuccFormAccumulators(tr: var FznTranslator, circuitCI: int,
         cand.channelVars = channelVars
         cand.timeVarNames = valueVarNames
         cand.useMaxMetric = false
+        cand.verifiedIntermediates = verified
         accumArrays.incl(arrName)
         outCands.add(cand)
         stderr.writeLine("[FZN] Detected circuit-accumulator chain on array '" &
@@ -3180,20 +3227,23 @@ proc inferPositionChainCircuits(tr: var FznTranslator) =
 
 
 proc computeDeadCircuitTimeIntermediates(tr: var FznTranslator) =
-    ## Time-dependent and mirror travel terms are evaluated inside
-    ## CircuitTimeProp from tables; their consumed intermediates (t[S_i],
-    ## t[p_i], buckets, indices, lookups) keep element / div bindings and
-    ## domain bounds that every move recomputes for nobody. The matcher verified
-    ## their declared domains, so an intermediate no live reader needs gets no
-    ## binding (it stays an inert channel position). Readers: every constraint
-    ## the circuit-time instances did not consume, output, the objective,
-    ## annotated search variables, the instances' own link and time variables,
-    ## and (fixpoint) consumed definitions whose output is read.
+    ## CircuitTimeProp walks its chains from tables, but the chain's
+    ## intermediates (element results along the links such as arr[succ[i]] or
+    ## load[succ[i]], per-arc lookups, TD buckets and indices, mirror terms)
+    ## keep element / div bindings and domain bounds that every move
+    ## recomputes for nobody: each changed time re-evaluates every element
+    ## over the time array. The matchers verified their declared domains, so
+    ## an intermediate no live reader needs gets no binding (it stays an inert
+    ## channel position). Readers: every constraint the circuit-time instances
+    ## did not consume (except the element definitions of the intermediates
+    ## themselves), output, the objective, annotated search variables, the
+    ## instances' own link and time variables, and (fixpoint) definitions whose
+    ## output is read.
     var inter: HashSet[string]
     var ctpConsumed = initPackedSet[int]()
     var used: HashSet[string]
     for cand in tr.circuitTimeCandidates:
-        for v in cand.tdIntermediates: inter.incl(v)
+        for v in cand.verifiedIntermediates: inter.incl(v)
         for ci in cand.consumedCIs.items: ctpConsumed.incl(ci)
         for v in cand.linkVarNames: used.incl(v)
         for v in cand.timeVarNames: used.incl(v)
@@ -3235,8 +3285,13 @@ proc computeDeadCircuitTimeIntermediates(tr: var FznTranslator) =
                     if e.kind == FznIdent and e.ident != skip and
                        not used.containsOrIncl(e.ident): result = true
             else: discard
+    # Element definitions of intermediates (e.g. per-arc offset lookups the
+    # chain does not consume) read their arguments only while their output is live
+    var interDefs = initPackedSet[int]()
+    for ci, dn in tr.channelConstraints.pairs:
+        if dn in inter and ci notin ctpConsumed: interDefs.incl(ci)
     for ci, con in tr.model.constraints:
-        if ci notin ctpConsumed: discard readArgs(con, "", used, arrElems)
+        if ci notin ctpConsumed and ci notin interDefs: discard readArgs(con, "", used, arrElems)
     var changed = true
     while changed:
         changed = false
@@ -3247,6 +3302,9 @@ proc computeDeadCircuitTimeIntermediates(tr: var FznTranslator) =
             if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
             let b = ann.args[0].ident
             if b in used and readArgs(con, b, used, arrElems): changed = true
+        for ci in interDefs.items:
+            let b = tr.channelConstraints[ci]
+            if b in used and readArgs(tr.model.constraints[ci], b, used, arrElems): changed = true
     var nDead = 0
     for v in inter:
         if v notin used and v notin tr.deadChannelVars:
@@ -3255,4 +3313,4 @@ proc computeDeadCircuitTimeIntermediates(tr: var FznTranslator) =
             inc nDead
     if nDead > 0:
         stderr.writeLine("[FZN] Circuit-time: " & $nDead &
-                         " consumed travel intermediates need no channel binding")
+                         " chain intermediates need no channel binding")

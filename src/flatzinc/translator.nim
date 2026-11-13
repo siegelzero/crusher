@@ -312,9 +312,10 @@ type
         aliasGroups*: seq[seq[int]]     # equality chain: nodes sharing one value variable
         tdBucket*: int                  # >0: time-dependent travel, bucket = t div tdBucket
         tdTravel*: seq[seq[seq[int]]]   # [from][to][bucket], service folded in
-        tdIntermediates*: seq[string]   # consumed TD/mirror intermediates whose declared
-                                        # domains the matcher verified (no binding needed
-                                        # unless something live reads them)
+        verifiedIntermediates*: seq[string]  # chain intermediates (element results along the
+                                        # links, TD/mirror lookups) whose declared domains the
+                                        # matcher verified: no binding needed unless something
+                                        # live reads them
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int
