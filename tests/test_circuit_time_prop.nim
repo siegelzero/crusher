@@ -343,3 +343,64 @@ suite "Valid circuit initialization":
             check a[6] == 2
             check a[7] == 1
             check a[0] != 8
+
+suite "CircuitTimeProp time-dependent travel":
+    ## Successor form, depot 0 (time 0), customers 1 and 2; the arc out of 2
+    ## is unconstrained (giant-tour wrap). Bucket 10: leaving 1 during [0,10)
+    ## takes 50, during [10,20) only 1 (non-FIFO), so the walk waits at 1.
+    proc mk(): CircuitTimePropConstraint[int] =
+        result = newCircuitTimePropConstraint[int](
+            linkPositions = @[0, 1, 2],
+            distanceMatrix = @[@[0, 0, 0], @[0, 0, 0], @[0, 0, 0]],
+            earlyTimes = @[0, 0, 0],
+            lateTimes = @[0, 29, 100],
+            depotIndex = 0,
+            depotDeparture = 0,
+            arrivalPositions = @[-1, -1, -1],
+            departurePositions = @[-1, -1, -1],
+            valueOffset = 0,
+            forward = true,
+            outConstrained = @[true, true, false])
+        # travel[from][to][bucket], buckets up to late[from] div 10
+        result.setTimeDependentTravel(10, @[
+            @[@[0], @[5], @[3]],
+            @[@[7, 7, 7], @[0, 0, 0], @[50, 1, 50]],
+            @[@[0], @[0], @[0]]])
+
+    test "the walk starts a node later when that arrives earlier":
+        let c = mk()
+        c.initialize(@[1, 2, 0])          # 0 -> 1 -> 2 -> (wrap) 0
+        check c.cost == 0
+        check c.arrivalTime[1] == 5
+        check c.departureTime[1] == 10    # waits for the fast bucket
+        check c.arrivalTime[2] == 11
+        check c.departureTime[2] == 11
+
+    test "waiting stays within the node's window":
+        let c = mk()
+        c.lateTimes[1] = 9                # only bucket 0 usable
+        c.setTimeDependentTravel(10, @[
+            @[@[0], @[5], @[3]],
+            @[@[7], @[0], @[50]],
+            @[@[0], @[0], @[0]]])
+        c.initialize(@[1, 2, 0])
+        check c.departureTime[1] == 5
+        check c.arrivalTime[2] == 55
+
+    test "moveDelta matches a fresh walk":
+        randomize(7)
+        let c = mk()
+        var a = @[1, 2, 0]
+        c.initialize(a)
+        for it in 0..<200:
+            let p = rand(2)
+            let v = rand(2)
+            let d = c.moveDelta(p, a[p], v)
+            var b = a
+            b[p] = v
+            let fresh = mk()
+            fresh.initialize(b)
+            check d == fresh.cost - c.cost
+            a = b
+            c.updatePosition(p, v)
+            check c.cost == fresh.cost

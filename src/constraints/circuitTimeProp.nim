@@ -85,6 +85,17 @@ type
         # member disagreeing with the group's first visited member costs 1.
         # Disables the incremental walk (its prefix caches don't cover them).
         aliasGroups*: seq[seq[int]]
+        # Time-dependent travel (inequality form, no release): leaving `from`
+        # at time t reaches `to` at t + tdTravel[from][to][t div tdBucket]
+        # (service included; one entry per bucket up to late[from]). With
+        # non-FIFO travel a later start can arrive earlier, so the walk starts
+        # each node at the argmin over [earliest, late] — the earliest-arrival
+        # function is monotone, so composing it along the tour stays exact.
+        # Disables the incremental walk. tdBucket = 0: static distanceMatrix.
+        tdBucket*: int
+        tdTravel*: seq[seq[seq[T]]]          # [from][to][bucket]
+        tdSufMin*: seq[seq[seq[T]]]          # [from][to][k] = min_{k'>=k} k'*L + travel[k']
+        tdSufArg*: seq[seq[seq[int]]]        # argmin k' of tdSufMin
 
         # Release (waiting) variables, inequality form only. A node with a
         # release position departs at max(arrival, early, release): searching
@@ -235,6 +246,50 @@ proc newCircuitTimePropConstraint*[T](
     result.objectiveMetricLo = objectiveMetricLo
     result.objectiveConstOffset = objectiveConstOffset
     result.cost = 0
+
+
+proc setTimeDependentTravel*[T](c: CircuitTimePropConstraint[T], bucket: int,
+                                travel: seq[seq[seq[T]]]) =
+    ## Attach time-dependent travel (see the tdBucket field). travel[from][to]
+    ## must cover buckets 0..late[from] div bucket.
+    c.tdBucket = bucket
+    c.tdTravel = travel
+    let n = c.n
+    c.tdSufMin = newSeq[seq[seq[T]]](n)
+    c.tdSufArg = newSeq[seq[seq[int]]](n)
+    for f in 0..<n:
+        c.tdSufMin[f] = newSeq[seq[T]](n)
+        c.tdSufArg[f] = newSeq[seq[int]](n)
+        for t in 0..<n:
+            let row {.cursor.} = travel[f][t]
+            let k = row.len
+            var sm = newSeq[T](k)
+            var sa = newSeq[int](k)
+            for b in countdown(k - 1, 0):
+                let v = T(b * bucket) + row[b]
+                if b == k - 1 or v < sm[b + 1]:
+                    sm[b] = v
+                    sa[b] = b
+                else:
+                    sm[b] = sm[b + 1]
+                    sa[b] = sa[b + 1]
+            c.tdSufMin[f][t] = sm
+            c.tdSufArg[f][t] = sa
+
+
+proc tdArc[T](c: CircuitTimePropConstraint[T], fromN, toN: int,
+              t: T): tuple[dep, arr: T] {.inline.} =
+    ## Best start at `fromN` no earlier than t (and within its window) and the
+    ## resulting arrival at `toN`.
+    let row {.cursor.} = c.tdTravel[fromN][toN]
+    let k = row.len
+    var b = int(t) div c.tdBucket
+    if b >= k: b = k - 1        # past late[fromN]: the window penalty charges it
+    if b < 0: b = 0
+    result = (dep: t, arr: t + row[b])
+    if b + 1 < k and c.tdSufMin[fromN][toN][b + 1] < result.arr:
+        let kb = c.tdSufArg[fromN][toN][b + 1]
+        result = (dep: T(kb * c.tdBucket), arr: c.tdSufMin[fromN][toN][b + 1])
 
 
 proc computePenaltiesEquality[T](c: CircuitTimePropConstraint[T],
@@ -398,7 +453,13 @@ proc computePenalties*[T](c: CircuitTimePropConstraint[T],
             break  # broken or cycle back to non-depot
 
         if c.outConstrained[current]:
-            arrival[next] = departure[current] + c.distanceMatrix[next][current]
+            if c.tdBucket > 0:
+                let (d, a) = c.tdArc(current, next, departure[current])
+                departure[current] = d
+                if d > maxTime: maxTime = d
+                arrival[next] = a
+            else:
+                arrival[next] = departure[current] + c.distanceMatrix[next][current]
         else:
             # No time constraint on this arc: the clock resets (e.g. giant-tour
             # wrap from one vehicle's end depot to the next vehicle's start).
@@ -428,7 +489,13 @@ proc computePenalties*[T](c: CircuitTimePropConstraint[T],
         if lastSucc != c.depotIndex:
             circPenalty = 1  # all visited but doesn't close
         elif c.outConstrained[current]:
-            arrival[c.depotIndex] = departure[current] + c.distanceMatrix[c.depotIndex][current]
+            if c.tdBucket > 0:
+                let (d, a) = c.tdArc(current, c.depotIndex, departure[current])
+                departure[current] = d
+                if d > maxTime: maxTime = d
+                arrival[c.depotIndex] = a
+            else:
+                arrival[c.depotIndex] = departure[current] + c.distanceMatrix[c.depotIndex][current]
             if arrival[c.depotIndex] > c.lateTimes[c.depotIndex]:
                 twPenalty += int(arrival[c.depotIndex] - c.lateTimes[c.depotIndex])
             if arrival[c.depotIndex] > maxTime:
@@ -466,6 +533,7 @@ proc rebuildIncCache[T](c: CircuitTimePropConstraint[T]) =
     ## a backward (predecessor) link change rewires two successor arcs, so the
     ## prefix argument doesn't hold there.
     c.incValid = c.forward and not c.hasRelease and c.aliasGroups.len == 0 and
+                 c.tdBucket == 0 and
                  (c.equalityChain or c.useMaxMetric or c.useSumMetric)
     if not c.incValid: return
     let n = c.n
@@ -856,6 +924,10 @@ proc deepCopy*[T](c: CircuitTimePropConstraint[T]): CircuitTimePropConstraint[T]
     result.circuitWeight = c.circuitWeight
     result.closureFree = c.closureFree
     result.aliasGroups = c.aliasGroups
+    result.tdBucket = c.tdBucket
+    result.tdTravel = c.tdTravel
+    result.tdSufMin = c.tdSufMin
+    result.tdSufArg = c.tdSufArg
     result.hasRelease = c.hasRelease
     result.releasePositions = c.releasePositions
     result.releaseToIndex = c.releaseToIndex

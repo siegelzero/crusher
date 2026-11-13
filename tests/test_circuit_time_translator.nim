@@ -872,3 +872,72 @@ suite "Objective bound delegation (circuitTimeObjectiveExact)":
     test "unlinked accumulator instance: no delegation":
         let tr = translate(parseFzn(AccumLoadSrc & "solve satisfy;\n"))
         check tr.sys.circuitTimeObjectiveExact == false
+
+# ---------------------------------------------------------------------------
+# Position-encoded tours with time-dependent travel (tdtsp)
+# ---------------------------------------------------------------------------
+
+suite "Position-chain circuits and time-dependent travel (tdtsp)":
+    ## tests/data/tdtsp/tiny.fzn: the challenge model on 3 visits + end node,
+    ## buckets of 10. No circuit: the tour is next/prev (inverse) plus
+    ## position[next[i]] = position[i] + 1; travel is T[i, next[i], t div 10],
+    ## stated over successors and again over predecessors, plus two redundant
+    ## sum bounds. The optimum, 24, needs waiting at visit 2 (Gecode: tvar =
+    ## [0, 10, 15, 24]).
+    let src = readFile("tests/data/tdtsp/tiny.fzn")
+
+    test "implied circuit; time chain with buckets, mirrors and sums consumed":
+        let tr = translate(parseFzn(src))
+        var nTd, nAcc: int
+        for cand in tr.circuitTimeCandidates:
+            if cand.equalityChain: inc nAcc
+            elif cand.tdBucket == 10: inc nTd
+        check nTd == 1
+        check nAcc == 1                      # the position chain
+        check tr.countType(CircuitTimePropType) == 2
+        # Every arc (both statements) and both redundant sums are consumed
+        var nLe = 0
+        for ci, con in tr.model.constraints:
+            if con.name == "int_lin_le":
+                inc nLe
+                check ci in tr.definingConstraints
+        check nLe > 0
+
+    test "round-trip: optimum through waiting":
+        var tr = translate(parseFzn(src))
+        let objExpr = tr.getExpr(tr.objectivePos)
+        minimize(tr.sys, objExpr, parallel = false, tabuThreshold = 1000,
+                 lowerBound = tr.objectiveLoBound, upperBound = tr.objectiveHiBound)
+        check tr.sys.hasFeasibleSolution
+        let tv = @[0, tr.val("X_INTRODUCED_13_"), tr.val("X_INTRODUCED_14_"), tr.val("objective")]
+        check tv[3] == 24
+        check tv[1] == 10
+
+    test "no implied circuit unless the closing node's position is N":
+        # With P[4] free, S = [2, 4, 2, 1], P = [1, 2, 1, 3] satisfies every
+        # chain equation (cycle 1 -> 2 -> 4 -> 1, node 3 hanging off 2), so
+        # circuit(S) is not implied.
+        let mk = proc(p4: string): string = """
+var 1..4: s1;
+var 1..4: s2;
+var 1..4: s3;
+var 1..4: p2;
+var 1..4: p3;
+""" & p4 & """
+var 1..4: r2;
+var 1..4: r3;
+array [1..4] of var int: S :: output_array([1..4]) = [s1, s2, s3, 1];
+array [1..4] of var int: P :: output_array([1..4]) = [1, p2, p3, P4];
+constraint array_var_int_element(s1, P, 2);
+constraint array_var_int_element(s2, P, r2) :: defines_var(r2);
+constraint int_lin_eq([1, -1], [r2, p2], 1);
+constraint array_var_int_element(s3, P, r3) :: defines_var(r3);
+constraint int_lin_eq([1, -1], [r3, p3], 1);
+solve satisfy;
+"""
+        proc nCircuits(src: string): int =
+            let tr = translate(parseFzn(src))
+            for con in tr.model.constraints:
+                if con.name == "crusher_circuit": inc result
+        check nCircuits(mk("var 4..4: P4;\n")) == 1
+        check nCircuits(mk("var 1..4: P4;\n")) == 0

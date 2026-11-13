@@ -310,6 +310,8 @@ type
         sumMetricWeights*: seq[int]     # per node; objective weight of the node's time (with useSumMetric)
         equalityChain*: bool            # exact accumulator chain (no clamp, two-sided windows)
         aliasGroups*: seq[seq[int]]     # equality chain: nodes sharing one value variable
+        tdBucket*: int                  # >0: time-dependent travel, bucket = t div tdBucket
+        tdTravel*: seq[seq[seq[int]]]   # [from][to][bucket], service folded in
         objectiveWeight*: int           # >0: metric feeds minimized objective with this weight
         objectiveMetricLo*: int
         objectiveConstOffset*: int
@@ -1329,6 +1331,8 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     result.canonicalizeFznVarAliases()
     # Group `c * bool2int(x == v)` sum terms over the same x into table channels
     result.groupIndicatorSums()
+    # Tours encoded by positions (P[S[i]] = P[i] + 1) imply circuit(S)
+    result.inferPositionChainCircuits()
     # Collect defined variables before translating variables
     result.collectDefinedVars()
     # Drop fzn_all_different_int constraints whose argument list is fully fixed

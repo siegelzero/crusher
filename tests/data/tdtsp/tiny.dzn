@@ -1,0 +1,12 @@
+% Tiny tdtsp instance for test_circuit_time_translator: the optimum (24)
+% needs waiting at visit 2 for the fast travel bucket (T[2,3,1] = 2).
+n = 3;
+D = [2,3,4];
+q = 0;
+prec = array2d(1..0,1..2,[]);
+steps = 3;
+l = 10;
+r = 0;
+which = [];
+interval = array2d(1..0,1..2,[]);
+T = array3d(1..4,1..4,0..3,[0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0, 30, 2, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 8, 8, 8, 8, 0, 0, 0, 0, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0, 0, 0, 0]);

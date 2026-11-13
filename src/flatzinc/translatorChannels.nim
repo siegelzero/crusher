@@ -2552,13 +2552,22 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
 
     # Circuit-time link variables must remain searchable: the emitted
     # CircuitTimeProp constraints are attached to their positions.
+    # Their written-back values (times, accumulator values) are channels of
+    # the walk already; a second (inverse) binding would fight over them.
     var ctProtected: HashSet[string]
     for cand in tr.circuitTimeCandidates:
         for vn in cand.linkVarNames:
             if vn.len > 0: ctProtected.incl(vn)
+        for vn in cand.departureVars & cand.arrivalVars:
+            if vn.len > 0: ctProtected.incl(vn)
 
     # Step 1: Group array_var_int_element constraints by their array argument
     var arrayGroups: Table[string, seq[int]]  # array name -> constraint indices
+    # Exact repeats (same index var, same result; e.g. tdtsp's redundant
+    # chains restate inverse facts) are kept out of the group and consumed
+    # with it.
+    var dupCIs: Table[string, seq[int]]
+    var seenPair: HashSet[(string, string, int)]
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints:
@@ -2579,6 +2588,11 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
         if con.args[2].kind != FznIntLit:
             continue
         let arrName = arrArg.ident
+        let key = (arrName, con.args[0].ident, con.args[2].intVal)
+        if key in seenPair:
+            dupCIs.mgetOrPut(arrName, @[]).add(ci)
+            continue
+        seenPair.incl(key)
         if arrName notin arrayGroups:
             arrayGroups[arrName] = @[]
         arrayGroups[arrName].add(ci)
@@ -2740,6 +2754,8 @@ proc detectInverseChannelPatterns(tr: var FznTranslator) =
 
         # Mark element constraints as consumed
         for ci in ciList:
+            tr.definingConstraints.incl(ci)
+        for ci in dupCIs.getOrDefault(arrName, @[]):
             tr.definingConstraints.incl(ci)
         # Mark GCC/alldifferent constraints as consumed
         for ci2 in gccCIs:

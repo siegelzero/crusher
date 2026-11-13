@@ -93,6 +93,335 @@ proc circuitTimeFixedValue(tr: FznTranslator, e: FznExpr): (bool, int) =
     return (false, 0)
 
 
+proc circuitTimeParseLinEq(tr: FznTranslator, con: FznConstraint):
+        tuple[ok: bool, coeffs: seq[int], varNames: seq[string], rhs: int]
+
+type CircuitTimeTdTerm = object
+    ## d = table[cb*(t div bL) + cs*link + c0] (1-based); no bucket term when
+    ## bVar is "".
+    table: seq[int]
+    cs, cb, c0: int
+    idxVar, bVar, bSrc: string
+    bL: int
+    idxCI, divCI: int
+    # Declared domains: an index or value outside them makes the arc
+    # infeasible; the bucket's domain bounds the node's time.
+    idxLo, idxHi, valLo, valHi, bLo, bHi: int
+
+const CircuitTimeTdBigArc = 1_000_000_000   # travel past the table: arc infeasible
+
+proc tdValue(t: CircuitTimeTdTerm, bucket, link: int): int =
+    ## The travel term for successor value `link` in `bucket`, or BigArc.
+    let kk = if t.bVar == "": 0 else: bucket
+    let idx = t.cb * kk + t.cs * link + t.c0
+    if idx < max(1, t.idxLo) or idx > min(t.table.len, t.idxHi): return CircuitTimeTdBigArc
+    let v = t.table[idx - 1]
+    if v < t.valLo or v > t.valHi: return CircuitTimeTdBigArc
+    v
+
+proc circuitTimeTdDefs(tr: FznTranslator):
+        (Table[string, (int, string, int)], Table[string, int]) =
+    ## int_div bucket definitions (b -> (ci, source, L)) and int_lin_eq
+    ## definitions (defined var -> ci).
+    var divOf: Table[string, (int, string, int)]
+    var idxDef: Table[string, int]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if not con.hasAnnotation("defines_var"): continue
+        let name = stripSolverPrefix(con.name)
+        if name == "int_div" and con.args.len == 3 and con.args[0].kind == FznIdent and
+           con.args[2].kind == FznIdent:
+            let (f, L) = tr.circuitTimeFixedValue(con.args[1])
+            if f and L > 0: divOf[con.args[2].ident] = (ci, con.args[0].ident, L)
+        elif name == "int_lin_eq":
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                idxDef[ann.args[0].ident] = ci
+    (divOf, idxDef)
+
+proc circuitTimeTdIndex(tr: FznTranslator, con: FznConstraint,
+                        divOf: Table[string, (int, string, int)],
+                        idxDef: Table[string, int],
+                        links: Table[string, int],
+                        t: var CircuitTimeTdTerm, linkName: var string): bool =
+    ## array_int_element(idx, table, d) whose idx is defined linearly from one
+    ## link variable (a key of `links`) and at most one int_div bucket.
+    let idxVar = con.args[0].ident
+    if idxVar notin idxDef: return false
+    let (ok, coeffs, vars, rhs) = tr.circuitTimeParseLinEq(tr.model.constraints[idxDef[idxVar]])
+    if not ok: return false
+    var cIdx = 0
+    var cs = 0
+    var cb = 0
+    var bVar = ""
+    linkName = ""
+    for k, v in vars:
+        if v == idxVar and cIdx == 0: cIdx = coeffs[k]
+        elif v in links and linkName == "":
+            linkName = v
+            cs = coeffs[k]
+        elif v in divOf and bVar == "":
+            bVar = v
+            cb = coeffs[k]
+        else: return false
+    if linkName == "" or cIdx notin [-1, 1]: return false
+    let table = try: tr.resolveIntArray(con.args[1])
+                except ValueError, KeyError: return false
+    # cIdx*idx + cs*s + cb*b = rhs  =>  idx = cIdx*rhs - cIdx*cs*s - cIdx*cb*b
+    t = CircuitTimeTdTerm(table: table, cs: -cIdx * cs, cb: -cIdx * cb, c0: cIdx * rhs,
+                          idxVar: idxVar, bVar: bVar, idxCI: idxDef[idxVar], divCI: -1)
+    (t.idxLo, t.idxHi) = tr.circuitTimeDeclaredBounds(idxVar)
+    (t.valLo, t.valHi) = if con.args[2].kind == FznIdent: tr.circuitTimeDeclaredBounds(con.args[2].ident)
+                         else: (low(int) div 2, high(int) div 2)
+    (t.bLo, t.bHi) = (low(int) div 2, high(int) div 2)
+    if bVar != "":
+        let (dci, src, L) = divOf[bVar]
+        t.divCI = dci
+        t.bSrc = src
+        t.bL = L
+        (t.bLo, t.bHi) = tr.circuitTimeDeclaredBounds(bVar)
+    true
+
+proc circuitTimeSameElems(a, b: seq[FznExpr]): bool =
+    if a.len != b.len: return false
+    for k in 0..<a.len:
+        if a[k].kind != b[k].kind: return false
+        case a[k].kind
+        of FznIdent:
+            if a[k].ident != b[k].ident: return false
+        of FznIntLit:
+            if a[k].intVal != b[k].intVal: return false
+        else: return false
+    true
+
+proc matchCircuitTimeMirrors(tr: FznTranslator, circuitCI: int,
+                             linkElems, timeElems: seq[FznExpr],
+                             services: seq[int], durVars: seq[string],
+                             fwdTerms: seq[(string, string, seq[int])],
+                             cand: var CircuitTimeCandidate) =
+    ## Time-dependent successor chains (tdtsp) state every arc twice: over the
+    ## successors (matched) and over the predecessors p_i (next[p_i] = i, kept
+    ## as a constraint), t_i >= t[p_i] + D[p_i] + T[p_i, i, t[p_i] div L].
+    ## A mirror whose travel equals the matched travel for every predecessor
+    ## and bucket is implied by the chain plus next[p_i] = i, and is consumed
+    ## with its intermediates. So are redundant sums
+    ##   sum(arc travel terms) - t_last <= rhs
+    ## over a complete set of forward or mirror terms whose rhs the telescoped
+    ## chain implies. Anything not matched stays and fails verification.
+    let n = linkElems.len
+    var nodeOfTime: Table[string, int]
+    for i, tn in cand.timeVarNames:
+        if tn != "": nodeOfTime[tn] = i
+    # Predecessor variables: array_var_int_element(p, S, i) with S the circuit array
+    var predNode: Table[string, int]
+    var timeElemDef: Table[string, (int, string)]   # A -> (ci, p)  A = t[p]
+    var constElemDef: Table[string, (int, string, seq[int])]  # Dv -> (ci, p, table)
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in cand.consumedCIs: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if con.args.len != 3 or con.args[0].kind != FznIdent: continue
+        if name == "array_var_int_element":
+            let arr = tr.presolveResolveVarElems(con.args[1])
+            if circuitTimeSameElems(arr, linkElems):
+                let (f, v) = tr.circuitTimeFixedValue(con.args[2])
+                if f and v >= 1 and v <= n: predNode[con.args[0].ident] = v - 1
+            elif circuitTimeSameElems(arr, timeElems) and con.args[2].kind == FznIdent and
+                 con.hasAnnotation("defines_var"):
+                timeElemDef[con.args[2].ident] = (ci, con.args[0].ident)
+        elif name == "array_int_element" and con.args[2].kind == FznIdent and
+             con.hasAnnotation("defines_var"):
+            let table = try: tr.resolveIntArray(con.args[1])
+                        except ValueError, KeyError: continue
+            constElemDef[con.args[2].ident] = (ci, con.args[0].ident, table)
+    let (divOf, idxDef) = tr.circuitTimeTdDefs()
+    var tElemDef: Table[string, int]   # Tv -> element ci (index defined linearly)
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in cand.consumedCIs: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) == "array_int_element" and con.args.len == 3 and
+           con.args[0].kind == FznIdent and con.args[2].kind == FznIdent and
+           con.args[0].ident in idxDef:
+            tElemDef[con.args[2].ident] = ci
+
+    var mirrorTv = newSeq[string](n)
+    var termOfIdx: Table[string, (string, seq[int])]   # index var -> (term var, table)
+    for (idxVar, tv, table) in fwdTerms: termOfIdx[idxVar] = (tv, table)
+    var mirrorRhs = newSeq[int](n)
+    var mirrorD = newSeq[seq[int]](n)
+    var nMirror = 0
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in cand.consumedCIs: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_lin_le": continue
+        let (ok, coeffs, vars, rhs) = tr.circuitTimeParseLinEq(con)
+        if not ok: continue
+        var toN = -1
+        var aVar, dVar, tVar: string
+        var shapeOk = true
+        for k, v in vars:
+            if coeffs[k] == -1 and v in nodeOfTime and toN < 0: toN = nodeOfTime[v]
+            elif coeffs[k] == 1 and v in timeElemDef and aVar == "": aVar = v
+            elif coeffs[k] == 1 and v in tElemDef and tVar == "": tVar = v
+            elif coeffs[k] == 1 and v in constElemDef and dVar == "": dVar = v
+            else: shapeOk = false
+        if not shapeOk or toN < 0 or aVar == "" or tVar == "": continue
+        let (aCI, pName) = timeElemDef[aVar]
+        if predNode.getOrDefault(pName, -1) != toN: continue
+        var dTable: seq[int]
+        var dCI = -1
+        if dVar != "":
+            let (dci0, dp, tab) = constElemDef[dVar]
+            if dp != pName: continue
+            dTable = tab
+            dCI = dci0
+        let tCI = tElemDef[tVar]
+        var term: CircuitTimeTdTerm
+        var linkName: string
+        let pOnly = {pName: 0}.toTable
+        if not tr.circuitTimeTdIndex(tr.model.constraints[tCI], divOf, idxDef, pOnly,
+                                     term, linkName): continue
+        if term.bVar != "" and (term.bSrc != aVar or term.bL != cand.tdBucket): continue
+        if term.idxVar == tVar or term.idxVar == aVar: continue
+        # Travel equality for every predecessor value and bucket
+        let (plo, phi) = tr.circuitTimeDomainBounds(pName)
+        let pDom = if pName in tr.presolveDomains: tr.presolveDomains[pName]
+                   elif phi - plo <= 100_000: toSeq(plo..phi)
+                   else: @[]
+        if pDom.len == 0: continue
+        var same = true
+        for pv in pDom:
+            let f = pv - 1
+            if f == toN: continue   # next[toN] = toN: excluded by the circuit
+            if f < 0 or f >= n:
+                same = false
+                break
+            if not cand.outConstrained[f]:
+                # an unconstrained arc out of a fixed link that can't reach toN
+                if cand.linkVarNames[f] == "" and cand.rawFixedLinks[f] - 1 != toN: continue
+                same = false
+                break
+            if dVar != "" and (pv < 1 or pv > dTable.len):
+                same = false
+                break
+            let dv = if dVar != "": dTable[pv - 1] else: 0
+            let row {.cursor.} = cand.tdTravel[f][toN]
+            if term.bVar != "" and (term.bLo > 0 or term.bHi < row.len - 1):
+                same = false   # the mirror's bucket domain would bound t[p] further
+                break
+            for k in 0..<row.len:
+                let tv = term.tdValue(k, pv)
+                let mv = if tv < CircuitTimeTdBigArc: dv + tv - rhs else: CircuitTimeTdBigArc
+                if mv >= CircuitTimeTdBigArc or row[k] >= CircuitTimeTdBigArc:
+                    if mv < CircuitTimeTdBigArc or row[k] < CircuitTimeTdBigArc:
+                        same = false
+                elif mv != row[k]:
+                    same = false
+                if not same: break
+            if not same: break
+        if not same: continue
+        cand.consumedCIs.incl(ci)
+        cand.consumedCIs.incl(aCI)
+        cand.consumedCIs.incl(tCI)
+        cand.consumedCIs.incl(term.idxCI)
+        cand.channelVars.add(aVar)
+        cand.channelVars.add(tVar)
+        cand.channelVars.add(term.idxVar)
+        if term.bVar != "":
+            cand.consumedCIs.incl(term.divCI)
+            cand.channelVars.add(term.bVar)
+        if dCI >= 0:
+            cand.consumedCIs.incl(dCI)
+            cand.channelVars.add(dVar)
+        termOfIdx[term.idxVar] = (tVar, term.table)
+        if mirrorTv[toN] == "":
+            mirrorTv[toN] = tVar
+            mirrorRhs[toN] = rhs
+            mirrorD[toN] = dTable
+            inc nMirror
+
+    # The flattener may repeat a travel lookup (same index, an equal table
+    # under another name) for a redundant sum: such a result is the same term.
+    var termAlias: Table[string, (string, int)]   # duplicate -> (term var, element ci)
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in cand.consumedCIs: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "array_int_element" or con.args.len != 3: continue
+        if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        if con.args[0].ident notin termOfIdx: continue
+        let (tv, table) = termOfIdx[con.args[0].ident]
+        if con.args[2].ident == tv: continue
+        let other = try: tr.resolveIntArray(con.args[1])
+                    except ValueError, KeyError: continue
+        if other == table: termAlias[con.args[2].ident] = (tv, ci)
+
+    # Redundant sums over a complete set of travel terms
+    var lastNode = -1
+    for i in 0..<n:
+        if not cand.outConstrained[i]:
+            if lastNode >= 0 or cand.linkVarNames[i] != "" or
+               cand.rawFixedLinks[i] - 1 != cand.depotIdx:
+                lastNode = -2
+                break
+            lastNode = i
+    if lastNode < 0 or cand.timeVarNames[lastNode] == "": return
+    let tDepot = cand.depotDep
+    var fwdSet: HashSet[string]
+    var fwdBound = -tDepot
+    for i in 0..<n:
+        if cand.outConstrained[i]:
+            fwdSet.incl(durVars[i])
+            fwdBound -= services[i]
+    var mirSet: HashSet[string]
+    var mirBound = -tDepot
+    var mirOk = true
+    for i in 0..<n:
+        if i == cand.depotIdx: continue
+        if mirrorTv[i] == "" or mirrorD[i] != mirrorD[(if cand.depotIdx == 0: 1 else: 0)]:
+            mirOk = false
+            break
+        mirSet.incl(mirrorTv[i])
+        mirBound += mirrorRhs[i]
+    if mirOk:
+        # sum of D over the predecessors: every node but the last
+        let dTab = mirrorD[(if cand.depotIdx == 0: 1 else: 0)]
+        for p in 0..<n:
+            if p == lastNode: continue
+            if dTab.len > 0:
+                if p >= dTab.len:
+                    mirOk = false
+                    break
+                mirBound -= dTab[p]
+    for ci in 0 ..< tr.model.constraints.len:
+        if ci in cand.consumedCIs: continue
+        let con {.cursor.} = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_lin_le": continue
+        let (ok, coeffs, vars, rhs) = tr.circuitTimeParseLinEq(con)
+        if not ok: continue
+        var terms: HashSet[string]
+        var aliasUsed: seq[(string, int)]
+        var hasLast = false
+        var shapeOk = true
+        for k, v in vars:
+            var tv = v
+            if v in termAlias:
+                tv = termAlias[v][0]
+                aliasUsed.add((v, termAlias[v][1]))
+            if coeffs[k] == -1 and v == cand.timeVarNames[lastNode] and not hasLast: hasLast = true
+            elif coeffs[k] == 1 and tv notin terms: terms.incl(tv)
+            else: shapeOk = false
+        if not shapeOk or not hasLast: continue
+        if (terms == fwdSet and rhs >= fwdBound) or
+           (mirOk and terms == mirSet and rhs >= mirBound):
+            cand.consumedCIs.incl(ci)
+            for (v, eci) in aliasUsed:
+                cand.consumedCIs.incl(eci)
+                cand.channelVars.add(v)
+    if nMirror > 0:
+        stderr.writeLine("[FZN] Circuit-time: " & $nMirror &
+                         " predecessor-side mirror arcs implied by the chain")
+
+
 proc tryMatchPredFormCircuitTime(tr: var FznTranslator, circuitCI: int,
                                  elems: seq[FznExpr],
                                  cand: var CircuitTimeCandidate): bool =
@@ -435,11 +764,40 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
         constElemCI[nodeIdx] = ci
         hasDist[nodeIdx] = true
 
-    # Step 2: var elements on a shared time array, indexed by the same link vars
-    var timeElems: seq[FznExpr]
-    var atVars = newSeq[string](n)
-    var varElemCI = newSeq[int](n)
-    var hasAt = newSeq[bool](n)
+    # Step 1b: time-dependent travel terms (tdtsp): d = Ttab[cb*(t_i div L) +
+    # cs*s_i + c0], an array_int_element over an index the int_lin_eq defines
+    # from s_i and an int_div bucket of the node's own time (no bucket term
+    # when the node's time is fixed). Bucket sources are checked in Step 7b.
+    var tdTerm = newSeq[CircuitTimeTdTerm](n)
+    var hasTd = newSeq[bool](n)
+    block:
+        let (divOf, idxDef) = tr.circuitTimeTdDefs()
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "array_int_element" or con.args.len < 3: continue
+            if con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+            var t: CircuitTimeTdTerm
+            var linkName: string
+            if not tr.circuitTimeTdIndex(con, divOf, idxDef, nodeOfLinkVar, t, linkName): continue
+            let nodeIdx = nodeOfLinkVar[linkName]
+            if hasDist[nodeIdx] or hasTd[nodeIdx]: continue
+            if con.args[2].ident in nodeOfLinkVar: continue
+            tdTerm[nodeIdx] = t
+            hasTd[nodeIdx] = true
+            hasDist[nodeIdx] = true
+            durVars[nodeIdx] = con.args[2].ident
+            constElemCI[nodeIdx] = ci
+
+    # Step 2: var elements on a shared time array, indexed by the same link
+    # vars. Several arrays can qualify (tdtsp also chains positions along the
+    # successors); pick the one whose element results share an int_lin_le with
+    # the same node's travel term most often (first on ties).
+    type TimeGroup = object
+        elems: seq[FznExpr]
+        atVars: seq[string]
+        varElemCI: seq[int]
+        hasAt: seq[bool]
+    var groups: seq[TimeGroup]
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         let name = stripSolverPrefix(con.name)
@@ -448,7 +806,7 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
         if not con.hasAnnotation("defines_var"): continue
         if con.args[0].kind != FznIdent: continue
         let nodeIdx = nodeOfLinkVar.getOrDefault(con.args[0].ident, -1)
-        if nodeIdx < 0 or hasAt[nodeIdx]: continue
+        if nodeIdx < 0: continue
         if not hasDist[nodeIdx]: continue
         let arrElems = tr.presolveResolveVarElems(con.args[1])
         if arrElems.len != n: continue
@@ -458,29 +816,55 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
                 shapeOk = false
                 break
         if not shapeOk: continue
-        if timeElems.len == 0:
-            timeElems = arrElems
-        else:
-            var same = true
-            for k in 0..<n:
-                if arrElems[k].kind != timeElems[k].kind:
-                    same = false
-                    break
-                case arrElems[k].kind
-                of FznIdent:
-                    if arrElems[k].ident != timeElems[k].ident:
-                        same = false
-                of FznIntLit:
-                    if arrElems[k].intVal != timeElems[k].intVal:
-                        same = false
-                else:
-                    same = false
-                if not same: break
-            if not same: continue
+        var gi = -1
+        for k, g in groups:
+            if circuitTimeSameElems(g.elems, arrElems):
+                gi = k
+                break
+        if gi < 0:
+            groups.add(TimeGroup(elems: arrElems, atVars: newSeq[string](n),
+                                 varElemCI: newSeq[int](n), hasAt: newSeq[bool](n)))
+            gi = groups.len - 1
+        if groups[gi].hasAt[nodeIdx]: continue
         if con.args[2].kind != FznIdent: continue
-        atVars[nodeIdx] = con.args[2].ident
-        varElemCI[nodeIdx] = ci
-        hasAt[nodeIdx] = true
+        groups[gi].atVars[nodeIdx] = con.args[2].ident
+        groups[gi].varElemCI[nodeIdx] = ci
+        groups[gi].hasAt[nodeIdx] = true
+    var timeElems: seq[FznExpr]
+    var atVars = newSeq[string](n)
+    var varElemCI = newSeq[int](n)
+    var hasAt = newSeq[bool](n)
+    if groups.len == 1:
+        timeElems = groups[0].elems
+        atVars = groups[0].atVars
+        varElemCI = groups[0].varElemCI
+        hasAt = groups[0].hasAt
+    elif groups.len > 1:
+        var leByVar: Table[string, seq[int]]
+        for ci in 0 ..< tr.model.constraints.len:
+            let con {.cursor.} = tr.model.constraints[ci]
+            if stripSolverPrefix(con.name) != "int_lin_le" or con.args.len < 3: continue
+            if con.args[1].kind != FznArrayLit: continue
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: leByVar.mgetOrPut(e.ident, @[]).add(ci)
+        var best = -1
+        var bestScore = -1
+        for k, g in groups:
+            var score = 0
+            for i in 0..<n:
+                if not g.hasAt[i]: continue
+                let dl = leByVar.getOrDefault(durVars[i], @[])
+                for ci in leByVar.getOrDefault(g.atVars[i], @[]):
+                    if ci in dl:
+                        inc score
+                        break
+            if score > bestScore:
+                best = k
+                bestScore = score
+        timeElems = groups[best].elems
+        atVars = groups[best].atVars
+        varElemCI = groups[best].varElemCI
+        hasAt = groups[best].hasAt
 
     if timeElems.len == 0: return false
 
@@ -613,7 +997,7 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     for toN in 0..<n:
         distMatrix[toN] = newSeq[int](n)
     for fromN in 0..<n:
-        if outConstrained[fromN]:
+        if outConstrained[fromN] and not hasTd[fromN]:
             for toN in 0..<n:
                 distMatrix[toN][fromN] = distRows[fromN][toN] + serviceTimes[fromN]
 
@@ -628,6 +1012,56 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
             let (lo, hi) = tr.circuitTimeDomainBounds(timeVarNames[i])
             earlyTimes[i] = lo
             lateTimes[i] = hi
+
+    # Step 7b: time-dependent travel table [from][to][bucket], service folded
+    # in. Each bucket term must divide the node's own time; a node without one
+    # needs a fixed time (its bucket is then a constant).
+    var tdL = 0
+    var anyTd = false
+    for i in 0..<n:
+        if not (outConstrained[i] and hasTd[i]): continue
+        anyTd = true
+        let t {.cursor.} = tdTerm[i]
+        if t.bVar == "":
+            if not timeFixed[i]: return false
+        else:
+            if t.bSrc != timeVarNames[i] or timeVarNames[i] == "": return false
+            if earlyTimes[i] < 0: return false   # int_div truncates toward zero
+            if tdL == 0: tdL = t.bL
+            elif tdL != t.bL: return false
+    var tdTravel: seq[seq[seq[int]]]
+    if anyTd and tdL > 0:
+        for i in 0..<n:
+            if outConstrained[i] and hasTd[i] and tdTerm[i].bVar != "":
+                # t div L must lie in the bucket variable's declared domain
+                let t {.cursor.} = tdTerm[i]
+                if t.bLo > high(int) div 4 or t.bHi < low(int) div 4: return false
+                if t.bLo > 0: earlyTimes[i] = max(earlyTimes[i], t.bLo * tdL)
+                if t.bHi < high(int) div (4 * tdL):
+                    lateTimes[i] = min(lateTimes[i], (t.bHi + 1) * tdL - 1)
+                if earlyTimes[i] > lateTimes[i]: return false
+    if anyTd:
+        if tdL == 0: tdL = high(int) div 4   # every TD node fixed in time: one bucket
+        tdTravel = newSeq[seq[seq[int]]](n)
+        for f in 0..<n:
+            tdTravel[f] = newSeq[seq[int]](n)
+            let kf = if outConstrained[f]: max(0, lateTimes[f]) div tdL + 1 else: 1
+            if kf > 100_000: return false
+            for toN in 0..<n:
+                var row = newSeq[int](kf)
+                if outConstrained[f]:
+                    for k in 0..<kf:
+                        if hasTd[f]:
+                            let v = tdTerm[f].tdValue(k, toN + 1)
+                            row[k] = if v < CircuitTimeTdBigArc: v + serviceTimes[f]
+                                     else: CircuitTimeTdBigArc
+                        else:
+                            row[k] = distRows[f][toN] + serviceTimes[f]
+                tdTravel[f][toN] = row
+            if hasTd[f] and outConstrained[f]:
+                let k0 = min(kf - 1, max(0, earlyTimes[f]) div tdL)
+                for toN in 0..<n:
+                    distMatrix[toN][f] = tdTravel[f][toN][k0]
 
     # Step 8: depot anchor = first fixed-time node
     var depotIdx = -1
@@ -648,6 +1082,12 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
             consumed.incl(linLeCI[i])
             channelVars.add(durVars[i])
             channelVars.add(atVars[i])
+            if hasTd[i]:
+                consumed.incl(tdTerm[i].idxCI)
+                channelVars.add(tdTerm[i].idxVar)
+                if tdTerm[i].bVar != "":
+                    consumed.incl(tdTerm[i].divCI)
+                    channelVars.add(tdTerm[i].bVar)
     for tn in timeVarNames:
         if tn != "": channelVars.add(tn)
 
@@ -673,6 +1113,18 @@ proc tryMatchSuccFormCircuitTime(tr: var FznTranslator, circuitCI: int,
     cand.objectiveWeight = 0               # set by verification when linked
     cand.objectiveMetricLo = metricLo
     cand.objectiveConstOffset = 0
+    if anyTd:
+        cand.tdBucket = tdL
+        cand.tdTravel = tdTravel
+        var tdServices = newSeq[int](n)
+        for i in 0..<n:
+            if outConstrained[i]: tdServices[i] = serviceTimes[i]
+        var fwdTerms: seq[(string, string, seq[int])]
+        for i in 0..<n:
+            if outConstrained[i] and hasTd[i]:
+                fwdTerms.add((tdTerm[i].idxVar, durVars[i], tdTerm[i].table))
+        tr.matchCircuitTimeMirrors(circuitCI, elems, timeElems, tdServices, durVars,
+                                   fwdTerms, cand)
     return true
 
 
@@ -2269,6 +2721,10 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
         )
         if cand.closureFree:
             ctpCon.circuitTimePropState.closureFree = true
+        if cand.tdBucket > 0:
+            ctpCon.circuitTimePropState.setTimeDependentTravel(cand.tdBucket, cand.tdTravel)
+            stderr.writeLine("[FZN] CircuitTimeProp: time-dependent travel, bucket " &
+                             $cand.tdBucket)
         if cand.aliasGroups.len > 0:
             ctpCon.circuitTimePropState.aliasGroups = cand.aliasGroups
             stderr.writeLine("[FZN] CircuitTimeProp: " & $cand.aliasGroups.len &
@@ -2333,3 +2789,127 @@ proc emitCircuitTimePropConstraint(tr: var FznTranslator) =
     if nLinked == 1 and linkedExact:
         tr.sys.circuitTimeObjectiveExact = true
         stderr.writeLine("[FZN] Objective bound delegated to CircuitTimeProp metric (exact single-instance linkage)")
+
+
+proc inferPositionChainCircuits(tr: var FznTranslator) =
+    ## A Hamiltonian tour encoded by positions instead of a circuit (tdtsp):
+    ##   P[S[i]] = P[i] + 1 for every node i but one, b, with S[b] = a fixed,
+    ##   P[a] = 1, P[b] = N, and every P within 1..N.
+    ## Walking S from a, the position rises by one per step and cannot exceed
+    ## N, so the walk reaches b exactly at step N: the N nodes visited are
+    ## distinct (distinct positions), and S[b] = a closes the cycle. So
+    ## circuit(S) is implied; adding it lets circuit-time detection chain P
+    ## (and any time variables) along S.
+    var circuitArgs: HashSet[string]
+    for con in tr.model.constraints:
+        if stripSolverPrefix(con.name) == "crusher_circuit" and con.args.len > 0 and
+           con.args[0].kind == FznIdent:
+            circuitArgs.incl(con.args[0].ident)
+    # Element constraints indexed by a variable: index var -> constraint ids
+    var elemByIndex: Table[string, seq[int]]
+    var linEqByVar: Table[string, seq[int]]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        let name = stripSolverPrefix(con.name)
+        if name in ["array_var_int_element", "array_var_int_element_nonshifted"] and
+           con.args.len == 3 and con.args[0].kind == FznIdent and con.args[1].kind == FznIdent:
+            elemByIndex.mgetOrPut(con.args[0].ident, @[]).add(ci)
+        elif name == "int_lin_eq":
+            let (ok, _, vars, _) = tr.circuitTimeParseLinEq(con)
+            if ok and vars.len == 2:
+                for v in vars: linEqByVar.mgetOrPut(v, @[]).add(ci)
+    var added: seq[string]
+    for decl in tr.model.variables:
+        if not decl.isArray or decl.value == nil or decl.value.kind != FznArrayLit: continue
+        if decl.name in circuitArgs: continue
+        let sElems = decl.value.elems
+        let n = sElems.len
+        if n < 3: continue
+        var bNode = -1
+        var nodeOf: Table[string, int]
+        var ok = true
+        for i, e in sElems:
+            case e.kind
+            of FznIdent:
+                if e.ident in nodeOf: ok = false
+                nodeOf[e.ident] = i
+                let (lo, hi) = tr.circuitTimeDomainBounds(e.ident)
+                if lo < 1 or hi > n: ok = false
+            of FznIntLit:
+                if bNode >= 0 or e.intVal < 1 or e.intVal > n: ok = false
+                bNode = i
+            else: ok = false
+            if not ok: break
+        if not ok or bNode < 0: continue
+        let aNode = sElems[bNode].intVal - 1
+        # Candidate position arrays: element arrays indexed by S entries
+        var pNames: HashSet[string]
+        for vn in nodeOf.keys:
+            for ci in elemByIndex.getOrDefault(vn, @[]):
+                pNames.incl(tr.model.constraints[ci].args[1].ident)
+        for pName in pNames:
+            let pElems = tr.presolveResolveVarElems(FznExpr(kind: FznIdent, ident: pName))
+            if pElems.len != n: continue
+            var pFixed = newSeq[bool](n)
+            var pVal = newSeq[int](n)
+            var pVar = newSeq[string](n)
+            var inRange = true
+            for i, e in pElems:
+                var (f, v) = tr.circuitTimeFixedValue(e)
+                if not f and e.kind == FznIdent:
+                    let (lo, hi) = tr.circuitTimeDomainBounds(e.ident)
+                    if lo == hi: (f, v) = (true, lo)
+                if f:
+                    pFixed[i] = true
+                    pVal[i] = v
+                    if v < 1 or v > n: inRange = false
+                elif e.kind == FznIdent:
+                    pVar[i] = e.ident
+                    let (lo, hi) = tr.circuitTimeDomainBounds(e.ident)
+                    if lo < 1 or hi > n: inRange = false
+                else:
+                    inRange = false
+            if not inRange: continue
+            if not (pFixed[aNode] and pVal[aNode] == 1 and pFixed[bNode] and pVal[bNode] == n):
+                continue
+            var chained = 0
+            for i in 0..<n:
+                if i == bNode: continue
+                let sv = sElems[i].ident
+                var found = false
+                for ci in elemByIndex.getOrDefault(sv, @[]):
+                    let con {.cursor.} = tr.model.constraints[ci]
+                    if con.args[1].ident != pName: continue
+                    let r = con.args[2]
+                    let (rFixed, rVal) = tr.circuitTimeFixedValue(r)
+                    if rFixed:
+                        # P[S_i] = c: needs P_i fixed to c - 1
+                        if pFixed[i] and pVal[i] == rVal - 1: found = true
+                    elif r.kind == FznIdent:
+                        for lci in linEqByVar.getOrDefault(r.ident, @[]):
+                            let (lok, coeffs, vars, rhs) =
+                                tr.circuitTimeParseLinEq(tr.model.constraints[lci])
+                            if not lok: continue
+                            if pFixed[i]:
+                                break   # P_i fixed: presolve fixes r too (rFixed above)
+                            # c_r*r + c_p*P_i = rhs with c_p = -c_r, |c_r| = 1, r = P_i + 1
+                            var ri = -1
+                            var pi = -1
+                            for k, v in vars:
+                                if v == r.ident: ri = k
+                                elif v == pVar[i]: pi = k
+                            if ri >= 0 and pi >= 0 and coeffs[ri] in [-1, 1] and
+                               coeffs[pi] == -coeffs[ri] and rhs * coeffs[ri] == 1:
+                                found = true
+                                break
+                    if found: break
+                if not found: break
+                inc chained
+            if chained != n - 1: continue
+            tr.model.constraints.add(FznConstraint(name: "crusher_circuit",
+                args: @[FznExpr(kind: FznIdent, ident: decl.name)]))
+            circuitArgs.incl(decl.name)
+            added.add(decl.name & " (positions " & pName & ")")
+            break
+    for a in added:
+        stderr.writeLine("[FZN] Implied circuit from a position chain: " & a)
