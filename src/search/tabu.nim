@@ -229,6 +229,14 @@ type
         # for stagnation-time machine-elimination moves
         mmnoIndices*: seq[int]
         machineElimApplied*: int
+        # GuardedCount constraints whose guards are search positions, for the
+        # facility-close move (tabuObjectivePolish)
+        gvIndices*: seq[int]
+        polishCalls*, polishMoves*, dropTries*, dropApplied*, swapTries*, swapApplied*: int
+        polishEstBuilt*: bool
+        polishHasEst*: seq[bool]
+        polishDirect*: seq[T]
+        polishElems*: seq[seq[(int, T)]]   # (element binding, slack coefficient)
 
         deltaMismatches*: int   # CRUSHER_CHECK_DELTA diagnostics
         tourFailStreak*: int    # consecutive fruitless tryTourMoves scans (backoff)
@@ -601,6 +609,7 @@ include tabuFlowMoves
 include tabuLinearRepair
 include tabuCircuitMoves
 include tabuRegularMoves
+include tabuObjectivePolish
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -1708,6 +1717,7 @@ proc balancePermutations[T](state: TabuState[T], verbose: bool = false) =
 
 let gCheckDelta = existsEnv("CRUSHER_CHECK_DELTA")
 const TableMoveEvery = 100    # stagnant iterations between table moves
+const PolishEvery = 100       # stagnant iterations between objective polish passes
 const MachineElimEvery = 20   # stagnant iterations between machine-elimination moves
 const KeepEndEvery = 5        # stagnant iterations between keep-end moves
 
@@ -1815,6 +1825,30 @@ proc cascadeEntryInputs[T](state: TabuState[T], carray: ConstrainedArray[T],
         let binding {.cursor.} = carray.expressionChannelBindings[bidx]
         for ep in binding.expression.positions.items:
             if ep != pos: result.incl(ep)
+
+proc cascadeEntryInputBound[T](state: TabuState[T], carray: ConstrainedArray[T],
+                               kind: CascadeEntryKind, bidx: int): int =
+    ## Upper bound on cascadeEntryInputs(...).len, without building the set.
+    case kind
+    of ceMinMax:
+        let fb {.cursor.} = state.flatMinMaxBindings[bidx]
+        result = fb.linearPositions.len
+        for expr in fb.complexExprs: result += expr.positions.len
+    of ceCountEq: result = carray.countEqChannelBindings[bidx].inputPositions.len
+    of ceConditionalCountEq:
+        let binding {.cursor.} = carray.conditionalCountEqChannelBindings[bidx]
+        result = binding.primaryPositions.len + binding.filterPositions.len +
+            binding.primaryOnlyPositions.len
+    of ceWeightedCountEq: result = carray.weightedCountEqChannelBindings[bidx].inputPositions.len
+    of ceArgmax: result = carray.argmaxChannelBindings[bidx].inputPositions.len
+    of ceCrossingCountMax:
+        let binding {.cursor.} = carray.crossingCountMaxChannelBindings[bidx]
+        result = 2 * binding.cables.len + binding.permPositions.len
+    of ceProfileMax: result = carray.profileMaxChannelBindings[bidx].groupsAtPos.len
+    of ceElement:
+        let bindingPtr = addr carray.channelBindings[bidx]
+        result = bindingPtr.indexExpression.positions.len + bindingPtr.arrayElements.len
+    of ceExpression: result = carray.expressionChannelBindings[bidx].expression.positions.len
 
 proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false, deadline: float = 0.0) =
     state.id = id
@@ -1972,6 +2006,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         ok = false; break
                     ok = true
             if ok: state.mmnoIndices.add(ci)
+        for ci, constraint in state.constraints:
+            if constraint.stateType != GuardedCountType: continue
+            let gc = constraint.guardedCountState
+            var ok = gc.values.len > 0
+            for g in gc.guardPositions:
+                if g in carray.channelPositions or g in carray.fixedPositions: ok = false
+            if ok: state.gvIndices.add(ci)
     if verbose and id == 0 and state.tableChanSrc.len > 0:
         stderr.writeLine("[Init] Table moves via channel source: " & $state.tableChanSrc.len &
                          " tables (of " & $state.tableInConstraintIndices.len & " table moves)")
@@ -3468,10 +3509,22 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                 let budget =
                     if state.sharedDomain[][pos].len <= 2: MaxCascadeInputEdges div 2
                     else: MaxCascadeInputEdges
+                # Cheap bound first: once the budget is nearly spent, building
+                # an entry's input set only to find it does not fit cost wlp02
+                # 12 s per state (3195 sources x a 3219-input count each).
+                # (The bound minus the source itself is exact unless an entry
+                # lists an input twice.)
+                var estEdges = 0
                 for ci in 0..<topoOrder.len:
-                    topoInputs.add state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos)
-                    cascadeEdges += topoInputs[^1].len
-                    if cascadeInputEdges + cascadeEdges > budget: break
+                    estEdges += max(0, state.cascadeEntryInputBound(carray, topoEntryKind[ci], topoBindingIdx[ci]) - 1)
+                    if cascadeInputEdges + estEdges > budget: break
+                if cascadeInputEdges + estEdges > budget:
+                    cascadeEdges = estEdges
+                else:
+                    for ci in 0..<topoOrder.len:
+                        topoInputs.add state.cascadeEntryInputs(carray, topoEntryKind[ci], topoBindingIdx[ci], pos)
+                        cascadeEdges += topoInputs[^1].len
+                        if cascadeInputEdges + cascadeEdges > budget: break
                 if cascadeInputEdges + cascadeEdges > budget:
                     canBuild = false
                     inc edgeBudgetSkipped
@@ -5394,6 +5447,36 @@ proc sampleByPosition[T](moves: seq[(int, T)]): (int, T) =
         i = j
     moves[chosenStart + rand(chosenEnd - chosenStart - 1)]
 
+const RawTieBreakSample = 24  # tied moves simulated per iteration
+
+proc rawObjectiveTieBreak[T](state: TabuState[T], moves: seq[(int, T)]): (int, T) =
+    ## Tie-break equal-cost moves by the raw objective. A scaled objective
+    ## bound (costScale > 1) moves by one cost unit per costScale objective
+    ## units, so most objective-improving moves tie with neutral ones and a
+    ## random pick among them is a random walk in the objective (warehouse:
+    ## supply cost 33k where a greedy assignment over the same open
+    ## facilities pays 11.5k). Simulates a sample of the tied moves and keeps
+    ## the one that lowers the raw objective most.
+    var idx = toSeq(0..<moves.len)
+    if idx.len > RawTieBreakSample:
+        shuffle(idx)
+        idx.setLen(RawTieBreakSample)
+    var best = -1
+    var bestSlack = high(T)
+    var ties = 0
+    for k in idx:
+        let (pos, v) = moves[k]
+        let old = state.assignment[pos]
+        state.assignValueLean(pos, v)
+        let slack = state.boundSlack()
+        state.assignValueLean(pos, old)
+        if slack < bestSlack:
+            bestSlack = slack; best = k; ties = 1
+        elif slack == bestSlack:
+            inc ties
+            if rand(ties - 1) == 0: best = k
+    moves[best]
+
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         let tBM = epochTime()
@@ -5483,7 +5566,9 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.applyElementImpliedMoves(p1)
         state.applyElementImpliedMoves(p2)
     elif moves.len > 0:
-        let (position, newValue) = sampleByPosition(moves)
+        let (position, newValue) =
+            if moves.len > 1 and state.scaledBoundTieBreak(): state.rawObjectiveTieBreak(moves)
+            else: sampleByPosition(moves)
         let oldValue = state.assignment[position]
         # Compute forced changes BEFORE assignValue to capture old values for tabu
         var forcedOldValues: seq[(int, T)]
@@ -5620,6 +5705,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
     if state.mmnoIndices.len > 0:
         echo &"[Tabu S{state.id}] machineElim: applied={state.machineElimApplied}"
+    if state.polishCalls > 0:
+        echo &"[Tabu S{state.id}] objectivePolish: calls={state.polishCalls} moves={state.polishMoves} dropTries={state.dropTries} drops={state.dropApplied} swapTries={state.swapTries} swaps={state.swapApplied}"
     if state.keepEndTasks.len > 0:
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
     if state.permSwapCalls > 0:
@@ -6073,6 +6160,25 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         trialStartCost = state.cost
 
     state.leanSearch = useLeanSearch
+    if state.scaledBoundTieBreak():
+        let budget = if deadline > 0: min(30.0, 0.25 * max(0.0, deadline - epochTime())) else: 5.0
+        # The penalty map built at init is still exact here: climb in
+        # best-move mode so that polish can prefilter on it and its moves
+        # keep it exact (lean commits would leave it stale).
+        let wasLean = state.leanSearch
+        state.leanSearch = false
+        state.objectiveHillClimb(budget)
+        state.leanSearch = wasLean
+        # The climb's time is not a stall, and its result is this state's best
+        state.nearStallRef = epochTime()
+        state.nearFeasRef = state.nearStallRef
+        if state.cost < state.bestCost:
+            state.bestCost = state.cost
+            state.bestAssignment = state.assignment
+            if state.cost == 0:
+                if state.verbose:
+                    state.logExitStats("Solution found via objective polish")
+                return state
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
             (if useLeanSearch: " (lean first-improvement)" else: "")
@@ -6426,6 +6532,22 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                             state.logExitStats("Solution found via machine elimination")
                         state.lastImprovementIter = lastImprovement
                         return state
+
+        # Objective polish under a scaled objective bound: descend the raw
+        # objective again from wherever the tabu walk has drifted
+        if state.iteration - lastImprovement >= PolishEvery and
+           (state.iteration - lastImprovement) mod PolishEvery == 0 and
+           state.scaledBoundTieBreak() and not outOfBudget():
+            state.objectiveHillClimb(1.0)
+            if state.cost < state.bestCost:
+                lastImprovement = state.iteration
+                state.bestCost = state.cost
+                state.bestAssignment = state.assignment
+                if state.cost == 0:
+                    if state.verbose:
+                        state.logExitStats("Solution found via objective polish")
+                    state.lastImprovementIter = lastImprovement
+                    return state
 
         # Keep-end moves: shift a task's start while its end stays put
         if state.iteration - lastImprovement >= KeepEndEvery and
