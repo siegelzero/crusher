@@ -1079,6 +1079,7 @@ include translatorCircuitTime
 include translatorInverseRewrite
 include translatorUnionCircuit
 include translatorLpDive
+include translatorProjection
 
 proc buildObjectiveDominant(tr: var FznTranslator) =
     ## Detects `minimize weight*v + rest` where weight > 0 is at least 10x every
@@ -3458,6 +3459,7 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
             stderr.writeLine(&"[FZN] Channel bound enforcement: {nEmittedLo} lower + {nEmittedHi} upper bounds added on element channels with sentinel values ({nNaturallyInDomain} naturally in domain)")
 
     result.translateSolve()
+    result.projectLocalExistentials()
 
     # Tighten objective lower bound: if objective is max(diff_i) where each diff_i = max(counts) - min(counts),
     # then objective >= 0 since max >= min for the same input set.

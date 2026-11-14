@@ -23,6 +23,7 @@ import test_mznc2026_features
 import test_union_cycle
 import test_circuit_time_prop
 import test_circuit_time_translator
+import test_local_projection
 import test_conditional_count_eq_channels
 import test_conditional_counter_element_channels
 import test_disjunctive_opt

@@ -1244,7 +1244,7 @@ proc extractAbsRelaxations[T](cons: RelationalConstraint[T]): seq[LinearForm[T]]
         relation: GreaterThanEq
     ))
 
-proc evaluateExpression[T](expr: Expression[T], assignment: seq[T]): T =
+proc evaluateExpression*[T](expr: Expression[T], assignment: seq[T]): T =
     ## Statelessly evaluate an Expression with a raw assignment.
     case expr.kind
     of SumExpr:
@@ -1262,7 +1262,7 @@ proc evaluateExpression[T](expr: Expression[T], assignment: seq[T]): T =
     of BinaryPairwiseSumExpr:
         return expr.binaryPairwiseSumExpr.evaluate(assignment)
 
-proc evaluateConstraint[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
+proc evaluateConstraint*[T](cons: StatefulConstraint[T], assignment: seq[T]): T =
     ## Statelessly evaluate a constraint's penalty with a raw assignment.
     ## Returns penalty (0 = satisfied). Returns -1 for unsupported types.
     case cons.stateType
