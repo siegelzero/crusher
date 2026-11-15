@@ -308,6 +308,19 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             var hiProven = false
             let domainHiBound = if upperBound != high(int): upperBound else: high(int)
 
+        # The objective's declared domain is only checked after each solve
+        # (see boundsViolated above). Once a solve lands outside it, the search
+        # does go there (objective polish pushes the objective past any probe
+        # target), so enforce it as a constraint from then on; otherwise a
+        # deadline-free ladder re-asks and rejects forever.
+        var domainEnforced = boundsViolated
+        var domainRejected = false
+        template enforceDomainBound() =
+            if domainRejected and not domainEnforced:
+                domainEnforced = true
+                if upperBound != high(int): system.addConstraint(objective <= upperBound)
+                if lowerBound != low(int): system.addConstraint(objective >= lowerBound)
+
         # A probe state where only the objective-bound constraint is violated
         # is a feasible solution of the original problem (TabuState tracks the
         # best such state as nearBest*, collected into system.nearFeasible*).
@@ -374,6 +387,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if hasBoundConstraint:
                 system.removeLastConstraint()
                 hasBoundConstraint = false
+            enforceDomainBound()
 
             when direction == Minimize:
                 # With an exact single-instance circuit-time linkage the metric
@@ -447,6 +461,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 # dynamic binary search lo/hi which ratchets during no-solution rounds.
                 when direction == Minimize:
                     if lowerBound != low(int) and currentCost < domainLoBound:
+                        domainRejected = true
                         if verbose:
                             echo "[Opt] Rejected infeasible solution: ", currentCost, " < domain lower bound ", domainLoBound
                             flushFile(stdout)
@@ -457,6 +472,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         continue
                 else:
                     if upperBound != high(int) and currentCost > domainHiBound:
+                        domainRejected = true
                         if verbose:
                             echo "[Opt] Rejected infeasible solution: ", currentCost, " > domain upper bound ", domainHiBound
                             flushFile(stdout)
@@ -605,6 +621,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 if hasBoundConstraint:
                     system.removeLastConstraint()
                     hasBoundConstraint = false
+                enforceDomainBound()
 
                 let askFrom = currentCost
                 when direction == Minimize:
@@ -709,6 +726,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                                 objective.initialize(system.assignment)
                                 currentCost = objective.value
                                 if domainLoBound != low(int) and currentCost < domainLoBound:
+                                    domainRejected = true
                                     system.initialize(bestSolution)
                                     objective.initialize(system.assignment)
                                     currentCost = objective.value
@@ -804,6 +822,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     # Note: constraint/fixedPositions restore is handled by the finally block.
                     when direction == Minimize:
                         if domainLoBound != low(int) and currentCost < domainLoBound:
+                            domainRejected = true
                             if verbose:
                                 echo "[Opt] Rejected infeasible retry solution: ", currentCost, " < domain bound ", domainLoBound
                                 flushFile(stdout)
@@ -816,6 +835,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                             continue
                     else:
                         if domainHiBound != high(int) and currentCost > domainHiBound:
+                            domainRejected = true
                             if verbose:
                                 echo "[Opt] Rejected infeasible retry solution: ", currentCost, " > domain bound ", domainHiBound
                                 flushFile(stdout)

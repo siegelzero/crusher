@@ -107,16 +107,31 @@ proc polishBestValue[T](state: TabuState[T], pos: int, excluded: T, mode: Polish
     # Candidate domain indices, in simulation order
     var order: seq[int]
     if hasEst:
-        var est: seq[(T, int)]
+        # Candidates whose own constraints already show the required hard
+        # delta go first, each group cheapest estimate first: the scan's
+        # early exit then usually fires after a simulation or two (closing
+        # a facility otherwise simulated every destination of every input,
+        # most of them full or incompatible).
+        let atPos {.cursor.} = state.constraintsAtPosition[pos]
+        var est: seq[(int, T, int)]
         for di in 0..<n:
             let v = domain[di]
             if v == old or v == excluded: continue
             let e = state.polishEstimate(pos, v)
             if mode == pmPolish and e >= 0: continue
-            est.add((e, di))
+            var direct = 0
+            for c in atPos:
+                if c != state.boundConstraint: direct += c.moveDelta(pos, old, v)
+            let fits = if mode == pmPolish: direct <= 0 else: direct < 0
+            # A repair move must remove a violation; scanning the rest only
+            # finds nothing (most inputs on a destination are not involved).
+            if mode == pmRepair and not fits: continue
+            est.add(((if fits: 0 else: 1), e, di))
         shuffle(est)
-        est.sort(proc (a, b: (T, int)): int = cmp(a[0], b[0]))
-        for (_, di) in est: order.add(di)
+        est.sort(proc (a, b: (int, T, int)): int =
+            result = cmp(a[0], b[0])
+            if result == 0: result = cmp(a[1], b[1]))
+        for (_, _, di) in est: order.add(di)
     elif n > PolishMaxValues:
         for k in 0..<PolishMaxValues: order.add(rand(n - 1))
     else:
@@ -191,6 +206,7 @@ proc tryObjectivePolish[T](state: TabuState[T], budget: float): int =
     state.polishMoves += result
 
 const DropRepairRounds = 3
+const SwapCloseTries = 4
 
 template hardSince[T](state: TabuState[T], baseCost, baseBound: int): int =
     (state.cost - baseCost) - (state.boundConstraint.penalty() - baseBound)
@@ -208,6 +224,12 @@ proc settleSim[T](state: TabuState[T], changes: seq[(int, T)], keep: bool) =
         state.assignValueLean(changes[i][0], changes[i][1])
     for (pos, x) in finalMoves:
         if x != state.assignment[pos]: state.commitPolish(pos, x)
+
+proc rollbackSim[T](state: TabuState[T], changes: var seq[(int, T)], mark: int) =
+    ## Undo the lean-simulated changes after index `mark`.
+    for i in countdown(changes.len - 1, mark):
+        state.assignValueLean(changes[i][0], changes[i][1])
+    changes.setLen(mark)
 
 proc guardInactive[T](state: TabuState[T], c: GuardedCountConstraint[T], s: int): (bool, T) =
     for x in state.sharedDomain[][c.guardPositions[s]]:
@@ -312,6 +334,7 @@ proc tryGuardedValueSwap[T](state: TabuState[T], budget: float): int =
         let (hasOpen, openVal) = state.guardInactive(c, k)
         if not hasOpen: continue
         inc state.swapTries
+        if not state.polishEstBuilt: state.buildPolishEstimates()
         let vk = c.values[k]
         var slotOf = initTable[T, int]()
         for s, v in c.values: slotOf[v] = s
@@ -329,6 +352,8 @@ proc tryGuardedValueSwap[T](state: TabuState[T], budget: float): int =
             if old == vk or p in state.carray.fixedPositions or
                p in state.carray.channelPositions or state.domIdx(p, vk) < 0:
                 continue
+            if state.polishHasEst.len > 0 and state.polishHasEst[p] and
+               state.polishEstimate(p, vk) >= 0: continue
             let cost0 = state.cost
             let bound0 = state.boundConstraint.penalty()
             let slack0 = state.boundSlack()
@@ -343,9 +368,8 @@ proc tryGuardedValueSwap[T](state: TabuState[T], budget: float): int =
                 state.assignValueLean(p, old)
         var keep = false
         if anyLost:
-            # Close the source slot left with the fewest inputs
-            var bestS = -1
-            var bestLoad = high(int)
+            # Close one of the source slots, fewest remaining inputs first
+            var order: seq[(int, int)]
             for s in 0..<lost.len:
                 if lost[s] == 0: continue
                 let g = c.guardPositions[s]
@@ -354,11 +378,16 @@ proc tryGuardedValueSwap[T](state: TabuState[T], budget: float): int =
                 var load = 0
                 for p in c.inputPositions:
                     if state.assignment[p] == c.values[s]: inc load
-                if load < bestLoad:
-                    bestLoad = load; bestS = s
-            if bestS >= 0 and state.simEvictSlot(c, bestS, changes, baseCost, baseBound):
-                keep = state.hardSince(baseCost, baseBound) <= 0 and
-                    state.boundSlack() < baseSlack
+                order.add((load, s))
+            order.sort()
+            let mark = changes.len
+            for oi in 0..<min(order.len, SwapCloseTries):
+                if state.simEvictSlot(c, order[oi][1], changes, baseCost, baseBound) and
+                   state.hardSince(baseCost, baseBound) <= 0 and
+                   state.boundSlack() < baseSlack:
+                    keep = true
+                    break
+                state.rollbackSim(changes, mark)
         state.settleSim(changes, keep)
         if keep: inc result
     state.swapApplied += result
