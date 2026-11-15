@@ -41,7 +41,22 @@ proc watchdogProc(deadline: float) {.thread.} =
   stderr.flushFile()
   discard posix.kill(posix.getpid(), SIGTERM)
 
-proc sigTermHandler(sig: cint) {.noconv.} =
+var gSignalThread: Thread[void]
+
+proc terminationSignals(): Sigset =
+  discard sigemptyset(result)
+  discard sigaddset(result, SIGTERM)
+  discard sigaddset(result, SIGINT)
+
+proc signalThreadProc() {.thread.} =
+  ## SIGTERM/SIGINT are blocked in every thread and taken here with sigwait,
+  ## so the final output runs in ordinary thread context. Printing from an
+  ## asynchronous handler deadlocked when the signal (e.g. the watchdog's)
+  ## interrupted a malloc: the output's own allocation waited on the
+  ## allocator lock held by the interrupted frame.
+  var sigs = terminationSignals()
+  var sig: cint
+  while sigwait(sigs, sig) != 0: discard
   flushFile(stdout)
   if gSavedFd >= 0:
     discard dup2(gSavedFd, stdout.getFileHandle())
@@ -267,8 +282,12 @@ proc main() =
   gSavedFd = savedFd
   gTranslator = addr tr
   gHasSolution = addr tr.sys.hasFeasibleSolution
-  signal(SIGTERM, sigTermHandler)
-  signal(SIGINT, sigTermHandler)
+  # Block the termination signals before any other thread exists (threads
+  # inherit the mask), then take them synchronously in the signal thread
+  var sigs = terminationSignals()
+  var oldSigs: Sigset
+  discard pthread_sigmask(SIG_BLOCK, sigs, oldSigs)
+  createThread(gSignalThread, signalThreadProc)
   signal(SIGPIPE, SIG_IGN)  # Ignore broken pipe (MiniZinc may close stdout early)
 
   # Hard watchdog: SIGTERM ourselves 10s past the deadline if still running
