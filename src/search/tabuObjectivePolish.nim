@@ -9,7 +9,7 @@
 ## violation and lowers the raw objective, so a feasible state stays feasible
 ## and the near-feasible tracking sees every gain.
 
-proc scaledBoundTieBreak[T](state: TabuState[T]): bool {.inline.} =
+proc scaledObjectiveBound[T](state: TabuState[T]): bool {.inline.} =
     state.boundConstraint != nil and
         state.boundConstraint.stateType == RelationalType and
         state.boundConstraint.relationalState.costScale > 1
@@ -179,7 +179,7 @@ proc tryObjectivePolish[T](state: TabuState[T], budget: float): int =
     ## Sweeps the search positions, moving each to its best raw-objective
     ## value that adds no hard violation, until a sweep finds nothing or the
     ## time budget runs out. Returns the number of moves made.
-    if not state.scaledBoundTieBreak(): return 0
+    if not state.scaledObjectiveBound(): return 0
     let t0 = epochTime()
     var positions = state.searchPositions
     # A sweep whose first tenth finds nothing gives up: on problems where
@@ -298,7 +298,7 @@ proc tryGuardedValueDrop[T](state: TabuState[T], budget: float): int =
     ## (the fixed cost saved exceeds the moved inputs' extra cost). Tries the
     ## open slots in random order until the budget runs out. Returns the
     ## number of slots closed.
-    if not state.scaledBoundTieBreak() or state.gvIndices.len == 0: return 0
+    if not state.scaledObjectiveBound() or state.gvIndices.len == 0: return 0
     let t0 = epochTime()
     for (ci, s) in state.guardedSlots():
         if epochTime() - t0 > budget: break
@@ -324,7 +324,7 @@ proc tryGuardedValueSwap[T](state: TabuState[T], budget: float): int =
     ## lost the most of its inputs (simEvictSlot). Kept only when no hard
     ## violation is added and the raw objective falls. Returns the number of
     ## swaps made.
-    if not state.scaledBoundTieBreak() or state.gvIndices.len == 0: return 0
+    if not state.scaledObjectiveBound() or state.gvIndices.len == 0: return 0
     let t0 = epochTime()
     for (ci, k) in state.guardedSlots():
         if epochTime() - t0 > budget: break
@@ -399,7 +399,7 @@ proc objectiveHillClimb[T](state: TabuState[T], budget: float) =
     ## problem, while pushing the objective of a state that still violates
     ## hard constraints steers its repair (unit commitment, 380k hard cost:
     ## 0.56-1.57M instead of 0.25-0.45M).
-    if not state.scaledBoundTieBreak(): return
+    if not state.scaledObjectiveBound(): return
     if state.cost != state.boundConstraint.penalty(): return
     let t0 = epochTime()
     while true:

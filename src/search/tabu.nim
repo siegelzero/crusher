@@ -5447,36 +5447,6 @@ proc sampleByPosition[T](moves: seq[(int, T)]): (int, T) =
         i = j
     moves[chosenStart + rand(chosenEnd - chosenStart - 1)]
 
-const RawTieBreakSample = 24  # tied moves simulated per iteration
-
-proc rawObjectiveTieBreak[T](state: TabuState[T], moves: seq[(int, T)]): (int, T) =
-    ## Tie-break equal-cost moves by the raw objective. A scaled objective
-    ## bound (costScale > 1) moves by one cost unit per costScale objective
-    ## units, so most objective-improving moves tie with neutral ones and a
-    ## random pick among them is a random walk in the objective (warehouse:
-    ## supply cost 33k where a greedy assignment over the same open
-    ## facilities pays 11.5k). Simulates a sample of the tied moves and keeps
-    ## the one that lowers the raw objective most.
-    var idx = toSeq(0..<moves.len)
-    if idx.len > RawTieBreakSample:
-        shuffle(idx)
-        idx.setLen(RawTieBreakSample)
-    var best = -1
-    var bestSlack = high(T)
-    var ties = 0
-    for k in idx:
-        let (pos, v) = moves[k]
-        let old = state.assignment[pos]
-        state.assignValueLean(pos, v)
-        let slack = state.boundSlack()
-        state.assignValueLean(pos, old)
-        if slack < bestSlack:
-            bestSlack = slack; best = k; ties = 1
-        elif slack == bestSlack:
-            inc ties
-            if rand(ties - 1) == 0: best = k
-    moves[best]
-
 proc applyBestMove[T](state: TabuState[T]) {.inline.} =
     when ProfileIteration:
         let tBM = epochTime()
@@ -5566,9 +5536,7 @@ proc applyBestMove[T](state: TabuState[T]) {.inline.} =
         state.applyElementImpliedMoves(p1)
         state.applyElementImpliedMoves(p2)
     elif moves.len > 0:
-        let (position, newValue) =
-            if moves.len > 1 and state.scaledBoundTieBreak(): state.rawObjectiveTieBreak(moves)
-            else: sampleByPosition(moves)
+        let (position, newValue) = sampleByPosition(moves)
         let oldValue = state.assignment[position]
         # Compute forced changes BEFORE assignValue to capture old values for tabu
         var forcedOldValues: seq[(int, T)]
@@ -6160,7 +6128,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         trialStartCost = state.cost
 
     state.leanSearch = useLeanSearch
-    if state.scaledBoundTieBreak():
+    if state.scaledObjectiveBound():
         let budget = if deadline > 0: min(30.0, 0.25 * max(0.0, deadline - epochTime())) else: 5.0
         # The penalty map built at init is still exact here: climb in
         # best-move mode so that polish can prefilter on it and its moves
@@ -6537,7 +6505,7 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # objective again from wherever the tabu walk has drifted
         if state.iteration - lastImprovement >= PolishEvery and
            (state.iteration - lastImprovement) mod PolishEvery == 0 and
-           state.scaledBoundTieBreak() and not outOfBudget():
+           state.scaledObjectiveBound() and not outOfBudget():
             state.objectiveHillClimb(1.0)
             if state.cost < state.bestCost:
                 lastImprovement = state.iteration
