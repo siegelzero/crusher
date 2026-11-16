@@ -631,8 +631,9 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
     var eqVarNames: HashSet[string]
     for defs in boolEqReifByFirst.values:
         for d in defs: eqVarNames.incl(d.eqVar)
+    if eqVarNames.len == 0: return  # step 5 needs a bool_eq_reif for b
     var forcingByEq = initTable[string, seq[tuple[otherLits: HashSet[string], ci: int]]]()
-    for ci in 0 ..< (if eqVarNames.len == 0: 0 else: tr.model.constraints.len):
+    for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
