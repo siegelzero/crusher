@@ -2874,14 +2874,18 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                                 if tp notin visited:
                                     visited.incl(tp)
                                     worklist.add(tp)
-                # Element channel bindings
+                # Element channel bindings. Recursive definitions are reached
+                # but not walked through, as in the cascades: from any input
+                # the walk would cover the whole recursion (sdn-chain: every
+                # link reaches all of domain_path, 1.1 s of each state's init).
                 if p in carray.channelsAtPosition:
                     for bi in carray.channelsAtPosition[p]:
                         let chanPos = carray.channelBindings[bi].channelPosition
                         reachable.incl(chanPos)
                         if chanPos notin visited:
                             visited.incl(chanPos)
-                            worklist.add(chanPos)
+                            if not carray.channelBindings[bi].stopsCascade:
+                                worklist.add(chanPos)
                 # Min/max channel bindings
                 if p in carray.minMaxChannelsAtPosition:
                     for bi in carray.minMaxChannelsAtPosition[p]:
