@@ -625,9 +625,14 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
         boolEqReifByFirst.mgetOrPut(bName, @[]).add((prevVar: prevName, eqVar: eqName, ci: ci))
 
     # Step 4: Build index of forcing clauses: bool_clause([eq, ...], [])
-    # Maps eq var → [(allPosLits, ci)]
+    # Maps eq var → [(allPosLits, ci)]. Only bool_eq_reif outputs are ever
+    # looked up: indexing every literal of every clause cost O(k²) per
+    # k-literal clause (sdn-chain: 1543-literal clauses, ~3.7 s per call).
+    var eqVarNames: HashSet[string]
+    for defs in boolEqReifByFirst.values:
+        for d in defs: eqVarNames.incl(d.eqVar)
     var forcingByEq = initTable[string, seq[tuple[otherLits: HashSet[string], ci: int]]]()
-    for ci in 0 ..< tr.model.constraints.len:
+    for ci in 0 ..< (if eqVarNames.len == 0: 0 else: tr.model.constraints.len):
         let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
         if stripSolverPrefix(con.name) != "bool_clause": continue
@@ -647,6 +652,7 @@ proc detectBoolOrChannels*(tr: var FznTranslator) =
         if not allIdent: continue
         # Index by each element as potential eq variable
         for i, eqCandidate in posNames:
+            if eqCandidate notin eqVarNames: continue
             var others: HashSet[string]
             for j, name in posNames:
                 if j != i: others.incl(name)
