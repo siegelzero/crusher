@@ -17,6 +17,8 @@ sdn_chain_d10n780_1,2020/sdn-chain/model.mzn,2020/sdn-chain/d10n780-1.dzn,minimi
 sdn_chain_d10n780_2,2020/sdn-chain/model.mzn,2020/sdn-chain/d10n780-2.dzn,minimize,30000,22,30
 sdn_chain_2026_d15n180_1,2026/sdn-chain/model.mzn,2026/sdn-chain/d15n180-1.dzn,minimize,15000,36,40
 sdn_chain_2026_d10n780_7,2026/sdn-chain/model.mzn,2026/sdn-chain/d10n780-7.dzn,minimize,45000,29,40
+sdn_chain_d24n600_3,2020/sdn-chain/model.mzn,2020/sdn-chain/d24n600-3.dzn,minimize,60000,12,30
+sdn_chain_2026_d26n600_5,2026/sdn-chain/model.mzn,2026/sdn-chain/d26n600-5.dzn,minimize,60000,12,30
 skill_allocation_1m_1,2020/skill-allocation/skill_allocation_only.mzn,2020/skill-allocation/skill_allocation_mzn_1m_1.dzn,minimize,10000,10,100
 sparse_mds_breast_cancer4,2020/minimal-decision-sets/sparse_mds.mzn,2020/minimal-decision-sets/breast-cancer_train4.dzn,minimize,10000,102,200
 
