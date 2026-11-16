@@ -88,6 +88,17 @@ proc tryChainRepair[T](state: TabuState[T]): bool =
                 elif c.moveDelta(p, state.assignment[p], v) >= 0: continue
             anchors.add((p, v))
         shuffle(anchors)
+        if anchors.len > ChainMaxAnchors:
+            # Too many to try (a 1543-term "some selected link enters this
+            # node" sum): keep the cheapest flips by costDelta. The repairing
+            # link costs at most the count it unbalances; a random one costs
+            # more, and a random sample of 24 found it ~1.5% of the time.
+            var scored: seq[(int, int)]
+            for i, (p, v) in anchors: scored.add((state.costDelta(p, v), i))
+            scored.sort()
+            var kept: seq[(int, T)]
+            for k in 0 ..< ChainMaxAnchors: kept.add(anchors[scored[k][1]])
+            anchors = kept
         if anchors.len > ChainMaxAnchors: anchors.setLen(ChainMaxAnchors)
         for (anchor, av) in anchors:
             if (state.stopSignal != nil and state.stopSignal[].load()) or
