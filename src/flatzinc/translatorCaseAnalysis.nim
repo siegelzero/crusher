@@ -650,7 +650,10 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
                 inc nRejectedIncomplete
                 continue
             if tdom.len == 2:
-                discard  # binary domain: default is the other value (handled below)
+                # One direction only (cond -> T=v): T is free in the uncovered
+                # cases, and defaulting it to the other value cuts solutions
+                inc nRejectedIncomplete
+                continue
             else:
                 # Non-binary domain: default to 0 if it's in the domain and
                 # the mapped value is non-zero (conditional activation pattern)
@@ -926,16 +929,9 @@ proc detectCaseAnalysisChannels(tr: var FznTranslator, timeBudgetMs: float = 200
         var lookupTable = newSeq[int](tableSize)
         var varEntries = initTable[int, CaseAnalysisVarEntry]()
 
-        var defaultVal = 0
-        if not isComplete:
-            let tdom = tr.lookupVarDomain(targetVar).sorted()
-            let mappedVal = entries[0].testVal.intVal
-            if tdom.len == 2:
-                # Binary domain: default is the other value
-                defaultVal = if tdom[0] == mappedVal: tdom[1] else: tdom[0]
-            else:
-                # Non-binary domain: default to 0 (conditional assignment pattern)
-                defaultVal = 0
+        # Incomplete cases reach here only for non-binary targets (conditional
+        # activation): the uncovered cases default to 0
+        let defaultVal = 0
 
         var allResolved = true
 

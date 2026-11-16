@@ -2198,13 +2198,23 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
 
     # Add table constraints for detected implication patterns
     var nTableDomainRestrictions = 0
+    var nTablesCompleted = 0
     for tbl in result.implicationTables:
         let condHasPos = tbl.condVar in result.varPositions
         let targetHasPos = tbl.targetVar in result.varPositions
+        # The tuples are implications (cond == c -> target == t): condition
+        # values no implication mentions leave the target unconstrained
+        var covered: PackedSet[int]
+        for t in tbl.tuples: covered.incl(t[0])
         if condHasPos and targetHasPos:
             let condPos = result.varPositions[tbl.condVar]
             let targetPos = result.varPositions[tbl.targetVar]
-            result.sys.addConstraint(tableInGacSafe[int](@[condPos, targetPos], tbl.tuples))
+            var tuples = tbl.tuples
+            for c in result.sys.baseArray.domain[condPos]:
+                if c notin covered:
+                    for t in result.sys.baseArray.domain[targetPos]: tuples.add(@[c, t])
+            if tuples.len > tbl.tuples.len: inc nTablesCompleted
+            result.sys.addConstraint(tableInGacSafe[int](@[condPos, targetPos], tuples))
         elif not condHasPos and targetHasPos:
             # condVar was eliminated — check if it's a constant
             if tbl.condVar in result.definedVarExprs:
@@ -2239,15 +2249,17 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
                     for t in tbl.tuples:
                         if t[1] == constVal:
                             allowed.incl(t[0])
-                    if allowed.len > 0:
+                    block:
                         let currentDom = result.sys.baseArray.domain[condPos]
                         var newDom: seq[int]
                         for v in currentDom:
-                            if v in allowed:
+                            if v in allowed or v notin covered:
                                 newDom.add(v)
                         if newDom.len > 0 and newDom.len < currentDom.len:
                             result.sys.baseArray.setDomain(condPos, newDom)
                             inc nTableDomainRestrictions
+    if nTablesCompleted > 0:
+        stderr.writeLine(&"[FZN] Implication tables: {nTablesCompleted} of {result.implicationTables.len} allow unmentioned condition values")
     if nTableDomainRestrictions > 0:
         stderr.writeLine(&"[FZN] Table domain restrictions from eliminated variables: {nTableDomainRestrictions}")
 
