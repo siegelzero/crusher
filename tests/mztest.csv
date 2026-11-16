@@ -95,6 +95,8 @@ workforce_alloc_2026_24_56,2026/workforce-alloc/scheduling_model.mzn,2026/workfo
 workforce_alloc_2026_19,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_19.dzn,minimize,15000,9000,40000
 atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance6-stage2.dzn,minimize,5000,726404,726404
 nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,
+# orthorio: rip-up-and-reroute moves (optimum 43; 30 s runs gave 43-45)
+orthorio_2026_challenge_01,2026/orthorio/orthorio.mzn,2026/orthorio/challenge_01.dzn,minimize,30000,43,50
 # warehouse: regression bounds above the worst 15 s result on 5749d8b (wlp02 242508, olil4 102105 over 11 runs), not optima
 warehouse_2026_wlp02,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/wlp02.dzn,minimize,15000,,260000
 warehouse_2026_olil4,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/olil4.dzn,minimize,15000,,120000

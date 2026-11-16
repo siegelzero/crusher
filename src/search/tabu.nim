@@ -61,6 +61,37 @@ type
         ceConditionalCountEq  ## ConditionalCountEq channel binding
         ceExpression  ## Expression channel binding (int_times/int_div/int_mod/int_plus)
 
+    RerouteNet*[T] = ref object
+        ## Routing view of a subcircuit (see tabuRerouteMoves)
+        n*, offset*: int
+        pos*: seq[int]                   # node -> successor position
+        succ*: seq[seq[int]]             # node -> candidate successors (0-based, no self)
+        succIdx*: seq[Table[int, int]]   # node -> successor -> index in succ
+        canIdle*: seq[bool]              # self-loop allowed (optional node)
+        fixedSucc*, fixedPred*: seq[int] # fixed successor / predecessor, or -1
+        sides*: seq[seq[int]]            # node -> side search positions
+        sideLinks*: seq[seq[seq[StatefulConstraint[T]]]]  # node -> side -> link constraints
+        typePos*: seq[int]               # node -> type side position, or -1
+        typeDom*: seq[seq[T]]            # node -> type domain
+        typeLinks*: seq[seq[StatefulConstraint[T]]]  # node -> links of its type
+        allowMask*: seq[seq[uint32]]     # node -> succ index -> types fitting that edge
+        compat*: seq[seq[seq[uint32]]]   # node -> succ index -> type -> successor types
+        anyAllow*: seq[uint32]           # node -> types fitting some edge
+        occReq*: seq[seq[seq[int]]]      # node -> type -> nodes that must be occupied
+        idleVals*: seq[seq[T]]           # node -> side values when idle
+        sources*, targets*: seq[int]     # route endpoints
+        tgt*: seq[int]                   # per route: its target node
+        route*: seq[seq[int]]            # per route: nodes source..target
+        rtype*: seq[seq[int]]            # per route: type index per node (-1 untyped)
+        paired*: bool                    # tgt decided by rrPair
+        nodeHist*: seq[float]
+        edgeHist*: seq[Table[int, float]]
+        blameEdges*, blameNodes*: seq[seq[int]]  # per constraint index
+        carried*: seq[int]               # element constraints indexed by a successor
+        circuitCons*: seq[StatefulConstraint[T]]  # subcircuit / alldifferent over the successors
+        carriedNode*: seq[int]           # node whose successor indexes carried[k]
+        touchPos*: seq[int]              # every position the move may write
+
     TabuState*[T] = ref object of RootObj
         id*: int  # Identifies this state in parallel runs
         # Search budget handles, set by tabuImprove on entry. Long-running
@@ -173,6 +204,11 @@ type
         chainRepairCalls*, chainRepairApplied*: int
         chainFailStreak*, chainNextTry*: int
         chainRepairTime*: float
+        rerouteNets*: seq[RerouteNet[T]]
+        rerouteBuilt*: bool
+        rerouteCalls*, rerouteApplied*, rerouteTries*: int
+        rerouteFailStreak*, rerouteNextTry*: int
+        rerouteTime*: float
         trialAborted*: bool
         trialNeighborCalls*: int
 
@@ -614,6 +650,7 @@ include tabuCircuitMoves
 include tabuRegularMoves
 include tabuObjectivePolish
 include tabuChainRepair
+include tabuRerouteMoves
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -5689,6 +5726,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
     if state.regLineCalls > 0:
         echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
+    if state.rerouteCalls > 0:
+        echo &"[Tabu S{state.id}] reroute: calls={state.rerouteCalls} applied={state.rerouteApplied} tries={state.rerouteTries} time={state.rerouteTime:.2f}s"
     if state.chainRepairCalls > 0:
         echo &"[Tabu S{state.id}] chainRepair: calls={state.chainRepairCalls} applied={state.chainRepairApplied} time={state.chainRepairTime:.2f}s"
     if state.mmnoIndices.len > 0:
@@ -6588,6 +6627,33 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                             state.logExitStats("Solution found via compound count repair")
                         state.lastImprovementIter = lastImprovement
                         return state
+
+        # Rip-up-and-reroute on subcircuit routing models (see
+        # tabuRerouteMoves): an inner negotiated-congestion search over whole
+        # routes, and the main search on such models once it has paid off
+        # (retried after 10 stagnant iterations). Backoff 10 * 2^k iterations
+        # only while it has never improved a state.
+        if state.iteration - lastImprovement >= 10 and
+           state.iteration >= state.rerouteNextTry and
+           (state.rerouteBuilt.not or state.rerouteNets.len > 0) and
+           not outOfBudget():
+            let remaining = if deadline > 0: deadline - epochTime() else: 10.0
+            if state.tryRerouteMoves(clamp(0.25 * remaining, 0.2, 2.0)):
+                state.rerouteFailStreak = 0
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.nearStallRef = epochTime()
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via reroute")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            elif state.rerouteApplied == 0 and state.rerouteCalls >= 4:
+                # Never helped: back off (subcircuits that are not routing problems)
+                state.rerouteFailStreak = min(state.rerouteFailStreak + 1, 8)
+            state.rerouteNextTry = state.iteration + 10 * (1 shl state.rerouteFailStreak)
 
         # Chain repair during stagnation: an anchor flip on a violated
         # constraint plus follow-up flips through the implications it breaks
