@@ -449,6 +449,7 @@ type
         # int_eq_reif(V,1)/int_ne_reif(W,1)/bool_clause patterns).
         # consumedClauses lets the build phase revert (excl from
         # definingConstraints) if it has to skip — keeping the implications live.
+        recursiveIffChannelNames*: HashSet[string]  # int clause-iff channels defined through each other
         implicationOrChannelDefs*: seq[tuple[targetVar: string,
                                              sourceVars: seq[string],
                                              consumedClauses: seq[int]]]
@@ -1502,6 +1503,10 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # disjunctions. Critical for SFC-style problems where selected_nodes[v] is held
     # high by multiple incident link_selection arcs and a count constraint pulls V
     # toward 0; without channelization, single-flip moves are stuck at delta ≥ 0.
+    # Detect 0/1 integers defined by an equivalence with a clause channel
+    # (x = 1 <-> exists(...)), recursive monotone definitions included.
+    # MUST run before detectImplicationOrChannels: its builder encodes them.
+    result.detectIntIffClauseChannels()
     result.detectImplicationOrChannels()
     # Detect implication-AND channels: degree-2 indicators forced up by a single
     # bool_clause and summed via bool2int into a count constraint. The dual of

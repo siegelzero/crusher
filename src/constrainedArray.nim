@@ -24,6 +24,7 @@ type
         indexExpression*: AlgebraicExpression[T]  # Index expr (may be complex, e.g. X+1)
         arrayElements*: SharedElems[T]       # The array (constants and/or variable positions); shared, immutable
         hasOffset*: bool                     # true if any element has non-zero offset
+        stopsCascade*: bool                  # cascades include this channel but not its dependents (recursive definitions)
         # Flat form of a linear index expression (reified linear comparisons
         # index a 0/1 table by a 10-term sum): evaluated as one dot product
         # instead of walking the expression tree. See evalIndex.
@@ -5591,7 +5592,8 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
             channelPosition: binding.channelPosition,
             indexExpression: binding.indexExpression.deepCopy(),
             arrayElements: binding.arrayElements,
-            hasOffset: binding.hasOffset
+            hasOffset: binding.hasOffset,
+            stopsCascade: binding.stopsCascade
         )
     result.channelsAtPosition = arr.channelsAtPosition
 

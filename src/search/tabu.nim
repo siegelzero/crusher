@@ -170,6 +170,9 @@ type
         # pathologically expensive best-move iteration into no-ops.
         trialAbortAt*: float
         regLineCalls*, regLineApplied*: int
+        chainRepairCalls*, chainRepairApplied*: int
+        chainFailStreak*, chainNextTry*: int
+        chainRepairTime*: float
         trialAborted*: bool
         trialNeighborCalls*: int
 
@@ -610,6 +613,7 @@ include tabuLinearRepair
 include tabuCircuitMoves
 include tabuRegularMoves
 include tabuObjectivePolish
+include tabuChainRepair
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -2291,6 +2295,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
         for p in carray.profileMaxChannelBindings[bi].groupsAtPos.keys:
             if p in carray.channelPositions: state.pmHintOk[bi] = false
         state.assignment[carray.profileMaxChannelBindings[bi].channelPosition] = state.pmRebuild(bi)
+    # Recursive (monotone 0/1) definitions start at 0: in-place passes from
+    # the bottom only raise them, so they settle on the least fixpoint
+    # instead of whatever the initial values happened to support. A seed
+    # keeps its own (consistent) values: it may rely on a self-supported cycle.
+    if initialAssignment.len == 0:
+        for binding in carray.channelBindings:
+            if binding.stopsCascade: state.assignment[binding.channelPosition] = T(0)
     while channelChanged:
         channelChanged = false
         fpIter += 1
@@ -3361,10 +3372,12 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                         if chanPos notin visited:
                             visited.incl(chanPos)
                             # Don't propagate downstream from offset channels — they
-                            # create long visit-time backward chains. The channel values
-                            # still propagate correctly at runtime via the worklist, but
-                            # the cascade penalty computation stops here to stay fast.
-                            if not bindingPtr.hasOffset:
+                            # create long visit-time backward chains — nor from recursive
+                            # definitions, whose cascade would span the whole recursion.
+                            # The channel values still propagate correctly at runtime via
+                            # the worklist, but the cascade penalty computation stops here
+                            # to stay fast.
+                            if not bindingPtr.hasOffset and not bindingPtr.stopsCascade:
                                 bfsQueue.add(chanPos)
                 # Min/max channel bindings: include in cascade as dynamic entries.
                 # Implicit channels (detected without defines_var) are cascade-exempt:
@@ -4408,9 +4421,10 @@ proc propagateChannels[T](state: TabuState[T], position: int, changedChannels: v
                     when ProfileIteration:
                         state.propagateNeighborCalls += 1
                     # Skip per-change penalty updates for offset channels (visit-time
-                    # backward chains) to avoid O(n²) cascade re-evaluations. These
+                    # backward chains) and recursive definitions to avoid O(n²)
+                    # cascade re-evaluations. These
                     # are handled by recomputeAffectedChannelDepPenalties in assignValue.
-                    if not bindingPtr.hasOffset:
+                    if not bindingPtr.hasOffset and not bindingPtr.stopsCascade:
                         state.updateNeighborPenalties(bindingPtr.channelPosition)
                     if bindingPtr.channelPosition notin inWorklist:
                         inWorklist.incl(bindingPtr.channelPosition)
@@ -5671,6 +5685,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         (if state.circuitMergesApplied > 0: &" circuitMerges={state.circuitMergesApplied}" else: "")
     if state.regLineCalls > 0:
         echo &"[Tabu S{state.id}] regularLine: calls={state.regLineCalls} applied={state.regLineApplied}"
+    if state.chainRepairCalls > 0:
+        echo &"[Tabu S{state.id}] chainRepair: calls={state.chainRepairCalls} applied={state.chainRepairApplied} time={state.chainRepairTime:.2f}s"
     if state.mmnoIndices.len > 0:
         echo &"[Tabu S{state.id}] machineElim: applied={state.machineElimApplied}"
     if state.polishCalls > 0:
@@ -6568,6 +6584,37 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                             state.logExitStats("Solution found via compound count repair")
                         state.lastImprovementIter = lastImprovement
                         return state
+
+        # Chain repair during stagnation: an anchor flip on a violated
+        # constraint plus follow-up flips through the implications it breaks
+        # (see tabuChainRepair). Chain while improving.
+        # Backoff: after a fruitless call, wait 20 * 2^k iterations (k =
+        # consecutive fruitless calls, reset on success).
+        if state.iteration - lastImprovement >= 20 and
+           state.iteration >= state.chainNextTry and
+           not outOfBudget():
+            let tc = epochTime()
+            var chainIters = 0
+            while chainIters < 20 and not outOfBudget():
+                inc state.chainRepairCalls
+                if not state.tryChainRepair(): break
+                inc chainIters
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        state.chainRepairTime += epochTime() - tc
+                        if state.verbose:
+                            state.logExitStats("Solution found via chain repair")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+            state.chainRepairTime += epochTime() - tc
+            if chainIters == 0:
+                state.chainFailStreak = min(state.chainFailStreak + 1, 8)
+            else:
+                state.chainFailStreak = 0
+            state.chainNextTry = state.iteration + 20 * (1 shl state.chainFailStreak)
 
         state.iteration += 1
 

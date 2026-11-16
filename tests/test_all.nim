@@ -105,6 +105,7 @@ import test_set_intersect_card_objective
 import test_simple_element
 import test_sparse_clamp_channels
 import test_table_constraint
+import test_int_iff_clause_channels
 import test_one_direction_implications
 import test_table_functional_channel
 import test_unified_api

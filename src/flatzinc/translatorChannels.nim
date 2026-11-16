@@ -1141,6 +1141,11 @@ proc buildImplicationOrChannelBindings*(tr: var FznTranslator) =
             arrayElems.add(ArrayElement[int](isConstant: true, constantValue: 1))
 
         tr.sys.baseArray.addChannelBinding(vPos, indexExpr, arrayElems)
+        if vName in tr.recursiveIffChannelNames:
+            # Recursive definition: a cascade through it would span the
+            # whole recursion (sdn-chain: every link reaches all of
+            # domain_path), so cascades stop here
+            tr.sys.baseArray.channelBindings[^1].stopsCascade = true
         nBuilt += 1
 
     if tr.implicationOrChannelDefs.len > 0:

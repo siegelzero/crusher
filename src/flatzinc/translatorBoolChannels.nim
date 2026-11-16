@@ -338,6 +338,202 @@ proc detectBoolClauseIffChannels*(tr: var FznTranslator) =
     if detected > 0:
         stderr.writeLine(&"[FZN] Detected {detected} bool clause iff channels (b ↔ reif via two clauses)")
 
+proc detectIntIffClauseChannels*(tr: var FznTranslator) =
+    ## Detects 0/1 integer variables x defined by an equivalence with a
+    ## clause channel c (c ↔ ∨pos ∨ ¬neg, from bool_clause_reif):
+    ##
+    ##   int_eq_reif(x, 1, b1), int_eq_reif(x, 0, b0)
+    ##   bool_clause([b1], [c])              -- c → x = 1
+    ##   bool_clause(pos ++ [b0], neg)       -- x = 1 → c
+    ##
+    ## and channels x = c. MiniZinc emits this for `x = 1 <-> exists(...)`
+    ## over 0..1 integers (if-then-else reachability in sdn-chain).
+    ##
+    ## Such definitions may be recursive: sdn-chain's domain_path[i,j] is
+    ## defined through other domain_path entries. A recursive x is accepted
+    ## only when every path from its clause back to accepted candidates is
+    ## positive (=1 reifs, ANDs, positive clause literals). Monotone
+    ## definitions keep worklist propagation terminating: one source change
+    ## moves every affected channel the same way. Any fixpoint satisfies the
+    ## equivalences, so the channels never admit an invalid solution.
+    ## Recursive targets go in recursiveIffChannelNames (cascades stop at them).
+    var reifChannelLits: Table[string, tuple[posLits, negLits: HashSet[string]]]
+    for ci in tr.boolClauseReifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if con.args.len < 3 or con.args[2].kind != FznIdent: continue
+        var posLits, negLits: HashSet[string]
+        if con.args[0].kind == FznArrayLit:
+            for e in con.args[0].elems:
+                if e.kind == FznIdent: posLits.incl(e.ident)
+        if con.args[1].kind == FznArrayLit:
+            for e in con.args[1].elems:
+                if e.kind == FznIdent: negLits.incl(e.ident)
+        reifChannelLits[con.args[2].ident] = (posLits: posLits, negLits: negLits)
+    if reifChannelLits.len == 0: return
+    var eqOf: Table[string, tuple[x: string, v: int]]
+    var eq0Of: Table[string, string]   # x -> its (x == 0) literal
+    for ci in tr.reifChannelDefs:
+        let con = tr.model.constraints[ci]
+        if stripSolverPrefix(con.name) != "int_eq_reif": continue
+        if con.args.len < 3 or con.args[0].kind != FznIdent or con.args[2].kind != FznIdent: continue
+        let v = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: continue
+        eqOf[con.args[2].ident] = (x: con.args[0].ident, v: v)
+        if v == 0: eq0Of[con.args[0].ident] = con.args[2].ident
+    proc clauseKey(pos, neg: HashSet[string]): string =
+        var a = toSeq(pos.items)
+        a.sort()
+        var b = toSeq(neg.items)
+        b.sort()
+        a.join(",") & "|" & b.join(",")
+    var simple: seq[tuple[b, c: string, ci: int]]
+    var byKey: Table[string, int]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in tr.definingConstraints: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2 or con.args[0].kind != FznArrayLit or con.args[1].kind != FznArrayLit: continue
+        var pos, neg: HashSet[string]
+        var ok = true
+        for e in con.args[0].elems:
+            if e.kind != FznIdent:
+                ok = false
+                break
+            pos.incl(e.ident)
+        for e in con.args[1].elems:
+            if e.kind != FznIdent:
+                ok = false
+                break
+            neg.incl(e.ident)
+        if not ok: continue
+        if con.args[0].elems.len == 1 and con.args[1].elems.len == 1:
+            simple.add((b: con.args[0].elems[0].ident, c: con.args[1].elems[0].ident, ci: ci))
+        byKey[clauseKey(pos, neg)] = ci
+
+    type Cand = tuple[x, c: string, ci1, ci2: int]
+    var cands: Table[string, Cand]
+    for (b, c, ci1) in simple:
+        if c notin reifChannelLits or b notin eqOf: continue
+        let (x, v) = eqOf[b]
+        if v != 1 or x notin eq0Of or x in cands: continue
+        if x in tr.channelVarNames or x in tr.definedVarNames or x in tr.paramValues: continue
+        if x in tr.equalityCopyAliases: continue
+        let dom = tr.lookupVarDomain(x)
+        if dom.len != 2 or dom[0] != 0 or dom[1] != 1: continue
+        var pos = reifChannelLits[c].posLits
+        pos.incl(eq0Of[x])
+        let k = clauseKey(pos, reifChannelLits[c].negLits)
+        if k notin byKey: continue
+        let ci2 = byKey[k]
+        if ci2 == ci1 or ci2 in tr.definingConstraints: continue
+        cands[x] = (x: x, c: c, ci1: ci1, ci2: ci2)
+    if cands.len == 0: return
+
+    # Defining constraint of each defined variable, for the polarity walk
+    var definer: Table[string, int]
+    for ci, con in tr.model.constraints:
+        if not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent: continue
+        definer[ann.args[0].ident] = ci
+    const PolPos = 1
+    const PolNeg = 2
+    # deps(v, p): candidates and undefined (base) variables v depends on, with
+    # polarity bits; unknown definitions pass both polarities to all their
+    # identifier arguments, and a walk too deep to finish reports "?".
+    var memo: Table[(string, int), Table[string, int]]
+    proc deps(tr: var FznTranslator, v: string, p: int, depth: int,
+              cands: Table[string, Cand], definer: Table[string, int],
+              memo: var Table[(string, int), Table[string, int]]): Table[string, int] =
+        if v in cands: return {v: p}.toTable
+        if v in tr.paramValues: return
+        if (v, p) in memo: return memo[(v, p)]
+        if depth > 64: return {"?": PolPos or PolNeg}.toTable
+        if v notin definer: return {v: p}.toTable
+        memo[(v, p)] = initTable[string, int]()   # cycle guard
+        let flip = (if p == PolPos: PolNeg elif p == PolNeg: PolPos else: p)
+        let con {.cursor.} = tr.model.constraints[definer[v]]
+        let nm = stripSolverPrefix(con.name)
+        var parts: seq[(string, int)]
+        proc addIdents(a: FznExpr, pol: int, parts: var seq[(string, int)]) =
+            if a.kind == FznIdent: parts.add((a.ident, pol))
+            elif a.kind == FznArrayLit:
+                for e in a.elems:
+                    if e.kind == FznIdent: parts.add((e.ident, pol))
+        case nm
+        of "int_eq_reif", "int_ne_reif":
+            let k = try: tr.resolveIntArg(con.args[1]) except ValueError, KeyError: -1
+            let wDom = (if con.args[0].kind == FznIdent: tr.lookupVarDomain(con.args[0].ident) else: @[])
+            let binary = wDom.len == 2 and wDom[0] == 0 and wDom[1] == 1
+            let up = (nm == "int_eq_reif") == (k == 1)
+            if binary and (k == 0 or k == 1):
+                addIdents(con.args[0], (if up: p else: flip), parts)
+            else:
+                addIdents(con.args[0], PolPos or PolNeg, parts)
+        of "array_bool_and", "array_bool_or", "bool2int":
+            addIdents(con.args[0], p, parts)
+        of "bool_clause_reif":
+            addIdents(con.args[0], p, parts)
+            addIdents(con.args[1], flip, parts)
+        of "bool_not":
+            addIdents(con.args[0], flip, parts)
+        else:
+            for a in con.args:
+                if a.kind == FznIdent and a.ident == v: continue
+                addIdents(a, PolPos or PolNeg, parts)
+        for (w, pol) in parts:
+            if w == v: continue
+            for x, bits in tr.deps(w, pol, depth + 1, cands, definer, memo):
+                result[x] = result.getOrDefault(x, 0) or bits
+        memo[(v, p)] = result
+
+    # Reject a candidate whose clause reaches an accepted candidate negatively
+    # (or through a walk too deep to classify), until no rejection changes
+    # the picture. Then the recursive ones must also read each base variable
+    # with one sign only: one source change then moves every recursive
+    # channel the same way, so propagation from a fixpoint is monotone and
+    # ends at a fixpoint.
+    var recursive: HashSet[string]
+    while true:
+        memo.clear()
+        var rejected: seq[string]
+        recursive.clear()
+        var baseOf: Table[string, Table[string, int]]   # recursive x -> its base deps
+        for x, cd in cands:
+            let d = tr.deps(cd.c, PolPos, 0, cands, definer, memo)
+            var neg, onCands = false
+            for y, bits in d:
+                if y in cands:
+                    onCands = true
+                    if (bits and PolNeg) != 0: neg = true
+            if onCands and "?" in d: neg = true
+            if neg:
+                rejected.add(x)
+            elif onCands:
+                recursive.incl(x)
+                var b: Table[string, int]
+                for y, bits in d:
+                    if y notin cands: b[y] = bits
+                baseOf[x] = b
+        if rejected.len == 0:
+            var basePol: Table[string, int]
+            for x, b in baseOf:
+                for y, bits in b: basePol[y] = basePol.getOrDefault(y, 0) or bits
+            for x, b in baseOf:
+                for y in b.keys:
+                    if basePol[y] == (PolPos or PolNeg):
+                        rejected.add(x)
+                        break
+        if rejected.len == 0: break
+        for x in rejected: cands.del(x)
+    for x, cd in cands:
+        tr.implicationOrChannelDefs.add((targetVar: x, sourceVars: @[cd.c],
+                                         consumedClauses: @[cd.ci1, cd.ci2]))
+        tr.channelVarNames.incl(x)
+        tr.definingConstraints.incl(cd.ci1)
+        tr.definingConstraints.incl(cd.ci2)
+    tr.recursiveIffChannelNames = recursive
+    stderr.writeLine(&"[FZN] Detected {cands.len} int clause-iff channels ({recursive.len} recursive)")
+
 proc detectBoolOrChannels*(tr: var FznTranslator) =
     ## Detects boolean OR channels: b = c ∨ prev where c and prev are channels.
     ##
