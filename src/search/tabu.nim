@@ -2800,10 +2800,13 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
     for pos in carray.allSearchPositions():
         state.searchPositions.add(pos)
         let dsize = state.sharedDomain[][pos].len
+        # Lazy positions count too: the size decides between first-improvement
+        # and full best-move scans, and a full scan of a lazy position
+        # evaluates its whole domain on demand (rect-euler EU: 60 lazy
+        # coordinates of ~1500 values ran 5 it/s under best-move).
+        state.totalDomainSize += dsize
         if dsize > LazyThreshold:
             state.isLazy[pos] = true
-        else:
-            state.totalDomainSize += dsize
 
     if verbose and id == 0:
         var bin2, bin3to10, bin11to50, binLarge = 0
