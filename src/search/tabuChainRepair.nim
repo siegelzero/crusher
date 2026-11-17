@@ -17,6 +17,8 @@ const ChainMaxSteps = 32         # follow-up moves after the anchor
 const ChainMaxPartners = 48      # sources scored per broken constraint
 const ChainMaxAnchors = 24       # anchors tried per violated constraint
 const ChainMaxConstraints = 8    # violated constraints sampled per call
+const ChainExpensiveCall = 0.05  # seconds per call above which the time cap applies
+const ChainMaxTimeShare = 0.25   # share of the run expensive chains may take
 
 proc chainFlipValue[T](state: TabuState[T], p: int, v: var T): bool {.inline.} =
     ## The other value of a two-value search position.

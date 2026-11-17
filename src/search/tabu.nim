@@ -6663,12 +6663,21 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # (see tabuChainRepair). Chain while improving.
         # Backoff: after a fruitless call, wait 20 * 2^k iterations (k =
         # consecutive fruitless calls, reset on success).
+        # Time cap: expensive chains (nonogram: ~1 s per call over 35-cell
+        # regular lines, against 4-10 ms on sdn-chain) may take at most a
+        # quarter of the run, or they starve tabu itself (hard_01: 30 vs
+        # 6000 it/s).
+        template chainCapped(spent: float, calls: int): bool =
+            calls > 0 and spent / calls.float > ChainExpensiveCall and
+                spent > ChainMaxTimeShare * (epochTime() - state.startTime)
         if state.iteration - lastImprovement >= 20 and
            state.iteration >= state.chainNextTry and
+           not chainCapped(state.chainRepairTime, state.chainRepairCalls) and
            not outOfBudget():
             let tc = epochTime()
             var chainIters = 0
-            while chainIters < 20 and not outOfBudget():
+            while chainIters < 20 and not outOfBudget() and
+                    not chainCapped(state.chainRepairTime + (epochTime() - tc), state.chainRepairCalls):
                 inc state.chainRepairCalls
                 if not state.tryChainRepair(): break
                 inc chainIters
