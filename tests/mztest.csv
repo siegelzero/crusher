@@ -97,6 +97,8 @@ atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp
 nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,
 # orthorio: rip-up-and-reroute moves (optimum 43; 30 s runs gave 43-45)
 orthorio_2026_challenge_01,2026/orthorio/orthorio.mzn,2026/orthorio/challenge_01.dzn,minimize,30000,43,50
+# 8 agents (optimum 90; 60 s runs gave 91-101)
+orthorio_2026_challenge_13,2026/orthorio/orthorio.mzn,2026/orthorio/challenge_13.dzn,minimize,60000,90,105
 # warehouse: regression bounds above the worst 15 s result on 5749d8b (wlp02 242508, olil4 102105 over 11 runs), not optima
 warehouse_2026_wlp02,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/wlp02.dzn,minimize,15000,,260000
 warehouse_2026_olil4,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/olil4.dzn,minimize,15000,,120000

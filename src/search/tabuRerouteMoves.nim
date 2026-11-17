@@ -26,12 +26,17 @@
 ## routing). Routes may share a cell at a congestion cost that grows over
 ## time; crusher's state holds whichever route was written last there, and
 ## the shared cell shows up as violations until the routes separate.
+## After a stretch without improvement the move restarts with a clean
+## history, either building every route again or going back to its best
+## state and re-routing a few routes from scratch.
 
 import std/heapqueue
 
 const
-    RerouteRestartAfter = 600     # non-improving reroutes before a fresh construction
-    RerouteAcceptWorse = 0.2      # chance to keep a worsening reroute
+    RerouteRestartAfter = 200     # non-improving reroutes before a restart
+    RerouteRestartFromBest = 0.5  # chance a restart resumes from the best state
+    RerouteRestartRipUp = 2       # routes ripped up when resuming from the best state
+    RerouteAcceptWorse = 0.05     # chance to keep a worsening reroute
     ReroutePresGrowth = 1.02      # present-congestion growth per reroute
     RerouteHistStep = 0.3         # history added per violated constraint read, per reroute
     RerouteBlameEvery = 4         # reroutes between history updates
@@ -789,12 +794,13 @@ proc rrPair[T](state: TabuState[T], net: RerouteNet[T]) =
     if state.verbose:
         echo &"[Tabu S{state.id}] Reroute pairing: carried violations={keyOf(bestPerm)[0]} targets={net.tgt}"
 
-proc rrConstruct[T](state: TabuState[T], net: RerouteNet[T], pres: float) =
-    ## Route every source to its target from scratch, in random order.
-    if not net.paired: state.rrPair(net)
+proc rrRipUp[T](state: TabuState[T], net: RerouteNet[T], k: int, pres: float) =
+    ## Rip up k random routes (all of them when k >= the route count) and
+    ## route them again one by one, in random order, around the others.
     var order = toSeq(0 ..< net.sources.len)
     shuffle(order)
-    for r in 0 ..< net.route.len:
+    order.setLen(min(k, order.len))
+    for r in order:
         net.route[r] = @[]
         net.rtype[r] = @[]
     state.rrProject(net)
@@ -805,6 +811,12 @@ proc rrConstruct[T](state: TabuState[T], net: RerouteNet[T], pres: float) =
         net.route[r] = path
         net.rtype[r] = types
         state.rrProject(net)
+
+proc rrConstruct[T](state: TabuState[T], net: RerouteNet[T], pres: float) =
+    ## Route every source to its target from scratch.
+    if not net.paired: state.rrPair(net)
+    state.rrRipUp(net, net.sources.len, pres)
+
 template rrAccept(c, cur: int): bool =
     c <= cur or rand(1.0) < RerouteAcceptWorse
 
@@ -894,6 +906,10 @@ proc tryRerouteMoves[T](state: TabuState[T], budget: float): bool =
         var bestSnap = state.rrSnapshot(net)
         var bestRoutes = net.route
         var bestTypes = net.rtype
+        # best state by the move's own score (restart point)
+        var scoreSnap = bestSnap
+        var scoreRoutes = net.route
+        var scoreTypes = net.rtype
         var it = 0
         var lastImp = 0
         while not stopNow():
@@ -903,7 +919,14 @@ proc tryRerouteMoves[T](state: TabuState[T], budget: float): bool =
                 for h in net.nodeHist.mitems: h = 0.0
                 for e in net.edgeHist.mitems: e.clear()
                 pres = 1.0
-                state.rrConstruct(net, pres)
+                if rand(1.0) < RerouteRestartFromBest:
+                    # Perturb the best state: a few routes again from scratch
+                    state.rrRestore(net, scoreSnap)
+                    net.route = scoreRoutes
+                    net.rtype = scoreTypes
+                    state.rrRipUp(net, RerouteRestartRipUp, pres)
+                else:
+                    state.rrConstruct(net, pres)
                 cur = state.rrScore(net)
                 lastImp = it
             state.rrRerouteOne(net, cur, pres)
@@ -913,6 +936,9 @@ proc tryRerouteMoves[T](state: TabuState[T], budget: float): bool =
             pres = min(pres * ReroutePresGrowth, ReroutePresMax)
             if cur < bestScore:
                 bestScore = cur
+                scoreSnap = state.rrSnapshot(net)
+                scoreRoutes = net.route
+                scoreTypes = net.rtype
                 lastImp = it
             if state.cost < best:
                 best = state.cost
