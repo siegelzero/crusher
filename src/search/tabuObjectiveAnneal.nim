@@ -148,10 +148,16 @@ proc objectiveAnneal[T](state: TabuState[T], deadline: float): bool =
         var disabled: bool
         withLock a.lock:
             if a.schedStart == 0.0:
-                a.calibrated = true
                 if c0 <= 0.0:
-                    if a.schedules == 0: a.disabled = true
+                    # Only a state seeded with the incumbent decides: an
+                    # unseeded one that starts bound-only-violated is no
+                    # sample of the incumbent's neighbourhood (spot5 1407:
+                    # one disabled annealing that gains 4% at 60 s)
+                    if state.id < a.seeded:
+                        a.calibrated = true
+                        if a.schedules == 0: a.disabled = true
                 else:
+                    a.calibrated = true
                     a.t0 = c0
                     a.t1 = c1
                     a.schedStart = now
