@@ -3636,15 +3636,20 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                     let nSrc = if nSrcReaders < 0: n else: nSrcReaders
                     var o2, b2: seq[int]
                     var k2: seq[CascadeEntryKind]
-                    var i2: seq[PackedSet[int]]
                     var newSrc = 0
+                    var w = 0
                     for ci in 0..<n:
                         if not useful[ci]: continue
                         if ci < nSrc: inc newSrc
                         o2.add topoOrder[ci]; b2.add topoBindingIdx[ci]; k2.add topoEntryKind[ci]
-                        i2.add move(topoInputs[ci])
+                        # Compact in place: assigning a whole seq[PackedSet]
+                        # (`topoInputs = move(other)`, even `= @[]`) leaks the
+                        # old elements under this stdlib's PackedSet =copy hook
+                        # (~16 MB per state on sdn-chain d28, every ask).
+                        if w != ci: swap(topoInputs[w], topoInputs[ci])
+                        inc w
                     topoOrder = o2; topoBindingIdx = b2; topoEntryKind = k2
-                    topoInputs = move(i2)
+                    topoInputs.setLen(w)
                     topoSet = initPackedSet[int]()
                     for cp in topoOrder: topoSet.incl(cp)
                     if nSrcReaders >= 0: nSrcReaders = newSrc
