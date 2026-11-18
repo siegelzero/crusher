@@ -307,6 +307,51 @@ proc bestSwapMoves[T](state: TabuState[T]): (seq[(int, int, T, T)], int) =
     return (moves, bestSwapCost)
 
 
+proc evalSwapPair[T](state: TabuState[T], p1, p2: int, fastEval: bool,
+                     delta: var int, tabuBlocked: var bool): bool {.inline.} =
+    ## Exact cost change of exchanging the values of p1 and p2. Returns false
+    ## when the exchange is not allowed (equal values, value outside the other
+    ## domain); `tabuBlocked` when both old values are tabu.
+    let val1 = state.assignment[p1]
+    let val2 = state.assignment[p2]
+    if val1 == val2: return false
+    let idx1 = state.domIdx(p1, val2)
+    let idx2 = state.domIdx(p2, val1)
+    if idx1 < 0 or idx2 < 0: return false
+    tabuBlocked = (not state.isLazy[p1] and state.tabu[p1][idx1] > state.iteration) and
+                  (not state.isLazy[p2] and state.tabu[p2][idx2] > state.iteration)
+    # Exact swap delta: decomposed when safe, else full simulation
+    if fastEval:
+        delta = state.exactSwapDelta(p1, p2, val2, val1)
+    else:
+        let origCost = state.cost
+        state.assignValueLean(p1, val2)
+        state.assignValueLean(p2, val1)
+        delta = state.cost - origCost
+        # Restore (reverse order)
+        state.assignValueLean(p2, val2)
+        state.assignValueLean(p1, val1)
+    true
+
+proc applySwap[T](state: TabuState[T], p1, p2: int) =
+    let oldVal1 = state.assignment[p1]
+    let oldVal2 = state.assignment[p2]
+    state.commitValue(p1, oldVal2)
+    state.commitValue(p2, oldVal1)
+
+    # Set tabu on old values
+    let tabuTenure = state.iteration + 1 + state.iteration mod 10
+    let oldIdx1 = state.domIdx(p1, oldVal1)
+    if oldIdx1 >= 0 and not state.isLazy[p1]:
+        state.tabu[p1][oldIdx1] = tabuTenure
+    let oldIdx2 = state.domIdx(p2, oldVal2)
+    if oldIdx2 >= 0 and not state.isLazy[p2]:
+        state.tabu[p2][oldIdx2] = tabuTenure
+
+template swapStopRequested[T](state: TabuState[T]): bool =
+    (state.stopSignal != nil and state.stopSignal[].load()) or
+        (state.searchDeadline > 0 and epochTime() > state.searchDeadline)
+
 proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
     ## Try value-exchange swaps between search positions.
     ## Uses assignValueLean simulation for exact delta computation.
@@ -325,44 +370,21 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
             continue
         # Swapping two successors of one valid tour splits it: tour moves cover these
         if state.onValidCtpCircuit(p1): continue
-        let val1 = state.assignment[p1]
 
         for j in (i+1)..<state.searchPositions.len:
             let p2 = state.searchPositions[j]
             if state.onValidCtpCircuit(p2): continue
-            let val2 = state.assignment[p2]
-            if val1 == val2:
-                continue
-
-            # Check both values are in each other's domain
-            let idx1 = state.domIdx(p1, val2)
-            let idx2 = state.domIdx(p2, val1)
-            if idx1 < 0 or idx2 < 0:
-                continue
-            let tabu1 = not state.isLazy[p1] and state.tabu[p1][idx1] > state.iteration
-            let tabu2 = not state.isLazy[p2] and state.tabu[p2][idx2] > state.iteration
-
-            # Exact swap delta: decomposed when safe, else full simulation
             var delta: int
-            if fastEval:
-                delta = state.exactSwapDelta(p1, p2, val2, val1)
-            else:
-                let origCost = state.cost
-                state.assignValueLean(p1, val2)
-                state.assignValueLean(p2, val1)
-                delta = state.cost - origCost
-                # Restore (reverse order)
-                state.assignValueLean(p2, val2)
-                state.assignValueLean(p1, val1)
+            var tabuBlocked: bool
+            if not state.evalSwapPair(p1, p2, fastEval, delta, tabuBlocked):
+                continue
 
             inc evalsCount
-            if (evalsCount and 63) == 0 and (
-                    (state.stopSignal != nil and state.stopSignal[].load()) or
-                    (state.searchDeadline > 0 and epochTime() > state.searchDeadline)):
+            if (evalsCount and 63) == 0 and state.swapStopRequested():
                 return false
 
             let aspiration = state.cost + delta < state.bestCost
-            if tabu1 and tabu2 and not aspiration:
+            if tabuBlocked and not aspiration:
                 continue
 
             if delta < bestDelta:
@@ -381,19 +403,111 @@ proc tryGeneralSwapMoves[T](state: TabuState[T]): bool =
 
     # Apply the best swap
     let (p1, p2) = sample(bestSwaps)
-    let oldVal1 = state.assignment[p1]
-    let oldVal2 = state.assignment[p2]
-    state.commitValue(p1, oldVal2)
-    state.commitValue(p2, oldVal1)
+    state.applySwap(p1, p2)
+    return true
 
-    # Set tabu on old values
-    let tabuTenure = state.iteration + 1 + state.iteration mod 10
-    let oldIdx1 = state.domIdx(p1, oldVal1)
-    if oldIdx1 >= 0 and not state.isLazy[p1]:
-        state.tabu[p1][oldIdx1] = tabuTenure
-    let oldIdx2 = state.domIdx(p2, oldVal2)
-    if oldIdx2 >= 0 and not state.isLazy[p2]:
-        state.tabu[p2][oldIdx2] = tabuTenure
+
+# Neighbour swaps for models above the general-swap size limit.
+#
+# The general scan above is all-pairs from position 0, so past ~200 search
+# positions its 2000-evaluation budget never leaves the first few positions.
+# Improving exchanges sit between positions that share a small constraint
+# (gbac UD1, 307 courses: at a single-move local optimum all 51 improving
+# swaps of 41694 pairs exchange two courses of one curriculum, i.e. two
+# positions of one per-curriculum count constraint). Partners are the search
+# positions sharing a constraint of at most NbSwapMaxConstraintSize positions;
+# the scan resumes where the previous call stopped, and calls back off
+# geometrically while they find nothing.
+const NbSwapMaxConstraintSize = 64
+const NbSwapMaxPartners = 256
+const NbSwapMinGap = 20
+const NbSwapMaxGap = 640
+
+proc buildNeighborSwapPartners[T](state: TabuState[T]) =
+    state.nbSwapBuilt = true
+    state.nbSwapGap = NbSwapMinGap
+    let n = state.searchPositions.len
+    var isCand = newSeq[bool](state.assignment.len)
+    for p in state.searchPositions:
+        if p in state.carray.fixedPositions: continue
+        # Two-value positions: an exchange is a double flip, which the binary
+        # swap moves cover (roster_shifts_bool_small, 1450 booleans, lost
+        # ~3% of its objective to these exchanges).
+        if state.sharedDomain[][p].len <= 2: continue
+        isCand[p] = true
+    state.nbSwapPartners = newSeq[seq[int]](n)
+    var total = 0
+    for i, p in state.searchPositions:
+        if not isCand[p]: continue
+        var seen = initPackedSet[int]()
+        var partners: seq[int]
+        block scan:
+            for c in state.constraintsAtPosition[p]:
+                if c.isObjectiveBound or c.positions.len > NbSwapMaxConstraintSize:
+                    continue
+                for q in c.positions.items:
+                    if q == p or not isCand[q] or q in seen: continue
+                    seen.incl(q)
+                    partners.add(q)
+                    if partners.len >= NbSwapMaxPartners: break scan
+        total += partners.len
+        state.nbSwapPartners[i] = partners
+    if total == 0:
+        state.nbSwapPartners = @[]
+    elif n > 0:
+        state.nbSwapCursor = rand(n - 1)
+
+proc tryNeighborSwapMoves[T](state: TabuState[T]): bool =
+    ## Best improving exchange among (position, partner) pairs, scanning from
+    ## the cursor for up to NbSwapMaxEvals evaluations. Same scoring, tabu and
+    ## aspiration rules as tryGeneralSwapMoves.
+    const NbSwapMaxEvals = 2000
+    if not state.nbSwapBuilt: state.buildNeighborSwapPartners()
+    let n = state.nbSwapPartners.len
+    if n == 0: return false
+
+    var bestDelta = 0
+    var bestSwaps: seq[(int, int)] = @[]
+    var evalsCount = 0
+    let fastEval = state.fastSwapEvalOk
+    let start = state.nbSwapCursor mod n
+    var scanned = 0
+    while scanned < n and evalsCount < NbSwapMaxEvals:
+        let i = (start + scanned) mod n
+        inc scanned
+        let p1 = state.searchPositions[i]
+        if state.nbSwapPartners[i].len == 0: continue
+        if state.violationCount[p1] == 0 and
+           state.channelDepPenalties[p1].len == 0:
+            continue
+        if state.onValidCtpCircuit(p1): continue
+        for p2 in state.nbSwapPartners[i]:
+            if state.onValidCtpCircuit(p2): continue
+            var delta: int
+            var tabuBlocked: bool
+            if not state.evalSwapPair(p1, p2, fastEval, delta, tabuBlocked):
+                continue
+            inc evalsCount
+            if (evalsCount and 63) == 0 and state.swapStopRequested():
+                return false
+            let aspiration = state.cost + delta < state.bestCost
+            if tabuBlocked and not aspiration:
+                continue
+            if delta < bestDelta:
+                bestDelta = delta
+                bestSwaps = @[(p1, p2)]
+            elif delta == bestDelta and delta < 0:
+                bestSwaps.add((p1, p2))
+    state.nbSwapCursor = (start + scanned) mod n
+    inc state.nbSwapCalls
+
+    if bestSwaps.len == 0:
+        state.nbSwapGap = min(state.nbSwapGap * 2, NbSwapMaxGap)
+        return false
+    state.nbSwapGap = NbSwapMinGap
+    inc state.nbSwapApplied
+    let (p1, p2) = sample(bestSwaps)
+    state.applySwap(p1, p2)
     return true
 
 

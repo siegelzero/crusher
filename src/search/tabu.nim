@@ -219,6 +219,11 @@ type
         binaryPosIndex*: Table[int, int]     # position -> index in binaryPositions
         swapNeighbors*: seq[seq[int]]        # [binaryIdx] -> neighbor binary indices (by binaryIdx)
         sharedConstraints*: Table[(int,int), seq[StatefulConstraint[T]]]  # (min_pos,max_pos) -> shared constraints
+        # Neighbour swaps above the general-swap size limit (tabuSwapMoves)
+        nbSwapBuilt*: bool
+        nbSwapPartners*: seq[seq[int]]       # [searchPositions index] -> partner positions
+        nbSwapCursor*, nbSwapGap*, nbSwapNextIter*: int
+        nbSwapCalls*, nbSwapApplied*: int
 
         # Ejection chain / flow network structure
         flowEnabled*: bool
@@ -5767,6 +5772,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] reroute: calls={state.rerouteCalls} applied={state.rerouteApplied} tries={state.rerouteTries} time={state.rerouteTime:.2f}s"
     if state.chainRepairCalls > 0:
         echo &"[Tabu S{state.id}] chainRepair: calls={state.chainRepairCalls} applied={state.chainRepairApplied} time={state.chainRepairTime:.2f}s"
+    if state.nbSwapCalls > 0:
+        echo &"[Tabu S{state.id}] neighborSwap: calls={state.nbSwapCalls} applied={state.nbSwapApplied}"
     if state.mmnoIndices.len > 0:
         echo &"[Tabu S{state.id}] machineElim: applied={state.machineElimApplied}"
     if state.polishCalls > 0:
@@ -6403,12 +6410,24 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                         state.lastImprovementIter = lastImprovement
                         return state
 
-        # Try general swap moves periodically during stagnation
-        if state.searchPositions.len <= 200 and
-           state.iteration - lastImprovement >= 20 and
-           (state.iteration - lastImprovement) mod 20 == 0 and
-           not outOfBudget():
-            if state.tryGeneralSwapMoves():
+        # Try general swap moves periodically during stagnation; above 200
+        # search positions, exchanges between positions of a shared small
+        # constraint instead (backing off while they find nothing).
+        let swapDue =
+            if state.searchPositions.len <= 200:
+                state.iteration - lastImprovement >= 20 and
+                    (state.iteration - lastImprovement) mod 20 == 0
+            else:
+                state.iteration - lastImprovement >= NbSwapMinGap and
+                    state.iteration >= state.nbSwapNextIter
+        if swapDue and not outOfBudget():
+            let swapped =
+                if state.searchPositions.len <= 200: state.tryGeneralSwapMoves()
+                else:
+                    let ok = state.tryNeighborSwapMoves()
+                    state.nbSwapNextIter = state.iteration + state.nbSwapGap
+                    ok
+            if swapped:
                 if state.cost < state.bestCost:
                     lastImprovement = state.iteration
                     state.bestCost = state.cost
