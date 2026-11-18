@@ -78,11 +78,11 @@ proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
                 break
             try:
                 if pool.seedAssignment.len > 0 and idx == 0:
-                    pool.results[idx] = newTabuState[T](pool.carrays[idx],
+                    pool.results[idx] = newTabuState[T](move(pool.carrays[idx]),
                         pool.seedAssignment,
                         verbose = pool.verbose, id = idx)
                 else:
-                    pool.results[idx] = newTabuState[T](pool.carrays[idx],
+                    pool.results[idx] = newTabuState[T](move(pool.carrays[idx]),
                         verbose = pool.verbose and idx == 0, id = idx,
                         initStrategy = pool.strategies[idx],
                         deadline = pool.deadline)
@@ -297,7 +297,7 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
                 sleep(1)
 
             # Create TabuState from pre-deepCopied array + assignment, then improve
-            let state = newTabuState[T](pool.carrays[idx], pool.assignments[idx],
+            let state = newTabuState[T](move(pool.carrays[idx]), pool.assignments[idx],
                 verbose = false, id = idx)
             let startTime = epochTime()
             let improved = state.tabuImprove(pool.tabuThreshold, addr pool.solutionFound, pool.deadline)

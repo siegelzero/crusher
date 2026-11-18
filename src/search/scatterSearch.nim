@@ -137,7 +137,7 @@ proc relinkWorker*[T](data: RelinkWorkerData[T]) {.thread.} =
                 sleep(1)
 
             let task = pool.tasks[idx]
-            var relinkState = newRelinkState[T](pool.carrays[idx], task.sourceAssignment, id = idx)
+            var relinkState = newRelinkState[T](move(pool.carrays[idx]), task.sourceAssignment, id = idx)
             let pathEntries = relinkPath(relinkState, task.targetAssignment)
 
             let result = RelinkResult[T](

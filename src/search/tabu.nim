@@ -1893,9 +1893,12 @@ proc cascadeEntryInputBound[T](state: TabuState[T], carray: ConstrainedArray[T],
         result = bindingPtr.indexExpression.positions.len + bindingPtr.arrayElements.len
     of ceExpression: result = carray.expressionChannelBindings[bidx].expression.positions.len
 
-proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false, deadline: float = 0.0) =
+proc init*[T](state: TabuState[T], carrayArg: sink ConstrainedArray[T], verbose: bool = false, id: int = 0, initialAssignment: seq[T] = @[], initStrategy: InitStrategy = isRandom, forRelinking: bool = false, deadline: float = 0.0) =
     state.id = id
-    state.carray = carray
+    # Take ownership: a plain `state.carray = carray` copies the whole array
+    # (seqs are deep-copied under ARC), on top of the caller's deepCopy.
+    state.carray = move(carrayArg)
+    template carray: untyped = state.carray
     # Use shared domain pointer if available (parallel path), otherwise own copy (sequential path)
     if state.carray.sharedDomainPtr != nil:
         state.sharedDomain = state.carray.sharedDomainPtr
@@ -4424,15 +4427,15 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             state.bestAssignment = state.assignment
 
 
-proc newTabuState*[T](carray: ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom, deadline: float = 0.0): TabuState[T] =
+proc newTabuState*[T](carray: sink ConstrainedArray[T], verbose: bool = false, id: int = 0, initStrategy: InitStrategy = isRandom, deadline: float = 0.0): TabuState[T] =
     new(result)
     result.init(carray, verbose, id, initStrategy = initStrategy, deadline = deadline)
 
-proc newTabuState*[T](carray: ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
+proc newTabuState*[T](carray: sink ConstrainedArray[T], assignment: seq[T], verbose: bool = false, id: int = 0): TabuState[T] =
     new(result)
     result.init(carray, verbose, id, initialAssignment = assignment)
 
-proc newRelinkState*[T](carray: ConstrainedArray[T], assignment: seq[T], id: int = 0): TabuState[T] =
+proc newRelinkState*[T](carray: sink ConstrainedArray[T], assignment: seq[T], id: int = 0): TabuState[T] =
     ## Create a lean TabuState for path relinking: skips penalty maps and
     ## channel-dep penalties (only costDelta/assignValueLean are needed).
     new(result)
