@@ -210,25 +210,23 @@ iterator improveStates*[T](population: seq[TabuState[T]],
 
             # Monitor and yield results as they become available
             var yieldedResults = 0
-            var lastResultCount = 0
 
             while yieldedResults < population.len and not pool.solutionFound.load():
-                # Check for new results
-                var currentResults: seq[BatchResult[T]]
+                # Take new results out of the pool (move: copying the whole
+                # accumulated seq on every poll is O(results x assignment)).
+                var newResults: seq[BatchResult[T]]
                 withLock pool.resultsLock:
-                    currentResults = pool.results
+                    newResults = move(pool.results)
+                    pool.results = @[]
 
                 # Yield any new results
-                for i in lastResultCount..<currentResults.len:
-                    let result = currentResults[i]
-                    yield result
+                for i in 0..<newResults.len:
+                    yield newResults[i]
                     inc yieldedResults
 
-                    if result.found:
+                    if newResults[i].found:
                         pool.solutionFound.store(true)
                         break
-
-                lastResultCount = currentResults.len
 
                 if yieldedResults >= population.len or pool.solutionFound.load():
                     break
@@ -250,7 +248,7 @@ iterator improveStates*[T](population: seq[TabuState[T]],
 
             # Yield any remaining results after all workers are done
             withLock pool.resultsLock:
-                for i in lastResultCount..<pool.results.len:
+                for i in 0..<pool.results.len:
                     if yieldedResults < population.len:
                         yield pool.results[i]
                         inc yieldedResults
@@ -417,7 +415,6 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
 
             # Monitor and yield results as they become available
             var yieldedResults = 0
-            var lastResultCount = 0
 
             while yieldedResults < assignments.len and not pool.solutionFound.load():
                 # Create more carrays ahead of workers (lazy, bounded buffer)
@@ -428,21 +425,19 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                     createdSoFar += 1
                     pool.createdUpTo.store(createdSoFar)
 
-                var currentResults: seq[BatchResult[T]]
+                var newResults: seq[BatchResult[T]]
                 withLock pool.resultsLock:
-                    currentResults = pool.results
+                    newResults = move(pool.results)
+                    pool.results = @[]
 
-                for i in lastResultCount..<currentResults.len:
-                    let result = currentResults[i]
-                    yield result
+                for i in 0..<newResults.len:
+                    yield newResults[i]
                     # Free the carray slot — worker already copied it into TabuState
-                    reset(carrays[result.taskIndex])
+                    reset(carrays[newResults[i].taskIndex])
                     inc yieldedResults
-                    if result.found:
+                    if newResults[i].found:
                         pool.solutionFound.store(true)
                         break
-
-                lastResultCount = currentResults.len
 
                 if yieldedResults >= assignments.len or pool.solutionFound.load():
                     break
@@ -462,7 +457,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
 
             # Yield any remaining results after workers complete
             withLock pool.resultsLock:
-                for i in lastResultCount..<pool.results.len:
+                for i in 0..<pool.results.len:
                     if yieldedResults < assignments.len:
                         yield pool.results[i]
                         reset(carrays[pool.results[i].taskIndex])

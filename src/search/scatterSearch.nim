@@ -333,7 +333,15 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
 
                 # Monitor and collect results
                 var collectedResults = 0
-                var lastResultCount = 0
+
+                # Take finished results out of the pool (move, not copy: on
+                # large problems the accumulated path entries reach hundreds
+                # of MB, and copying them every poll stalls the workers on the
+                # lock and leaves ~1 GB of fragmented heap behind).
+                template drainResults(newResults: var seq[RelinkResult[T]]) =
+                    withLock relinkPool.resultsLock:
+                        newResults = move(relinkPool.results)
+                        relinkPool.results = @[]
 
                 while collectedResults < relinkTasks.len and not relinkPool.solutionFound.load():
                     # Create more carrays ahead of workers (lazy, bounded buffer)
@@ -344,20 +352,17 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                         createdSoFar += 1
                         relinkPool.createdUpTo.store(createdSoFar)
 
-                    var currentResults: seq[RelinkResult[T]]
-                    withLock relinkPool.resultsLock:
-                        currentResults = relinkPool.results
+                    var newResults: seq[RelinkResult[T]]
+                    drainResults(newResults)
 
-                    for i in lastResultCount..<currentResults.len:
-                        let res = currentResults[i]
-                        allPathEntries.add(res.pathEntries)
+                    for res in newResults.mitems:
+                        let solved = res.pathEntries.len > 0 and res.pathEntries[^1].cost == 0
+                        for pe in res.pathEntries.mitems:
+                            allPathEntries.add(move(pe))
                         reset(carrays[res.taskIndex])
                         inc collectedResults
-                        if res.pathEntries.len > 0 and res.pathEntries[^1].cost == 0:
+                        if solved:
                             relinkPool.solutionFound.store(true)
-                            break
-
-                    lastResultCount = currentResults.len
 
                     if collectedResults >= relinkTasks.len or relinkPool.solutionFound.load():
                         break
@@ -376,13 +381,12 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 threadsJoined = true
 
                 # Collect any remaining results
-                withLock relinkPool.resultsLock:
-                    for i in lastResultCount..<relinkPool.results.len:
-                        allPathEntries.add(relinkPool.results[i].pathEntries)
-                        reset(carrays[relinkPool.results[i].taskIndex])
-
-                withLock relinkPool.resultsLock:
-                    relinkPool.results.setLen(0)
+                var restResults: seq[RelinkResult[T]]
+                drainResults(restResults)
+                for res in restResults.mitems:
+                    for pe in res.pathEntries.mitems:
+                        allPathEntries.add(move(pe))
+                    reset(carrays[res.taskIndex])
 
         if verbose:
             let relinkElapsed = currentTime() - relinkStart
@@ -505,22 +509,24 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
                 cost: batchResult.cost
             ))
 
+        # Release the diversification states before intensifying (each holds a
+        # full ConstrainedArray copy; ~230 MB apiece on sdn-chain d30).
+        freshPop.setLen(0)
+        reset(freshTemplate)
+
         if verbose:
             echo &"[Scatter] Diversification took {currentTime() - divStart:.2f}s"
 
-        # d. INTENSIFY: Re-optimize all pool members with tabu search
+        # d. INTENSIFY: Re-optimize all pool members with tabu search.
+        # improveFromAssignments builds each state lazily in its worker and drops
+        # it after the task, instead of holding pool-size states at once.
         let intStart = currentTime()
         if verbose:
             echo &"[Scatter] Intensifying pool"
 
-        var intensifyTemplate = system.baseArray.deepCopy()
-        var intensifyPop = newSeq[TabuState[T]](pool.entries.len)
-        for i in 0..<pool.entries.len:
-            let arr = intensifyTemplate.deepCopy()
-            intensifyPop[i] = newTabuState[T](arr, pool.entries[i].assignment, verbose = false, id = i)
-
+        let intensifyAssignments = pool.entries.mapIt(it.assignment)
         var newEntries: seq[PoolEntry[T]] = @[]
-        for batchResult in improveStates(intensifyPop, actualWorkers, effectiveThreshold, verbose = false, deadline = deadline):
+        for batchResult in improveFromAssignments(system, intensifyAssignments, actualWorkers, effectiveThreshold, deadline = deadline):
             if batchResult.found:
                 system.initialize(batchResult.assignment)
                 if verbose:
