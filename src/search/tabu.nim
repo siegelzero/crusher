@@ -17,6 +17,7 @@ const LogInterval* = 50000  # Log every N iterations
 const ProfileMoveDelta* = defined(profileMoveDelta) or defined(profileIteration)
 const ProfileIteration* = defined(profileIteration)
 const LazyThreshold* = 1000  # Positions with domain > this use on-demand costDelta instead of penalty maps
+const WideCoeffScan = 4      # cascade setup scans a constraint's terms only when <= this * cascade size
 const BatchLazyMax* = 10000  # Lazy positions with domain <= this use batch evaluation in bestMoves
 const LeanBatchMinDomain* = 64  # Lean moves score domains at least this wide with batch kernels
 
@@ -329,6 +330,7 @@ type
         # Precomputed coefficient lists for channel-dep constraints (flat arrays, no hash lookups)
         cdConstraintCoeffs: seq[seq[tuple[pos: int, coeff: T]]]   # [constraintIdx][j] = (position, coefficient) - left side
         cdConstraintCoeffsR: seq[seq[tuple[pos: int, coeff: T]]]  # right side coefficients
+        cdCoeffTermIdx, cdCoeffTermIdxR: seq[Table[int, seq[int]]]  # wide constraints: position -> term indices (cascade setup)
         cdConstraintCanFast: seq[bool]                             # can use fast path (both sides PositionBased/Constant)
 
         # Precomputed cascade tables: topology + optional precomputed values.
@@ -3791,16 +3793,35 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
                             var coeffsR: seq[tuple[cascadeIdx: int, coeff: T]] = @[]
                             var srcL, srcR: T
                             if state.cdConstraintCanFast[ci]:
-                                for (cpos, coeff) in state.cdConstraintCoeffs[ci]:
-                                    if cpos in chanToIdx:
-                                        coeffsL.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
-                                    elif cpos == pos:
-                                        srcL += coeff
-                                for (cpos, coeff) in state.cdConstraintCoeffsR[ci]:
-                                    if cpos in chanToIdx:
-                                        coeffsR.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
-                                    elif cpos == pos:
-                                        srcR += coeff
+                                template mapCoeffs(coeffs: untyped, idxOf: untyped,
+                                                   dest: untyped, src: untyped) =
+                                    if coeffs.len <= WideCoeffScan * topoOrder.len:
+                                        for (cpos, coeff) in coeffs:
+                                            if cpos in chanToIdx:
+                                                dest.add((cascadeIdx: chanToIdx[cpos], coeff: coeff))
+                                            elif cpos == pos:
+                                                src += coeff
+                                    else:
+                                        # A wide constraint (an objective bound over
+                                        # ~1800 terms) seen from a small cascade: look
+                                        # the cascade's channels up instead of scanning
+                                        # every term, keeping the term order.
+                                        if idxOf.len == 0:
+                                            idxOf = newSeq[Table[int, seq[int]]](state.channelDepConstraints.len)
+                                        if idxOf[ci].len == 0:
+                                            for k, (cpos, _) in coeffs:
+                                                idxOf[ci].mgetOrPut(cpos, @[]).add(k)
+                                        var hits: seq[(int, int)]   # (term index, cascade index)
+                                        for cIdx, cp in topoOrder:
+                                            idxOf[ci].withValue(cp, ks):
+                                                for k in ks[]: hits.add((k, cIdx))
+                                        hits.sort()
+                                        for (k, cIdx) in hits:
+                                            dest.add((cascadeIdx: cIdx, coeff: coeffs[k][1]))
+                                        idxOf[ci].withValue(pos, ks):
+                                            for k in ks[]: src += coeffs[k][1]
+                                mapCoeffs(state.cdConstraintCoeffs[ci], state.cdCoeffTermIdx, coeffsL, srcL)
+                                mapCoeffs(state.cdConstraintCoeffsR[ci], state.cdCoeffTermIdxR, coeffsR, srcR)
                             constraintCoeffL.add(coeffsL)
                             constraintCoeffR.add(coeffsR)
                             # Joint (direct + cascade) scoring only for the
@@ -3973,9 +3994,14 @@ proc init*[T](state: TabuState[T], carray: ConstrainedArray[T], verbose: bool = 
             block:
                 var entryCons = newSeq[seq[int]](topoOrder.len)
                 for cli, dci in constraintLocalIds:
-                    for p in state.channelDepConstraints[dci].positions.items:
-                        if p in chanToIdx:
-                            entryCons[chanToIdx[p]].add(cli)
+                    let cps {.cursor.} = state.channelDepConstraints[dci].positions
+                    if cps.len <= WideCoeffScan * topoOrder.len:
+                        for p in cps.items:
+                            if p in chanToIdx:
+                                entryCons[chanToIdx[p]].add(cli)
+                    else:
+                        for idx, cp in topoOrder:
+                            if cp in cps: entryCons[idx].add(cli)
                 state.cdCascadeEntryCons.add(entryCons)
                 var singleIdx = newSeq[int](constraintLocalIds.len)
                 for cli, dci in constraintLocalIds:

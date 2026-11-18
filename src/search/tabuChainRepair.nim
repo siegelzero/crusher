@@ -96,7 +96,12 @@ proc tryChainRepair[T](state: TabuState[T]): bool =
             # link costs at most the count it unbalances; a random one costs
             # more, and a random sample of 24 found it ~1.5% of the time.
             var scored: seq[(int, int)]
-            for i, (p, v) in anchors: scored.add((state.costDelta(p, v), i))
+            for i, (p, v) in anchors:
+                # Scoring a wide sum's anchors takes up to ~1 s on sdn-chain:
+                # stop as soon as another worker has solved the probe
+                if (i and 63) == 63 and state.stopSignal != nil and state.stopSignal[].load():
+                    return false
+                scored.add((state.costDelta(p, v), i))
             scored.sort()
             var kept: seq[(int, T)]
             for k in 0 ..< ChainMaxAnchors: kept.add(anchors[scored[k][1]])
