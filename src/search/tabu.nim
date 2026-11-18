@@ -1,4 +1,4 @@
-import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os]
+import std/[algorithm, math, packedsets, random, sequtils, sets, strutils, tables, atomics, strformat, os, locks]
 from std/times import epochTime, cpuTime
 
 import ../constraints/[algebraic, stateful, allDifferent, relationalConstraint, elementState, types, cumulative, geost, matrixElement, constraintNode, tableConstraint, nvalue, diffn, noOverlapFixedBox, circuit, unionCycle, involution, conditionalCumulative, conditionalNoOverlap, conditionalDayCapacity, disjunctiveClause, adjacencyEqual, valueSupport, multiResourceNoOverlap, circuitTimeProp, multiMachineNoOverlap, conditionalLinear, reservoir, setIntersectCard, conjunctSumAtMost, pseudoBoolLinLe, groupValueDisjoint, guardedCount]
@@ -656,6 +656,7 @@ include tabuLinearRepair
 include tabuCircuitMoves
 include tabuRegularMoves
 include tabuObjectivePolish
+include tabuObjectiveAnneal
 include tabuChainRepair
 include tabuRerouteMoves
 
@@ -6250,6 +6251,37 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
                 if state.verbose:
                     state.logExitStats("Solution found via objective polish")
                 return state
+    elif state.annealApplicable():
+        # Ask seeded with the incumbent: anneal the raw objective first
+        # (tabuObjectiveAnneal.nim)
+        let annealDone = state.objectiveAnneal(deadline)
+        # Its lean moves left the penalty structures stale
+        if not state.leanSearch:
+            for pos in state.channelDepSearchPositions:
+                if not state.isLazy[pos]:
+                    state.computeChannelDepPenaltiesAt(pos)
+            state.rebuildPenaltyMap()
+        state.nearStallRef = epochTime()
+        state.nearFeasRef = state.nearStallRef
+        if state.cost < state.bestCost:
+            state.bestCost = state.cost
+            state.bestAssignment = state.assignment
+        if state.cost == 0:
+            if state.verbose:
+                state.logExitStats("Solution found via objective anneal")
+            return state
+        if state.cost == state.boundConstraint.penalty():
+            let raw = max(int(state.boundSlack()), 1)
+            if raw < state.nearBestCost:
+                state.nearBestCost = raw
+                state.nearBestAssignment = state.assignment
+        if annealDone:
+            if state.verbose:
+                state.logExitStats("Anneal schedule finished")
+            return state
+        # The lean/best-move trial measures the tabu walk only
+        trialStartT = epochTime()
+        trialStartCost = state.cost
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
             (if useLeanSearch: " (lean first-improvement)" else: "")

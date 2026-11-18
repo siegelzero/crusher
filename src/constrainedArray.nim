@@ -1,4 +1,4 @@
-import std/[packedsets, sequtils, strformat, tables, times]
+import std/[locks, packedsets, sequtils, strformat, tables, times]
 from std/os import existsEnv
 import constraints/[stateful, algebraic, ordering, types, tableConstraint, regular, sharedElems]
 export sharedElems
@@ -138,9 +138,23 @@ type
         forwardValues*: seq[T]       # explicit values per forward position (empty = use i + forwardBase)
         constantEntries*: seq[(int, T)]  # (inverseIndex, value) for constant inverse positions
 
+    AnnealShared* = object
+        ## Objective-annealing schedule shared by the tabu states of one
+        ## optimisation run (see search/tabuObjectiveAnneal.nim).
+        lock*: Lock
+        calibrated*, disabled*: bool
+        t0*, t1*: float          # temperature range of the current schedule
+        schedStart*: float       # wall-clock start of the current schedule (0 = none)
+        schedLen*: float         # its length in seconds
+        schedules*: int
+        seeded*: int             # states of the current ask seeded from the incumbent
+
     ConstrainedArray*[T] = object
         len*: int
         constraints*: seq[StatefulConstraint[T]]
+        # Optimizer runs with a deadline: the shared objective-annealing
+        # schedule (nil = no annealing). Owned by the optimizer.
+        anneal*: ptr AnnealShared
         # Optimizer probes/asks: a tabu run stops once its near-feasible
         # incumbent (only the objective bound violated) has not improved for
         # this many seconds (0 = off). Copied into every TabuState.
@@ -5551,6 +5565,7 @@ proc deepCopy*[T](arr: ConstrainedArray[T]): ConstrainedArray[T] =
     result.len = arr.len
     result.nearStallSecs = arr.nearStallSecs
     result.nearGapCap = arr.nearGapCap
+    result.anneal = arr.anneal
 
     if arr.sharedDomainPtr != nil:
         # Parallel search state: domain not needed (reduceDomain already ran),

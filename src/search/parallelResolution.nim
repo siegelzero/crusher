@@ -58,7 +58,8 @@ type
         carrays: ptr UncheckedArray[ConstrainedArray[T]]
         results: ptr UncheckedArray[TabuState[T]]
         strategies: ptr UncheckedArray[InitStrategy]
-        seedAssignment: seq[T]  ## If non-empty, state 0 uses this as initial assignment
+        seedAssignment: seq[T]  ## If non-empty, states 0..<seededCount use this as initial assignment
+        seededCount: int
         nextTaskIndex: Atomic[int]
         totalTasks: int
         verbose: bool
@@ -77,10 +78,10 @@ proc initPoolWorker[T](data: InitWorkerData[T]) {.thread.} =
             if idx >= pool.totalTasks:
                 break
             try:
-                if pool.seedAssignment.len > 0 and idx == 0:
+                if pool.seedAssignment.len > 0 and idx < pool.seededCount:
                     pool.results[idx] = newTabuState[T](move(pool.carrays[idx]),
                         pool.seedAssignment,
-                        verbose = pool.verbose, id = idx)
+                        verbose = pool.verbose and idx <= 1, id = idx)
                 else:
                     pool.results[idx] = newTabuState[T](move(pool.carrays[idx]),
                         verbose = pool.verbose and idx == 0, id = idx,
@@ -514,10 +515,14 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     # feasibility solve), all states use random to avoid extreme-init solutions with
     # terrible objectives dominating the initial solution selection.
     var strategies = newSeq[InitStrategy](populationSize)
+    let seededCount = if seedAssignment.len > 0: min(populationSize, annealSeedCount(system.baseArray.anneal, actualWorkers)) else: 0
+    if system.baseArray.anneal != nil:
+        withLock system.baseArray.anneal.lock:
+            system.baseArray.anneal.seeded = seededCount
     if seedAssignment.len > 0:
-        # State 0: seeded (handled separately in initPoolWorker), shift min/max to 1/2
+        # States 0..<seededCount: seeded (handled separately in initPoolWorker), shift min/max after them
         for i in 0..<populationSize:
-            strategies[i] = initStrategyForPopulation(i - 1, populationSize - 1)
+            strategies[i] = initStrategyForPopulation(i - seededCount, populationSize - seededCount)
     elif populationSize >= 3:
         # Initial feasibility solve: workers 0/1 get domain min/max for diversity
         # (helps problems where extreme inits like all-zeros are near-feasible),
@@ -536,6 +541,7 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         results: cast[ptr UncheckedArray[TabuState[T]]](addr population[0]),
         strategies: cast[ptr UncheckedArray[InitStrategy]](addr strategies[0]),
         seedAssignment: seedAssignment,
+        seededCount: seededCount,
         totalTasks: populationSize,
         verbose: verbose,
         deadline: deadline

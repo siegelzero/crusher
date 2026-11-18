@@ -1,7 +1,7 @@
 
 import resolution
 from std/times import epochTime
-import std/[algorithm, packedsets]
+import std/[algorithm, locks, packedsets]
 import std/tables
 from std/os import getEnv
 from std/strutils import parseInt
@@ -141,6 +141,19 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 workers * 2
         else:
             if populationSize > 0: populationSize else: 8
+
+        # Objective annealing (tabuObjectiveAnneal.nim) runs on a wall-clock
+        # schedule, so only under a deadline.
+        var annealShared: ptr AnnealShared = nil
+        if deadline > 0:
+            annealShared = createShared(AnnealShared)
+            initLock(annealShared.lock)
+            system.baseArray.anneal = annealShared
+        defer:
+            if annealShared != nil:
+                system.baseArray.anneal = nil
+                deinitLock(annealShared.lock)
+                freeShared(annealShared)
 
         # Find initial feasible solution: single unified resolve with tabu + scatter fallback.
         # Tabu probe runs first; if it fails, scatter search continues from the tabu pool
