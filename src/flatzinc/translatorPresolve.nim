@@ -1446,9 +1446,11 @@ proc resolveReifications(tr: FznTranslator,
         elif name == "bool2int" and con.args.len >= 2:
             let bName = presolveVarName(con.args[0])
             let xName = presolveVarName(con.args[1])
-            # Propagate domain intersection in both directions
-            let bDom {.cursor.} = if bName != "" and bName in domains: domains[bName] else: presolveEmptyDom
-            let xDom {.cursor.} = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
+            # Propagate domain intersection in both directions. Copies, not
+            # cursors: tightening x replaces domains[x] (freeing the old seq),
+            # and xDom is read after that.
+            let bDom = if bName != "" and bName in domains: domains[bName] else: presolveEmptyDom
+            let xDom = if xName != "" and xName in domains: domains[xName] else: presolveEmptyDom
             if bDom.len > 0 and xName != "":
                 if presolveTightenDomain(domains, xName, bDom, infeasible):
                     result = true
