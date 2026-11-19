@@ -3713,7 +3713,8 @@ proc productChainBoundPropagate(tr: FznTranslator,
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         if ci in eliminated: continue
-        if stripSolverPrefix(con.name) != "int_times": continue
+        # stripSolverPrefix maps prefixed names to fzn_*, never to int_times
+        if con.name != "int_times": continue
         if con.args.len < 3: continue
         if not con.hasAnnotation("defines_var"): continue
         let aName = presolveVarName(con.args[0])
@@ -3729,6 +3730,20 @@ proc productChainBoundPropagate(tr: FznTranslator,
         prodToSmall[pName] = smallName
 
     if productsByFactor.len == 0: return
+
+    # The int_lin_le constraints, parsed once: the steps below scan them per
+    # factor group and per chain (nside MEDIUM_2000_500: 200 of 601K
+    # constraints, and rescanning every constraint per group took ~180 s)
+    type ParsedLinLe = tuple[coeffs: seq[int], varNames: seq[string], rhs: int]
+    var linLes: seq[ParsedLinLe]
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in eliminated: continue
+        if con.name != "int_lin_le": continue
+        let parsed = tr.resolveLinLeArgs(con)
+        if parsed.ok:
+            linLes.add((coeffs: parsed.coeffs, varNames: parsed.varNames, rhs: parsed.rhs))
+    if linLes.len == 0: return
 
     # Step 2: For each factor group, detect chains
     for factorName, products in productsByFactor:
@@ -3750,12 +3765,7 @@ proc productChainBoundPropagate(tr: FznTranslator,
 
         var chainLinks: seq[ChainLink]
 
-        for ci in 0 ..< tr.model.constraints.len:
-            let con {.cursor.} = tr.model.constraints[ci]
-            if ci in eliminated: continue
-            if stripSolverPrefix(con.name) != "int_lin_le": continue
-            let parsed = tr.resolveLinLeArgs(con)
-            if not parsed.ok: continue
+        for parsed in linLes:
 
             # Find exactly one product variable
             var prodIdx = -1
@@ -3887,12 +3897,7 @@ proc productChainBoundPropagate(tr: FznTranslator,
             var foundClosing = false
 
             if realChainEnd != "":
-                for ci in 0 ..< tr.model.constraints.len:
-                    let con {.cursor.} = tr.model.constraints[ci]
-                    if ci in eliminated: continue
-                    if stripSolverPrefix(con.name) != "int_lin_le": continue
-                    let parsed = tr.resolveLinLeArgs(con)
-                    if not parsed.ok: continue
+                for parsed in linLes:
                     var endCoeff, factCoeff, fixContrib: int
                     var endFound, factFound: bool
                     for i, vn in parsed.varNames:
@@ -3916,12 +3921,7 @@ proc productChainBoundPropagate(tr: FznTranslator,
                 if sn != "": smallNameSet.incl(sn)
 
             var sumBound = int.high
-            for ci in 0 ..< tr.model.constraints.len:
-                let con {.cursor.} = tr.model.constraints[ci]
-                if ci in eliminated: continue
-                if stripSolverPrefix(con.name) != "int_lin_le": continue
-                let parsed = tr.resolveLinLeArgs(con)
-                if not parsed.ok: continue
+            for parsed in linLes:
                 var allSmall = true
                 var allSameCoeff = true
                 var fixedSum = 0
