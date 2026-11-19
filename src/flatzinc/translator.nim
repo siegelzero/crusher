@@ -1324,6 +1324,11 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # Canonicalize single-term linear reifs into primitive eq/ne/le_reif so
     # presolve and all downstream pattern-detection passes see a uniform shape.
     result.canonicalizeLinearReifs()
+    # Group `c * bool2int(x == v)` sum terms over the same x into table channels.
+    # Before presolve: the grouping reads declared domains only, and the
+    # product/indicator definitions it leaves dead (nside: ~595K of 600K
+    # constraints) would otherwise cost presolve ~60 s.
+    result.groupIndicatorSums()
     # Presolve: fixpoint propagation to fix singletons, tighten domains, eliminate constraints
     result.presolve()
     # Equalities whose reification presolve fixed true become FZN aliases.
@@ -1337,8 +1342,6 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
     # flattened by MZN's CSE create independent positions for the same logical variable,
     # breaking the model's implicit equalities.
     result.canonicalizeFznVarAliases()
-    # Group `c * bool2int(x == v)` sum terms over the same x into table channels
-    result.groupIndicatorSums()
     # Tours encoded by positions (P[S[i]] = P[i] + 1) imply circuit(S)
     result.inferPositionChainCircuits()
     # Collect defined variables before translating variables
@@ -1849,7 +1852,14 @@ proc translate*(model: FznModel, timeBudgetSecs: float = 0.0): FznTranslator =
                 let dom = if e.ident in result.paramValues: @[result.paramValues[e.ident]]
                           else: result.lookupTightenedDomain(e.ident)
                 if dom.len == 0: ok = false; break
-                let (dmin, dmax) = (min(dom), max(dom))
+                var (dmin, dmax) = (min(dom), max(dom))
+                # A profile max channel lies in its slots' natural range
+                # (presolve runs after the grouping and never sees its sums)
+                for def in result.profileMaxDefs:
+                    if def.maxVarName == e.ident:
+                        dmin = max(dmin, def.natLo)
+                        dmax = min(dmax, def.natHi)
+                if dmin > dmax: ok = false; break
                 if coeffs[i] >= 0:
                     lo += coeffs[i] * dmin; hi += coeffs[i] * dmax
                 else:
