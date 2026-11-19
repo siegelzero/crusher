@@ -5446,6 +5446,159 @@ proc inferUnboundedDomains(tr: FznTranslator,
         discard fixSingletons(domains, fixedVars)
 
 
+proc disjunctionImpliedDomainPropagate(tr: FznTranslator,
+                                       domains: var Table[string, seq[int]],
+                                       fixedVars: Table[string, int],
+                                       eliminated: PackedSet[int],
+                                       infeasible: var bool): bool =
+    ## Constructive disjunction over clauses: for bool_clause([l_1..l_k], [])
+    ## where every literal l_i, when true, bounds a shared integer x to an
+    ## interval I_i, dom(x) ⊆ ∪ I_i. A literal's intervals come from its
+    ## reification (int_le/lt/eq_reif against a constant, single-term
+    ## int_lin_le_reif) and from what it implies: array_bool_and(as, l)
+    ## (l → each a) and bool_clause([m], [l]) (l → m), followed up to
+    ## three steps. Generalises disjunctionEqualitiesPropagate (all l_i =
+    ## (x = c_i)) to ranges and chained implications.
+    ##
+    ## kitchen: `(w > 0) -> used(s)` and `pairs[s,f] -> w in [min_f, max_f]`
+    ## give the clause (w <= 0) \/ pairs[s,f_1] \/ ... with
+    ## pairs[s,f] -> and(w >= min_f, w <= max_f): a base segment's width
+    ## 0..650 shrinks to {0, 200, 400, 600, 650}.
+    ##
+    ## Defined (channel) variables are left alone: their presolved domains
+    ## are not enforced, so a tightening there could license dropping the
+    ## very constraints it came from.
+    result = false
+    type Iv = tuple[lo, hi: int]
+    var direct: Table[string, seq[(string, Iv)]]   # literal -> (x, interval) when true
+    var implies: Table[string, seq[string]]        # literal -> literals it forces true
+    var defined: HashSet[string]
+    const NoLo = low(int) div 4
+    const NoHi = high(int) div 4
+
+    proc isLit(e: FznExpr): bool {.inline.} = e.kind == FznIntLit
+    for ci in 0 ..< tr.model.constraints.len:
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in eliminated: continue
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len >= 1 and ann.args[0].kind == FznIdent:
+                defined.incl(ann.args[0].ident)
+        let name = stripSolverPrefix(con.name)
+        case name
+        of "int_le_reif", "int_lt_reif", "int_eq_reif":
+            if con.args.len < 3: continue
+            let r = presolveVarName(con.args[2])
+            if r == "": continue
+            let a = con.args[0]
+            let b = con.args[1]
+            let strict = if name == "int_lt_reif": 1 else: 0
+            if a.kind == FznIdent and isLit(b):
+                let c = b.intVal
+                let iv: Iv = if name == "int_eq_reif": (c, c) else: (NoLo, c - strict)
+                direct.mgetOrPut(r, @[]).add((a.ident, iv))
+            elif isLit(a) and b.kind == FznIdent:
+                let c = a.intVal
+                let iv: Iv = if name == "int_eq_reif": (c, c) else: (c + strict, NoHi)
+                direct.mgetOrPut(r, @[]).add((b.ident, iv))
+        of "int_lin_le_reif":
+            if con.args.len < 4: continue
+            let r = presolveVarName(con.args[3])
+            if r == "" or con.args[2].kind != FznIntLit: continue
+            let (coeffs, okC) = ppResolveConstIntSeq(tr, con.args[0])
+            if not okC or coeffs.len != 1 or coeffs[0] == 0: continue
+            let xs = ppResolveVarArrayLit(tr, con.args[1])
+            if xs == nil or xs.kind != FznArrayLit or xs.elems.len != 1: continue
+            let x = presolveVarName(xs.elems[0])
+            if x == "": continue
+            let k = coeffs[0]
+            let rhs = con.args[2].intVal
+            let iv: Iv = if k > 0: (NoLo, psFloorDiv(rhs, k)) else: (psCeilDiv(-rhs, -k), NoHi)
+            direct.mgetOrPut(r, @[]).add((x, iv))
+        of "array_bool_and":
+            if con.args.len < 2 or con.args[0].kind != FznArrayLit: continue
+            let r = presolveVarName(con.args[1])
+            if r == "": continue
+            for e in con.args[0].elems:
+                let a = presolveVarName(e)
+                if a != "": implies.mgetOrPut(r, @[]).add(a)
+        of "bool_clause":
+            if con.args.len < 2 or con.args[0].kind != FznArrayLit or
+               con.args[1].kind != FznArrayLit: continue
+            if con.args[0].elems.len == 1 and con.args[1].elems.len == 1:
+                let m = presolveVarName(con.args[0].elems[0])
+                let l = presolveVarName(con.args[1].elems[0])
+                if m != "" and l != "" and m != l:
+                    implies.mgetOrPut(l, @[]).add(m)
+        else: discard
+    if direct.len == 0: return
+
+    # Intervals a literal forces when true (intersection over everything it
+    # implies), memoised.
+    var memo: Table[string, Table[string, Iv]]
+    proc factsOf(l: string, depth: int): Table[string, Iv] =
+        if depth == 0 and l in memo: return memo[l]
+        if l in direct:
+            for (x, iv) in direct[l]:
+                if x in result:
+                    let o = result[x]
+                    result[x] = (max(o.lo, iv.lo), min(o.hi, iv.hi))
+                else:
+                    result[x] = iv
+        if depth < 3 and l in implies:
+            for m in implies[l]:
+                for x, iv in factsOf(m, depth + 1):
+                    if x in result:
+                        let o = result[x]
+                        result[x] = (max(o.lo, iv.lo), min(o.hi, iv.hi))
+                    else:
+                        result[x] = iv
+        if depth == 0: memo[l] = result
+
+    for ci in 0 ..< tr.model.constraints.len:
+        if infeasible: return
+        let con {.cursor.} = tr.model.constraints[ci]
+        if ci in eliminated: continue
+        if stripSolverPrefix(con.name) != "bool_clause": continue
+        if con.args.len < 2 or con.args[0].kind != FznArrayLit or
+           con.args[1].kind != FznArrayLit: continue
+        if con.args[1].elems.len > 0 or con.args[0].elems.len < 2: continue
+        var lits: seq[string]
+        var ok = true
+        for e in con.args[0].elems:
+            let l = presolveVarName(e)
+            if l == "": ok = false; break
+            let isFalse = (l in fixedVars and fixedVars[l] == 0) or
+                (l in domains and domains[l].len == 1 and domains[l][0] == 0)
+            if not isFalse: lits.add(l)
+        if not ok or lits.len == 0: continue
+        # Variables bounded by every live literal
+        var common = factsOf(lits[0], 0)
+        if common.len == 0: continue
+        var unions: Table[string, seq[Iv]]
+        for x, iv in common: unions[x] = @[iv]
+        for i in 1 ..< lits.len:
+            let f = factsOf(lits[i], 0)
+            var drop: seq[string]
+            for x in unions.keys:
+                if x in f: unions[x].add(f[x])
+                else: drop.add(x)
+            for x in drop: unions.del(x)
+            if unions.len == 0: break
+        for x, ivs in unions:
+            if x in defined or x notin domains: continue
+            let dom = domains[x]
+            var allowed: seq[int]
+            for v in dom:
+                for iv in ivs:
+                    if v >= iv.lo and v <= iv.hi:
+                        allowed.add(v)
+                        break
+            if allowed.len < dom.len:
+                if presolveTightenDomain(domains, x, allowed, infeasible):
+                    result = true
+                if infeasible: return
+
 proc applyPresolveResults(tr: var FznTranslator,
                           domains: Table[string, seq[int]],
                           fixedVars: Table[string, int],
@@ -5544,6 +5697,12 @@ proc presolve*(tr: var FznTranslator) =
         # bool_clause([b_1,...,b_n],[]) where every b_i is int_eq_reif(x, c_i, b_i)
         # on a shared x ⇒ dom(x) ⊆ {c_i}. Recovers MZN's flattened "exists" pattern.
         if disjunctionEqualitiesPropagate(tr, domains, fixedVars, eliminated, infeasible):
+            changed = true
+        if infeasible: break
+
+        # Step 3c1: the same over intervals and chained implications: each
+        # literal of a clause bounds a shared x => dom(x) ⊆ union of bounds.
+        if disjunctionImpliedDomainPropagate(tr, domains, fixedVars, eliminated, infeasible):
             changed = true
         if infeasible: break
 
