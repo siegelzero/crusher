@@ -2353,6 +2353,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
             # value (if col0 values are unique, dependent cols become channels).
             if filtered.len == 0:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after singleton filtering — infeasible")
+                tr.infeasibleReasons.add("table with no tuple matching its fixed columns")
             elif not tr.tryTableFunctionalDep(reducedPositions, filtered, reducedDefinesVarCol):
                 # Not functional — fall back to penalty-based tableIn, where
                 # filtering tuples by variable domains is sound.
@@ -2373,6 +2374,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         tr.sys.addConstraint(tableInComplete[int](reducedPositions, domainFiltered))
                 else:
                     stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
+                    tr.infeasibleReasons.add("table with no tuple inside its columns' domains")
         elif allRefs:
             # Try functional dependency on the FULL table first — see
             # trySingleColumnKey: filtering tuples by a (possibly objective-
@@ -2398,6 +2400,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         tr.sys.addConstraint(tableInComplete[int](positions, domainFiltered))
                 else:
                     stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after domain filtering — infeasible")
+                    tr.infeasibleReasons.add("table with no tuple inside its columns' domains")
         else:
             # Some expressions are not simple variable references (e.g., defined vars
             # with linear expressions, or constants). Materialize them:
@@ -2424,6 +2427,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
 
             if filteredTuples.len == 0:
                 stderr.writeLine("[FznTranslator] WARNING: table constraint has 0 matching tuples after constant filtering — infeasible")
+                tr.infeasibleReasons.add("table with no tuple matching its constant columns")
             else:
                 # Build positions for non-constant columns, materializing complex expressions
                 var tablePositions: seq[int]
@@ -3321,6 +3325,7 @@ proc translateConstraint(tr: var FznTranslator, con: FznConstraint) =
                         newDom.add(v)
                 if newDom.len == 0:
                     stderr.writeLine(&"[FZN] bin_packing_load: load[{binValue}] has empty subset-sum intersection — instance infeasible")
+                    tr.infeasibleReasons.add(&"bin_packing_load: no reachable load for bin {binValue}")
                 elif newDom.len < currentDom.len:
                     nValuesRemoved += currentDom.len - newDom.len
                     tr.sys.baseArray.domain[loadPos] = newDom

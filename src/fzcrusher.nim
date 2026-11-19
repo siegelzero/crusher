@@ -266,6 +266,16 @@ proc main() =
     flushFile(stdout)
     immediateExit(0)
 
+  # Translation proved some constraint unsatisfiable and emitted nothing for
+  # it, so an assignment found would violate the model. Crusher never claims
+  # UNSATISFIABLE (presolve can be wrong): report UNKNOWN.
+  if tr.infeasibleReasons.len > 0:
+    stderr.writeLine(&"[FZN] model is infeasible ({tr.infeasibleReasons.len} constraint(s)); " &
+      "reporting UNKNOWN: " & tr.infeasibleReasons.join("; "))
+    printUnknown()
+    flushFile(stdout)
+    immediateExit(0)
+
   # MiniZinc's --time-limit includes its own compilation time (before we start).
   # Anchor to process start and subtract a small margin. If our deadline doesn't
   # fire in time, the SIGTERM handler will output the best solution.

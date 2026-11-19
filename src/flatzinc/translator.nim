@@ -766,6 +766,9 @@ type
         # guarantee the solution satisfies the full model, so the FZN driver
         # must report UNKNOWN rather than emit a possibly-invalid assignment.
         unsupportedConstraints*: seq[string]
+        # Translation proved a constraint unsatisfiable and emitted nothing
+        # for it: any assignment found would violate the model
+        infeasibleReasons*: seq[string]
 
 proc getExpr*(tr: FznTranslator, pos: int): AlgebraicExpression[int] {.inline.} =
     tr.sys.baseArray[pos]

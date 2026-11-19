@@ -4150,6 +4150,8 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
         # Resolve positions
         if def.idxVarName notin tr.varPositions:
             stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} idx var not resolved, skipping")
+            # Its set constraints are already consumed
+            tr.unsupportedConstraints.add(&"set-equality table {defIdx} (index unresolved)")
             continue
         let idxPos = tr.varPositions[def.idxVarName]
         var positions: seq[int] = @[idxPos]
@@ -4187,6 +4189,7 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
 
         if not allResolved:
             stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} sources not resolved, skipping")
+            tr.unsupportedConstraints.add(&"set-equality table {defIdx} (sources unresolved)")
             continue
 
         # Get domains
@@ -4294,8 +4297,9 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
         if tuples.len == 0:
             # No valid tuples — problem is infeasible for this pattern.
             # Original constraints are already consumed (set vars skipped),
-            # so we can't fall back. Log a warning; Crusher will report UNKNOWN.
+            # so we can't fall back: report UNKNOWN.
             stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} produced 0 tuples (likely infeasible)")
+            tr.infeasibleReasons.add(&"set-equality table {defIdx} has no tuple")
             continue
 
         if tuples.len > MaxTuples:
@@ -4336,6 +4340,7 @@ proc emitSetEqualityTableConstraints(tr: var FznTranslator) =
             totalTuples += tuples.len
         elif tuples.len == 0:
             stderr.writeLine(&"[FZN] Warning: set-equality table {defIdx} empty after projection (likely infeasible)")
+            tr.infeasibleReasons.add(&"set-equality table {defIdx} has no tuple matching its fixed sources")
 
     if nEmitted > 0:
         stderr.writeLine(&"[FZN] Emitted {nEmitted} set-equality table constraints ({totalTuples} total tuples)")
