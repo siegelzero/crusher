@@ -18,6 +18,8 @@ const
     SeedFallbackAfter = 0.3       # fraction of the budget searched before it
     SeedFallbackBudget = 0.15     # fraction of the rest the fallback may use
     SeedFallbackMaxSecs = 30.0
+    SeedFirstShare = 0.02         # fraction of the budget the first seed may use
+    SeedFirstMaxSecs = 10.0
 
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
@@ -111,17 +113,28 @@ proc resolve*[T](system: ConstraintSystem[T],
                         lnsImprove(system, pool, scatterThreshold, adaptedThreshold, actualWorkers, verbose, dl)
             false
 
+        # First seed (one shot): a propagation DFS on models it supports,
+        # bounded by a small share of the budget
+        var firstSeed = seedAssignment
+        let seedFirst = system.seedFirst
+        system.seedFirst = nil
+        if seedFirst != nil and seedAssignment.len == 0 and not system.hasFeasibleSolution:
+            let budget = if deadline > 0: min(SeedFirstMaxSecs, SeedFirstShare * (deadline - epochTime()))
+                         else: SeedFirstMaxSecs
+            if budget > 0:
+                let seed = seedFirst(budget)
+                if seed.len == system.baseArray.len: firstSeed = seed
         # Seed fallback (one shot): search for part of the budget first; only
         # if that finds nothing is the fallback seed computed and the search
         # restarted from it.
         let fallback = system.seedFallback
         system.seedFallback = nil
-        let useFallback = fallback != nil and seedAssignment.len == 0 and
+        let useFallback = fallback != nil and firstSeed.len == 0 and
                           not system.hasFeasibleSolution and deadline > 0 and
                           deadline - epochTime() >= SeedFallbackMinBudget
         let firstDeadline = if useFallback: epochTime() + SeedFallbackAfter * (deadline - epochTime())
                             else: deadline
-        var found = attempt(firstDeadline, seedAssignment)
+        var found = attempt(firstDeadline, firstSeed)
         if not found and useFallback and epochTime() < deadline:
             let seed = fallback(min(SeedFallbackMaxSecs, SeedFallbackBudget * (deadline - epochTime())))
             if epochTime() < deadline:

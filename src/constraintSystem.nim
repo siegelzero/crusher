@@ -99,6 +99,9 @@ type
         # nothing by part of the budget, this is called with a time budget and
         # the search restarts with state 0 seeded from the result (the LP dive).
         seedFallback*: proc(budget: float): seq[T] {.closure.}
+        # One-shot seed source called before the first resolve searches (the
+        # propagation DFS): an empty result leaves the search unseeded.
+        seedFirst*: proc(budget: float): seq[T] {.closure.}
         circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
                                           # minimized objective exactly: its metric bound
                                           # replaces the explicit objective<=target constraint

@@ -1083,6 +1083,7 @@ include translatorCircuitTime
 include translatorInverseRewrite
 include translatorUnionCircuit
 include translatorLpDive
+include translatorCp
 include translatorProjection
 
 proc buildObjectiveDominant(tr: var FznTranslator) =

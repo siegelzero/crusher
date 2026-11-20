@@ -6282,6 +6282,16 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         # The lean/best-move trial measures the tabu walk only
         trialStartT = epochTime()
         trialStartCost = state.cost
+    if state.cost == 0:
+        # Seeded with a solution (the propagation DFS): the walk below would
+        # only report it once the threshold is exhausted (kitchen b1: 1000
+        # iterations at 14 it/s)
+        state.bestCost = 0
+        state.bestAssignment = state.assignment
+        if state.verbose:
+            state.logExitStats("Solution found at start")
+        state.lastImprovementIter = lastImprovement
+        return state
     if state.verbose:
         echo &"[Tabu S{state.id}] Starting: vars={state.carray.len} constraints={state.constraints.len} threshold={threshold} cost={state.cost}" &
             (if useLeanSearch: " (lean first-improvement)" else: "")

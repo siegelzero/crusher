@@ -331,6 +331,9 @@ proc main() =
   # an integral point of the LP relaxation (models linear apart from
   # reifications/clauses) seeds a restarted search.
   tr.sys.seedFallback = tr.lpDiveFallback(verbose)
+  # Propagation DFS over the FlatZinc model before local search, on models
+  # the engine has a propagator for every constraint of
+  tr.sys.seedFirst = tr.cpSeedFirst(verbose)
 
   # Solve
   let solveWallStart = epochTime()
