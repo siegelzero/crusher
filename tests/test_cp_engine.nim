@@ -3,7 +3,7 @@
 ## force (status and solution validity).
 
 import unittest
-import std/[random, sequtils]
+import std/[random, sequtils, times]
 import cp/cpEngine
 
 proc queens(n: int): (CpStatus, seq[int]) =
@@ -107,6 +107,21 @@ suite "CP engine":
         check s.value(a) == abs(s.value(p))
         check s.value(m) == max(s.value(r), s.value(a))
         check s.value(m) == 27
+
+    test "depth stall cutoff":
+        # 14 pigeons in 13 holes with pairwise disequalities: the search
+        # reaches its full depth at once and then thrashes below it
+        let s = newCpSolver()
+        var p: seq[int]
+        for i in 0 ..< 14: p.add s.newVar(1, 13)
+        for i in 0 ..< 14:
+            for j in i + 1 ..< 14:
+                s.addLinear(@[1, -1], @[p[i], p[j]], 0, lrNe)
+        s.addBranchGroup(p, vsInputOrder, valMin)
+        let t0 = epochTime()
+        check s.solve(deadline = t0 + 30.0, stallMin = 0.2) == cpLimit
+        check s.stalled
+        check epochTime() - t0 < 5.0
 
     test "random models agree with brute force":
         var rng = initRand(12345)

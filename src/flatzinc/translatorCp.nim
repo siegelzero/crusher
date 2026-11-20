@@ -281,6 +281,8 @@ proc buildCpModel(tr: var FznTranslator): CpPlan =
         addSearch(tr, plan, varArrays, ann.name, ann.args)
     plan
 
+const CpStallMinSecs = 2.0   # see CpSolver.solve: depth-stall cutoff floor
+
 proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): seq[int] {.closure.} =
     ## The DFS as a seed source for the first resolve (nil when the engine
     ## has no propagator for some constraint of the model).
@@ -306,9 +308,10 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): se
         stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables ({epochTime() - t0:.2f}s)")
     result = proc(budget: float): seq[int] =
         let t1 = epochTime()
-        let st = plan.s.solve(deadline = t1 + budget)
+        let st = plan.s.solve(deadline = t1 + budget, stallMin = CpStallMinSecs)
         if verbose or st == cpSat:
-            stderr.writeLine(&"[CP] DFS {st}: {plan.s.nodes} nodes, {plan.s.fails} fails, " &
+            let why = if plan.s.stalled: " (depth stalled)" else: ""
+            stderr.writeLine(&"[CP] DFS {st}{why}: {plan.s.nodes} nodes, {plan.s.fails} fails, " &
                              &"depth {plan.s.maxDepth}, {epochTime() - t1:.2f}s")
         if st != cpSat: return @[]
         result = defaults

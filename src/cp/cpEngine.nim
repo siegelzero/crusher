@@ -74,6 +74,7 @@ type
         grouped: seq[bool]
         nodes*, fails*: int
         maxDepth*: int
+        stalled*: bool         # last solve gave up on a depth stall
 
 # ---------------------------------------------------------------- variables
 
@@ -883,9 +884,16 @@ proc applyDecision(s: CpSolver, d: Decision, left: bool): bool =
     of dkLe: (if left: s.setMax(d.v, d.val) else: s.setMin(d.v, d.val + 1))
     of dkGe: (if left: s.setMin(d.v, d.val) else: s.setMax(d.v, d.val - 1))
 
-proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil): CpStatus =
+proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
+            stallMin: float = 0.0): CpStatus =
     ## Depth-first search for one solution; on cpSat every variable is fixed
     ## (read with value). Ungrouped variables are searched last (first fail).
+    ## With stallMin > 0 the search also gives up (cpLimit, stalled = true)
+    ## once the deepest decision level has not grown for max(stallMin,
+    ## 2 * the time at which it was reached): searches that will not finish
+    ## thrash at a fixed depth (zephyrus, hoist, hard nonograms), while the
+    ## ones that do finish keep reaching new depths (nonogram medium_05's
+    ## longest gap is 0.70 of this limit, kitchen b1's 0.44).
     var rest: seq[int]
     for v in 0 ..< s.vars.len:
         if not s.grouped[v]: rest.add v
@@ -895,6 +903,18 @@ proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil): CpStatus 
     for p in 0 ..< s.props.len: s.enqueue(p)
     if not s.propagateAll(): return cpUnsat
     var stack: seq[Decision]
+    let t0 = epochTime()
+    var depthT = 0.0
+    s.stalled = false
+    proc limitHit(): bool =
+        if stop != nil and stop[]: return true
+        if deadline <= 0 and stallMin <= 0: return false
+        let now = epochTime()
+        if deadline > 0 and now > deadline: return true
+        if stallMin > 0 and now - t0 - depthT > max(stallMin, 2 * depthT):
+            s.stalled = true
+            return true
+        false
     while true:
         var d: Decision
         if not s.selectDecision(d):
@@ -905,17 +925,16 @@ proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil): CpStatus 
             return cpSat
         inc s.nodes
         if (s.nodes and 7) == 0:
-            if (deadline > 0 and epochTime() > deadline) or (stop != nil and stop[]):
-                return cpLimit
+            if limitHit(): return cpLimit
         s.pushLevel()
         stack.add d
-        s.maxDepth = max(s.maxDepth, stack.len)
+        if stack.len > s.maxDepth:
+            s.maxDepth = stack.len
+            if stallMin > 0: depthT = epochTime() - t0
         var ok = s.applyDecision(d, true) and s.propagateAll()
         while not ok:
             if stack.len == 0: return cpUnsat
             let last = stack.pop()
             s.popLevel()
             ok = s.applyDecision(last, false) and s.propagateAll()
-            if not ok and (s.fails and 7) == 0 and
-               ((deadline > 0 and epochTime() > deadline) or (stop != nil and stop[])):
-                return cpLimit
+            if not ok and (s.fails and 7) == 0 and limitHit(): return cpLimit
