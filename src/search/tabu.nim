@@ -417,6 +417,11 @@ type
         keepEndTasks: seq[tuple[sp, dp: int]]
         keepEndStartOf: Table[int, seq[(int, int)]]   # start pos -> (MMNO ci, task)
         keepEndApplied: int
+        # Schedule compaction (tabuCompaction): sorted domains of the moved
+        # positions, call and move counts
+        compactDom: Table[int, seq[T]]
+        compactCalls, compactMoves: int
+        compactMmno: seq[int]       # every MultiMachineNoOverlap constraint
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -659,6 +664,7 @@ include tabuObjectivePolish
 include tabuObjectiveAnneal
 include tabuChainRepair
 include tabuRerouteMoves
+include tabuCompaction
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -2149,7 +2155,17 @@ proc init*[T](state: TabuState[T], carrayArg: sink ConstrainedArray[T], verbose:
                         state.assignment[pos] = dom[0]
                     else:
                         case initStrategy
-                        of isRandom:    state.assignment[pos] = sample(dom)
+                        of isRandom:
+                            # The nearest allowed value: a random one undoes
+                            # the warm start (saeling: the makespan-defining
+                            # start drawn at random cost 3066 instead of 1)
+                            let v0 = initialAssignment[pos]
+                            var best = dom[0]
+                            for v in dom:
+                                let d = abs(int(v) - int(v0))
+                                let db = abs(int(best) - int(v0))
+                                if d < db or (d == db and v < best): best = v
+                            state.assignment[pos] = best
                         of isDomainMin: state.assignment[pos] = dom[0]
                         of isDomainMax: state.assignment[pos] = dom[^1]
                 else:
@@ -5781,6 +5797,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] objectivePolish: calls={state.polishCalls} moves={state.polishMoves} dropTries={state.dropTries} drops={state.dropApplied} swapTries={state.swapTries} swaps={state.swapApplied}"
     if state.keepEndTasks.len > 0:
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
+    if state.compactCalls > 0:
+        echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -6078,22 +6096,7 @@ proc tryKeepEndMoves[T](state: TabuState[T]): bool =
     ## the two ends. Candidates: the ends of the tasks sharing a machine with
     ## it, the range extremes and a few random values. Applies the best one
     ## when it lowers the cost, or keeps it at equal cost now and then.
-    if not state.keepEndBuilt:
-        state.keepEndBuilt = true
-        var seen: PackedSet[int]
-        template movable(p: int): bool =
-            p >= 0 and p notin state.carray.channelPositions and p notin state.carray.fixedPositions
-        for ci, c in state.constraints:
-            if c.stateType != MultiMachineNoOverlapType: continue
-            let mc = c.multiMachineNoOverlapState
-            for t in 0..<mc.taskCount:
-                let sp = mc.startPositions[t]
-                if not sp.movable: continue
-                state.keepEndStartOf.mgetOrPut(sp, @[]).add((ci, t))
-                let dp = mc.durPositions[t]
-                if dp.movable and sp notin seen:
-                    seen.incl(sp)
-                    state.keepEndTasks.add((sp: sp, dp: dp))
+    state.ensureKeepEndTables()
     if state.keepEndTasks.len == 0: return false
     let (sp, dp) = state.keepEndTasks[rand(state.keepEndTasks.len - 1)]
     let s0 = state.assignment[sp]
@@ -6144,7 +6147,7 @@ proc tryKeepEndMoves[T](state: TabuState[T]): bool =
     inc state.keepEndApplied
     true
 
-proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
+proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     state.searchDeadline = deadline
     state.stopSignal = shouldStop
     var lastImprovement = 0
@@ -6823,6 +6826,47 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
 
     state.lastImprovementIter = lastImprovement
     return state
+
+const CompactMaxSecs = 2.0      # compaction budget per feasible state
+const CompactShare = 0.05       # ... at most this share of the time left
+
+proc compactState[T](state: TabuState[T], deadline: float) =
+    ## Runs tabuCompaction on a state violating at most the objective bound
+    ## and records what it reaches as the best or near-feasible state.
+    let bc = state.boundConstraint
+    if bc == nil or state.cost != bc.penalty(): return
+    let budget = if deadline > 0: min(CompactMaxSecs, CompactShare * max(0.0, deadline - epochTime()))
+                 else: CompactMaxSecs
+    let slack0 = state.boundSlack()
+    let t0 = epochTime()
+    let moves = state.compactSchedule(budget)
+    if moves == 0: return
+    if state.cost < state.bestCost:
+        state.bestCost = state.cost
+        state.bestAssignment = state.assignment
+    if state.cost > 0:
+        let raw = max(int(state.boundSlack()), 1)
+        if raw < state.nearBestCost:
+            state.nearBestCost = raw
+            state.nearBestAssignment = state.assignment
+    if state.verbose:
+        let slack1 = state.boundSlack()
+        let secs = epochTime() - t0
+        echo &"[Tabu S{state.id}] Compaction: {moves} moves, objective slack {slack0} -> {slack1}, cost {state.cost} ({secs:.2f}s)"
+
+proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
+    ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
+    ## and of the result when they violate at most the objective bound.
+    let bc = state.boundConstraint
+    let pre = bc != nil and state.cost == bc.penalty()
+    var compacted: seq[T]
+    if pre:
+        state.compactState(deadline)
+        compacted = state.assignment
+    result = state.tabuWalk(threshold, shouldStop, deadline)
+    # A second pass over the state the first one left would find nothing
+    if not pre or result.assignment != compacted:
+        result.compactState(deadline)
 
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int, verbose: bool = false, deadline: float = 0.0): TabuState[T] =

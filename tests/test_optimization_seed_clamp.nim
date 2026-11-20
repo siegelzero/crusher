@@ -89,6 +89,27 @@ suite "Optimization seed clamping":
         check state.assignment[0] == 4  # dom[^1]
         check state.assignment[1] == 1  # dom[^1]
 
+    test "newTabuState clamps a stale seed value to the nearest domain value":
+        # The default strategy keeps the warm start: an incumbent value the
+        # tightened domain lost moves to the closest value left (ties low).
+        var system = initConstraintSystem[int]()
+        let xs = system.newConstrainedSequence(3)
+        xs.setDomain(toSeq(0..20))
+        system.addConstraint(sum(xs) <= 60)
+
+        system.baseArray.reducedDomain = newSeq[seq[int]](3)
+        system.baseArray.reducedDomain[0] = toSeq(0..9)
+        system.baseArray.reducedDomain[1] = @[2, 6, 14]
+        system.baseArray.reducedDomain[2] = @[3, 7]
+        system.baseArray.sharedDomainPtr = addr system.baseArray.reducedDomain
+
+        let staleSeed = @[10, 12, 5]
+        let state = newTabuState[int](system.baseArray, staleSeed)
+
+        check state.assignment[0] == 9
+        check state.assignment[1] == 14
+        check state.assignment[2] == 3
+
     test "newTabuState regenerates involution when seed clamping is needed":
         # When a seeded position belongs to an inverse group and its seed value
         # is out-of-domain, single-position clamping would leave the involution
