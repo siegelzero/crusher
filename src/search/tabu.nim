@@ -423,6 +423,9 @@ type
         compactCalls, compactMoves: int
         compactMmno: seq[int]       # every MultiMachineNoOverlap constraint
         compactAnchors: Table[int, seq[(int, int)]]   # dur pos -> (MMNO ci, task) whose start channel reads it
+        compactReassignBuilt: bool
+        compactReassign: Table[int, seq[int]]         # start pos -> positions moving its tasks' machines
+        reassignTrials, reassignKept: int
         reorderTrials, reorderKept, reorderGains: int
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
@@ -5801,7 +5804,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
     if state.compactCalls > 0:
         echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}" &
-             &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains}"
+             &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains}" &
+             &" reassign: trials={state.reassignTrials} kept={state.reassignKept}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -6832,8 +6836,8 @@ proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[boo
 
 const CompactMaxSecs = 2.0      # compaction budget per feasible state
 const CompactShare = 0.05       # ... at most this share of the time left
-const ReorderMaxSecs = 10.0     # reorder budget per state
-const ReorderShare = 0.10       # ... at most this share of the time left
+const ReorderMaxSecs = 30.0     # reorder budget per state
+const ReorderShare = 0.25       # ... at most this share of the time left
 
 proc compactState[T](state: TabuState[T], deadline: float) =
     ## Runs tabuCompaction (compaction, then reordering) on a state violating
@@ -6853,8 +6857,10 @@ proc compactState[T](state: TabuState[T], deadline: float) =
     let slack1 = state.boundSlack()
     let t1 = epochTime()
     let kept0 = state.reorderKept
+    let rkept0 = state.reassignKept
     let gains = state.reorderSchedule(rBudget)
-    let kept = state.reorderKept - kept0
+    let rkept = state.reassignKept - rkept0
+    let kept = state.reorderKept - kept0 + rkept
     state.leanSearch = wasLean
     if moves == 0 and kept == 0: return
     if not wasLean:
@@ -6876,7 +6882,7 @@ proc compactState[T](state: TabuState[T], deadline: float) =
         let slack2 = state.boundSlack()
         let t2 = epochTime()
         echo &"[Tabu S{state.id}] Compaction: {moves} moves, objective slack {slack0} -> {slack1} ({t1 - t0:.2f}s); " &
-             &"reorder: {kept} kept, {gains} gains, slack -> {slack2}, cost {state.cost} ({t2 - t1:.2f}s)"
+             &"reorder: {kept} kept ({rkept} reassigned), {gains} gains, slack -> {slack2}, cost {state.cost} ({t2 - t1:.2f}s)"
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
