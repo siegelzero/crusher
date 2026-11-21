@@ -6884,9 +6884,55 @@ proc compactState[T](state: TabuState[T], deadline: float) =
         echo &"[Tabu S{state.id}] Compaction: {moves} moves, objective slack {slack0} -> {slack1} ({t1 - t0:.2f}s); " &
              &"reorder: {kept} kept ({rkept} reassigned), {gains} gains, slack -> {slack2}, cost {state.cost} ({t2 - t1:.2f}s)"
 
+const ConstructMaxSecs = 5.0    # construction budget per walk
+
+proc constructState[T](state: TabuState[T], deadline: float) =
+    ## When the walk's best state violates only no-overlaps (and the objective
+    ## bound), moves the state there and builds a schedule without overlaps
+    ## from it (tabuCompaction.constructSchedule); records it as the best
+    ## state when it is no worse.
+    if state.bestCost <= 0 or state.bestAssignment.len != state.assignment.len: return
+    state.ensureKeepEndTables()
+    if state.compactMmno.len == 0 or state.keepEndStartOf.len < 2: return
+    let left = if deadline > 0: max(0.0, deadline - epochTime()) else: ConstructMaxSecs
+    let budget = min(ConstructMaxSecs, CompactShare * left)
+    let t0 = epochTime()
+    let wasLean = state.leanSearch
+    state.leanSearch = true
+    var back: seq[(int, T)]
+    for p in 0..<state.assignment.len:
+        if state.assignment[p] != state.bestAssignment[p] and p notin state.carray.channelPositions:
+            back.add((p, state.assignment[p]))
+            state.assignValueLean(p, state.bestAssignment[p])
+    let ok = state.constructSchedule(budget)
+    if not ok:
+        # Back to the walk's state: the penalty structures still match it
+        for k in countdown(back.len - 1, 0):
+            state.assignValueLean(back[k][0], back[k][1])
+        state.leanSearch = wasLean
+        if state.verbose and state.cost > 0:
+            let secs = epochTime() - t0
+            echo &"[Tabu S{state.id}] Construction: failed ({secs:.2f}s)"
+        return
+    state.leanSearch = wasLean
+    if not wasLean:
+        for pos in state.channelDepSearchPositions:
+            if not state.isLazy[pos]:
+                state.computeChannelDepPenaltiesAt(pos)
+        state.rebuildPenaltyMap()
+    if state.cost <= state.bestCost:
+        state.bestCost = state.cost
+        state.bestAssignment = state.assignment
+    if state.verbose:
+        let secs = epochTime() - t0
+        echo &"[Tabu S{state.id}] Construction: built, cost {state.cost}, " &
+             &"best cost {state.bestCost} ({secs:.2f}s)"
+
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
-    ## and of the result when they violate at most the objective bound.
+    ## and of the result when they violate at most the objective bound, and
+    ## construction of a schedule from a best state whose only other
+    ## violations are no-overlap overlaps.
     let bc = state.boundConstraint
     let pre = bc != nil and state.cost == bc.penalty()
     var compacted: seq[T]
@@ -6894,6 +6940,8 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
         state.compactState(deadline)
         compacted = state.assignment
     result = state.tabuWalk(threshold, shouldStop, deadline)
+    if result.bestCost > 0:
+        result.constructState(deadline)
     # A second pass over the state the first one left would find nothing
     if not pre or result.assignment != compacted:
         result.compactState(deadline)

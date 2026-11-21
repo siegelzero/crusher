@@ -468,6 +468,30 @@ proc reorderTrial[T](state: TabuState[T], events: seq[ReorderEvent], units: seq[
         hardRef = state.otherHard()
     true
 
+proc reorderEvents[T](state: TabuState[T]): (seq[int], seq[int], seq[ReorderEvent]) =
+    ## Units (movable no-overlap start positions), their anchoring duration
+    ## positions (-1 if none) and the start/end events sorted by time.
+    let units = toSeq(state.keepEndStartOf.keys)
+    var dpOf = initTable[int, int]()
+    for (sp, dp) in state.keepEndTasks: dpOf[sp] = dp
+    var durOf = newSeq[int](units.len)
+    var events: seq[ReorderEvent]
+    for u, sp in units:
+        let dp = dpOf.getOrDefault(sp, -1)
+        durOf[u] = (if dp >= 0 and state.compactAnchored(dp).len > 0: dp else: -1)
+        events.add((false, u))
+        if durOf[u] >= 0: events.add((true, u))
+    proc eventTime(e: ReorderEvent): int =
+        if not e.isEnd: return int(state.assignment[units[e.unit]])
+        let (aci, ax) = state.compactAnchored(durOf[e.unit])[0]
+        int(state.constraints[aci].multiMachineNoOverlapState.currentStarts[ax])
+    var keyed = newSeq[(int, int, int)](events.len)
+    for k, e in events: keyed[k] = (eventTime(e), ord(e.isEnd), k)
+    keyed.sort()
+    var sortedEvents = newSeq[ReorderEvent](events.len)
+    for k in 0..<keyed.len: sortedEvents[k] = events[keyed[k][2]]
+    (units, durOf, sortedEvents)
+
 proc reorderSchedule[T](state: TabuState[T], budget: float): int =
     ## Reorder trials (see above) on a state violating at most the objective
     ## bound, until the budget or ReorderStallTrials trials without a strict
@@ -480,20 +504,8 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
     for ci in state.compactMmno:
         if state.constraints[ci].multiMachineNoOverlapState.setupMatrix.len > 0: return 0
     let t0 = epochTime()
-    let units = toSeq(state.keepEndStartOf.keys)
-    var dpOf = initTable[int, int]()
-    for (sp, dp) in state.keepEndTasks: dpOf[sp] = dp
-    var durOf = newSeq[int](units.len)
-    var events: seq[ReorderEvent]
-    for u, sp in units:
-        let dp = dpOf.getOrDefault(sp, -1)
-        durOf[u] = (if dp >= 0 and state.compactAnchored(dp).len > 0: dp else: -1)
-        events.add((false, u))
-        if durOf[u] >= 0: events.add((true, u))
-    proc eventTime(state: TabuState[T], e: ReorderEvent): int =
-        if not e.isEnd: return int(state.assignment[units[e.unit]])
-        let (aci, ax) = state.compactAnchored(durOf[e.unit])[0]
-        int(state.constraints[aci].multiMachineNoOverlapState.currentStarts[ax])
+    let (units, durOf, sortedEvents) = state.reorderEvents()
+    var events = sortedEvents
     state.buildReassign(units, durOf)
     var reassignable: seq[int]   # units with reassignment positions
     for u, sp in units:
@@ -503,17 +515,11 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
     var finals: seq[(int, T)]
     var seen: PackedSet[int]
     var stall = 0
-    # The event order is the search state: sorted by time once, then moved
-    # by the kept trials (a kept trial that leaves the schedule unchanged
-    # still changes the order: drift on the plateau)
-    block:
-        var keyed = newSeq[(int, int, int)](events.len)
-        for k, e in events: keyed[k] = (state.eventTime(e), ord(e.isEnd), k)
-        keyed.sort()
-        let old = events
-        for k in 0..<keyed.len: events[k] = old[keyed[k][2]]
-        for k, e in events:
-            if not e.isEnd: startAt[e.unit] = k
+    # The event order is the search state: sorted by time once (by
+    # reorderEvents), then moved by the kept trials (a kept trial that leaves
+    # the schedule unchanged still changes the order: drift on the plateau)
+    for k, e in events:
+        if not e.isEnd: startAt[e.unit] = k
     while stall < ReorderStallTrials and epochTime() - t0 < budget:
         var i, j: int
         var rp = -1
@@ -569,3 +575,302 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
         else:
             inc stall
     state.reorderGains += result
+
+## Construction: a state whose only violations are no-overlap overlaps (and
+## the objective bound) gets a schedule without overlaps from a serial
+## schedule generation scheme over the same events, in time order. The units
+## not placed yet stay where they are; overlaps count only between placed
+## tasks, and a unit whose start is placed but not its end holds its machine
+## (its task with the decoded duration). Each event takes the earliest place
+## after the placed tasks on its machines that satisfies every constraint
+## between the unit and the units already complete; a start waits until the
+## units it shares a constraint with that started earlier (by the state's
+## times) are complete, and until its machines are free. Which units a
+## constraint involves comes from probing each unit's positions once (the
+## channels that move with them). saeling j0050_m003: the first-solution
+## walks stall at cost 5-20, all of it overlap.
+
+const ConstructEligMaxUnits = 8   # constraints over more units don't gate starts
+
+proc constructSchedule[T](state: TabuState[T], budget: float): bool =
+    ## Builds a schedule without overlaps (see above) on a state violating only
+    ## the no-overlaps and the objective bound; true when it did (the state
+    ## then violates at most the bound), else the state is unchanged.
+    let bc = state.boundConstraint
+    if bc != nil and bc.stateType != RelationalType: return false
+    state.ensureKeepEndTables()
+    if state.keepEndStartOf.len < 2: return false
+    var mmnoPen = 0
+    for ci in state.compactMmno:
+        if state.constraints[ci].multiMachineNoOverlapState.setupMatrix.len > 0: return false
+        mmnoPen += state.constraints[ci].penalty()
+    let bcPen0 = if bc != nil: bc.penalty() else: 0
+    if mmnoPen == 0 or state.cost != mmnoPen + bcPen0: return false
+    let t0 = epochTime()
+    let (units, durOf, order) = state.reorderEvents()
+    let nu = units.len
+    var log: seq[(int, T)]
+    template sim(p: int, v: T) =
+        log.add((p, state.assignment[p]))
+        state.assignValueLean(p, v)
+    template undoAll() =
+        for k in countdown(log.len - 1, 0):
+            state.assignValueLean(log[k][0], log[k][1])
+        log.setLen(0)
+    # Task ownership: per no-overlap constraint (index into compactMmno),
+    # each task's unit (-1: none, always placed), whether it is the unit's
+    # anchored task, and whether its duration is the unit's (open-ended
+    # while the unit is open)
+    var ownerOf, kindOf: seq[seq[int]]
+    var openEnded: seq[seq[bool]]
+    var ownTasks = newSeq[seq[(int, int)]](nu)      # (k, x), started tasks
+    var anchTasks = newSeq[seq[(int, int)]](nu)     # (k, x), anchored tasks
+    var kOf = initTable[int, int]()
+    for k, ci in state.compactMmno:
+        kOf[ci] = k
+        let n = state.constraints[ci].multiMachineNoOverlapState.taskCount
+        ownerOf.add(newSeqWith(n, -1))
+        kindOf.add(newSeq[int](n))
+        openEnded.add(newSeq[bool](n))
+    for u, sp in units:
+        for (ci, x) in state.keepEndStartOf.getOrDefault(sp, @[]):
+            let k = kOf[ci]
+            ownerOf[k][x] = u
+            let mc = state.constraints[ci].multiMachineNoOverlapState
+            openEnded[k][x] = durOf[u] >= 0 and mc.durPositions[x] == durOf[u]
+            ownTasks[u].add((k, x))
+        if durOf[u] >= 0:
+            for (ci, x) in state.compactAnchored(durOf[u]):
+                let k = kOf[ci]
+                ownerOf[k][x] = u
+                kindOf[k][x] = 1
+                anchTasks[u].add((k, x))
+    # Constraints (besides the no-overlaps and the bound) per unit, from the
+    # positions that move with its start (S) and its duration (D)
+    var cIndex = initTable[pointer, int]()
+    for ci, c in state.constraints: cIndex[cast[pointer](c)] = ci
+    var skipC: PackedSet[int]
+    for ci in state.compactMmno: skipC.incl(ci)
+    if bc != nil: skipC.incl(cIndex[cast[pointer](bc)])
+    proc reach(p: int): seq[int] =
+        result = @[p]
+        let dom {.cursor.} = state.compactSortedDomain(p)
+        if dom.len < 2: return
+        let v0 = state.assignment[p]
+        let v1 = if dom[^1] != v0: dom[^1] else: dom[0]
+        let before = state.assignment
+        state.assignValueLean(p, v1)
+        for q in 0..<before.len:
+            if q != p and state.assignment[q] != before[q]: result.add(q)
+        state.assignValueLean(p, v0)
+    var consOf = newSeq[seq[(int, bool)]](nu)      # (ci, touches D)
+    var unitsOf = initTable[int, seq[int]]()
+    for u, sp in units:
+        var touch = initTable[int, bool]()
+        for q in reach(sp):
+            for c in state.constraintsAtPosition[q]:
+                let ci = cIndex[cast[pointer](c)]
+                if ci notin skipC and ci notin touch: touch[ci] = false
+        if durOf[u] >= 0:
+            for q in reach(durOf[u]):
+                for c in state.constraintsAtPosition[q]:
+                    let ci = cIndex[cast[pointer](c)]
+                    if ci notin skipC: touch[ci] = true
+        for ci, d in touch.pairs:
+            consOf[u].add((ci, d))
+            unitsOf.mgetOrPut(ci, @[]).add(u)
+    var status = newSeq[int](nu)      # 0 waiting, 1 open (start placed), 2 complete
+    var origIdx = newSeq[int](nu)
+    for k, e in order:
+        if not e.isEnd: origIdx[e.unit] = k
+    proc consOk(u: int, endMode: bool): bool =
+        ## Constraints between u and complete units hold (a start checks
+        ## those its duration does not move)
+        for (ci, d) in consOf[u]:
+            if d and not endMode: continue
+            var all = true
+            for v in unitsOf[ci]:
+                if v != u and status[v] != 2:
+                    all = false
+                    break
+            if all and state.constraints[ci].penalty() > 0: return false
+        true
+    proc eligible(u: int): bool =
+        for (ci, _) in consOf[u]:
+            let us {.cursor.} = unitsOf[ci]
+            if us.len > ConstructEligMaxUnits: continue
+            for v in us:
+                if v != u and origIdx[v] < origIdx[u] and status[v] != 2: return false
+        true
+    proc isPlaced(k, y: int): (bool, bool) =
+        ## (placed, open-ended)
+        let o = ownerOf[k][y]
+        if o < 0: return (true, false)
+        if kindOf[k][y] == 1: return (status[o] == 2, false)
+        (status[o] >= 1, openEnded[k][y] and status[o] == 1)
+    proc machineEnd(k, x: int): int =
+        ## Latest end of the placed tasks on task x's machine (high(int): an
+        ## open task holds it)
+        let mc = state.constraints[state.compactMmno[k]].multiMachineNoOverlapState
+        let m = mc.mmnoMachine(x)
+        result = low(int)
+        if m == mc.ignoreMachine: return
+        for y in 0..<mc.taskCount:
+            if y == x or mc.mmnoMachine(y) != m: continue
+            let (pl, op) = isPlaced(k, y)
+            if not pl: continue
+            if op: return high(int)
+            if mc.currentDurs[y] > 0:
+                result = max(result, int(mc.currentStarts[y]) + mc.currentDurs[y])
+    proc overlaps(k, x: int, openX: bool): bool =
+        ## Task x (open-ended if openX) overlaps a placed task or a fixed block
+        let mc = state.constraints[state.compactMmno[k]].multiMachineNoOverlapState
+        let m = mc.mmnoMachine(x)
+        if m == mc.ignoreMachine: return false
+        let s = int(mc.currentStarts[x])
+        let e = if openX: high(int) else: s + mc.currentDurs[x]
+        if e <= s: return false
+        for y in 0..<mc.taskCount:
+            if y == x or mc.mmnoMachine(y) != m: continue
+            let (pl, op) = isPlaced(k, y)
+            if not pl: continue
+            let sy = int(mc.currentStarts[y])
+            let ey = if op: high(int) else: sy + mc.currentDurs[y]
+            if ey > sy and sy < e and s < ey: return true
+        if m < mc.fixedBlocks.len:
+            for (bs, bd) in mc.fixedBlocks[m]:
+                if bd > 0 and bs < e and s < bs + bd: return true
+        false
+    proc endsFrom(lo: int): seq[int] =
+        ## Ends of the placed tasks at or after lo, sorted
+        for k, ci in state.compactMmno:
+            let mc = state.constraints[ci].multiMachineNoOverlapState
+            for y in 0..<mc.taskCount:
+                let (pl, op) = isPlaced(k, y)
+                if pl and not op and mc.currentDurs[y] > 0:
+                    let en = int(mc.currentStarts[y]) + mc.currentDurs[y]
+                    if en > lo: result.add(en)
+        result.sort()
+    proc firstOk(p: int, lo: int, u: int, endMode: bool): int =
+        ## Smallest value >= lo of position p's domain passing consOk, assuming
+        ## it fails below some value and passes from there on (galloping, then
+        ## bisection); -1 if none. Leaves p at that value.
+        let dom {.cursor.} = state.compactSortedDomain(p)
+        var a = dom.lowerBound(T(lo))
+        if a >= dom.len: return -1
+        sim(p, dom[a])
+        if consOk(u, endMode): return a
+        var step = 1
+        var b = a + 1
+        while true:
+            if b >= dom.len: return -1
+            sim(p, dom[b])
+            if consOk(u, endMode): break
+            a = b
+            step *= 2
+            b = a + step
+        while b - a > 1:
+            let mid = (a + b) div 2
+            sim(p, dom[mid])
+            if consOk(u, endMode): b = mid else: a = mid
+        sim(p, dom[b])
+        b
+    proc place(e: ReorderEvent): bool =
+        let u = e.unit
+        let sp = units[u]
+        let dp = durOf[u]
+        let closes = e.isEnd or dp < 0
+        if not e.isEnd:
+            var lo = int(state.compactSortedDomain(sp)[0])
+            for (k, x) in ownTasks[u]:
+                let me = machineEnd(k, x)
+                if me == high(int): return false      # machine held by an open task
+                lo = max(lo, me)
+            let mark = log.len
+            let a = firstOk(sp, lo, u, closes)
+            if a < 0:
+                for k in countdown(log.len - 1, mark): state.assignValueLean(log[k][0], log[k][1])
+                log.setLen(mark)
+                return false
+            let sDom {.cursor.} = state.compactSortedDomain(sp)
+            var cands = @[int(sDom[a])]
+            for en in endsFrom(int(sDom[a])): cands.add(en)
+            var tried = 0
+            for v in cands:
+                if sDom.binarySearch(T(v)) < 0: continue
+                inc tried
+                if tried > ReorderMaxStarts: break
+                sim(sp, T(v))
+                var bad = false
+                for (k, x) in ownTasks[u]:
+                    if overlaps(k, x, openEnded[k][x] and not closes):
+                        bad = true
+                        break
+                if not bad and consOk(u, closes):
+                    status[u] = (if closes: 2 else: 1)
+                    return true
+            for k in countdown(log.len - 1, mark): state.assignValueLean(log[k][0], log[k][1])
+            log.setLen(mark)
+            return false
+        # End event: the shortest duration putting the anchored tasks after
+        # the placed tasks on their machines
+        let s0 = int(state.assignment[sp])
+        let (aci0, ax0) = state.compactAnchored(dp)[0]
+        let off = s0 + int(state.assignment[dp]) -
+                  int(state.constraints[aci0].multiMachineNoOverlapState.currentStarts[ax0])
+        var dLo = int(state.compactSortedDomain(dp)[0])
+        for (k, x) in anchTasks[u]:
+            let me = machineEnd(k, x)
+            if me == high(int): return false
+            if me != low(int): dLo = max(dLo, me - s0 + off)
+        status[u] = 2     # for the checks; reset on failure
+        let mark = log.len
+        let a = firstOk(dp, dLo, u, true)
+        if a >= 0:
+            let dDom {.cursor.} = state.compactSortedDomain(dp)
+            var cands = @[int(dDom[a])]
+            for en in endsFrom(int(dDom[a]) + s0 - off): cands.add(en - s0 + off)
+            var tried = 0
+            for d in cands:
+                if dDom.binarySearch(T(d)) < 0: continue
+                inc tried
+                if tried > ReorderMaxDurs: break
+                sim(dp, T(d))
+                var bad = false
+                for (k, x) in anchTasks[u]:
+                    if overlaps(k, x, false):
+                        bad = true
+                        break
+                if not bad:
+                    for (k, x) in ownTasks[u]:
+                        if overlaps(k, x, false):
+                            bad = true
+                            break
+                if not bad and consOk(u, true): return true
+        status[u] = 1
+        for k in countdown(log.len - 1, mark): state.assignValueLean(log[k][0], log[k][1])
+        log.setLen(mark)
+        false
+    var pending = order
+    while pending.len > 0:
+        if epochTime() - t0 > budget:
+            undoAll()
+            return false
+        var placed = false
+        for idx in 0..<pending.len:
+            let e = pending[idx]
+            if e.isEnd:
+                if status[e.unit] != 1: continue
+            elif not eligible(e.unit): continue
+            if place(e):
+                pending.delete(idx)
+                placed = true
+                break
+        if not placed:
+            undoAll()
+            return false
+    let bcPen = if bc != nil: bc.penalty() else: 0
+    if state.cost != bcPen:
+        undoAll()
+        return false
+    true
