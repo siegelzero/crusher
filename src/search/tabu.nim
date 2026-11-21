@@ -6862,7 +6862,9 @@ proc compactState[T](state: TabuState[T], deadline: float) =
             if not state.isLazy[pos]:
                 state.computeChannelDepPenaltiesAt(pos)
         state.rebuildPenaltyMap()
-    if state.cost < state.bestCost:
+    # <=: at cost 0 the walk has already recorded this state uncompacted,
+    # and the moves only lower its objective
+    if state.cost <= state.bestCost:
         state.bestCost = state.cost
         state.bestAssignment = state.assignment
     if state.cost > 0:
