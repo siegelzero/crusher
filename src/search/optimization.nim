@@ -4,7 +4,7 @@ from std/times import epochTime
 import std/[algorithm, locks, packedsets]
 import std/tables
 from std/os import getEnv
-from std/strutils import parseInt
+from std/strutils import parseInt, formatFloat, FloatFormatMode
 import ../constraints/[types, circuitTimeProp, stateful]
 import ../expressions/expressions
 
@@ -371,6 +371,46 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     flushFile(stdout)
                     adopted = true
             adopted
+
+        # Proven lower bound from no-overlap energy (noOverlapEnergyFeasible):
+        # the smallest objective bound the required tasks' work fits under
+        # (saeling, one worker: 1248, best known 1254). Starts the bisection
+        # there and proves optimality when the incumbent reaches it.
+        when direction == Minimize:
+            block energyBound:
+                const EnergyBoundMaxSecs = 5.0
+                let ebStart = epochTime()
+                template energyFits(u: int): bool =
+                    block:
+                        let bc = objective <= T(u)
+                        bc.stateType != RelationalType or
+                            noOverlapEnergyFeasible(system.baseArray, bc.relationalState)
+                if not energyFits(currentCost):
+                    # The incumbent itself is rejected: the bound is unsound here
+                    if verbose:
+                        echo "[Opt] No-overlap energy bound rejects the incumbent ", currentCost, "; ignored"
+                    break energyBound
+                if energyFits(lo): break energyBound
+                # energyFits is monotone in u: smallest u in (lo, currentCost]
+                var a = lo
+                var b = currentCost
+                var steps = 0
+                while b - a > 1:
+                    if epochTime() - ebStart > EnergyBoundMaxSecs: break
+                    let mid = a + (b - a) div 2
+                    if energyFits(mid): b = mid else: a = mid
+                    inc steps
+                if b - a > 1:
+                    lo = a + 1   # every u <= a fails
+                else:
+                    lo = b
+                loProven = true
+                if verbose:
+                    echo "[Opt] No-overlap energy bound: ", lo, " (", steps, " checks, ",
+                         formatFloat(epochTime() - ebStart, ffDecimal, 2), "s)"
+                    let bc = objective <= T(lo - 1)
+                    discard noOverlapEnergyFeasible(system.baseArray, bc.relationalState, verbose = true)
+                    flushFile(stdout)
 
         # Phase 1: Binary search — fast tabu-only probes (no scatter)
         if verbose:

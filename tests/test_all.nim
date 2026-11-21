@@ -19,6 +19,7 @@ import test_channel_dependencies
 import test_channel_result_bounds
 import test_table_infeasible
 import test_cp_engine
+import test_energy_bound
 import test_channel_substitution
 import test_circuit
 import test_mznc2026_features

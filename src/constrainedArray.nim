@@ -9,6 +9,7 @@ import constraints/elementState
 import constraints/matrixElement
 import constraints/cumulative
 import constraints/diffn
+import constraints/multiMachineNoOverlap
 import expressions/expressions
 import expressions/stateful as exprStateful
 import expressions/sumExpression
@@ -1128,6 +1129,309 @@ proc tightenReducedDomain*[T](carray: var ConstrainedArray[T]) =
         if newDomain.len < 2: continue  # never tighten to singleton or empty
         if newDomain.len < rd.len:
             carray.reducedDomain[pos] = newDomain
+
+################################################################################
+# No-overlap energy lower bound on a minimized objective
+################################################################################
+
+proc noOverlapEnergyFeasible*[T](carray: ConstrainedArray[T], objBound: RelationalConstraint[T],
+                                 verbose = false): bool =
+    ## False only when `objBound` (the objective's upper bound, e.g.
+    ## objective <= U) cannot hold: bounds propagation over the linear
+    ## constraints and channel definitions gives every no-overlap task a time
+    ## window, and the required tasks' minimum durations exceed what the
+    ## constraint's machines can process inside the union of those windows.
+    ## Sound for proofs: search positions start from their reduced domain
+    ## (sound presolve), channels only from their definitions (linear
+    ## expressions, constant element tables), never from their domains.
+    if carray.reducedDomain.len == 0: return true
+    var mmno: seq[MultiMachineNoOverlapConstraint[T]]
+    for cons in carray.constraints:
+        if cons.stateType == MultiMachineNoOverlapType:
+            mmno.add(cons.multiMachineNoOverlapState)
+    if mmno.len == 0: return true
+    let (okObj, objForm) = extractLinearForm[T](objBound)
+    if not okObj: return true
+
+    const Inf = high(int) div 4
+    let n = carray.len
+    var lo = newSeq[int](n)
+    var hi = newSeq[int](n)
+    for pos in 0..<n:
+        if pos in carray.channelPositions:
+            lo[pos] = -Inf
+            hi[pos] = Inf
+        else:
+            let rd {.cursor.} = (if carray.reducedDomain[pos].len > 0: carray.reducedDomain[pos]
+                                 else: carray.domain[pos])
+            if rd.len == 0: return true
+            lo[pos] = int(rd[0])
+            hi[pos] = int(rd[0])
+            for v in rd:
+                lo[pos] = min(lo[pos], int(v))
+                hi[pos] = max(hi[pos], int(v))
+    # Element channels over constant tables: the table's range
+    for b in carray.channelBindings:
+        var allConst = b.arrayElements.len > 0
+        var mn = Inf
+        var mx = -Inf
+        for e in b.arrayElements:
+            if not e.isConstant:
+                allConst = false
+                break
+            mn = min(mn, int(e.constantValue))
+            mx = max(mx, int(e.constantValue))
+        if allConst:
+            lo[b.channelPosition] = max(lo[b.channelPosition], mn)
+            hi[b.channelPosition] = min(hi[b.channelPosition], mx)
+
+    # Forms: sum(c[i] * x[i]) + k >= 0
+    type Form = tuple[pos: seq[int], coef: seq[int], k: int]
+    var forms: seq[Form]
+    proc addGe(forms: var seq[Form], coeffs: Table[int, T], k: T, negate: bool) =
+        var f: Form
+        for p, c in coeffs.pairs:
+            if c == 0: continue
+            f.pos.add(p)
+            f.coef.add(if negate: -int(c) else: int(c))
+        f.k = if negate: -int(k) else: int(k)
+        if f.pos.len > 0: forms.add(f)
+    proc addForm(forms: var seq[Form], lf: LinearForm[T]) =
+        case lf.relation
+        of GreaterThanEq: forms.addGe(lf.coefficients, lf.constant, false)
+        of GreaterThan: forms.addGe(lf.coefficients, lf.constant - T(1), false)
+        of LessThanEq: forms.addGe(lf.coefficients, lf.constant, true)
+        of LessThan: forms.addGe(lf.coefficients, lf.constant + T(1), true)
+        of EqualTo:
+            forms.addGe(lf.coefficients, lf.constant, false)
+            forms.addGe(lf.coefficients, lf.constant, true)
+        else: discard
+    for cons in carray.constraints:
+        if cons.stateType != RelationalType: continue
+        let (ok, lf) = extractLinearForm[T](cons.relationalState)
+        if ok: forms.addForm(lf)
+    forms.addForm(objForm)
+    # Max channel ch >= input, min channel ch <= input (linear inputs)
+    for binding in carray.minMaxChannelBindings:
+        for inputExpr in binding.inputExprs:
+            if not inputExpr.linear: continue
+            let lin = linearize(inputExpr)
+            if lin.evalMethod != PositionBased: continue
+            var coeffs: Table[int, T]
+            for p, c in lin.coefficient.pairs: coeffs[p] = -c
+            coeffs[binding.channelPosition] = coeffs.getOrDefault(binding.channelPosition, T(0)) + T(1)
+            forms.addGe(coeffs, -lin.constant, binding.isMin)
+    # Linear expression channels: ch = sum(c * x) + k
+    var chanDef = initTable[int, (seq[int], seq[int], int)]()   # ch -> linear definition
+    for b in carray.expressionChannelBindings:
+        if not b.linearExpr: continue
+        var coeffs: Table[int, T]
+        for i, p in b.linPositions: coeffs[p] = coeffs.getOrDefault(p, T(0)) + b.linCoeffs[i]
+        coeffs[b.channelPosition] = coeffs.getOrDefault(b.channelPosition, T(0)) - T(1)
+        forms.addGe(coeffs, b.linConst, false)
+        forms.addGe(coeffs, b.linConst, true)
+        var ps, cs: seq[int]
+        for i, p in b.linPositions:
+            ps.add(p)
+            cs.add(int(b.linCoeffs[i]))
+        chanDef[b.channelPosition] = (ps, cs, int(b.linConst))
+
+    # Non-linear expression channels over small boxes (saeling: load time =
+    # setup + transport * [machines differ]): exact range by enumeration
+    proc enumerateChannels(): bool =
+        ## Tightens those channels' bounds; true when one changed.
+        const MaxCombos = 4096
+        for b in carray.expressionChannelBindings:
+            if b.linearExpr: continue
+            let ch = b.channelPosition
+            let ps = toSeq(b.expression.positions.items)
+            if ps.len == 0 or ps.len > 6: continue
+            var vals = newSeq[seq[int]](ps.len)
+            var combos = 1
+            var ok = true
+            for i, p in ps:
+                if p notin carray.channelPositions:
+                    for v in carray.reducedDomain[p]:
+                        if int(v) >= lo[p] and int(v) <= hi[p]: vals[i].add(int(v))
+                elif lo[p] > -Inf and hi[p] < Inf and hi[p] - lo[p] < MaxCombos:
+                    for v in lo[p]..hi[p]: vals[i].add(v)
+                else:
+                    ok = false
+                    break
+                if vals[i].len == 0:
+                    ok = false
+                    break
+                combos *= vals[i].len
+                if combos > MaxCombos:
+                    ok = false
+                    break
+            if not ok: continue
+            var tbl = initTable[int, T]()
+            var idx = newSeq[int](ps.len)
+            var mn = Inf
+            var mx = -Inf
+            while true:
+                for i, p in ps: tbl[p] = T(vals[i][idx[i]])
+                let v = int(b.expression.evaluate(tbl))
+                mn = min(mn, v)
+                mx = max(mx, v)
+                var i = 0
+                while i < ps.len:
+                    inc idx[i]
+                    if idx[i] < vals[i].len: break
+                    idx[i] = 0
+                    inc i
+                if i == ps.len: break
+            if mn > lo[ch]:
+                lo[ch] = mn
+                result = true
+            if mx < hi[ch]:
+                hi[ch] = mx
+                result = true
+
+    # Bounds propagation to a fixed point (bounded rounds)
+    proc floorDiv(a, b: int): int = (if (a mod b != 0) and ((a < 0) != (b < 0)): a div b - 1 else: a div b)
+    proc ceilDiv(a, b: int): int = -floorDiv(-a, b)
+    discard enumerateChannels()
+    var changed = true
+    var rounds = 0
+    while changed and rounds < 100:
+        changed = false
+        inc rounds
+        for f in forms:
+            # c_j * x_j >= -(k + sum over others of max(c_i * x_i))
+            var restMax = f.k
+            var infCount = 0
+            var infAt = -1
+            for i, p in f.pos:
+                let c = f.coef[i]
+                let b = if c > 0: hi[p] else: lo[p]
+                if b >= Inf or b <= -Inf or abs(b) > Inf div max(1, abs(c)):
+                    inc infCount
+                    infAt = i
+                    if infCount > 1: break
+                else:
+                    restMax += c * b
+                    if abs(restMax) > Inf:
+                        infCount = 2
+                        break
+            if infCount > 1: continue
+            for i, p in f.pos:
+                if infCount == 1 and i != infAt: continue
+                let c = f.coef[i]
+                var rest = restMax
+                if infCount == 0: rest -= c * (if c > 0: hi[p] else: lo[p])
+                # c * x_p + rest >= 0
+                if c > 0:
+                    let nl = ceilDiv(-rest, c)
+                    if nl > lo[p]:
+                        lo[p] = nl
+                        changed = true
+                else:
+                    let nh = floorDiv(rest, -c)
+                    if nh < hi[p]:
+                        hi[p] = nh
+                        changed = true
+                if lo[p] > hi[p]:
+                    if verbose: echo "[LB] bounds empty at position ", p
+                    return false
+        # At a fixed point, the enumerated channels may move again
+        if not changed: changed = enumerateChannels()
+
+    # Latest end of a linear expression e (pos, coef, k): its box maximum, or
+    # that of e + f for a form f cancelling one of e's terms (e <= e + f)
+    var formsAt = initTable[int, seq[int]]()
+    for fi, f in forms:
+        for p in f.pos: formsAt.mgetOrPut(p, @[]).add(fi)
+    proc boxMax(ps, cs: seq[int], k: int): int =
+        result = k
+        for i, p in ps:
+            let b = if cs[i] > 0: hi[p] else: lo[p]
+            if b >= Inf or b <= -Inf or abs(b) > Inf div max(1, abs(cs[i])): return Inf
+            result += cs[i] * b
+            if abs(result) > Inf: return Inf
+    proc exprMax(ps, cs: seq[int], k: int, depth: int): int =
+        ## Upper bound of sum(cs * x[ps]) + k: the box maximum, or that of
+        ## e + f for a form f (f >= 0, so e <= e + f) cancelling a term of e,
+        ## recursively up to `depth` forms.
+        result = boxMax(ps, cs, k)
+        if depth == 0: return
+        var tried: PackedSet[int]
+        for i, p in ps:
+            for fi in formsAt.getOrDefault(p, @[]):
+                if fi in tried: continue
+                tried.incl(fi)
+                let f = forms[fi]
+                var cancels = false
+                for j, q in f.pos:
+                    if q == p and f.coef[j] == -cs[i]:
+                        cancels = true
+                        break
+                if not cancels: continue
+                var sum = initTable[int, int]()
+                for j, q in ps: sum[q] = sum.getOrDefault(q, 0) + cs[j]
+                for j, q in f.pos: sum[q] = sum.getOrDefault(q, 0) + f.coef[j]
+                var qs, ds: seq[int]
+                for q, c in sum.pairs:
+                    if c != 0:
+                        qs.add(q)
+                        ds.add(c)
+                if qs.len > 8: continue
+                result = min(result, exprMax(qs, ds, k + f.k, depth - 1))
+
+    for mc in mmno:
+        var est = Inf
+        var lct = -Inf
+        var work = 0
+        var machines: PackedSet[int]
+        var counted = 0
+        for t in 0..<mc.taskCount:
+            # Required on one of its machines (never on the ignored one)
+            var mvals: seq[int]
+            let mp = mc.machinePositions[t]
+            if mp >= 0:
+                if mp in carray.channelPositions:
+                    # A channel machine: its derived range (a superset of the
+                    # machines it can take, so the bound only gets weaker)
+                    if lo[mp] > -Inf and hi[mp] < Inf and hi[mp] - lo[mp] < 4096:
+                        for v in lo[mp]..hi[mp]: mvals.add(v)
+                else:
+                    for v in carray.reducedDomain[mp]: mvals.add(int(v))
+            else:
+                mvals = @[mc.fixedMachines[t]]
+            if mvals.len == 0 or mc.ignoreMachine in mvals: continue
+            let sp = mc.startPositions[t]
+            let dp = mc.durPositions[t]
+            let dMin = if dp >= 0: lo[dp] else: mc.durations[t]
+            if dMin <= 0 or dMin >= Inf: continue
+            # Start expression: a linear channel's definition, else the position
+            var ps, cs: seq[int]
+            var k = 0
+            if sp in chanDef:
+                (ps, cs, k) = chanDef[sp]
+            else:
+                ps = @[sp]
+                cs = @[1]
+            let sLo = lo[sp]
+            if dp >= 0:
+                ps.add(dp)
+                cs.add(1)
+            else:
+                k += mc.durations[t]
+            let eMax = exprMax(ps, cs, k, 2)
+            if sLo <= -Inf or eMax >= Inf: return true   # an unbounded task: no bound
+            est = min(est, sLo)
+            lct = max(lct, eMax)
+            work += dMin
+            inc counted
+            for v in mvals: machines.incl(v)
+        if counted == 0: continue
+        let capacity = machines.len * max(0, lct - est)
+        if verbose:
+            echo "[LB] no-overlap: ", counted, " tasks, work ", work, ", machines ", machines.len,
+                 ", window [", est, ", ", lct, "]"
+        if work > capacity: return false
+    true
 
 proc extractLinearCoeffs[T](expr: Expression[T]): (bool, Table[int, T], T) =
     ## Extract coefficients and constant from a linear Expression.
