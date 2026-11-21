@@ -422,6 +422,8 @@ type
         compactDom: Table[int, seq[T]]
         compactCalls, compactMoves: int
         compactMmno: seq[int]       # every MultiMachineNoOverlap constraint
+        compactAnchors: Table[int, seq[(int, int)]]   # dur pos -> (MMNO ci, task) whose start channel reads it
+        reorderTrials, reorderKept, reorderGains: int
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -5798,7 +5800,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
     if state.keepEndTasks.len > 0:
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
     if state.compactCalls > 0:
-        echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}"
+        echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}" &
+             &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
         echo &"[Tabu S{state.id}] permSwap: fast={fastOk} anyChannels={state.anyChannels} hasChannelDeps={state.hasChannelDeps} " &
@@ -6829,18 +6832,36 @@ proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[boo
 
 const CompactMaxSecs = 2.0      # compaction budget per feasible state
 const CompactShare = 0.05       # ... at most this share of the time left
+const ReorderMaxSecs = 10.0     # reorder budget per state
+const ReorderShare = 0.10       # ... at most this share of the time left
 
 proc compactState[T](state: TabuState[T], deadline: float) =
-    ## Runs tabuCompaction on a state violating at most the objective bound
-    ## and records what it reaches as the best or near-feasible state.
+    ## Runs tabuCompaction (compaction, then reordering) on a state violating
+    ## at most the objective bound and records what it reaches as the best or
+    ## near-feasible state.
     let bc = state.boundConstraint
     if bc == nil or state.cost != bc.penalty(): return
-    let budget = if deadline > 0: min(CompactMaxSecs, CompactShare * max(0.0, deadline - epochTime()))
-                 else: CompactMaxSecs
+    let left = if deadline > 0: max(0.0, deadline - epochTime()) else: 0.0
+    let budget = if deadline > 0: min(CompactMaxSecs, CompactShare * left) else: CompactMaxSecs
+    let rBudget = if deadline > 0: min(ReorderMaxSecs, ReorderShare * left) else: ReorderMaxSecs
     let slack0 = state.boundSlack()
     let t0 = epochTime()
+    # Lean commits; the penalty structures are rebuilt below for a best-move walk
+    let wasLean = state.leanSearch
+    state.leanSearch = true
     let moves = state.compactSchedule(budget)
-    if moves == 0: return
+    let slack1 = state.boundSlack()
+    let t1 = epochTime()
+    let kept0 = state.reorderKept
+    let gains = state.reorderSchedule(rBudget)
+    let kept = state.reorderKept - kept0
+    state.leanSearch = wasLean
+    if moves == 0 and kept == 0: return
+    if not wasLean:
+        for pos in state.channelDepSearchPositions:
+            if not state.isLazy[pos]:
+                state.computeChannelDepPenaltiesAt(pos)
+        state.rebuildPenaltyMap()
     if state.cost < state.bestCost:
         state.bestCost = state.cost
         state.bestAssignment = state.assignment
@@ -6850,9 +6871,10 @@ proc compactState[T](state: TabuState[T], deadline: float) =
             state.nearBestCost = raw
             state.nearBestAssignment = state.assignment
     if state.verbose:
-        let slack1 = state.boundSlack()
-        let secs = epochTime() - t0
-        echo &"[Tabu S{state.id}] Compaction: {moves} moves, objective slack {slack0} -> {slack1}, cost {state.cost} ({secs:.2f}s)"
+        let slack2 = state.boundSlack()
+        let t2 = epochTime()
+        echo &"[Tabu S{state.id}] Compaction: {moves} moves, objective slack {slack0} -> {slack1} ({t1 - t0:.2f}s); " &
+             &"reorder: {kept} kept, {gains} gains, slack -> {slack2}, cost {state.cost} ({t2 - t1:.2f}s)"
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
