@@ -426,7 +426,7 @@ type
         compactReassignBuilt: bool
         compactReassign: Table[int, seq[int]]         # start pos -> positions moving its tasks' machines
         reassignTrials, reassignKept: int
-        reorderTrials, reorderKept, reorderGains: int
+        reorderTrials, reorderKept, reorderGains, reorderKicks: int
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -5804,7 +5804,7 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
     if state.compactCalls > 0:
         echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}" &
-             &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains}" &
+             &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains} kicks={state.reorderKicks}" &
              &" reassign: trials={state.reassignTrials} kept={state.reassignKept}"
     if state.permSwapCalls > 0:
         let fastOk = fastSwapEvalOk(state)
@@ -6836,10 +6836,10 @@ proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[boo
 
 const CompactMaxSecs = 2.0      # compaction budget per feasible state
 const CompactShare = 0.05       # ... at most this share of the time left
-const ReorderMaxSecs = 30.0     # reorder budget per state
+const ReorderMaxSecs = 300.0    # reorder budget per state
 const ReorderShare = 0.25       # ... at most this share of the time left
 
-proc compactState[T](state: TabuState[T], deadline: float) =
+proc compactState[T](state: TabuState[T], deadline: float, shouldStop: ptr Atomic[bool] = nil) =
     ## Runs tabuCompaction (compaction, then reordering) on a state violating
     ## at most the objective bound and records what it reaches as the best or
     ## near-feasible state.
@@ -6858,7 +6858,7 @@ proc compactState[T](state: TabuState[T], deadline: float) =
     let t1 = epochTime()
     let kept0 = state.reorderKept
     let rkept0 = state.reassignKept
-    let gains = state.reorderSchedule(rBudget)
+    let gains = state.reorderSchedule(rBudget, shouldStop)
     let rkept = state.reassignKept - rkept0
     let kept = state.reorderKept - kept0 + rkept
     state.leanSearch = wasLean
@@ -6928,6 +6928,14 @@ proc constructState[T](state: TabuState[T], deadline: float) =
         echo &"[Tabu S{state.id}] Construction: built, cost {state.cost}, " &
              &"best cost {state.bestCost} ({secs:.2f}s)"
 
+proc resultSlack*[T](state: TabuState[T]): int =
+    ## Objective-bound slack of the best assignment when it is the current
+    ## one (negative = inside the bound), else high(int)
+    if state.boundConstraint == nil or state.boundConstraint.stateType != RelationalType or
+            state.bestAssignment != state.assignment:
+        return high(int)
+    int(state.boundSlack())
+
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
     ## and of the result when they violate at most the objective bound, and
@@ -6937,14 +6945,14 @@ proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic
     let pre = bc != nil and state.cost == bc.penalty()
     var compacted: seq[T]
     if pre:
-        state.compactState(deadline)
+        state.compactState(deadline, shouldStop)
         compacted = state.assignment
     result = state.tabuWalk(threshold, shouldStop, deadline)
     if result.bestCost > 0:
         result.constructState(deadline)
     # A second pass over the state the first one left would find nothing
     if not pre or result.assignment != compacted:
-        result.compactState(deadline)
+        result.compactState(deadline, shouldStop)
 
 
 proc tabuImprove*[T](carray: ConstrainedArray[T], threshold: int, verbose: bool = false, deadline: float = 0.0): TabuState[T] =

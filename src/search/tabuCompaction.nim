@@ -167,7 +167,11 @@ proc compactSchedule[T](state: TabuState[T], budget: float): int =
 const ReorderWindow = 12        # event move distance in the order
 const ReorderMaxStarts = 48     # start candidates per start event
 const ReorderMaxDurs = 48       # duration candidates per end event
-const ReorderStallTrials = 10000 # trials without a strict gain before giving up
+const ReorderStallTrials = 10000 # trials without a strict gain before giving up, no kicks
+const ReorderKickStall = 2000   # trials without a strict gain before a kick
+const ReorderKickMoves = 8      # kept trials of any slack per kick
+const ReorderIdleKicks = 100    # kicks without a new best before giving up
+const ReassignMoveShare = 0.5   # reassignments that also move the unit's start
 const ReassignShare = 0.3       # share of reassignment trials
 const ReassignMaxProbe = 20000  # search positions probed for reassignment at most
 
@@ -492,10 +496,17 @@ proc reorderEvents[T](state: TabuState[T]): (seq[int], seq[int], seq[ReorderEven
     for k in 0..<keyed.len: sortedEvents[k] = events[keyed[k][2]]
     (units, durOf, sortedEvents)
 
-proc reorderSchedule[T](state: TabuState[T], budget: float): int =
+proc reorderSchedule[T](state: TabuState[T], budget: float, shouldStop: ptr Atomic[bool] = nil): int =
     ## Reorder trials (see above) on a state violating at most the objective
-    ## bound, until the budget or ReorderStallTrials trials without a strict
-    ## gain; returns the number of strict gains.
+    ## bound. On a state under the bound, an iterated local search: after
+    ## ReorderKickStall trials without a strict gain, the best schedule found
+    ## takes ReorderKickMoves trials whatever their slack (a kick) and the
+    ## descent goes on from there, until the budget, ReorderIdleKicks kicks
+    ## in a row without a new best or shouldStop; otherwise a descent until
+    ## ReorderStallTrials trials without a strict gain. Leaves the best
+    ## schedule; returns the number of times the best improved. saeling
+    ## j0010_m008: the descent converges within ~17k trials in the basin of
+    ## its start (170-190).
     let bc = state.boundConstraint
     if bc == nil or bc.stateType != RelationalType: return 0
     if state.cost != bc.penalty(): return 0
@@ -515,17 +526,44 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
     var finals: seq[(int, T)]
     var seen: PackedSet[int]
     var stall = 0
+    var kick = 0                 # kick trials left
+    var idleKicks = 0
     # The event order is the search state: sorted by time once (by
     # reorderEvents), then moved by the kept trials (a kept trial that leaves
     # the schedule unchanged still changes the order: drift on the plateau)
-    for k, e in events:
-        if not e.isEnd: startAt[e.unit] = k
-    while stall < ReorderStallTrials and epochTime() - t0 < budget:
+    template indexStarts() =
+        for k, e in events:
+            if not e.isEnd: startAt[e.unit] = k
+    indexStarts()
+    var bestSlack = state.boundSlack()
+    var bestAssignment = state.assignment
+    var bestEvents = events
+    template restoreBest() =
+        for p in 0..<bestAssignment.len:
+            if state.assignment[p] != bestAssignment[p] and p notin state.carray.channelPositions:
+                state.assignValueLean(p, bestAssignment[p])
+        events = bestEvents
+        indexStarts()
+    # Kicks need room under the bound: in a state over it (an incumbent
+    # seeding a retry ask) the domains, tightened by the bound, keep every
+    # schedule within about the incumbent's objective
+    let kicks = state.boundSlack() < 0
+    while epochTime() - t0 < budget:
+        if not kicks and stall >= ReorderStallTrials: break
+        if shouldStop != nil and shouldStop[].load(moRelaxed): break
+        if kicks and kick == 0 and stall >= ReorderKickStall:
+            if idleKicks >= ReorderIdleKicks: break
+            inc idleKicks
+            restoreBest()
+            kick = ReorderKickMoves
+            stall = 0
+            inc state.reorderKicks
         var i, j: int
         var rp = -1
         var rv = T(0)
         if reassignable.len > 0 and rand(1.0) < ReassignShare:
-            # Reassignment: a new value for one of a unit's positions
+            # Reassignment: a new value for one of a unit's positions, with
+            # the unit's start moved or not
             let u = reassignable[rand(reassignable.len - 1)]
             let ps {.cursor.} = state.compactReassign[units[u]]
             rp = ps[rand(ps.len - 1)]
@@ -534,6 +572,8 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
             if rv == state.assignment[rp]: continue
             i = startAt[u]
             j = i
+            if rand(1.0) < ReassignMoveShare:
+                j = clamp(i + rand(2 * ReorderWindow) - ReorderWindow, 0, events.len - 1)
             inc state.reassignTrials
         else:
             i = rand(events.len - 1)
@@ -543,7 +583,7 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
         let slack0 = state.boundSlack()
         log.setLen(0)
         let ok = state.reorderTrial(events, units, durOf, i, j, log, rp, rv)
-        let keep = ok and state.cost == bc.penalty() and state.boundSlack() <= slack0
+        let keep = ok and state.cost == bc.penalty() and (kick > 0 or state.boundSlack() <= slack0)
         let gain = keep and state.boundSlack() < slack0
         finals.setLen(0)
         if keep and not state.leanSearch:
@@ -562,18 +602,22 @@ proc reorderSchedule[T](state: TabuState[T], budget: float): int =
                 for (p, v) in finals:
                     if state.assignment[p] != v: state.commitValue(p, v)
             if rp >= 0: inc state.reassignKept
-            else:
-                inc state.reorderKept
+            else: inc state.reorderKept
+            if i != j:
                 let ev = events[i]
                 events.delete(i)
                 events.insert(ev, j)
-                for k, e in events:
-                    if not e.isEnd: startAt[e.unit] = k
-        if gain:
+                indexStarts()
+            if kick > 0: dec kick
+        if gain: stall = 0
+        else: inc stall
+        if keep and state.boundSlack() < bestSlack:
+            bestSlack = state.boundSlack()
+            bestAssignment = state.assignment
+            bestEvents = events
+            idleKicks = 0
             inc result
-            stall = 0
-        else:
-            inc stall
+    if state.boundSlack() > bestSlack: restoreBest()
     state.reorderGains += result
 
 ## Construction: a state whose only violations are no-overlap overlaps (and

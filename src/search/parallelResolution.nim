@@ -10,6 +10,7 @@ export candidatePool
 type
     BatchResult*[T] = object
         found*: bool
+        slack*: int  # objective-bound slack of a found assignment (high(int): unknown)
         cost*: int  # Store cost instead of full state
         assignment*: seq[T]  # Safe copy of solution values
         workerId*: int
@@ -116,6 +117,7 @@ proc iterativeWorker*[T](data: IterativeWorkerData[T]) {.thread.} =
 
             let result = BatchResult[T](
                 found: improved.bestCost == 0,
+                slack: improved.resultSlack(),
                 cost: improved.bestCost,
                 assignment: improved.bestAssignment,
                 workerId: data.workerId,
@@ -159,6 +161,7 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                 let endTime = epochTime()
                 let result = BatchResult[T](
                     found: improved.bestCost == 0,
+                    slack: improved.resultSlack(),
                     cost: improved.bestCost,
                     assignment: improved.bestAssignment,
                     workerId: 0,
@@ -220,14 +223,13 @@ iterator improveStates*[T](population: seq[TabuState[T]],
                     newResults = move(pool.results)
                     pool.results = @[]
 
-                # Yield any new results
+                # Yield any new results (all of them: a batch can hold more
+                # than one solution)
                 for i in 0..<newResults.len:
                     yield newResults[i]
                     inc yieldedResults
-
                     if newResults[i].found:
                         pool.solutionFound.store(true)
-                        break
 
                 if yieldedResults >= population.len or pool.solutionFound.load():
                     break
@@ -306,6 +308,7 @@ proc assignmentWorker*[T](data: AssignmentWorkerData[T]) {.thread.} =
 
             let result = BatchResult[T](
                 found: improved.bestCost == 0,
+                slack: improved.resultSlack(),
                 cost: improved.bestCost,
                 assignment: improved.bestAssignment,
                 workerId: data.workerId,
@@ -352,6 +355,7 @@ iterator improveFromAssignments*[T](system: ConstraintSystem[T],
                 let endTime = epochTime()
                 let result = BatchResult[T](
                     found: improved.bestCost == 0,
+                    slack: improved.resultSlack(),
                     cost: improved.bestCost,
                     assignment: improved.bestAssignment,
                     workerId: 0,
@@ -578,17 +582,19 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
     var allResults: seq[PoolEntry[T]] = @[]
     var maxLastImp = 0
 
+    # The first solution stops the other workers; those that also reach one
+    # still report it, and the one furthest inside the objective bound wins
+    # (workers improving a solution, as tabuCompaction's reordering does,
+    # all stop at about the same time)
+    var winner = -1
+    var found: seq[BatchResult[T]]
     for result in improveStates(population, numWorkers, tabuThreshold, verbose = false, deadline = deadline):
         maxLastImp = max(maxLastImp, result.lastImprovement)
         if result.found:
-            if verbose:
-                let elapsed = result.endTime - result.startTime
-                let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
-                echo &"[Solve] Solution found by S{result.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)"
-            system.initialize(result.assignment)
-            system.lastIterations = result.iterations
-            system.lastSearchSeconds = result.endTime - result.startTime
-            return true
+            found.add(result)
+            if winner < 0 or result.slack < found[winner].slack: winner = found.len - 1
+            continue
+        if winner >= 0: continue
         if verbose:
             let elapsed = result.endTime - result.startTime
             echo &"[Solve] S{result.workerId} stopped: cost={result.cost} iters={result.iterations} {elapsed:.1f}s"
@@ -599,6 +605,17 @@ proc parallelResolve*[T](system: ConstraintSystem[T],
         if result.nearAssignment.len > 0 and result.nearCost < system.nearFeasibleCost:
             system.nearFeasibleCost = result.nearCost
             system.nearFeasibleAssignment = result.nearAssignment
+    if winner >= 0:
+        let result = found[winner]
+        if verbose:
+            let elapsed = result.endTime - result.startTime
+            let rate = if elapsed > 0: result.iterations.float / elapsed else: 0.0
+            echo &"[Solve] Solution found by S{result.workerId} in {elapsed:.1f}s ({rate:.0f} iter/s)" &
+                 (if found.len > 1: &" (best of {found.len})" else: "")
+        system.initialize(result.assignment)
+        system.lastIterations = result.iterations
+        system.lastSearchSeconds = result.endTime - result.startTime
+        return true
 
     # Set adapted threshold based on observed search depth
     if maxLastImp > 0:
