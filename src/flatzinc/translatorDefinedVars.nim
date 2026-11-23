@@ -844,6 +844,82 @@ proc detectReifEquationChannelVars(tr: var FznTranslator) =
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Detected {nDetected} reif-equation channel vars (int_lin_eq_reif → channel, {iterations} iterations)")
 
+type DefinitionGraph = object
+    built: bool
+    arrays: Table[string, seq[FznExpr]]
+    definer: Table[string, int]   # defined var -> its defining constraint
+
+proc buildDefinitionGraph(tr: FznTranslator): DefinitionGraph =
+    result.built = true
+    for decl in tr.model.variables:
+        if decl.isArray and decl.value != nil and decl.value.kind == FznArrayLit:
+            result.arrays[decl.name] = decl.value.elems
+    for dci in tr.definingConstraints:
+        let con {.cursor.} = tr.model.constraints[dci]
+        if con.hasAnnotation("defines_var"):
+            let ann = con.getAnnotation("defines_var")
+            if ann.args.len > 0 and ann.args[0].kind == FznIdent:
+                result.definer[ann.args[0].ident] = dci
+        elif dci in tr.implicitLinEqDefinedVars:
+            result.definer[tr.implicitLinEqDefinedVars[dci]] = dci
+
+proc dependsOn(tr: FznTranslator, g: DefinitionGraph, y, x: string): bool =
+    ## Whether the definition of `y` reads `x`, directly or through other
+    ## defined variables.
+    var seen = initHashSet[string]()
+    var stack = @[y]
+    while stack.len > 0:
+        let v = stack.pop()
+        if v == x: return true
+        if v in seen: continue
+        seen.incl(v)
+        if v notin g.definer: continue
+        for a in tr.model.constraints[g.definer[v]].args:
+            if a.kind == FznIdent:
+                stack.add(a.ident)
+                if a.ident in g.arrays:
+                    for e in g.arrays[a.ident]:
+                        if e.kind == FznIdent: stack.add(e.ident)
+            elif a.kind == FznArrayLit:
+                for e in a.elems:
+                    if e.kind == FznIdent: stack.add(e.ident)
+    false
+
+proc tryScaledCopyDefinition(tr: var FznTranslator, ci: int, coefs: seq[int],
+                              varElems: seq[FznExpr], alreadyDefined: var HashSet[string],
+                              graph: var DefinitionGraph): bool =
+    ## `x ± a*y = c` where y is already computed (a defined or channel var) and
+    ## x is a plain variable: x is then fully determined by y, so it becomes
+    ## y's scaled copy instead of a search position that every change of y
+    ## must be matched by (zephyrus: `bindings = 10 * comps_num`, with
+    ## comps_num the sum of the placements; one placement move broke the
+    ## equality by 10). x may be search-annotated: the annotation cannot make
+    ## it a free choice. x's declared range is re-emitted as a bound.
+    if varElems[0].kind != FznIdent or varElems[1].kind != FznIdent: return false
+    for xi in 0..1:
+        let yi = 1 - xi
+        if coefs[xi] != 1 and coefs[xi] != -1: continue
+        let x = varElems[xi].ident
+        let y = varElems[yi].ident
+        if x == y: continue
+        if y notin tr.definedVarNames and y notin tr.channelVarNames: continue
+        if x in tr.paramValues or x in tr.definedVarNames or x in tr.channelVarNames or
+           x in alreadyDefined:
+            continue
+        # Defining x from y closes a cycle when y is built from x
+        if not graph.built: graph = tr.buildDefinitionGraph()
+        if tr.dependsOn(graph, y, x): continue
+        let (dom, lo, hi) = tr.getTightenedBounds(x)
+        if dom.len == 0: continue
+        tr.definedVarNames.incl(x)
+        tr.definingConstraints.incl(ci)
+        tr.implicitLinEqDefinedVars[ci] = x
+        tr.implicitLinEqRangeBounds.add((ci: ci, varName: x, lo: lo, hi: hi))
+        alreadyDefined.incl(x)
+        graph.definer[x] = ci
+        return true
+    false
+
 proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
     ## Promotes one variable per int_lin_eq constraint without `defines_var` to
     ## a defined-var expression. Runs late, after all specialised pattern
@@ -887,6 +963,8 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
     # Step 2: scan int_lin_eq constraints without defines_var and identify the
     # subset that has a unique eligible candidate variable.
     var nDetected = 0
+    var nScaled = 0
+    var defGraph: DefinitionGraph
     for ci in 0 ..< tr.model.constraints.len:
         let con {.cursor.} = tr.model.constraints[ci]
         if ci in tr.definingConstraints: continue
@@ -910,6 +988,9 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
         except CatchableError: continue
         let varElems = tr.resolveVarArrayElems(con.args[1])
         if coefs.len != varElems.len or varElems.len == 0: continue
+        if varElems.len == 2 and tr.tryScaledCopyDefinition(ci, coefs, varElems, alreadyDefined, defGraph):
+            inc nScaled
+            continue
         # Restrict to the "sum + slack = capacity" shape: ≥ 3 variables and
         # every coefficient is ±1. This is the pattern where the modeller
         # encoded a balance equation that should really have been a defining
@@ -965,6 +1046,8 @@ proc detectImplicitLinEqDefinedVars*(tr: var FznTranslator) =
 
     if nDetected > 0:
         stderr.writeLine(&"[FZN] Promoted {nDetected} unannotated int_lin_eq vars to defined channels (sum+slack=capacity pattern)")
+    if nScaled > 0:
+        stderr.writeLine(&"[FZN] Promoted {nScaled} unannotated int_lin_eq vars to defined channels (scaled copy of a computed var)")
 
 proc detectImplicitElementChannels*(tr: var FznTranslator) =
     ## Promotes constant-array element constraints WITHOUT `defines_var` to
