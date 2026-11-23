@@ -84,6 +84,19 @@ proc applyCircuitTimeObjectiveBounds[T](system: ConstraintSystem[T],
             dec bound   # floor division for a negative numerator
         c.setObjectiveBound(bound)
 
+proc applyStagingLevel[T](system: ConstraintSystem[T], k: int): int =
+    ## Applies the staged-presolve fixings derived under `v <= k`; the caller
+    ## guarantees `v <= k` holds. Returns the number of positions fixed.
+    let st = system.objectiveStaging
+    if k notin st.fixingsByBound: return 0
+    let fixes = st.fixingsByBound[k]
+    if fixes.len == 0: return 0
+    for (pos, val) in fixes:
+        system.baseArray.reducedDomain[pos] = @[val]
+        system.baseArray.fixedPositions.incl(pos)
+    system.baseArray.tightenReducedDomain()
+    fixes.len
+
 proc applyObjectiveStaging[T](system: ConstraintSystem[T], targetBound: int, verbose: bool) =
     ## When the objective upper bound `targetBound` implies the dominant gating
     ## variable `v <= k`, apply the precomputed staged-presolve fixings (singleton
@@ -100,16 +113,10 @@ proc applyObjectiveStaging[T](system: ConstraintSystem[T], targetBound: int, ver
         dec kB   # floor division for a negative numerator
     if kB >= st.vHi: return    # bound does not constrain v
     if kB < st.vLo: return     # implies v below its domain: subproblem infeasible — let search report it
-    if kB notin st.fixingsByBound: return
-    let fixes = st.fixingsByBound[kB]
-    if fixes.len == 0: return
-    for (pos, val) in fixes:
-        system.baseArray.reducedDomain[pos] = @[val]
-        system.baseArray.fixedPositions.incl(pos)
-    system.baseArray.tightenReducedDomain()
-    if verbose:
+    let n = applyStagingLevel(system, kB)
+    if verbose and n > 0:
         echo "[Opt] Staging: objective<=", targetBound, " implies v<=", kB,
-             " (fixed ", fixes.len, " gated positions)"
+             " (fixed ", n, " gated positions)"
         flushFile(stdout)
 
 
@@ -832,8 +839,25 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         if curV - 1 >= vMin and curV - 1 < domBlockedLevel:
                             system.addConstraint(od.expr <= T(curV - 1))
                             domAsk = true
+                            # addConstraint drops the cached reduced domain:
+                            # restore this ask's (base + objective staging)
+                            system.baseArray.reducedDomain = baseReducedDomain
+                            system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
+                            system.baseArray.tightenReducedDomain()
+                            applyObjectiveStaging(system, askTarget, false)
+                            # The ask enforces v <= curV - 1: when v is also the
+                            # staging variable, collapse the blocks presolve
+                            # fixed under that bound, as a probe implying it
+                            # would (seat-moving: steps after the level fixed
+                            # to the goal; without them the ask misses).
+                            var staged = 0
+                            let st = system.objectiveStaging
+                            if st.active and st.weight > 0 and od.expr.positions.len == 1 and
+                                    st.boundVar in od.expr.positions:
+                                staged = applyStagingLevel(system, curV - 1)
                             if verbose:
-                                echo "[Opt] Dominant ask: v <= ", curV - 1
+                                echo "[Opt] Dominant ask: v <= ", curV - 1,
+                                     (if staged > 0: " (staged: fixed " & $staged & " gated positions)" else: "")
                                 flushFile(stdout)
 
                 let thisUnseeded = askUnseeded
