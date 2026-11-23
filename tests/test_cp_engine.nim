@@ -123,6 +123,25 @@ suite "CP engine":
         check s.stalled
         check epochTime() - t0 < 5.0
 
+    test "root shaving: a bound only fixed values refute":
+        # zephyrus' unicity shape: n = i -> bind <= i * m (i < 10), bind = 10 * m,
+        # m >= 1; bounds propagation alone keeps n >= 0, shaving finds n >= 10
+        let s = newCpSolver()
+        let n = s.newVar(0, 20)
+        let m = s.newVar(1, 5)
+        let bnd = s.newVar(0, 100)
+        s.addLinear(@[1, -10], @[bnd, m], 0, lrEq)
+        for i in 0 ..< 10:
+            let b = s.newVar(0, 1)
+            s.addLinear(@[1], @[n], i, lrEq, b)
+            s.addLinear(@[1, -i], @[bnd, m], 0, lrLe, b, imp = true)
+        let removed = s.shaveBounds()
+        check removed > 0
+        check s.lo(n) == 10
+        check s.hi(n) == 20
+        check s.solve() == cpSat
+        check s.value(n) >= 10
+
     test "random models agree with brute force":
         var rng = initRand(12345)
         const nVars = 4
@@ -235,7 +254,9 @@ suite "CP engine":
                     let ab = s.newVar(-100, 100)
                     s.addAbs(dv, ab)
                     s.addLinear(@[1, -1], @[ab, xs[cn.x[^1]]], 0, lrEq, r)
-            let st = s.solve()
+            # odd trials shave the root first: removals must keep every solution
+            let shaved = if trial mod 2 == 1: s.shaveBounds() else: 0
+            let st = if shaved < 0: cpUnsat else: s.solve()
             check st == (if anySol: cpSat else: cpUnsat)
             if st == cpSat:
                 var sol = xs.mapIt(s.value(it))

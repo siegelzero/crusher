@@ -282,6 +282,7 @@ proc buildCpModel(tr: var FznTranslator): CpPlan =
     plan
 
 const CpStallMinSecs = 2.0   # see CpSolver.solve: depth-stall cutoff floor
+const CpShaveShare = 0.25    # share of the seed budget for root shaving
 
 proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): seq[int] {.closure.} =
     ## The DFS as a seed source for the first resolve (nil when the engine
@@ -308,6 +309,10 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): se
         stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables ({epochTime() - t0:.2f}s)")
     result = proc(budget: float): seq[int] =
         let t1 = epochTime()
+        let shaved = plan.s.shaveBounds(deadline = t1 + budget * CpShaveShare)
+        if verbose:
+            stderr.writeLine(&"[CP] root shaving: {shaved} values removed ({epochTime() - t1:.2f}s)")
+        if shaved < 0: return @[]
         let st = plan.s.solve(deadline = t1 + budget, stallMin = CpStallMinSecs)
         if verbose or st == cpSat:
             let why = if plan.s.stalled: " (depth stalled)" else: ""

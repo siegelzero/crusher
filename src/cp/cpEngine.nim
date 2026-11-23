@@ -841,6 +841,44 @@ proc addRegular*(s: CpSolver, xs: seq[int], q, sy: int, d: seq[int], q0: int, fi
     p.bwd = newSeq[bool]((xs.len + 1) * (q + 1))
     s.addProp(p)
 
+# --------------------------------------------------------------- shaving
+
+const ShaveMaxStepsPerBound = 64   # removals per bound and round (wide domains)
+
+proc shaveBounds*(s: CpSolver, deadline: float = 0.0, maxRounds = 4): int =
+    ## Root-level singleton bound consistency: a variable's lowest (highest)
+    ## value is removed while assigning it fails propagation; rounds repeat
+    ## while a bound moved. Finds what bounds propagation sees only once a
+    ## variable is fixed, e.g. zephyrus' unicity constraints `n = i ->
+    ## bindings <= i * m` for i < 10 against `bindings = 10 * m`, m >= 1:
+    ## n >= 10. The removals are permanent (call before solve). Returns the
+    ## number of refuted bound values (propagation removes more), -1 when the
+    ## root is infeasible.
+    for p in 0 ..< s.props.len: s.enqueue(p)
+    if not s.propagateAll(): return -1
+    let fails0 = s.fails
+    for round in 0 ..< maxRounds:
+        var moved = false
+        for v in 0 ..< s.vars.len:
+            for side in 0 .. 1:
+                var steps = 0
+                while s.vars[v].size > 1 and steps < ShaveMaxStepsPerBound:
+                    if deadline > 0 and epochTime() > deadline:
+                        s.fails = fails0
+                        return result
+                    let val = if side == 0: s.vars[v].lo else: s.vars[v].hi
+                    s.pushLevel()
+                    let ok = s.assign(v, val) and s.propagateAll()
+                    s.popLevel()
+                    if ok: break
+                    s.clearQueues()
+                    let cut = if side == 0: s.setMin(v, val + 1) else: s.setMax(v, val - 1)
+                    if not (cut and s.propagateAll()): return -1
+                    inc result; inc steps
+                    moved = true
+        if not moved: break
+    s.fails = fails0
+
 # ------------------------------------------------------------------ search
 
 proc addBranchGroup*(s: CpSolver, vars: seq[int], varSel: CpVarSel, valSel: CpValSel) =
