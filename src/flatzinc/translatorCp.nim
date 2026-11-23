@@ -284,6 +284,34 @@ proc buildCpModel(tr: var FznTranslator): CpPlan =
 const CpStallMinSecs = 2.0   # see CpSolver.solve: depth-stall cutoff floor
 const CpShaveShare = 0.25    # share of the seed budget for root shaving
 
+type CpPositionMap = object
+    defaults: seq[int]            # value per position (first domain value)
+    posVar: seq[(int, int)]       # (position, engine variable)
+    posDom: seq[seq[int]]         # position domains, parallel to posVar
+
+proc cpPositionMap(tr: FznTranslator, plan: CpPlan): CpPositionMap =
+    result.defaults = newSeq[int](tr.sys.baseArray.len)
+    for p in 0 ..< result.defaults.len:
+        let d {.cursor.} = tr.sys.baseArray.domain[p]
+        result.defaults[p] = if d.len > 0: d[0] else: 0
+    for name, v in plan.varOf:
+        if name notin tr.varPositions: continue
+        let p = tr.varPositions[name]
+        if p < 0 or p >= result.defaults.len or tr.sys.baseArray.domain[p].len == 0: continue
+        result.posVar.add (p, v)
+    for (p, v) in result.posVar: result.posDom.add tr.sys.baseArray.domain[p]
+
+proc toAssignment(m: CpPositionMap, value: proc(v: int): int): seq[int] =
+    ## Engine values -> a position assignment (nearest domain value)
+    result = m.defaults
+    for k, (p, v) in m.posVar:
+        let x = value(v)
+        let d {.cursor.} = m.posDom[k]
+        var bestV = d[0]
+        for y in d:
+            if abs(y - x) < abs(bestV - x): bestV = y
+        result[p] = bestV
+
 proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): seq[int] {.closure.} =
     ## The DFS as a seed source for the first resolve (nil when the engine
     ## has no propagator for some constraint of the model).
@@ -293,18 +321,7 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): se
         if verbose: stderr.writeLine(&"[CP] skipped: {plan.unsupported}")
         return nil
     # Position mapping, so the search needs nothing from the translator
-    var defaults = newSeq[int](tr.sys.baseArray.len)
-    for p in 0 ..< defaults.len:
-        let d {.cursor.} = tr.sys.baseArray.domain[p]
-        defaults[p] = if d.len > 0: d[0] else: 0
-    var posVar: seq[(int, int)]     # (position, engine variable)
-    for name, v in plan.varOf:
-        if name notin tr.varPositions: continue
-        let p = tr.varPositions[name]
-        if p < 0 or p >= defaults.len or tr.sys.baseArray.domain[p].len == 0: continue
-        posVar.add (p, v)
-    var posDom: seq[seq[int]]
-    for (p, v) in posVar: posDom.add tr.sys.baseArray.domain[p]
+    let m = tr.cpPositionMap(plan)
     if verbose:
         stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables ({epochTime() - t0:.2f}s)")
     result = proc(budget: float): seq[int] =
@@ -319,11 +336,108 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): se
             stderr.writeLine(&"[CP] DFS {st}{why}: {plan.s.nodes} nodes, {plan.s.fails} fails, " &
                              &"depth {plan.s.maxDepth}, {epochTime() - t1:.2f}s")
         if st != cpSat: return @[]
-        result = defaults
-        for k, (p, v) in posVar:
-            let x = plan.s.value(v)
-            let d {.cursor.} = posDom[k]
-            var bestV = d[0]
-            for y in d:
-                if abs(y - x) < abs(bestV - x): bestV = y
-            result[p] = bestV
+        let s = plan.s
+        m.toAssignment(proc(v: int): int = s.value(v))
+
+import std/random
+
+const
+    CpLnsMaxNodes = 2000        # nodes per neighbourhood search
+    CpLnsStallMin = 3.0         # a phase ends after max(this, half its improving time) without a gain
+    CpLnsFracStart = 0.2        # share of the decision variables freed per neighbourhood
+
+proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[int], budget: float): seq[int] {.closure.} =
+    ## Large neighbourhood search with the propagation engine, for the
+    ## optimizer (nil when the model is unsupported or has no objective
+    ## variable). Each neighbourhood keeps a random share of the decision
+    ## variables (the solve annotation's search lists) at the incumbent's
+    ## values, requires a strictly better objective and runs a node-limited
+    ## DFS over the rest; the share freed grows when neighbourhoods are proved
+    ## empty and shrinks when the search runs out of nodes. kitchen at 300 s
+    ## -p 4: tall_complex 409 (optimal), larger 465 of 470, linear 501 of
+    ## 516, real_b1 802 of 852, b1 9351 of 9942, where local search alone
+    ## reached 255 / 422 / 277 / 431 / 5200. A phase ends on its
+    ## budget or once it stops improving; the incumbent comes from the caller
+    ## (imported when it propagates), else from a DFS of the engine's own.
+    let sol = tr.model.solve
+    if sol.kind == Satisfy or sol.objective == nil or sol.objective.kind != FznIdent: return nil
+    var plan = tr.buildCpModel()
+    if plan.unsupported != "" or sol.objective.ident notin plan.varOf: return nil
+    let s = plan.s
+    let obj = plan.varOf[sol.objective.ident]
+    let maximize = sol.kind == Maximize
+    let dvars = s.groupVars()
+    if dvars.len == 0: return nil
+    let m = tr.cpPositionMap(plan)
+    var isDvar = newSeq[bool](s.numVars)
+    for v in dvars: isDvar[v] = true
+    var ready = false
+    var rootOk = true
+    var cur: seq[int]          # engine incumbent (all variables), empty until known
+    var rng = initRand(0x5eed)
+    var frac = CpLnsFracStart
+    proc better(a, b: int): bool = (if maximize: a > b else: a < b)
+    proc record() =
+        cur.setLen s.numVars
+        for v in 0 ..< s.numVars: cur[v] = s.value(v)
+    result = proc(incumbent: seq[int], budget: float): seq[int] =
+        let t0 = epochTime()
+        let deadline = t0 + budget
+        if not ready:
+            ready = true
+            rootOk = s.shaveBounds(deadline = t0 + budget * CpShaveShare) >= 0 and s.prepare()
+        if not rootOk: return @[]
+        # Import the caller's incumbent: its decision values, completed by a DFS
+        var startObj = 0
+        var haveStart = false
+        if incumbent.len == m.defaults.len:
+            s.pushAssume()
+            var ok = true
+            for (p, v) in m.posVar:
+                if isDvar[v] and not s.assign(v, incumbent[p]):
+                    ok = false
+                    break
+            if ok and s.propagate() and s.search(deadline = deadline, maxNodes = CpLnsMaxNodes) == cpSat:
+                startObj = s.value(obj)
+                haveStart = true
+                if cur.len == 0 or not better(cur[obj], startObj): record()
+            s.popTo(0)
+        if cur.len == 0:
+            if s.search(deadline = deadline, stallMin = CpStallMinSecs) != cpSat: return @[]
+            record()
+            s.popTo(0)
+        let from0 = cur[obj]
+        # The stall clock starts after shaving and the import, which can take
+        # longer than the stall limit on large models
+        let tLoop = epochTime()
+        var lastGain = tLoop
+        var its, gains = 0
+        while true:
+            let now = epochTime()
+            if now > deadline or now - lastGain > max(CpLnsStallMin, 0.5 * (lastGain - tLoop)): break
+            inc its
+            s.pushAssume()
+            var ok = (if maximize: s.setMin(obj, cur[obj] + 1) else: s.setMax(obj, cur[obj] - 1))
+            if ok:
+                for v in dvars:
+                    if rng.rand(1.0) >= frac and not s.assign(v, cur[v]):
+                        ok = false
+                        break
+            let st = if ok and s.propagate(): s.search(deadline = deadline, maxNodes = CpLnsMaxNodes)
+                     else: cpUnsat
+            case st
+            of cpSat:
+                record()
+                inc gains
+                lastGain = epochTime()
+            of cpUnsat: frac = min(0.9, frac * 1.05)
+            of cpLimit: frac = max(0.02, frac / 1.05)
+            s.popTo(0)
+        if verbose:
+            let start = if haveStart: $startObj else: "not imported"
+            stderr.writeLine(&"[CP] LNS: {from0} -> {cur[obj]} (incumbent {start}), {gains} gains in {its} " &
+                             &"neighbourhoods, free share {frac:.2f}, {epochTime() - t0:.2f}s " &
+                             &"({tLoop - t0:.2f}s setup)")
+        if haveStart and not better(cur[obj], startObj): return @[]
+        let snapshot = cur
+        m.toAssignment(proc(v: int): int = snapshot[v])

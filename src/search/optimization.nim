@@ -21,6 +21,8 @@ proc copyPackedSet(src: PackedSet[int]): PackedSet[int] =
 
 const BoundFloor = low(int) div 2
 const BoundCeil = high(int) div 2
+const CpLnsShare = 0.5     # cap on the remaining budget for the CP LNS phase (it stops on a stall)
+const CpLnsMinSecs = 1.0
 
 proc safeLowerBound(v: int): int {.inline.} =
     ## Compute a heuristic lower bound well below v, without overflow.
@@ -312,6 +314,48 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
             if deadline <= 0 or totalBudget < StallCapMinBudget:
                 return 0.0
             max(5.0, probeCapPct.float / 100.0 * (deadline - epochTime()))
+
+        # Propagation-engine LNS (models the engine supports, see
+        # ConstraintSystem.cpImprove): improves the incumbent before the
+        # ladder starts; its result is confirmed by a tabu state started from
+        # it (a zero-cost start returns at once) and adopted only when the
+        # objective, evaluated here, is better and inside the declared domain.
+        if system.cpImprove != nil and system.hasFeasibleSolution and deadline > 0:
+            let cpImprove = system.cpImprove
+            let budget = CpLnsShare * (deadline - epochTime())
+            if budget >= CpLnsMinSecs:
+                let cand = cpImprove(system.bestFeasibleAssignment, budget)
+                if cand.len == system.baseArray.len:
+                    let bestSolution = system.bestFeasibleAssignment
+                    system.baseArray.reducedDomain = baseReducedDomain
+                    system.baseArray.fixedPositions = copyPackedSet(baseFixedPositions)
+                    var adopted = false
+                    try:
+                        # One state from the candidate: a parallel resolve's
+                        # unseeded workers return unrelated solutions
+                        system.resolveFromAssignment(cand, min(tabuThreshold, 1000), verbose, deadline)
+                        objective.initialize(system.assignment)
+                        let c = objective.value
+                        let inDomain = (upperBound == high(int) or c <= upperBound) and
+                                       (lowerBound == low(int) or c >= lowerBound)
+                        let gain = when direction == Minimize: c < currentCost else: c > currentCost
+                        if inDomain and gain:
+                            adopted = true
+                            currentCost = c
+                            system.bestAssignmentValid = false
+                            system.bestFeasibleAssignment = system.assignment
+                            system.bestAssignmentValid = true
+                            if onSolution != nil: onSolution(system.bestFeasibleAssignment)
+                            echo "[Opt] CP LNS improved: ", currentCost
+                            flushFile(stdout)
+                    except NoSolutionFoundError, TimeLimitExceededError:
+                        discard
+                    if not adopted:
+                        if verbose:
+                            echo "[Opt] CP LNS result not confirmed"
+                            flushFile(stdout)
+                        system.initialize(bestSolution)
+                        objective.initialize(system.assignment)
 
         # Binary search bounds
         when direction == Minimize:

@@ -580,6 +580,11 @@ proc scatterImprove*[T](system: ConstraintSystem[T],
             var freshPool = buildInitialPopulation(system, max(pool.entries.len, 2),
                 effectiveThreshold, actualWorkers, verbose, restartMaxLI, deadline)
             maxLastImp = max(maxLastImp, restartMaxLI)
+            if freshPool.entries.len == 0:
+                # Deadline hit while improving: no fresh states (and an empty
+                # pool reports minCost 0). Keep the old pool.
+                saveThreshold()
+                return false
             if freshPool.minCost == 0:
                 for e in freshPool.entries:
                     if e.cost == 0:

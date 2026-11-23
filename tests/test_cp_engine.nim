@@ -142,6 +142,44 @@ suite "CP engine":
         check s.solve() == cpSat
         check s.value(n) >= 10
 
+    test "search under assumptions, node limit, popTo":
+        # x + y + z = 6 over 0..3: improving neighbourhoods as the CP LNS runs them
+        let s = newCpSolver()
+        let x = s.newVar(0, 3)
+        let y = s.newVar(0, 3)
+        let z = s.newVar(0, 3)
+        s.addLinear(@[1, 1, 1], @[x, y, z], 6, lrEq)
+        s.addBranchGroup(@[x, y, z], vsInputOrder, valMin)
+        check s.prepare()
+        check s.level == 0
+        # x = 3 assumed: solution below the assumption level, discarded with popTo
+        s.pushAssume()
+        check s.assign(x, 3) and s.propagate()
+        check s.search() == cpSat
+        check s.value(x) == 3
+        check s.value(y) + s.value(z) == 3
+        s.popTo(0)
+        check s.level == 0
+        check s.lo(x) == 0 and s.hi(x) == 3
+        # x = 0 and y = 0: z would be 6, unsatisfiable; state restored
+        s.pushAssume()
+        let ok = s.assign(x, 0) and s.assign(y, 0) and s.propagate()
+        if ok: check s.search() == cpUnsat
+        s.popTo(0)
+        check s.lo(y) == 0 and s.hi(y) == 3
+        # a node limit gives up (cpLimit) and restores the level it started from
+        let q = newCpSolver()
+        var p: seq[int]
+        for i in 0 ..< 9: p.add q.newVar(1, 8)
+        for i in 0 ..< 9:
+            for j in i + 1 ..< 9:
+                q.addLinear(@[1, -1], @[p[i], p[j]], 0, lrNe)
+        q.addBranchGroup(p, vsInputOrder, valMin)
+        check q.prepare()
+        check q.search(maxNodes = 50) == cpLimit
+        check q.level == 0
+        for v in p: check q.lo(v) == 1 and q.hi(v) == 8
+
     test "random models agree with brute force":
         var rng = initRand(12345)
         const nVars = 4

@@ -334,6 +334,8 @@ proc main() =
   # Propagation DFS over the FlatZinc model before local search, on models
   # the engine has a propagator for every constraint of
   tr.sys.seedFirst = tr.cpSeedFirst(verbose)
+  # ... and as a large-neighbourhood improver of the optimizer's incumbents
+  tr.sys.cpImprove = tr.cpImproveLns(verbose)
 
   # Solve
   let solveWallStart = epochTime()

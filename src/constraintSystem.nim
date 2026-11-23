@@ -102,6 +102,11 @@ type
         # One-shot seed source called before the first resolve searches (the
         # propagation DFS): an empty result leaves the search unseeded.
         seedFirst*: proc(budget: float): seq[T] {.closure.}
+        # Large-neighbourhood improvement by the propagation engine (nil when
+        # the model is unsupported): called by the optimizer with the
+        # incumbent and a time budget; returns a better assignment, or empty.
+        # The optimizer confirms a result in its own model before adopting it.
+        cpImprove*: proc(incumbent: seq[T], budget: float): seq[T] {.closure.}
         circuitTimeObjectiveExact*: bool  # one CircuitTimeProp instance carries the
                                           # minimized objective exactly: its metric bound
                                           # replaces the explicit objective<=target constraint

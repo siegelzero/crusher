@@ -922,6 +922,88 @@ proc applyDecision(s: CpSolver, d: Decision, left: bool): bool =
     of dkLe: (if left: s.setMax(d.v, d.val) else: s.setMin(d.v, d.val + 1))
     of dkGe: (if left: s.setMin(d.v, d.val) else: s.setMax(d.v, d.val - 1))
 
+proc prepare*(s: CpSolver): bool =
+    ## Adds the remaining variables as the last branch group (first fail) and
+    ## propagates the root; false when the root is infeasible. Idempotent.
+    var rest: seq[int]
+    for v in 0 ..< s.vars.len:
+        if not s.grouped[v]: rest.add v
+    s.addBranchGroup(rest, vsFirstFail, valMin)
+    for x in s.vars:
+        if x.size <= 0: return false
+    for p in 0 ..< s.props.len: s.enqueue(p)
+    s.propagateAll()
+
+proc groupVars*(s: CpSolver): seq[int] =
+    ## Variables of the branch groups added so far, in group order.
+    for g in s.groups:
+        for v in g.vars: result.add v
+
+proc level*(s: CpSolver): int = s.trailLim.len
+    ## Current decision level (0 = root); see popTo.
+
+proc popTo*(s: CpSolver, lvl: int) =
+    ## Undoes every level above lvl (after a search, to read and then discard
+    ## its solution, or after assumptions pushed with pushAssume).
+    s.clearQueues()
+    while s.trailLim.len > lvl: s.popLevel()
+
+proc pushAssume*(s: CpSolver) = s.pushLevel()
+    ## Opens a level for assumptions (assign / setMin / setMax + propagate),
+    ## undone with popTo.
+
+proc propagate*(s: CpSolver): bool = s.propagateAll()
+
+proc search*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
+             stallMin: float = 0.0, maxNodes = 0): CpStatus =
+    ## Depth-first search below the current level (call prepare first). On
+    ## cpSat every variable is fixed (read with value) and the search levels
+    ## stay on the trail (popTo to discard them); cpUnsat / cpLimit restore
+    ## the level search started from. maxNodes > 0 limits the nodes of this
+    ## call. See solve for stallMin.
+    var stack: seq[Decision]
+    let t0 = epochTime()
+    let base = s.trailLim.len
+    let nodes0 = s.nodes
+    var depthT = 0.0
+    s.stalled = false
+    proc limitHit(): bool =
+        if stop != nil and stop[]: return true
+        if maxNodes > 0 and s.nodes - nodes0 >= maxNodes: return true
+        if deadline <= 0 and stallMin <= 0: return false
+        let now = epochTime()
+        if deadline > 0 and now > deadline: return true
+        if stallMin > 0 and now - t0 - depthT > max(stallMin, 2 * depthT):
+            s.stalled = true
+            return true
+        false
+    template giveUp(st: CpStatus) =
+        s.popTo(base)
+        return st
+    while true:
+        var d: Decision
+        if not s.selectDecision(d):
+            for p in s.props:
+                if not p.check(s):
+                    stderr.writeLine("[CP] solution violates constraint " & $p.id & ": propagator bug")
+                    giveUp(cpLimit)
+            return cpSat
+        inc s.nodes
+        if (s.nodes and 7) == 0 or maxNodes > 0:
+            if limitHit(): giveUp(cpLimit)
+        s.pushLevel()
+        stack.add d
+        if stack.len > s.maxDepth:
+            s.maxDepth = stack.len
+            if stallMin > 0: depthT = epochTime() - t0
+        var ok = s.applyDecision(d, true) and s.propagateAll()
+        while not ok:
+            if stack.len == 0: giveUp(cpUnsat)
+            let last = stack.pop()
+            s.popLevel()
+            ok = s.applyDecision(last, false) and s.propagateAll()
+            if not ok and ((s.fails and 7) == 0 or maxNodes > 0) and limitHit(): giveUp(cpLimit)
+
 proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
             stallMin: float = 0.0): CpStatus =
     ## Depth-first search for one solution; on cpSat every variable is fixed
@@ -932,47 +1014,5 @@ proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
     ## thrash at a fixed depth (zephyrus, hoist, hard nonograms), while the
     ## ones that do finish keep reaching new depths (nonogram medium_05's
     ## longest gap is 0.70 of this limit, kitchen b1's 0.44).
-    var rest: seq[int]
-    for v in 0 ..< s.vars.len:
-        if not s.grouped[v]: rest.add v
-    s.addBranchGroup(rest, vsFirstFail, valMin)
-    for x in s.vars:
-        if x.size <= 0: return cpUnsat
-    for p in 0 ..< s.props.len: s.enqueue(p)
-    if not s.propagateAll(): return cpUnsat
-    var stack: seq[Decision]
-    let t0 = epochTime()
-    var depthT = 0.0
-    s.stalled = false
-    proc limitHit(): bool =
-        if stop != nil and stop[]: return true
-        if deadline <= 0 and stallMin <= 0: return false
-        let now = epochTime()
-        if deadline > 0 and now > deadline: return true
-        if stallMin > 0 and now - t0 - depthT > max(stallMin, 2 * depthT):
-            s.stalled = true
-            return true
-        false
-    while true:
-        var d: Decision
-        if not s.selectDecision(d):
-            for p in s.props:
-                if not p.check(s):
-                    stderr.writeLine("[CP] solution violates constraint " & $p.id & ": propagator bug")
-                    return cpLimit
-            return cpSat
-        inc s.nodes
-        if (s.nodes and 7) == 0:
-            if limitHit(): return cpLimit
-        s.pushLevel()
-        stack.add d
-        if stack.len > s.maxDepth:
-            s.maxDepth = stack.len
-            if stallMin > 0: depthT = epochTime() - t0
-        var ok = s.applyDecision(d, true) and s.propagateAll()
-        while not ok:
-            if stack.len == 0: return cpUnsat
-            let last = stack.pop()
-            s.popLevel()
-            ok = s.applyDecision(last, false) and s.propagateAll()
-            if not ok and (s.fails and 7) == 0 and limitHit(): return cpLimit
+    if not s.prepare(): return cpUnsat
+    s.search(deadline, stop, stallMin)
