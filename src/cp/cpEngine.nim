@@ -75,6 +75,8 @@ type
         nodes*, fails*: int
         maxDepth*: int
         stalled*: bool         # last solve gave up on a depth stall
+        wdegAll: bool          # branch on dom/wdeg over all variables (refute)
+        weight: seq[int]       # per propagator: 1 + its failures (dom/wdeg)
 
 # ---------------------------------------------------------------- variables
 
@@ -302,6 +304,7 @@ method check*(p: Prop, s: CpSolver): bool {.base.} = true
 proc addProp*(s: CpSolver, p: Prop) =
     p.id = s.props.len
     s.props.add p
+    s.weight.add 1
     s.inQueue.add false
     var seen: seq[int]
     for v in p.vs:
@@ -330,6 +333,7 @@ proc propagateAll(s: CpSolver): bool =
         if not s.props[p].propagate(s):
             s.clearQueues()
             inc s.fails
+            inc s.weight[p]
             return false
     s.qLight.setLen 0; s.qHeavy.setLen 0
     s.qlHead = 0; s.qhHead = 0
@@ -1035,6 +1039,24 @@ proc addGcc*(s: CpSolver, xs: seq[int], cover: seq[int], lb, ub: seq[int],
     p.poss = newSeq[int](cover.len)
     s.addProp(p)
 
+proc arithmeticSafe*(s: CpSolver): bool =
+    ## No linear sum or product can leave int64 over the current domains
+    ## (with a factor-2 margin); domains only shrink, so this holds for the
+    ## whole search. Overflow raises (checks stay on in release builds), so
+    ## an unsafe model fails loudly rather than unsoundly, but a proof
+    ## should not crash.
+    const lim = float(1 shl 62)
+    proc mag(s: CpSolver, v: int): float = max(abs(float(s.vars[v].lo)), abs(float(s.vars[v].hi)))
+    for p in s.props:
+        if p of LinProp:
+            let lp = LinProp(p)
+            var tot = abs(float(lp.c))
+            for i in 0 ..< lp.a.len: tot += abs(float(lp.a[i])) * s.mag(lp.x[i])
+            if tot >= lim: return false
+        elif p of TimesProp:
+            if s.mag(p.vs[0]) * s.mag(p.vs[1]) >= lim or s.mag(p.vs[2]) >= lim: return false
+    true
+
 # --------------------------------------------------------------- shaving
 
 const ShaveMaxStepsPerBound = 64   # removals per bound and round (wide domains)
@@ -1083,7 +1105,27 @@ proc addBranchGroup*(s: CpSolver, vars: seq[int], varSel: CpVarSel, valSel: CpVa
             vs.add v
     if vs.len > 0: s.groups.add BranchGroup(vars: vs, varSel: varSel, valSel: valSel)
 
+proc selectDomWdeg(s: CpSolver, d: var Decision): bool =
+    ## Smallest domain size / summed weight of the watching propagators
+    ## (Boussemart et al.'s dom/wdeg, without the two-unfixed-variables test),
+    ## minimum value first.
+    var best = -1
+    var bestScore = 0.0
+    for v in 0 ..< s.vars.len:
+        let x = s.vars[v]
+        if x.size == 1: continue
+        var w = 0
+        for p in s.watch[v]: w += s.weight[p]
+        let score = float(x.size) / float(max(1, w))
+        if best < 0 or score < bestScore:
+            best = v
+            bestScore = score
+    if best < 0: return false
+    d = Decision(v: best, val: s.vars[best].lo, kind: dkEq)
+    true
+
 proc selectDecision(s: CpSolver, d: var Decision): bool =
+    if s.wdegAll: return s.selectDomWdeg(d)
     for g in s.groups:
         var best = -1
         var bestKey = 0
@@ -1197,6 +1239,30 @@ proc search*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
             s.popLevel()
             ok = s.applyDecision(last, false) and s.propagateAll()
             if not ok and ((s.fails and 7) == 0 or maxNodes > 0) and limitHit(): giveUp(cpLimit)
+
+proc luby(i: int): int =
+    ## The i-th term (1-based) of the Luby sequence 1 1 2 1 1 2 4 ...
+    var k = 1
+    while (1 shl k) - 1 < i: inc k
+    if i == (1 shl k) - 1: return 1 shl (k - 1)
+    luby(i - (1 shl (k - 1)) + 1)
+
+const RefuteRestartBase = 100   # nodes per Luby unit
+
+proc refute*(s: CpSolver, deadline: float = 0.0): CpStatus =
+    ## Complete search for a solution or a proof that none exists: dom/wdeg
+    ## branching over every variable (failures raise the weight of the
+    ## propagator that failed) with Luby restarts that keep the weights.
+    ## Restart limits grow without bound, so the search stays complete:
+    ## cpUnsat only when one run exhausts its tree; cpLimit on the deadline.
+    if not s.prepare(): return cpUnsat
+    s.wdegAll = true
+    var i = 1
+    while true:
+        let st = s.search(deadline = deadline, maxNodes = RefuteRestartBase * luby(i))
+        if st != cpLimit: return st
+        if deadline > 0 and epochTime() > deadline: return cpLimit
+        inc i
 
 proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
             stallMin: float = 0.0): CpStatus =

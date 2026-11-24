@@ -1,6 +1,6 @@
 # MiniZinc Integration Test Definitions
 # name,model,data,type,time_ms,min_obj,max_obj
-# type: minimize | maximize | satisfy
+# type: minimize | maximize | satisfy | unsat (passes only on =====UNSATISFIABLE=====)
 # Leave min_obj or max_obj empty to skip that bound check
 # For satisfy problems, both bounds are ignored
 
@@ -104,3 +104,4 @@ warehouse_2026_wlp02,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/wlp02.dzn,mini
 warehouse_2026_olil4,2026/warehouse/ms-cflp-ci.mzn,2026/warehouse/olil4.dzn,minimize,15000,,120000
 # kitchen: regression floor; larger left the empty layout in 10/10 runs at 45-60 s (worst 178, optimum 470)
 kitchen_2026_larger,2026/kitchen/kitchen.mzn,2026/kitchen/larger.instance.json,maximize,45000,100,
+gcc_2026_l35_1,2026/gcc-benchmark/roomsgcc.mzn,2026/gcc-benchmark/instance-l35_1.json,unsat,10000,,

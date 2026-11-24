@@ -205,6 +205,24 @@ suite "CP engine":
         check s.value(g[1]) == 1 and s.value(g[2]) == 1
         s.popTo(0)
 
+    test "refute: pigeonhole through restarts, satisfiable model":
+        let s = newCpSolver()
+        var xs: seq[int]
+        for i in 0 ..< 7: xs.add s.newVar(1, 6)
+        for i in 0 ..< 7:
+            for j in i + 1 ..< 7: s.addLinear(@[1, -1], @[xs[i], xs[j]], 0, lrNe)
+        check s.refute() == cpUnsat
+        check s.nodes > 100          # needed restarts (the first run stops at 100 nodes)
+        let s2 = newCpSolver()
+        var ys: seq[int]
+        for i in 0 ..< 6: ys.add s2.newVar(1, 6)
+        for i in 0 ..< 6:
+            for j in i + 1 ..< 6: s2.addLinear(@[1, -1], @[ys[i], ys[j]], 0, lrNe)
+        check s2.refute() == cpSat
+        var seen: seq[int]
+        for y in ys: seen.add s2.value(y)
+        check seen.deduplicate.len == 6
+
     test "random models agree with brute force":
         var rng = initRand(12345)
         const nVars = 4
@@ -371,7 +389,8 @@ suite "CP engine":
                     s.addLinear(@[1, -1], @[ab, xs[cn.x[^1]]], 0, lrEq, r)
             # odd trials shave the root first: removals must keep every solution
             let shaved = if trial mod 2 == 1: s.shaveBounds() else: 0
-            let st = if shaved < 0: cpUnsat else: s.solve()
+            # every fourth trial uses the refutation search (dom/wdeg, restarts)
+            let st = if shaved < 0: cpUnsat elif trial mod 4 == 3: s.refute() else: s.solve()
             check st == (if anySol: cpSat else: cpUnsat)
             if st == cpSat:
                 var sol = xs.mapIt(s.value(it))

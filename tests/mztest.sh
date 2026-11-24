@@ -48,6 +48,17 @@ while IFS=, read -r name model data type time_limit min_obj max_obj; do
         failed=$((failed + 1)); errors+=("$name: =====ERROR====="); continue
     fi
 
+    # Expected unsatisfiable: only a proof passes
+    if [ "$type" = "unsat" ]; then
+        if echo "$output" | grep -q "=====UNSATISFIABLE====="; then
+            printf "${GREEN}PASS${NC} (unsatisfiable)\n"; passed=$((passed + 1))
+        else
+            printf "${RED}FAIL${NC} (not proved unsatisfiable)\n"
+            failed=$((failed + 1)); errors+=("$name: not proved unsatisfiable")
+        fi
+        continue
+    fi
+
     # Check for no-solution statuses
     if echo "$output" | grep -q "=====UNKNOWN====="; then
         printf "${RED}FAIL${NC} (no solution found)\n"

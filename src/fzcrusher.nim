@@ -20,6 +20,10 @@ import crusher
 import flatzinc/[parser, translator, output]
 import expressions/[weightedSameValue, binaryPairwiseSum]
 
+const RefuteMaxSecs = 10.0   # refutation attempt before local search: at most this
+const RefuteShare = 0.03     # ... and this share of the time limit
+const RefuteMinSecs = 0.5    # ... but at least this (or a quarter of a shorter limit)
+
 proc immediateExit(status: cint) {.importc: "_exit", header: "<unistd.h>", noReturn.}
 
 # Global state for SIGTERM handler — allows graceful output on MiniZinc kill
@@ -161,10 +165,12 @@ proc main() =
   # crash with a stack trace — every challenge instance must yield valid output.
   var model: FznModel
   var tr: FznTranslator
+  var refutable = false
   try:
     if verbose:
       stderr.writeLine(&"[FZN] Parsing {filename}...")
     model = parseFznFile(filename)
+    refutable = cpRefutable(model)    # before translation rewrites the model
     if verbose:
       stderr.writeLine(&"[FZN] Parsed: {model.variables.len} variables, {model.parameters.len} parameters, {model.constraints.len} constraints")
       stderr.writeLine(&"[Mem] after parse: rss={currentRssBytes() div MiB}MiB")
@@ -256,25 +262,49 @@ proc main() =
     flushFile(stdout)
     immediateExit(0)
 
+  # Unsatisfiability: claimed only on a proof by the propagation engine over
+  # the FlatZinc file itself (cpRefute: parsed afresh, declared domains,
+  # complete search), never on translation or presolve, which can be wrong.
+  let timeLimitSecs = timeLimitMs.float / 1000.0
+  proc remainingSecs(): float =
+    if timeLimitMs > 0: wallStart + timeLimitSecs - epochTime() - 1.0 else: 60.0
+  proc proveUnsat(budget: float): bool =
+    refutable and budget > 0.0 and cpRefute(filename, epochTime() + budget, verbose)
+  template reportUnsat() =
+    stderr.writeLine("[CP] model proved unsatisfiable")
+    printUnsatisfiable()
+    flushFile(stdout)
+    immediateExit(0)
+
   # If translation dropped any constraint Crusher cannot enforce natively, a
   # found assignment may violate the model. Report UNKNOWN instead of emitting
-  # an invalid solution.
+  # an invalid solution (unless the model is proved unsatisfiable).
   if tr.unsupportedConstraints.len > 0:
     stderr.writeLine(&"[FZN] {tr.unsupportedConstraints.len} unsupported constraint(s) " &
       "could not be enforced; reporting UNKNOWN: " & tr.unsupportedConstraints.join(", "))
+    if proveUnsat(0.8 * remainingSecs()): reportUnsat()
     printUnknown()
     flushFile(stdout)
     immediateExit(0)
 
   # Translation proved some constraint unsatisfiable and emitted nothing for
-  # it, so an assignment found would violate the model. Crusher never claims
-  # UNSATISFIABLE (presolve can be wrong): report UNKNOWN.
+  # it, so an assignment found would violate the model. Translation is no
+  # proof (presolve can be wrong): UNSATISFIABLE only if cpRefute agrees,
+  # else UNKNOWN.
   if tr.infeasibleReasons.len > 0:
     stderr.writeLine(&"[FZN] model is infeasible ({tr.infeasibleReasons.len} constraint(s)); " &
-      "reporting UNKNOWN: " & tr.infeasibleReasons.join("; "))
+      "reporting UNKNOWN unless proved: " & tr.infeasibleReasons.join("; "))
+    if proveUnsat(0.8 * remainingSecs()): reportUnsat()
     printUnknown()
     flushFile(stdout)
     immediateExit(0)
+
+  # A short refutation attempt before local search, which can never prove
+  # anything (gcc-benchmark l35_1: refuted at the root in 0.01 s; on
+  # satisfiable models the search usually finds a solution and stops early).
+  let limitSecs = if timeLimitMs > 0: timeLimitSecs else: 300.0
+  if proveUnsat(min([RefuteMaxSecs, max(RefuteMinSecs, RefuteShare * limitSecs), 0.25 * limitSecs])):
+    reportUnsat()
 
   # MiniZinc's --time-limit includes its own compilation time (before we start).
   # Anchor to process start and subtract a small margin. If our deadline doesn't

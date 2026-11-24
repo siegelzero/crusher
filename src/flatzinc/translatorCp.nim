@@ -35,7 +35,10 @@ type CpPlan = object
     varOf: Table[string, int]       # FZN scalar variable -> engine variable
     unsupported: string
 
-proc buildCpModel(tr: var FznTranslator): CpPlan =
+proc buildCpModel(tr: var FznTranslator, strict = false): CpPlan =
+    ## strict: declared domains only (no presolve), and variables declared
+    ## without bounds decline (otherwise capped at CpUnboundedLimit), for
+    ## proofs (cpRefute).
     var plan = CpPlan(s: newCpSolver())
     template decline(why: string) =
         plan.unsupported = why
@@ -56,7 +59,9 @@ proc buildCpModel(tr: var FznTranslator): CpPlan =
         if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}:
             decline("set variable " & decl.name)
         var id: int
-        if decl.name in tr.presolveDomains:
+        if strict and decl.varType.kind notin {FznBool, FznIntRange, FznIntSet}:
+            decline("unbounded variable " & decl.name)
+        if not strict and decl.name in tr.presolveDomains:
             id = s.newVarValues(tr.presolveDomains[decl.name])
         else:
             case decl.varType.kind
@@ -490,3 +495,46 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
         if haveStart and not (better(cur[obj], startObj) and significant(cur[obj], startObj)): return @[]
         let snapshot = cur
         m.toAssignment(proc(v: int): int = snapshot[v])
+
+proc cpRefutable*(model: FznModel): bool =
+    ## Every constraint of the (untranslated) model has a propagator and no
+    ## variable is a set: worth calling cpRefute (which checks the rest).
+    for con in model.constraints:
+        if stripSolverPrefix(con.name) notin CpSupported: return false
+    for decl in model.variables:
+        if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}: return false
+    true
+
+proc cpRefute*(filename: string, deadline: float, verbose: bool): bool =
+    ## True when the propagation engine proves the FlatZinc model in filename
+    ## unsatisfiable (false: a solution exists, the model is unsupported or
+    ## time ran out). Sound by construction, so the caller may print
+    ## UNSATISFIABLE: the file is parsed afresh
+    ## (translation rewrites the parsed model and presolve tightens domains,
+    ## neither of which a proof may rest on), parameters are its literal
+    ## values, variables keep their declared domains (declined when one has
+    ## no bounds), arithmetic must fit int64 over those domains, and the
+    ## search (after root shaving) is complete: dom/wdeg on bounds with
+    ## growing Luby restarts (CpSolver.refute). Proves gcc-benchmark l35_1 at
+    ## the root; l42_3 (triangle-free conflicts, every day matchable) needs
+    ## clause learning, not found in 300 s.
+    let t0 = epochTime()
+    var pt: FznTranslator
+    try:
+        pt.model = parseFznFile(filename)
+        pt.translateParameters()
+    except CatchableError:
+        return false
+    var plan = pt.buildCpModel(strict = true)
+    if plan.unsupported != "":
+        if verbose: stderr.writeLine(&"[CP] refutation skipped: {plan.unsupported}")
+        return false
+    if not plan.s.arithmeticSafe():
+        if verbose: stderr.writeLine("[CP] refutation skipped: arithmetic may overflow")
+        return false
+    let shaved = plan.s.shaveBounds(deadline = t0 + CpShaveShare * (deadline - t0))
+    let st = if shaved < 0: cpUnsat else: plan.s.refute(deadline = deadline)
+    if verbose:
+        stderr.writeLine(&"[CP] refutation: {st} ({plan.s.numVars} variables, {plan.s.nodes} nodes, " &
+                         &"{plan.s.fails} fails, {epochTime() - t0:.2f}s)")
+    st == cpUnsat
