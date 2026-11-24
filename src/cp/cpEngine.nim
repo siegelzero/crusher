@@ -841,6 +841,200 @@ proc addRegular*(s: CpSolver, xs: seq[int], q, sy: int, d: seq[int], q0: int, fi
     p.bwd = newSeq[bool]((xs.len + 1) * (q + 1))
     s.addProp(p)
 
+# table(xs, tuples): (xs) is one of the tuples (row-major, arity xs.len).
+# Domain-consistent by a scan of the tuples still valid.
+
+type TableProp = ref object of Prop
+    tuples: seq[int]
+    sup: seq[seq[int]]      # scratch: supported values per column
+
+method propagate(p: TableProp, s: CpSolver): bool =
+    let k = p.vs.len
+    for i in 0 ..< k: p.sup[i].setLen 0
+    var any = false
+    var t = 0
+    while t < p.tuples.len:
+        var ok = true
+        for i in 0 ..< k:
+            if not s.contains(p.vs[i], p.tuples[t + i]): ok = false; break
+        if ok:
+            any = true
+            for i in 0 ..< k: p.sup[i].add p.tuples[t + i]
+        t += k
+    if not any: return false
+    for i in 0 ..< k:
+        let x = p.vs[i]
+        p.sup[i].sort()
+        if not s.setMin(x, p.sup[i][0]) or not s.setMax(x, p.sup[i][^1]): return false
+        if s.vars[x].w0 >= 0 and s.size(x) > 2:
+            s.buf.setLen 0
+            for v in s.values(x):
+                if p.sup[i].binarySearch(v) < 0: s.buf.add v
+            for v in s.buf:
+                if not s.remove(x, v): return false
+    true
+
+method check(p: TableProp, s: CpSolver): bool =
+    let k = p.vs.len
+    var t = 0
+    while t < p.tuples.len:
+        var ok = true
+        for i in 0 ..< k:
+            if s.value(p.vs[i]) != p.tuples[t + i]: ok = false; break
+        if ok: return true
+        t += k
+    false
+
+proc addTable*(s: CpSolver, xs: seq[int], tuples: seq[int]) =
+    ## tuples.len must be a multiple of xs.len (> 0)
+    assert xs.len > 0 and tuples.len mod xs.len == 0
+    var p = TableProp(vs: xs, tuples: tuples, heavy: tuples.len > 256)
+    p.sup = newSeq[seq[int]](xs.len)
+    s.addProp(p)
+
+# c = a div b, truncating toward zero (b != 0). Bounds: c from the corners of
+# the box on each sign side of b; a from c once b is fixed.
+
+type DivProp = ref object of Prop
+
+proc divPreimage(q, k: int): (int, int) =
+    ## The values a with a div k == q (k != 0), an interval.
+    let m = abs(k)
+    let qq = (if k > 0: q else: -q)     # a div m == qq
+    if qq > 0: (qq * m, qq * m + m - 1)
+    elif qq < 0: (qq * m - m + 1, qq * m)
+    else: (-(m - 1), m - 1)
+
+method propagate(p: DivProp, s: CpSolver): bool =
+    let a = p.vs[0]
+    let b = p.vs[1]
+    let c = p.vs[2]
+    if not s.remove(b, 0): return false
+    var lo = high(int)
+    var hi = low(int)
+    for (bl, bh) in [(s.lo(b), min(s.hi(b), -1)), (max(s.lo(b), 1), s.hi(b))]:
+        if bl > bh: continue
+        for av in [s.lo(a), s.hi(a)]:
+            for bv in [bl, bh]:
+                let q = av div bv
+                lo = min(lo, q)
+                hi = max(hi, q)
+    if lo > hi: return false
+    if not s.setMin(c, lo) or not s.setMax(c, hi): return false
+    if s.isFixed(b):
+        let k = s.value(b)
+        let (l1, h1) = divPreimage(s.lo(c), k)
+        let (l2, h2) = divPreimage(s.hi(c), k)
+        if not s.setMin(a, min(l1, l2)) or not s.setMax(a, max(h1, h2)): return false
+    true
+
+method check(p: DivProp, s: CpSolver): bool =
+    let bv = s.value(p.vs[1])
+    bv != 0 and s.value(p.vs[0]) div bv == s.value(p.vs[2])
+
+proc addDiv*(s: CpSolver, a, b, c: int) = s.addProp(DivProp(vs: @[a, b, c]))
+
+# global_cardinality(xs, cover, ...): the number of xs equal to cover[j] is
+# within [lb[j], ub[j]] (constant bounds) or equals the variable counts[j]
+# (vs = xs..., counts...); closed: every x takes a cover value. Counting:
+# values fixed vs still possible per cover value; at the upper bound the value
+# leaves the other domains, at the lower bound every candidate takes it.
+
+type GccProp = ref object of Prop
+    n: int                  # number of xs (counts follow in vs)
+    cover: seq[int]
+    lb, ub: seq[int]        # constant bounds (empty with count variables)
+    closed: bool
+    coverSorted: seq[int]
+    cnt, poss: seq[int]     # scratch
+
+proc coverIndex(p: GccProp, v: int): int =
+    ## Index of v in cover, -1 when absent.
+    for j, c in p.cover:
+        if c == v: return j
+    -1
+
+method propagate(p: GccProp, s: CpSolver): bool =
+    let m = p.cover.len
+    let hasCounts = p.lb.len == 0
+    if m == 0: return not p.closed or p.n == 0
+    if p.closed:
+        for i in 0 ..< p.n:
+            let x = p.vs[i]
+            if not s.setMin(x, p.coverSorted[0]) or not s.setMax(x, p.coverSorted[^1]): return false
+            if s.vars[x].w0 >= 0 and s.size(x) > 1:
+                s.buf.setLen 0
+                for v in s.values(x):
+                    if p.coverSorted.binarySearch(v) < 0: s.buf.add v
+                for v in s.buf:
+                    if not s.remove(x, v): return false
+    for j in 0 ..< m:
+        p.cnt[j] = 0
+        p.poss[j] = 0
+    for i in 0 ..< p.n:
+        let x = p.vs[i]
+        if s.isFixed(x):
+            let j = p.coverIndex(s.value(x))
+            if j >= 0: (inc p.cnt[j]; inc p.poss[j])
+        elif s.vars[x].w0 >= 0 and s.size(x) <= m:
+            for v in s.values(x):
+                let j = p.coverIndex(v)
+                if j >= 0: inc p.poss[j]
+        else:
+            for j in 0 ..< m:
+                if s.contains(x, p.cover[j]): inc p.poss[j]
+    var sumLo, sumHi = 0
+    for j in 0 ..< m:
+        var lo, hi: int
+        if hasCounts:
+            let cv = p.vs[p.n + j]
+            if not s.setMin(cv, p.cnt[j]) or not s.setMax(cv, p.poss[j]): return false
+            lo = s.lo(cv)
+            hi = s.hi(cv)
+        else:
+            lo = p.lb[j]
+            hi = p.ub[j]
+        if p.cnt[j] > hi or p.poss[j] < lo: return false
+        sumLo += max(lo, p.cnt[j])
+        sumHi += min(hi, p.poss[j])
+        let v = p.cover[j]
+        if p.cnt[j] == hi and p.poss[j] > hi:
+            for i in 0 ..< p.n:
+                let x = p.vs[i]
+                if not s.isFixed(x) and not s.remove(x, v): return false
+        elif p.poss[j] == lo and p.poss[j] > p.cnt[j]:
+            for i in 0 ..< p.n:
+                let x = p.vs[i]
+                if not s.isFixed(x) and s.contains(x, v) and not s.assign(x, v): return false
+    if sumLo > p.n or (p.closed and sumHi < p.n): return false
+    true
+
+method check(p: GccProp, s: CpSolver): bool =
+    let m = p.cover.len
+    for j in 0 ..< m: p.cnt[j] = 0
+    for i in 0 ..< p.n:
+        let j = p.coverIndex(s.value(p.vs[i]))
+        if j >= 0: inc p.cnt[j]
+        elif p.closed: return false
+    for j in 0 ..< m:
+        if p.lb.len == 0:
+            if s.value(p.vs[p.n + j]) != p.cnt[j]: return false
+        elif p.cnt[j] < p.lb[j] or p.cnt[j] > p.ub[j]: return false
+    true
+
+proc addGcc*(s: CpSolver, xs: seq[int], cover: seq[int], lb, ub: seq[int],
+             counts: seq[int] = @[], closed = false) =
+    ## Either constant bounds (lb, ub) or count variables (counts, with lb and
+    ## ub empty); cover values must be distinct.
+    assert (counts.len == cover.len and lb.len == 0) or (lb.len == cover.len and ub.len == cover.len)
+    var p = GccProp(vs: xs & counts, n: xs.len, cover: cover, lb: lb, ub: ub, closed: closed,
+                    heavy: xs.len * cover.len > 256)
+    p.coverSorted = cover
+    p.coverSorted.sort()
+    p.cnt = newSeq[int](cover.len)
+    p.poss = newSeq[int](cover.len)
+    s.addProp(p)
+
 # --------------------------------------------------------------- shaving
 
 const ShaveMaxStepsPerBound = 64   # removals per bound and round (wide domains)

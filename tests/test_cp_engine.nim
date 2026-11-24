@@ -180,6 +180,31 @@ suite "CP engine":
         check q.level == 0
         for v in p: check q.lo(v) == 1 and q.hi(v) == 8
 
+    test "table, div and gcc propagation":
+        let s = newCpSolver()
+        let x = s.newVar(0, 3)
+        let y = s.newVar(0, 3)
+        s.addTable(@[x, y], @[0, 1, 2, 3, 3, 3, 5, 1])
+        let a = s.newVar(0, 100)
+        let q = s.newVar(3, 3)
+        s.addDiv(a, s.constVar(7), q)
+        let n = s.newVar(-50, -1)
+        let qn = s.newVar(-100, 100)
+        s.addDiv(n, s.constVar(10), qn)
+        var g: seq[int]
+        for i in 0 ..< 3: g.add s.newVar(1, 3)
+        s.addGcc(g, @[1, 2], @[2, 1], @[2, 1], closed = true)
+        check s.prepare()
+        check toSeq(s.values(x)) == @[0, 2, 3]
+        check toSeq(s.values(y)) == @[1, 3]
+        check s.lo(a) == 21 and s.hi(a) == 27
+        check s.lo(qn) == -5 and s.hi(qn) == 0      # -50 div 10 .. -1 div 10, truncating
+        for v in g: check s.hi(v) == 2              # closed: 3 is not a cover value
+        s.pushAssume()
+        check s.assign(g[0], 2) and s.propagate()
+        check s.value(g[1]) == 1 and s.value(g[2]) == 1
+        s.popTo(0)
+
     test "random models agree with brute force":
         var rng = initRand(12345)
         const nVars = 4
@@ -191,16 +216,20 @@ suite "CP engine":
             x: seq[int]
             c: int
             r: int
-        for trial in 0 ..< 1500:
+            t: seq[int]     # table tuples (kind 9)
+        for trial in 0 ..< 3000:
             var cons: seq[Con]
             let nCons = rng.rand(1 .. 5)
             for k in 0 ..< nCons:
-                var cn = Con(kind: rng.rand(0 .. 8), r: -1)
+                # table, div and gcc (kinds 9-11) have no reified form: never first
+                var cn = Con(kind: (if k == 0: rng.rand(0 .. 8) else: rng.rand(0 .. 11)), r: -1)
                 let ar = rng.rand(1 .. 3)
                 for t in 0 ..< ar:
                     cn.a.add rng.rand(-3 .. 3)
                     cn.x.add rng.rand(0 ..< nVars)
                 cn.c = rng.rand(-6 .. 6)
+                if cn.kind == 9:
+                    for _ in 0 ..< rng.rand(0 .. 6) * ar: cn.t.add rng.rand(-1 .. 4)
                 cons.add cn
             # one boolean (var nVars, 0..1) reifies the first constraint
             let reif = rng.rand(1) == 1
@@ -218,6 +247,31 @@ suite "CP engine":
                     # r = xs[x0 + 1] over the array (x_1..x_3, x_0): 1-based index x0 + 1
                     let arr = @[v[1], v[2], v[3], v[0]]
                     arr[v[cn.x[0]]] == v[cn.x[^1]] + (cn.c mod 2)
+                of 9:
+                    var found = false
+                    var t = 0
+                    while t < cn.t.len:
+                        var ok = true
+                        for i in 0 ..< cn.x.len:
+                            if v[cn.x[i]] != cn.t[t + i]: ok = false
+                        if ok: found = true
+                        t += cn.x.len
+                    found
+                of 10:
+                    # (x0 - 1) div (x_last - 2) == c mod 3, truncating, divisor != 0
+                    let bv = v[cn.x[^1]] - 2
+                    bv != 0 and (v[cn.x[0]] - 1) div bv == cn.c mod 3
+                of 11:
+                    # gcc over cn.x with cover [1, 3]: even c -> bounds [0..1, 1..2],
+                    # odd c -> counts equal; closed when |c| > 2
+                    var n1, n3, outside = 0
+                    for t in cn.x:
+                        if v[t] == 1: inc n1
+                        elif v[t] == 3: inc n3
+                        else: inc outside
+                    if abs(cn.c) > 2 and outside > 0: false
+                    elif cn.c mod 2 == 0: n1 <= 1 and n3 >= 1 and n3 <= 2
+                    else: n1 == n3
                 else:
                     # clause: some x_i >= 2 (i in cn.x), or x_0 = 0 when c < 0
                     var any = cn.c < 0 and v[0] == 0
@@ -286,6 +340,29 @@ suite "CP engine":
                         lits.add z; pols.add true
                     if r < 0: s.addOr(lits, pols)
                     else: s.addOr(lits, pols, r, true)
+                of 9:
+                    if cn.t.len == 0:
+                        s.addLinear(@[1], @[xs[0]], -1, lrLe)     # no tuple: infeasible
+                    else:
+                        s.addTable(cn.x.mapIt(xs[it]), cn.t)
+                of 10:
+                    let av = s.newVar(-100, 100)
+                    s.addLinear(@[1, -1], @[av, xs[cn.x[0]]], -1, lrEq)
+                    let bv = s.newVar(-100, 100)
+                    s.addLinear(@[1, -1], @[bv, xs[cn.x[^1]]], -2, lrEq)
+                    let q = s.newVar(-100, 100)
+                    s.addDiv(av, bv, q)
+                    s.addLinear(@[1], @[q], cn.c mod 3, lrEq)
+                of 11:
+                    let closed = abs(cn.c) > 2
+                    let xv = cn.x.mapIt(xs[it])
+                    if cn.c mod 2 == 0:
+                        s.addGcc(xv, @[1, 3], @[0, 1], @[1, 2], closed = closed)
+                    else:
+                        let c1 = s.newVar(-100, 100)
+                        let c3 = s.newVar(-100, 100)
+                        s.addGcc(xv, @[3, 1], @[], @[], @[c3, c1], closed)
+                        s.addLinear(@[1, -1], @[c1, c3], 0, lrEq)
                 else:
                     let dv = s.newVar(-100, 100)
                     s.addLinear(@[1, -1], @[dv, xs[cn.x[0]]], -2, lrEq)

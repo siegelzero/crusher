@@ -26,7 +26,9 @@ const CpSupported = ["int_lin_le", "int_lin_eq", "int_lin_ne", "bool_lin_le", "b
     "bool_and", "bool_or", "bool_xor",
     "int_times", "int_abs", "int_max", "int_min", "array_int_maximum", "array_int_minimum",
     "array_int_element", "array_bool_element", "array_var_int_element", "array_var_bool_element",
-    "set_in", "set_in_reif", "set_in_imp", "fzn_regular"]
+    "set_in", "set_in_reif", "set_in_imp", "fzn_regular", "fzn_table_int", "int_div",
+    "fzn_global_cardinality", "fzn_global_cardinality_closed",
+    "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed"]
 
 type CpPlan = object
     s: CpSolver
@@ -243,6 +245,40 @@ proc buildCpModel(tr: var FznTranslator): CpPlan =
             if bad == "" and d.len != q * sy: bad = "regular: transition table size"
             if bad != "": decline(bad)
             s.addRegular(xs, q, sy, d, q0, f)
+        of "fzn_table_int":
+            let xs = VS(0)
+            let t = intArray(tr, args[1], bad)
+            if bad == "" and (xs.len == 0 or t.len mod xs.len != 0): bad = "table: tuple size"
+            if bad != "": decline(bad)
+            s.addTable(xs, t)
+        of "int_div":
+            let a = V(0)
+            let b = V(1)
+            let c = V(2)
+            if bad != "": decline(bad)
+            s.addDiv(a, b, c)
+        of "fzn_global_cardinality", "fzn_global_cardinality_closed",
+           "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed":
+            let xs = VS(0)
+            let cover = intArray(tr, args[1], bad)
+            let closed = name.endsWith("_closed")
+            var lb, ub, counts: seq[int]
+            if "_low_up" in name:
+                lb = intArray(tr, args[2], bad)
+                ub = intArray(tr, args[3], bad)
+                if bad == "" and (lb.len != cover.len or ub.len != cover.len): bad = name & ": length mismatch"
+            else:
+                counts = VS(2)
+                if bad == "" and counts.len != cover.len: bad = name & ": length mismatch"
+            if bad == "" and cover.deduplicate.len != cover.len: bad = name & ": repeated cover value"
+            if bad != "": decline(bad)
+            s.addGcc(xs, cover, lb, ub, counts, closed)
+            # Implied: the counts add up to the xs taking a cover value
+            if counts.len > 0:
+                var ones: seq[int]
+                for _ in counts: ones.add 1
+                if closed: s.addLinear(ones, counts, xs.len, lrEq)
+                else: s.addLinear(ones, counts, xs.len, lrLe)
         else:
             decline(name)
 
@@ -345,6 +381,13 @@ const
     CpLnsMaxNodes = 2000        # nodes per neighbourhood search
     CpLnsStallMin = 3.0         # a phase ends after max(this, half its improving time) without a gain
     CpLnsFracStart = 0.2        # share of the decision variables freed per neighbourhood
+    # A gain counts as progress (resets the stall clock) only when it moves the
+    # objective by this share of its magnitude since the last such gain, and a
+    # phase's result is returned only when it beats the incumbent by as much:
+    # spot5 1504 crept 285544 -> 285493 in 40 s, and adopting that state turned
+    # on the ladder's objective annealing (worse there: 175361 vs 165999 mean
+    # over 3 runs at 300 s), where local search alone reaches 191375 in one probe.
+    CpLnsMinGain = 0.001
 
 proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[int], budget: float): seq[int] {.closure.} =
     ## Large neighbourhood search with the propagation engine, for the
@@ -377,6 +420,9 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
     var rng = initRand(0x5eed)
     var frac = CpLnsFracStart
     proc better(a, b: int): bool = (if maximize: a > b else: a < b)
+    proc significant(a, b: int): bool =
+        ## a improves on b by at least CpLnsMinGain of b's magnitude (and by 1)
+        float(abs(a - b)) >= max(1.0, CpLnsMinGain * abs(float(b)))
     proc record() =
         cur.setLen s.numVars
         for v in 0 ..< s.numVars: cur[v] = s.value(v)
@@ -411,6 +457,7 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
         # longer than the stall limit on large models
         let tLoop = epochTime()
         var lastGain = tLoop
+        var lastSig = cur[obj]      # objective at the last gain that counted as progress
         var its, gains = 0
         while true:
             let now = epochTime()
@@ -429,7 +476,9 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
             of cpSat:
                 record()
                 inc gains
-                lastGain = epochTime()
+                if significant(cur[obj], lastSig):
+                    lastSig = cur[obj]
+                    lastGain = epochTime()
             of cpUnsat: frac = min(0.9, frac * 1.05)
             of cpLimit: frac = max(0.02, frac / 1.05)
             s.popTo(0)
@@ -438,6 +487,6 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
             stderr.writeLine(&"[CP] LNS: {from0} -> {cur[obj]} (incumbent {start}), {gains} gains in {its} " &
                              &"neighbourhoods, free share {frac:.2f}, {epochTime() - t0:.2f}s " &
                              &"({tLoop - t0:.2f}s setup)")
-        if haveStart and not better(cur[obj], startObj): return @[]
+        if haveStart and not (better(cur[obj], startObj) and significant(cur[obj], startObj)): return @[]
         let snapshot = cur
         m.toAssignment(proc(v: int): int = snapshot[v])
