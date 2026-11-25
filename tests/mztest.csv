@@ -95,6 +95,11 @@ workforce_alloc_2026_24_56,2026/workforce-alloc/scheduling_model.mzn,2026/workfo
 workforce_alloc_2026_19,2026/workforce-alloc/scheduling_model.mzn,2026/workforce-alloc/instance_19.dzn,minimize,15000,9000,40000
 atp_stage2_2026_instance6,2026/atp-stage2/stage2_disjunctive_search.mzn,2026/atp-stage2/instance6-stage2.dzn,minimize,5000,726404,726404
 nonogram_2026_easy_01,2026/nonogram/non.mzn,2026/nonogram/easy_01.json,satisfy,10000,,
+# vrplc / tdtsp: ruin-and-recreate on the tour (20 s runs gave 207 x4, 381-402, 14961 x4 = best known;
+# before it 60 s gave 280, 585, 15084-15252)
+vrplc_2026_vrplc10_5_15_s4,2026/vrplc/vrplc_service.mzn,2026/vrplc/vrplc10_5_15_s4.dzn,minimize,20000,207,240
+vrplc_2026_vrplc11_5_20_s2,2026/vrplc/vrplc_service.mzn,2026/vrplc/vrplc11_5_20_s2.dzn,minimize,20000,381,440
+tdtsp_2026_inst_20_56_00,2026/tdtsp/tdtsp.mzn,2026/tdtsp/inst_20_56_00.dzn,minimize,20000,14961,15050
 # orthorio: rip-up-and-reroute moves (optimum 43; 30 s runs gave 43-45)
 orthorio_2026_challenge_01,2026/orthorio/orthorio.mzn,2026/orthorio/challenge_01.dzn,minimize,30000,43,50
 # 8 agents (optimum 90; 60 s runs gave 91-101)
