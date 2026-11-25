@@ -1039,6 +1039,67 @@ proc addGcc*(s: CpSolver, xs: seq[int], cover: seq[int], lb, ub: seq[int],
     p.poss = newSeq[int](cover.len)
     s.addProp(p)
 
+# diffn(x, y, dx, dy): every pair of rectangles i < j satisfies one of
+# x_i + dx_i <= x_j, y_i + dy_i <= y_j, x_j + dx_j <= x_i, y_j + dy_j <= y_i
+# (MiniZinc's strict fzn_diffn: zero-size rectangles may not lie inside
+# others either). Pairwise on bounds: no disjunct possible fails, a single
+# possible one is enforced.
+
+type DiffnProp = ref object of Prop
+    n: int
+
+proc leOk(s: CpSolver, a, da, b: int): bool {.inline.} =
+    ## a + da <= b is still possible
+    s.lo(a) + s.lo(da) <= s.hi(b)
+
+proc leSet(s: CpSolver, a, da, b: int): bool {.inline.} =
+    ## enforce a + da <= b on bounds
+    s.setMin(b, s.lo(a) + s.lo(da)) and s.setMax(a, s.hi(b) - s.lo(da)) and
+        s.setMax(da, s.hi(b) - s.lo(a))
+
+method propagate(p: DiffnProp, s: CpSolver): bool =
+    let n = p.n
+    for i in 0 ..< n:
+        let xi = p.vs[i]
+        let yi = p.vs[n + i]
+        let dxi = p.vs[2 * n + i]
+        let dyi = p.vs[3 * n + i]
+        for j in i + 1 ..< n:
+            let xj = p.vs[j]
+            let yj = p.vs[n + j]
+            let dxj = p.vs[2 * n + j]
+            let dyj = p.vs[3 * n + j]
+            let c1 = s.leOk(xi, dxi, xj)
+            let c2 = s.leOk(yi, dyi, yj)
+            let c3 = s.leOk(xj, dxj, xi)
+            let c4 = s.leOk(yj, dyj, yi)
+            case ord(c1) + ord(c2) + ord(c3) + ord(c4)
+            of 0: return false
+            of 1:
+                let ok = (if c1: s.leSet(xi, dxi, xj)
+                          elif c2: s.leSet(yi, dyi, yj)
+                          elif c3: s.leSet(xj, dxj, xi)
+                          else: s.leSet(yj, dyj, yi))
+                if not ok: return false
+            else: discard
+    true
+
+method check(p: DiffnProp, s: CpSolver): bool =
+    let n = p.n
+    template v(k: int): int = s.value(p.vs[k])
+    for i in 0 ..< n:
+        for j in i + 1 ..< n:
+            if not (v(i) + v(2 * n + i) <= v(j) or v(n + i) + v(3 * n + i) <= v(n + j) or
+                    v(j) + v(2 * n + j) <= v(i) or v(n + j) + v(3 * n + j) <= v(n + i)):
+                return false
+    true
+
+proc addDiffn*(s: CpSolver, x, y, dx, dy: seq[int]) =
+    ## Non-overlapping rectangles (x, y) of size (dx, dy); equal lengths.
+    assert x.len == y.len and x.len == dx.len and x.len == dy.len
+    if x.len < 2: return
+    s.addProp(DiffnProp(vs: x & y & dx & dy, n: x.len, heavy: x.len > 32))
+
 proc arithmeticSafe*(s: CpSolver): bool =
     ## No linear sum or product can leave int64 over the current domains
     ## (with a factor-2 margin); domains only shrink, so this holds for the

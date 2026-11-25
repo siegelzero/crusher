@@ -205,6 +205,73 @@ suite "CP engine":
         check s.value(g[1]) == 1 and s.value(g[2]) == 1
         s.popTo(0)
 
+    test "diffn propagation and packing":
+        let s = newCpSolver()
+        let two = s.constVar(2)
+        let x1 = s.newVar(0, 5)
+        s.addDiffn(@[s.constVar(0), x1], @[s.constVar(0), s.constVar(0)], @[two, two], @[two, two])
+        check s.prepare()
+        check s.lo(x1) == 2                     # same row: only "right of" is left
+        # strict: a zero-size rectangle may not lie inside another
+        let s2 = newCpSolver()
+        s2.addDiffn(@[s2.constVar(0), s2.constVar(1)], @[s2.constVar(0), s2.constVar(1)],
+                    @[s2.constVar(3), s2.constVar(0)], @[s2.constVar(3), s2.constVar(0)])
+        check not s2.prepare()
+        # four 2x2 squares fill a 4x4 square, five do not
+        for k in [4, 5]:
+            let p = newCpSolver()
+            var xs, ys, ds: seq[int]
+            for i in 0 ..< k:
+                xs.add p.newVar(0, 2)
+                ys.add p.newVar(0, 2)
+                ds.add p.constVar(2)
+            p.addDiffn(xs, ys, ds, ds)
+            p.addBranchGroup(xs & ys, vsInputOrder, valMin)
+            check p.solve() == (if k == 4: cpSat else: cpUnsat)
+
+    test "diffn: random small instances agree with brute force":
+        var rng = initRand(4242)
+        for trial in 0 ..< 400:
+            # 3 rectangles; coordinates in random sub-ranges of 0..2, sizes
+            # constant 0..2 except rectangle 0, whose sizes range over -1..2
+            var lo, hi: seq[int]           # per variable: x0..x2, y0..y2, dx0..dx2, dy0..dy2
+            for k in 0 ..< 12:
+                if k < 6:
+                    let a = rng.rand(0 .. 2)
+                    lo.add a
+                    hi.add rng.rand(a .. 2)
+                elif k == 6 or k == 9:
+                    lo.add -1
+                    hi.add 2
+                else:
+                    let c = rng.rand(0 .. 2)
+                    lo.add c
+                    hi.add c
+            proc ok(v: seq[int]): bool =
+                for i in 0 ..< 3:
+                    for j in i + 1 ..< 3:
+                        if not (v[i] + v[6 + i] <= v[j] or v[3 + i] + v[9 + i] <= v[3 + j] or
+                                v[j] + v[6 + j] <= v[i] or v[3 + j] + v[9 + j] <= v[3 + i]):
+                            return false
+                true
+            var v = newSeq[int](12)
+            proc rec(k: int): bool =
+                if k == 12: return ok(v)
+                for val in lo[k] .. hi[k]:
+                    v[k] = val
+                    if rec(k + 1): return true
+                false
+            let expected = rec(0)
+            let s = newCpSolver()
+            var ids: seq[int]
+            for k in 0 ..< 12: ids.add s.newVar(lo[k], hi[k])
+            s.addDiffn(ids[0 ..< 3], ids[3 ..< 6], ids[6 ..< 9], ids[9 ..< 12])
+            s.addBranchGroup(ids, vsFirstFail, valMin)
+            let st = s.solve()
+            check st == (if expected: cpSat else: cpUnsat)
+            if st == cpSat:
+                check ok(ids.mapIt(s.value(it)))
+
     test "refute: pigeonhole through restarts, satisfiable model":
         let s = newCpSolver()
         var xs: seq[int]

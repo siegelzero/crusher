@@ -28,7 +28,7 @@ const CpSupported = ["int_lin_le", "int_lin_eq", "int_lin_ne", "bool_lin_le", "b
     "array_int_element", "array_bool_element", "array_var_int_element", "array_var_bool_element",
     "set_in", "set_in_reif", "set_in_imp", "fzn_regular", "fzn_table_int", "int_div",
     "fzn_global_cardinality", "fzn_global_cardinality_closed",
-    "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed"]
+    "fzn_global_cardinality_low_up", "fzn_global_cardinality_low_up_closed", "fzn_diffn"]
 
 type CpPlan = object
     s: CpSolver
@@ -284,6 +284,15 @@ proc buildCpModel(tr: var FznTranslator, strict = false): CpPlan =
                 for _ in counts: ones.add 1
                 if closed: s.addLinear(ones, counts, xs.len, lrEq)
                 else: s.addLinear(ones, counts, xs.len, lrLe)
+        of "fzn_diffn":
+            let x = VS(0)
+            let y = VS(1)
+            let dx = VS(2)
+            let dy = VS(3)
+            if bad == "" and (y.len != x.len or dx.len != x.len or dy.len != x.len):
+                bad = name & ": length mismatch"
+            if bad != "": decline(bad)
+            s.addDiffn(x, y, dx, dy)
         else:
             decline(name)
 
@@ -437,6 +446,7 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
         if not ready:
             ready = true
             rootOk = s.shaveBounds(deadline = t0 + budget * CpShaveShare) >= 0 and s.prepare()
+            if verbose and not rootOk: stderr.writeLine("[CP] LNS: root infeasible")
         if not rootOk: return @[]
         # Import the caller's incumbent: its decision values, completed by a DFS
         var startObj = 0
@@ -448,13 +458,21 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
                 if isDvar[v] and not s.assign(v, incumbent[p]):
                     ok = false
                     break
-            if ok and s.propagate() and s.search(deadline = deadline, maxNodes = CpLnsMaxNodes) == cpSat:
-                startObj = s.value(obj)
-                haveStart = true
-                if cur.len == 0 or not better(cur[obj], startObj): record()
+            var stage = (if ok: "propagate" else: "assign")
+            if ok and s.propagate():
+                stage = "search"
+                if s.search(deadline = deadline, maxNodes = CpLnsMaxNodes) == cpSat:
+                    stage = ""
+                    startObj = s.value(obj)
+                    haveStart = true
+                    if cur.len == 0 or not better(cur[obj], startObj): record()
+            if verbose and stage != "":
+                stderr.writeLine(&"[CP] LNS: incumbent import failed at {stage}")
             s.popTo(0)
         if cur.len == 0:
-            if s.search(deadline = deadline, stallMin = CpStallMinSecs) != cpSat: return @[]
+            if s.search(deadline = deadline, stallMin = CpStallMinSecs) != cpSat:
+                if verbose: stderr.writeLine("[CP] LNS: no start (import and DFS failed)")
+                return @[]
             record()
             s.popTo(0)
         let from0 = cur[obj]
