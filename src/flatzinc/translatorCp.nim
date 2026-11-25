@@ -362,9 +362,16 @@ proc toAssignment(m: CpPositionMap, value: proc(v: int): int): seq[int] =
             if abs(y - x) < abs(bestV - x): bestV = y
         result[p] = bestV
 
-proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): seq[int] {.closure.} =
+proc cpSeedFirst*(tr: var FznTranslator, verbose: bool,
+                  known: Table[string, int] = initTable[string, int]()): proc(budget: float): seq[int] {.closure.} =
     ## The DFS as a seed source for the first resolve (nil when the engine
-    ## has no propagator for some constraint of the model).
+    ## has no propagator for some constraint of the model). known: a
+    ## solution of the FlatZinc model by variable name (cpRefute's), the
+    ## seed when the DFS finds none (rect-euler british_isles / 3venn: the
+    ## refutation's dom/wdeg restarts solve in 50-70 nodes, the annotation
+    ## DFS stalls after ~400k). Not instead of the DFS: on
+    ## community-detection mexican the DFS's start (objective 466964) leads
+    ## LNS to the optimum and the refutation's (85314) does not.
     let t0 = epochTime()
     var plan = tr.buildCpModel()
     if plan.unsupported != "":
@@ -375,17 +382,25 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool): proc(budget: float): se
     if verbose:
         stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables ({epochTime() - t0:.2f}s)")
     result = proc(budget: float): seq[int] =
+        proc fromKnown(): seq[int] =
+            if known.len == 0: return @[]
+            var val = newSeq[int](plan.s.numVars)
+            for v in 0 ..< val.len: val[v] = plan.s.lo(v)
+            for name, v in plan.varOf:
+                if name in known: val[v] = known[name]
+            if verbose: stderr.writeLine(&"[CP] seed: the refutation's solution ({known.len} variables)")
+            m.toAssignment(proc(v: int): int = val[v])
         let t1 = epochTime()
         let shaved = plan.s.shaveBounds(deadline = t1 + budget * CpShaveShare)
         if verbose:
             stderr.writeLine(&"[CP] root shaving: {shaved} values removed ({epochTime() - t1:.2f}s)")
-        if shaved < 0: return @[]
+        if shaved < 0: return fromKnown()
         let st = plan.s.solve(deadline = t1 + budget, stallMin = CpStallMinSecs)
         if verbose or st == cpSat:
             let why = if plan.s.stalled: " (depth stalled)" else: ""
             stderr.writeLine(&"[CP] DFS {st}{why}: {plan.s.nodes} nodes, {plan.s.fails} fails, " &
                              &"depth {plan.s.maxDepth}, {epochTime() - t1:.2f}s")
-        if st != cpSat: return @[]
+        if st != cpSat: return fromKnown()
         let s = plan.s
         m.toAssignment(proc(v: int): int = s.value(v))
 
@@ -523,10 +538,12 @@ proc cpRefutable*(model: FznModel): bool =
         if decl.varType.kind in {FznSetOfInt, FznSetOfIntRange, FznSetOfIntSet}: return false
     true
 
-proc cpRefute*(filename: string, deadline: float, verbose: bool): bool =
+proc cpRefute*(filename: string, deadline: float, verbose: bool,
+               found: var Table[string, int]): bool =
     ## True when the propagation engine proves the FlatZinc model in filename
     ## unsatisfiable (false: a solution exists, the model is unsupported or
-    ## time ran out). Sound by construction, so the caller may print
+    ## time ran out; when the search found a solution, found holds its value
+    ## per FlatZinc variable name). Sound by construction, so the caller may print
     ## UNSATISFIABLE: the file is parsed afresh
     ## (translation rewrites the parsed model and presolve tightens domains,
     ## neither of which a proof may rest on), parameters are its literal
@@ -555,4 +572,7 @@ proc cpRefute*(filename: string, deadline: float, verbose: bool): bool =
     if verbose:
         stderr.writeLine(&"[CP] refutation: {st} ({plan.s.numVars} variables, {plan.s.nodes} nodes, " &
                          &"{plan.s.fails} fails, {epochTime() - t0:.2f}s)")
+    if st == cpSat:
+        found.clear()
+        for name, v in plan.varOf: found[name] = plan.s.value(v)
     st == cpUnsat

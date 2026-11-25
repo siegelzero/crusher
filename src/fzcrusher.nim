@@ -268,8 +268,9 @@ proc main() =
   let timeLimitSecs = timeLimitMs.float / 1000.0
   proc remainingSecs(): float =
     if timeLimitMs > 0: wallStart + timeLimitSecs - epochTime() - 1.0 else: 60.0
+  var refuteSolution: Table[string, int]   # a solution the refutation search found
   proc proveUnsat(budget: float): bool =
-    refutable and budget > 0.0 and cpRefute(filename, epochTime() + budget, verbose)
+    refutable and budget > 0.0 and cpRefute(filename, epochTime() + budget, verbose, refuteSolution)
   template reportUnsat() =
     stderr.writeLine("[CP] model proved unsatisfiable")
     printUnsatisfiable()
@@ -363,7 +364,7 @@ proc main() =
   tr.sys.seedFallback = tr.lpDiveFallback(verbose)
   # Propagation DFS over the FlatZinc model before local search, on models
   # the engine has a propagator for every constraint of
-  tr.sys.seedFirst = tr.cpSeedFirst(verbose)
+  tr.sys.seedFirst = tr.cpSeedFirst(verbose, refuteSolution)
   # ... and as a large-neighbourhood improver of the optimizer's incumbents
   tr.sys.cpImprove = tr.cpImproveLns(verbose)
 
