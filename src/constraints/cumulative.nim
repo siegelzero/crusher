@@ -167,6 +167,19 @@ func newCumulativeConstraint*[T](originExpressions: seq[AlgebraicExpression[T]],
 # CumulativeConstraint utility functions
 ################################################################################
 
+proc ensureHorizon[T](state: CumulativeConstraint[T], endT: int) =
+    ## Grows the profile so that [0, endT) lies inside it. Every task stays
+    ## inside the profile: usage past maxTime would otherwise be clipped, and
+    ## an overload there cost nothing (moves reach start values the initial
+    ## assignment did not; rect-euler Vitamins printed two tasks of a
+    ## disjunctive group overlapping at 1522). Starts below 0 are still clipped.
+    if endT - 1 <= state.maxTime: return
+    let newMax = max(endT - 1, state.maxTime + state.maxTime div 4)
+    if not state.sweepMode:
+        state.resourceProfile.setLen(newMax + 1)
+        state.prefixDeltaBuf.setLen(newMax + 2)
+    state.maxTime = newMax
+
 proc updateResourceProfile[T](state: CumulativeConstraint[T], taskIdx: int, origin: T, isAdding: bool) =
     ## Updates the resource profile for a task being added or removed
     let duration = state.getDuration(taskIdx)
@@ -203,6 +216,10 @@ proc chooseSweepMode[T](state: CumulativeConstraint[T]): bool =
 
 proc sweepCost[T](state: CumulativeConstraint[T]): int =
     ## Overload integral of the tasks at state.taskStart, clipped to [0, maxTime].
+    block:
+        var maxEnd = 0
+        for i in 0..<state.taskStart.len: maxEnd = max(maxEnd, state.taskStart[i] + int(state.getDuration(i)))
+        state.ensureHorizon(maxEnd)
     let tEnd = state.maxTime + 1
     let limit = int(state.limit)
     state.evBuf.setLen(0)
@@ -227,6 +244,11 @@ proc sweepBatchSingle[T](state: CumulativeConstraint[T], taskIdx: int,
     ## Cost delta of moving one task to each of newOrigins: step function of the
     ## other tasks' usage, prefix integral of the task's marginal overload.
     result = newSeq[int](newOrigins.len)
+    block:
+        var maxEnd = 0
+        for i in 0..<state.taskStart.len: maxEnd = max(maxEnd, state.taskStart[i] + int(state.getDuration(i)))
+        for o in newOrigins: maxEnd = max(maxEnd, o + int(state.getDuration(taskIdx)))
+        state.ensureHorizon(maxEnd)
     let tEnd = state.maxTime + 1
     let limit = int(state.limit)
     let h = int(state.getHeight(taskIdx))
@@ -410,6 +432,7 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
         let oldDur = oldValue
         let newDur = newValue
         var costDelta = 0
+        state.ensureHorizon(int(origin) + int(newDur))
         let tMax = state.maxTime + 1
         let startT = max(0, int(origin))
         # Remove time points that are in old range but not new
@@ -459,6 +482,7 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
                 let oldEnd = int(oldValue + duration)
                 let newStart = int(newValue)
                 let newEnd = int(newValue + duration)
+                state.ensureHorizon(newEnd)
                 let tMax = state.maxTime + 1
 
                 # Symmetric difference: only update time points that actually change
@@ -493,7 +517,7 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
         of ExpressionBased:
             if position in state.expressionsAtPosition:
                 var costDelta = 0
-                let tMax = state.maxTime + 1
+                var tMax = state.maxTime + 1
 
                 # Evaluate all old/new origins upfront (before mutating assignment)
                 var changes: seq[tuple[oldStart, oldEnd, newStart, newEnd: int, height: T]]
@@ -512,6 +536,9 @@ proc updatePosition*[T](state: CumulativeConstraint[T], position: int, newValue:
                         newStart: int(newOrigin), newEnd: int(newOrigin + duration),
                         height: state.getHeight(i)
                     ))
+
+                for c in changes: state.ensureHorizon(c.newEnd)
+                tMax = state.maxTime + 1
 
                 # Pass 1: remove "leaving" time points (in old range but not new)
                 for c in changes:
@@ -791,6 +818,7 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
         let oldDur = oldValue
         let newDur = newValue
         var costDelta = 0
+        state.ensureHorizon(int(origin) + int(newDur))
         let tMax = state.maxTime + 1
         let startT = max(0, int(origin))
         if newDur < oldDur:
@@ -834,6 +862,7 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
             let oldEnd = int(oldValue + duration)
             let newStart = int(newValue)
             let newEnd = int(newValue + duration)
+            state.ensureHorizon(newEnd)
             let tMax = state.maxTime + 1
 
             # Symmetric difference: only visit time points that actually change.
@@ -861,7 +890,7 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
             if position notin state.expressionsAtPosition:
                 return 0
 
-            let tMax = state.maxTime + 1
+            var tMax = state.maxTime + 1
 
             # Evaluate old origins before mutation
             type TaskChange = tuple[oldStart, oldEnd, newStart, newEnd: int, height: T]
@@ -883,6 +912,8 @@ proc moveDelta*[T](state: CumulativeConstraint[T], position: int, oldValue, newV
                     height: state.getHeight(i)
                 ))
 
+            for c in changes: state.ensureHorizon(c.newEnd)
+            tMax = state.maxTime + 1
             if changes.len == 0:
                 return 0
 
@@ -995,6 +1026,13 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
             let duration = int(state.getDuration(taskIdx))
             let height = int(state.getHeight(taskIdx))
             let limit = int(state.limit)
+            block:
+                var maxEnd = 0
+                for v in domain:
+                    state.currentAssignment[position] = v
+                    maxEnd = max(maxEnd, int(state.originExpressions[taskIdx].evaluate(state.currentAssignment)) + duration)
+                state.currentAssignment[position] = currentValue
+                state.ensureHorizon(maxEnd)
             let tMax = state.maxTime + 1
 
             # Evaluate current origin
@@ -1035,6 +1073,14 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
         else:
             # Multiple tasks affected — batch via mutate/restore
             let limit = int(state.limit)
+            block:
+                var maxEnd = 0
+                for v in domain:
+                    state.currentAssignment[position] = v
+                    for ti in taskIndices:
+                        maxEnd = max(maxEnd, int(state.originExpressions[ti].evaluate(state.currentAssignment)) + int(state.getDuration(ti)))
+                state.currentAssignment[position] = currentValue
+                state.ensureHorizon(maxEnd)
             let tMax = state.maxTime + 1
 
             # Pre-evaluate current origins and remove all affected tasks from profile
@@ -1118,6 +1164,9 @@ proc batchMovePenalty*[T](state: CumulativeConstraint[T], position: int, current
     let duration = int(state.getDuration(taskIdx))
     let height = int(state.getHeight(taskIdx))
     let limit = int(state.limit)
+    var maxV = int(currentValue)
+    for v in domain: maxV = max(maxV, int(v))
+    state.ensureHorizon(maxV + duration)
     let tMax = state.maxTime + 1
 
     # Step 1: Compute "removed profile" overuse and delta array

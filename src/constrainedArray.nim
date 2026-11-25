@@ -1595,18 +1595,22 @@ proc evaluateConstraint*[T](cons: StatefulConstraint[T], assignment: seq[T]): T 
         let cumState = cons.cumulativeState
         case cumState.evalMethod
         of PositionBased:
-            # Build resource profile from scratch and count overloads
-            var profile = newSeq[T](cumState.maxTime + 1)
+            # Build resource profile from scratch and count overloads (over
+            # every task's span: the state's maxTime need not cover this assignment)
+            var horizon = cumState.maxTime
+            for i in 0..<cumState.originPositions.len:
+                horizon = max(horizon, int(assignment[cumState.originPositions[i]] + cumState.durations[i]) - 1)
+            var profile = newSeq[T](horizon + 1)
             for i in 0..<cumState.originPositions.len:
                 let origin = assignment[cumState.originPositions[i]]
                 let dur = cumState.durations[i]
                 let h = cumState.heights[i]
                 let startT = int(origin)
                 let endT = int(origin + dur)
-                for t in max(0, startT) ..< min(endT, cumState.maxTime + 1):
+                for t in max(0, startT) ..< min(endT, horizon + 1):
                     profile[t] += h
             var cost: T = 0
-            for t in 0..cumState.maxTime:
+            for t in 0..horizon:
                 if profile[t] > cumState.limit:
                     cost += profile[t] - cumState.limit
             return cost

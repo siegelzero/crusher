@@ -102,3 +102,53 @@ suite "Cumulative sweep mode":
         c.initialize(@[0, 20000])
         check c.sweepMode
         check c.cost == 30000
+
+    test "tasks moved past the initial horizon are not clipped":
+        # initialize with every task inside the default 500 horizon, then move
+        # tasks far beyond it: costs and deltas must match a from-scratch count
+        proc overload(a, durs, heights: seq[int], limit: int, offsets: seq[int]): int =
+            var hi = 0
+            for i in 0..<a.len: hi = max(hi, a[i] + offsets[i] + durs[i])
+            var prof = newSeq[int](hi + 1)
+            for i in 0..<a.len:
+                for t in max(0, a[i] + offsets[i]) ..< a[i] + offsets[i] + durs[i]: prof[t] += heights[i]
+            for u in prof: result += max(0, u - limit)
+        randomize(777)
+        for trial in 0..<40:
+            let n = rand(2..6)
+            let useExpr = trial mod 2 == 1
+            var durs, heights, offsets: seq[int]
+            for i in 0..<n:
+                durs.add(rand(1..30))
+                heights.add(rand(1..3))
+                offsets.add(if useExpr: rand(0..5) else: 0)
+            let limit = rand(1..3)
+            var (sw, pr) = pair(n, durs, heights, limit, useExpr, offsets)
+            var a = newSeq[int](n)
+            for i in 0..<n: a[i] = rand(0..100)
+            sw.initialize(a)
+            pr.initialize(a)
+            let dom = toSeq(0..100) & toSeq(1500..1530)
+            for step in 0..<30:
+                let p = rand(0..<n)
+                let bs = sw.batchMovePenalty(p, a[p], dom)
+                let bp = pr.batchMovePenalty(p, a[p], dom)
+                let before = overload(a, durs, heights, limit, offsets)
+                for k, v in dom:
+                    var b = a
+                    b[p] = v
+                    let want = overload(b, durs, heights, limit, offsets) - before
+                    if v != a[p]:
+                        check bs[k] == want
+                        check bp[k] == want
+                let v = (if rand(1) == 0: rand(0..100) else: rand(1500..1530))
+                var b = a
+                b[p] = v
+                let want = overload(b, durs, heights, limit, offsets) - before
+                check sw.moveDelta(p, a[p], v) == want
+                check pr.moveDelta(p, a[p], v) == want
+                sw.updatePosition(p, v)
+                pr.updatePosition(p, v)
+                a = b
+                check sw.cost == overload(a, durs, heights, limit, offsets)
+                check pr.cost == overload(a, durs, heights, limit, offsets)
