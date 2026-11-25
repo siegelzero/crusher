@@ -294,6 +294,18 @@ type
         pairOrder*: seq[int]        # tryPairTourMoves: random pair order resumed across calls
         pairCursor*: int
         pairsSinceImprove*: int     # pairs scanned since the last applied pair move
+        # Ruin-and-recreate on a giant-tour circuit (tabuRuinRecreate)
+        rrBuilt*: bool
+        rrCirc*: int
+        rrUnits*: seq[seq[int]]     # requests: a linked node pair or one movable node
+        rrMovable*: seq[bool]       # node has a free successor and no fixed arc into it
+        rrDist*: seq[seq[int]]      # [from][to] travel (service included), empty if none
+        rrEarly*: seq[int]          # window opening per node
+        rrRelPos*: seq[seq[int]]    # release (waiting) positions per node
+        rrNextTry*: int
+        rrFailStreak*: int
+        rrRounds*, rrImproved*, rrRejected*, rrAborted*, rrBroken*, rrEvals*: int
+        rrTime*: float
 
         # Regular constraints over search positions, for line-rewrite moves (tabuRegularMoves)
         regularConstraintIndices*: seq[int]
@@ -666,6 +678,7 @@ include tabuLinearRepair
 include tabuCircuitMoves
 include tabuRegularMoves
 include tabuObjectivePolish
+include tabuRuinRecreate
 include tabuObjectiveAnneal
 include tabuChainRepair
 include tabuRerouteMoves
@@ -5802,6 +5815,8 @@ proc logExitStats[T](state: TabuState[T], label: string) =
         echo &"[Tabu S{state.id}] objectivePolish: calls={state.polishCalls} moves={state.polishMoves} dropTries={state.dropTries} drops={state.dropApplied} swapTries={state.swapTries} swaps={state.swapApplied}"
     if state.keepEndTasks.len > 0:
         echo &"[Tabu S{state.id}] keepEnd: applied={state.keepEndApplied}"
+    if state.rrRounds > 0:
+        echo &"[Tabu S{state.id}] ruinRecreate: rounds={state.rrRounds} improved={state.rrImproved} rejected={state.rrRejected} aborted={state.rrAborted} broken={state.rrBroken} evals={state.rrEvals} time={state.rrTime:.2f}s"
     if state.compactCalls > 0:
         echo &"[Tabu S{state.id}] compaction: calls={state.compactCalls} moves={state.compactMoves}" &
              &" reorder: trials={state.reorderTrials} kept={state.reorderKept} gains={state.reorderGains} kicks={state.reorderKicks}" &
@@ -6568,6 +6583,43 @@ proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[boo
                 state.pairsSinceImprove = 0
                 state.pairFailStreak = min(state.pairFailStreak + 1, 8)
                 state.pairNextTry = state.iteration + 10 * (1 shl state.pairFailStreak)
+
+        # Ruin-and-recreate bursts on valid tours with linked pairs
+        if state.circuitConstraints.len > 0 and state.circuitTimePropConstraints.len > 0 and
+           state.iteration - lastImprovement >= 5 and
+           state.iteration >= state.rrNextTry and
+           not outOfBudget():
+            if not state.rrBuilt: state.buildRuinRecreate()
+            if state.rrUnits.len >= 2:
+                let t0 = epochTime()
+                var fails = 0
+                var improved = false
+                while fails < RrBurstFails and epochTime() - t0 < RrBurstSecs and
+                        not outOfBudget():
+                    if state.rrRound() > 0:
+                        fails = 0
+                        improved = true
+                    else:
+                        inc fails
+                    if state.cost == 0: break
+                state.rrTime += epochTime() - t0
+                if state.cost < state.bestCost:
+                    lastImprovement = state.iteration
+                    state.bestCost = state.cost
+                    state.bestAssignment = state.assignment
+                    if state.cost == 0:
+                        if state.verbose:
+                            state.logExitStats("Solution found via ruin-recreate")
+                        state.lastImprovementIter = lastImprovement
+                        return state
+                if improved:
+                    state.rrFailStreak = 0
+                    state.rrNextTry = state.iteration + 2
+                else:
+                    state.rrFailStreak = min(state.rrFailStreak + 1, 6)
+                    state.rrNextTry = state.iteration + 5 * (1 shl state.rrFailStreak)
+            else:
+                state.rrNextTry = high(int)
 
         # Try circuit cross-cycle merge moves during stagnation: when a circuit
         # constraint has split into disjoint subtours, a 2-opt swap of successors

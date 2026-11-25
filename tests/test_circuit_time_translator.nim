@@ -1175,3 +1175,41 @@ suite "Split time chains (VRP with location congestion)":
             check arr[1] <= ser[1] and ser[1] + 3 <= dep[1] and ser[1] in 6..30
             check dep[0] + 4 <= arr[1]
             for t in arr & ser & dep: check t in 0..40
+
+suite "Ruin-and-recreate on a pickup-and-delivery giant tour":
+
+    ## vrplc_service.mzn on two requests (pickups 1, 2; deliveries 3, 4), two
+    ## vehicles, one service slot per location; optimum 16.
+    test "rounds keep the tour valid, never worsen the key, and commit exactly":
+        let src = readFile("tests/data/vrplc/two_requests.fzn")
+        for seed in 0..<8:
+            randomize(seed)
+            var tr = translate(parseFzn(src))
+            tr.sys.baseArray.reducedDomain = reduceDomain(tr.sys.baseArray)
+            tr.sys.baseArray.sharedDomainPtr = addr tr.sys.baseArray.reducedDomain
+            let st = newTabuState[int](tr.sys.baseArray)
+            st.buildRuinRecreate()
+            check st.rrUnits.len == 2
+            for u in st.rrUnits: check u.len == 2
+            var nMovable = 0
+            for m in st.rrMovable:
+                if m: inc nMovable
+            check nMovable == 4
+            let cc = st.circuitConstraints[st.rrCirc]
+            if cc.cost != 0: continue
+            var improved = 0
+            for round in 0..<200:
+                let before = st.rrKey()
+                let r = st.rrRound()
+                let after = st.rrKey()
+                check cc.cost == 0
+                check after <= before
+                if r > 0:
+                    inc improved
+                    check after < before
+                if r < 0: check after == before
+            # the incremental state matches a fresh evaluation of its assignment
+            var fresh = TabuState[int]()
+            fresh.init(tr.sys.baseArray, initialAssignment = st.assignment)
+            check fresh.cost == st.cost
+            check st.rrRounds > 0
