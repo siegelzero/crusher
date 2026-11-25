@@ -296,7 +296,11 @@ type
         pairsSinceImprove*: int     # pairs scanned since the last applied pair move
         # Ruin-and-recreate on a giant-tour circuit (tabuRuinRecreate)
         rrBuilt*: bool
-        rrCirc*: int
+        rrCirc*: int                # tour source: circuit constraint index, or -1
+        rrCtp*: int                 # ... else time chain (circuitTimePropConstraints) index
+        rrLinkPos*: seq[int]        # link position per node, -1 if fixed
+        rrFixedLink*: seq[int]      # link of fixed nodes
+        rrOff*: int
         rrUnits*: seq[seq[int]]     # requests: a linked node pair or one movable node
         rrMovable*: seq[bool]       # node has a free successor and no fixed arc into it
         rrDist*: seq[seq[int]]      # [from][to] travel (service included), empty if none
@@ -6584,8 +6588,8 @@ proc tabuWalk[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[boo
                 state.pairFailStreak = min(state.pairFailStreak + 1, 8)
                 state.pairNextTry = state.iteration + 10 * (1 shl state.pairFailStreak)
 
-        # Ruin-and-recreate bursts on valid tours with linked pairs
-        if state.circuitConstraints.len > 0 and state.circuitTimePropConstraints.len > 0 and
+        # Ruin-and-recreate bursts on valid tours
+        if (state.circuitConstraints.len > 0 or state.circuitTimePropConstraints.len > 0) and
            state.iteration - lastImprovement >= 5 and
            state.iteration >= state.rrNextTry and
            not outOfBudget():

@@ -19,6 +19,14 @@
 ## Removed nodes get their release (waiting) variables reset to the earliest
 ## value: the old waits were set for their old position. A round is kept when
 ## its key is not worse than before the ruin (sideways rounds diversify).
+##
+## The tour is a circuit constraint (preferring one with linked pairs), else a
+## time chain that enforces its own circuit (CVRP / TSPTW translations, where
+## links may be fixed literals or predecessors: a round only rewires links, so
+## the orientation does not matter). Insertion candidates are tried cheapest
+## travel detour first, from the time chain's matrix or else the objective's
+## per-link cost; the "route" ruin takes the seed's route, or a string of the
+## tour around it when the tour has no anchors.
 
 const RrMinRemove = 2
 const RrMaxRemove = 8
@@ -27,32 +35,78 @@ const RrEmptyRoutes = 2      # empty routes tried per insertion (identical-looki
 const RrEvalAfterBest = 12   # candidates evaluated past the best one (detour order)
 const RrBurstFails = 25      # consecutive rounds without improvement that end a burst
 const RrBurstSecs = 1.0
+const RrMinNodes = 5          # smallest circuit worth a round
+const RrDistMaxNodes = 2000   # objective-derived travel matrix up to this size
 proc buildRuinRecreate*[T](state: TabuState[T]) =
+    ## Pick the tour (a circuit constraint, else a time chain that enforces its
+    ## own circuit), its requests, travel estimates and release positions.
     state.rrBuilt = true
+    state.rrCirc = -1
+    state.rrCtp = -1
     if not state.tourPairsBuilt: state.buildTourPairs()
-    if state.tourPairs.len == 0: return
-    let circ = state.tourPairs[0][0]
-    let cc = state.circuitConstraints[circ]
-    let n = cc.n
-    let off = cc.valueOffset
-    state.rrCirc = circ
-    # Movable nodes: own successor variable, and no fixed arc into them (route
-    # anchors such as giant-tour start/end depots are reached by fixed arcs or
+    var n = 0
+    var off = 0
+    var linkPos: seq[int]
+    var fixedLink: seq[int]
+    if state.tourPairs.len > 0:
+        state.rrCirc = state.tourPairs[0][0]
+    else:
+        # the circuit with the most free successors
+        var bestFree = 0
+        for ci, c in state.circuitConstraints:
+            if c.n < RrMinNodes: continue
+            var nFree = 0
+            for p in c.positionArray:
+                if p >= 0 and state.sharedDomain[][p].len > 1: inc nFree
+            if nFree > bestFree:
+                bestFree = nFree
+                state.rrCirc = ci
+    if state.rrCirc >= 0:
+        let cc = state.circuitConstraints[state.rrCirc]
+        n = cc.n
+        off = cc.valueOffset
+        linkPos = cc.positionArray
+        fixedLink = newSeq[int](n)
+        for i in 0..<n:
+            if linkPos[i] < 0: return
+    else:
+        # no circuit constraint: a time chain carrying the circuit (CVRP, TSPTW)
+        var bestFree = 0
+        for ti, c in state.circuitTimePropConstraints:
+            if c.n < RrMinNodes or c.equalityChain: continue
+            var nFree = 0
+            for p in c.positionArray:
+                if p >= 0 and state.sharedDomain[][p].len > 1: inc nFree
+            if nFree > bestFree:
+                bestFree = nFree
+                state.rrCtp = ti
+        if state.rrCtp < 0: return
+        let c = state.circuitTimePropConstraints[state.rrCtp]
+        n = c.n
+        off = c.valueOffset
+        linkPos = c.positionArray
+        fixedLink = newSeq[int](n)
+        for i in 0..<n: fixedLink[i] = c.links[i]
+    state.rrOff = off
+    state.rrLinkPos = linkPos
+    state.rrFixedLink = fixedLink
+    # Movable nodes: own link variable, and no fixed link into them (route
+    # anchors such as giant-tour start/end depots are reached by fixed links or
     # leave by one)
     var fixedInto = newSeq[bool](n)
     var movable = newSeq[bool](n)
     for i in 0..<n:
-        let p = cc.positionArray[i]
-        if p < 0: return
-        let d = state.sharedDomain[][p]
-        if d.len == 1:
-            let s = int(d[0]) - off
-            if s >= 0 and s < n: fixedInto[s] = true
+        let p = linkPos[i]
+        var s = -1
+        if p < 0: s = fixedLink[i]
+        elif state.sharedDomain[][p].len == 1: s = int(state.sharedDomain[][p][0]) - off
+        if s >= 0 and s < n: fixedInto[s] = true
     for i in 0..<n:
-        movable[i] = state.sharedDomain[][cc.positionArray[i]].len > 1 and not fixedInto[i]
+        movable[i] = linkPos[i] >= 0 and state.sharedDomain[][linkPos[i]].len > 1 and
+                     not fixedInto[i]
     var inPair = newSeq[bool](n)
     for (pc, na, nb) in state.tourPairs:
-        if pc != circ: continue
+        if pc != state.rrCirc: continue
         if not movable[na] or not movable[nb]: continue
         inPair[na] = true
         inPair[nb] = true
@@ -60,7 +114,8 @@ proc buildRuinRecreate*[T](state: TabuState[T]) =
     for i in 0..<n:
         if movable[i] and not inPair[i]: state.rrUnits.add(@[i])
     state.rrMovable = movable
-    # Distances and time windows from a time chain on this circuit
+    # Travel (in link orientation: the cost of link(a) = b) and time windows
+    # from a time chain on this tour
     state.rrEarly = newSeq[int](n)
     state.rrRelPos = newSeq[seq[int]](n)
     for ctc in state.circuitTimePropConstraints:
@@ -68,7 +123,7 @@ proc buildRuinRecreate*[T](state: TabuState[T]) =
         var same = true
         for i in 0..<n:
             let lp = ctc.positionArray[i]
-            if lp >= 0 and lp != cc.positionArray[i]:
+            if lp >= 0 and lp != linkPos[i]:
                 same = false
                 break
         if not same: continue
@@ -76,15 +131,49 @@ proc buildRuinRecreate*[T](state: TabuState[T]) =
             for i in 0..<n:
                 if i < ctc.releasePositions.len and ctc.releasePositions[i] >= 0:
                     state.rrRelPos[i].add(ctc.releasePositions[i])
-        if not ctc.equalityChain and state.rrDist.len == 0:
+        if not ctc.equalityChain and state.rrDist.len == 0 and ctc.distanceMatrix.len == n:
             state.rrDist = newSeq[seq[int]](n)
             for a in 0..<n:
                 state.rrDist[a] = newSeq[int](n)
                 for b in 0..<n:
-                    state.rrDist[a][b] = int(ctc.distanceMatrix[b][a])   # a -> b
+                    # distanceMatrix[to][from]; a backward link is a predecessor
+                    state.rrDist[a][b] = int(if ctc.forward: ctc.distanceMatrix[b][a]
+                                             else: ctc.distanceMatrix[a][b])
             for i in 0..<n: state.rrEarly[i] = int(ctc.earlyTimes[i])
+    # No travel matrix from a time chain: the objective's per-link cost (direct
+    # coefficient plus constant element lookups of the link), if any
+    if state.rrDist.len == 0 and state.boundConstraint != nil and n <= RrDistMaxNodes and
+       state.boundConstraint.stateType == RelationalType:
+        if not state.polishEstBuilt: state.buildPolishEstimates()
+        if state.polishElems.len > 0:
+            var anyArc = false
+            var dist = newSeq[seq[int]](n)
+            for a in 0..<n:
+                dist[a] = newSeq[int](n)
+                let p = linkPos[a]
+                if p < 0: continue
+                let old = state.assignment[p]
+                for b in 0..<n:
+                    let v = T(b + off)
+                    var d = int(state.polishDirect[p] * v)
+                    for (bi, c) in state.polishElems[p]:
+                        let bnd {.cursor.} = state.carray.channelBindings[bi]
+                        state.assignment[p] = v
+                        let i1 = int(bnd.evalIndex(state.assignment))
+                        state.assignment[p] = old
+                        if i1 >= 0 and i1 < bnd.arrayElements.len:
+                            d += int(c * bnd.arrayElements[i1].constantValue)
+                    dist[a][b] = d
+                    if d != 0: anyArc = true
+            if anyArc: state.rrDist = dist
     if (state.verbose and state.id == 0) or existsEnv("CRUSHER_DEBUG_CIRCUIT"):
-        echo "[Init] Ruin-recreate: " & $state.rrUnits.len & " requests"
+        echo "[Init] Ruin-recreate: " & $state.rrUnits.len & " requests on a " &
+             (if state.rrCirc >= 0: "circuit" else: "time chain") & " of " & $n & " nodes" &
+             (if state.rrDist.len > 0: " (travel estimates)" else: "")
+
+proc rrTourValid[T](state: TabuState[T]): bool {.inline.} =
+    if state.rrCirc >= 0: state.circuitConstraints[state.rrCirc].cost == 0
+    else: state.circuitTimePropConstraints[state.rrCtp].circuitPenalty == 0
 
 proc rrKey*[T](state: TabuState[T]): (int, int) {.inline.} =
     ## (hard violation, raw objective slack); see the module comment
@@ -105,20 +194,23 @@ proc rrRelatedness[T](state: TabuState[T], u, v: int): int =
 proc rrRound*[T](state: TabuState[T]): int =
     ## One ruin-and-recreate round. 1 = improved, 0 = kept sideways,
     ## -1 = rejected (state restored).
-    let cc = state.circuitConstraints[state.rrCirc]
-    if cc.cost != 0:
+    if not state.rrTourValid():
         inc state.rrBroken
         return -1
-    let n = cc.n
-    let off = cc.valueOffset
+    let n = state.rrLinkPos.len
+    let off = state.rrOff
     let nu = state.rrUnits.len
     var log: seq[(int, T)]
-    template succOf(v: int): int = int(state.assignment[cc.positionArray[v]]) - off
+    # "successor" = the tour's link (a predecessor on a backward time chain)
+    template succOf(v: int): int =
+        (if state.rrLinkPos[v] >= 0: int(state.assignment[state.rrLinkPos[v]]) - off
+         else: state.rrFixedLink[v])
     template setPos(p: int, val: T) =
         log.add((p, state.assignment[p]))
         state.assignValueLean(p, val)
-    template setSucc(v, w: int) = setPos(cc.positionArray[v], T(w + off))
-    template canSucc(v, w: int): bool = state.domIdx(cc.positionArray[v], T(w + off)) >= 0
+    template setSucc(v, w: int) = setPos(state.rrLinkPos[v], T(w + off))
+    template canSucc(v, w: int): bool =
+        state.rrLinkPos[v] >= 0 and state.domIdx(state.rrLinkPos[v], T(w + off)) >= 0
     template undoTo(mark: int) =
         for li in countdown(log.len - 1, mark):
             state.assignValueLean(log[li][0], log[li][1])
@@ -142,20 +234,26 @@ proc rrRound*[T](state: TabuState[T]): int =
     let seed = rand(nu - 1)
     choose(seed)
     if mode == 2:
-        # every request on the seed's route
+        # the seed's route (anchor to anchor), or a string of the tour around
+        # the seed when the route is long (single-tour circuits)
         let z0 = state.rrUnits[seed][0]
-        var z = succOf(z0)
+        var fwd = succOf(z0)
+        var bwd = pred[z0]
+        var fwdOpen = true
+        var bwdOpen = true
         var guard = 0
-        while z != z0 and state.rrMovable[z] and guard < n:
-            if unitOf[z] >= 0: choose(unitOf[z])
-            z = succOf(z)
+        while (fwdOpen or bwdOpen) and chosen.len < RrMaxRemove and guard < n:
             inc guard
-        z = pred[z0]
-        guard = 0
-        while z != z0 and state.rrMovable[z] and guard < n:
-            if unitOf[z] >= 0: choose(unitOf[z])
-            z = pred[z]
-            inc guard
+            if fwdOpen:
+                if fwd == z0 or not state.rrMovable[fwd]: fwdOpen = false
+                else:
+                    if unitOf[fwd] >= 0: choose(unitOf[fwd])
+                    fwd = succOf(fwd)
+            if bwdOpen and chosen.len < RrMaxRemove:
+                if bwd == z0 or not state.rrMovable[bwd]: bwdOpen = false
+                else:
+                    if unitOf[bwd] >= 0: choose(unitOf[bwd])
+                    bwd = pred[bwd]
     if chosen.len < k:
         if mode == 0:
             while chosen.len < k: choose(rand(nu - 1))
@@ -237,7 +335,8 @@ proc rrRound*[T](state: TabuState[T]): int =
         var emptySeen = 0
         for u in us:
             let su = succOf(u)
-            if state.sharedDomain[][cc.positionArray[u]].len <= 1: continue   # fixed arc
+            if state.rrLinkPos[u] < 0 or state.sharedDomain[][state.rrLinkPos[u]].len <= 1:
+                continue   # fixed link
             if not state.rrMovable[u] and not state.rrMovable[su]:
                 if emptySeen >= RrEmptyRoutes: continue
                 inc emptySeen
@@ -302,7 +401,7 @@ proc rrRound*[T](state: TabuState[T]): int =
         for z in nodes: removed[z] = false
     let after = state.rrKey()
     inc state.rrRounds
-    if cc.cost != 0 or before < after:
+    if not state.rrTourValid() or before < after:
         undoTo(0)
         inc state.rrRejected
         return -1
