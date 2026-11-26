@@ -100,8 +100,10 @@ type
         # the search restarts with state 0 seeded from the result (the LP dive).
         seedFallback*: proc(budget: float): seq[T] {.closure.}
         # One-shot seed source called before the first resolve searches (the
-        # propagation DFS): an empty result leaves the search unseeded.
-        seedFirst*: proc(budget: float): seq[T] {.closure.}
+        # propagation DFS): an empty seed leaves the search unseeded; a later
+        # one is used only if the unseeded search finds nothing by part of
+        # the budget (the refutation's solution).
+        seedFirst*: proc(budget: float): tuple[seed: seq[T], later: bool] {.closure.}
         # Large-neighbourhood improvement by the propagation engine (nil when
         # the model is unsupported): called by the optimizer with the
         # incumbent and a time budget; returns a better assignment, or empty.

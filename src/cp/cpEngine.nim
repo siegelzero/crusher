@@ -35,10 +35,11 @@ type
         base: int        # bitset: value of bit 0
         w0: int          # bitset: first word in CpSolver.words; -1 = interval
 
+    TrailKind = enum tkVar, tkWord, tkCell
     TrailEntry = object
-        isWord: bool
-        i: int           # var id or word index
-        a, b, c: int     # lo, hi, size, or the old word (a)
+        kind: TrailKind
+        i: int           # var id, word index or cell index
+        a, b, c: int     # lo, hi, size, or the old word / cell value (a)
 
     Prop* = ref object of RootObj
         id: int
@@ -63,6 +64,8 @@ type
         levelIds: seq[int]
         curLevel, levelCounter: int
         varStamp, wordStamp: seq[int]
+        cells: seq[int]               # trailed propagator state (newCells / setCell)
+        cellStamp: seq[int]
         props: seq[Prop]
         watch: seq[seq[int32]]
         qLight, qHeavy: seq[int32]
@@ -189,12 +192,25 @@ proc saveVar(s: CpSolver, v: int) {.inline.} =
     if s.trailLim.len > 0 and s.varStamp[v] != s.curLevel:
         s.varStamp[v] = s.curLevel
         let x = s.vars[v]
-        s.trail.add TrailEntry(isWord: false, i: v, a: x.lo, b: x.hi, c: x.size)
+        s.trail.add TrailEntry(kind: tkVar, i: v, a: x.lo, b: x.hi, c: x.size)
 
 proc saveWord(s: CpSolver, w: int) {.inline.} =
     if s.trailLim.len > 0 and s.wordStamp[w] != s.curLevel:
         s.wordStamp[w] = s.curLevel
-        s.trail.add TrailEntry(isWord: true, i: w, a: cast[int](s.words[w]))
+        s.trail.add TrailEntry(kind: tkWord, i: w, a: cast[int](s.words[w]))
+
+proc newCells(s: CpSolver, n, init: int): int =
+    ## n trailed integers for a propagator's state; returns the first index.
+    result = s.cells.len
+    for _ in 0 ..< n:
+        s.cells.add init
+        s.cellStamp.add -1
+
+proc setCell(s: CpSolver, i, v: int) {.inline.} =
+    if s.trailLim.len > 0 and s.cellStamp[i] != s.curLevel:
+        s.cellStamp[i] = s.curLevel
+        s.trail.add TrailEntry(kind: tkCell, i: i, a: s.cells[i])
+    s.cells[i] = v
 
 proc pushLevel(s: CpSolver) =
     s.trailLim.add s.trail.len
@@ -207,8 +223,10 @@ proc popLevel(s: CpSolver) =
     var k = s.trail.len - 1
     while k >= lim:
         let e = s.trail[k]
-        if e.isWord: s.words[e.i] = cast[uint64](e.a)
-        else:
+        case e.kind
+        of tkWord: s.words[e.i] = cast[uint64](e.a)
+        of tkCell: s.cells[e.i] = e.a
+        of tkVar:
             s.vars[e.i].lo = e.a
             s.vars[e.i].hi = e.b
             s.vars[e.i].size = e.c
@@ -1099,6 +1117,284 @@ proc addDiffn*(s: CpSolver, x, y, dx, dy: seq[int]) =
     assert x.len == y.len and x.len == dx.len and x.len == dy.len
     if x.len < 2: return
     s.addProp(DiffnProp(vs: x & y & dx & dy, n: x.len, heavy: x.len > 32))
+
+# Difference logic: the constraints x_v - x_u >= k among the model's linear
+# constraints (after substituting defined variables), hard, reified by a
+# literal, or as the separation disjunctions of diffn, as one graph. D[i][j]
+# is the longest path i -> j over those edges (a lower bound on x_j - x_i;
+# node 0 is the constant 0, for one-variable constraints), kept closed
+# incrementally and trailed. Unlike bounds propagation it fails on a positive
+# cycle as soon as its last edge is added, moves bounds along whole paths in
+# one step, and fixes the literals whose difference a path implies or
+# excludes: rect-euler EU (2000 reified differences, 666 clauses, 17 diffn
+# over 120 coordinates of range ~1500) thrashed for 9 s without a solution
+# on bounds; with path consistency a DFS branching on clauses solves it in
+# 265 nodes (a z3 QF_IDL export in 0.13 s).
+# Bounds stay out of D: as edges from node 0 they would connect every pair of
+# nodes, so each bound change (and each added edge) would update all n^2
+# cells (kitchen tall_complex, 360 nodes: LNS 8x slower).
+
+const DlNeg = low(int) div 4          # no path
+const DlMaxNodes* = 400               # n^2 cells, O(n^2) per added edge
+
+type
+    DlDef* = object
+        ## v = c + sum a_i x_i (a defined variable, substituted)
+        v*: int
+        a*, x*: seq[int]
+        c*: int
+    DlEdge = object
+        a, b, k: int                  # x_b - x_a >= k (node indices)
+    DlLit = object
+        r: int                        # engine boolean
+        e: DlEdge                     # r = 1 -> e
+        full: bool                    # r = 0 -> not e (else r = 0 says nothing)
+    DiffLogicProp = ref object of Prop
+        n, base: int                  # nodes, first cell of D
+        seen: int                     # first of 2n cells: bounds last pushed along D
+        nodeVar: seq[int]             # engine variable per node (node 0: -1)
+        lits: seq[DlLit]
+        disj: seq[seq[DlEdge]]        # at least one edge holds
+
+template dl(s: CpSolver, p: DiffLogicProp, i, j: int): int = s.cells[p.base + i * p.n + j]
+
+proc nlo(s: CpSolver, p: DiffLogicProp, i: int): int {.inline.} =
+    (if i == 0: 0 else: s.lo(p.nodeVar[i]))
+proc nhi(s: CpSolver, p: DiffLogicProp, i: int): int {.inline.} =
+    (if i == 0: 0 else: s.hi(p.nodeVar[i]))
+
+proc dlEntailed(s: CpSolver, p: DiffLogicProp, e: DlEdge): bool {.inline.} =
+    s.dl(p, e.a, e.b) >= e.k
+
+proc dlExcluded(s: CpSolver, p: DiffLogicProp, e: DlEdge): bool {.inline.} =
+    ## Adding e would close a positive cycle.
+    let back = s.dl(p, e.b, e.a)
+    back > DlNeg and back + e.k > 0
+
+proc dlAdd(s: CpSolver, p: DiffLogicProp, e: DlEdge): bool =
+    ## Adds x_b - x_a >= k and restores the closure (false: positive cycle).
+    ## Row b and column a cannot change (that would need a positive cycle),
+    ## so they are read while the rest is updated.
+    if s.dlEntailed(p, e): return true
+    if s.dlExcluded(p, e): return false
+    let n = p.n
+    s.buf.setLen 0
+    for j in 0 ..< n:
+        if s.dl(p, e.b, j) > DlNeg: s.buf.add j
+    for i in 0 ..< n:
+        let dia = s.dl(p, i, e.a)
+        if dia <= DlNeg: continue
+        let base = dia + e.k
+        let row = p.base + i * n
+        for j in s.buf:
+            let cand = base + s.cells[p.base + e.b * n + j]
+            if cand > s.cells[row + j]: s.setCell(row + j, cand)
+    true
+
+proc dlPush(s: CpSolver, p: DiffLogicProp, i: int): bool =
+    ## Moves the bounds of node i along its paths: x_j >= lo_i + D[i][j],
+    ## x_j <= hi_i - D[j][i].
+    let li = s.nlo(p, i)
+    let hi = s.nhi(p, i)
+    if i > 0:
+        if s.cells[p.seen + 2 * i] != li: s.setCell(p.seen + 2 * i, li)
+        if s.cells[p.seen + 2 * i + 1] != hi: s.setCell(p.seen + 2 * i + 1, hi)
+    for j in 0 ..< p.n:
+        if j == i: continue
+        let dij = s.dl(p, i, j)
+        if dij > DlNeg:
+            if j == 0:
+                if li + dij > 0: return false
+            elif not s.setMin(p.nodeVar[j], li + dij): return false
+        let dji = s.dl(p, j, i)
+        if dji > DlNeg:
+            if j == 0:
+                if hi - dji < 0: return false
+            elif not s.setMax(p.nodeVar[j], hi - dji): return false
+    true
+
+method propagate(p: DiffLogicProp, s: CpSolver): bool =
+    var added = false
+    # fixed literals in
+    for l in p.lits:
+        if not s.isFixed(l.r): continue
+        let e = (if s.value(l.r) == 1: l.e
+                 elif l.full: DlEdge(a: l.e.b, b: l.e.a, k: 1 - l.e.k)
+                 else: continue)
+        if not s.dlEntailed(p, e):
+            if not s.dlAdd(p, e): return false
+            added = true
+    # disjunctions: unit propagation to a fixpoint (paths and bounds)
+    var again = true
+    while again:
+        again = false
+        for d in p.disj:
+            var free = -1
+            var nFree = 0
+            var sat = false
+            for k, e in d:
+                if s.dlEntailed(p, e) or s.nlo(p, e.b) - s.nhi(p, e.a) >= e.k: (sat = true; break)
+                if not s.dlExcluded(p, e) and s.nhi(p, e.b) - s.nlo(p, e.a) >= e.k:
+                    inc nFree
+                    free = k
+            if sat: continue
+            if nFree == 0: return false
+            if nFree == 1:
+                if not s.dlAdd(p, d[free]): return false
+                added = true
+                again = true
+    # bounds along paths: every node after a new edge, else the nodes whose
+    # bounds changed since they were last pushed
+    for i in 0 ..< p.n:
+        if added or (i > 0 and (s.cells[p.seen + 2 * i] != s.nlo(p, i) or
+                                s.cells[p.seen + 2 * i + 1] != s.nhi(p, i))):
+            if not s.dlPush(p, i): return false
+    # literals out
+    for l in p.lits:
+        if s.isFixed(l.r): continue
+        if s.dlExcluded(p, l.e):
+            if not s.assign(l.r, 0): return false
+        elif l.full and s.dlEntailed(p, l.e):
+            if not s.assign(l.r, 1): return false
+    true
+
+proc addDifferenceLogic*(s: CpSolver, defs: seq[DlDef] = @[], maxNodes = DlMaxNodes): int =
+    ## Adds one DiffLogicProp over the difference constraints among the
+    ## linear and diffn propagators added so far (call after the model, before
+    ## prepare). defs: defined variables, substituted into every constraint
+    ## (rect-euler: diffn sizes c_width + 5 with c_width = cx_max - cx_min, so
+    ## x_i + dx_i <= x_j is cx_max_i + 5 <= cx_min_j). Redundant with the
+    ## propagators it reads, so it only strengthens propagation. Returns the
+    ## number of nodes, 0 when nothing was added (no literal or disjunction,
+    ## or more than maxNodes variables).
+    var defOf = newSeq[int](s.vars.len)
+    for i in 0 ..< defOf.len: defOf[i] = -1
+    for k, d in defs:
+        if d.v >= 0 and d.v < defOf.len: defOf[d.v] = k
+    # linear form over non-defined, non-fixed variables: (coef, var) pairs + constant
+    proc expand(s: CpSolver, a, x: seq[int], c0: int): (seq[(int, int)], int) =
+        var terms: seq[(int, int)]
+        var c = c0
+        var work: seq[(int, int, int)]          # (coef, var, depth)
+        for k in 0 ..< x.len: work.add (a[k], x[k], 0)
+        while work.len > 0:
+            let (co, v, depth) = work.pop()
+            if co == 0: continue
+            if s.vars[v].size == 1:
+                c += co * s.vars[v].lo
+            elif defOf[v] >= 0 and depth < 16:
+                let d = defs[defOf[v]]
+                c += co * d.c
+                for k in 0 ..< d.x.len: work.add (co * d.a[k], d.x[k], depth + 1)
+            else:
+                var found = false
+                for t in terms.mitems:
+                    if t[1] == v: (t[0] += co; found = true; break)
+                if not found: terms.add (co, v)
+        var kept: seq[(int, int)]
+        for t in terms:
+            if t[0] != 0: kept.add t
+        (kept, c)
+    var nodeOf = newSeq[int](s.vars.len)
+    for i in 0 ..< nodeOf.len: nodeOf[i] = -1
+    var nodeVar = @[-1]
+    proc nodeFor(v: int): int =
+        if v < 0: return 0
+        if nodeOf[v] < 0:
+            nodeOf[v] = nodeVar.len
+            nodeVar.add v
+        nodeOf[v]
+    # sum a_i x_i + c <= 0 as an edge, or none
+    proc edgeOf(s: CpSolver, a, x: seq[int], c: int, e: var DlEdge): bool =
+        let (t, k) = s.expand(a, x, c)
+        # u - v + k <= 0  <=>  x_u - x_v <= -k  <=>  x_v - x_u >= k
+        var u = -1
+        var v = -1
+        if t.len == 1 and abs(t[0][0]) == 1:
+            if t[0][0] == 1: u = t[0][1] else: v = t[0][1]
+        elif t.len == 2 and t[0][0] + t[1][0] == 0 and abs(t[0][0]) == 1:
+            if t[0][0] == 1: (u = t[0][1]; v = t[1][1]) else: (u = t[1][1]; v = t[0][1])
+        else: return false
+        e = DlEdge(a: nodeFor(u), b: nodeFor(v), k: k)
+        true
+    var hard: seq[DlEdge]
+    var lits: seq[DlLit]
+    var disj: seq[seq[DlEdge]]
+    var hasTrivialFalse = false
+    proc neg(a: seq[int]): seq[int] =
+        for x in a: result.add -x
+    for p in s.props:
+        if p of LinProp:
+            let q = LinProp(p)
+            if q.rel == lrNe or (q.rel == lrEq and q.r >= 0): continue
+            var e: DlEdge
+            # sum a x <= c  <=>  sum a x - c <= 0
+            if not s.edgeOf(q.a, q.x, -q.c, e): continue
+            if q.rel == lrEq:
+                var f: DlEdge
+                discard s.edgeOf(neg(q.a), q.x, q.c, f)
+                hard.add e
+                hard.add f
+            elif q.r < 0: hard.add e
+            elif s.vars[q.r].size == 1:
+                if s.vars[q.r].lo == 1: hard.add e
+                elif not q.imp: hard.add DlEdge(a: e.b, b: e.a, k: 1 - e.k)
+            else:
+                lits.add DlLit(r: q.r, e: e, full: not q.imp)
+        elif p of DiffnProp:
+            let q = DiffnProp(p)
+            let n = q.n
+            for i in 0 ..< n:
+                for j in i + 1 ..< n:
+                    var d: seq[DlEdge]
+                    var ok = true
+                    # x_i + dx_i <= x_j, y_i + dy_i <= y_j, x_j + dx_j <= x_i, y_j + dy_j <= y_i
+                    for (o, z) in [(0, 0), (n, 0), (0, 1), (n, 1)]:
+                        let (f, g) = (if z == 0: (i, j) else: (j, i))
+                        var e: DlEdge
+                        if not s.edgeOf(@[1, 1, -1], @[q.vs[o + f], q.vs[2 * n + o + f], q.vs[o + g]], 0, e):
+                            ok = false
+                            break
+                        d.add e
+                    if ok: disj.add d
+    if lits.len == 0 and disj.len == 0: return 0
+    # defined variables' own bounds
+    for d in defs:
+        if d.v < 0 or d.v >= s.vars.len or s.vars[d.v].size == 1: continue
+        var e: DlEdge
+        # v <= hi: sum a x + c - hi <= 0;  v >= lo: -(sum a x) - c + lo <= 0
+        if s.edgeOf(d.a, d.x, d.c - s.vars[d.v].hi, e): hard.add e
+        if s.edgeOf(neg(d.a), d.x, -d.c + s.vars[d.v].lo, e): hard.add e
+    if nodeVar.len > maxNodes: return 0
+    let n = nodeVar.len
+    let p = DiffLogicProp(n: n, nodeVar: nodeVar, lits: lits, disj: disj, heavy: true)
+    p.base = s.newCells(n * n, DlNeg)
+    for i in 0 ..< n: s.cells[p.base + i * n + i] = 0
+    # bounds last pushed along D: none yet (the first call pushes every node)
+    p.seen = s.newCells(2 * n, DlNeg)
+    # root closure (Floyd-Warshall) over the hard edges
+    template D(i, j: int): untyped = s.cells[p.base + (i) * n + (j)]
+    for e in hard:
+        if e.k > D(e.a, e.b): D(e.a, e.b) = e.k
+    for k in 0 ..< n:
+        for i in 0 ..< n:
+            let dik = D(i, k)
+            if dik <= DlNeg: continue
+            for j in 0 ..< n:
+                let dkj = D(k, j)
+                if dkj <= DlNeg: continue
+                if dik + dkj > D(i, j): D(i, j) = dik + dkj
+    for i in 0 ..< n:
+        if D(i, i) > 0:
+            # infeasible at the root: an empty variable makes prepare fail
+            hasTrivialFalse = true
+    if hasTrivialFalse:
+        discard s.newVar(1, 0)
+        return n
+    for i in 1 ..< n: p.vs.add nodeVar[i]
+    for l in lits: p.vs.add l.r
+    s.addProp(p)
+    n
 
 proc arithmeticSafe*(s: CpSolver): bool =
     ## No linear sum or product can leave int64 over the current domains

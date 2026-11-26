@@ -20,6 +20,7 @@ const
     SeedFallbackMaxSecs = 30.0
     SeedFirstShare = 0.02         # fraction of the budget the first seed may use
     SeedFirstMaxSecs = 10.0
+    SeedLaterAfterSecs = 30.0     # a later first seed: searched without it for at most this
 
 proc resolve*[T](system: ConstraintSystem[T],
                 tabuThreshold: int = 10000,
@@ -116,25 +117,36 @@ proc resolve*[T](system: ConstraintSystem[T],
         # First seed (one shot): a propagation DFS on models it supports,
         # bounded by a small share of the budget
         var firstSeed = seedAssignment
+        var laterSeed: seq[T]
         let seedFirst = system.seedFirst
         system.seedFirst = nil
         if seedFirst != nil and seedAssignment.len == 0 and not system.hasFeasibleSolution:
             let budget = if deadline > 0: min(SeedFirstMaxSecs, SeedFirstShare * (deadline - epochTime()))
                          else: SeedFirstMaxSecs
             if budget > 0:
-                let seed = seedFirst(budget)
-                if seed.len == system.baseArray.len: firstSeed = seed
-        # Seed fallback (one shot): search for part of the budget first; only
-        # if that finds nothing is the fallback seed computed and the search
-        # restarted from it.
+                let (seed, later) = seedFirst(budget)
+                if seed.len == system.baseArray.len:
+                    if later and deadline > 0: laterSeed = seed
+                    else: firstSeed = seed
+        # A later seed (rect-euler harrypotter: local search's own first
+        # solution leads to 3912-4425 at 300 s, the refutation's to 4930-5083;
+        # EU: local search finds none) or the seed fallback (one shot): search
+        # for part of the budget first; only if that finds nothing is the
+        # search restarted from the seed, the fallback's computed only then.
         let fallback = system.seedFallback
         system.seedFallback = nil
-        let useFallback = fallback != nil and firstSeed.len == 0 and
+        let useLater = laterSeed.len > 0
+        let useFallback = not useLater and fallback != nil and firstSeed.len == 0 and
                           not system.hasFeasibleSolution and deadline > 0 and
                           deadline - epochTime() >= SeedFallbackMinBudget
-        let firstDeadline = if useFallback: epochTime() + SeedFallbackAfter * (deadline - epochTime())
-                            else: deadline
+        let firstDeadline =
+            if useLater: epochTime() + min(SeedLaterAfterSecs, SeedFallbackAfter * (deadline - epochTime()))
+            elif useFallback: epochTime() + SeedFallbackAfter * (deadline - epochTime())
+            else: deadline
         var found = attempt(firstDeadline, firstSeed)
+        if not found and useLater and epochTime() < deadline:
+            if verbose: echo "[Solve] No solution yet: restarting from the later seed"
+            found = attempt(deadline, laterSeed)
         if not found and useFallback and epochTime() < deadline:
             let seed = fallback(min(SeedFallbackMaxSecs, SeedFallbackBudget * (deadline - epochTime())))
             if epochTime() < deadline:

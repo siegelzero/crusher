@@ -34,6 +34,7 @@ type CpPlan = object
     s: CpSolver
     varOf: Table[string, int]       # FZN scalar variable -> engine variable
     unsupported: string
+    dlNodes: int                    # variables of the difference-logic propagator (0: none)
 
 proc buildCpModel(tr: var FznTranslator, strict = false): CpPlan =
     ## strict: declared domains only (no presolve), and variables declared
@@ -296,6 +297,31 @@ proc buildCpModel(tr: var FznTranslator, strict = false): CpPlan =
         else:
             decline(name)
 
+    # Difference logic over the linear and diffn constraints, with the
+    # variables that int_lin_eq defines (coefficient +-1) substituted
+    var defs: seq[DlDef]
+    for con in tr.model.constraints:
+        if stripSolverPrefix(con.name) != "int_lin_eq" or not con.hasAnnotation("defines_var"): continue
+        let ann = con.getAnnotation("defines_var")
+        if ann.args.len == 0 or ann.args[0].kind != FznIdent or ann.args[0].ident notin plan.varOf: continue
+        var b = ""
+        let a = intArray(tr, con.args[0], b)
+        let x = argVars(tr, plan, varArrays, con.args[1], b)
+        let c = intConst(tr, con.args[2], b)
+        if b != "" or a.len != x.len: continue
+        let v = plan.varOf[ann.args[0].ident]
+        var k = -1
+        for i in 0 ..< x.len:
+            if x[i] == v: (k = i; break)
+        if k < 0 or abs(a[k]) != 1: continue
+        var d = DlDef(v: v, c: a[k] * c)
+        for i in 0 ..< x.len:
+            if i != k:
+                d.a.add -a[k] * a[i]
+                d.x.add x[i]
+        defs.add d
+    plan.dlNodes = s.addDifferenceLogic(defs)
+
     # Branching: the solve annotation's search lists, in order
     proc annName(e: FznExpr): string =
         if e.kind == FznIdent: e.ident
@@ -363,16 +389,22 @@ proc toAssignment(m: CpPositionMap, value: proc(v: int): int): seq[int] =
         result[p] = bestV
 
 proc cpSeedFirst*(tr: var FznTranslator, verbose: bool,
-                  known: Table[string, int] = initTable[string, int]()): proc(budget: float): seq[int] {.closure.} =
+                  known: Table[string, int] = initTable[string, int]()):
+                  proc(budget: float): tuple[seed: seq[int], later: bool] {.closure.} =
     ## The DFS as a seed source for the first resolve (nil when the engine
     ## has no propagator for some constraint of the model). known: a
-    ## solution of the FlatZinc model by variable name (cpRefute's), the
-    ## seed when the DFS finds none (rect-euler british_isles / 3venn: the
-    ## refutation's dom/wdeg restarts solve in 50-70 nodes, the annotation
-    ## DFS stalls after ~400k). Not instead of the DFS: on
-    ## community-detection mexican the DFS's start (objective 466964) leads
-    ## LNS to the optimum and the refutation's (85314) does not.
+    ## solution of the FlatZinc model by variable name (cpRefute's). With a
+    ## DFS solution, the seed is the one of the better objective
+    ## (community-detection mexican: the DFS's 466964 leads LNS to the
+    ## optimum, the refutation's 85314 does not; rect-euler british_isles:
+    ## the refutation's 2742 leads to the optimum 2702, the DFS's 3029 to
+    ## 2707-2736). Without one, known is a later seed on optimization
+    ## problems: used only when local search finds nothing of its own
+    ## (rect-euler EU).
     let t0 = epochTime()
+    let sol = tr.model.solve
+    let objName = if sol.kind != Satisfy and sol.objective != nil and sol.objective.kind == FznIdent:
+                      sol.objective.ident else: ""
     var plan = tr.buildCpModel()
     if plan.unsupported != "":
         if verbose: stderr.writeLine(&"[CP] skipped: {plan.unsupported}")
@@ -380,29 +412,39 @@ proc cpSeedFirst*(tr: var FznTranslator, verbose: bool,
     # Position mapping, so the search needs nothing from the translator
     let m = tr.cpPositionMap(plan)
     if verbose:
-        stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables ({epochTime() - t0:.2f}s)")
-    result = proc(budget: float): seq[int] =
-        proc fromKnown(): seq[int] =
+        let dl = if plan.dlNodes > 0: &", difference logic over {plan.dlNodes - 1}" else: ""
+        stderr.writeLine(&"[CP] ready: {plan.s.numVars} variables{dl} ({epochTime() - t0:.2f}s)")
+    let deferKnown = sol.kind != Satisfy   # a satisfaction problem's is an answer
+    result = proc(budget: float): tuple[seed: seq[int], later: bool] =
+        proc fromKnown(later = deferKnown): seq[int] =
             if known.len == 0: return @[]
             var val = newSeq[int](plan.s.numVars)
             for v in 0 ..< val.len: val[v] = plan.s.lo(v)
             for name, v in plan.varOf:
                 if name in known: val[v] = known[name]
-            if verbose: stderr.writeLine(&"[CP] seed: the refutation's solution ({known.len} variables)")
+            if verbose:
+                let what = if later: "later seed" else: "seed"
+                stderr.writeLine(&"[CP] {what}: the refutation's solution ({known.len} variables)")
             m.toAssignment(proc(v: int): int = val[v])
         let t1 = epochTime()
         let shaved = plan.s.shaveBounds(deadline = t1 + budget * CpShaveShare)
         if verbose:
             stderr.writeLine(&"[CP] root shaving: {shaved} values removed ({epochTime() - t1:.2f}s)")
-        if shaved < 0: return fromKnown()
+        if shaved < 0: return (fromKnown(), deferKnown)
         let st = plan.s.solve(deadline = t1 + budget, stallMin = CpStallMinSecs)
         if verbose or st == cpSat:
             let why = if plan.s.stalled: " (depth stalled)" else: ""
             stderr.writeLine(&"[CP] DFS {st}{why}: {plan.s.nodes} nodes, {plan.s.fails} fails, " &
                              &"depth {plan.s.maxDepth}, {epochTime() - t1:.2f}s")
-        if st != cpSat: return fromKnown()
+        if st != cpSat: return (fromKnown(), deferKnown)
         let s = plan.s
-        m.toAssignment(proc(v: int): int = s.value(v))
+        if objName in known and objName in plan.varOf:
+            let mine = s.value(plan.varOf[objName])
+            let theirs = known[objName]
+            if (if sol.kind == Minimize: theirs < mine else: theirs > mine):
+                if verbose: stderr.writeLine(&"[CP] refutation's objective {theirs} beats the DFS's {mine}")
+                return (fromKnown(later = false), false)
+        (m.toAssignment(proc(v: int): int = s.value(v)), false)
 
 import std/random
 
@@ -570,7 +612,7 @@ proc cpRefute*(filename: string, deadline: float, verbose: bool,
     let shaved = plan.s.shaveBounds(deadline = t0 + CpShaveShare * (deadline - t0))
     let st = if shaved < 0: cpUnsat else: plan.s.refute(deadline = deadline)
     if verbose:
-        stderr.writeLine(&"[CP] refutation: {st} ({plan.s.numVars} variables, {plan.s.nodes} nodes, " &
+        stderr.writeLine(&"[CP] refutation: {st} ({plan.s.numVars} variables, dl {plan.dlNodes}, {plan.s.nodes} nodes, " &
                          &"{plan.s.fails} fails, {epochTime() - t0:.2f}s)")
     if st == cpSat:
         found.clear()

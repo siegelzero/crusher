@@ -272,6 +272,127 @@ suite "CP engine":
             if st == cpSat:
                 check ok(ids.mapIt(s.value(it)))
 
+    test "difference logic: paths fix literals and close cycles":
+        # x < y < z over a wide range; b <-> z < x is false by the path x -> z,
+        # which bounds propagation alone cannot see
+        let s = newCpSolver()
+        let x = s.newVar(0, 1_000_000)
+        let y = s.newVar(0, 1_000_000)
+        let z = s.newVar(0, 1_000_000)
+        let b = s.newVar(0, 1)
+        s.addLinear(@[1, -1], @[x, y], -1, lrLe)
+        s.addLinear(@[1, -1], @[y, z], -1, lrLe)
+        s.addLinear(@[1, -1], @[z, x], -1, lrLe, b)
+        check s.addDifferenceLogic() == 4
+        check s.prepare()
+        check s.isFixed(b) and s.value(b) == 0
+        # a defined variable is substituted: w = z - x, and c <-> w <= 1 is false
+        let s2 = newCpSolver()
+        let x2 = s2.newVar(0, 1_000_000)
+        let y2 = s2.newVar(0, 1_000_000)
+        let z2 = s2.newVar(0, 1_000_000)
+        let w2 = s2.newVar(-2_000_000, 2_000_000)
+        let c2 = s2.newVar(0, 1)
+        s2.addLinear(@[1, -1], @[x2, y2], -1, lrLe)
+        s2.addLinear(@[1, -1], @[y2, z2], -1, lrLe)
+        s2.addLinear(@[1, -1, 1], @[w2, z2, x2], 0, lrEq)
+        s2.addLinear(@[1], @[w2], 1, lrLe, c2)
+        check s2.addDifferenceLogic(@[DlDef(v: w2, a: @[1, -1], x: @[z2, x2], c: 0)]) == 4
+        check s2.prepare()
+        check s2.isFixed(c2) and s2.value(c2) == 0
+
+    test "difference logic: random small models agree with brute force":
+        var rng = initRand(777)
+        var sats = 0
+        var withDl = 0
+        for trial in 0 ..< 400:
+            # ints x0..x3 in sub-ranges of 0..4, w = x_wa - x_wb + wc (defined),
+            # hard differences, (half-)reified differences, clauses over the
+            # literals, and a 2-rectangle diffn with constant sizes
+            var lo, hi: seq[int]
+            for k in 0 ..< 4:
+                let a = rng.rand(0 .. 4)
+                lo.add a
+                hi.add rng.rand(a .. 4)
+            let wa = rng.rand(0 .. 3)
+            let wb = (wa + 1 + rng.rand(0 .. 2)) mod 4
+            let wc = rng.rand(-2 .. 2)
+            type Dc = tuple[u, v, c: int]        # val(u) - val(v) <= c; index 4 = w
+            var hard: seq[Dc]
+            for _ in 0 ..< rng.rand(0 .. 2):
+                let u = rng.rand(0 .. 4)
+                hard.add (u, (u + 1 + rng.rand(0 .. 3)) mod 5, rng.rand(-2 .. 2))
+            var lits: seq[(Dc, bool)]          # (difference, full reification)
+            for _ in 0 ..< 3:
+                let u = rng.rand(0 .. 4)
+                lits.add ((u, (u + 1 + rng.rand(0 .. 3)) mod 5, rng.rand(-3 .. 2)), rng.rand(1.0) < 0.7)
+            var clauses: seq[seq[(int, bool)]]
+            for _ in 0 ..< 2:
+                var cl: seq[(int, bool)]
+                for _ in 0 ..< rng.rand(1 .. 3): cl.add (rng.rand(0 .. 2), rng.rand(1.0) < 0.6)
+                clauses.add cl
+            let sz = [rng.rand(1 .. 2), rng.rand(1 .. 2), rng.rand(1 .. 2), rng.rand(1 .. 2)]
+            proc okAll(xv: seq[int], bv: seq[int]): bool =
+                var v = xv
+                v.add xv[wa] - xv[wb] + wc
+                for h in hard:
+                    if v[h.u] - v[h.v] > h.c: return false
+                for k, (d, full) in lits:
+                    let holds = v[d.u] - v[d.v] <= d.c
+                    if bv[k] == 1 and not holds: return false
+                    if full and bv[k] == 0 and holds: return false
+                for cl in clauses:
+                    var sat = false
+                    for (k, pos) in cl:
+                        if (bv[k] == 1) == pos: sat = true
+                    if not sat: return false
+                # rectangles at (x0, x2) size (sz0, sz1) and (x1, x3) size (sz2, sz3)
+                v[0] + sz[0] <= v[1] or v[2] + sz[1] <= v[3] or
+                    v[1] + sz[2] <= v[0] or v[3] + sz[3] <= v[2]
+            var expected = false
+            var xv = newSeq[int](4)
+            proc rec(k: int): bool =
+                if k == 4:
+                    for m in 0 ..< 8:
+                        if okAll(xv, @[m and 1, (m shr 1) and 1, (m shr 2) and 1]): return true
+                    return false
+                for val in lo[k] .. hi[k]:
+                    xv[k] = val
+                    if rec(k + 1): return true
+                false
+            expected = rec(0)
+            let s = newCpSolver()
+            var ids: seq[int]
+            for k in 0 ..< 4: ids.add s.newVar(lo[k], hi[k])
+            let w = s.newVar(-10, 10)
+            ids.add w
+            s.addLinear(@[1, -1, 1], @[w, ids[wa], ids[wb]], wc, lrEq)
+            for h in hard: s.addLinear(@[1, -1], @[ids[h.u], ids[h.v]], h.c, lrLe)
+            var bs: seq[int]
+            for (d, full) in lits:
+                let b = s.newVar(0, 1)
+                bs.add b
+                s.addLinear(@[1, -1], @[ids[d.u], ids[d.v]], d.c, lrLe, b, not full)
+            for cl in clauses:
+                var lv: seq[int]
+                var lp: seq[bool]
+                for (k, pos) in cl:
+                    lv.add bs[k]
+                    lp.add pos
+                s.addOr(lv, lp)
+            s.addDiffn(@[ids[0], ids[1]], @[ids[2], ids[3]],
+                       @[s.constVar(sz[0]), s.constVar(sz[2])], @[s.constVar(sz[1]), s.constVar(sz[3])])
+            let dlDefs = @[DlDef(v: w, a: @[1, -1], x: @[ids[wa], ids[wb]], c: wc)]
+            if s.addDifferenceLogic(dlDefs) > 0: inc withDl
+            let st = s.refute()
+            check st == (if expected: cpSat else: cpUnsat)
+            if st == cpSat:
+                inc sats
+                check okAll(ids[0 ..< 4].mapIt(s.value(it)), bs.mapIt(s.value(it)))
+                check s.value(w) == s.value(ids[wa]) - s.value(ids[wb]) + wc
+        check sats > 50 and sats < 350
+        check withDl > 300
+
     test "refute: pigeonhole through restarts, satisfiable model":
         let s = newCpSolver()
         var xs: seq[int]
