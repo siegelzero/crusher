@@ -443,6 +443,16 @@ type
         compactReassign: Table[int, seq[int]]         # start pos -> positions moving its tasks' machines
         reassignTrials, reassignKept: int
         reorderTrials, reorderKept, reorderGains, reorderKicks: int
+        # Spread construction (tabuSpread): the no-overlap it applies to (-1:
+        # none), per task the constraints its start / machine reach, the tasks
+        # of each such constraint
+        spreadBuilt: bool
+        spreadCi: int
+        spreadConsS, spreadConsM: seq[seq[int]]
+        spreadTasksOf: Table[int, seq[int]]
+        spreadAux: seq[int]                           # other search positions, repaired after a build
+        spreadAuxCons: seq[seq[int]]                  # ... the constraints each reaches
+        spreadTries, spreadWins, spreadPolishGains: int
         # Uniform delta: saved constraint costs before propagation
         cdSavedConstraintCosts: seq[int]          # [constraintIdx] -> saved cost before propagateChannels
         # Single-position relational channel-dep constraints (e.g. bounds on a nonlinear
@@ -687,6 +697,7 @@ include tabuObjectiveAnneal
 include tabuChainRepair
 include tabuRerouteMoves
 include tabuCompaction
+include tabuSpread
 
 ################################################################################
 # Dense Array Penalty Lookup
@@ -6984,6 +6995,29 @@ proc constructState[T](state: TabuState[T], deadline: float) =
         echo &"[Tabu S{state.id}] Construction: built, cost {state.cost}, " &
              &"best cost {state.bestCost} ({secs:.2f}s)"
 
+proc spreadState[T](state: TabuState[T], deadline: float) =
+    ## On a violated state whose no-overlap holds (a schedule, like the
+    ## incumbent seeding an optimizer ask), tries the spread construction
+    ## (tabuSpread); a state it builds costs 0.
+    if state.cost == 0: return
+    state.ensureSpreadTables()
+    if state.spreadCi < 0 or state.constraints[state.spreadCi].penalty() > 0: return
+    let left = if deadline > 0: max(0.0, deadline - epochTime()) else: SpreadMaxSecs
+    let budget = min(SpreadMaxSecs, CompactShare * left)
+    let wasLean = state.leanSearch
+    state.leanSearch = true
+    let built = state.spreadSchedule(budget)
+    state.leanSearch = wasLean
+    if not built: return
+    if not wasLean:
+        for pos in state.channelDepSearchPositions:
+            if not state.isLazy[pos]:
+                state.computeChannelDepPenaltiesAt(pos)
+        state.rebuildPenaltyMap()
+    if state.cost <= state.bestCost:
+        state.bestCost = state.cost
+        state.bestAssignment = state.assignment
+
 proc resultSlack*[T](state: TabuState[T]): int =
     ## Objective-bound slack of the best assignment when it is the current
     ## one (negative = inside the bound), else high(int)
@@ -6994,15 +7028,17 @@ proc resultSlack*[T](state: TabuState[T]): int =
 
 proc tabuImprove*[T](state: TabuState[T], threshold: int, shouldStop: ptr Atomic[bool] = nil, deadline: float = 0.0): TabuState[T] =
     ## Tabu walk, with schedule compaction (tabuCompaction) of the start state
-    ## and of the result when they violate at most the objective bound, and
-    ## construction of a schedule from a best state whose only other
-    ## violations are no-overlap overlaps.
+    ## and of the result when they violate at most the objective bound, the
+    ## spread construction (tabuSpread) of a violated start state whose
+    ## no-overlap holds, and construction of a schedule from a best state
+    ## whose only other violations are no-overlap overlaps.
     let bc = state.boundConstraint
     let pre = bc != nil and state.cost == bc.penalty()
     var compacted: seq[T]
     if pre:
         state.compactState(deadline, shouldStop)
         compacted = state.assignment
+    state.spreadState(deadline)
     result = state.tabuWalk(threshold, shouldStop, deadline)
     if result.bestCost > 0:
         result.constructState(deadline)
