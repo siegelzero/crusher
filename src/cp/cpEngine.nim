@@ -1633,3 +1633,5 @@ proc solve*(s: CpSolver, deadline: float = 0.0, stop: ptr bool = nil,
     ## longest gap is 0.70 of this limit, kitchen b1's 0.44).
     if not s.prepare(): return cpUnsat
     s.search(deadline, stop, stallMin)
+
+include dlOrient

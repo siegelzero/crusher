@@ -459,6 +459,9 @@ const
     # on the ladder's objective annealing (worse there: 175361 vs 165999 mean
     # over 3 runs at 300 s), where local search alone reaches 191375 in one probe.
     CpLnsMinGain = 0.001
+    CpLnsDlNodes = 200          # LP nodes per orientation neighbourhood
+    CpLnsDlFracStart = 0.15     # share of the disjunctions an orientation neighbourhood re-decides
+    CpLnsDlStallIts = 100       # orientation neighbourhoods: a stall also needs this many without a gain
 
 proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[int], budget: float): seq[int] {.closure.} =
     ## Large neighbourhood search with the propagation engine, for the
@@ -490,6 +493,9 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
     var cur: seq[int]          # engine incumbent (all variables), empty until known
     var rng = initRand(0x5eed)
     var frac = CpLnsFracStart
+    var orient: DlOrient        # orientation neighbourhoods (difference-logic models)
+    var disjOfNode: seq[seq[int]]
+    var oFrac = CpLnsDlFracStart
     proc better(a, b: int): bool = (if maximize: a > b else: a < b)
     proc significant(a, b: int): bool =
         ## a improves on b by at least CpLnsMinGain of b's magnitude (and by 1)
@@ -502,7 +508,19 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
         let deadline = t0 + budget
         if not ready:
             ready = true
-            rootOk = s.shaveBounds(deadline = t0 + budget * CpShaveShare) >= 0 and s.prepare()
+            # Orientation neighbourhoods need no shaving: their LP moves every
+            # variable at once (rect-euler EU: 10 s of a 120 s run's LNS
+            # budget, 8418 vs 8541 without it)
+            rootOk = s.prepare()
+            if rootOk:
+                orient = s.dlOrientation(obj, maximize)
+                if orient == nil:
+                    rootOk = s.shaveBounds(deadline = t0 + budget * CpShaveShare) >= 0 and s.prepare()
+            if orient != nil:
+                for k, ns in orient.disjNodes:
+                    for nd in ns:
+                        if nd >= disjOfNode.len: disjOfNode.setLen nd + 1
+                        disjOfNode[nd].add k
             if verbose and not rootOk: stderr.writeLine("[CP] LNS: root infeasible")
         if not rootOk: return @[]
         # Import the caller's incumbent: its decision values, completed by a DFS
@@ -539,10 +557,38 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
         var lastGain = tLoop
         var lastSig = cur[obj]      # objective at the last gain that counted as progress
         var its, gains = 0
+        var lastGainIt = 0          # neighbourhood of the last gain that counted as progress
         while true:
             let now = epochTime()
-            if now > deadline or now - lastGain > max(CpLnsStallMin, 0.5 * (lastGain - tLoop)): break
+            if now > deadline or (now - lastGain > max(CpLnsStallMin, 0.5 * (lastGain - tLoop)) and
+                                  (orient == nil or its - lastGainIt >= CpLnsDlStallIts)): break
             inc its
+            if orient != nil:
+                # Re-decide the disjunctions around a few random ones, every
+                # variable free (the first neighbourhood re-decides none: the
+                # LP placement of the incumbent's own orientation)
+                var free = newSeq[bool](orient.disj.len)
+                if its > 1:
+                    let target = max(1, int(oFrac * float(free.len)))
+                    var cnt = 0
+                    while cnt < target:
+                        for nd in orient.disjNodes[rng.rand(free.len - 1)]:
+                            for k in disjOfNode[nd]:
+                                if not free[k]:
+                                    free[k] = true
+                                    inc cnt
+                var used = 0
+                let vals = s.dlImprove(orient, cur, free, CpLnsDlNodes, deadline, used)
+                if vals.len > 0:
+                    cur = vals
+                    inc gains
+                    if significant(cur[obj], lastSig):
+                        lastSig = cur[obj]
+                        lastGain = epochTime()
+                        lastGainIt = its
+                elif used < CpLnsDlNodes: oFrac = min(0.9, oFrac * 1.1)
+                else: oFrac = max(0.005, oFrac / 1.1)
+                continue
             s.pushAssume()
             var ok = (if maximize: s.setMin(obj, cur[obj] + 1) else: s.setMax(obj, cur[obj] - 1))
             if ok:
@@ -567,6 +613,10 @@ proc cpImproveLns*(tr: var FznTranslator, verbose: bool): proc(incumbent: seq[in
             stderr.writeLine(&"[CP] LNS: {from0} -> {cur[obj]} (incumbent {start}), {gains} gains in {its} " &
                              &"neighbourhoods, free share {frac:.2f}, {epochTime() - t0:.2f}s " &
                              &"({tLoop - t0:.2f}s setup)")
+            if orient != nil:
+                stderr.writeLine(&"[CP] LNS orientations: {orient.disj.len} disjunctions, share {oFrac:.3f}, " &
+                                 &"{orient.bbNodes} nodes, {orient.lps} LPs, {orient.leaves} leaves " &
+                                 &"({orient.leafFails} failed)")
         if haveStart and not (better(cur[obj], startObj) and significant(cur[obj], startObj)): return @[]
         let snapshot = cur
         m.toAssignment(proc(v: int): int = snapshot[v])

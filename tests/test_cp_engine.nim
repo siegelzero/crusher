@@ -393,6 +393,114 @@ suite "CP engine":
         check sats > 50 and sats < 350
         check withDl > 300
 
+    test "orientation branch and bound: random packings reach the brute-force optimum":
+        # 3 rectangles (diffn, sizes 1..2) on 0..4, hard differences, two
+        # reified differences in a clause; objective mx + my + |mx - my| with
+        # mx / my the maxima of the far edges (rect-euler's shape: max and abs
+        # over defined variables, a max result that is a graph node)
+        var rng = initRand(4242)
+        var improvedRuns, exact, optimalStarts = 0
+        for trial in 0 ..< 150:
+            var w, h: seq[int]
+            for i in 0 ..< 3:
+                w.add rng.rand(1 .. 2)
+                h.add rng.rand(1 .. 2)
+            type Dc = tuple[u, v, c: int]        # val(u) - val(v) <= c over x0..x2, y0..y2
+            var hard: seq[Dc]
+            for _ in 0 ..< rng.rand(0 .. 2):
+                let u = rng.rand(0 .. 5)
+                hard.add (u, (u + 1 + rng.rand(0 .. 4)) mod 6, rng.rand(-1 .. 3))
+            var lits: seq[Dc]
+            for _ in 0 ..< 2:
+                let u = rng.rand(0 .. 5)
+                lits.add (u, (u + 1 + rng.rand(0 .. 4)) mod 6, rng.rand(-2 .. 1))
+            proc cost(v: seq[int]): int =
+                ## objective of positions v (x0..x2, y0..y2), or -1 if infeasible
+                for hd in hard:
+                    if v[hd.u] - v[hd.v] > hd.c: return -1
+                if not (v[lits[0].u] - v[lits[0].v] <= lits[0].c or v[lits[1].u] - v[lits[1].v] <= lits[1].c):
+                    return -1
+                for i in 0 ..< 3:
+                    for j in i + 1 ..< 3:
+                        if not (v[i] + w[i] <= v[j] or v[j] + w[j] <= v[i] or
+                                v[3 + i] + h[i] <= v[3 + j] or v[3 + j] + h[j] <= v[3 + i]): return -1
+                var mx, my = 0
+                for i in 0 ..< 3:
+                    mx = max(mx, v[i] + w[i])
+                    my = max(my, v[3 + i] + h[i])
+                mx + my + abs(mx - my)
+            var best = -1
+            var pos = newSeq[int](6)
+            proc brute(k: int) =
+                if k == 6:
+                    let c = cost(pos)
+                    if c >= 0 and (best < 0 or c < best): best = c
+                    return
+                for val in 0 .. 4:
+                    pos[k] = val
+                    brute(k + 1)
+            brute(0)
+            let s = newCpSolver()
+            var xs, ys: seq[int]
+            for i in 0 ..< 3: xs.add s.newVar(0, 4)
+            for i in 0 ..< 3: ys.add s.newVar(0, 4)
+            let ids = xs & ys
+            var defs: seq[DlDef]
+            var ex, ey: seq[int]
+            for i in 0 ..< 3:
+                ex.add s.newVar(0, 10)
+                s.addLinear(@[1, -1], @[ex[i], xs[i]], w[i], lrEq)
+                defs.add DlDef(v: ex[i], a: @[1], x: @[xs[i]], c: w[i])
+                ey.add s.newVar(0, 10)
+                s.addLinear(@[1, -1], @[ey[i], ys[i]], h[i], lrEq)
+                defs.add DlDef(v: ey[i], a: @[1], x: @[ys[i]], c: h[i])
+            let mx = s.newVar(0, 10)
+            let my = s.newVar(0, 10)
+            s.addMax(mx, ex)
+            s.addMax(my, ey)
+            let t = s.newVar(-10, 10)
+            s.addLinear(@[1, -1, 1], @[t, mx, my], 0, lrEq)
+            defs.add DlDef(v: t, a: @[1, -1], x: @[mx, my], c: 0)
+            let d = s.newVar(0, 10)
+            s.addAbs(t, d)
+            let obj = s.newVar(0, 40)
+            s.addLinear(@[1, 1, 1, -1], @[mx, my, d, obj], 0, lrEq)
+            for hd in hard: s.addLinear(@[1, -1], @[ids[hd.u], ids[hd.v]], hd.c, lrLe)
+            var bs: seq[int]
+            for l in lits:
+                let b = s.newVar(0, 1)
+                bs.add b
+                s.addLinear(@[1, -1], @[ids[l.u], ids[l.v]], l.c, lrLe, b, rng.rand(1.0) < 0.5)
+            s.addOr(bs, @[true, true])
+            s.addDiffn(xs, ys, w.mapIt(s.constVar(it)), h.mapIt(s.constVar(it)))
+            if s.addDifferenceLogic(defs) == 0 or not s.prepare():
+                check best < 0
+                continue
+            if s.search() != cpSat:
+                check best < 0
+                continue
+            var cur = newSeq[int](s.numVars)
+            for v in 0 ..< s.numVars: cur[v] = s.value(v)
+            s.popTo(0)
+            check best >= 0 and cost(ids.mapIt(cur[it])) == cur[obj]
+            let o = s.dlOrientation(obj, false)
+            check o != nil
+            if o == nil: continue
+            var used = 0
+            let found = s.dlImprove(o, cur, newSeq[bool](o.disj.len).mapIt(true), 100_000, 0.0, used)
+            check s.level == 0
+            if cur[obj] == best:
+                inc optimalStarts
+                check found.len == 0
+            elif found.len > 0:
+                inc improvedRuns
+                let c = cost(ids.mapIt(found[it]))
+                check c == found[obj] and c >= best and c < cur[obj]
+                if c == best: inc exact
+        check improvedRuns >= 30
+        check exact >= improvedRuns - 2
+        check optimalStarts + improvedRuns >= 100
+
     test "refute: pigeonhole through restarts, satisfiable model":
         let s = newCpSolver()
         var xs: seq[int]
