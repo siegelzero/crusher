@@ -503,7 +503,11 @@ proc reorderSchedule[T](state: TabuState[T], budget: float, shouldStop: ptr Atom
     ## takes ReorderKickMoves trials whatever their slack (a kick) and the
     ## descent goes on from there, until the budget, ReorderIdleKicks kicks
     ## in a row without a new best or shouldStop; otherwise a descent until
-    ## ReorderStallTrials trials without a strict gain. Leaves the best
+    ## ReorderStallTrials trials without a strict gain. Either way it stops
+    ## after ReorderStallTrials trials in a row of which none was kept: a kick
+    ## then cannot finish (saeling j0005 and workforce-alloc solved states:
+    ## millions of trials, none kept, for a quarter of the time left; kept
+    ## trials on the saeling instances come at most ~340 trials apart). Leaves the best
     ## schedule; returns the number of times the best improved. saeling
     ## j0010_m008: the descent converges within ~17k trials in the basin of
     ## its start (170-190).
@@ -548,8 +552,10 @@ proc reorderSchedule[T](state: TabuState[T], budget: float, shouldStop: ptr Atom
     # seeding a retry ask) the domains, tightened by the bound, keep every
     # schedule within about the incumbent's objective
     let kicks = state.boundSlack() < 0
+    var sinceKeep = 0            # trials in a row without a kept one
     while epochTime() - t0 < budget:
         if not kicks and stall >= ReorderStallTrials: break
+        if sinceKeep >= ReorderStallTrials: break
         if shouldStop != nil and shouldStop[].load(moRelaxed): break
         if kicks and kick == 0 and stall >= ReorderKickStall:
             if idleKicks >= ReorderIdleKicks: break
@@ -598,6 +604,7 @@ proc reorderSchedule[T](state: TabuState[T], budget: float, shouldStop: ptr Atom
             for k in countdown(log.len - 1, 0):
                 state.assignValueLean(log[k][0], log[k][1])
         if keep:
+            sinceKeep = 0
             if not state.leanSearch:
                 for (p, v) in finals:
                     if state.assignment[p] != v: state.commitValue(p, v)
@@ -611,6 +618,8 @@ proc reorderSchedule[T](state: TabuState[T], budget: float, shouldStop: ptr Atom
             if kick > 0: dec kick
         if gain: stall = 0
         else: inc stall
+        if not keep:
+            inc sinceKeep
         if keep and state.boundSlack() < bestSlack:
             bestSlack = state.boundSlack()
             bestAssignment = state.assignment

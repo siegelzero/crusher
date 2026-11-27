@@ -151,6 +151,15 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                 workers * 2
         else:
             if populationSize > 0: populationSize else: 8
+        # Dominant-term asks run one state per worker: a level local search
+        # cannot reach costs every state its stall cap, and a second round of
+        # states only doubles that (workforce-alloc 19: the impossible
+        # 4-team ask took 34 s of a 60 s run with 8 states on 4 workers)
+        let domAskPopSize = when compileOption("threads"):
+            let workers = if numWorkers > 0: numWorkers else: getOptimalWorkerCount()
+            min(effectivePopSize, max(2, workers))
+        else:
+            effectivePopSize
 
         # Objective annealing (tabuObjectiveAnneal.nim) runs on a wall-clock
         # schedule, so only under a deadline.
@@ -937,7 +946,7 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                         parallel=parallel,
                         tabuThreshold=retryThreshold,
                         scatterThreshold=(if fastAsk: 0 else: scatterThreshold),
-                        populationSize=effectivePopSize,
+                        populationSize=(if domAsk: domAskPopSize else: effectivePopSize),
                         numWorkers=numWorkers,
                         scatterStrategy=scatterStrategy,
                         verbose=verbose,
@@ -994,10 +1003,20 @@ template optimizeImpl(ObjectiveType: typedesc, direction: OptimizationDirection,
                     system.searchCompleted = false
                     break retryLoop
                 except InfeasibleError:
-                    # Domain reduction proved no better solution exists — provably optimal
-                    system.optimalityProven = true
                     system.initialize(bestSolution)
                     objective.initialize(system.assignment)
+                    if domAsk:
+                        # Only level v-1 under this bound is refuted, not
+                        # every better objective: block the level
+                        domBlockedLevel = int(system.objectiveDominant.expr.evaluate(system.assignment)) - 1
+                        if verbose:
+                            echo "[Opt] Dominant ask refuted; blocked at v <= ", domBlockedLevel
+                            flushFile(stdout)
+                        if deadline > 0 and epochTime() < deadline:
+                            continue
+                        break retryLoop
+                    # Domain reduction proved no better solution exists — provably optimal
+                    system.optimalityProven = true
                     break retryLoop
                 except NoSolutionFoundError:
                     if adoptNearFeasible():

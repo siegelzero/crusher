@@ -135,9 +135,16 @@ proc spreadRepairAux[T](state: TabuState[T], log: var seq[(int, T)]) =
     ## domain's value of least cost, each at most once; cost-neutral moves
     ## count, since a dropped machine can need two (workforce-alloc: the
     ## team's set-element boolean, then the team count matching their sum).
-    ## Changes go to log.
+    ## The objective bound does not count: its scaled penalty would make a
+    ## variable of the objective lie to meet it (workforce-alloc: the team
+    ## count left at 4 under 5 teams, cost 2, rather than the true objective
+    ## 1 over the bound), and the polish needs the true objective. Changes go
+    ## to log.
+    let bc = state.boundConstraint
+    template others(): int =
+        state.cost - (if bc != nil: bc.penalty() else: 0)
     var moved = newSeq[bool](state.spreadAux.len)
-    while state.cost > 0:
+    while others() > 0:
         var bestK = -1
         var bestV: T
         var bestCost = high(int)
@@ -153,12 +160,12 @@ proc spreadRepairAux[T](state: TabuState[T], log: var seq[(int, T)]) =
             for v in state.compactSortedDomain(p):
                 if v == v0: continue
                 state.assignValueLean(p, v)
-                if state.cost < bestCost:
-                    bestCost = state.cost
+                if others() < bestCost:
+                    bestCost = others()
                     bestK = k
                     bestV = v
             state.assignValueLean(p, v0)
-        if bestK < 0 or bestCost > state.cost: return
+        if bestK < 0 or bestCost > others(): return
         let p = state.spreadAux[bestK]
         log.add((p, state.assignment[p]))
         state.assignValueLean(p, bestV)
@@ -234,17 +241,33 @@ proc spreadSchedule[T](state: TabuState[T], budget: float): bool =
     var isPlaced = newSeq[bool](n)
     var groupTasks = newSeq[seq[int]](groupPos.len)
     for t in 0..<n: groupTasks[groupOf[t]].add t
+    let bc = state.boundConstraint
+    let slackOk = bc != nil and bc.stateType == RelationalType
+    template boundOnly(): bool =
+        ## Nothing but the objective bound violated
+        state.cost == bc.penalty()
     proc polish(chosen: seq[int]) =
         ## Moves a group of tasks to another machine of the build, or swaps
         ## two, each task at the start nearest its own that is clear there
         ## and keeps its constraints with the others; a move stays when the
-        ## state still costs 0 and the objective (bound slack) drops, until
-        ## SpreadPolishFails moves in a row bring nothing
+        ## state still violates at most the objective bound and the objective
+        ## (bound slack) drops, until SpreadPolishFails moves in a row bring
+        ## nothing. Builds over the bound get polished too: under a tight
+        ## bound only a polished build meets it (workforce-alloc 71 at
+        ## 10155, ask 10154: dispersion 0 needed, 0 of ~2000 unpolished builds).
+        ## Ties in the objective go to the move that evens the machine loads
+        ## (sum of squares): max - min of the loads is flat under most moves
         for ci, v in unplacedIn.mpairs: v = 1          # every other task placed
         var tasksOn = initTable[int, seq[int]]()
         for v in chosen: tasksOn[v] = @[]
         for t in 0..<n: tasksOn.mgetOrPut(int(state.assignment[mc.machinePositions[t]]), @[]).add t
         var cur = state.boundSlack()
+        proc loadSq(): int =
+            for v, ts in tasksOn.pairs:
+                var l = 0
+                for t in ts: l += durs[t]
+                result += l * l
+        var curSq = loadSq()
         proc moveGroup(g, b: int, excl: seq[int]): bool =
             ## g's tasks onto machine b, b's tasks of the groups in excl ignored
             sim(groupPos[g], T(b))
@@ -304,9 +327,8 @@ proc spreadSchedule[T](state: TabuState[T], budget: float): bool =
             var ok = moveGroup(g, b, (if h >= 0: @[g, h] else: @[g]))
             if ok and h >= 0: ok = moveGroup(h, a, @[h])
             if ok and state.cost > 0: state.spreadRepairAux(log)
-            if ok and state.cost == 0 and state.boundSlack() < cur:
-                cur = state.boundSlack()
-                fails = 0
+            var take = false
+            if ok and boundOnly() and state.boundSlack() <= cur:
                 for t in groupTasks[g]:
                     tasksOn[a].delete(tasksOn[a].find(t))
                     tasksOn[b].add t
@@ -314,11 +336,23 @@ proc spreadSchedule[T](state: TabuState[T], budget: float): bool =
                     for t in groupTasks[h]:
                         tasksOn[b].delete(tasksOn[b].find(t))
                         tasksOn[a].add t
-                inc state.spreadPolishGains
-            else:
+                let sq = loadSq()
+                take = state.boundSlack() < cur or sq < curSq
+                if take:
+                    cur = state.boundSlack()
+                    curSq = sq
+                    fails = 0
+                    inc state.spreadPolishGains
+                else:
+                    if h >= 0:
+                        for t in groupTasks[h]:
+                            tasksOn[a].delete(tasksOn[a].find(t))
+                            tasksOn[b].add t
+                    for t in groupTasks[g]:
+                        tasksOn[b].delete(tasksOn[b].find(t))
+                        tasksOn[a].add t
+            if not take:
                 undoTo(mark)
-    let bc = state.boundConstraint
-    let slackOk = bc != nil and bc.stateType == RelationalType
     var tries, wins, sinceGain = 0
     var bestK = -1                  # machines of the kept build (-1: none)
     var bestSlack: T
@@ -453,7 +487,7 @@ proc spreadSchedule[T](state: TabuState[T], budget: float): bool =
                 ok = false
                 break
         if ok and state.cost > 0: state.spreadRepairAux(log)
-        if ok and state.cost == 0 and slackOk: polish(chosen)
+        if ok and slackOk and boundOnly(): polish(chosen)
         if ok and state.cost == 0:
             let sl = if slackOk: state.boundSlack() else: T(0)
             if bestK < 0 or sl < bestSlack:
